@@ -510,6 +510,12 @@ mod tests {
     }
 
     #[test]
+    fn test_segment_display_confed_set() {
+        let seg = AsPathSegment::ConfedSet(vec![Asn::new(65001), Asn::new(65002)]);
+        assert_eq!(seg.to_string(), "({65001, 65002})");
+    }
+
+    #[test]
     fn test_aspath_display() {
         let path = AsPath::from_sequence(vec![Asn::new(65003), Asn::new(65002), Asn::new(65001)]);
         assert_eq!(path.to_string(), "65003 65002 65001");
@@ -522,5 +528,26 @@ mod tests {
             AsPathSegment::Set(vec![Asn::new(65000), Asn::new(65001)]),
         ]);
         assert_eq!(path.to_string(), "65002 {65000, 65001}");
+    }
+
+    #[test]
+    fn test_aspath_origin_as_skips_non_sequence_segments() {
+        // When iterating in reverse, a ConfedSequence appearing after the last
+        // Sequence hits the `_ => None` arm of find_map before the Sequence is found.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::Sequence(vec![Asn::new(65003), Asn::new(65002)]),
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
+        ]);
+        // Reversed: ConfedSequence (→ None, continue), then Sequence (→ Some(65002))
+        assert_eq!(path.origin_as(), Some(Asn::new(65002)));
+    }
+
+    #[test]
+    fn test_aspath_origin_as_none_without_sequence() {
+        // A path with only non-Sequence segments has no determinable origin AS.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
+        ]);
+        assert_eq!(path.origin_as(), None);
     }
 }

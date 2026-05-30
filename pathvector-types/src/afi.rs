@@ -359,6 +359,14 @@ mod tests {
     }
 
     #[test]
+    fn test_afi_into_u16() {
+        let v: u16 = Afi::IPV4.into();
+        assert_eq!(v, 1);
+        let v: u16 = Afi::L2VPN.into();
+        assert_eq!(v, 25);
+    }
+
+    #[test]
     fn test_afi_display_known() {
         assert_eq!(Afi::IPV4.to_string(), "IPv4");
         assert_eq!(Afi::IPV6.to_string(), "IPv6");
@@ -399,6 +407,14 @@ mod tests {
     #[test]
     fn test_safi_from_u8() {
         assert_eq!(Safi::from(1u8), Safi::UNICAST);
+    }
+
+    #[test]
+    fn test_safi_into_u8() {
+        let v: u8 = Safi::UNICAST.into();
+        assert_eq!(v, 1);
+        let v: u8 = Safi::MPLS_VPN.into();
+        assert_eq!(v, 128);
     }
 
     #[test]

@@ -559,10 +559,24 @@ mod tests {
     }
 
     #[test]
+    fn test_community_new() {
+        let c = Community::new(0xFDE8_0064);
+        assert_eq!(c.high(), 0xFDE8);
+        assert_eq!(c.low(), 0x0064);
+        assert_eq!(c.as_u32(), 0xFDE8_0064);
+    }
+
+    #[test]
     fn test_community_from_u32() {
         let c = Community::from(0xFDE8_0064u32);
         assert_eq!(c.high(), 0xFDE8);
         assert_eq!(c.low(), 0x0064);
+    }
+
+    #[test]
+    fn test_community_into_u32() {
+        let v: u32 = Community::from_parts(65000, 100).into();
+        assert_eq!(v, (65000u32 << 16) | 100);
     }
 
     // --- LargeCommunity ---
@@ -628,5 +642,28 @@ mod tests {
         let bytes = [0x00, 0x02, 0xFD, 0xE8, 0x00, 0x00, 0x00, 0x64];
         let ec = ExtendedCommunity::from_bytes(bytes);
         assert_eq!(ec.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn test_extended_community_value() {
+        // value() returns the 6 bytes after the type and sub-type bytes.
+        let rt = ExtendedCommunity::route_target_as2(65000, 100);
+        let v = rt.value();
+        assert_eq!(v.len(), 6);
+        // bytes[2..4] = 65000 big-endian = [0xFD, 0xE8]
+        assert_eq!(v[0], 0xFD);
+        assert_eq!(v[1], 0xE8);
+        // bytes[4..8] = 100 big-endian = [0x00, 0x00, 0x00, 0x64]
+        assert_eq!(&v[2..], &[0x00, 0x00, 0x00, 0x64]);
+    }
+
+    #[test]
+    fn test_extended_community_display() {
+        // Display renders all 8 bytes as hex with a colon after the first two.
+        let ec = ExtendedCommunity::from_bytes([0x00, 0x02, 0xFD, 0xE8, 0x00, 0x00, 0x00, 0x64]);
+        assert_eq!(ec.to_string(), "0002:fde800000064");
+
+        let ec2 = ExtendedCommunity::from_bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(ec2.to_string(), "0000:000000000000");
     }
 }

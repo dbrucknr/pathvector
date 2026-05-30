@@ -223,6 +223,19 @@ mod tests {
     }
 
     #[test]
+    fn test_asn_from_u32() {
+        let asn = Asn::from(131072u32);
+        assert_eq!(asn.as_u32(), 131072);
+        assert!(asn.is_four_byte());
+    }
+
+    #[test]
+    fn test_asn_into_u32() {
+        let v: u32 = Asn::new(65000).into();
+        assert_eq!(v, 65000);
+    }
+
+    #[test]
     fn test_asn_ordering() {
         assert!(Asn::new(1) < Asn::new(65000));
         assert!(Asn::new(65000) > Asn::new(64511));

@@ -534,6 +534,12 @@ mod tests {
     }
 
     #[test]
+    fn test_med_as_u32() {
+        assert_eq!(Med::new(42).as_u32(), 42);
+        assert_eq!(Med::new(0).as_u32(), 0);
+    }
+
+    #[test]
     fn test_med_from_u32() {
         assert_eq!(Med::from(42u32), Med::new(42));
     }
