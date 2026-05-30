@@ -49,6 +49,32 @@ Property tests live in a dedicated `src/prop_tests.rs` module within each crate 
 
 Each property test defines a **strategy** (how to generate random inputs) and an **invariant** (what must always be true). Proptest generates 256 random cases per invariant by default, shrinking failing cases to the smallest reproducing input automatically.
 
+**Current property-tested invariants in `pathvector-types`:**
+
+| Invariant | Why it matters |
+|---|---|
+| `u32 → Asn → u32` roundtrip is lossless | Wire encoding depends on exact value preservation |
+| `Asn::is_four_byte()` iff value > 65535 | Controls AS_TRANS substitution logic in the session layer |
+| `Asn::is_private()` matches exactly the two IANA ranges | Strip-on-export logic must not touch public ASNs |
+| `AsPath::from_sequence(asns).path_length() == asns.len()` | Path length drives best-path selection |
+| `prepend(asn)` always increases `path_length` by exactly 1 | Every re-advertisement must lengthen the path by 1 |
+| After `prepend(asn)`, `contains(asn)` is true | Loop detection reads back what prepend wrote |
+| `prepend` on a non-empty path preserves `origin_as` | The originating AS must never change during propagation |
+| `Community::from_parts(h, l).high() == h` and `.low() == l` | Bit-packing for the `high:low` community format must be exact |
+| `Community::new(v).as_u32() == v` | Raw value preservation |
+| `Community::is_well_known()` iff `high() == 0xFFFF` | Well-known community detection cannot miss or over-match |
+| `LargeCommunity::from_bytes(lc.to_bytes()) == lc` | 12-byte wire roundtrip must be lossless |
+| Large community fields are independent | No field bleeds into another during construction |
+| `Nlri::prefix_len()` matches the construction mask | Prefix length must survive storage |
+| Masked network address is contained within its own prefix | Fundamental CIDR containment property |
+| A prefix always overlaps itself | Self-overlap is an axiom of prefix containment |
+| `is_default_route()` iff `prefix_len == 0` | Default route identification used in policy and RIB |
+| `is_host_route()` iff `prefix_len == 32` (IPv4) | Host route identification used in blackhole and loopback handling |
+| `Origin::from_u8(origin.as_u8()) == Some(origin)` | Wire byte roundtrip must recover the original value |
+| `Origin::from_u8(v)` is `None` for v > 2 | Parser must reject invalid origin bytes |
+| `LocalPref` ordering matches underlying `u32` | Best-path selection (higher wins) must sort correctly |
+| `Med` ordering matches underlying `u32` | Best-path selection (lower wins) must sort correctly |
+
 **Current property-tested invariants in `pathvector-policy`:**
 
 | Invariant | Why it matters |

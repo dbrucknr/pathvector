@@ -425,7 +425,10 @@ mod tests {
     #[test]
     fn test_set_local_pref() {
         let mut route = TestRoute::new("10.0.0.0/8");
-        assert_eq!(SetLocalPref::new(LocalPref::new(200)).apply(&mut route), Decision::Next);
+        assert_eq!(
+            SetLocalPref::new(LocalPref::new(200)).apply(&mut route),
+            Decision::Next
+        );
         assert_eq!(route.local_pref, Some(LocalPref::new(200)));
     }
 
@@ -483,7 +486,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "times must be >= 1")]
     fn test_prepend_as_path_zero_panics() {
-        PrependAsPath::new(Asn::new(65000), 0);
+        let _ = PrependAsPath::new(Asn::new(65000), 0);
     }
 
     #[test]
@@ -561,8 +564,7 @@ mod tests {
     #[test]
     fn test_action_sequence_all_next() {
         let mut route = TestRoute::new("10.0.0.0/8");
-        let seq: ActionSequence<_> =
-            ActionSequence::new().then(Next).then(Next);
+        let seq: ActionSequence<_> = ActionSequence::new().then(Next).then(Next);
         assert_eq!(seq.apply(&mut route), Decision::Next);
     }
 
@@ -581,8 +583,7 @@ mod tests {
     #[test]
     fn test_action_sequence_terminates_on_reject() {
         let mut route = TestRoute::new("10.0.0.0/8");
-        let seq: ActionSequence<_> =
-            ActionSequence::new().then(Reject).then(Accept);
+        let seq: ActionSequence<_> = ActionSequence::new().then(Reject).then(Accept);
         assert_eq!(seq.apply(&mut route), Decision::Reject);
     }
 

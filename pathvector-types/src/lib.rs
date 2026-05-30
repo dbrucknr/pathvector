@@ -16,3 +16,6 @@ pub use nlri::{InvalidPrefixLen, Nlri, ParsePrefixError};
 
 pub use ipnetx::interfaces::IpAddress;
 pub use ipnetx::prefix::IpPrefix;
+
+#[cfg(test)]
+mod prop_tests;
