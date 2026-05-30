@@ -161,12 +161,12 @@ impl Safi {
     /// dominant enterprise WAN VPN technology.
     pub const MPLS_VPN: Self = Self(128);
 
-    /// BGP FlowSpec (RFC 5575). Routes encode traffic-matching rules
+    /// BGP `FlowSpec` (RFC 5575). Routes encode traffic-matching rules
     /// (5-tuple, DSCP, packet length, etc.) and actions (rate-limit, drop,
-    /// redirect). Used for distributed DDoS mitigation and traffic steering.
+    /// redirect). Used for distributed `DDoS` mitigation and traffic steering.
     pub const FLOW_SPEC: Self = Self(133);
 
-    /// VPN FlowSpec — FlowSpec rules scoped to a VPN routing instance.
+    /// VPN `FlowSpec` — `FlowSpec` rules scoped to a VPN routing instance.
     pub const FLOW_SPEC_VPN: Self = Self(134);
 
     /// Creates a `Safi` from a raw 8-bit value.
@@ -250,8 +250,8 @@ impl std::fmt::Display for Safi {
 /// | [`AfiSafi::IPV4_MPLS_VPN`] | 1 | 128 | IPv4 MPLS L3VPN |
 /// | [`AfiSafi::IPV6_MPLS_VPN`] | 2 | 128 | IPv6 MPLS L3VPN |
 /// | [`AfiSafi::EVPN`] | 25 | 70 | Ethernet VPN |
-/// | [`AfiSafi::IPV4_FLOW_SPEC`] | 1 | 133 | IPv4 FlowSpec |
-/// | [`AfiSafi::IPV6_FLOW_SPEC`] | 2 | 133 | IPv6 FlowSpec |
+/// | [`AfiSafi::IPV4_FLOW_SPEC`] | 1 | 133 | IPv4 `FlowSpec` |
+/// | [`AfiSafi::IPV6_FLOW_SPEC`] | 2 | 133 | IPv6 `FlowSpec` |
 ///
 /// # Examples
 ///
@@ -306,10 +306,10 @@ impl AfiSafi {
     /// BGP carries MAC and IP reachability for data centre and carrier overlays.
     pub const EVPN: Self = Self { afi: Afi::L2VPN, safi: Safi::EVPN };
 
-    /// IPv4 FlowSpec — traffic flow rules for DDoS mitigation and steering.
+    /// IPv4 `FlowSpec` — traffic flow rules for `DDoS` mitigation and steering.
     pub const IPV4_FLOW_SPEC: Self = Self { afi: Afi::IPV4, safi: Safi::FLOW_SPEC };
 
-    /// IPv6 FlowSpec.
+    /// IPv6 `FlowSpec`.
     pub const IPV6_FLOW_SPEC: Self = Self { afi: Afi::IPV6, safi: Safi::FLOW_SPEC };
 
     /// Creates an `AfiSafi` from an [`Afi`] and [`Safi`] pair.

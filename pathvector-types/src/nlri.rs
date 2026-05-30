@@ -84,11 +84,13 @@ impl<A: IpAddress> Nlri<A> {
 
     /// Creates an `Nlri` from a raw IP address and prefix length.
     ///
-    /// Returns [`Err(InvalidPrefixLen)`](InvalidPrefixLen) if the prefix
-    /// length exceeds the address width (`> 32` for IPv4, `> 128` for IPv6).
-    ///
     /// Host bits in the address are preserved. Use [`Nlri::masked`] to obtain
     /// canonical form where host bits are zeroed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Err(InvalidPrefixLen)`](InvalidPrefixLen) if `mask` exceeds
+    /// the address width (`> 32` for IPv4, `> 128` for IPv6).
     ///
     /// # Examples
     ///
@@ -199,7 +201,7 @@ impl<A: IpAddress> Nlri<A> {
     /// - **ECMP next-hop resolution** — BGP next-hops are often resolved via
     ///   a /32 in the IGP.
     /// - **Blackhole routing** — a /32 with `BLACKHOLE` community signals
-    ///   upstream providers to drop traffic to a specific host (DDoS
+    ///   upstream providers to drop traffic to a specific host (`DDoS`
     ///   mitigation).
     ///
     /// # Examples

@@ -96,14 +96,14 @@ impl std::fmt::Display for Origin {
     }
 }
 
-/// The LOCAL_PREF path attribute (type code 5, well-known discretionary).
+/// The `LOCAL_PREF` path attribute (type code 5, well-known discretionary).
 ///
 /// `LOCAL_PREF` is the primary tool for expressing route preference *inside*
 /// an AS. It is only exchanged between iBGP peers — when a route is
 /// advertised to an eBGP peer, this attribute is stripped.
 ///
-/// **Higher LOCAL_PREF wins.** A router receiving the same prefix from
-/// multiple iBGP peers selects the route with the highest LOCAL_PREF. This
+/// **Higher `LOCAL_PREF` wins.** A router receiving the same prefix from
+/// multiple iBGP peers selects the route with the highest `LOCAL_PREF`. This
 /// is the first meaningful criterion in the BGP decision process.
 ///
 /// Common operator convention: default is 100. Routes set above 100 are
@@ -134,9 +134,9 @@ impl std::fmt::Display for Origin {
 pub struct LocalPref(u32);
 
 impl LocalPref {
-    /// The conventional default LOCAL_PREF value used by most implementations.
+    /// The conventional default `LOCAL_PREF` value used by most implementations.
     ///
-    /// Routes without an explicit LOCAL_PREF are typically treated as if they
+    /// Routes without an explicit `LOCAL_PREF` are typically treated as if they
     /// carry this value. Setting routes above 100 makes them preferred; below
     /// 100 marks them as backup.
     pub const DEFAULT: Self = Self(100);
@@ -189,7 +189,7 @@ impl std::fmt::Display for LocalPref {
     }
 }
 
-/// The MULTI_EXIT_DISC (MED) path attribute (type code 4, optional
+/// The `MULTI_EXIT_DISC` (MED) path attribute (type code 4, optional
 /// non-transitive).
 ///
 /// MED is a hint an AS sends to its directly connected neighbors suggesting
@@ -272,7 +272,7 @@ impl std::fmt::Display for Med {
     }
 }
 
-/// The NEXT_HOP path attribute (type code 3, well-known mandatory for IPv4
+/// The `NEXT_HOP` path attribute (type code 3, well-known mandatory for IPv4
 /// unicast) and its IPv6 multiprotocol equivalent.
 ///
 /// The next-hop is the IP address a router must forward packets to in order
@@ -304,7 +304,7 @@ impl std::fmt::Display for Med {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NextHop {
-    /// An IPv4 next-hop address. Used for the classic IPv4 unicast NEXT_HOP
+    /// An IPv4 next-hop address. Used for the classic IPv4 unicast `NEXT_HOP`
     /// attribute (type code 3) and IPv4 multiprotocol next-hops.
     V4(Ipv4Addr),
     /// An IPv6 next-hop address. Carried in `MP_REACH_NLRI` for IPv6 routes.
@@ -364,7 +364,7 @@ impl std::fmt::Display for NextHop {
     }
 }
 
-/// The ATOMIC_AGGREGATE path attribute (type code 6, well-known
+/// The `ATOMIC_AGGREGATE` path attribute (type code 6, well-known
 /// discretionary).
 ///
 /// This is a flag attribute — its *presence* is the signal; it carries no

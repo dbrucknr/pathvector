@@ -158,7 +158,7 @@ impl From<u32> for Asn {
 
 impl From<u16> for Asn {
     fn from(value: u16) -> Self {
-        Self(value as u32)
+        Self(u32::from(value))
     }
 }
 

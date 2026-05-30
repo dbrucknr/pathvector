@@ -161,7 +161,7 @@ Both types are newtypes over their wire size rather than enums. The IANA registr
 | `IPV4_MPLS_VPN` | 1 | 128 | MPLS L3VPN (RFC 4364) |
 | `IPV6_MPLS_VPN` | 2 | 128 | IPv6 MPLS L3VPN |
 | `EVPN` | 25 | 70 | Ethernet VPN (RFC 7432) |
-| `IPV4_FLOW_SPEC` | 1 | 133 | FlowSpec DDoS mitigation (RFC 5575) |
+| `IPV4_FLOW_SPEC` | 1 | 133 | `FlowSpec` `DDoS` mitigation (RFC 5575) |
 
 ```rust
 use pathvector_types::{Afi, AfiSafi, Safi};
@@ -240,11 +240,11 @@ The decision process runs through these steps in order until one route wins ([RF
 | 7 | IGP metric to next-hop | **lower** | Closest exit wins |
 | 8 | Router-ID | **lower** | Final tie-breaker |
 
-**`ORIGIN`** — how the route was born. `Igp` means injected from an interior routing protocol; `Incomplete` means redistributed from something else (static routes, etc.). Rarely changes the outcome in practice since LOCAL_PREF dominates.
+**`ORIGIN`** — how the route was born. `Igp` means injected from an interior routing protocol; `Incomplete` means redistributed from something else (static routes, etc.). Rarely changes the outcome in practice since `LOCAL_PREF` dominates.
 
 **`LOCAL_PREF`** — the most powerful lever operators have. **Higher wins.** Convention: default 100, above 100 means preferred, below 100 means backup. Never crosses an AS boundary.
 
-**`MED` (MULTI_EXIT_DISC)** — a polite suggestion to a neighboring AS about which of your entry points they should use. **Lower wins** — the opposite direction from LOCAL_PREF, which trips people up. Non-transitive: not propagated beyond the directly peering AS.
+**`MED` (`MULTI_EXIT_DISC`)** — a polite suggestion to a neighboring AS about which of your entry points they should use. **Lower wins** — the opposite direction from `LOCAL_PREF`, which trips people up. Non-transitive: not propagated beyond the directly peering AS.
 
 **`NEXT_HOP`** — the IP address a router should forward packets to in order to reach the prefix. In iBGP, this is the *original eBGP peer's address*, preserved unchanged as the route travels inside the AS. Every router in the AS needs an IGP route to this address, which is why "IGP reachability of BGP next-hops" matters.
 

@@ -57,7 +57,7 @@ impl Community {
     pub const NO_EXPORT_SUBCONFED: Self = Self(0xFFFF_FF03);
 
     /// Signal that traffic toward this prefix should be dropped (blackholed).
-    /// Used for DDoS mitigation — advertise a /32 with this community
+    /// Used for `DDoS` mitigation — advertise a /32 with this community
     /// to trigger upstream providers to discard matching traffic at their edge.
     /// Defined in RFC 7999.
     pub const BLACKHOLE: Self = Self(0xFFFF_029A);
@@ -126,7 +126,10 @@ impl Community {
     /// assert_eq!(Community::from_parts(65000, 100).low(), 100);
     /// ```
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub const fn low(self) -> u16 {
+        // Intentional: extract the low 16 bits of the community u32.
+        // A Community value splits as [high: u16][low: u16]; truncation is by design.
         self.0 as u16
     }
 
@@ -282,9 +285,9 @@ impl LargeCommunity {
     #[must_use]
     pub fn from_bytes(bytes: [u8; 12]) -> Self {
         Self {
-            global_administrator: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
-            local_data_1: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
-            local_data_2: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            global_administrator: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            local_data_1: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            local_data_2: u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
         }
     }
 }

@@ -364,7 +364,7 @@ impl AsPath {
 
 impl std::fmt::Display for AsPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let parts: Vec<String> = self.segments.iter().map(|s| s.to_string()).collect();
+        let parts: Vec<String> = self.segments.iter().map(std::string::ToString::to_string).collect();
         write!(f, "{}", parts.join(" "))
     }
 }
