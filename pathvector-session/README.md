@@ -59,10 +59,10 @@ Every transition out of **OpenSent**, **OpenConfirm**, and **Established** cause
 All BGP messages share a **19-byte header**:
 
 ```text
-┌──────────────────────────────────── 16 bytes ──────────────────────────────────────┐
+┌──────────────────────────────────── 16 bytes ───────────────────────────────────────┐
 │  Marker (all 0xFF — legacy authentication field, always 0xFF in modern deployments) │
 └─────────────────────────────────────────────────────────────────────────────────────┘
-┌─── 2 bytes ───┐ ┌─ 1 byte ─┐
+┌─── 2 bytes ────┐ ┌─ 1 byte ─┐
 │  Total length  │ │   Type   │
 └────────────────┘ └──────────┘
 ```

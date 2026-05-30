@@ -1,0 +1,342 @@
+use std::net::Ipv4Addr;
+
+use pathvector_types::{Afi, AfiSafi, Safi};
+
+use super::{Cursor, Writer};
+use super::error::CodecError;
+use super::header::{encode_header, MessageType};
+
+/// The BGP version advertised in OPEN messages. Must be 4.
+const BGP_VERSION: u8 = 4;
+/// Optional parameter type code for capabilities (RFC 3392).
+const OPT_PARAM_CAPABILITIES: u8 = 2;
+
+/// A BGP OPEN message (type 1).
+///
+/// Both peers send an OPEN immediately after TCP is established. The
+/// connection is not confirmed until both OPENs have been received and
+/// validated. Capabilities are negotiated here — a feature is only used
+/// if both sides advertise the matching capability code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenMessage {
+    /// BGP version — always 4 on receive; always written as 4 on send.
+    pub version: u8,
+    /// The sender's 2-byte AS field.
+    ///
+    /// For 4-byte ASNs this field carries `AS_TRANS` (23456) and the real
+    /// ASN is in the [`Capability::FourByteAsn`] value.
+    pub my_as: u16,
+    /// Proposed hold time in seconds. The negotiated value will be
+    /// `min(our_hold_time, peer_hold_time)`. Zero disables the hold timer.
+    pub hold_time: u16,
+    /// The sender's BGP identifier (router-id).
+    pub bgp_id: Ipv4Addr,
+    /// All capabilities the sender wishes to advertise.
+    pub capabilities: Vec<Capability>,
+}
+
+impl OpenMessage {
+    pub(super) fn decode(cur: &mut Cursor<'_>) -> Result<Self, CodecError> {
+        let version = cur.read_u8()?;
+        if version != BGP_VERSION {
+            return Err(CodecError::UnsupportedVersion(version));
+        }
+        let my_as = cur.read_u16()?;
+        let hold_time = cur.read_u16()?;
+        let bgp_id = cur.read_ipv4addr()?;
+        let opt_len = cur.read_u8()? as usize;
+        let mut opt_cur = cur.fork(opt_len)?;
+        let capabilities = decode_capabilities(&mut opt_cur)?;
+        Ok(Self { version, my_as, hold_time, bgp_id, capabilities })
+    }
+
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let caps_bytes = encode_capabilities(&self.capabilities);
+
+        // Optional parameters: only type-2 (capabilities) if non-empty.
+        let mut opt_params = Writer::new();
+        if !caps_bytes.is_empty() {
+            opt_params.put_u8(OPT_PARAM_CAPABILITIES);
+            #[allow(clippy::cast_possible_truncation)]
+            opt_params.put_u8(caps_bytes.len() as u8);
+            opt_params.put_slice(&caps_bytes);
+        }
+        let opt_params = opt_params.finish();
+
+        let mut body = Writer::new();
+        body.put_u8(BGP_VERSION);
+        body.put_u16(self.my_as);
+        body.put_u16(self.hold_time);
+        body.put_slice(&self.bgp_id.octets());
+        #[allow(clippy::cast_possible_truncation)]
+        body.put_u8(opt_params.len() as u8);
+        body.put_slice(&opt_params);
+        let body = body.finish();
+
+        let mut w = Writer::new();
+        encode_header(&mut w, MessageType::Open, body.len());
+        w.put_slice(&body);
+        w.finish()
+    }
+}
+
+/// Parse optional parameters from the OPEN body, collecting all capability
+/// TLVs from parameter type 2 into a flat `Vec<Capability>`.
+fn decode_capabilities(opt_cur: &mut Cursor<'_>) -> Result<Vec<Capability>, CodecError> {
+    let mut caps = Vec::new();
+    while opt_cur.remaining() > 0 {
+        let param_type = opt_cur.read_u8()?;
+        let param_len = opt_cur.read_u8()? as usize;
+        let mut param_cur = opt_cur.fork(param_len)?;
+        if param_type == OPT_PARAM_CAPABILITIES {
+            while param_cur.remaining() > 0 {
+                let cap_code = param_cur.read_u8()?;
+                let cap_len = param_cur.read_u8()? as usize;
+                let mut cap_cur = param_cur.fork(cap_len)?;
+                caps.push(decode_capability(cap_code, &mut cap_cur)?);
+            }
+        }
+        // Unknown parameter types are silently skipped.
+    }
+    Ok(caps)
+}
+
+fn decode_capability(code: u8, cur: &mut Cursor<'_>) -> Result<Capability, CodecError> {
+    match code {
+        // Multi-Protocol (RFC 4760): AFI(2) + reserved(1) + SAFI(1)
+        1 => {
+            if cur.remaining() < 4 {
+                return Err(CodecError::InvalidCapability { code });
+            }
+            let afi = Afi::new(cur.read_u16()?);
+            let _reserved = cur.read_u8()?;
+            let safi = Safi::new(cur.read_u8()?);
+            Ok(Capability::MultiProtocol(AfiSafi::new(afi, safi)))
+        }
+        // Route Refresh (RFC 2918): no value
+        2 => Ok(Capability::RouteRefresh),
+        // 4-byte ASN (RFC 6793): 4-byte AS number
+        65 => {
+            if cur.remaining() < 4 {
+                return Err(CodecError::InvalidCapability { code });
+            }
+            Ok(Capability::FourByteAsn(cur.read_u32()?))
+        }
+        // Graceful Restart (RFC 4724):
+        // 2 bytes: restart flags (bit 15=R, bits 11-0=restart time)
+        // then per-family: AFI(2) + SAFI(1) + flags(1)
+        64 => {
+            if cur.remaining() < 2 {
+                return Err(CodecError::InvalidCapability { code });
+            }
+            let flags_time = cur.read_u16()?;
+            let restart_flags = (flags_time >> 12) as u8;
+            let restart_time = flags_time & 0x0FFF;
+            let mut families = Vec::new();
+            while cur.remaining() >= 4 {
+                let afi = Afi::new(cur.read_u16()?);
+                let safi = Safi::new(cur.read_u8()?);
+                let fwd_flags = cur.read_u8()?;
+                families.push(GracefulRestartFamily {
+                    afi_safi: AfiSafi::new(afi, safi),
+                    forwarding_preserved: (fwd_flags & 0x80) != 0,
+                });
+            }
+            Ok(Capability::GracefulRestart { restart_flags, restart_time, families })
+        }
+        _ => {
+            let value = cur.read_remaining().to_vec();
+            Ok(Capability::Unknown { code, value })
+        }
+    }
+}
+
+/// Encode all capabilities into a flat byte string suitable for wrapping in
+/// an optional parameter of type 2.
+fn encode_capabilities(caps: &[Capability]) -> Vec<u8> {
+    let mut out = Writer::new();
+    for cap in caps {
+        let value = encode_capability_value(cap);
+        out.put_u8(cap.code());
+        #[allow(clippy::cast_possible_truncation)]
+        out.put_u8(value.len() as u8);
+        out.put_slice(&value);
+    }
+    out.finish()
+}
+
+fn encode_capability_value(cap: &Capability) -> Vec<u8> {
+    let mut v = Writer::new();
+    match cap {
+        Capability::MultiProtocol(afi_safi) => {
+            v.put_u16(afi_safi.afi.as_u16());
+            v.put_u8(0); // reserved
+            v.put_u8(afi_safi.safi.as_u8());
+        }
+        Capability::RouteRefresh => {}
+        Capability::FourByteAsn(asn) => {
+            v.put_u32(*asn);
+        }
+        Capability::GracefulRestart { restart_flags, restart_time, families } => {
+            let flags_time = (u16::from(*restart_flags) << 12) | (restart_time & 0x0FFF);
+            v.put_u16(flags_time);
+            for fam in families {
+                v.put_u16(fam.afi_safi.afi.as_u16());
+                v.put_u8(fam.afi_safi.safi.as_u8());
+                v.put_u8(if fam.forwarding_preserved { 0x80 } else { 0x00 });
+            }
+        }
+        Capability::Unknown { value, .. } => {
+            v.put_slice(value);
+        }
+    }
+    v.finish()
+}
+
+/// A BGP capability advertised in the OPEN message optional parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Capability {
+    /// Multi-Protocol Extensions (RFC 4760, code 1).
+    ///
+    /// Signals support for routes beyond IPv4 unicast. One instance per
+    /// AFI/SAFI pair.
+    MultiProtocol(AfiSafi),
+
+    /// Route Refresh (RFC 2918, code 2).
+    ///
+    /// Both sides must advertise this for ROUTE-REFRESH messages to be
+    /// sent and honoured.
+    RouteRefresh,
+
+    /// 4-byte ASN support (RFC 6793, code 65).
+    ///
+    /// Carries the sender's full 32-bit ASN. When both peers advertise this,
+    /// `AS_PATH` uses 4-byte ASNs and `AS_TRANS` substitution is not needed.
+    FourByteAsn(u32),
+
+    /// Graceful Restart (RFC 4724, code 64).
+    ///
+    /// Allows forwarding to continue while the BGP control plane restarts.
+    /// `restart_time` is in seconds (max 4095). Each `GracefulRestartFamily`
+    /// entry indicates whether forwarding state was preserved for that
+    /// AFI/SAFI across the restart.
+    GracefulRestart {
+        restart_flags: u8,
+        restart_time: u16,
+        families: Vec<GracefulRestartFamily>,
+    },
+
+    /// Any capability code not recognised above. The raw value bytes are
+    /// preserved so unknown capabilities can be forwarded without corruption.
+    Unknown { code: u8, value: Vec<u8> },
+}
+
+impl Capability {
+    fn code(&self) -> u8 {
+        match self {
+            Self::MultiProtocol(_) => 1,
+            Self::RouteRefresh => 2,
+            Self::FourByteAsn(_) => 65,
+            Self::GracefulRestart { .. } => 64,
+            Self::Unknown { code, .. } => *code,
+        }
+    }
+}
+
+/// Per-address-family entry in a Graceful Restart capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GracefulRestartFamily {
+    pub afi_safi: AfiSafi,
+    /// `true` if the sender preserved forwarding state for this family across
+    /// the most recent restart.
+    pub forwarding_preserved: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(msg: &OpenMessage) -> OpenMessage {
+        let encoded = msg.encode();
+        let mut cur = Cursor::new(&encoded[19..]);
+        OpenMessage::decode(&mut cur).unwrap()
+    }
+
+    fn base_open() -> OpenMessage {
+        OpenMessage {
+            version: 4,
+            my_as: 65001,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+            capabilities: vec![],
+        }
+    }
+
+    #[test]
+    fn test_minimal_open_roundtrip() {
+        assert_eq!(roundtrip(&base_open()), base_open());
+    }
+
+    #[test]
+    fn test_open_with_capabilities_roundtrip() {
+        let mut msg = base_open();
+        msg.capabilities = vec![
+            Capability::FourByteAsn(65001),
+            Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+            Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
+            Capability::RouteRefresh,
+        ];
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_graceful_restart_roundtrip() {
+        let mut msg = base_open();
+        msg.capabilities = vec![Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 120,
+            families: vec![
+                GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    forwarding_preserved: true,
+                },
+                GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    forwarding_preserved: false,
+                },
+            ],
+        }];
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_unknown_capability_preserved() {
+        let mut msg = base_open();
+        msg.capabilities = vec![Capability::Unknown {
+            code: 200,
+            value: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }];
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_unsupported_version_rejected() {
+        let msg = OpenMessage { version: 3, ..base_open() };
+        // Manually build a version-3 OPEN body.
+        let encoded = msg.encode();
+        // The version byte is at offset 19 (after the header).
+        let mut bad = encoded.clone();
+        bad[19] = 3;
+        let mut cur = Cursor::new(&bad[19..]);
+        assert_eq!(
+            OpenMessage::decode(&mut cur),
+            Err(CodecError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn test_minimal_open_encoded_length() {
+        // header(19) + version(1) + my_as(2) + hold_time(2) + bgp_id(4) + opt_len(1) = 29.
+        assert_eq!(base_open().encode().len(), 29);
+    }
+}
