@@ -46,8 +46,9 @@ use crate::{peer::PeerId, route::Route};
 /// let (winner, _) = select_best(&candidates).unwrap();
 /// assert_eq!(winner, peer_a); // higher LOCAL_PREF wins
 /// ```
-pub fn select_best<A: IpAddress>(
-    candidates: &HashMap<PeerId, Route<A>>,
+#[must_use]
+pub fn select_best<A: IpAddress, S: std::hash::BuildHasher>(
+    candidates: &HashMap<PeerId, Route<A>, S>,
 ) -> Option<(PeerId, &Route<A>)> {
     candidates
         .iter()
@@ -106,8 +107,8 @@ fn prefer<A: IpAddress>(
     // Note: Strictly speaking, MED should only be compared between routes
     // from the same neighboring AS. This implementation compares MED
     // globally. See TODO.md (deterministic-med, always-compare-med).
-    let med_a = a.med.map_or(0, |m| m.as_u32());
-    let med_b = b.med.map_or(0, |m| m.as_u32());
+    let med_a = a.med.map_or(0, pathvector_types::Med::as_u32);
+    let med_b = b.med.map_or(0, pathvector_types::Med::as_u32);
     let med = med_b.cmp(&med_a);
     if med != Ordering::Equal {
         return med; // reverse: lower MED → Greater → preferred

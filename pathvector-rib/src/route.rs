@@ -36,8 +36,8 @@ use pathvector_types::{
 /// )
 /// .build();
 ///
-/// assert_eq!(route.origin(), Origin::Igp);
-/// assert_eq!(route.as_path().path_length(), 1);
+/// assert_eq!(route.origin, Origin::Igp);
+/// assert_eq!(route.as_path.path_length(), 1);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route<A: IpAddress> {

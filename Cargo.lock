@@ -217,6 +217,7 @@ dependencies = [
 name = "pathvector-rib"
 version = "0.1.0"
 dependencies = [
+ "ipnetx",
  "pathvector-policy",
  "pathvector-types",
  "routemap",

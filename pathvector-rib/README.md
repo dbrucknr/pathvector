@@ -36,18 +36,18 @@ Adj-RIB-Out represents that per-peer view.
 
 ### Data flow
 
-```
-Peer A ──UPDATE──▶ AdjRibIn[A]
-                        │
-                   import policy        ← applied by the caller, not by the RIB
-                        │
-                        ▼
-                      LocRib  ──best-path selection──▶ best route per prefix
-                        │
-                   export policy        ← applied by the caller, not by the RIB
-                        │
-                        ▼
-                   AdjRibOut[B] ──UPDATE──▶ Peer B
+```text
+Peer A --UPDATE--> AdjRibIn[A]
+                        |
+                   import policy        (applied by the caller, not by the RIB)
+                        |
+                        v
+                      LocRib  --best-path selection--> best route per prefix
+                        |
+                   export policy        (applied by the caller, not by the RIB)
+                        |
+                        v
+                   AdjRibOut[B] --UPDATE--> Peer B
 ```
 
 Policy is applied **externally** — the RIB stores and selects; the caller

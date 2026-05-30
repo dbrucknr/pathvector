@@ -1,14 +1,15 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#![doc = include_str!("../README.md")]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod adj_rib_in;
+pub mod adj_rib_out;
+pub mod best_path;
+pub mod loc_rib;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+mod peer;
+mod route;
+
+pub use adj_rib_in::AdjRibIn;
+pub use adj_rib_out::AdjRibOut;
+pub use loc_rib::LocRib;
+pub use peer::PeerId;
+pub use route::{Route, RouteBuilder};
