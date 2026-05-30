@@ -186,11 +186,42 @@ assert_eq!(custom.to_string(), "IPv4 SAFI(200)");
 
 The following types are planned and will be documented here as they are implemented.
 
-### `Nlri` — Network Layer Reachability Information
+### `Nlri<A>` — Network Layer Reachability Information
 
-**Concept:** NLRI is the actual payload of a BGP UPDATE message — the IP prefixes being advertised or withdrawn. Each NLRI entry is an IP prefix (e.g. `192.0.2.0/24`) paired with an AFI/SAFI that says what kind of prefix it is.
+**Concept:** NLRI is the actual payload of a BGP UPDATE message — the IP prefixes being advertised or withdrawn. Every route in BGP reduces to: "I can reach these prefixes, via this path, with these attributes."
 
-`Nlri<A>` in this crate wraps `IpPrefix<A>` from [`ipnetx`](https://crates.io/crates/ipnetx), reusing its set algebra and prefix math.
+An UPDATE message carries two NLRI lists:
+- **Withdrawn NLRI** — prefixes the sender is pulling back; remove them from your RIB
+- **Reachable NLRI** — prefixes being advertised, described by the path attributes in the same message
+
+`Nlri<A>` wraps [`IpPrefix<A>`](https://crates.io/crates/ipnetx) from ipnetx and adds BGP-specific semantics. The AFI/SAFI is not stored in `Nlri<A>` itself — it is always provided by the surrounding structure (a RIB table, an `MP_REACH_NLRI` attribute). The address type `A` implicitly encodes the AFI: `Ipv4Addr` → AFI 1, `Ipv6Addr` → AFI 2.
+
+```rust
+use std::net::{Ipv4Addr, Ipv6Addr};
+use pathvector_types::Nlri;
+
+// Parse from CIDR notation
+let nlri: Nlri<Ipv4Addr> = "192.168.1.0/24".parse().unwrap();
+assert_eq!(nlri.prefix_len(), 24);
+assert!(nlri.contains(Ipv4Addr::new(192, 168, 1, 100)));
+
+// The default route: matches every address, advertised by ISPs
+// to customers who don't need the full BGP routing table
+let default_route: Nlri<Ipv4Addr> = "0.0.0.0/0".parse().unwrap();
+assert!(default_route.is_default_route());
+
+// Host routes (/32 or /128): used for loopbacks, blackholes, ECMP next-hops
+let loopback: Nlri<Ipv4Addr> = "10.0.0.1/32".parse().unwrap();
+assert!(loopback.is_host_route());
+
+// Canonical form: zero host bits before advertising
+let with_host_bits = Nlri::new(Ipv4Addr::new(192, 168, 1, 100), 24).unwrap();
+assert_eq!(with_host_bits.masked().to_string(), "192.168.1.0/24");
+
+// IPv6 works identically
+let v6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+assert!(!v6.is_default_route());
+```
 
 ### Route Attributes — `Origin`, `Med`, `LocalPref`, `NextHop`, `Aggregator`
 
