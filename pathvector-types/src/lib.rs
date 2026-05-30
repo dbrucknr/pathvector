@@ -3,12 +3,14 @@
 mod afi;
 mod asn;
 mod aspath;
+mod attr;
 mod community;
 mod nlri;
 
 pub use afi::{Afi, AfiSafi, Safi};
 pub use asn::Asn;
 pub use aspath::{AsPath, AsPathSegment};
+pub use attr::{Aggregator, AtomicAggregate, LocalPref, Med, NextHop, Origin};
 pub use community::{Community, ExtendedCommunity, LargeCommunity};
 pub use nlri::{InvalidPrefixLen, Nlri, ParsePrefixError};
 

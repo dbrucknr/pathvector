@@ -223,16 +223,67 @@ let v6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
 assert!(!v6.is_default_route());
 ```
 
-### Route Attributes — `Origin`, `Med`, `LocalPref`, `NextHop`, `Aggregator`
+### Route Attributes — `Origin`, `LocalPref`, `Med`, `NextHop`, `AtomicAggregate`, `Aggregator`
 
-**Concept:** BGP routes carry a set of **path attributes** that describe the route's properties and influence the best-path selection algorithm ([RFC 4271 §9.1](https://www.rfc-editor.org/rfc/rfc4271#section-9.1)):
+**Concept:** BGP routes carry path attributes that describe their properties and drive the **best-path selection algorithm** — the process a router uses to pick one route when it has received the same prefix from multiple peers.
 
-- **`ORIGIN`** — how the route was learned: `IGP` (from an interior routing protocol), `EGP` (from the older EGP protocol), or `INCOMPLETE` (redistributed from some other source). IGP is preferred.
-- **`NEXT_HOP`** — the IP address of the next router to send packets toward this prefix.
-- **`LOCAL_PREF`** — a 32-bit value used *inside* an AS to express route preference. Higher is better. Not sent to eBGP peers.
-- **`MULTI_EXIT_DISC` (MED)** — a hint sent to neighboring ASes to influence which entry point they use into your network. Lower is preferred. Unlike `LOCAL_PREF`, this crosses AS boundaries.
-- **`ATOMIC_AGGREGATE`** — a flag indicating that the route is an aggregate and some path information has been suppressed.
-- **`AGGREGATOR`** — the ASN and IP address of the router that performed route aggregation.
+The decision process runs through these steps in order until one route wins ([RFC 4271 §9.1](https://www.rfc-editor.org/rfc/rfc4271#section-9.1)):
+
+| Step | Criterion | Winner | Notes |
+|---|---|---|---|
+| 1 | `LOCAL_PREF` | **higher** | iBGP only — stripped before sending to eBGP peers |
+| 2 | Locally originated | — | `network` / `redistribute` beats learned routes |
+| 3 | AS path length | **shorter** | Counts segments, not raw ASNs |
+| 4 | `ORIGIN` | **lower** | IGP(0) < EGP(1) < INCOMPLETE(2) |
+| 5 | `MED` | **lower** | Only compared within the same neighboring AS |
+| 6 | Peer type | eBGP > iBGP | External routes preferred over internal |
+| 7 | IGP metric to next-hop | **lower** | Closest exit wins |
+| 8 | Router-ID | **lower** | Final tie-breaker |
+
+**`ORIGIN`** — how the route was born. `Igp` means injected from an interior routing protocol; `Incomplete` means redistributed from something else (static routes, etc.). Rarely changes the outcome in practice since LOCAL_PREF dominates.
+
+**`LOCAL_PREF`** — the most powerful lever operators have. **Higher wins.** Convention: default 100, above 100 means preferred, below 100 means backup. Never crosses an AS boundary.
+
+**`MED` (MULTI_EXIT_DISC)** — a polite suggestion to a neighboring AS about which of your entry points they should use. **Lower wins** — the opposite direction from LOCAL_PREF, which trips people up. Non-transitive: not propagated beyond the directly peering AS.
+
+**`NEXT_HOP`** — the IP address a router should forward packets to in order to reach the prefix. In iBGP, this is the *original eBGP peer's address*, preserved unchanged as the route travels inside the AS. Every router in the AS needs an IGP route to this address, which is why "IGP reachability of BGP next-hops" matters.
+
+**`ATOMIC_AGGREGATE`** — a flag (no value) indicating that an aggregating router has suppressed some AS path information. Signals downstream routers not to de-aggregate the route.
+
+**`AGGREGATOR`** — the ASN and router-id of the router that performed aggregation. Optional companion to `ATOMIC_AGGREGATE`.
+
+```rust
+use std::net::{Ipv4Addr, Ipv6Addr};
+use pathvector_types::{Aggregator, AsPath, Asn, AtomicAggregate, LocalPref, Med, NextHop, Origin};
+
+// ORIGIN: most routes carry IGP — it is the most preferred value
+assert!(Origin::Igp < Origin::Incomplete);
+assert_eq!(Origin::Igp.as_u8(), 0);
+
+// LOCAL_PREF: higher wins; default 100 by convention
+let primary = LocalPref::new(200);
+let backup  = LocalPref::new(50);
+assert!(primary > backup);
+assert_eq!(LocalPref::DEFAULT, LocalPref::new(100));
+
+// MED: lower wins — the opposite direction from LOCAL_PREF
+let preferred_entry = Med::new(10);
+let fallback_entry  = Med::new(100);
+assert!(preferred_entry < fallback_entry);
+
+// NEXT_HOP: IPv4 or IPv6; IPv6 can carry a link-local alongside the global
+let v4_nh = NextHop::V4(Ipv4Addr::new(10, 0, 0, 1));
+let v6_nh = NextHop::V6WithLinkLocal {
+    global:     Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+    link_local: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+};
+assert!(v4_nh.is_v4());
+assert!(v6_nh.is_v6());
+
+// AGGREGATOR: identifies who aggregated the route
+let agg = Aggregator::new(Asn::new(65000), Ipv4Addr::new(10, 0, 0, 1));
+assert_eq!(agg.to_string(), "AS65000 10.0.0.1");
+```
 
 ---
 
