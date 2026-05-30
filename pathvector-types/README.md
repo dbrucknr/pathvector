@@ -50,20 +50,59 @@ assert!(large.is_private());
 
 ---
 
+### `AsPath` / `AsPathSegment` — AS Path
+
+**Concept:** Every BGP route carries an AS path — the sequence of autonomous systems the route has traversed to reach the current router. As a route propagates across the internet, each router prepends its own ASN before re-advertising. The result is an ordered record of every AS the route passed through, with the most recent hop first and the originating AS last.
+
+The AS path serves two critical roles:
+
+1. **Loop prevention** — a BGP speaker rejects any route whose AS path already contains its own ASN. If you see yourself in the path, the route has looped back to you.
+2. **Path selection** — all else being equal, shorter paths are preferred. BGP uses the *path length* (not a raw ASN count) in its decision process.
+
+An AS path is not a flat list — it is composed of typed **segments**:
+
+| Segment | Meaning |
+|---|---|
+| `AS_SEQUENCE` | Ordered list of ASNs; the normal case |
+| `AS_SET` | Unordered group; produced when routes from multiple ASes are aggregated into one prefix |
+| `AS_CONFED_SEQUENCE` | Ordered list within a BGP confederation ([RFC 5065](https://www.rfc-editor.org/rfc/rfc5065)) |
+| `AS_CONFED_SET` | Unordered group within a confederation |
+
+**Path length** is computed per segment type, not per raw ASN:
+- `AS_SEQUENCE` — each ASN counts as 1
+- `AS_SET` — the entire set counts as exactly 1, regardless of size
+- Confederation segments — count as 0 (they are internal hops, not public internet distance)
+
+**Prepending** is what a router does before re-advertising a route to an eBGP peer: it inserts its own ASN at the front of the path. Per RFC 4271, if the first segment is a full `AS_SEQUENCE` (255 entries) or is an `AS_SET`, a new `AS_SEQUENCE` segment is created in front rather than modifying the existing one.
+
+```rust
+use pathvector_types::{Asn, AsPath, AsPathSegment};
+
+// A route from AS 65001, re-advertised by AS 65002
+let mut path = AsPath::from_sequence(vec![Asn::new(65002), Asn::new(65001)]);
+assert_eq!(path.path_length(), 2);
+assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+
+// AS 65003 receives this and would reject it if it's already in the path
+assert!(!path.contains(Asn::new(65003)));
+
+// AS 65003 prepends itself before re-advertising
+path.prepend(Asn::new(65003));
+assert_eq!(path.path_length(), 3);
+
+// A mixed path: sequence + set (produced by aggregation)
+let aggregated = AsPath::from_segments(vec![
+    AsPathSegment::Sequence(vec![Asn::new(65003)]),
+    AsPathSegment::Set(vec![Asn::new(65001), Asn::new(65002)]),
+]);
+assert_eq!(aggregated.path_length(), 2); // 1 (sequence) + 1 (set)
+```
+
+---
+
 ## Coming soon
 
 The following types are planned and will be documented here as they are implemented.
-
-### `AsPath` — AS Path
-
-**Concept:** Every BGP route carries an AS path — the ordered list of autonomous systems the route has traversed to reach the current router. When AS 65001 advertises a prefix to AS 65002, and AS 65002 re-advertises it to AS 65003, the path `[65001, 65002]` is attached. AS 65003 prepends its own ASN before passing it along.
-
-The AS path serves two purposes: loop prevention (reject any route containing your own ASN) and path selection (shorter paths are generally preferred, all else being equal).
-
-Paths are made up of **segments**, not flat lists, because BGP supports sets of ASNs in addition to sequences:
-- `AS_SEQUENCE` — an ordered list; the normal case
-- `AS_SET` — an unordered set used when routes from multiple ASNs are aggregated into one
-- `AS_CONFED_SEQUENCE` / `AS_CONFED_SET` — variants used inside BGP confederations ([RFC 5065](https://www.rfc-editor.org/rfc/rfc5065))
 
 ### `Community` — BGP Community
 
