@@ -100,24 +100,52 @@ assert_eq!(aggregated.path_length(), 2); // 1 (sequence) + 1 (set)
 
 ---
 
+### `Community` / `LargeCommunity` / `ExtendedCommunity` — BGP Communities
+
+**Concept:** Communities are tags attached to routes that carry policy signals between networks. They let operators say things like "do not re-advertise this route" or "this is a customer route" without encoding that logic into the route itself. Routers apply policy based on the communities they receive, and strip or rewrite them before forwarding.
+
+There are three generations of BGP community, each introduced to solve a problem the previous one could not handle:
+
+**Standard community ([RFC 1997](https://www.rfc-editor.org/rfc/rfc1997))** — a 32-bit value split into two 16-bit halves: `high:low`, conventionally written as `ASN:value`. Well-known communities use `0xFFFF` in the high half (65535 is not a valid public ASN, preventing collision with operator communities). The limitation: no room for a 4-byte ASN in the 16-bit high field.
+
+| Well-known | Value | Meaning |
+|---|---|---|
+| `NO_EXPORT` | `0xFFFFFF01` | Do not advertise outside this AS |
+| `NO_ADVERTISE` | `0xFFFFFF02` | Do not advertise to any peer |
+| `NO_EXPORT_SUBCONFED` | `0xFFFFFF03` | Do not advertise outside this confederation |
+| `BLACKHOLE` | `0xFFFF029A` | Drop traffic to this prefix (RFC 7999) |
+
+**Large community ([RFC 8092](https://www.rfc-editor.org/rfc/rfc8092))** — three `u32` fields: `global-administrator:local-data-1:local-data-2`. Designed specifically for 4-byte ASN operators who cannot fit their ASN into a standard community's 16-bit field.
+
+**Extended community ([RFC 4360](https://www.rfc-editor.org/rfc/rfc4360))** — 8 bytes with an explicit type in the first two bytes. The type determines how the remaining 6 bytes are interpreted. Used heavily in VPN and EVPN. The most important extended community is the **Route Target (RT)**: it identifies which VRF (Virtual Routing and Forwarding instance) a VPN route belongs to. PE routers import routes whose RTs match their configured import policy.
+
+```rust
+use pathvector_types::{Community, LargeCommunity, ExtendedCommunity};
+
+// Standard: AS 65000 marks a route as low-priority
+let c = Community::from_parts(65000, 100);
+assert_eq!(c.to_string(), "65000:100");
+assert!(!c.is_well_known());
+
+// Well-known: signal peers not to re-advertise
+assert!(Community::NO_EXPORT.is_no_export());
+
+// Large: 4-byte ASN operator, two local data fields
+let lc = LargeCommunity::new(4_200_000_001, 999, 1);
+assert_eq!(lc.to_string(), "4200000001:999:1");
+
+// Extended: Route Target for MPLS VPN (2-byte AS form)
+let rt = ExtendedCommunity::route_target_as2(65000, 100);
+assert!(rt.is_transitive());
+assert_eq!(rt.type_high(), 0x00); // 2-byte AS specific
+assert_eq!(rt.type_low(), 0x02);  // Route Target sub-type
+```
+
+---
+
 ## Coming soon
 
 The following types are planned and will be documented here as they are implemented.
-
-### `Community` — BGP Community
-
-**Concept:** Communities are 32-bit tags attached to routes that carry policy signals. They let networks say things like "do not advertise this route beyond your region" or "this route came from a customer, treat it accordingly" without encoding that logic into the route itself.
-
-Standard communities ([RFC 1997](https://www.rfc-editor.org/rfc/rfc1997)) are 32-bit values conventionally written as `ASN:value` — e.g. `65000:100` might mean "low priority" within AS 65000's policy.
-
-Well-known communities have globally agreed-upon meanings:
-- `NO_EXPORT` (`0xFFFFFF01`) — do not advertise outside this AS
-- `NO_ADVERTISE` (`0xFFFFFF02`) — do not advertise to any peer
-- `NO_EXPORT_SUBCONFED` (`0xFFFFFF03`) — do not advertise outside this confederation
-
-**Large communities** ([RFC 8092](https://www.rfc-editor.org/rfc/rfc8092)) extend this to 96 bits (`global-admin:local-data-1:local-data-2`), solving the problem that standard communities have no unambiguous namespace for 4-byte ASNs.
-
-**Extended communities** ([RFC 4360](https://www.rfc-editor.org/rfc/rfc4360)) are 64-bit values with a typed structure, used primarily in VPN and EVPN contexts.
 
 ### `Afi` / `Safi` — Address Family Identifiers
 
