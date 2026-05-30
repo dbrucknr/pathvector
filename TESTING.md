@@ -94,6 +94,25 @@ Each property test defines a **strategy** (how to generate random inputs) and an
 | `ActionSequence` with Accept terminates with Accept | Compound actions must respect terminal decisions |
 | `ActionSequence` with Reject terminates with Reject | Same for Reject |
 
+**Current property-tested invariants in `pathvector-rib`:**
+
+| Invariant | Why it matters |
+|---|---|
+| `select_best` winner is always a key in the input candidate map | A phantom-peer winner would corrupt withdrawal tracking |
+| Non-empty candidate set always returns `Some` from `select_best` | Spurious `None` would silently drop a valid prefix from the Loc-RIB |
+| `select_best` is deterministic on the same input | Flapping best-path selection would oscillate FIB installs for a stable candidate set |
+| When all LOCAL_PREFs are distinct, the winner holds the highest value | LOCAL_PREF is the primary inbound policy lever — an incorrect winner ignores operator import filters |
+| `LocRib::is_empty()` and `len() == 0` always agree | Both are independently maintained; divergence makes capacity checks unreliable |
+| `best_routes().count() == len()` after any inserts | Mismatch means a prefix has candidates but no installed route, or a stale best entry with no remaining candidates |
+| A single insert always makes `best()` `Some` for that prefix | A missing best after insert would silently black-hole traffic |
+| `best_peer()` is always present in `candidates()` for that prefix | A stale best-peer pointer would forward traffic toward an already-withdrawn next-hop |
+| After `withdraw_peer`, prefixes exclusively owned by that peer have no best route | A stale best after session teardown keeps traffic flowing toward a down peer |
+| `AdjRibIn::insert` → `get` roundtrips exactly | A lossy insert corrupts the pre-policy store; soft reconfiguration re-evaluates stale data |
+| Second `AdjRibIn::insert` for the same NLRI returns the displaced route | Losing the old route prevents the session layer from detecting attribute changes |
+| `AdjRibIn::withdraw` → `get` returns `None` | A failed withdraw leaves a stale entry that soft reconfiguration would re-install |
+| `AdjRibOut::insert` → `get` roundtrips exactly | A lossy insert sends a different UPDATE than the one export policy produced |
+| `AdjRibOut::withdraw` → `get` returns `None` | A stale entry suppresses the WITHDRAW message the peer must receive |
+
 ---
 
 ## Coverage measurement

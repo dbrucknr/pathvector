@@ -220,6 +220,7 @@ dependencies = [
  "ipnetx",
  "pathvector-policy",
  "pathvector-types",
+ "proptest",
  "routemap",
 ]
 

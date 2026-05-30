@@ -8,6 +8,9 @@ pub mod loc_rib;
 mod peer;
 mod route;
 
+#[cfg(test)]
+mod prop_tests;
+
 pub use adj_rib_in::AdjRibIn;
 pub use adj_rib_out::AdjRibOut;
 pub use loc_rib::LocRib;
