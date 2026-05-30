@@ -1,0 +1,18 @@
+[package]
+name = "pathvector-bmp"
+version = "0.1.0"
+description = "BGP Monitoring Protocol (BMP) receiver: RFC 7854 Route Monitoring, Stats Reports, Peer Up/Down"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pathvector-types = { workspace = true }
+
+[lints]
+workspace = true

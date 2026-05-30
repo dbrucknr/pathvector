@@ -1,0 +1,20 @@
+[package]
+name = "pathvector-rib"
+version = "0.1.0"
+description = "BGP Routing Information Base: Adj-RIB-In, Loc-RIB, Adj-RIB-Out, and best-path selection"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pathvector-types  = { workspace = true }
+pathvector-policy = { workspace = true }
+routemap          = { workspace = true }
+
+[lints]
+workspace = true

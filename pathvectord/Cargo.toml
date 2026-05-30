@@ -1,0 +1,22 @@
+[package]
+name = "pathvectord"
+version = "0.1.0"
+description = "BGP daemon: TOML config, CLI, logging, and management API"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pathvector-types   = { workspace = true }
+pathvector-policy  = { workspace = true }
+pathvector-rib     = { workspace = true }
+pathvector-session = { workspace = true }
+pathvector-bmp     = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "pathvector-policy"
+version = "0.1.0"
+description = "BGP route policy engine: prefix-list, community, AS path match/action with first-match-wins semantics"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pathvector-types = { workspace = true }
+ipnetx           = { workspace = true }
+routemap         = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "pathvector-types",
+    "pathvector-policy",
+    "pathvector-rib",
+    "pathvector-session",
+    "pathvector-bmp",
+    "pathvectord",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+authors = ["Derek Bruckner <dbrucknr@umich.edu>"]
+repository = "https://github.com/dbrucknr/pathvector"
+categories = ["network-programming"]
+keywords = ["bgp", "routing", "networking"]
+
+[workspace.dependencies]
+# Internal crates
+pathvector-types   = { path = "pathvector-types",   version = "0.1.0" }
+pathvector-policy  = { path = "pathvector-policy",  version = "0.1.0" }
+pathvector-rib     = { path = "pathvector-rib",     version = "0.1.0" }
+pathvector-session = { path = "pathvector-session", version = "0.1.0" }
+pathvector-bmp     = { path = "pathvector-bmp",     version = "0.1.0" }
+
+# External dependencies
+ipnetx   = "0.2.2"
+routemap = "0.1.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
