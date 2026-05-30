@@ -143,19 +143,48 @@ assert_eq!(rt.type_low(), 0x02);  // Route Target sub-type
 
 ---
 
+### `Afi` / `Safi` / `AfiSafi` — Address Family Identifiers
+
+**Concept:** BGP-4 was originally IPv4-only. [RFC 4760](https://www.rfc-editor.org/rfc/rfc4760) introduced multiprotocol extensions, allowing BGP to carry routes for any address family by adding two new message fields:
+
+- **AFI** (Address Family Identifier, 16-bit) — *what kind of addresses?* IPv4, IPv6, L2VPN.
+- **SAFI** (Subsequent AFI, 8-bit) — *what kind of routing with those addresses?* Unicast, multicast, MPLS, VPN.
+
+Together they identify a routing table. A BGP speaker that handles IPv4 unicast and EVPN maintains completely separate tables for each, and routes are never mixed between them. During session setup, each side advertises the AFI/SAFI pairs it supports — if there's no overlap, no routes are exchanged for that family.
+
+Both types are newtypes over their wire size rather than enums. The IANA registry for AFI/SAFI values is large and evolves over time; a newtype with named constants can represent any assigned value without an `Unknown` catch-all variant that makes pattern matching awkward.
+
+| Constant | AFI | SAFI | Description |
+|---|---|---|---|
+| `IPV4_UNICAST` | 1 | 1 | Standard IPv4 forwarding — the classic case |
+| `IPV6_UNICAST` | 2 | 1 | Standard IPv6 forwarding |
+| `IPV4_MPLS_VPN` | 1 | 128 | MPLS L3VPN (RFC 4364) |
+| `IPV6_MPLS_VPN` | 2 | 128 | IPv6 MPLS L3VPN |
+| `EVPN` | 25 | 70 | Ethernet VPN (RFC 7432) |
+| `IPV4_FLOW_SPEC` | 1 | 133 | FlowSpec DDoS mitigation (RFC 5575) |
+
+```rust
+use pathvector_types::{Afi, AfiSafi, Safi};
+
+// Named constants for common pairs
+assert_eq!(AfiSafi::IPV4_UNICAST.afi, Afi::IPV4);
+assert_eq!(AfiSafi::IPV4_UNICAST.safi, Safi::UNICAST);
+assert_eq!(AfiSafi::IPV4_UNICAST.to_string(), "IPv4 unicast");
+
+// EVPN uses the L2VPN AFI
+assert_eq!(AfiSafi::EVPN.afi, Afi::L2VPN);
+assert_eq!(AfiSafi::EVPN.to_string(), "L2VPN evpn");
+
+// Any IANA value is representable
+let custom = AfiSafi::new(Afi::new(1), Safi::new(200));
+assert_eq!(custom.to_string(), "IPv4 SAFI(200)");
+```
+
+---
+
 ## Coming soon
 
 The following types are planned and will be documented here as they are implemented.
-
-### `Afi` / `Safi` — Address Family Identifiers
-
-**Concept:** BGP was originally IPv4-only. Multiprotocol extensions ([RFC 4760](https://www.rfc-editor.org/rfc/rfc4760)) generalized it to carry reachability information for any address family. AFI (Address Family Identifier) and SAFI (Subsequent AFI) together identify what kind of prefixes a capability or route advertisement refers to.
-
-Common combinations:
-- AFI 1, SAFI 1 — IPv4 unicast (the classic case)
-- AFI 2, SAFI 1 — IPv6 unicast
-- AFI 1, SAFI 128 — IPv4 VPN (MPLS L3VPN)
-- AFI 25, SAFI 70 — EVPN (Ethernet VPN)
 
 ### `Nlri` — Network Layer Reachability Information
 
