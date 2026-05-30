@@ -75,6 +75,12 @@ Early development. Crates are not yet published to crates.io.
 
 ---
 
+## Testing
+
+pathvector takes correctness seriously. The test suite combines unit tests, compiled documentation examples, property-based tests, and line coverage measurement. See [TESTING.md](TESTING.md) for a full description of the testing philosophy, patterns, and how to run the suite.
+
+---
+
 ## License
 
 MIT

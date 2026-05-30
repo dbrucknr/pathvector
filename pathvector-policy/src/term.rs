@@ -371,4 +371,66 @@ mod tests {
         let mut route = make_route("10.0.0.0/8");
         assert_eq!(policy.evaluate(&mut route), Decision::Accept);
     }
+
+    #[test]
+    fn test_combined_modifying_actions_both_applied() {
+        // SetLocalPref AND AddCommunity should both take effect before Accept.
+        let mark = Community::from_parts(65000, 999);
+        let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Reject)
+            .term(
+                AnyCondition,
+                ActionSequence::new()
+                    .then(SetLocalPref::new(LocalPref::new(200)))
+                    .then(AddCommunity::new(mark))
+                    .then(Accept),
+            )
+            .build();
+
+        let mut route = make_route("10.0.0.0/8");
+        assert_eq!(policy.evaluate(&mut route), Decision::Accept);
+        assert_eq!(route.local_pref, Some(LocalPref::new(200)));
+        assert!(route.communities.contains(&mark));
+    }
+
+    #[test]
+    fn test_multiple_next_terms_accumulate_modifications() {
+        // Two Next-returning terms each modify an attribute; a final term accepts.
+        // All three modifications must be visible in the accepted route.
+        let mark_a = Community::from_parts(65000, 1);
+        let mark_b = Community::from_parts(65000, 2);
+
+        let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Reject)
+            .term(AnyCondition, ActionSequence::new().then(AddCommunity::new(mark_a)).then(crate::action::Next))
+            .term(AnyCondition, ActionSequence::new().then(AddCommunity::new(mark_b)).then(crate::action::Next))
+            .term(AnyCondition, Accept)
+            .build();
+
+        let mut route = make_route("10.0.0.0/8");
+        assert_eq!(policy.evaluate(&mut route), Decision::Accept);
+        assert!(route.communities.contains(&mark_a));
+        assert!(route.communities.contains(&mark_b));
+        assert_eq!(route.communities.len(), 2);
+    }
+
+    #[test]
+    fn test_non_matching_term_does_not_modify_route() {
+        // A term whose condition fails must not apply its action.
+        // Verify the route is unchanged after skipping a non-matching term.
+        let irrelevant = Community::from_parts(65001, 1);
+        let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Accept)
+            .term(
+                CommunityCondition::new(Community::NO_EXPORT), // condition won't match
+                ActionSequence::new()
+                    .then(SetLocalPref::new(LocalPref::new(999)))
+                    .then(Accept),
+            )
+            .build();
+
+        let mut route = make_route("10.0.0.0/8");
+        route.communities = vec![irrelevant];
+
+        // No-export community not present — term condition fails
+        assert_eq!(policy.evaluate(&mut route), Decision::Accept); // default
+        assert_eq!(route.local_pref, None); // action was NOT applied
+    }
 }

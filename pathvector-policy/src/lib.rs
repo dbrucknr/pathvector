@@ -9,6 +9,8 @@ pub mod term;
 
 #[cfg(test)]
 pub(crate) mod testutil;
+#[cfg(test)]
+mod prop_tests;
 
 // ── Re-exports ─────────────────────────────────────────────────────────────
 

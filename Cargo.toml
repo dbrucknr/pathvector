@@ -27,8 +27,9 @@ pathvector-session = { path = "pathvector-session", version = "0.1.0" }
 pathvector-bmp     = { path = "pathvector-bmp",     version = "0.1.0" }
 
 # External dependencies
-ipnetx   = "0.2.2"
-routemap = "0.1.1"
+ipnetx    = "0.2.2"
+routemap  = "0.1.1"
+proptest  = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

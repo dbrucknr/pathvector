@@ -9,6 +9,7 @@ use crate::route::BgpRoute;
 /// This type implements [`BgpRoute`] so that conditions and actions can be
 /// tested without depending on `pathvector-rib`. It stores every standard
 /// BGP attribute as a plain field — no encoding, no wire format.
+#[derive(Debug)]
 pub struct TestRoute {
     pub nlri: Nlri<Ipv4Addr>,
     pub origin: Origin,

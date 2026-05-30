@@ -540,4 +540,122 @@ mod tests {
         route.origin = Origin::Incomplete;
         assert!(!condition.matches(&route));
     }
+
+    #[test]
+    fn test_prefix_list_condition_less_specific_does_not_match_more_specific_entry() {
+        // A /8 route should NOT match a prefix-list that only contains a /24.
+        // The /8's network address (e.g. 10.0.0.0) is outside the /24 range.
+        use ipnetx::{ipset::IpSetBuilder, prefix::IpPrefix};
+        use std::net::Ipv4Addr;
+
+        let mut builder = IpSetBuilder::<Ipv4Addr>::new();
+        builder.add_prefix(IpPrefix::new(Ipv4Addr::new(10, 1, 0, 0), 24).unwrap());
+        let condition = PrefixListCondition::new(builder.build());
+
+        // Less-specific route: 10.0.0.0/8 — network address 10.0.0.0 is NOT in 10.1.0.0/24
+        let less_specific = TestRoute::new("10.0.0.0/8");
+        assert!(!condition.matches(&less_specific));
+
+        // More-specific route: 10.1.0.0/24 — network address IS in the /24
+        let exact = TestRoute::new("10.1.0.0/24");
+        assert!(condition.matches(&exact));
+    }
+
+    #[test]
+    fn test_local_pref_condition_equal_op() {
+        use pathvector_types::LocalPref;
+
+        let condition = LocalPrefCondition::new(CompareOp::Equal, LocalPref::new(100));
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.local_pref = Some(LocalPref::new(100));
+        assert!(condition.matches(&route));
+
+        route.local_pref = Some(LocalPref::new(99));
+        assert!(!condition.matches(&route));
+    }
+
+    #[test]
+    fn test_local_pref_condition_not_equal_op() {
+        use pathvector_types::LocalPref;
+
+        let condition = LocalPrefCondition::new(CompareOp::NotEqual, LocalPref::new(100));
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.local_pref = Some(LocalPref::new(200));
+        assert!(condition.matches(&route));
+
+        route.local_pref = Some(LocalPref::new(100));
+        assert!(!condition.matches(&route));
+    }
+
+    #[test]
+    fn test_local_pref_condition_boundary_zero() {
+        use pathvector_types::LocalPref;
+
+        let condition = LocalPrefCondition::new(CompareOp::Equal, LocalPref::new(0));
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.local_pref = Some(LocalPref::new(0));
+        assert!(condition.matches(&route));
+
+        route.local_pref = Some(LocalPref::new(1));
+        assert!(!condition.matches(&route));
+    }
+
+    #[test]
+    fn test_med_condition_equal_op() {
+        use pathvector_types::Med;
+
+        let condition = MedCondition::new(CompareOp::Equal, Med::new(50));
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.med = Some(Med::new(50));
+        assert!(condition.matches(&route));
+
+        route.med = Some(Med::new(51));
+        assert!(!condition.matches(&route));
+    }
+
+    #[test]
+    fn test_med_condition_not_equal_op() {
+        use pathvector_types::Med;
+
+        let condition = MedCondition::new(CompareOp::NotEqual, Med::new(100));
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.med = Some(Med::new(0));
+        assert!(condition.matches(&route));
+
+        route.med = Some(Med::new(100));
+        assert!(!condition.matches(&route));
+    }
+
+    #[test]
+    fn test_med_condition_boundary_max() {
+        use pathvector_types::Med;
+
+        let condition = MedCondition::new(CompareOp::Equal, Med::new(u32::MAX));
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.med = Some(Med::new(u32::MAX));
+        assert!(condition.matches(&route));
+
+        route.med = Some(Med::new(u32::MAX - 1));
+        assert!(!condition.matches(&route));
+    }
+
+    #[test]
+    fn test_as_path_length_condition_equal_op() {
+        use pathvector_types::{AsPath, Asn};
+
+        let condition = AsPathLengthCondition::new(CompareOp::Equal, 2);
+        let mut route = TestRoute::new("10.0.0.0/8");
+
+        route.as_path = AsPath::from_sequence(vec![Asn::new(65002), Asn::new(65001)]);
+        assert!(condition.matches(&route));
+
+        route.as_path = AsPath::from_sequence(vec![Asn::new(65001)]);
+        assert!(!condition.matches(&route));
+    }
 }
