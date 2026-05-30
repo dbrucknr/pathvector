@@ -117,4 +117,11 @@ mod tests {
         let peer = PeerId::from(Ipv6Addr::LOCALHOST);
         assert_eq!(peer.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
     }
+
+    #[test]
+    fn test_peer_id_from_ipaddr() {
+        let addr = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        let peer = PeerId::from(addr);
+        assert_eq!(peer.ip(), addr);
+    }
 }

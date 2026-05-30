@@ -311,6 +311,69 @@ mod tests {
     }
 
     #[test]
+    fn test_route_builder_large_and_extended_community() {
+        use pathvector_types::{ExtendedCommunity, LargeCommunity};
+
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .large_community(LargeCommunity::new(65000, 1, 100))
+            .large_community(LargeCommunity::new(65001, 2, 200))
+            .extended_community(ExtendedCommunity::route_target_as2(65000, 1))
+            .build();
+
+        assert_eq!(route.large_communities.len(), 2);
+        assert_eq!(route.extended_communities.len(), 1);
+    }
+
+    #[test]
+    fn test_route_bgproute_remaining_getters() {
+        use pathvector_types::{ExtendedCommunity, LargeCommunity, Med, NextHop};
+        use pathvector_policy::BgpRoute;
+
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .med(Med::new(50))
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .community(pathvector_types::Community::from_parts(65000, 100))
+            .large_community(LargeCommunity::new(65000, 1, 2))
+            .extended_community(ExtendedCommunity::route_target_as2(65000, 1))
+            .build();
+
+        assert_eq!(route.med(), Some(Med::new(50)));
+        assert_eq!(route.next_hop(), Some(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert_eq!(route.communities().len(), 1);
+        assert_eq!(route.large_communities().len(), 1);
+        assert_eq!(route.extended_communities().len(), 1);
+    }
+
+    #[test]
+    fn test_route_bgproute_remaining_setters() {
+        use pathvector_types::{Community, ExtendedCommunity, LargeCommunity, Med, NextHop};
+        use pathvector_policy::BgpRoute;
+
+        let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
+
+        route.set_med(Some(Med::new(100)));
+        assert_eq!(route.med(), Some(Med::new(100)));
+
+        route.set_med(None);
+        assert_eq!(route.med(), None);
+
+        route.set_next_hop(Some(NextHop::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert_eq!(route.next_hop(), Some(NextHop::V4(Ipv4Addr::new(192, 168, 1, 1))));
+
+        route.set_next_hop(None);
+        assert_eq!(route.next_hop(), None);
+
+        route.set_communities(vec![Community::from_parts(65000, 1)]);
+        assert_eq!(route.communities().len(), 1);
+
+        route.set_large_communities(vec![LargeCommunity::new(65000, 1, 2)]);
+        assert_eq!(route.large_communities().len(), 1);
+
+        route.set_extended_communities(vec![ExtendedCommunity::route_target_as2(65000, 1)]);
+        assert_eq!(route.extended_communities().len(), 1);
+    }
+
+    #[test]
     fn test_route_clone() {
         let original =
             RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();

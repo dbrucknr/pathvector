@@ -316,6 +316,37 @@ mod tests {
     }
 
     #[test]
+    fn test_loc_rib_withdraw_nonexistent_prefix_is_noop() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.withdraw(&peer(1), &nlri("10.0.0.0/8"));
+        assert!(rib.is_empty());
+    }
+
+    #[test]
+    fn test_loc_rib_default() {
+        let rib: LocRib<Ipv4Addr> = LocRib::default();
+        assert!(rib.is_empty());
+        assert_eq!(rib.len(), 0);
+    }
+
+    #[test]
+    fn test_recompute_best_clears_best_when_candidates_empty() {
+        // Covers the defensive else-branch in recompute_best where select_best
+        // returns None. Unreachable through the public API, so we reach it by
+        // injecting an empty peer map directly into the private candidates field.
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(peer(1), route("10.0.0.0/8"));
+        assert!(rib.best(&n).is_some());
+
+        rib.candidates.insert(n, std::collections::HashMap::new());
+        rib.recompute_best(n);
+
+        assert!(rib.best(&n).is_none());
+    }
+
+    #[test]
     fn test_loc_rib_same_peer_update_replaces_candidate() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
