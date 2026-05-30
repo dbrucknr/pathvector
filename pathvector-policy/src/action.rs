@@ -548,6 +548,17 @@ mod tests {
     }
 
     #[test]
+    fn test_set_next_hop_clear() {
+        use pathvector_types::NextHop;
+        use std::net::Ipv4Addr;
+        let nh = NextHop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut route = TestRoute::new("10.0.0.0/8");
+        route.next_hop = Some(nh);
+        SetNextHop::clear().apply(&mut route);
+        assert_eq!(route.next_hop, None);
+    }
+
+    #[test]
     fn test_action_sequence_all_next() {
         let mut route = TestRoute::new("10.0.0.0/8");
         let seq: ActionSequence<_> =
@@ -579,6 +590,13 @@ mod tests {
     fn test_action_sequence_empty_returns_next() {
         let mut route = TestRoute::new("10.0.0.0/8");
         let seq: ActionSequence<TestRoute> = ActionSequence::new();
+        assert_eq!(seq.apply(&mut route), Decision::Next);
+    }
+
+    #[test]
+    fn test_action_sequence_default_equivalent_to_new() {
+        let mut route = TestRoute::new("10.0.0.0/8");
+        let seq: ActionSequence<TestRoute> = ActionSequence::default();
         assert_eq!(seq.apply(&mut route), Decision::Next);
     }
 }

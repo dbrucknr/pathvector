@@ -71,3 +71,27 @@ impl BgpRoute for TestRoute {
     fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) { self.extended_communities = c; }
     fn set_next_hop(&mut self, nh: Option<NextHop>) { self.next_hop = nh; }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BgpRoute;
+
+    #[test]
+    fn test_testroute_next_hop_getter() {
+        use std::net::Ipv4Addr;
+        let mut route = TestRoute::new("10.0.0.0/8");
+        assert_eq!(route.next_hop(), None);
+        route.next_hop = Some(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(route.next_hop().is_some());
+    }
+
+    #[test]
+    fn test_testroute_extended_communities() {
+        let mut route = TestRoute::new("10.0.0.0/8");
+        assert!(route.extended_communities().is_empty());
+        let ec = ExtendedCommunity::route_target_as2(65000, 1);
+        route.set_extended_communities(vec![ec]);
+        assert_eq!(route.extended_communities(), &[ec]);
+    }
+}
