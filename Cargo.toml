@@ -28,8 +28,10 @@ pathvector-bmp     = { path = "pathvector-bmp",     version = "0.1.0" }
 
 # External dependencies
 bytes      = "1"
+futures    = "0.3"
 ipnetx     = "0.2.2"
 routemap   = "0.1.1"
+tokio      = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 proptest   = "1"
 

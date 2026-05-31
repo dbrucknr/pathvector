@@ -73,8 +73,6 @@ offer:
 
 ### Remaining
 
-- Framing layer: tokio `Codec` that reads the 19-byte BGP header, uses the 2-byte length field to accumulate a complete message, then calls `BgpMessage::decode`
-- TCP transport: wire the framing layer and FSM together over a real TCP connection (port 179)
 - MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)

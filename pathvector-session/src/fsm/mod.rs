@@ -947,4 +947,139 @@ mod tests {
         assert_eq!(fsm.state(), State::OpenConfirm);
         assert!(matches!(find_send(&out), Some(BgpMessage::Keepalive)));
     }
+
+    // ── Connect / Active state gaps ───────────────────────────────────────────
+
+    #[test]
+    fn test_connect_retry_timer_from_connect_reinitiates_tcp() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart); // → Connect
+        let out = fsm.process(FsmInput::ConnectRetryTimerExpired);
+        assert_eq!(fsm.state(), State::Connect);
+        assert!(has_output(&out, |o| *o == FsmOutput::InitiateTcpConnect));
+        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartConnectRetryTimer(_))));
+    }
+
+    #[test]
+    fn test_tcp_connected_from_active_enters_open_sent() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart); // → Connect
+        fsm.process(FsmInput::TcpFailed);   // → Active
+        let out = fsm.process(FsmInput::TcpConnected);
+        assert_eq!(fsm.state(), State::OpenSent);
+        assert!(matches!(find_send(&out), Some(BgpMessage::Open(_))));
+    }
+
+    #[test]
+    fn test_manual_stop_from_active() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpFailed); // → Active
+        let out = fsm.process(FsmInput::ManualStop);
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(has_output(&out, |o| *o == FsmOutput::StopConnectRetryTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+    }
+
+    // ── OpenSent gaps ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tcp_failed_in_open_sent_enters_active() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let out = fsm.process(FsmInput::TcpFailed);
+        assert_eq!(fsm.state(), State::Active);
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartConnectRetryTimer(_))));
+    }
+
+    #[test]
+    fn test_manual_stop_from_open_sent_sends_cease() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let out = fsm.process(FsmInput::ManualStop);
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+                ..
+            }))
+        ));
+    }
+
+    // ── OpenConfirm gaps ──────────────────────────────────────────────────────
+
+    fn enter_open_confirm() -> Fsm {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
+        assert_eq!(fsm.state(), State::OpenConfirm);
+        fsm
+    }
+
+    #[test]
+    fn test_notification_in_open_confirm_terminates() {
+        let mut fsm = enter_open_confirm();
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Notification(
+            NotificationMessage { error: NotificationError::HoldTimerExpired, data: vec![] },
+        )));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+        assert!(has_output(&out, |o| *o == FsmOutput::SessionTerminated));
+    }
+
+    #[test]
+    fn test_tcp_failed_in_open_confirm_terminates() {
+        let mut fsm = enter_open_confirm();
+        let out = fsm.process(FsmInput::TcpFailed);
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(has_output(&out, |o| *o == FsmOutput::SessionTerminated));
+    }
+
+    #[test]
+    fn test_hold_timer_expired_in_open_confirm() {
+        let mut fsm = enter_open_confirm();
+        let out = fsm.process(FsmInput::HoldTimerExpired);
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::HoldTimerExpired,
+                ..
+            }))
+        ));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+    }
+
+    #[test]
+    fn test_manual_stop_from_open_confirm_sends_cease() {
+        let mut fsm = enter_open_confirm();
+        let out = fsm.process(FsmInput::ManualStop);
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+                ..
+            }))
+        ));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+    }
+
+    // ── Established gaps ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_keepalive_message_in_established_resets_hold_timer() {
+        let (mut fsm, _) = establish(default_config());
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        assert_eq!(fsm.state(), State::Established);
+        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartHoldTimer(_))));
+    }
 }
