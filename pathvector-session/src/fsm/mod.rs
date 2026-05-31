@@ -526,6 +526,9 @@ fn push_timer_actions(out: &mut Vec<FsmOutput>, negotiated: u16) {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod prop_tests;
+
+#[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
 
