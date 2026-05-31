@@ -87,6 +87,8 @@ offer:
 - 4-byte ASN capability — codec encoding/decoding, `AS_TRANS` substitution in FSM, `AS4_PATH` / `AS4_AGGREGATOR` handling
 - Graceful Restart and Route Refresh capability — codec parsing and encoding
 - BGP FSM: Idle → Connect → Active → OpenSent → OpenConfirm → Established (pure state machine, no I/O)
+- Codec error logging in transport — `recv_message` errors are now surfaced via `tracing::warn!` before dropping the connection
+- **GoBGP interoperability validated (2026-05-31)** — full session lifecycle confirmed: OPEN negotiation, KEEPALIVE exchange, UPDATE announce and withdraw, session teardown
 
 ### Remaining
 
@@ -109,14 +111,23 @@ Not yet started. Key work items:
 
 ## pathvectord
 
-Not yet started. Key work items:
+### Done
 
-- TOML configuration: peers, policies, address families
+- TOML configuration: `local_as`, `bgp_id`, `hold_time`, per-peer `address`/`port`/`remote_as`
+- Session spawning: one `transport::spawn()` task per configured peer, events multiplexed into a single channel
+- RIB integration: `UpdateMessage` → `Route<Ipv4Addr>` conversion, `LocRib` insert/withdraw/peer-teardown
+- Structured logging via `tracing` with `RUST_LOG` env-filter support
+- **GoBGP interoperability validated (2026-05-31)**
+
+### Remaining
+
 - gRPC management API — define `.proto` schema for:
   - Peer state queries (session state, uptime, prefixes received/advertised)
   - RIB queries (show route, show best path, show candidates)
   - Policy introspection
   - Runtime policy reload
+- Import policy — apply `pathvector-policy` to routes before `LocRib::insert`; currently all received routes are accepted unconditionally
+- `AdjRibIn` — add pre-policy store per peer to support soft reconfiguration without requiring a full session reset
 - CLI binary (`pathvector`) using the gRPC client
 - Docker image: `FROM debian:slim`, single binary, config file mount, gRPC port exposed
 

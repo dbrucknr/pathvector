@@ -179,8 +179,12 @@ impl Session {
             }
 
             msg = recv_message(&mut self.reader) => {
-                if let Some(Ok(m)) = msg {
-                    return FsmInput::MessageReceived(m);
+                match msg {
+                    Some(Ok(m)) => return FsmInput::MessageReceived(m),
+                    Some(Err(e)) => {
+                        tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
+                    }
+                    None => {}
                 }
                 self.drop_connection();
                 FsmInput::TcpFailed
