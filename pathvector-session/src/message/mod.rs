@@ -2,6 +2,8 @@ mod error;
 mod header;
 mod notification;
 mod open;
+#[cfg(test)]
+mod prop_tests;
 mod route_refresh;
 mod update;
 
@@ -15,7 +17,7 @@ pub use open::{Capability, GracefulRestartFamily, OpenMessage};
 pub use route_refresh::RouteRefreshMessage;
 pub use update::{MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage};
 
-use header::{decode_header, encode_header, MessageType as MsgType};
+use header::{MessageType as MsgType, decode_header, encode_header};
 
 // ── Shared codec primitives ───────────────────────────────────────────────────
 //
@@ -43,7 +45,10 @@ impl<'a> Cursor<'a> {
 
     fn read_u8(&mut self) -> Result<u8, CodecError> {
         if self.remaining() < 1 {
-            return Err(CodecError::Truncated { needed: 1, available: 0 });
+            return Err(CodecError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
         let v = self.data[self.pos];
         self.pos += 1;
@@ -52,7 +57,10 @@ impl<'a> Cursor<'a> {
 
     fn read_u16(&mut self) -> Result<u16, CodecError> {
         if self.remaining() < 2 {
-            return Err(CodecError::Truncated { needed: 2, available: self.remaining() });
+            return Err(CodecError::Truncated {
+                needed: 2,
+                available: self.remaining(),
+            });
         }
         let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
@@ -61,7 +69,10 @@ impl<'a> Cursor<'a> {
 
     fn read_u32(&mut self) -> Result<u32, CodecError> {
         if self.remaining() < 4 {
-            return Err(CodecError::Truncated { needed: 4, available: self.remaining() });
+            return Err(CodecError::Truncated {
+                needed: 4,
+                available: self.remaining(),
+            });
         }
         let v = u32::from_be_bytes([
             self.data[self.pos],
@@ -75,7 +86,10 @@ impl<'a> Cursor<'a> {
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], CodecError> {
         if self.remaining() < n {
-            return Err(CodecError::Truncated { needed: n, available: self.remaining() });
+            return Err(CodecError::Truncated {
+                needed: n,
+                available: self.remaining(),
+            });
         }
         let slice = &self.data[self.pos..self.pos + n];
         self.pos += n;
@@ -173,18 +187,14 @@ impl BgpMessage {
         match msg_type {
             MsgType::Open => Ok(Self::Open(OpenMessage::decode(&mut cur)?)),
             MsgType::Update => Ok(Self::Update(UpdateMessage::decode(&mut cur)?)),
-            MsgType::Notification => {
-                Ok(Self::Notification(NotificationMessage::decode(&mut cur)?))
-            }
+            MsgType::Notification => Ok(Self::Notification(NotificationMessage::decode(&mut cur)?)),
             MsgType::Keepalive => {
                 if cur.remaining() != 0 {
                     return Err(CodecError::InvalidLength(total_len));
                 }
                 Ok(Self::Keepalive)
             }
-            MsgType::RouteRefresh => {
-                Ok(Self::RouteRefresh(RouteRefreshMessage::decode(&mut cur)?))
-            }
+            MsgType::RouteRefresh => Ok(Self::RouteRefresh(RouteRefreshMessage::decode(&mut cur)?)),
         }
     }
 
@@ -290,7 +300,10 @@ mod tests {
     fn test_decode_rejects_bad_marker() {
         let mut keepalive = BgpMessage::Keepalive.encode();
         keepalive[0] = 0x00;
-        assert_eq!(BgpMessage::decode(&keepalive), Err(CodecError::InvalidMarker));
+        assert_eq!(
+            BgpMessage::decode(&keepalive),
+            Err(CodecError::InvalidMarker)
+        );
     }
 
     // ── Cursor truncated-read paths ───────────────────────────────────────────
@@ -312,7 +325,10 @@ mod tests {
         let raw = make_raw_message(3, &[]);
         assert!(matches!(
             BgpMessage::decode(&raw),
-            Err(CodecError::Truncated { needed: 1, available: 0 })
+            Err(CodecError::Truncated {
+                needed: 1,
+                available: 0
+            })
         ));
     }
 
@@ -320,7 +336,10 @@ mod tests {
     fn test_truncated_read_u16_update_one_byte_body() {
         // UPDATE with 1-byte body → read_u16 for withdrawn_len fails.
         let raw = make_raw_message(2, &[0x00]);
-        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::Truncated { .. })));
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -330,21 +349,29 @@ mod tests {
         // With only 6 body bytes, bgp_id read fails.
         let body: &[u8] = &[4, 0xFF, 0x00, 0x00, 0x5A, 0x0A]; // 6 bytes, need 9
         let raw = make_raw_message(1, body);
-        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::Truncated { .. })));
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 
     #[test]
     fn test_truncated_read_bytes_open_body() {
         // OPEN with only version byte → my_as read fails (needs 2 bytes).
         let raw = make_raw_message(1, &[4]);
-        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::Truncated { .. })));
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 
     #[test]
     fn test_keepalive_with_extra_body_is_error() {
         // Header claims length=20 and body has 1 byte → Keepalive body must be empty.
         let raw = make_raw_message(4, &[0x00]);
-        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::InvalidLength(20))));
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::InvalidLength(20))
+        ));
     }
-
 }
