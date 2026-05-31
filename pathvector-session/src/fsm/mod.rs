@@ -614,13 +614,12 @@ mod tests {
         let mut fsm = Fsm::new(default_config());
         fsm.process(FsmInput::ManualStart);
         let out = fsm.process(FsmInput::TcpConnected);
-        if let Some(BgpMessage::Open(open)) = find_send(&out) {
-            assert_eq!(open.my_as, 65001);
-            assert_eq!(open.bgp_id, Ipv4Addr::new(10, 0, 0, 1));
-            assert_eq!(open.hold_time, 90);
-        } else {
+        let Some(BgpMessage::Open(open)) = find_send(&out) else {
             panic!("expected OPEN message");
-        }
+        };
+        assert_eq!(open.my_as, 65001);
+        assert_eq!(open.bgp_id, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(open.hold_time, 90);
     }
 
     #[test]
@@ -924,11 +923,10 @@ mod tests {
         fsm.process(FsmInput::ManualStart);
         // Verify we send AS_TRANS in the my_as field.
         let out = fsm.process(FsmInput::TcpConnected);
-        if let Some(BgpMessage::Open(open)) = find_send(&out) {
-            assert_eq!(open.my_as, AS_TRANS);
-        } else {
+        let Some(BgpMessage::Open(open)) = find_send(&out) else {
             panic!("expected OPEN");
-        }
+        };
+        assert_eq!(open.my_as, AS_TRANS);
         // Verify we accept a peer with 4-byte ASN via capability.
         fsm.process(FsmInput::MessageReceived(peer_open(131073, 90)));
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));

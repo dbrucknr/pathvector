@@ -45,3 +45,53 @@ pub struct PeerConfig {
 fn default_bgp_port() -> u16 {
     179
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_defaults_hold_time_and_port() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.daemon.hold_time, 90);
+        assert_eq!(cfg.peers[0].port, 179);
+    }
+
+    #[test]
+    fn test_config_explicit_hold_time_and_port() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+hold_time = 180
+
+[[peers]]
+address = "10.0.0.2"
+port = 1179
+remote_as = 65002
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.daemon.hold_time, 180);
+        assert_eq!(cfg.peers[0].port, 1179);
+    }
+
+    #[test]
+    fn test_config_no_peers_defaults_to_empty() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.peers.is_empty());
+    }
+}

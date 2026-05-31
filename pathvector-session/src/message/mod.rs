@@ -344,6 +344,18 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_read_u32_truncated() {
+        // read_u32 with 3 bytes remaining — its own truncation guard (lines 71-75).
+        // All production callers pre-check `remaining() < 4` so this branch is
+        // unreachable through `BgpMessage::decode`, requiring a direct Cursor test.
+        let mut cur = Cursor::new(&[0x00, 0x01, 0x02]);
+        assert!(matches!(
+            cur.read_u32(),
+            Err(CodecError::Truncated { needed: 4, available: 3 })
+        ));
+    }
+
+    #[test]
     fn test_truncated_read_u32_open_short_body() {
         // OPEN: version(1) + my_as(2) + hold_time(2) + bgp_id — cut off inside bgp_id.
         // read_ipv4addr calls read_bytes(4) which in turn calls read_u32 equivalent logic.

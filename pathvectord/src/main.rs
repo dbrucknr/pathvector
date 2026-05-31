@@ -87,6 +87,122 @@ async fn run(cfg: config::Config) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pathvector_types::{Aggregator, Asn, Community, ExtendedCommunity, LargeCommunity, Nlri};
+
+    use super::*;
+
+    fn peer() -> PeerId {
+        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+    }
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_handle_update_inserts_route_with_all_attributes() {
+        let mut rib = LocRib::new();
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Egp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                PathAttribute::LocalPref(200),
+                PathAttribute::Med(50),
+                PathAttribute::Communities(vec![Community::new(0x0001_0001)]),
+                PathAttribute::LargeCommunities(vec![LargeCommunity::new(65000, 1, 100)]),
+                PathAttribute::ExtendedCommunities(vec![
+                    ExtendedCommunity::route_target_as2(65000, 1),
+                ]),
+                PathAttribute::AtomicAggregate,
+                PathAttribute::Aggregator(Aggregator::new(
+                    Asn::new(65001),
+                    Ipv4Addr::new(1, 1, 1, 1),
+                )),
+            ],
+            announced: vec![nlri("192.168.0.0/16")],
+        };
+        handle_update(peer(), msg, &mut rib);
+
+        let route = rib.best(&nlri("192.168.0.0/16")).unwrap();
+        assert_eq!(route.origin, Origin::Egp);
+        assert_eq!(route.local_pref, Some(LocalPref::new(200)));
+        assert_eq!(route.med, Some(Med::new(50)));
+        assert_eq!(route.communities.len(), 1);
+        assert_eq!(route.large_communities.len(), 1);
+        assert_eq!(route.extended_communities.len(), 1);
+        assert!(route.atomic_aggregate);
+        assert!(route.aggregator.is_some());
+    }
+
+    #[test]
+    fn test_handle_update_withdraw_removes_route() {
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut rib,
+        );
+        assert_eq!(rib.len(), 1);
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![nlri("10.0.0.0/8")],
+                attributes: vec![],
+                announced: vec![],
+            },
+            &mut rib,
+        );
+        assert!(rib.is_empty());
+    }
+
+    #[test]
+    fn test_handle_update_empty_announced_is_noop() {
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                announced: vec![],
+            },
+            &mut rib,
+        );
+        assert!(rib.is_empty());
+    }
+
+    #[test]
+    fn test_handle_update_unknown_attribute_is_skipped() {
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::Unknown { flags: 0x80, type_code: 255, value: vec![1, 2, 3] },
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut rib,
+        );
+        assert_eq!(rib.len(), 1);
+    }
+}
+
 fn handle_update(peer: PeerId, msg: UpdateMessage, rib: &mut LocRib<Ipv4Addr>) {
     let withdrawn_count = msg.withdrawn.len();
     let announced_count = msg.announced.len();

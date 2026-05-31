@@ -357,6 +357,15 @@ mod tests {
     }
 
     #[test]
+    fn test_recompute_best_noop_for_unknown_prefix() {
+        // Calls recompute_best directly with a prefix that is not in candidates.
+        // Covers the implicit else-fallthrough of `if let Some(peer_map)`.
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.recompute_best(nlri("10.0.0.0/8"));
+        assert!(rib.is_empty());
+    }
+
+    #[test]
     fn test_loc_rib_longest_match() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         rib.insert(peer(1), route("10.0.0.0/8"));
