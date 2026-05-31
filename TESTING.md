@@ -168,7 +168,11 @@ go install github.com/osrg/gobgp/v4/cmd/gobgp@latest
   [neighbors.config]
     neighbor-address = "127.0.0.1"
     peer-as = 65002
+  [neighbors.transport.config]
+    passive-mode = true
 ```
+
+`passive-mode = true` is required. Without it, GoBGP also dials `127.0.0.1:179` and connects to its own listener, creating a self-loop that results in repeated NOTIFICATION Code 2 Subcode 3 rejections.
 
 BGP uses port 179, which requires root on macOS:
 
@@ -176,7 +180,61 @@ BGP uses port 179, which requires root on macOS:
 sudo gobgpd -f gobgp.toml
 ```
 
-pathvectord (once wired up) connects as AS 65002 from the same host. A successful test is: session reaches `Established`, routes announced by GoBGP appear in pathvector's Loc-RIB, and no unexpected NOTIFICATION messages are exchanged in either direction.
+pathvectord connects as AS 65002 from the same host. A successful test is: session reaches `Established`, routes announced by GoBGP appear in pathvector's Loc-RIB, and no unexpected NOTIFICATION messages are exchanged in either direction.
+
+### Known gotchas (validated 2026-05-31)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| NOTIFICATION Code 2 Subcode 3 (Bad BGP Identifier) | `bgp_id` is in `127.0.0.0/8` — GoBGP rejects loopback BGP IDs | Use a non-loopback address e.g. `10.0.0.2` |
+| Session drops immediately on first UPDATE | `capabilities` omits `FourByteAsn` — GoBGP sends 2-byte AS_PATH encoding, our decoder reads 4 bytes per ASN, buffer misaligns | Add `Capability::FourByteAsn(local_as)` to `SessionConfig::capabilities` |
+| Repeated self-connection NOTIFICATIONs before Rust app starts | GoBGP dials its own listener | Set `passive-mode = true` in GoBGP neighbor transport config |
+
+Sample Test Setup
+After installing and configuring GoBGP and pathvectord, run the following commands to start the test:
+In one terminal, start GoBGP:
+
+```bash
+sudo gobgpd -f gobgp.toml
+```
+
+In another terminal, start pathvectord:
+
+```bash
+RUST_LOG=info cargo run -p pathvectord -- config.toml
+```
+
+NOTE: The `config.toml` file looks like this:
+```toml
+[daemon]
+local_as = 65002
+bgp_id   = "10.0.0.2"
+
+[[peers]]
+address   = "127.0.0.1"
+remote_as = 65001
+```
+
+In yet another terminal, try and announce a route via GoBGP:
+
+```bash
+gobgp global rib add 192.168.100.0/24 nexthop 10.0.0.1
+```
+
+Our Rust `pathvector` will log:
+```bash
+2026-05-31T13:24:44.368434Z  INFO pathvectord: processed UPDATE peer=127.0.0.1 withdrawn=0 announced=1 rib_size=1
+```
+Afterwards, announce the route removal via GoBGP:
+
+```bash
+gobgp global rib del 192.168.100.0/24
+```
+
+Our Rust `pathvector` will log:
+```bash
+2026-05-31T13:24:44.368434Z  INFO pathvectord: processed UPDATE peer=127.0.0.1 withdrawn=1 announced=0 rib_size=0
+```
 
 ### What to look for
 

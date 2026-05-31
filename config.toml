@@ -1,0 +1,7 @@
+[daemon]
+local_as = 65002
+bgp_id   = "10.0.0.2"
+
+[[peers]]
+address   = "127.0.0.1"
+remote_as = 65001

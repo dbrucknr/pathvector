@@ -23,10 +23,10 @@ Sessions are either **iBGP** (internal — both routers are in the same AS) or *
 | State | Meaning |
 |---|---|
 | **Idle** | No connection is being attempted. The session enters this state on startup and after any error. A `ConnectRetryTimer` controls re-entry into Connect. |
-| **Connect** | A TCP connection is being dialled. If it succeeds, an OPEN is sent and the state advances to OpenSent. If it fails, the state moves to Active. |
+| **Connect** | A TCP connection is being dialled. If it succeeds, an OPEN is sent and the state advances to `OpenSent`. If it fails, the state moves to Active. |
 | **Active** | The TCP dial failed; the router is actively retrying. When the `ConnectRetryTimer` expires the state returns to Connect for another attempt. |
-| **OpenSent** | TCP is established and an OPEN message has been sent. The router is waiting for the peer's OPEN. |
-| **OpenConfirm** | Both OPENs have been received and validated. Waiting for the first KEEPALIVE to confirm the peer also accepted our OPEN. |
+| **`OpenSent`** | TCP is established and an OPEN message has been sent. The router is waiting for the peer's OPEN. |
+| **`OpenConfirm`** | Both OPENs have been received and validated. Waiting for the first KEEPALIVE to confirm the peer also accepted our OPEN. |
 | **Established** | The session is fully operational. UPDATE, KEEPALIVE, and ROUTE-REFRESH messages may be exchanged. |
 
 ```text
@@ -50,7 +50,7 @@ Sessions are either **iBGP** (internal — both routers are in the same AS) or *
                   └──► Connect
 ```
 
-Every transition out of **OpenSent**, **OpenConfirm**, and **Established** caused by an error sends a NOTIFICATION message before closing the TCP connection, giving the peer a machine-readable reason for the teardown.
+Every transition out of **`OpenSent`**, **`OpenConfirm`**, and **`Established`** caused by an error sends a NOTIFICATION message before closing the TCP connection, giving the peer a machine-readable reason for the teardown.
 
 ---
 
@@ -122,7 +122,7 @@ Each path attribute carries four flag bits in its first byte: **Optional** (well
 
 ### KEEPALIVE (type 4)
 
-A 19-byte header with no body. Sent periodically to prevent the hold timer from expiring when no UPDATEs are pending. Also sent in response to an OPEN as confirmation that the peer's OPEN was accepted, triggering the transition from OpenConfirm to Established.
+A 19-byte header with no body. Sent periodically to prevent the hold timer from expiring when no UPDATEs are pending. Also sent in response to an OPEN as confirmation that the peer's OPEN was accepted, triggering the transition from `OpenConfirm` to Established.
 
 ### NOTIFICATION (type 3)
 

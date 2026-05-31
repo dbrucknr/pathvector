@@ -199,6 +199,7 @@ impl BgpMessage {
     }
 
     /// Encode this message to wire format, including the 19-byte header.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Open(m) => m.encode(),

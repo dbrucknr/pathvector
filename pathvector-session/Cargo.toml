@@ -17,6 +17,7 @@ futures          = { workspace = true }
 pathvector-types = { workspace = true }
 tokio            = { workspace = true }
 tokio-util       = { workspace = true }
+tracing          = "0.1"
 
 [dev-dependencies]
 proptest = { workspace = true }
