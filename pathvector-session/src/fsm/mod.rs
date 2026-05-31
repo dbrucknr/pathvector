@@ -291,7 +291,18 @@ impl Fsm {
     fn on_open_confirm(&mut self, input: &FsmInput) -> Vec<FsmOutput> {
         match input {
             FsmInput::MessageReceived(BgpMessage::Keepalive) => {
-                let info = self.build_session_info();
+                let Some(info) = self.build_session_info() else {
+                    // peer_open is None in OpenConfirm — this is a programming error,
+                    // not a protocol event. Reset cleanly rather than panic so the
+                    // daemon stays up and the peer can retry.
+                    tracing::error!("peer_open missing in OpenConfirm; resetting session to Idle");
+                    self.state = State::Idle;
+                    return vec![
+                        FsmOutput::StopHoldTimer,
+                        FsmOutput::StopKeepaliveTimer,
+                        FsmOutput::CloseTcpConnection,
+                    ];
+                };
                 self.state = State::Established;
                 let mut out = vec![FsmOutput::SessionEstablished(info)];
                 if self.negotiated_hold_time > 0 {
@@ -479,14 +490,14 @@ impl Fsm {
     }
 
     /// Construct `SessionInfo` from the stored peer OPEN.
-    fn build_session_info(&self) -> SessionInfo {
-        let peer = self.peer_open.as_ref().expect("peer_open set before OpenConfirm");
-        SessionInfo {
+    fn build_session_info(&self) -> Option<SessionInfo> {
+        let peer = self.peer_open.as_ref()?;
+        Some(SessionInfo {
             peer_as: resolve_as(peer),
             peer_bgp_id: peer.bgp_id,
             hold_time: self.negotiated_hold_time,
             peer_capabilities: peer.capabilities.clone(),
-        }
+        })
     }
 }
 
@@ -1020,6 +1031,25 @@ mod tests {
         fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
         assert_eq!(fsm.state(), State::OpenConfirm);
         fsm
+    }
+
+    #[test]
+    fn test_keepalive_in_open_confirm_with_missing_peer_open_resets_to_idle() {
+        // Exercises the invariant-violation guard added to build_session_info:
+        // if peer_open is somehow None in OpenConfirm, the FSM must reset cleanly
+        // rather than panic (a panic would leave stale routes in the RIB).
+        let mut fsm = enter_open_confirm();
+        assert_eq!(fsm.state(), State::OpenConfirm);
+        fsm.peer_open = None; // force the invariant violation
+
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+        // Session never reached Established, so SessionEstablished must not appear.
+        assert!(!has_output(&out, |o| matches!(o, FsmOutput::SessionEstablished(_))));
     }
 
     #[test]

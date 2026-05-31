@@ -94,6 +94,45 @@ offer:
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 
+### Panic safety — replace `expect()` in `build_session_info`
+
+**Done.** `build_session_info` now returns `Option<SessionInfo>`. The `on_open_confirm`
+Keepalive arm uses `let...else`: on `None` it logs `tracing::error!`, resets the FSM
+to Idle, and returns `[StopHoldTimer, StopKeepaliveTimer, CloseTcpConnection]` — the
+same clean teardown as a normal failure, without panicking or leaving stale routes.
+Covered by `test_keepalive_in_open_confirm_with_missing_peer_open_resets_to_idle`.
+
+### Transport layer mocking via `BgpTransport` trait
+
+The `Session` struct has `TcpStream` baked in, making the async I/O paths
+(`transport/mod.rs:147-148,184-185,204-205,227-230`) impossible to unit test without
+real sockets. These paths cover send failure recovery, codec errors on receive, connect
+retry timer firing, and the `TcpFailed` re-entry loop.
+
+Fix: define a trait in `transport/mod.rs`:
+
+```rust
+trait BgpTransport: Send + 'static {
+    async fn send(&mut self, msg: BgpMessage) -> io::Result<()>;
+    async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>>;
+}
+```
+
+Make `Session<T: BgpTransport>` generic over `T`. The public `spawn()` function stays
+non-generic — it constructs `Session<FramedBgpTransport>` internally where
+`FramedBgpTransport` wraps the existing `FramedRead` / `FramedWrite` pair. A
+`#[cfg(test)]` helper `spawn_with(config, transport: T)` enables test injection without
+touching the production call sites in `pathvectord`.
+
+Performance: pure static dispatch. Monomorphization means the production binary only
+ever sees `Session<FramedBgpTransport>` — zero vtable overhead, same codegen as today.
+`async fn` in traits is stable since Rust 1.75, well within MSRV 1.86.
+
+Note: `tokio::io::duplex()` is a good alternative for integration-style tests that want
+real framing without a real socket — wrap the duplex halves with `FramedRead` / `FramedWrite`
+and `BgpCodec`, giving `FramedBgpTransport` instances that can be handed to two `Session`s
+to simulate a full session handshake in memory. No mock trait needed for that test pattern.
+
 ---
 
 ## pathvector-bmp
