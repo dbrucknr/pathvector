@@ -137,6 +137,63 @@ cargo llvm-cov -p pathvector-policy --show-missing-lines
 
 ---
 
+## Interoperability testing
+
+Property tests and unit tests verify **internal consistency**: roundtrips, invariants, and RFC-cited edge cases. They cannot verify **interoperability correctness** — whether pathvector's wire behaviour matches what a real BGP implementation expects.
+
+The core risk: the integration tests in `tests/transport.rs` peer two pathvector instances against each other. Both sides share the same codec bugs. If the OPEN capability encoding is subtly wrong, or an UPDATE attribute ordering triggers a non-compliant NOTIFICATION, both sides will silently agree with each other and the tests will pass. Only a third-party speaker exposes those bugs.
+
+### Why this matters before adding features
+
+Interoperability correctness should be validated before extending the session or RIB layers further. Building ECMP, route reflection, or graceful restart on top of a codec that a real peer rejects wastes effort. The validation step is: establish a session, exchange routes, observe no unexpected NOTIFICATIONs.
+
+### Tool: GoBGP (native, not Docker)
+
+GoBGP is a pure Go binary with no system dependencies. Install it natively on macOS rather than via Docker — Docker on macOS runs inside a Linux VM and does not support `--network host`, which makes loopback BGP peering awkward.
+
+```bash
+go install github.com/osrg/gobgp/v4/cmd/gobgpd@latest
+go install github.com/osrg/gobgp/v4/cmd/gobgp@latest
+```
+
+### Minimal GoBGP configuration
+
+```toml
+# gobgp.toml
+[global.config]
+  as = 65001
+  router-id = "1.0.0.1"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "127.0.0.1"
+    peer-as = 65002
+```
+
+BGP uses port 179, which requires root on macOS:
+
+```bash
+sudo gobgpd -f gobgp.toml
+```
+
+pathvectord (once wired up) connects as AS 65002 from the same host. A successful test is: session reaches `Established`, routes announced by GoBGP appear in pathvector's Loc-RIB, and no unexpected NOTIFICATION messages are exchanged in either direction.
+
+### What to look for
+
+| Signal | Meaning |
+|---|---|
+| Session reaches `Established` | OPEN and capability negotiation are RFC-compliant |
+| No NOTIFICATION on UPDATE receipt | Path attribute encoding matches peer expectations |
+| `gobgp global rib` shows pathvector-announced routes | MP_REACH_NLRI and NLRI encoding are correct |
+| Hold timer maintained (keepalives exchanged) | Timer logic and KEEPALIVE encoding are correct |
+| Clean `Idle` on `ManualStop` | NOTIFICATION teardown is spec-compliant |
+
+### Second implementation: BIRD
+
+Once GoBGP passes, test against BIRD (`brew install bird`) as a second data point. BIRD is stricter about attribute ordering and optional attribute handling than GoBGP, which makes it a better stress test for codec edge cases.
+
+---
+
 ## Correctness approaches by concern
 
 ### Type safety
