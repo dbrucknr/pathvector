@@ -4,6 +4,9 @@
 //! over a real TCP connection. Call [`spawn`] to start a session task and
 //! interact with it via the returned [`SessionHandle`].
 
+#[cfg(test)]
+mod prop_tests;
+
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 

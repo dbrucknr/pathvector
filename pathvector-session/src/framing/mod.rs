@@ -124,6 +124,9 @@ impl Encoder<BgpMessage> for BgpCodec {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod prop_tests;
+
+#[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
 
