@@ -33,7 +33,7 @@ Sessions are either **iBGP** (internal — both routers are in the same AS) or *
                               Start
                                 │
                                 ▼
-                  ┌─────────── Idle ◄──────────────────────────────┐
+                  ┌─────────── Idle ◄───────────────────────────────┐
                   │                                                 │
               ConnectRetry                                       any error /
                   │                                             NOTIFICATION
@@ -91,7 +91,7 @@ Sent immediately after TCP is established. Both peers send their OPEN before wai
 The workhorse of BGP — carries route advertisements and withdrawals. A single UPDATE may advertise multiple prefixes that share the same path attributes, and simultaneously withdraw multiple prefixes.
 
 ```text
-┌── 2 bytes ──┐ ┌── variable ──┐ ┌── 2 bytes ──┐ ┌── variable ─────┐ ┌── variable ──┐
+┌── 2 bytes ──┐ ┌── variable ──┐ ┌── 2 bytes ──┐ ┌── variable ─────┐  ┌── variable ──┐
 │  Withdrawn  │ │   Withdrawn  │ │  Path Attr  │ │  Path Attributes │ │  Announced   │
 │  Routes Len │ │    NLRIs     │ │  Length     │ │  (TLV list)      │ │  NLRIs       │
 └─────────────┘ └──────────────┘ └─────────────┘ └──────────────────┘ └──────────────┘
@@ -214,7 +214,7 @@ Additional differences by session type:
                     TCP (port 179)
                          │
          ┌───────────────▼───────────────┐
-         │       pathvector-session       │
+         │       pathvector-session      │
          │                               │
          │  ┌─────────────────────────┐  │
          │  │  Message codec          │  │
@@ -225,7 +225,7 @@ Additional differences by session type:
          │              │                │
          │  ┌───────────▼─────────────┐  │
          │  │  BGP FSM                │  │
-         │  │  Idle → ... → Established│  │
+         │  │  Idle →...→ Established │  │
          │  │  Hold timer             │  │
          │  │  Capability negotiation │  │
          │  └───────────┬─────────────┘  │
@@ -234,15 +234,15 @@ Additional differences by session type:
                         │ + withdrawals
                         ▼
          ┌──────────────────────────────┐
-         │       pathvector-rib          │
-         │  AdjRibIn → LocRib →          │
-         │  best-path → AdjRibOut        │
+         │       pathvector-rib         │
+         │  AdjRibIn → LocRib →         │
+         │  best-path → AdjRibOut       │
          └──────────────┬───────────────┘
                         │ Route<A> from AdjRibOut
                         ▼
          ┌──────────────────────────────┐
-         │       pathvector-session      │
-         │  encode UPDATE messages       │
+         │       pathvector-session     │
+         │  encode UPDATE messages      │
          └──────────────┬───────────────┘
                         │
                     TCP (port 179)

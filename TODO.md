@@ -62,16 +62,22 @@ offer:
 
 ## pathvector-session
 
-Not yet started. Key work items:
+### Done
 
-- TCP connection management and MD5 authentication
-- BGP FSM: Idle → Connect → Active → OpenSent → OpenConfirm → Established
 - Message codec: OPEN, UPDATE, KEEPALIVE, NOTIFICATION, ROUTE-REFRESH
-- 4-byte ASN capability negotiation (RFC 6793) — `AS_TRANS` substitution and `AS4_PATH` / `AS4_AGGREGATOR` handling
-- Graceful restart capability (RFC 4724)
-- Route-refresh capability (RFC 2918)
 - NLRI parser: variable-length prefix encoding for IPv4 and IPv6
 - MP_REACH_NLRI / MP_UNREACH_NLRI for multiprotocol routes
+- 4-byte ASN capability — codec encoding/decoding, `AS_TRANS` substitution in FSM, `AS4_PATH` / `AS4_AGGREGATOR` handling
+- Graceful Restart and Route Refresh capability — codec parsing and encoding
+- BGP FSM: Idle → Connect → Active → OpenSent → OpenConfirm → Established (pure state machine, no I/O)
+
+### Remaining
+
+- Framing layer: tokio `Codec` that reads the 19-byte BGP header, uses the 2-byte length field to accumulate a complete message, then calls `BgpMessage::decode`
+- TCP transport: wire the framing layer and FSM together over a real TCP connection (port 179)
+- MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
+- Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
+- Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 
 ---
 

@@ -12,7 +12,9 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
+bytes            = { workspace = true }
 pathvector-types = { workspace = true }
+tokio-util       = { workspace = true }
 
 [lints]
 workspace = true
