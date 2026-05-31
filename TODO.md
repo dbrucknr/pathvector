@@ -4,7 +4,24 @@ Tracked items that are intentionally deferred — known gaps, planned features,
 and protocol steps that require components not yet built. Each entry notes
 which crate it belongs to and why it was deferred.
 
+- Add cargo fuzz, make sure to include proptest for each module. It's missing
+
 ---
+
+## General
+Download Relevant RFC's to each module.
+Generate a list of requirements from the RFC's.
+Check whether or not the each module currently meets these requirements.
+
+Add cargo fuzz testing to each module.
+- Should help us catch bugs, and possible security vulnerabilities.
+- We want to try to guarantee our system doesn't panic.
+
+Tests e2e
+  - We will use the RFC's to generate test cases for each module.
+  - I think the RFC's should provide .conf files (or otherwise) to define test scenarios. They will try to cover the requirements
+    specified in the RFC's.
+- We should also try and simulate adversarial inputs to the daemon to ensure it can handle unexpected situations.
 
 ## pathvector-rib
 
