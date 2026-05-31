@@ -534,9 +534,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "routemap"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48d3f030e8bc6adf7679e052d4e0dddb72e3fd618ce9705cf64963a7fa78979b"
+checksum = "2d99dd905480b540b0e39eef24e0957a281239d290e683f84a721a719edf07e1"
 dependencies = [
  "ipnetx",
 ]

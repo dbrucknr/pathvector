@@ -41,13 +41,10 @@ they require information the RIB layer does not yet have.
 
 ### Longest-prefix-match queries
 
-The current `LocRib` uses `HashMap<Nlri<A>, _>` keyed on exact prefixes.
-Real BGP implementations support longest-prefix-match queries (e.g. "which
-route covers `10.1.2.3`?") for forwarding decisions.
-
-Switch to [`routemap`](https://crates.io/crates/routemap) (already in the
-workspace dependencies) for the `best` map in `LocRib` to enable O(log n)
-LPM lookups.
+**Done.** `LocRib::best` now uses `RouteMap<A, (PeerId, Route<A>)>` (routemap 0.1.2)
+instead of `HashMap`. `LocRib::longest_match(addr: A)` exposes O(log n) LPM
+for forwarding lookups. Exact-prefix queries (`best`, `best_peer`) use the new
+`RouteMap::get` added in routemap 0.1.2.
 
 ### Multi-path (ECMP)
 

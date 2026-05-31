@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
+use routemap::RouteMap;
 
 use crate::{best_path::select_best, peer::PeerId, route::Route};
 
@@ -49,14 +50,14 @@ use crate::{best_path::select_best, peer::PeerId, route::Route};
 /// ```
 pub struct LocRib<A: IpAddress> {
     candidates: HashMap<Nlri<A>, HashMap<PeerId, Route<A>>>,
-    best: HashMap<Nlri<A>, (PeerId, Route<A>)>,
+    best: RouteMap<A, (PeerId, Route<A>)>,
 }
 
 impl<A: IpAddress> LocRib<A> {
     /// Creates an empty `LocRib`.
     #[must_use]
     pub fn new() -> Self {
-        Self { candidates: HashMap::new(), best: HashMap::new() }
+        Self { candidates: HashMap::new(), best: RouteMap::new() }
     }
 
     /// Inserts a route from `peer` into the candidate set and recomputes the
@@ -84,7 +85,7 @@ impl<A: IpAddress> LocRib<A> {
             peer_map.remove(peer);
             if peer_map.is_empty() {
                 self.candidates.remove(nlri);
-                self.best.remove(nlri);
+                self.best.remove(nlri.prefix());
             } else {
                 self.recompute_best(*nlri);
             }
@@ -115,21 +116,30 @@ impl<A: IpAddress> LocRib<A> {
     /// from among all peers that announced this prefix.
     #[must_use]
     pub fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        self.best.get(nlri).map(|(_, route)| route)
+        self.best.get(nlri.prefix()).map(|pair| &pair.1)
     }
 
     /// Returns the peer whose route is currently best for `nlri`.
     #[must_use]
     pub fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        self.best.get(nlri).map(|(peer, _)| *peer)
+        self.best.get(nlri.prefix()).map(|pair| pair.0)
     }
 
     /// Iterates over all `(prefix, best_route)` pairs.
     ///
     /// Useful for building `AdjRibOut` — iterate this, apply export policy,
     /// and insert accepted routes into the peer's outbound table.
-    pub fn best_routes(&self) -> impl Iterator<Item = (&Nlri<A>, &Route<A>)> {
-        self.best.iter().map(|(n, (_, r))| (n, r))
+    pub fn best_routes(&self) -> impl Iterator<Item = (Nlri<A>, &Route<A>)> {
+        self.best.iter().map(|(prefix, pair)| (Nlri::from_prefix(prefix), &pair.1))
+    }
+
+    /// Returns the best route whose prefix most specifically covers `addr`.
+    ///
+    /// This is the forwarding lookup — the same route the data plane would use
+    /// to forward a packet destined for `addr`.
+    #[must_use]
+    pub fn longest_match(&self, addr: A) -> Option<&Route<A>> {
+        self.best.longest_match(addr).map(|pair| &pair.1)
     }
 
     /// Returns all candidate routes for `nlri`, keyed by peer.
@@ -155,9 +165,9 @@ impl<A: IpAddress> LocRib<A> {
     fn recompute_best(&mut self, nlri: Nlri<A>) {
         if let Some(peer_map) = self.candidates.get(&nlri) {
             if let Some((peer, route)) = select_best(peer_map) {
-                self.best.insert(nlri, (peer, route.clone()));
+                self.best.insert(nlri.prefix(), (peer, route.clone()));
             } else {
-                self.best.remove(&nlri);
+                self.best.remove(nlri.prefix());
             }
         }
     }
@@ -344,6 +354,20 @@ mod tests {
         rib.recompute_best(n);
 
         assert!(rib.best(&n).is_none());
+    }
+
+    #[test]
+    fn test_loc_rib_longest_match() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(peer(1), route("10.0.0.0/8"));
+        rib.insert(peer(2), route("10.20.0.0/16"));
+
+        // /16 is more specific than /8
+        assert!(rib.longest_match(Ipv4Addr::new(10, 20, 5, 1)).is_some());
+        // falls back to /8
+        assert!(rib.longest_match(Ipv4Addr::new(10, 99, 0, 1)).is_some());
+        // no match
+        assert!(rib.longest_match(Ipv4Addr::new(192, 168, 1, 1)).is_none());
     }
 
     #[test]
