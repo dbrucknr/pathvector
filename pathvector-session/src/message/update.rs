@@ -5,9 +5,9 @@ use pathvector_types::{
     LargeCommunity, NextHop, Nlri, Origin, Safi,
 };
 
-use super::{Cursor, Writer};
 use super::error::CodecError;
-use super::header::{encode_header, MessageType};
+use super::header::{MessageType, encode_header};
+use super::{Cursor, Writer};
 
 // ── Path attribute flag bits ─────────────────────────────────────────────────
 
@@ -82,7 +82,11 @@ impl UpdateMessage {
         // Announced NLRIs (remainder of the message).
         let announced = decode_nlri_list_v4(cur)?;
 
-        Ok(Self { withdrawn, attributes, announced })
+        Ok(Self {
+            withdrawn,
+            attributes,
+            announced,
+        })
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
@@ -118,19 +122,19 @@ fn decode_nlri_list_v4(cur: &mut Cursor<'_>) -> Result<Vec<Nlri<Ipv4Addr>>, Code
     Ok(out)
 }
 
-/// Decode a single variable-length IPv4 NLRI: prefix_len (1 byte) followed
+/// Decode a single variable-length IPv4 NLRI: `prefix_len` (1 byte) followed
 /// by `ceil(prefix_len / 8)` address bytes (only significant bytes are sent).
 fn decode_nlri_v4(cur: &mut Cursor<'_>) -> Result<Nlri<Ipv4Addr>, CodecError> {
     let prefix_len = cur.read_u8()?;
     if prefix_len > 32 {
         return Err(CodecError::InvalidNlri { prefix_len });
     }
-    let byte_count = ((prefix_len as usize) + 7) / 8;
+    let byte_count = (prefix_len as usize).div_ceil(8);
     let addr_bytes = cur.read_bytes(byte_count)?;
     let mut octets = [0u8; 4];
     octets[..byte_count].copy_from_slice(addr_bytes);
     Nlri::new(Ipv4Addr::from(octets), prefix_len)
-        .map(|n| n.masked())
+        .map(Nlri::masked)
         .map_err(|_| CodecError::InvalidNlri { prefix_len })
 }
 
@@ -140,12 +144,12 @@ fn decode_nlri_v6(cur: &mut Cursor<'_>) -> Result<Nlri<Ipv6Addr>, CodecError> {
     if prefix_len > 128 {
         return Err(CodecError::InvalidNlri { prefix_len });
     }
-    let byte_count = ((prefix_len as usize) + 7) / 8;
+    let byte_count = (prefix_len as usize).div_ceil(8);
     let addr_bytes = cur.read_bytes(byte_count)?;
     let mut octets = [0u8; 16];
     octets[..byte_count].copy_from_slice(addr_bytes);
     Nlri::new(Ipv6Addr::from(octets), prefix_len)
-        .map(|n| n.masked())
+        .map(Nlri::masked)
         .map_err(|_| CodecError::InvalidNlri { prefix_len })
 }
 
@@ -157,16 +161,16 @@ fn decode_nlri_list_v6(cur: &mut Cursor<'_>) -> Result<Vec<Nlri<Ipv6Addr>>, Code
     Ok(out)
 }
 
-fn encode_nlri_v4(w: &mut Writer, nlri: &Nlri<Ipv4Addr>) {
+fn encode_nlri_v4(w: &mut Writer, nlri: Nlri<Ipv4Addr>) {
     let prefix_len = nlri.prefix_len();
-    let byte_count = ((prefix_len as usize) + 7) / 8;
+    let byte_count = (prefix_len as usize).div_ceil(8);
     w.put_u8(prefix_len);
     w.put_slice(&nlri.prefix().ip().octets()[..byte_count]);
 }
 
 fn encode_nlri_v6(w: &mut Writer, nlri: &Nlri<Ipv6Addr>) {
     let prefix_len = nlri.prefix_len();
-    let byte_count = ((prefix_len as usize) + 7) / 8;
+    let byte_count = (prefix_len as usize).div_ceil(8);
     w.put_u8(prefix_len);
     w.put_slice(&nlri.prefix().ip().octets()[..byte_count]);
 }
@@ -174,7 +178,7 @@ fn encode_nlri_v6(w: &mut Writer, nlri: &Nlri<Ipv6Addr>) {
 fn encode_nlri_list_v4(nlris: &[Nlri<Ipv4Addr>]) -> Vec<u8> {
     let mut w = Writer::new();
     for nlri in nlris {
-        encode_nlri_v4(&mut w, nlri);
+        encode_nlri_v4(&mut w, *nlri);
     }
     w.finish()
 }
@@ -201,6 +205,7 @@ fn decode_one_path_attr(cur: &mut Cursor<'_>) -> Result<PathAttribute, CodecErro
     decode_attr_value(flags, type_code, &mut val)
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_attr_value(
     flags: u8,
     type_code: u8,
@@ -371,12 +376,16 @@ fn decode_attr_value(
 
         _ => {
             let value = cur.read_remaining().to_vec();
-            Ok(PathAttribute::Unknown { flags, type_code, value })
+            Ok(PathAttribute::Unknown {
+                flags,
+                type_code,
+                value,
+            })
         }
     }
 }
 
-/// Decode AS_PATH or AS4_PATH segments (always 4-byte ASNs).
+/// Decode `AS_PATH` or `AS4_PATH` segments (always 4-byte ASNs).
 fn decode_as_path_segments(cur: &mut Cursor<'_>) -> Result<Vec<AsPathSegment>, CodecError> {
     let mut segments = Vec::new();
     while cur.remaining() > 0 {
@@ -404,13 +413,13 @@ fn decode_as_path_segments(cur: &mut Cursor<'_>) -> Result<Vec<AsPathSegment>, C
     Ok(segments)
 }
 
-/// Decode the NEXT_HOP value from MP_REACH_NLRI based on the AFI and byte
+/// Decode the `NEXT_HOP` value from `MP_REACH_NLRI` based on the `AFI` and byte
 /// length of the next-hop field.
 fn decode_next_hop(afi: Afi, bytes: &[u8]) -> Result<NextHop, CodecError> {
     match (afi, bytes.len()) {
-        (Afi::IPV4, 4) => {
-            Ok(NextHop::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])))
-        }
+        (Afi::IPV4, 4) => Ok(NextHop::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
         (Afi::IPV6, 16) => {
             let arr: [u8; 16] = bytes.try_into().expect("read exactly 16 bytes");
             Ok(NextHop::V6(Ipv6Addr::from(arr)))
@@ -430,12 +439,18 @@ fn decode_next_hop(afi: Afi, bytes: &[u8]) -> Result<NextHop, CodecError> {
     }
 }
 
-/// Decode the NLRI list in MP_REACH or MP_UNREACH based on the AFI.
+/// Decode the NLRI list in `MP_REACH` or `MP_UNREACH` based on the AFI.
 fn decode_mp_nlri(afi: Afi, cur: &mut Cursor<'_>) -> Result<Vec<Prefix>, CodecError> {
     if afi == Afi::IPV4 {
-        Ok(decode_nlri_list_v4(cur)?.into_iter().map(Prefix::V4).collect())
+        Ok(decode_nlri_list_v4(cur)?
+            .into_iter()
+            .map(Prefix::V4)
+            .collect())
     } else if afi == Afi::IPV6 {
-        Ok(decode_nlri_list_v6(cur)?.into_iter().map(Prefix::V6).collect())
+        Ok(decode_nlri_list_v6(cur)?
+            .into_iter()
+            .map(Prefix::V6)
+            .collect())
     } else {
         // For unknown AFIs, consume the remaining bytes without parsing.
         let _raw = cur.read_remaining();
@@ -472,9 +487,7 @@ fn encode_one_path_attr(w: &mut Writer, attr: &PathAttribute) {
 
 fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
     match attr {
-        PathAttribute::Origin(origin) => {
-            (FLAGS_WKM, ATTR_ORIGIN, vec![origin.as_u8()])
-        }
+        PathAttribute::Origin(origin) => (FLAGS_WKM, ATTR_ORIGIN, vec![origin.as_u8()]),
 
         PathAttribute::AsPath(path) => {
             let mut v = Writer::new();
@@ -482,21 +495,13 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             (FLAGS_WKM, ATTR_AS_PATH, v.finish())
         }
 
-        PathAttribute::NextHop(ip) => {
-            (FLAGS_WKM, ATTR_NEXT_HOP, ip.octets().to_vec())
-        }
+        PathAttribute::NextHop(ip) => (FLAGS_WKM, ATTR_NEXT_HOP, ip.octets().to_vec()),
 
-        PathAttribute::Med(med) => {
-            (FLAGS_ONT, ATTR_MED, med.to_be_bytes().to_vec())
-        }
+        PathAttribute::Med(med) => (FLAGS_ONT, ATTR_MED, med.to_be_bytes().to_vec()),
 
-        PathAttribute::LocalPref(lp) => {
-            (FLAGS_WKM, ATTR_LOCAL_PREF, lp.to_be_bytes().to_vec())
-        }
+        PathAttribute::LocalPref(lp) => (FLAGS_WKM, ATTR_LOCAL_PREF, lp.to_be_bytes().to_vec()),
 
-        PathAttribute::AtomicAggregate => {
-            (FLAGS_WKM, ATTR_ATOMIC_AGGREGATE, vec![])
-        }
+        PathAttribute::AtomicAggregate => (FLAGS_WKM, ATTR_ATOMIC_AGGREGATE, vec![]),
 
         PathAttribute::Aggregator(agg) => {
             let mut v = Writer::new();
@@ -524,7 +529,7 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             v.put_u8(0); // SNPA (reserved, must be 0)
             for prefix in &mp.prefixes {
                 match prefix {
-                    Prefix::V4(n) => encode_nlri_v4(&mut v, n),
+                    Prefix::V4(n) => encode_nlri_v4(&mut v, *n),
                     Prefix::V6(n) => encode_nlri_v6(&mut v, n),
                 }
             }
@@ -537,7 +542,7 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             v.put_u8(mp.afi_safi.safi.as_u8());
             for prefix in &mp.prefixes {
                 match prefix {
-                    Prefix::V4(n) => encode_nlri_v4(&mut v, n),
+                    Prefix::V4(n) => encode_nlri_v4(&mut v, *n),
                     Prefix::V6(n) => encode_nlri_v6(&mut v, n),
                 }
             }
@@ -575,9 +580,11 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             (FLAGS_OT, ATTR_LARGE_COMMUNITY, v.finish())
         }
 
-        PathAttribute::Unknown { flags, type_code, value } => {
-            (*flags, *type_code, value.clone())
-        }
+        PathAttribute::Unknown {
+            flags,
+            type_code,
+            value,
+        } => (*flags, *type_code, value.clone()),
     }
 }
 
@@ -658,7 +665,11 @@ pub enum PathAttribute {
     LargeCommunities(Vec<LargeCommunity>),
     /// Any unrecognised attribute. Flags and value are preserved intact so
     /// optional-transitive attributes can be forwarded to the next hop.
-    Unknown { flags: u8, type_code: u8, value: Vec<u8> },
+    Unknown {
+        flags: u8,
+        type_code: u8,
+        value: Vec<u8>,
+    },
 }
 
 /// Reachable prefixes for a specific AFI/SAFI, carried in `MP_REACH_NLRI`.
@@ -869,12 +880,7 @@ mod tests {
 
     #[test]
     fn test_invalid_origin_rejected() {
-        let body: &[u8] = &[
-            0x00, 0x00,
-            0x00, 0x04,
-            FLAGS_WKM, ATTR_ORIGIN, 0x01,
-            99,
-        ];
+        let body: &[u8] = &[0x00, 0x00, 0x00, 0x04, FLAGS_WKM, ATTR_ORIGIN, 0x01, 99];
         let mut cur = Cursor::new(body);
         assert!(matches!(
             UpdateMessage::decode(&mut cur),
@@ -1183,10 +1189,10 @@ mod tests {
         // AFI=IPv4, SAFI=1, nh_len=3 (not 4 → decode_next_hop fails).
         let mp_body: &[u8] = &[
             0x00, 0x01, // AFI = IPv4
-            0x01,       // SAFI = unicast
-            0x03,       // nh_len = 3
-            10, 0, 0,   // 3 next-hop bytes (should be 4)
-            0x00,       // SNPA
+            0x01, // SAFI = unicast
+            0x03, // nh_len = 3
+            10, 0, 0,    // 3 next-hop bytes (should be 4)
+            0x00, // SNPA
         ];
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, mp_body);
         assert!(matches!(
