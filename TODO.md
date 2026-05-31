@@ -91,6 +91,7 @@ offer:
 ### Remaining
 
 - MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
+- BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 
@@ -132,6 +133,7 @@ schema is finalised. Will contain generated client stubs so users and the
 ## Cross-cutting
 
 - CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.86)
+- Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range
 - Fuzz testing for the session codec (OPEN/UPDATE parsing are attack surface)
 - Benchmark suite for `LocRib` insert/best-path under realistic prefix volumes
   (100k IPv4 prefixes, M2 Max baseline)

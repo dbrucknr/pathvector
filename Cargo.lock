@@ -336,6 +336,7 @@ dependencies = [
  "bytes",
  "futures",
  "pathvector-types",
+ "proptest",
  "tokio",
  "tokio-util",
 ]
