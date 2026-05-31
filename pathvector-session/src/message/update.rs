@@ -869,19 +869,343 @@ mod tests {
 
     #[test]
     fn test_invalid_origin_rejected() {
-        // Build a raw UPDATE with an ORIGIN value of 99.
-        // Withdrawn len(2) + attrs len(2) + flags(1) + type(1) + len(1) + value(1) = 8 bytes.
-        // attrs_len covers only the attribute bytes: flags(1)+type(1)+len(1)+value(1) = 4.
         let body: &[u8] = &[
-            0x00, 0x00,                   // withdrawn_len = 0
-            0x00, 0x04,                   // attrs_len = 4
-            FLAGS_WKM, ATTR_ORIGIN, 0x01, // flags, type, length=1
-            99,                           // ORIGIN = 99 (invalid)
+            0x00, 0x00,
+            0x00, 0x04,
+            FLAGS_WKM, ATTR_ORIGIN, 0x01,
+            99,
         ];
         let mut cur = Cursor::new(body);
         assert!(matches!(
             UpdateMessage::decode(&mut cur),
             Err(CodecError::InvalidOrigin(99))
+        ));
+    }
+
+    // ── Missing roundtrip coverage ────────────────────────────────────────────
+
+    #[test]
+    fn test_extended_communities_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::ExtendedCommunities(vec![
+                ExtendedCommunity::from_bytes([0x00, 0x02, 0xFF, 0xE9, 0x00, 0x00, 0x00, 0x64]),
+            ])],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_as4_path_roundtrip() {
+        let path = AsPath::from_sequence(vec![Asn::new(131072), Asn::new(131073)]);
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::As4Path(path)],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_as4_aggregator_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::As4Aggregator {
+                asn: 131072,
+                bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+            }],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_mp_reach_ipv4_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpReachNlri(MpReachNlri {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                next_hop: NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                prefixes: vec![Prefix::V4(nlri4("10.0.0.0/8"))],
+            })],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_mp_reach_ipv6_link_local_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpReachNlri(MpReachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                next_hop: NextHop::V6WithLinkLocal {
+                    global: "2001:db8::1".parse().unwrap(),
+                    link_local: "fe80::1".parse().unwrap(),
+                },
+                prefixes: vec![Prefix::V6(nlri6("2001:db8::/32"))],
+            })],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_mp_unreach_ipv4_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                prefixes: vec![Prefix::V4(nlri4("10.0.0.0/8"))],
+            })],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_as_path_confed_segments_roundtrip() {
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001), Asn::new(65002)]),
+            AsPathSegment::ConfedSet(vec![Asn::new(65003)]),
+        ]);
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::AsPath(path)],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_extended_length_encode_path() {
+        // 65 communities × 4 bytes = 260 bytes → encode_one_path_attr uses ext-len.
+        let communities: Vec<Community> = (0u32..65).map(Community::new).collect();
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::Communities(communities)],
+            announced: vec![],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    // ── Raw-byte decode helpers ───────────────────────────────────────────────
+
+    fn decode_update(body: &[u8]) -> Result<UpdateMessage, CodecError> {
+        let mut cur = Cursor::new(body);
+        UpdateMessage::decode(&mut cur)
+    }
+
+    /// Build an UPDATE body: no withdrawn routes, one path attribute (short len).
+    fn update_with_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
+        let attr_total = 3 + value.len(); // flags + type + 1-byte len + value
+        let mut body = vec![0u8, 0]; // withdrawn_len = 0
+        body.extend_from_slice(&(attr_total as u16).to_be_bytes());
+        body.push(flags);
+        body.push(type_code);
+        body.push(value.len() as u8);
+        body.extend_from_slice(value);
+        body
+    }
+
+    /// Build an UPDATE body using the extended-length (2-byte) flag.
+    fn update_with_ext_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
+        let attr_total = 4 + value.len(); // flags + type + 2-byte len + value
+        let mut body = vec![0u8, 0];
+        body.extend_from_slice(&(attr_total as u16).to_be_bytes());
+        body.push(flags | FLAG_EXT_LEN);
+        body.push(type_code);
+        body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        body.extend_from_slice(value);
+        body
+    }
+
+    // ── NLRI error paths ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_invalid_ipv4_nlri_prefix_too_long() {
+        // withdrawn prefix_len = 33 (> 32 for IPv4).
+        let body: &[u8] = &[0x00, 0x02, 33, 0x00, 0x00, 0x00];
+        assert!(matches!(
+            decode_update(body),
+            Err(CodecError::InvalidNlri { prefix_len: 33 })
+        ));
+    }
+
+    #[test]
+    fn test_invalid_ipv6_nlri_prefix_too_long() {
+        // MP_UNREACH NLRI with IPv6 prefix_len = 129 (> 128).
+        let mp_body: &[u8] = &[0x00, 0x02, 0x01, 129, 0x00]; // AFI=2 IPv6, SAFI=1, pfx_len=129
+        let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, mp_body);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidNlri { prefix_len: 129 })
+        ));
+    }
+
+    // ── Extended-length attribute ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extended_length_origin_attribute() {
+        let body = update_with_ext_attr(FLAGS_WKM, ATTR_ORIGIN, &[0u8]); // ORIGIN=IGP
+        let update = decode_update(&body).unwrap();
+        assert!(matches!(update.attributes[0], PathAttribute::Origin(_)));
+    }
+
+    // ── Path attribute error paths ────────────────────────────────────────────
+
+    #[test]
+    fn test_origin_too_short_is_error() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_ORIGIN, &[]);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn test_next_hop_too_short_is_error() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_NEXT_HOP, &[10, 0, 0]); // 3 bytes, needs 4
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn test_med_too_short_is_error() {
+        let body = update_with_attr(FLAGS_ONT, ATTR_MED, &[0u8; 3]);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn test_local_pref_too_short_is_error() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_LOCAL_PREF, &[0u8; 3]);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn test_aggregator_too_short_is_error() {
+        let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &[0u8; 7]); // needs 8
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn test_community_bad_length_is_error() {
+        let body = update_with_attr(FLAGS_OT, ATTR_COMMUNITY, &[0u8; 3]); // not multiple of 4
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn test_mp_reach_nlri_too_short_is_error() {
+        let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, &[0x00, 0x01]); // only 2 bytes
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 14, .. })
+        ));
+    }
+
+    #[test]
+    fn test_mp_unreach_nlri_too_short_is_error() {
+        let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, &[0x00]); // only 1 byte
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 15, .. })
+        ));
+    }
+
+    #[test]
+    fn test_extended_communities_bad_length_is_error() {
+        let body = update_with_attr(FLAGS_OT, ATTR_EXTENDED_COMMUNITIES, &[0u8; 7]); // not multiple of 8
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 16, .. })
+        ));
+    }
+
+    #[test]
+    fn test_as4_aggregator_too_short_is_error() {
+        let body = update_with_attr(FLAGS_OT, ATTR_AS4_AGGREGATOR, &[0u8; 7]); // needs 8
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 18, .. })
+        ));
+    }
+
+    #[test]
+    fn test_large_community_bad_length_is_error() {
+        let body = update_with_attr(FLAGS_OT, ATTR_LARGE_COMMUNITY, &[0u8; 11]); // not multiple of 12
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 32, .. })
+        ));
+    }
+
+    // ── AS_PATH error and edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_unknown_as_path_segment_type_is_error() {
+        // seg_type=9 (unknown), count=0
+        let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[9, 0]);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::UnknownAsPathSegmentType(9))
+        ));
+    }
+
+    #[test]
+    fn test_truncated_asn_in_as_path_is_error() {
+        // SEG_SEQUENCE, count=2, but only 4 bytes (enough for 1 ASN, not 2).
+        let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[2, 2, 0, 0, 0x00, 0x01]);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 2, .. })
+        ));
+    }
+
+    // ── MP_REACH next-hop error paths ─────────────────────────────────────────
+
+    #[test]
+    fn test_mp_reach_invalid_next_hop_length_is_error() {
+        // AFI=IPv4, SAFI=1, nh_len=3 (not 4 → decode_next_hop fails).
+        let mp_body: &[u8] = &[
+            0x00, 0x01, // AFI = IPv4
+            0x01,       // SAFI = unicast
+            0x03,       // nh_len = 3
+            10, 0, 0,   // 3 next-hop bytes (should be 4)
+            0x00,       // SNPA
+        ];
+        let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, mp_body);
+        assert!(matches!(
+            decode_update(&body),
+            Err(CodecError::InvalidAttribute { type_code: 14, .. })
+        ));
+    }
+
+    // ── Unknown AFI in MP_UNREACH → decode_mp_nlri else branch ───────────────
+
+    #[test]
+    fn test_mp_unreach_unknown_afi_produces_empty_prefixes() {
+        // AFI=9 (unknown), no further NLRI bytes.
+        let mp_body: &[u8] = &[0x00, 0x09, 0x01]; // AFI=9, SAFI=1
+        let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, mp_body);
+        let update = decode_update(&body).unwrap();
+        assert!(matches!(
+            &update.attributes[0],
+            PathAttribute::MpUnreachNlri(mp) if mp.prefixes.is_empty()
         ));
     }
 }

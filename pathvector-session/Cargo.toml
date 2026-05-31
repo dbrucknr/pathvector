@@ -18,5 +18,8 @@ pathvector-types = { workspace = true }
 tokio            = { workspace = true }
 tokio-util       = { workspace = true }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
+
 [lints]
 workspace = true

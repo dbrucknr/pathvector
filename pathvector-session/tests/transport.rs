@@ -13,6 +13,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
+    UpdateMessage,
 };
 use pathvector_session::transport::{SessionConfig, SessionEvent, spawn};
 
@@ -209,6 +210,189 @@ async fn test_connect_retry_on_refused_connection() {
     // We expect a timeout (no event yet) because the retry timer is 120s.
     // The session is alive and waiting — not erroring out.
     assert!(result.is_err(), "expected timeout waiting for event on refused connection");
+}
+
+// ── Short-timer config for timer-expiry tests ─────────────────────────────────
+//
+// Hold time = 3 s (minimum valid) → keepalive interval = 1 s.
+// Tests that need timers to fire use this config and wait with real time.
+
+fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
+    SessionConfig {
+        local_as: 65001,
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        hold_time: 3,
+        capabilities: vec![Capability::FourByteAsn(65001)],
+        peer_as: Some(65002),
+        peer_addr,
+    }
+}
+
+/// Handshake helper that sends `hold_time = 3` from the peer side.
+async fn accept_and_handshake_short(
+    listener: TcpListener,
+) -> (
+    FramedRead<tokio::net::tcp::OwnedReadHalf, BgpCodec>,
+    FramedWrite<tokio::net::tcp::OwnedWriteHalf, BgpCodec>,
+) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let (r, w) = stream.into_split();
+    let mut reader = FramedRead::new(r, BgpCodec);
+    let mut writer = FramedWrite::new(w, BgpCodec);
+
+    let msg = reader.next().await.unwrap().unwrap();
+    assert!(matches!(msg, BgpMessage::Open(_)));
+
+    writer.send(peer_open(65002, 3)).await.unwrap();
+
+    let msg = reader.next().await.unwrap().unwrap();
+    assert!(matches!(msg, BgpMessage::Keepalive));
+
+    writer.send(BgpMessage::Keepalive).await.unwrap();
+
+    (reader, writer)
+}
+
+// ── RouteUpdate event ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_update_message_emits_route_update_event() {
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (mut _reader, mut writer) = accept_and_handshake(listener).await;
+        let update = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        });
+        writer.send(update).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for RouteUpdate")
+        .expect("session exited");
+    assert!(
+        matches!(event, SessionEvent::RouteUpdate(_)),
+        "expected RouteUpdate, got {event:?}"
+    );
+
+    peer.abort();
+}
+
+// ── Keepalive timer fires ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_keepalive_timer_fires_sends_keepalive_to_peer() {
+    // hold_time=3 → keepalive interval=1 s; wait up to 3 s for it to fire.
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (mut reader, _writer) = accept_and_handshake_short(listener).await;
+        // First message after Established should be a KEEPALIVE from the session's
+        // keepalive timer (fires after 1 s).
+        let msg = tokio::time::timeout(Duration::from_secs(3), reader.next())
+            .await
+            .expect("timed out waiting for KEEPALIVE from session")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(msg, BgpMessage::Keepalive),
+            "expected KEEPALIVE from session timer, got {msg:?}"
+        );
+    });
+
+    let mut handle = spawn(short_timer_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    peer.await.expect("peer task panicked");
+}
+
+// ── Hold timer fires ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_hold_timer_fires_terminates_session() {
+    // hold_time=3 s; peer sends no KEEPALIVEs after the handshake, so the hold
+    // timer fires at 3 s and the session sends a NOTIFICATION then terminates.
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (mut reader, _writer) = accept_and_handshake_short(listener).await;
+        // Drain KEEPALIVEs (from session's keepalive timer), then wait for
+        // NOTIFICATION when the hold timer fires.
+        loop {
+            match reader.next().await {
+                Some(Ok(BgpMessage::Keepalive)) => continue,
+                Some(Ok(BgpMessage::Notification(_))) | None => break,
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    });
+
+    let mut handle = spawn(short_timer_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    // Hold timer fires at 3 s (peer is not sending KEEPALIVEs).
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for Terminated")
+        .expect("session exited");
+    assert!(
+        matches!(event, SessionEvent::Terminated),
+        "expected Terminated, got {event:?}"
+    );
+
+    peer.await.expect("peer task panicked");
+}
+
+// ── Stop while connecting (abort pending connect task, covers line 261) ───────
+
+#[tokio::test]
+async fn test_stop_while_connecting_aborts_pending_task() {
+    let (listener, addr) = loopback_listener().await;
+    drop(listener); // Nothing listening — first connect is refused quickly.
+
+    let mut handle = spawn(local_config(addr));
+    // Buffer both Start and Stop before the session processes either.
+    // The biased select! ensures ManualStop is processed before recv_connect
+    // (even if the TCP refusal is already ready), so drop_connection is called
+    // while connect_task is still Some — covering the t.abort() path.
+    handle.start().await;
+    handle.stop().await;
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    let result = tokio::time::timeout(Duration::from_millis(300), handle.next_event()).await;
+    if let Ok(Some(event)) = result {
+        assert!(
+            !matches!(event, SessionEvent::Established(_)),
+            "should not establish after immediate stop"
+        );
+    }
 }
 
 #[tokio::test]

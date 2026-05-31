@@ -321,4 +321,93 @@ mod tests {
         let encoded = msg.encode();
         assert!(encoded[..16].iter().all(|&b| b == 0xFF));
     }
+
+    // ── MessageHeader subcodes ────────────────────────────────────────────────
+
+    #[test]
+    fn test_msg_header_error_roundtrips() {
+        let cases = [
+            NotificationError::MessageHeader(MsgHeaderError::ConnectionNotSynchronized),
+            NotificationError::MessageHeader(MsgHeaderError::BadMessageLength),
+            NotificationError::MessageHeader(MsgHeaderError::BadMessageType),
+            NotificationError::MessageHeader(MsgHeaderError::Unknown(9)),
+        ];
+        for error in cases {
+            let msg = NotificationMessage { error, data: vec![] };
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    // ── OpenMessage subcodes ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_open_msg_error_roundtrips() {
+        let cases = [
+            NotificationError::OpenMessage(OpenMsgError::UnsupportedVersionNumber),
+            NotificationError::OpenMessage(OpenMsgError::BadPeerAs),
+            NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
+            NotificationError::OpenMessage(OpenMsgError::UnsupportedOptionalParameter),
+            NotificationError::OpenMessage(OpenMsgError::UnacceptableHoldTime),
+            NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability),
+            NotificationError::OpenMessage(OpenMsgError::Unknown(9)),
+        ];
+        for error in cases {
+            let msg = NotificationMessage { error, data: vec![] };
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    // ── FsmError ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fsm_error_roundtrip() {
+        let msg = NotificationMessage { error: NotificationError::FsmError, data: vec![] };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    // ── UpdateMessage subcodes ────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_msg_error_all_variants_roundtrip() {
+        let cases = [
+            NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+            NotificationError::UpdateMessage(UpdateMsgError::UnrecognizedWellKnownAttribute),
+            NotificationError::UpdateMessage(UpdateMsgError::MissingWellKnownAttribute),
+            NotificationError::UpdateMessage(UpdateMsgError::AttributeFlagsError),
+            NotificationError::UpdateMessage(UpdateMsgError::AttributeLengthError),
+            NotificationError::UpdateMessage(UpdateMsgError::InvalidOriginAttribute),
+            NotificationError::UpdateMessage(UpdateMsgError::InvalidNextHopAttribute),
+            NotificationError::UpdateMessage(UpdateMsgError::OptionalAttributeError),
+            NotificationError::UpdateMessage(UpdateMsgError::InvalidNetworkField),
+            NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+            NotificationError::UpdateMessage(UpdateMsgError::Unknown(99)),
+        ];
+        for error in cases {
+            let msg = NotificationMessage { error, data: vec![] };
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    // ── Cease subcodes ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cease_all_variants_roundtrip() {
+        let cases = [
+            NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+            NotificationError::Cease(CeaseError::AdministrativeShutdown),
+            NotificationError::Cease(CeaseError::PeerDeconfigured),
+            NotificationError::Cease(CeaseError::AdministrativeReset),
+            NotificationError::Cease(CeaseError::ConnectionRejected),
+            NotificationError::Cease(CeaseError::OtherConfigurationChange),
+            NotificationError::Cease(CeaseError::ConnectionCollisionResolution),
+            NotificationError::Cease(CeaseError::OutOfResources),
+            NotificationError::Cease(CeaseError::HardReset),
+            NotificationError::Cease(CeaseError::BfdDown),
+            NotificationError::Cease(CeaseError::Unknown(42)),
+        ];
+        for error in cases {
+            let msg = NotificationMessage { error, data: vec![] };
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
 }

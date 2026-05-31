@@ -75,4 +75,60 @@ mod tests {
         let e: &dyn std::error::Error = &CodecError::InvalidMarker;
         assert!(e.source().is_none());
     }
+
+    #[test]
+    fn test_error_display_invalid_length() {
+        assert_eq!(CodecError::InvalidLength(100).to_string(), "invalid message length: 100");
+    }
+
+    #[test]
+    fn test_error_display_unknown_message_type() {
+        assert_eq!(CodecError::UnknownMessageType(9).to_string(), "unknown message type: 9");
+    }
+
+    #[test]
+    fn test_error_display_unsupported_version() {
+        assert_eq!(
+            CodecError::UnsupportedVersion(3).to_string(),
+            "unsupported BGP version: 3 (expected 4)"
+        );
+    }
+
+    #[test]
+    fn test_error_display_unknown_as_path_segment_type() {
+        assert_eq!(
+            CodecError::UnknownAsPathSegmentType(5).to_string(),
+            "unknown AS_PATH segment type: 5"
+        );
+    }
+
+    #[test]
+    fn test_error_display_invalid_origin() {
+        assert_eq!(
+            CodecError::InvalidOrigin(9).to_string(),
+            "invalid ORIGIN value: 9 (expected 0\u{2013}2)"
+        );
+    }
+
+    #[test]
+    fn test_error_display_invalid_capability() {
+        assert_eq!(
+            CodecError::InvalidCapability { code: 64 }.to_string(),
+            "malformed capability TLV for code 64"
+        );
+    }
+
+    #[test]
+    fn test_error_display_invalid_attribute() {
+        let e = CodecError::InvalidAttribute { type_code: 3, detail: "NEXT_HOP must be 4 bytes" };
+        assert_eq!(e.to_string(), "invalid path attribute 3: NEXT_HOP must be 4 bytes");
+    }
+
+    #[test]
+    fn test_error_display_invalid_nlri() {
+        assert_eq!(
+            CodecError::InvalidNlri { prefix_len: 33 }.to_string(),
+            "NLRI prefix length 33 is out of range"
+        );
+    }
 }

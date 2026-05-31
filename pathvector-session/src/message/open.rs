@@ -339,4 +339,76 @@ mod tests {
         // header(19) + version(1) + my_as(2) + hold_time(2) + bgp_id(4) + opt_len(1) = 29.
         assert_eq!(base_open().encode().len(), 29);
     }
+
+    /// Build an OPEN body with a custom optional-parameter byte string.
+    fn open_with_raw_opt_params(opt_params: &[u8]) -> Vec<u8> {
+        let mut body: Vec<u8> = vec![
+            4,             // version
+            0xFF, 0xE9,    // my_as = 65001
+            0x00, 0x5A,    // hold_time = 90
+            10, 0, 0, 1,   // bgp_id
+        ];
+        body.push(opt_params.len() as u8);
+        body.extend_from_slice(opt_params);
+        body
+    }
+
+    fn decode_open_body(body: &[u8]) -> Result<OpenMessage, CodecError> {
+        let mut cur = Cursor::new(body);
+        OpenMessage::decode(&mut cur)
+    }
+
+    #[test]
+    fn test_unknown_opt_param_type_is_skipped() {
+        // param_type=99 (unknown) should be silently skipped, yielding no capabilities.
+        let params = [99_u8, 0]; // type=99, len=0
+        let body = open_with_raw_opt_params(&params);
+        let open = decode_open_body(&body).unwrap();
+        assert!(open.capabilities.is_empty());
+    }
+
+    #[test]
+    fn test_truncated_multiprotocol_capability_is_error() {
+        // cap_code=1 (MultiProtocol), cap_len=2, but MultiProtocol needs 4 bytes.
+        let params = [
+            OPT_PARAM_CAPABILITIES, 4, // type=2, param_len=4
+            1, 2,                       // cap_code=1, cap_len=2 (should be 4)
+            0x00, 0x01,                 // only 2 bytes of value
+        ];
+        let body = open_with_raw_opt_params(&params);
+        assert!(matches!(
+            decode_open_body(&body),
+            Err(CodecError::InvalidCapability { code: 1 })
+        ));
+    }
+
+    #[test]
+    fn test_truncated_four_byte_asn_capability_is_error() {
+        // cap_code=65 (FourByteAsn), cap_len=2, but FourByteAsn needs 4 bytes.
+        let params = [
+            OPT_PARAM_CAPABILITIES, 4,
+            65, 2,     // cap_code=65, cap_len=2
+            0x00, 0x01,
+        ];
+        let body = open_with_raw_opt_params(&params);
+        assert!(matches!(
+            decode_open_body(&body),
+            Err(CodecError::InvalidCapability { code: 65 })
+        ));
+    }
+
+    #[test]
+    fn test_truncated_graceful_restart_capability_is_error() {
+        // cap_code=64 (GracefulRestart), cap_len=1, but needs at least 2 bytes.
+        let params = [
+            OPT_PARAM_CAPABILITIES, 3,
+            64, 1,  // cap_code=64, cap_len=1
+            0x00,   // only 1 byte
+        ];
+        let body = open_with_raw_opt_params(&params);
+        assert!(matches!(
+            decode_open_body(&body),
+            Err(CodecError::InvalidCapability { code: 64 })
+        ));
+    }
 }

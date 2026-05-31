@@ -269,6 +269,48 @@ mod tests {
         assert!(buf[..16].iter().all(|&b| b == 0xFF));
     }
 
+    // ── FramingError trait impls ──────────────────────────────────────────────
+
+    #[test]
+    fn test_framing_error_io_display() {
+        let e = FramingError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+        assert!(e.to_string().starts_with("I/O:"));
+    }
+
+    #[test]
+    fn test_framing_error_codec_display() {
+        let e = FramingError::Codec(CodecError::InvalidMarker);
+        assert_eq!(e.to_string(), "BGP codec: BGP marker is not all 0xFF");
+    }
+
+    #[test]
+    fn test_framing_error_io_source() {
+        use std::error::Error;
+        let e = FramingError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "test"));
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn test_framing_error_codec_source() {
+        use std::error::Error;
+        let e = FramingError::Codec(CodecError::InvalidMarker);
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn test_framing_error_from_io_error() {
+        let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        let framing_err = FramingError::from(io_err);
+        assert!(matches!(framing_err, FramingError::Io(_)));
+    }
+
+    #[test]
+    fn test_framing_error_from_codec_error() {
+        let codec_err = CodecError::InvalidMarker;
+        let framing_err = FramingError::from(codec_err);
+        assert!(matches!(framing_err, FramingError::Codec(_)));
+    }
+
     #[test]
     fn test_encode_decode_roundtrip() {
         let mut codec = BgpCodec;

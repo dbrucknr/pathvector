@@ -293,4 +293,58 @@ mod tests {
         assert_eq!(BgpMessage::decode(&keepalive), Err(CodecError::InvalidMarker));
     }
 
+    // ── Cursor truncated-read paths ───────────────────────────────────────────
+
+    /// Build a syntactically valid BGP frame (all-0xFF marker, correct length)
+    /// but with a custom body, so that body-level parsing can fail.
+    fn make_raw_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let total_len = 19 + body.len();
+        let mut bytes = vec![0xFF_u8; 16];
+        bytes.extend_from_slice(&(total_len as u16).to_be_bytes());
+        bytes.push(msg_type);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[test]
+    fn test_truncated_read_u8_notification_no_body() {
+        // NOTIFICATION with empty body → read_u8 for error code fails.
+        let raw = make_raw_message(3, &[]);
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::Truncated { needed: 1, available: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_truncated_read_u16_update_one_byte_body() {
+        // UPDATE with 1-byte body → read_u16 for withdrawn_len fails.
+        let raw = make_raw_message(2, &[0x00]);
+        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::Truncated { .. })));
+    }
+
+    #[test]
+    fn test_truncated_read_u32_open_short_body() {
+        // OPEN: version(1) + my_as(2) + hold_time(2) + bgp_id — cut off inside bgp_id.
+        // read_ipv4addr calls read_bytes(4) which in turn calls read_u32 equivalent logic.
+        // With only 6 body bytes, bgp_id read fails.
+        let body: &[u8] = &[4, 0xFF, 0x00, 0x00, 0x5A, 0x0A]; // 6 bytes, need 9
+        let raw = make_raw_message(1, body);
+        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::Truncated { .. })));
+    }
+
+    #[test]
+    fn test_truncated_read_bytes_open_body() {
+        // OPEN with only version byte → my_as read fails (needs 2 bytes).
+        let raw = make_raw_message(1, &[4]);
+        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::Truncated { .. })));
+    }
+
+    #[test]
+    fn test_keepalive_with_extra_body_is_error() {
+        // Header claims length=20 and body has 1 byte → Keepalive body must be empty.
+        let raw = make_raw_message(4, &[0x00]);
+        assert!(matches!(BgpMessage::decode(&raw), Err(CodecError::InvalidLength(20))));
+    }
+
 }

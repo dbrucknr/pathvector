@@ -1082,4 +1082,88 @@ mod tests {
         assert_eq!(fsm.state(), State::Established);
         assert!(has_output(&out, |o| matches!(o, FsmOutput::StartHoldTimer(_))));
     }
+
+    // ── Catch-all _ => vec![] branches ───────────────────────────────────────
+
+    #[test]
+    fn test_unhandled_input_in_connect_is_noop() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart); // → Connect
+        let out = fsm.process(FsmInput::HoldTimerExpired);
+        assert_eq!(fsm.state(), State::Connect);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_unhandled_input_in_active_is_noop() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpFailed); // → Active
+        let out = fsm.process(FsmInput::HoldTimerExpired);
+        assert_eq!(fsm.state(), State::Active);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_unhandled_input_in_open_sent_is_noop() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected); // → OpenSent
+        let out = fsm.process(FsmInput::KeepaliveTimerExpired);
+        assert_eq!(fsm.state(), State::OpenSent);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_unhandled_input_in_open_confirm_is_noop() {
+        let mut fsm = enter_open_confirm();
+        let out = fsm.process(FsmInput::ConnectRetryTimerExpired);
+        assert_eq!(fsm.state(), State::OpenConfirm);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_unhandled_input_in_established_is_noop() {
+        let (mut fsm, _) = establish(default_config());
+        let out = fsm.process(FsmInput::ConnectRetryTimerExpired);
+        assert_eq!(fsm.state(), State::Established);
+        assert!(out.is_empty());
+    }
+
+    // ── reset_hold_if_active else branch (hold_time == 0) ────────────────────
+
+    #[test]
+    fn test_keepalive_in_established_no_hold_timer_when_disabled() {
+        let config = FsmConfig { hold_time: 0, ..default_config() };
+        let (mut fsm, _) = establish(config);
+        // With negotiated_hold_time == 0, a Keepalive in Established returns no outputs.
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        assert_eq!(fsm.state(), State::Established);
+        assert!(out.is_empty());
+    }
+
+    // ── validate_open: UnsupportedVersionNumber ───────────────────────────────
+
+    #[test]
+    fn test_unsupported_version_in_open_sends_notification() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let bad_open = BgpMessage::Open(OpenMessage {
+            version: 3,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(bad_open));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::OpenMessage(OpenMsgError::UnsupportedVersionNumber),
+                ..
+            }))
+        ));
+    }
 }
