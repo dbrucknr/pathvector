@@ -63,6 +63,22 @@ Intra-cluster route reflection (RFC 4456) requires the RIB to track:
 Loop prevention in a route reflector topology uses these attributes instead
 of (or in addition to) the AS path.
 
+### iBGP split horizon enforcement in Adj-RIB-Out
+
+RFC 4271 §9.2 requires that a route learned from an iBGP peer is not
+re-advertised to other iBGP peers. `AdjRibOut` exists but does not currently
+enforce this rule — it has no knowledge of whether the originating peer was
+iBGP or eBGP. Requires the session layer to tag each peer with its session
+type (internal vs external) and `AdjRibOut::fill` to filter accordingly.
+
+### Confederation segment stripping before eBGP advertisement
+
+RFC 5065 §5.1 requires that `AS_CONFED_SEQUENCE` and `AS_CONFED_SET`
+segments are removed from `AS_PATH` before a route is advertised to an eBGP
+peer. `AdjRibOut` does not yet perform this strip; confederation segment
+types are modeled in `pathvector-types/src/aspath.rs` but there is no
+call site that removes them at advertisement time.
+
 ### Configurable MED behaviour
 
 The current implementation treats missing MED as `0`. Real implementations
@@ -89,6 +105,7 @@ offer:
 
 ### Remaining
 
+- Unknown transitive attribute Partial bit (RFC 4271 §5) — when a router forwards an optional transitive attribute it does not recognise, it must set the Partial flag (bit 5) in the attribute flags byte. Unknown attributes are currently preserved in the `PathAttribute::Unknown` variant but the Partial bit is not actively set on re-encode in `pathvector-session/src/message/update.rs`.
 - MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
@@ -163,6 +180,7 @@ Not yet started. Key work items:
   - Policy introspection
   - Runtime policy reload
 - Import policy — apply `pathvector-policy` to routes before `LocRib::insert`; currently all received routes are accepted unconditionally
+- BLACKHOLE community discard action (RFC 7999) — `Community::BLACKHOLE` (0xFFFF029A) is defined and detectable via `is_blackhole()`, but there is no null-route or discard action wired in the RIB or daemon; routes tagged with BLACKHOLE should have traffic to their prefix dropped at the forwarding plane
 - `AdjRibIn` — add pre-policy store per peer to support soft reconfiguration without requiring a full session reset
 - CLI binary (`pathvector`) using the gRPC client
 - Docker image: `FROM debian:slim`, single binary, config file mount, gRPC port exposed
