@@ -139,6 +139,21 @@ The core protocol. Every crate is shaped by it.
 | Adj-RIB-Out: per-peer store of routes to be advertised | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_get`, `test_adj_rib_out_withdraw` |
 | iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_ibgp_route_not_advertised_to_ibgp_peer`, `test_ibgp_split_horizon_evicts_previously_stored_route`, `test_ebgp_route_advertised_to_ibgp_peer`, `test_ibgp_route_advertised_to_ebgp_peer` |
 
+### §9.2 — Update-Send Process
+
+The RIB structures above are implemented. The process that drives outbound UPDATE
+generation from Loc-RIB changes is not yet wired in the daemon.
+
+| Requirement | Module | Status | Verified by |
+|---|---|---|---|
+| Loc-RIB best-path change triggers export policy evaluation per peer | `pathvectord` | ❌ | — |
+| Export policy accepted routes populate per-peer Adj-RIB-Out | `pathvectord` | ❌ | — |
+| Adj-RIB-Out change generates and sends UPDATE (announcement) to peer | `pathvectord` | ❌ | — |
+| Withdrawn best path generates UPDATE with withdrawn NLRI to all peers | `pathvectord` | ❌ | — |
+| LOCAL_PREF not included in UPDATEs sent to eBGP peers | `pathvectord` | ❌ | — |
+| Local AS prepended to AS_PATH in UPDATEs sent to eBGP peers | `pathvectord` | ❌ | — |
+| NEXT_HOP set to local interface address in UPDATEs sent to eBGP peers | `pathvectord` | ❌ | — |
+
 ---
 
 ## RFC 2918 — Route Refresh Capability
@@ -403,7 +418,7 @@ The core protocol. Every crate is shaped by it.
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9, collision detection, and full Update-Send Process outstanding |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
 | RFC 3392 | Capability Advertisement | ✅ |
 | RFC 4760 | Multiprotocol Extensions | ✅ |

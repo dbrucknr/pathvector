@@ -202,6 +202,30 @@ Not yet started. Key work items:
 
 ### Remaining
 
+- Outbound advertisement (export path) — the daemon currently only processes inbound
+  UPDATEs. It never sends UPDATE messages to peers, making it a route receiver rather
+  than a full BGP speaker. Required work:
+  - Export policy — evaluate LocRib best routes through a per-peer export policy before
+    Adj-RIB-Out population (mirrors the import policy already wired on the receive side)
+  - Adj-RIB-Out population — on each best-path change, push the new best route through
+    export policy and update each peer's AdjRibOut accordingly
+  - UPDATE generation — translate Adj-RIB-Out changes into wire-format UPDATE messages
+    and send them via the session transport's send path
+  - Attribute rewrite for eBGP peers — prepend local AS to AS_PATH, strip LOCAL_PREF,
+    rewrite NEXT_HOP to the local interface address
+  - Withdrawal propagation — when a best path is removed from LocRib, send a withdrawn
+    NLRI UPDATE to all peers that held the route in their Adj-RIB-Out
+
+- Panic safety in main event loop — the `expect()` calls at lines 127 and 130 of
+  `main.rs` would panic the entire daemon if a peer IP appeared in a `SessionEvent`
+  that was not present in the config maps. The invariant is currently structural (maps
+  are built from the same config slice as sessions), but is invisible at the call sites
+  and fragile to future refactoring. Replace with `tracing::error!` + graceful skip.
+
+- IPv6 in the daemon — the session layer already speaks IPv6 via MP_REACH_NLRI, but
+  `pathvectord` is hardcoded to `Route<Ipv4Addr>`. Extending to IPv6 requires a
+  dual-stack RIB or a generic event dispatch on address family.
+
 - gRPC management API — define `.proto` schema for:
   - Peer state queries (session state, uptime, prefixes received/advertised)
   - RIB queries (show route, show best path, show candidates)
