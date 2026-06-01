@@ -13,7 +13,7 @@ use crate::{peer::PeerId, route::Route};
 /// reads routes from here, it applies policy and inserts the accepted routes
 /// into [`LocRib`](crate::LocRib).
 ///
-/// Storing the pre-policy routes separately from the post-policy [`LocRib`]
+/// Storing the pre-policy routes separately from the post-policy [`LocRib`](crate::LocRib)
 /// is what makes soft reconfiguration possible: if you change your import
 /// policy, you re-process the `AdjRibIn` without asking the peer to
 /// re-advertise.
@@ -46,7 +46,10 @@ impl<A: IpAddress> AdjRibIn<A> {
     /// Creates an empty `AdjRibIn` for the given peer.
     #[must_use]
     pub fn new(peer: PeerId) -> Self {
-        Self { peer, routes: HashMap::new() }
+        Self {
+            peer,
+            routes: HashMap::new(),
+        }
     }
 
     /// Returns the peer this table belongs to.
@@ -121,8 +124,8 @@ impl<A: IpAddress> AdjRibIn<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
     use pathvector_types::{AsPath, Asn, LocalPref, Origin};
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn peer() -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
