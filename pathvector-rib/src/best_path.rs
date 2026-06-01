@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use ipnetx::interfaces::IpAddress;
-use pathvector_types::{LocalPref, PeerType};
+use pathvector_types::LocalPref;
 
 use crate::{peer::PeerId, route::Route};
 
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin};
+    use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 
     use crate::RouteBuilder;
 

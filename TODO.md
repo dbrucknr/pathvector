@@ -35,7 +35,6 @@ they require information the RIB layer does not yet have.
 |---|---|---|
 | 1 | Prefer routes with a reachable next-hop | IGP integration — the RIB needs to know which next-hops are reachable via the interior routing protocol |
 | 3 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally (`network` statement) vs learned from a peer |
-| 7 | Prefer eBGP over iBGP | Peer session type — the session layer must tag routes with the session type (internal vs external) when inserting into the RIB |
 | 8 | Prefer lowest IGP metric to next-hop | IGP integration — requires the router's own IGP topology view |
 | 9 | Prefer oldest eBGP route | Route age tracking — the RIB would need to record when each route was first received |
 
@@ -62,22 +61,6 @@ Intra-cluster route reflection (RFC 4456) requires the RIB to track:
 
 Loop prevention in a route reflector topology uses these attributes instead
 of (or in addition to) the AS path.
-
-### iBGP split horizon enforcement in Adj-RIB-Out
-
-RFC 4271 §9.2 requires that a route learned from an iBGP peer is not
-re-advertised to other iBGP peers. `AdjRibOut` exists but does not currently
-enforce this rule — it has no knowledge of whether the originating peer was
-iBGP or eBGP. Requires the session layer to tag each peer with its session
-type (internal vs external) and `AdjRibOut::fill` to filter accordingly.
-
-### Confederation segment stripping before eBGP advertisement
-
-RFC 5065 §5.1 requires that `AS_CONFED_SEQUENCE` and `AS_CONFED_SET`
-segments are removed from `AS_PATH` before a route is advertised to an eBGP
-peer. `AdjRibOut` does not yet perform this strip; confederation segment
-types are modeled in `pathvector-types/src/aspath.rs` but there is no
-call site that removes them at advertisement time.
 
 ### Configurable MED behaviour
 

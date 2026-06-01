@@ -134,7 +134,7 @@ The core protocol. Every crate is shaped by it.
 | Loc-RIB: withdraw last candidate removes the prefix entirely | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_last_candidate_removes_prefix` |
 | Loc-RIB: withdraw one peer promotes the remaining candidate | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_peer_promotes_remaining_candidate` |
 | Adj-RIB-Out: per-peer store of routes to be advertised | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_get`, `test_adj_rib_out_withdraw` |
-| iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ⚠️ | — (`PeerType` now available on `Route`; enforcement logic not yet wired into LocRib/AdjRibOut — see TODO) |
+| iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_ibgp_route_not_advertised_to_ibgp_peer`, `test_ibgp_split_horizon_evicts_previously_stored_route`, `test_ebgp_route_advertised_to_ibgp_peer`, `test_ibgp_route_advertised_to_ebgp_peer` |
 
 ---
 
@@ -294,7 +294,7 @@ The core protocol. Every crate is shaped by it.
 | AS_CONFED_SEQUENCE (segment type 3) and AS_CONFED_SET (segment type 4) encode and decode | `pathvector-types/src/aspath.rs` | ✅ | `test_segment_display_confed_sequence`, `test_segment_display_confed_set`, `test_as_path_confed_segments_roundtrip` |
 | Confederation segments count as 0 in AS path length (best-path step 4) | `pathvector-rib/src/best_path.rs` | ✅ | `test_aspath_path_length_confed_counts_as_zero` |
 | `AsPath::strip_confed_segments()` removes all ConfedSequence/ConfedSet segments | `pathvector-types/src/aspath.rs` | ✅ | `test_strip_confed_segments_removes_confed_sequence_and_set`, `test_strip_confed_segments_preserves_sequence_and_set`, `test_strip_confed_segments_all_confed_yields_empty`, `test_strip_confed_segments_empty_path_stays_empty`, `test_strip_confed_segments_does_not_mutate_original`, `test_strip_confed_segments_preserves_segment_order` |
-| Confederation segments stripped from AS_PATH before advertising to eBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ⚠️ | — (blocked on session-type tagging; `strip_confed_segments()` ready to call) |
+| Confederation segments stripped from AS_PATH before advertising to eBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_confed_segments_stripped_for_ebgp_peer`, `test_all_confed_path_stripped_to_empty_for_ebgp_peer`, `test_confed_segments_preserved_for_ibgp_peer`, `test_no_confed_path_unmodified_for_ebgp_peer` |
 
 ---
 
@@ -400,7 +400,7 @@ The core protocol. Every crate is shaped by it.
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/7/8/9 and collision detection outstanding |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
 | RFC 3392 | Capability Advertisement | ✅ |
 | RFC 4760 | Multiprotocol Extensions | ✅ |
@@ -413,7 +413,7 @@ The core protocol. Every crate is shaped by it.
 | RFC 7999 | BLACKHOLE Community | ⚠️ Value and predicate defined; discard action not wired |
 | RFC 1930 | Private ASN (2-byte) | ✅ |
 | RFC 6996 | Private ASN (4-byte) | ✅ |
-| RFC 5065 | BGP Confederations | ⚠️ Segment types and path length correct; eBGP strip not implemented |
+| RFC 5065 | BGP Confederations | ✅ |
 | RFC 4456 | Route Reflectors | ❌ |
 | RFC 3107 | MPLS Labeled Unicast | ⚠️ SAFI defined; label encoding not implemented |
 | RFC 4364 | MPLS L3VPN | ⚠️ SAFI defined; VPN-IPv4 NLRI not implemented |

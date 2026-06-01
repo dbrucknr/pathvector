@@ -309,8 +309,9 @@ proptest! {
     fn prop_adj_rib_out_insert_then_get(
         route in arb_nlri().prop_flat_map(arb_route_for),
     ) {
+        use pathvector_types::PeerType;
         let peer = PeerId::from(Ipv4Addr::new(10, 0, 0, 1));
-        let mut rib: AdjRibOut<Ipv4Addr> = AdjRibOut::new(peer);
+        let mut rib: AdjRibOut<Ipv4Addr> = AdjRibOut::new(peer, PeerType::External);
         let nlri = route.nlri;
         rib.insert(route.clone());
         prop_assert_eq!(rib.get(&nlri), Some(&route));
@@ -324,8 +325,9 @@ proptest! {
     fn prop_adj_rib_out_withdraw_clears_route(
         route in arb_nlri().prop_flat_map(arb_route_for),
     ) {
+        use pathvector_types::PeerType;
         let peer = PeerId::from(Ipv4Addr::new(10, 0, 0, 1));
-        let mut rib: AdjRibOut<Ipv4Addr> = AdjRibOut::new(peer);
+        let mut rib: AdjRibOut<Ipv4Addr> = AdjRibOut::new(peer, PeerType::External);
         let nlri = route.nlri;
         rib.insert(route);
         rib.withdraw(&nlri);
