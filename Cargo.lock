@@ -391,6 +391,7 @@ dependencies = [
  "pathvector-rib",
  "pathvector-session",
  "pathvector-types",
+ "proptest",
  "serde",
  "tokio",
  "toml",

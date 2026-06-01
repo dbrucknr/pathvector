@@ -2044,4 +2044,403 @@ mod tests {
             "local AS must be prepended"
         );
     }
+
+    // ── propagate_prefix — iBGP split-horizon eviction ────────────────────────
+
+    /// When the best path for a prefix switches from eBGP to iBGP, the
+    /// previously stored eBGP entry in the iBGP peer's AdjRibOut is evicted
+    /// (`InsertOutcome::Filtered(Some(_))`), triggering a WITHDRAW.
+    #[test]
+    fn test_propagate_prefix_ibgp_split_horizon_eviction_sends_withdraw() {
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        let (_, mut aro) = ibgp_out_peer();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        // Phase 1: best path is eBGP — stored in the iBGP peer's AdjRibOut.
+        let mut rib = LocRib::new();
+        rib.insert(src, ebgp_route_with_lp("10.0.0.0/8"));
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::Internal,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let _ = rx.try_recv(); // consume the UPDATE
+
+        // Phase 2: best path switches to iBGP — split-horizon evicts the stored
+        // eBGP entry and the peer must receive a WITHDRAW.
+        let mut rib2 = LocRib::new();
+        rib2.insert(src, ibgp_route("10.0.0.0/8"));
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib2,
+            &mut aro,
+            &accept_all(),
+            PeerType::Internal,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let msg = rx
+            .try_recv()
+            .expect("split-horizon eviction must send WITHDRAW");
+        assert!(!msg.withdrawn.is_empty());
+        assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
+    }
+
+    // ── propagate_prefix — channel-full warnings ──────────────────────────────
+
+    /// When the outbound UPDATE channel is full, a warning is logged but no
+    /// panic occurs.  Fill the channel before propagating a new route.
+    #[test]
+    fn test_propagate_prefix_full_update_channel_does_not_panic() {
+        let mut rib = LocRib::new();
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        let (_, mut aro) = ebgp_out_peer();
+        let (tx, _rx) = mpsc::channel(1);
+
+        // Fill the single-slot channel so the next try_send fails.
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+
+        // propagate_prefix must log a warning and not panic.
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+    }
+
+    /// When the outbound WITHDRAW channel is full (Reject/Next decision path),
+    /// a warning is logged and no panic occurs.
+    #[test]
+    fn test_propagate_prefix_full_withdraw_on_reject_does_not_panic() {
+        let mut rib = LocRib::new();
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        let (_, mut aro) = ebgp_out_peer();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        // Advertise the route so it is stored in AdjRibOut.
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let _ = rx.try_recv();
+
+        // Fill the channel before the second call so try_send fails.
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+
+        // Export policy now rejects — triggers WITHDRAW try_send on a full channel.
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &reject_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+    }
+
+    /// When the outbound WITHDRAW channel is full (no best route / None path),
+    /// a warning is logged and no panic occurs.
+    #[test]
+    fn test_propagate_prefix_full_withdraw_on_empty_rib_does_not_panic() {
+        let mut rib = LocRib::new();
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        let (_, mut aro) = ebgp_out_peer();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        // Store the route in AdjRibOut.
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let _ = rx.try_recv();
+
+        // Remove the route so loc_rib.best returns None.
+        rib.withdraw(&peer(), &nlri("10.0.0.0/8"));
+
+        // Fill the channel so the WITHDRAW try_send fails.
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+
+        // propagate_prefix with empty rib + full channel: must log, not panic.
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+    }
+
+    // ── DaemonState — unknown peer defensive paths ────────────────────────────
+
+    /// Calling `on_established` with a peer IP that was never in the config
+    /// logs an error and returns without panicking.
+    #[test]
+    fn test_on_established_unknown_peer_is_noop() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+
+        let unknown: Ipv4Addr = "10.0.0.99".parse().unwrap();
+        state.on_established(unknown, PeerType::External, 65099, 90);
+        // Invariant: no state changes (the unknown IP is absent from maps).
+        assert!(!state.peer_types.contains_key(&peer_ip));
+    }
+
+    /// When `on_terminated` propagates to other established peers, a ghost peer
+    /// (one that reached `Established` via `on_established` but was never in the
+    /// config maps) triggers the missing-export-policy error path.  Must not
+    /// panic.
+    #[test]
+    fn test_on_terminated_ghost_established_peer_does_not_panic() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002)]);
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+
+        // Inject a ghost peer into peer_types (never registered in config maps).
+        let ghost: Ipv4Addr = "10.0.0.99".parse().unwrap();
+        state.on_established(ghost, PeerType::External, 65099, 90);
+
+        // Terminating peer_a iterates established peers; ghost has no policy /
+        // rib entries — the error branch logs and continues without panicking.
+        state.on_terminated(peer_a);
+        assert!(!state.peer_types.contains_key(&peer_a));
+    }
+
+    /// Calling `on_route_update` with an unknown peer IP logs an error and
+    /// returns without panicking.
+    #[test]
+    fn test_on_route_update_unknown_peer_is_noop() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+
+        let unknown: Ipv4Addr = "10.0.0.99".parse().unwrap();
+        state.on_route_update(
+            unknown,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![],
+                announced: vec![],
+            },
+        );
+        assert_eq!(state.loc_rib.len(), 0);
+    }
+
+    /// When `on_route_update` propagates to established peers, a ghost peer
+    /// (in peer_types but absent from policy maps) triggers the error path.
+    /// Must not panic.
+    #[test]
+    fn test_on_route_update_ghost_established_peer_does_not_panic() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002)]);
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+
+        let ghost: Ipv4Addr = "10.0.0.99".parse().unwrap();
+        state.on_established(ghost, PeerType::External, 65099, 90);
+
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert_eq!(state.loc_rib.len(), 1);
+    }
+}
+
+// ── Property tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests {
+    use std::net::Ipv4Addr;
+
+    use proptest::prelude::*;
+
+    use pathvector_types::{AsPath, Asn, LocalPref, NextHop, Origin, PeerType};
+
+    use super::*;
+    use crate::RouteBuilder;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn base_route(prefix: &str) -> Route<Ipv4Addr> {
+        RouteBuilder::new(
+            nlri(prefix),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65002)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        .local_pref(LocalPref::new(100))
+        .peer_type(PeerType::External)
+        .build()
+    }
+
+    proptest! {
+        /// `config_peer_type` returns `Internal` iff the two AS numbers are
+        /// equal, and `External` otherwise.
+        #[test]
+        fn prop_config_peer_type_internal_iff_equal(a: u32, b: u32) {
+            let pt = config_peer_type(a, b);
+            if a == b {
+                prop_assert_eq!(pt, PeerType::Internal);
+            } else {
+                prop_assert_eq!(pt, PeerType::External);
+            }
+        }
+
+        /// An explicit import default always overrides the eBGP/iBGP derived
+        /// default, regardless of the `is_ebgp` flag.
+        #[test]
+        fn prop_resolve_import_explicit_always_wins(is_ebgp: bool) {
+            let accept = resolve_import_default(Some(config::ImportDefault::Accept), is_ebgp);
+            let reject = resolve_import_default(Some(config::ImportDefault::Reject), is_ebgp);
+            prop_assert!(matches!(accept, DefaultAction::Accept));
+            prop_assert!(matches!(reject, DefaultAction::Reject));
+        }
+
+        /// An explicit export default always overrides the eBGP/iBGP derived
+        /// default.
+        #[test]
+        fn prop_resolve_export_explicit_always_wins(is_ebgp: bool) {
+            let accept = resolve_export_default(Some(config::ExportDefault::Accept), is_ebgp);
+            let reject = resolve_export_default(Some(config::ExportDefault::Reject), is_ebgp);
+            prop_assert!(matches!(accept, DefaultAction::Accept));
+            prop_assert!(matches!(reject, DefaultAction::Reject));
+        }
+
+        /// `withdraw_msg` always produces exactly one withdrawn NLRI and no
+        /// announced NLRIs.
+        #[test]
+        fn prop_withdraw_msg_structure(
+            prefix in prop::sample::select(vec![
+                "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12", "0.0.0.0/0",
+            ])
+        ) {
+            let n: Nlri<Ipv4Addr> = prefix.parse().unwrap();
+            let msg = withdraw_msg(n);
+            prop_assert_eq!(msg.withdrawn.len(), 1);
+            prop_assert_eq!(msg.withdrawn[0], n);
+            prop_assert!(msg.announced.is_empty());
+            prop_assert!(msg.attributes.is_empty());
+        }
+
+        /// `route_to_update` always announces exactly the route's NLRI, never
+        /// withdraws anything, and always includes Origin and AsPath attributes.
+        #[test]
+        fn prop_route_to_update_structure(
+            prefix in prop::sample::select(vec![
+                "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12",
+            ])
+        ) {
+            use pathvector_session::message::PathAttribute;
+            let route = base_route(prefix);
+            let nlri_val: Nlri<Ipv4Addr> = prefix.parse().unwrap();
+            let msg = route_to_update(route);
+
+            prop_assert_eq!(msg.announced, vec![nlri_val]);
+            prop_assert!(msg.withdrawn.is_empty());
+            prop_assert!(
+                msg.attributes.iter().any(|a| matches!(a, PathAttribute::Origin(_))),
+                "UPDATE must carry ORIGIN"
+            );
+            prop_assert!(
+                msg.attributes.iter().any(|a| matches!(a, PathAttribute::AsPath(_))),
+                "UPDATE must carry AS_PATH"
+            );
+        }
+
+        /// For iBGP peers, `prepare_outbound` is an identity transform: the
+        /// route's AS_PATH, NEXT_HOP, and LOCAL_PREF are all preserved.
+        #[test]
+        fn prop_prepare_outbound_ibgp_is_identity(lp_value in 0u32..=65535) {
+            let route = RouteBuilder::new(
+                nlri("10.0.0.0/8"),
+                Origin::Igp,
+                AsPath::from_sequence(vec![Asn::new(65002)]),
+            )
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)))
+            .local_pref(LocalPref::new(lp_value))
+            .peer_type(PeerType::Internal)
+            .build();
+
+            let result = prepare_outbound(
+                route.clone(),
+                PeerType::Internal,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+            );
+
+            prop_assert_eq!(result.as_path, route.as_path, "AS_PATH must be unchanged for iBGP");
+            prop_assert_eq!(result.next_hop, route.next_hop, "NEXT_HOP must be unchanged for iBGP");
+            prop_assert_eq!(result.local_pref, route.local_pref, "LOCAL_PREF must be preserved for iBGP");
+        }
+
+        /// For eBGP peers, `prepare_outbound` always prepends the local AS,
+        /// rewrites the NEXT_HOP, and strips LOCAL_PREF.
+        #[test]
+        fn prop_prepare_outbound_ebgp_transforms(local_as in 1u32..=4_294_967_294) {
+            let bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+            let route = base_route("10.0.0.0/8");
+            let original_path_len = route.as_path.path_length();
+
+            let result = prepare_outbound(route, PeerType::External, local_as, bgp_id);
+
+            prop_assert_eq!(
+                result.as_path.path_length(),
+                original_path_len + 1,
+                "local AS must be prepended for eBGP"
+            );
+            prop_assert!(result.as_path.contains(Asn::new(local_as)), "local AS must be in the path");
+            prop_assert_eq!(result.next_hop, Some(NextHop::V4(bgp_id)), "NEXT_HOP must be rewritten");
+            prop_assert!(result.local_pref.is_none(), "LOCAL_PREF must be stripped for eBGP");
+        }
+    }
 }

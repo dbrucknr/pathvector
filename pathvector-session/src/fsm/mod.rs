@@ -1432,4 +1432,36 @@ mod tests {
             }))
         ));
     }
+
+    /// When the peer sends an OPEN with no `FourByteAsn` capability,
+    /// `resolve_as` falls back to the 2-byte `my_as` field (line 547).
+    #[test]
+    fn test_receive_open_without_four_byte_asn_capability_falls_back_to_my_as() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        // Peer sends OPEN with no capabilities at all — resolve_as must use my_as.
+        let peer_open_no_cap = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![],
+        });
+        fsm.process(FsmInput::MessageReceived(peer_open_no_cap));
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+
+        let info = out
+            .iter()
+            .find_map(|o| {
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("SessionEstablished");
+        assert_eq!(info.peer_as, 65002, "peer_as must come from my_as when no FourByteAsn cap");
+    }
 }

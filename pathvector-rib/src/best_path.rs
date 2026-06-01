@@ -172,6 +172,17 @@ mod tests {
         assert!(select_best(&candidates).is_none());
     }
 
+    /// `basic` with `path_len = 0` takes the `asns.is_empty()` branch and builds
+    /// a route with an empty AS_PATH. Exercises the otherwise-uncovered branch.
+    #[test]
+    fn test_select_best_with_empty_as_path() {
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), basic(Origin::Igp, 0, None, None));
+        let result = select_best(&candidates);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, peer(1));
+    }
+
     #[test]
     fn test_select_best_single_candidate() {
         let mut candidates = HashMap::new();
