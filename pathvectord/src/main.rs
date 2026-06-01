@@ -38,6 +38,32 @@ async fn main() {
     run(cfg).await;
 }
 
+/// Resolves the effective import default action for a peer (RFC 8212).
+///
+/// eBGP peers with no explicit setting default to `Reject` — no routes are
+/// accepted unless a policy term explicitly accepts them. iBGP peers default
+/// to `Accept`. An explicit `import_default` in config always wins.
+fn resolve_import_default(opt: Option<config::ImportDefault>, is_ebgp: bool) -> DefaultAction {
+    match opt {
+        Some(d) => DefaultAction::from(d),
+        None if is_ebgp => DefaultAction::Reject,
+        None => DefaultAction::Accept,
+    }
+}
+
+/// Resolves the effective export default action for a peer (RFC 8212).
+///
+/// eBGP peers with no explicit setting default to `Reject` — no routes are
+/// advertised unless a policy term explicitly accepts them. iBGP peers default
+/// to `Accept`. An explicit `export_default` in config always wins.
+fn resolve_export_default(opt: Option<config::ExportDefault>, is_ebgp: bool) -> DefaultAction {
+    match opt {
+        Some(d) => DefaultAction::from(d),
+        None if is_ebgp => DefaultAction::Reject,
+        None => DefaultAction::Accept,
+    }
+}
+
 fn build_import_policy(default: DefaultAction) -> Policy<Route<Ipv4Addr>> {
     Policy::new(default)
 }
@@ -217,9 +243,10 @@ async fn run(cfg: config::Config) {
         .peers
         .iter()
         .map(|p| {
+            let is_ebgp = p.remote_as != local_as;
             (
                 p.address,
-                build_import_policy(DefaultAction::from(p.import_default)),
+                build_import_policy(resolve_import_default(p.import_default, is_ebgp)),
             )
         })
         .collect();
@@ -228,9 +255,10 @@ async fn run(cfg: config::Config) {
         .peers
         .iter()
         .map(|p| {
+            let is_ebgp = p.remote_as != local_as;
             (
                 p.address,
-                build_export_policy(DefaultAction::from(p.export_default)),
+                build_export_policy(resolve_export_default(p.export_default, is_ebgp)),
             )
         })
         .collect();
@@ -635,6 +663,72 @@ mod tests {
     };
 
     use super::*;
+
+    // ── RFC 8212 default resolution ───────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_import_ebgp_omitted_defaults_to_reject() {
+        assert!(matches!(
+            resolve_import_default(None, true),
+            DefaultAction::Reject
+        ));
+    }
+
+    #[test]
+    fn test_resolve_import_ibgp_omitted_defaults_to_accept() {
+        assert!(matches!(
+            resolve_import_default(None, false),
+            DefaultAction::Accept
+        ));
+    }
+
+    #[test]
+    fn test_resolve_import_explicit_accept_overrides_ebgp_default() {
+        assert!(matches!(
+            resolve_import_default(Some(config::ImportDefault::Accept), true),
+            DefaultAction::Accept
+        ));
+    }
+
+    #[test]
+    fn test_resolve_import_explicit_reject_overrides_ibgp_default() {
+        assert!(matches!(
+            resolve_import_default(Some(config::ImportDefault::Reject), false),
+            DefaultAction::Reject
+        ));
+    }
+
+    #[test]
+    fn test_resolve_export_ebgp_omitted_defaults_to_reject() {
+        assert!(matches!(
+            resolve_export_default(None, true),
+            DefaultAction::Reject
+        ));
+    }
+
+    #[test]
+    fn test_resolve_export_ibgp_omitted_defaults_to_accept() {
+        assert!(matches!(
+            resolve_export_default(None, false),
+            DefaultAction::Accept
+        ));
+    }
+
+    #[test]
+    fn test_resolve_export_explicit_accept_overrides_ebgp_default() {
+        assert!(matches!(
+            resolve_export_default(Some(config::ExportDefault::Accept), true),
+            DefaultAction::Accept
+        ));
+    }
+
+    #[test]
+    fn test_resolve_export_explicit_reject_overrides_ibgp_default() {
+        assert!(matches!(
+            resolve_export_default(Some(config::ExportDefault::Reject), false),
+            DefaultAction::Reject
+        ));
+    }
 
     fn peer() -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))

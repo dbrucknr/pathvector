@@ -483,16 +483,17 @@ which state the unexpected message arrived in.
 
 Mandates that eBGP speakers MUST NOT advertise or accept routes without an explicit
 policy configured. A speaker with no import policy MUST NOT install routes from the
-peer; a speaker with no export policy MUST NOT advertise routes to the peer. Both
-`import_default` and `export_default` config fields exist and are configurable per peer,
-but both default to `"accept"` — non-compliant. Operators must explicitly set
-`import_default = "reject"` and `export_default = "reject"` to achieve compliance.
+peer; a speaker with no export policy MUST NOT advertise routes to the peer.
+
+`import_default` and `export_default` are resolved at startup via `resolve_import_default`
+/ `resolve_export_default`: eBGP peers (`remote_as != local_as`) default to `Reject` when
+the field is omitted; iBGP peers default to `Accept`. An explicit TOML value always wins.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| eBGP session MUST NOT accept routes without an explicit import policy | `pathvectord/src/config.rs` | ⚠️ | `import_default` configurable but defaults to `"accept"` — non-compliant default |
-| eBGP session MUST NOT advertise routes without an explicit export policy | `pathvectord/src/config.rs` | ⚠️ | `export_default` configurable but defaults to `"accept"` — non-compliant default |
-| Absence of explicit policy results in no route propagation, not accept-all | `pathvectord` | ❌ | — |
+| eBGP session MUST NOT accept routes without an explicit import policy | `pathvectord/src/main.rs` | ✅ | `test_resolve_import_ebgp_omitted_defaults_to_reject` |
+| eBGP session MUST NOT advertise routes without an explicit export policy | `pathvectord/src/main.rs` | ✅ | `test_resolve_export_ebgp_omitted_defaults_to_reject` |
+| Absence of explicit policy results in no route propagation, not accept-all | `pathvectord/src/main.rs` | ✅ | `test_resolve_import_ebgp_omitted_defaults_to_reject`, `test_resolve_export_ebgp_omitted_defaults_to_reject` |
 
 ---
 
@@ -519,7 +520,7 @@ but both default to `"accept"` — non-compliant. Operators must explicitly set
 | RFC 4456 | Route Reflectors | ❌ |
 | RFC 6286 | AS-Wide Unique BGP Identifier | ❌ |
 | RFC 7606 | Revised UPDATE Error Handling | ⚠️ Well-known mandatory errors correctly reset session; optional attribute errors should use discard/withdraw policies but currently reset session |
-| RFC 8212 | Default EBGP Route Propagation | ⚠️ Both import and export defaults non-compliant (default to accept); operators must set reject explicitly |
+| RFC 8212 | Default EBGP Route Propagation | ✅ eBGP peers default to Reject when policy is omitted; iBGP peers default to Accept; explicit config overrides |
 | RFC 3107 | MPLS Labeled Unicast | ⚠️ SAFI defined; label encoding not implemented |
 | RFC 4364 | MPLS L3VPN | ⚠️ SAFI defined; VPN-IPv4 NLRI not implemented |
 | RFC 4761 | VPLS | ⚠️ SAFI/AFI defined; NLRI not implemented |

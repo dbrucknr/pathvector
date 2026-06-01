@@ -38,20 +38,19 @@ fn default_hold_time() -> u16 {
 /// TOML representation of the import policy default action for a peer.
 ///
 /// Controls what happens to routes that do not match any import policy term.
-/// Defaults to `"accept"` if not specified, preserving the previous behaviour
-/// of installing every received route unconditionally.
+/// When omitted, eBGP peers default to `"reject"` (RFC 8212) and iBGP peers
+/// default to `"accept"`.
 ///
 /// ```toml
 /// [[peers]]
 /// address        = "10.0.0.1"
 /// remote_as      = 65001
-/// import_default = "reject"   # block all routes unless a term accepts them
+/// import_default = "accept"   # explicit opt-in for an eBGP peer
 /// ```
-#[derive(Deserialize, Default, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ImportDefault {
     /// Accept routes that matched no term.
-    #[default]
     Accept,
     /// Reject routes that matched no term.
     Reject,
@@ -69,21 +68,19 @@ impl From<ImportDefault> for DefaultAction {
 /// TOML representation of the export policy default action for a peer.
 ///
 /// Controls what happens to best routes that do not match any export policy
-/// term before they are advertised to this peer.  Defaults to `"accept"`,
-/// which re-advertises all best routes subject only to iBGP split-horizon and
-/// confederation-segment stripping.
+/// term before they are advertised to this peer.  When omitted, eBGP peers
+/// default to `"reject"` (RFC 8212) and iBGP peers default to `"accept"`.
 ///
 /// ```toml
 /// [[peers]]
 /// address        = "10.0.0.2"
 /// remote_as      = 65002
-/// export_default = "reject"   # suppress all outbound advertisements
+/// export_default = "accept"   # explicit opt-in for an eBGP peer
 /// ```
-#[derive(Deserialize, Default, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportDefault {
     /// Re-advertise routes that matched no term.
-    #[default]
     Accept,
     /// Suppress routes that matched no term.
     Reject,
@@ -106,16 +103,16 @@ pub struct PeerConfig {
     pub remote_as: u32,
     /// Default action when no import policy term matches.
     ///
-    /// Defaults to `"accept"` so the daemon behaves as before when
-    /// `import_default` is omitted.
+    /// When omitted: eBGP peers default to `"reject"` (RFC 8212 compliance);
+    /// iBGP peers default to `"accept"`. Set explicitly to override.
     #[serde(default)]
-    pub import_default: ImportDefault,
+    pub import_default: Option<ImportDefault>,
     /// Default action when no export policy term matches.
     ///
-    /// Defaults to `"accept"` so all best routes are advertised unless
-    /// explicitly suppressed.
+    /// When omitted: eBGP peers default to `"reject"` (RFC 8212 compliance);
+    /// iBGP peers default to `"accept"`. Set explicitly to override.
     #[serde(default)]
-    pub export_default: ExportDefault,
+    pub export_default: Option<ExportDefault>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -172,7 +169,7 @@ bgp_id = "10.0.0.1"
     }
 
     #[test]
-    fn test_config_import_default_omitted_is_accept() {
+    fn test_config_import_default_omitted_is_none() {
         let toml = r#"
 [daemon]
 local_as = 65001
@@ -183,7 +180,7 @@ address = "10.0.0.2"
 remote_as = 65002
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.peers[0].import_default, ImportDefault::Accept));
+        assert!(cfg.peers[0].import_default.is_none());
     }
 
     #[test]
@@ -199,7 +196,29 @@ remote_as = 65002
 import_default = "reject"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.peers[0].import_default, ImportDefault::Reject));
+        assert!(matches!(
+            cfg.peers[0].import_default,
+            Some(ImportDefault::Reject)
+        ));
+    }
+
+    #[test]
+    fn test_config_import_default_explicit_accept() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+import_default = "accept"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.peers[0].import_default,
+            Some(ImportDefault::Accept)
+        ));
     }
 
     #[test]
@@ -216,7 +235,7 @@ import_default = "reject"
     }
 
     #[test]
-    fn test_export_default_omitted_is_accept() {
+    fn test_export_default_omitted_is_none() {
         let toml = r#"
 [daemon]
 local_as = 65001
@@ -227,7 +246,7 @@ address = "10.0.0.2"
 remote_as = 65002
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.peers[0].export_default, ExportDefault::Accept));
+        assert!(cfg.peers[0].export_default.is_none());
     }
 
     #[test]
@@ -243,7 +262,29 @@ remote_as = 65002
 export_default = "reject"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.peers[0].export_default, ExportDefault::Reject));
+        assert!(matches!(
+            cfg.peers[0].export_default,
+            Some(ExportDefault::Reject)
+        ));
+    }
+
+    #[test]
+    fn test_export_default_explicit_accept() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+export_default = "accept"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.peers[0].export_default,
+            Some(ExportDefault::Accept)
+        ));
     }
 
     #[test]

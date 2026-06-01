@@ -3,5 +3,8 @@ local_as = 65002
 bgp_id   = "10.0.0.2"
 
 [[peers]]
-address   = "127.0.0.1"
-remote_as = 65001
+address        = "127.0.0.1"
+remote_as      = 65001
+# RFC 8212: eBGP peers default to reject. Explicit accept for GoBGP interop testing.
+import_default = "accept"
+export_default = "accept"
