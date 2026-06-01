@@ -51,10 +51,15 @@ async fn run(cfg: config::Config) {
     let import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>> = cfg
         .peers
         .iter()
-        .map(|p| (p.address, build_import_policy(DefaultAction::from(p.import_default))))
+        .map(|p| {
+            (
+                p.address,
+                build_import_policy(DefaultAction::from(p.import_default)),
+            )
+        })
         .collect();
 
-    let mut adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>> = cfg
+    let mut adj_ribs_in_map: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>> = cfg
         .peers
         .iter()
         .map(|p| (p.address, AdjRibIn::new(PeerId::from(p.address))))
@@ -104,7 +109,7 @@ async fn run(cfg: config::Config) {
             }
             SessionEvent::Terminated => {
                 peer_types.remove(&peer_ip);
-                if let Some(ari) = adj_ribs_in.get_mut(&peer_ip) {
+                if let Some(ari) = adj_ribs_in_map.get_mut(&peer_ip) {
                     ari.clear();
                 }
                 tracing::info!(peer = %peer_ip, "session terminated");
@@ -112,11 +117,16 @@ async fn run(cfg: config::Config) {
                 tracing::info!(rib_size = loc_rib.len(), "RIB updated after peer teardown");
             }
             SessionEvent::RouteUpdate(msg) => {
-                let peer_type = peer_types.get(&peer_ip).copied().unwrap_or(PeerType::External);
+                let peer_type = peer_types
+                    .get(&peer_ip)
+                    .copied()
+                    .unwrap_or(PeerType::External);
                 // Both maps are built from cfg.peers at startup — every peer has an entry.
-                let policy = import_policies.get(&peer_ip)
+                let policy = import_policies
+                    .get(&peer_ip)
                     .expect("peer IP missing from import_policies — this is a bug");
-                let adj_rib_in = adj_ribs_in.get_mut(&peer_ip)
+                let adj_rib_in = adj_ribs_in_map
+                    .get_mut(&peer_ip)
                     .expect("peer IP missing from adj_ribs_in — this is a bug");
                 handle_update(peer_id, msg, adj_rib_in, &mut loc_rib, policy, peer_type);
             }
@@ -217,9 +227,9 @@ mod tests {
                 PathAttribute::Med(50),
                 PathAttribute::Communities(vec![Community::new(0x0001_0001)]),
                 PathAttribute::LargeCommunities(vec![LargeCommunity::new(65000, 1, 100)]),
-                PathAttribute::ExtendedCommunities(vec![
-                    ExtendedCommunity::route_target_as2(65000, 1),
-                ]),
+                PathAttribute::ExtendedCommunities(vec![ExtendedCommunity::route_target_as2(
+                    65000, 1,
+                )]),
                 PathAttribute::AtomicAggregate,
                 PathAttribute::Aggregator(Aggregator::new(
                     Asn::new(65001),
@@ -228,7 +238,14 @@ mod tests {
             ],
             announced: vec![nlri("192.168.0.0/16")],
         };
-        handle_update(peer(), msg, &mut ari, &mut rib, &accept_all(), PeerType::External);
+        handle_update(
+            peer(),
+            msg,
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
 
         let route = rib.best(&nlri("192.168.0.0/16")).unwrap();
         assert_eq!(route.origin, Origin::Egp);
@@ -308,7 +325,11 @@ mod tests {
                 withdrawn: vec![],
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
-                    PathAttribute::Unknown { flags: 0x80, type_code: 255, value: vec![1, 2, 3] },
+                    PathAttribute::Unknown {
+                        flags: 0x80,
+                        type_code: 255,
+                        value: vec![1, 2, 3],
+                    },
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -371,7 +392,9 @@ mod tests {
         let mut policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Reject);
         policy.add_term(Term::new(
             AnyCondition,
-            ActionSequence::new().then(SetLocalPref::new(LP::new(200))).then(Accept),
+            ActionSequence::new()
+                .then(SetLocalPref::new(LP::new(200)))
+                .then(Accept),
         ));
 
         let mut rib = LocRib::new();
@@ -438,8 +461,14 @@ mod tests {
             PeerType::External,
         );
 
-        assert!(rib.best(&nlri("10.0.0.0/8")).is_none(), "blocked route must not be in RIB");
-        assert!(rib.best(&nlri("192.168.0.0/16")).is_some(), "clean route must be in RIB");
+        assert!(
+            rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "blocked route must not be in RIB"
+        );
+        assert!(
+            rib.best(&nlri("192.168.0.0/16")).is_some(),
+            "clean route must be in RIB"
+        );
     }
 
     #[test]
@@ -499,7 +528,9 @@ mod tests {
         let mut policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Reject);
         policy.add_term(Term::new(
             AnyCondition,
-            ActionSequence::new().then(SetLocalPref::new(LP::new(200))).then(Accept),
+            ActionSequence::new()
+                .then(SetLocalPref::new(LP::new(200)))
+                .then(Accept),
         ));
 
         let mut rib = LocRib::new();
@@ -521,7 +552,10 @@ mod tests {
         );
 
         // LocRib has the policy-modified route
-        assert_eq!(rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref, Some(LP::new(200)));
+        assert_eq!(
+            rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref,
+            Some(LP::new(200))
+        );
         // AdjRibIn has the raw route — no LOCAL_PREF set by policy
         assert_eq!(ari.get(&nlri("10.0.0.0/8")).unwrap().local_pref, None);
     }
@@ -646,11 +680,16 @@ mod tests {
         let mut new_policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Reject);
         new_policy.add_term(Term::new(
             AnyCondition,
-            ActionSequence::new().then(SetLocalPref::new(LP::new(300))).then(Accept),
+            ActionSequence::new()
+                .then(SetLocalPref::new(LP::new(300)))
+                .then(Accept),
         ));
 
         reapply_import_policy(peer(), &ari, &mut rib, &new_policy);
-        assert_eq!(rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref, Some(LP::new(300)));
+        assert_eq!(
+            rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref,
+            Some(LP::new(300))
+        );
         // Raw route in AdjRibIn is still unmodified
         assert_eq!(ari.get(&nlri("10.0.0.0/8")).unwrap().local_pref, None);
     }
@@ -701,8 +740,14 @@ mod tests {
         new_policy.add_term(Term::new(CommunityCondition::new(blocked), Reject));
 
         reapply_import_policy(peer(), &ari, &mut rib, &new_policy);
-        assert!(rib.best(&nlri("10.0.0.0/8")).is_none(), "blocked route must be withdrawn");
-        assert!(rib.best(&nlri("192.168.0.0/16")).is_some(), "clean route must remain");
+        assert!(
+            rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "blocked route must be withdrawn"
+        );
+        assert!(
+            rib.best(&nlri("192.168.0.0/16")).is_some(),
+            "clean route must remain"
+        );
     }
 }
 
@@ -754,16 +799,31 @@ fn handle_update(
         }
 
         for nlri in msg.announced {
-            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone())
-                .peer_type(peer_type);
-            if let Some(nh) = next_hop { builder = builder.next_hop(nh); }
-            if let Some(lp) = local_pref { builder = builder.local_pref(lp); }
-            if let Some(m) = med { builder = builder.med(m); }
-            for &c in &communities { builder = builder.community(c); }
-            for &lc in &large_communities { builder = builder.large_community(lc); }
-            for &ec in &extended_communities { builder = builder.extended_community(ec); }
-            if atomic_aggregate { builder = builder.atomic_aggregate(); }
-            if let Some(agg) = aggregator { builder = builder.aggregator(agg); }
+            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+            if let Some(nh) = next_hop {
+                builder = builder.next_hop(nh);
+            }
+            if let Some(lp) = local_pref {
+                builder = builder.local_pref(lp);
+            }
+            if let Some(m) = med {
+                builder = builder.med(m);
+            }
+            for &c in &communities {
+                builder = builder.community(c);
+            }
+            for &lc in &large_communities {
+                builder = builder.large_community(lc);
+            }
+            for &ec in &extended_communities {
+                builder = builder.extended_community(ec);
+            }
+            if atomic_aggregate {
+                builder = builder.atomic_aggregate();
+            }
+            if let Some(agg) = aggregator {
+                builder = builder.aggregator(agg);
+            }
 
             let raw = builder.build();
             // Store the pre-policy route for soft reconfiguration.
