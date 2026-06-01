@@ -8,9 +8,9 @@ pub mod condition;
 pub mod term;
 
 #[cfg(test)]
-pub(crate) mod testutil;
-#[cfg(test)]
 mod prop_tests;
+#[cfg(test)]
+pub(crate) mod testutil;
 
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
@@ -19,14 +19,14 @@ pub use route::BgpRoute;
 
 // Conditions
 pub use condition::{
-    AnyCondition, AsPathContainsCondition, AsPathLengthCondition, CompareOp, CommunityCondition,
+    AnyCondition, AsPathContainsCondition, AsPathLengthCondition, CommunityCondition, CompareOp,
     Condition, LargeCommunityCondition, LocalPrefCondition, MedCondition, Not, OriginCondition,
     PrefixListCondition,
 };
 
 // Actions
 pub use action::{
-    Accept, ActionSequence, AddCommunity, AddLargeCommunity, Action, Next, PrependAsPath, Reject,
+    Accept, Action, ActionSequence, AddCommunity, AddLargeCommunity, Next, PrependAsPath, Reject,
     RemoveCommunity, RemoveLargeCommunity, SetCommunities, SetLocalPref, SetMed, SetNextHop,
     SetOrigin,
 };

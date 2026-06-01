@@ -63,12 +63,7 @@ pub fn select_best<A: IpAddress, S: std::hash::BuildHasher>(
 /// This function encodes the partial BGP decision process. Steps that require
 /// external information (IGP metrics, session type) are not implemented here;
 /// the caller may wrap this with additional logic.
-fn prefer<A: IpAddress>(
-    peer_a: &PeerId,
-    a: &Route<A>,
-    peer_b: &PeerId,
-    b: &Route<A>,
-) -> Ordering {
+fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Route<A>) -> Ordering {
     // Step 2: Highest LOCAL_PREF (missing treated as the conventional default of 100).
     // LOCAL_PREF is the most powerful inbound policy lever — an operator can
     // force any route to win by setting this high enough.
@@ -83,10 +78,7 @@ fn prefer<A: IpAddress>(
     // Step 4: Shortest AS path length.
     // Shorter paths are generally closer to the destination. This is the
     // main tool for influencing inbound traffic from eBGP peers.
-    let path_len = b
-        .as_path
-        .path_length()
-        .cmp(&a.as_path.path_length());
+    let path_len = b.as_path.path_length().cmp(&a.as_path.path_length());
     if path_len != Ordering::Equal {
         return path_len; // reverse: shorter path_len(a) → Greater → preferred
     }
@@ -147,15 +139,30 @@ mod tests {
         "10.0.0.0/8".parse().unwrap()
     }
 
-    fn basic(origin: Origin, path_len: usize, lp: Option<u32>, med: Option<u32>) -> Route<Ipv4Addr> {
-        let asns: Vec<_> = (1..=u32::try_from(path_len).unwrap()).map(Asn::new).collect();
+    fn basic(
+        origin: Origin,
+        path_len: usize,
+        lp: Option<u32>,
+        med: Option<u32>,
+    ) -> Route<Ipv4Addr> {
+        let asns: Vec<_> = (1..=u32::try_from(path_len).unwrap())
+            .map(Asn::new)
+            .collect();
         let mut b = RouteBuilder::new(
             nlri(),
             origin,
-            if asns.is_empty() { AsPath::new() } else { AsPath::from_sequence(asns) },
+            if asns.is_empty() {
+                AsPath::new()
+            } else {
+                AsPath::from_sequence(asns)
+            },
         );
-        if let Some(v) = lp { b = b.local_pref(LocalPref::new(v)); }
-        if let Some(v) = med { b = b.med(Med::new(v)); }
+        if let Some(v) = lp {
+            b = b.local_pref(LocalPref::new(v));
+        }
+        if let Some(v) = med {
+            b = b.med(Med::new(v));
+        }
         b.build()
     }
 
@@ -221,7 +228,7 @@ mod tests {
     #[test]
     fn test_select_best_missing_med_treated_as_zero() {
         let mut candidates = HashMap::new();
-        candidates.insert(peer(1), basic(Origin::Igp, 2, Some(100), None));   // MED → 0
+        candidates.insert(peer(1), basic(Origin::Igp, 2, Some(100), None)); // MED → 0
         candidates.insert(peer(2), basic(Origin::Igp, 2, Some(100), Some(1))); // MED = 1
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(1)); // MED 0 < 1
@@ -242,7 +249,7 @@ mod tests {
         // LOCAL_PREF is evaluated before AS path length in the decision process.
         let mut candidates = HashMap::new();
         candidates.insert(peer(1), basic(Origin::Igp, 10, Some(200), None)); // long path, high LP
-        candidates.insert(peer(2), basic(Origin::Igp, 1, Some(100), None));  // short path, low LP
+        candidates.insert(peer(2), basic(Origin::Igp, 1, Some(100), None)); // short path, low LP
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(1));
     }

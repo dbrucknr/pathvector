@@ -205,8 +205,14 @@ import_default = "reject"
     #[test]
     fn test_import_default_converts_to_default_action() {
         use pathvector_policy::DefaultAction;
-        assert!(matches!(DefaultAction::from(ImportDefault::Accept), DefaultAction::Accept));
-        assert!(matches!(DefaultAction::from(ImportDefault::Reject), DefaultAction::Reject));
+        assert!(matches!(
+            DefaultAction::from(ImportDefault::Accept),
+            DefaultAction::Accept
+        ));
+        assert!(matches!(
+            DefaultAction::from(ImportDefault::Reject),
+            DefaultAction::Reject
+        ));
     }
 
     #[test]
@@ -243,7 +249,13 @@ export_default = "reject"
     #[test]
     fn test_export_default_converts_to_default_action() {
         use pathvector_policy::DefaultAction;
-        assert!(matches!(DefaultAction::from(ExportDefault::Accept), DefaultAction::Accept));
-        assert!(matches!(DefaultAction::from(ExportDefault::Reject), DefaultAction::Reject));
+        assert!(matches!(
+            DefaultAction::from(ExportDefault::Accept),
+            DefaultAction::Accept
+        ));
+        assert!(matches!(
+            DefaultAction::from(ExportDefault::Reject),
+            DefaultAction::Reject
+        ));
     }
 }

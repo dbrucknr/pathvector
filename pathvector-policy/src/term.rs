@@ -1,4 +1,9 @@
-use crate::{action::Action, condition::Condition, outcome::{Decision, DefaultAction}, route::BgpRoute};
+use crate::{
+    action::Action,
+    condition::Condition,
+    outcome::{Decision, DefaultAction},
+    route::BgpRoute,
+};
 
 /// An internal trait that erases the generic parameters of [`Term<C, A>`]
 /// so that heterogeneous terms can be stored in a `Vec`.
@@ -108,7 +113,10 @@ impl<R: BgpRoute> Policy<R> {
     /// Creates an empty policy with the given default action.
     #[must_use]
     pub fn new(default: DefaultAction) -> Self {
-        Self { terms: Vec::new(), default }
+        Self {
+            terms: Vec::new(),
+            default,
+        }
     }
 
     /// Appends a term to the end of this policy.
@@ -186,7 +194,10 @@ impl<R: BgpRoute> PolicyBuilder<R> {
     /// Creates a new builder with the given default action.
     #[must_use]
     pub fn new(default: DefaultAction) -> Self {
-        Self { terms: Vec::new(), default }
+        Self {
+            terms: Vec::new(),
+            default,
+        }
     }
 
     /// Appends a term and returns `self` for chaining.
@@ -203,7 +214,10 @@ impl<R: BgpRoute> PolicyBuilder<R> {
     /// Consumes the builder and returns the finished [`Policy`].
     #[must_use]
     pub fn build(self) -> Policy<R> {
-        Policy { terms: self.terms, default: self.default }
+        Policy {
+            terms: self.terms,
+            default: self.default,
+        }
     }
 }
 
@@ -211,7 +225,7 @@ impl<R: BgpRoute> PolicyBuilder<R> {
 mod tests {
     use super::*;
     use crate::{
-        action::{Accept, ActionSequence, AddCommunity, Reject, SetLocalPref, Next as ActionNext},
+        action::{Accept, ActionSequence, AddCommunity, Next as ActionNext, Reject, SetLocalPref},
         condition::{AnyCondition, CommunityCondition, OriginCondition},
         testutil::TestRoute,
     };
@@ -366,8 +380,7 @@ mod tests {
 
     #[test]
     fn test_policy_builder_empty_uses_default() {
-        let policy: Policy<TestRoute> =
-            PolicyBuilder::new(DefaultAction::Accept).build();
+        let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Accept).build();
         let mut route = make_route("10.0.0.0/8");
         assert_eq!(policy.evaluate(&mut route), Decision::Accept);
     }
@@ -400,8 +413,18 @@ mod tests {
         let mark_b = Community::from_parts(65000, 2);
 
         let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Reject)
-            .term(AnyCondition, ActionSequence::new().then(AddCommunity::new(mark_a)).then(crate::action::Next))
-            .term(AnyCondition, ActionSequence::new().then(AddCommunity::new(mark_b)).then(crate::action::Next))
+            .term(
+                AnyCondition,
+                ActionSequence::new()
+                    .then(AddCommunity::new(mark_a))
+                    .then(crate::action::Next),
+            )
+            .term(
+                AnyCondition,
+                ActionSequence::new()
+                    .then(AddCommunity::new(mark_b))
+                    .then(crate::action::Next),
+            )
             .term(AnyCondition, Accept)
             .build();
 

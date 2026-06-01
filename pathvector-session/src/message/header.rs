@@ -1,5 +1,5 @@
-use super::{Cursor, Writer};
 use super::error::CodecError;
+use super::{Cursor, Writer};
 
 /// Every BGP message begins with this 16-byte sequence.
 pub(super) const MARKER: [u8; 16] = [0xFF; 16];
@@ -111,14 +111,20 @@ mod tests {
     fn test_decode_header_length_too_large() {
         let bytes = valid_header(4, 4097); // above maximum
         let mut cur = Cursor::new(&bytes);
-        assert_eq!(decode_header(&mut cur), Err(CodecError::InvalidLength(4097)));
+        assert_eq!(
+            decode_header(&mut cur),
+            Err(CodecError::InvalidLength(4097))
+        );
     }
 
     #[test]
     fn test_decode_header_unknown_type() {
         let bytes = valid_header(99, 19);
         let mut cur = Cursor::new(&bytes);
-        assert_eq!(decode_header(&mut cur), Err(CodecError::UnknownMessageType(99)));
+        assert_eq!(
+            decode_header(&mut cur),
+            Err(CodecError::UnknownMessageType(99))
+        );
     }
 
     #[test]

@@ -210,7 +210,10 @@ async fn test_connect_retry_on_refused_connection() {
 
     // We expect a timeout (no event yet) because the retry timer is 120s.
     // The session is alive and waiting — not erroring out.
-    assert!(result.is_err(), "expected timeout waiting for event on refused connection");
+    assert!(
+        result.is_err(),
+        "expected timeout waiting for event on refused connection"
+    );
 }
 
 // ── Short-timer config for timer-expiry tests ─────────────────────────────────
@@ -425,8 +428,8 @@ async fn test_codec_error_emits_terminated() {
         // valid 16-byte all-ones marker, then length = 0 (invalid — must be ≥ 19).
         let mut raw_writer = writer.into_inner();
         let mut frame = [0u8; 19];
-        frame[..16].fill(0xFF);                                 // valid marker
-        frame[16..18].copy_from_slice(&0u16.to_be_bytes());    // length = 0 → invalid
+        frame[..16].fill(0xFF); // valid marker
+        frame[16..18].copy_from_slice(&0u16.to_be_bytes()); // length = 0 → invalid
         raw_writer.write_all(&frame).await.unwrap();
 
         // Keep the peer side open while the session processes the error.
@@ -487,7 +490,9 @@ async fn test_connect_retry_timer_fires_initiates_reconnect() {
 
     // Bind the listener BEFORE advancing the clock so it is ready when the
     // session retries.
-    let listener = TcpListener::bind(addr).await.expect("port should be free after first drop");
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("port should be free after first drop");
 
     // Advance past the 120 s retry timer.  The `sleep_until` inside
     // `deadline_fut` resolves; the retry arm in `wait_for_input` fires
@@ -504,7 +509,10 @@ async fn test_connect_retry_timer_fires_initiates_reconnect() {
     // paused-time timeout; after the yields above the connect is already in
     // the kernel accept queue.
     let accept = listener.accept().await;
-    assert!(accept.is_ok(), "session should have retried and connected after retry timer");
+    assert!(
+        accept.is_ok(),
+        "session should have retried and connected after retry timer"
+    );
 }
 
 #[tokio::test]
@@ -523,15 +531,17 @@ async fn test_open_with_wrong_peer_as_does_not_establish() {
 
         // Expect a NOTIFICATION back (bad peer AS).
         let msg = reader.next().await.unwrap().unwrap();
-        assert!(matches!(msg, BgpMessage::Notification(_)), "expected NOTIFICATION");
+        assert!(
+            matches!(msg, BgpMessage::Notification(_)),
+            "expected NOTIFICATION"
+        );
     });
 
     let mut handle = spawn(local_config(addr));
     handle.start().await;
 
     // No Established event should arrive — only a timeout.
-    let result =
-        tokio::time::timeout(Duration::from_secs(2), handle.next_event()).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), handle.next_event()).await;
     // Could get no event (if session is Idle after error) or it might re-try.
     // Either way, it must NOT emit Established.
     if let Ok(Some(event)) = result {

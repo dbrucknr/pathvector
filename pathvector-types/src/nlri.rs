@@ -243,7 +243,9 @@ impl<A: IpAddress> Nlri<A> {
     /// ```
     #[must_use]
     pub fn masked(self) -> Self {
-        Self { prefix: self.prefix.masked() }
+        Self {
+            prefix: self.prefix.masked(),
+        }
     }
 
     /// Returns `true` if this NLRI shares at least one address with `other`.

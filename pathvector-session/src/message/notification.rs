@@ -1,6 +1,6 @@
-use super::{Cursor, Writer};
 use super::error::CodecError;
-use super::header::{encode_header, MessageType};
+use super::header::{MessageType, encode_header};
+use super::{Cursor, Writer};
 
 /// A BGP NOTIFICATION message (type 3).
 ///
@@ -20,7 +20,10 @@ impl NotificationMessage {
         let code = cur.read_u8()?;
         let subcode = cur.read_u8()?;
         let data = cur.read_remaining().to_vec();
-        Ok(Self { error: NotificationError::from_codes(code, subcode), data })
+        Ok(Self {
+            error: NotificationError::from_codes(code, subcode),
+            data,
+        })
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
@@ -296,7 +299,10 @@ mod tests {
     #[test]
     fn test_unknown_code_preserved() {
         let msg = NotificationMessage {
-            error: NotificationError::Unknown { code: 42, subcode: 7 },
+            error: NotificationError::Unknown {
+                code: 42,
+                subcode: 7,
+            },
             data: vec![],
         };
         assert_eq!(roundtrip(&msg), msg);
@@ -333,7 +339,10 @@ mod tests {
             NotificationError::MessageHeader(MsgHeaderError::Unknown(9)),
         ];
         for error in cases {
-            let msg = NotificationMessage { error, data: vec![] };
+            let msg = NotificationMessage {
+                error,
+                data: vec![],
+            };
             assert_eq!(roundtrip(&msg), msg);
         }
     }
@@ -352,7 +361,10 @@ mod tests {
             NotificationError::OpenMessage(OpenMsgError::Unknown(9)),
         ];
         for error in cases {
-            let msg = NotificationMessage { error, data: vec![] };
+            let msg = NotificationMessage {
+                error,
+                data: vec![],
+            };
             assert_eq!(roundtrip(&msg), msg);
         }
     }
@@ -361,7 +373,10 @@ mod tests {
 
     #[test]
     fn test_fsm_error_roundtrip() {
-        let msg = NotificationMessage { error: NotificationError::FsmError, data: vec![] };
+        let msg = NotificationMessage {
+            error: NotificationError::FsmError,
+            data: vec![],
+        };
         assert_eq!(roundtrip(&msg), msg);
     }
 
@@ -383,7 +398,10 @@ mod tests {
             NotificationError::UpdateMessage(UpdateMsgError::Unknown(99)),
         ];
         for error in cases {
-            let msg = NotificationMessage { error, data: vec![] };
+            let msg = NotificationMessage {
+                error,
+                data: vec![],
+            };
             assert_eq!(roundtrip(&msg), msg);
         }
     }
@@ -406,7 +424,10 @@ mod tests {
             NotificationError::Cease(CeaseError::Unknown(42)),
         ];
         for error in cases {
-            let msg = NotificationMessage { error, data: vec![] };
+            let msg = NotificationMessage {
+                error,
+                data: vec![],
+            };
             assert_eq!(roundtrip(&msg), msg);
         }
     }

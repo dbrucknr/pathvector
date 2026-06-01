@@ -246,7 +246,11 @@ impl LargeCommunity {
     /// ```
     #[must_use]
     pub const fn new(global_administrator: u32, local_data_1: u32, local_data_2: u32) -> Self {
-        Self { global_administrator, local_data_1, local_data_2 }
+        Self {
+            global_administrator,
+            local_data_1,
+            local_data_2,
+        }
     }
 
     /// Returns the raw 12-byte representation (network byte order).
@@ -294,7 +298,11 @@ impl LargeCommunity {
 
 impl std::fmt::Display for LargeCommunity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}:{}", self.global_administrator, self.local_data_1, self.local_data_2)
+        write!(
+            f,
+            "{}:{}:{}",
+            self.global_administrator, self.local_data_1, self.local_data_2
+        )
     }
 }
 
@@ -598,7 +606,10 @@ mod tests {
 
     #[test]
     fn test_large_community_display() {
-        assert_eq!(LargeCommunity::new(65000, 1, 100).to_string(), "65000:1:100");
+        assert_eq!(
+            LargeCommunity::new(65000, 1, 100).to_string(),
+            "65000:1:100"
+        );
         assert_eq!(
             LargeCommunity::new(4_200_000_001, 999, 1).to_string(),
             "4200000001:999:1"

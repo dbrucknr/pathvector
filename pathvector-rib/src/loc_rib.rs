@@ -57,7 +57,10 @@ impl<A: IpAddress> LocRib<A> {
     /// Creates an empty `LocRib`.
     #[must_use]
     pub fn new() -> Self {
-        Self { candidates: HashMap::new(), best: RouteMap::new() }
+        Self {
+            candidates: HashMap::new(),
+            best: RouteMap::new(),
+        }
     }
 
     /// Inserts a route from `peer` into the candidate set and recomputes the
@@ -68,10 +71,7 @@ impl<A: IpAddress> LocRib<A> {
     /// reflects the current winner.
     pub fn insert(&mut self, peer: PeerId, route: Route<A>) {
         let nlri = route.nlri;
-        self.candidates
-            .entry(nlri)
-            .or_default()
-            .insert(peer, route);
+        self.candidates.entry(nlri).or_default().insert(peer, route);
         self.recompute_best(nlri);
     }
 
@@ -130,7 +130,9 @@ impl<A: IpAddress> LocRib<A> {
     /// Useful for building `AdjRibOut` — iterate this, apply export policy,
     /// and insert accepted routes into the peer's outbound table.
     pub fn best_routes(&self) -> impl Iterator<Item = (Nlri<A>, &Route<A>)> {
-        self.best.iter().map(|(prefix, pair)| (Nlri::from_prefix(prefix), &pair.1))
+        self.best
+            .iter()
+            .map(|(prefix, pair)| (Nlri::from_prefix(prefix), &pair.1))
     }
 
     /// Returns the best route whose prefix most specifically covers `addr`.
@@ -182,9 +184,9 @@ impl<A: IpAddress> Default for LocRib<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-    use pathvector_types::{AsPath, LocalPref, Origin};
     use crate::RouteBuilder;
+    use pathvector_types::{AsPath, LocalPref, Origin};
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn peer(n: u8) -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))

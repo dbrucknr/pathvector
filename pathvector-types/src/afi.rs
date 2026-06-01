@@ -277,40 +277,73 @@ pub struct AfiSafi {
 impl AfiSafi {
     /// IPv4 unicast — standard IPv4 route exchange. The default address family
     /// for BGP-4; supported by every BGP implementation.
-    pub const IPV4_UNICAST: Self = Self { afi: Afi::IPV4, safi: Safi::UNICAST };
+    pub const IPV4_UNICAST: Self = Self {
+        afi: Afi::IPV4,
+        safi: Safi::UNICAST,
+    };
 
     /// IPv6 unicast — standard IPv6 route exchange (RFC 4760).
-    pub const IPV6_UNICAST: Self = Self { afi: Afi::IPV6, safi: Safi::UNICAST };
+    pub const IPV6_UNICAST: Self = Self {
+        afi: Afi::IPV6,
+        safi: Safi::UNICAST,
+    };
 
     /// IPv4 multicast topology routes.
-    pub const IPV4_MULTICAST: Self = Self { afi: Afi::IPV4, safi: Safi::MULTICAST };
+    pub const IPV4_MULTICAST: Self = Self {
+        afi: Afi::IPV4,
+        safi: Safi::MULTICAST,
+    };
 
     /// IPv6 multicast topology routes.
-    pub const IPV6_MULTICAST: Self = Self { afi: Afi::IPV6, safi: Safi::MULTICAST };
+    pub const IPV6_MULTICAST: Self = Self {
+        afi: Afi::IPV6,
+        safi: Safi::MULTICAST,
+    };
 
     /// IPv4 MPLS labeled unicast (RFC 3107).
-    pub const IPV4_MPLS: Self = Self { afi: Afi::IPV4, safi: Safi::MPLS_LABELED };
+    pub const IPV4_MPLS: Self = Self {
+        afi: Afi::IPV4,
+        safi: Safi::MPLS_LABELED,
+    };
 
     /// IPv6 MPLS labeled unicast (RFC 3107).
-    pub const IPV6_MPLS: Self = Self { afi: Afi::IPV6, safi: Safi::MPLS_LABELED };
+    pub const IPV6_MPLS: Self = Self {
+        afi: Afi::IPV6,
+        safi: Safi::MPLS_LABELED,
+    };
 
     /// IPv4 MPLS Layer 3 VPN (RFC 4364). The dominant enterprise WAN VPN
     /// technology — routes carry MPLS labels that identify the customer VRF
     /// on the remote PE router.
-    pub const IPV4_MPLS_VPN: Self = Self { afi: Afi::IPV4, safi: Safi::MPLS_VPN };
+    pub const IPV4_MPLS_VPN: Self = Self {
+        afi: Afi::IPV4,
+        safi: Safi::MPLS_VPN,
+    };
 
     /// IPv6 MPLS Layer 3 VPN.
-    pub const IPV6_MPLS_VPN: Self = Self { afi: Afi::IPV6, safi: Safi::MPLS_VPN };
+    pub const IPV6_MPLS_VPN: Self = Self {
+        afi: Afi::IPV6,
+        safi: Safi::MPLS_VPN,
+    };
 
     /// Ethernet VPN (EVPN, RFC 7432). Uses the L2VPN AFI with the EVPN SAFI.
     /// BGP carries MAC and IP reachability for data centre and carrier overlays.
-    pub const EVPN: Self = Self { afi: Afi::L2VPN, safi: Safi::EVPN };
+    pub const EVPN: Self = Self {
+        afi: Afi::L2VPN,
+        safi: Safi::EVPN,
+    };
 
     /// IPv4 `FlowSpec` — traffic flow rules for `DDoS` mitigation and steering.
-    pub const IPV4_FLOW_SPEC: Self = Self { afi: Afi::IPV4, safi: Safi::FLOW_SPEC };
+    pub const IPV4_FLOW_SPEC: Self = Self {
+        afi: Afi::IPV4,
+        safi: Safi::FLOW_SPEC,
+    };
 
     /// IPv6 `FlowSpec`.
-    pub const IPV6_FLOW_SPEC: Self = Self { afi: Afi::IPV6, safi: Safi::FLOW_SPEC };
+    pub const IPV6_FLOW_SPEC: Self = Self {
+        afi: Afi::IPV6,
+        safi: Safi::FLOW_SPEC,
+    };
 
     /// Creates an `AfiSafi` from an [`Afi`] and [`Safi`] pair.
     ///

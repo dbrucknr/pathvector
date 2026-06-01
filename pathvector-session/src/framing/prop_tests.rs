@@ -2,8 +2,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bytes::BytesMut;
 use pathvector_types::{
-    Afi, AfiSafi, Aggregator, AsPath, AsPathSegment, Asn, Community, LargeCommunity, NextHop,
-    Nlri, Origin, Safi,
+    Afi, AfiSafi, Aggregator, AsPath, AsPathSegment, Asn, Community, LargeCommunity, NextHop, Nlri,
+    Origin, Safi,
 };
 use proptest::prelude::*;
 use tokio_util::codec::{Decoder, Encoder};
@@ -65,15 +65,20 @@ fn arb_capability() -> impl Strategy<Value = Capability> {
             0u16..=4095,
             prop::collection::vec(
                 (arb_afi_safi(), any::<bool>()).prop_map(|(afi_safi, forwarding_preserved)| {
-                    GracefulRestartFamily { afi_safi, forwarding_preserved }
+                    GracefulRestartFamily {
+                        afi_safi,
+                        forwarding_preserved,
+                    }
                 }),
                 0..3,
             ),
         )
-            .prop_map(|(restart_flags, restart_time, families)| Capability::GracefulRestart {
-                restart_flags,
-                restart_time,
-                families,
+            .prop_map(|(restart_flags, restart_time, families)| {
+                Capability::GracefulRestart {
+                    restart_flags,
+                    restart_time,
+                    families,
+                }
             }),
     ]
 }
@@ -179,20 +184,32 @@ fn arb_bgp_message() -> impl Strategy<Value = BgpMessage> {
             prop::collection::vec(arb_capability(), 0..4),
         )
             .prop_map(|(my_as, hold_time, bgp_id, capabilities)| {
-                BgpMessage::Open(OpenMessage { version: 4, my_as, hold_time, bgp_id, capabilities })
+                BgpMessage::Open(OpenMessage {
+                    version: 4,
+                    my_as,
+                    hold_time,
+                    bgp_id,
+                    capabilities,
+                })
             }),
         (
             arb_notification_error(),
             prop::collection::vec(any::<u8>(), 0..16),
         )
-            .prop_map(|(error, data)| BgpMessage::Notification(NotificationMessage { error, data })),
+            .prop_map(
+                |(error, data)| BgpMessage::Notification(NotificationMessage { error, data })
+            ),
         (
             prop::collection::vec(arb_nlri_v4(), 0..5),
             prop::collection::vec(arb_path_attribute(), 0..5),
             prop::collection::vec(arb_nlri_v4(), 0..5),
         )
             .prop_map(|(withdrawn, attributes, announced)| {
-                BgpMessage::Update(UpdateMessage { withdrawn, attributes, announced })
+                BgpMessage::Update(UpdateMessage {
+                    withdrawn,
+                    attributes,
+                    announced,
+                })
             }),
         arb_afi_safi()
             .prop_map(|afi_safi| BgpMessage::RouteRefresh(RouteRefreshMessage { afi_safi })),

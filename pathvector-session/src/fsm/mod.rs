@@ -163,7 +163,12 @@ impl Fsm {
     /// Create a new FSM in [`State::Idle`].
     #[must_use]
     pub fn new(config: FsmConfig) -> Self {
-        Self { state: State::Idle, config, peer_open: None, negotiated_hold_time: 0 }
+        Self {
+            state: State::Idle,
+            config,
+            peer_open: None,
+            negotiated_hold_time: 0,
+        }
     }
 
     /// Current FSM state.
@@ -246,9 +251,10 @@ impl Fsm {
                     Err(err) => {
                         self.state = State::Idle;
                         vec![
-                            FsmOutput::SendMessage(BgpMessage::Notification(
-                                NotificationMessage { error: err, data: vec![] },
-                            )),
+                            FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                                error: err,
+                                data: vec![],
+                            })),
                             FsmOutput::StopHoldTimer,
                             FsmOutput::CloseTcpConnection,
                         ]
@@ -258,10 +264,7 @@ impl Fsm {
             // NOTIFICATION in OpenSent: clean up and go Idle (RFC 4271 §8.2.2 event 25).
             FsmInput::MessageReceived(BgpMessage::Notification(_)) => {
                 self.state = State::Idle;
-                vec![
-                    FsmOutput::StopHoldTimer,
-                    FsmOutput::CloseTcpConnection,
-                ]
+                vec![FsmOutput::StopHoldTimer, FsmOutput::CloseTcpConnection]
             }
             FsmInput::TcpFailed => {
                 self.state = State::Active;
@@ -436,13 +439,18 @@ impl Fsm {
     /// [`FsmInput::ManualStop`] from Connect or Active (no OPEN exchanged yet).
     fn do_stop_pre_open(&mut self) -> Vec<FsmOutput> {
         self.state = State::Idle;
-        vec![FsmOutput::StopConnectRetryTimer, FsmOutput::CloseTcpConnection]
+        vec![
+            FsmOutput::StopConnectRetryTimer,
+            FsmOutput::CloseTcpConnection,
+        ]
     }
 
     /// Restart the hold timer if the negotiated hold time is non-zero.
     fn reset_hold_if_active(&self) -> Vec<FsmOutput> {
         if self.negotiated_hold_time > 0 {
-            vec![FsmOutput::StartHoldTimer(hold_duration(self.negotiated_hold_time))]
+            vec![FsmOutput::StartHoldTimer(hold_duration(
+                self.negotiated_hold_time,
+            ))]
         } else {
             vec![]
         }
@@ -454,7 +462,9 @@ impl Fsm {
             AS_TRANS
         } else {
             #[allow(clippy::cast_possible_truncation)] // guarded by the branch above
-            { self.config.local_as as u16 }
+            {
+                self.config.local_as as u16
+            }
         };
         OpenMessage {
             version: 4,
@@ -468,11 +478,15 @@ impl Fsm {
     /// Validate a received OPEN, returning the negotiated hold time on success.
     fn validate_open(&self, peer: &OpenMessage) -> Result<u16, NotificationError> {
         if peer.version != 4 {
-            return Err(NotificationError::OpenMessage(OpenMsgError::UnsupportedVersionNumber));
+            return Err(NotificationError::OpenMessage(
+                OpenMsgError::UnsupportedVersionNumber,
+            ));
         }
 
         if peer.bgp_id == Ipv4Addr::UNSPECIFIED {
-            return Err(NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier));
+            return Err(NotificationError::OpenMessage(
+                OpenMsgError::BadBgpIdentifier,
+            ));
         }
 
         if let Some(expected) = self.config.peer_as {
@@ -483,7 +497,9 @@ impl Fsm {
 
         // RFC 4271 §6.2: hold time values 1 and 2 are unacceptable.
         if peer.hold_time == 1 || peer.hold_time == 2 {
-            return Err(NotificationError::OpenMessage(OpenMsgError::UnacceptableHoldTime));
+            return Err(NotificationError::OpenMessage(
+                OpenMsgError::UnacceptableHoldTime,
+            ));
         }
 
         // If either side proposes 0, the result is 0 (timer disabled).
@@ -524,7 +540,13 @@ impl Fsm {
 fn resolve_as(open: &OpenMessage) -> u32 {
     open.capabilities
         .iter()
-        .find_map(|cap| if let Capability::FourByteAsn(n) = cap { Some(*n) } else { None })
+        .find_map(|cap| {
+            if let Capability::FourByteAsn(n) = cap {
+                Some(*n)
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| u32::from(open.my_as))
 }
 
@@ -541,7 +563,9 @@ fn keepalive_interval(hold_time: u16) -> Duration {
 fn push_timer_actions(out: &mut Vec<FsmOutput>, negotiated: u16) {
     if negotiated > 0 {
         out.push(FsmOutput::StartHoldTimer(hold_duration(negotiated)));
-        out.push(FsmOutput::StartKeepaliveTimer(keepalive_interval(negotiated)));
+        out.push(FsmOutput::StartKeepaliveTimer(keepalive_interval(
+            negotiated,
+        )));
     } else {
         out.push(FsmOutput::StopHoldTimer);
         out.push(FsmOutput::StopKeepaliveTimer);
@@ -557,7 +581,7 @@ mod prop_tests;
 mod tests {
     use std::net::Ipv4Addr;
 
-    use pathvector_types::{Asn, AsPath, Nlri, Origin};
+    use pathvector_types::{AsPath, Asn, Nlri, Origin};
 
     use super::*;
     use crate::message::{PathAttribute, UpdateMessage};
@@ -589,7 +613,13 @@ mod tests {
     }
 
     fn find_send(outputs: &[FsmOutput]) -> Option<&BgpMessage> {
-        outputs.iter().find_map(|o| if let FsmOutput::SendMessage(m) = o { Some(m) } else { None })
+        outputs.iter().find_map(|o| {
+            if let FsmOutput::SendMessage(m) = o {
+                Some(m)
+            } else {
+                None
+            }
+        })
     }
 
     /// Drive the FSM through the happy path up to Established and return it.
@@ -602,7 +632,11 @@ mod tests {
         let info = outputs
             .iter()
             .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None }
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
             })
             .expect("SessionEstablished in outputs");
         (fsm, info)
@@ -655,8 +689,14 @@ mod tests {
         let out = fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
         assert_eq!(fsm.state(), State::OpenConfirm);
         assert!(matches!(find_send(&out), Some(BgpMessage::Keepalive)));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartHoldTimer(_))));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartKeepaliveTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartHoldTimer(_)
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartKeepaliveTimer(_)
+        )));
     }
 
     #[test]
@@ -692,10 +732,20 @@ mod tests {
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = outputs
             .iter()
-            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
+            .find_map(|o| {
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
+            })
             .expect("SessionEstablished");
 
-        assert!(info.peer_capabilities.iter().any(|c| matches!(c, Capability::FourByteAsn(65002))));
+        assert!(
+            info.peer_capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::FourByteAsn(65002)))
+        );
         assert!(info.peer_capabilities.contains(&Capability::RouteRefresh));
         assert!(info.peer_capabilities.iter().any(|c| {
             matches!(c, Capability::MultiProtocol(a) if *a == pathvector_types::AfiSafi::IPV6_UNICAST)
@@ -712,7 +762,11 @@ mod tests {
     #[test]
     fn test_session_info_internal_peer_type_when_same_as() {
         // Same AS on both sides → iBGP → Internal.
-        let config = FsmConfig { local_as: 65002, peer_as: Some(65002), ..default_config() };
+        let config = FsmConfig {
+            local_as: 65002,
+            peer_as: Some(65002),
+            ..default_config()
+        };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
         fsm.process(FsmInput::TcpConnected);
@@ -720,7 +774,13 @@ mod tests {
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = outputs
             .iter()
-            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
+            .find_map(|o| {
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
+            })
             .expect("SessionEstablished");
         assert_eq!(info.peer_type, pathvector_types::PeerType::Internal);
     }
@@ -751,11 +811,22 @@ mod tests {
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = outputs
             .iter()
-            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
+            .find_map(|o| {
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
+            })
             .expect("SessionEstablished");
 
         let gr = info.peer_capabilities.iter().find_map(|c| {
-            if let Capability::GracefulRestart { restart_flags, restart_time, .. } = c {
+            if let Capability::GracefulRestart {
+                restart_flags,
+                restart_time,
+                ..
+            } = c
+            {
                 Some((*restart_flags, *restart_time))
             } else {
                 None
@@ -778,14 +849,21 @@ mod tests {
         fsm.process(FsmInput::TcpConnected);
         let out = fsm.process(FsmInput::MessageReceived(peer_open(65002, 30)));
         let hold = out.iter().find_map(|o| {
-            if let FsmOutput::StartHoldTimer(d) = o { Some(*d) } else { None }
+            if let FsmOutput::StartHoldTimer(d) = o {
+                Some(*d)
+            } else {
+                None
+            }
         });
         assert_eq!(hold, Some(Duration::from_secs(30)));
     }
 
     #[test]
     fn test_hold_time_zero_disables_timers() {
-        let config = FsmConfig { hold_time: 0, ..default_config() };
+        let config = FsmConfig {
+            hold_time: 0,
+            ..default_config()
+        };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
         fsm.process(FsmInput::TcpConnected);
@@ -897,7 +975,10 @@ mod tests {
         let out = fsm.process(FsmInput::KeepaliveTimerExpired);
         assert_eq!(fsm.state(), State::OpenConfirm);
         assert!(matches!(find_send(&out), Some(BgpMessage::Keepalive)));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartKeepaliveTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartKeepaliveTimer(_)
+        )));
     }
 
     #[test]
@@ -906,7 +987,10 @@ mod tests {
         let out = fsm.process(FsmInput::KeepaliveTimerExpired);
         assert_eq!(fsm.state(), State::Established);
         assert!(matches!(find_send(&out), Some(BgpMessage::Keepalive)));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartKeepaliveTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartKeepaliveTimer(_)
+        )));
     }
 
     #[test]
@@ -916,7 +1000,11 @@ mod tests {
         fsm.process(FsmInput::TcpConnected);
         let out = fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
         let ka = out.iter().find_map(|o| {
-            if let FsmOutput::StartKeepaliveTimer(d) = o { Some(*d) } else { None }
+            if let FsmOutput::StartKeepaliveTimer(d) = o {
+                Some(*d)
+            } else {
+                None
+            }
         });
         assert_eq!(ka, Some(Duration::from_secs(30)));
     }
@@ -935,10 +1023,15 @@ mod tests {
             ],
             announced: vec!["192.0.2.0/24".parse::<Nlri<Ipv4Addr>>().unwrap()],
         };
-        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Update(update.clone())));
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Update(
+            update.clone(),
+        )));
         assert_eq!(fsm.state(), State::Established);
         assert!(has_output(&out, |o| matches!(o, FsmOutput::RouteUpdate(_))));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartHoldTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartHoldTimer(_)
+        )));
     }
 
     // ── NOTIFICATION received ─────────────────────────────────────────────────
@@ -1012,7 +1105,10 @@ mod tests {
         fsm.process(FsmInput::ManualStart);
         let out = fsm.process(FsmInput::TcpFailed);
         assert_eq!(fsm.state(), State::Active);
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartConnectRetryTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartConnectRetryTimer(_)
+        )));
     }
 
     #[test]
@@ -1056,7 +1152,11 @@ mod tests {
         fsm.process(FsmInput::MessageReceived(peer_open(131_073, 90)));
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = out.iter().find_map(|o| {
-            if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None }
+            if let FsmOutput::SessionEstablished(i) = o {
+                Some(i.clone())
+            } else {
+                None
+            }
         });
         assert_eq!(info.unwrap().peer_as, 131_073);
     }
@@ -1065,7 +1165,10 @@ mod tests {
 
     #[test]
     fn test_open_accepted_when_peer_as_unconfigured() {
-        let config = FsmConfig { peer_as: None, ..default_config() };
+        let config = FsmConfig {
+            peer_as: None,
+            ..default_config()
+        };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
         fsm.process(FsmInput::TcpConnected);
@@ -1083,14 +1186,17 @@ mod tests {
         let out = fsm.process(FsmInput::ConnectRetryTimerExpired);
         assert_eq!(fsm.state(), State::Connect);
         assert!(has_output(&out, |o| *o == FsmOutput::InitiateTcpConnect));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartConnectRetryTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartConnectRetryTimer(_)
+        )));
     }
 
     #[test]
     fn test_tcp_connected_from_active_enters_open_sent() {
         let mut fsm = Fsm::new(default_config());
         fsm.process(FsmInput::ManualStart); // → Connect
-        fsm.process(FsmInput::TcpFailed);   // → Active
+        fsm.process(FsmInput::TcpFailed); // → Active
         let out = fsm.process(FsmInput::TcpConnected);
         assert_eq!(fsm.state(), State::OpenSent);
         assert!(matches!(find_send(&out), Some(BgpMessage::Open(_))));
@@ -1117,7 +1223,10 @@ mod tests {
         let out = fsm.process(FsmInput::TcpFailed);
         assert_eq!(fsm.state(), State::Active);
         assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartConnectRetryTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartConnectRetryTimer(_)
+        )));
     }
 
     #[test]
@@ -1163,14 +1272,20 @@ mod tests {
         assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
         assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
         // Session never reached Established, so SessionEstablished must not appear.
-        assert!(!has_output(&out, |o| matches!(o, FsmOutput::SessionEstablished(_))));
+        assert!(!has_output(&out, |o| matches!(
+            o,
+            FsmOutput::SessionEstablished(_)
+        )));
     }
 
     #[test]
     fn test_notification_in_open_confirm_terminates() {
         let mut fsm = enter_open_confirm();
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Notification(
-            NotificationMessage { error: NotificationError::HoldTimerExpired, data: vec![] },
+            NotificationMessage {
+                error: NotificationError::HoldTimerExpired,
+                data: vec![],
+            },
         )));
         assert_eq!(fsm.state(), State::Idle);
         assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
@@ -1225,7 +1340,10 @@ mod tests {
         let (mut fsm, _) = establish(default_config());
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         assert_eq!(fsm.state(), State::Established);
-        assert!(has_output(&out, |o| matches!(o, FsmOutput::StartHoldTimer(_))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            FsmOutput::StartHoldTimer(_)
+        )));
     }
 
     // ── Catch-all _ => vec![] branches ───────────────────────────────────────
@@ -1279,7 +1397,10 @@ mod tests {
 
     #[test]
     fn test_keepalive_in_established_no_hold_timer_when_disabled() {
-        let config = FsmConfig { hold_time: 0, ..default_config() };
+        let config = FsmConfig {
+            hold_time: 0,
+            ..default_config()
+        };
         let (mut fsm, _) = establish(config);
         // With negotiated_hold_time == 0, a Keepalive in Established returns no outputs.
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));

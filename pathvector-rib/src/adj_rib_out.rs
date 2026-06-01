@@ -76,7 +76,11 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// Creates an empty `AdjRibOut` for the given peer.
     #[must_use]
     pub fn new(peer: PeerId, peer_type: PeerType) -> Self {
-        Self { peer, peer_type, routes: HashMap::new() }
+        Self {
+            peer,
+            peer_type,
+            routes: HashMap::new(),
+        }
     }
 
     /// Returns the peer this outbound table belongs to.
@@ -151,9 +155,9 @@ impl<A: IpAddress> AdjRibOut<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-    use pathvector_types::{AsPath, Asn, AsPathSegment, LocalPref, Origin};
     use crate::RouteBuilder;
+    use pathvector_types::{AsPath, AsPathSegment, Asn, LocalPref, Origin};
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn ebgp_peer() -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
@@ -303,7 +307,10 @@ mod tests {
         assert_eq!(stored.as_path.path_length(), 2);
         for seg in stored.as_path.segments() {
             assert!(
-                !matches!(seg, AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)),
+                !matches!(
+                    seg,
+                    AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)
+                ),
                 "confed segment survived eBGP advertisement"
             );
         }

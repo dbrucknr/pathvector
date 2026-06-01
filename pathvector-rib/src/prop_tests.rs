@@ -3,10 +3,7 @@ use std::{collections::HashMap, net::Ipv4Addr};
 use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 use proptest::prelude::*;
 
-use crate::{
-    AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder,
-    best_path::select_best,
-};
+use crate::{AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder, best_path::select_best};
 
 // ── Strategies ───────────────────────────────────────────────────────────────
 
@@ -46,17 +43,21 @@ fn arb_route_for(nlri: Nlri<Ipv4Addr>) -> impl Strategy<Value = Route<Ipv4Addr>>
         proptest::option::of(0u32..=300u32),
         proptest::option::of(0u32..=1000u32),
     )
-    .prop_map(move |(origin, asns, lp, med)| {
-        let as_path = if asns.is_empty() {
-            AsPath::new()
-        } else {
-            AsPath::from_sequence(asns.into_iter().map(Asn::new).collect())
-        };
-        let mut b = RouteBuilder::new(nlri, origin, as_path);
-        if let Some(v) = lp { b = b.local_pref(LocalPref::new(v)); }
-        if let Some(v) = med { b = b.med(Med::new(v)); }
-        b.build()
-    })
+        .prop_map(move |(origin, asns, lp, med)| {
+            let as_path = if asns.is_empty() {
+                AsPath::new()
+            } else {
+                AsPath::from_sequence(asns.into_iter().map(Asn::new).collect())
+            };
+            let mut b = RouteBuilder::new(nlri, origin, as_path);
+            if let Some(v) = lp {
+                b = b.local_pref(LocalPref::new(v));
+            }
+            if let Some(v) = med {
+                b = b.med(Med::new(v));
+            }
+            b.build()
+        })
 }
 
 /// Non-empty candidate map (1–4 peers, all routes for 10.0.0.0/8).
@@ -67,9 +68,8 @@ fn arb_candidates() -> impl Strategy<Value = HashMap<PeerId, Route<Ipv4Addr>>> {
 
 /// A (peer, route) pair for [`LocRib`] insertion with a varying NLRI.
 fn arb_peer_route() -> impl Strategy<Value = (PeerId, Route<Ipv4Addr>)> {
-    (arb_peer_id(), arb_nlri()).prop_flat_map(|(peer, nlri)| {
-        arb_route_for(nlri).prop_map(move |route| (peer, route))
-    })
+    (arb_peer_id(), arb_nlri())
+        .prop_flat_map(|(peer, nlri)| arb_route_for(nlri).prop_map(move |route| (peer, route)))
 }
 
 // ── best_path::select_best ───────────────────────────────────────────────────

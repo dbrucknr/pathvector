@@ -4,8 +4,11 @@ use pathvector_types::{AsPath, Asn, Community, LocalPref, Med, Nlri, Origin};
 use proptest::prelude::*;
 
 use crate::{
-    action::{Accept, Action, ActionSequence, AddCommunity, Next, PrependAsPath, Reject, RemoveCommunity, SetLocalPref},
-    condition::{AnyCondition, Condition, CommunityCondition},
+    action::{
+        Accept, Action, ActionSequence, AddCommunity, Next, PrependAsPath, Reject, RemoveCommunity,
+        SetLocalPref,
+    },
+    condition::{AnyCondition, CommunityCondition, Condition},
     outcome::{Decision, DefaultAction},
     route::BgpRoute,
     term::{Policy, PolicyBuilder, Term},

@@ -28,26 +28,24 @@ pub enum CodecError {
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Truncated { needed, available } =>
-                write!(f, "truncated: need {needed} bytes, have {available}"),
-            Self::InvalidMarker =>
-                write!(f, "BGP marker is not all 0xFF"),
-            Self::InvalidLength(len) =>
-                write!(f, "invalid message length: {len}"),
-            Self::UnknownMessageType(t) =>
-                write!(f, "unknown message type: {t}"),
-            Self::UnsupportedVersion(v) =>
-                write!(f, "unsupported BGP version: {v} (expected 4)"),
-            Self::UnknownAsPathSegmentType(t) =>
-                write!(f, "unknown AS_PATH segment type: {t}"),
-            Self::InvalidOrigin(v) =>
-                write!(f, "invalid ORIGIN value: {v} (expected 0–2)"),
-            Self::InvalidCapability { code } =>
-                write!(f, "malformed capability TLV for code {code}"),
-            Self::InvalidAttribute { type_code, detail } =>
-                write!(f, "invalid path attribute {type_code}: {detail}"),
-            Self::InvalidNlri { prefix_len } =>
-                write!(f, "NLRI prefix length {prefix_len} is out of range"),
+            Self::Truncated { needed, available } => {
+                write!(f, "truncated: need {needed} bytes, have {available}")
+            }
+            Self::InvalidMarker => write!(f, "BGP marker is not all 0xFF"),
+            Self::InvalidLength(len) => write!(f, "invalid message length: {len}"),
+            Self::UnknownMessageType(t) => write!(f, "unknown message type: {t}"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported BGP version: {v} (expected 4)"),
+            Self::UnknownAsPathSegmentType(t) => write!(f, "unknown AS_PATH segment type: {t}"),
+            Self::InvalidOrigin(v) => write!(f, "invalid ORIGIN value: {v} (expected 0–2)"),
+            Self::InvalidCapability { code } => {
+                write!(f, "malformed capability TLV for code {code}")
+            }
+            Self::InvalidAttribute { type_code, detail } => {
+                write!(f, "invalid path attribute {type_code}: {detail}")
+            }
+            Self::InvalidNlri { prefix_len } => {
+                write!(f, "NLRI prefix length {prefix_len} is out of range")
+            }
         }
     }
 }
@@ -60,13 +58,19 @@ mod tests {
 
     #[test]
     fn test_error_display_truncated() {
-        let e = CodecError::Truncated { needed: 4, available: 1 };
+        let e = CodecError::Truncated {
+            needed: 4,
+            available: 1,
+        };
         assert_eq!(e.to_string(), "truncated: need 4 bytes, have 1");
     }
 
     #[test]
     fn test_error_display_invalid_marker() {
-        assert_eq!(CodecError::InvalidMarker.to_string(), "BGP marker is not all 0xFF");
+        assert_eq!(
+            CodecError::InvalidMarker.to_string(),
+            "BGP marker is not all 0xFF"
+        );
     }
 
     #[test]
@@ -78,12 +82,18 @@ mod tests {
 
     #[test]
     fn test_error_display_invalid_length() {
-        assert_eq!(CodecError::InvalidLength(100).to_string(), "invalid message length: 100");
+        assert_eq!(
+            CodecError::InvalidLength(100).to_string(),
+            "invalid message length: 100"
+        );
     }
 
     #[test]
     fn test_error_display_unknown_message_type() {
-        assert_eq!(CodecError::UnknownMessageType(9).to_string(), "unknown message type: 9");
+        assert_eq!(
+            CodecError::UnknownMessageType(9).to_string(),
+            "unknown message type: 9"
+        );
     }
 
     #[test]
@@ -120,8 +130,14 @@ mod tests {
 
     #[test]
     fn test_error_display_invalid_attribute() {
-        let e = CodecError::InvalidAttribute { type_code: 3, detail: "NEXT_HOP must be 4 bytes" };
-        assert_eq!(e.to_string(), "invalid path attribute 3: NEXT_HOP must be 4 bytes");
+        let e = CodecError::InvalidAttribute {
+            type_code: 3,
+            detail: "NEXT_HOP must be 4 bytes",
+        };
+        assert_eq!(
+            e.to_string(),
+            "invalid path attribute 3: NEXT_HOP must be 4 bytes"
+        );
     }
 
     #[test]

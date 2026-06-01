@@ -2,9 +2,9 @@ use std::net::Ipv4Addr;
 
 use pathvector_types::{Afi, AfiSafi, Safi};
 
-use super::{Cursor, Writer};
 use super::error::CodecError;
-use super::header::{encode_header, MessageType};
+use super::header::{MessageType, encode_header};
+use super::{Cursor, Writer};
 
 /// The BGP version advertised in OPEN messages. Must be 4.
 const BGP_VERSION: u8 = 4;
@@ -47,7 +47,13 @@ impl OpenMessage {
         let opt_len = cur.read_u8()? as usize;
         let mut opt_cur = cur.fork(opt_len)?;
         let capabilities = decode_capabilities(&mut opt_cur)?;
-        Ok(Self { version, my_as, hold_time, bgp_id, capabilities })
+        Ok(Self {
+            version,
+            my_as,
+            hold_time,
+            bgp_id,
+            capabilities,
+        })
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
@@ -142,7 +148,11 @@ fn decode_capability(code: u8, cur: &mut Cursor<'_>) -> Result<Capability, Codec
                     forwarding_preserved: (fwd_flags & 0x80) != 0,
                 });
             }
-            Ok(Capability::GracefulRestart { restart_flags, restart_time, families })
+            Ok(Capability::GracefulRestart {
+                restart_flags,
+                restart_time,
+                families,
+            })
         }
         _ => {
             let value = cur.read_remaining().to_vec();
@@ -177,7 +187,11 @@ fn encode_capability_value(cap: &Capability) -> Vec<u8> {
         Capability::FourByteAsn(asn) => {
             v.put_u32(*asn);
         }
-        Capability::GracefulRestart { restart_flags, restart_time, families } => {
+        Capability::GracefulRestart {
+            restart_flags,
+            restart_time,
+            families,
+        } => {
             let flags_time = (u16::from(*restart_flags) << 12) | (restart_time & 0x0FFF);
             v.put_u16(flags_time);
             for fam in families {
@@ -321,7 +335,10 @@ mod tests {
 
     #[test]
     fn test_unsupported_version_rejected() {
-        let msg = OpenMessage { version: 3, ..base_open() };
+        let msg = OpenMessage {
+            version: 3,
+            ..base_open()
+        };
         // Manually build a version-3 OPEN body.
         let encoded = msg.encode();
         // The version byte is at offset 19 (after the header).
@@ -343,10 +360,10 @@ mod tests {
     /// Build an OPEN body with a custom optional-parameter byte string.
     fn open_with_raw_opt_params(opt_params: &[u8]) -> Vec<u8> {
         let mut body: Vec<u8> = vec![
-            4,             // version
-            0xFF, 0xE9,    // my_as = 65001
-            0x00, 0x5A,    // hold_time = 90
-            10, 0, 0, 1,   // bgp_id
+            4, // version
+            0xFF, 0xE9, // my_as = 65001
+            0x00, 0x5A, // hold_time = 90
+            10, 0, 0, 1, // bgp_id
         ];
         body.push(u8::try_from(opt_params.len()).unwrap());
         body.extend_from_slice(opt_params);
@@ -371,9 +388,12 @@ mod tests {
     fn test_truncated_multiprotocol_capability_is_error() {
         // cap_code=1 (MultiProtocol), cap_len=2, but MultiProtocol needs 4 bytes.
         let params = [
-            OPT_PARAM_CAPABILITIES, 4, // type=2, param_len=4
-            1, 2,                       // cap_code=1, cap_len=2 (should be 4)
-            0x00, 0x01,                 // only 2 bytes of value
+            OPT_PARAM_CAPABILITIES,
+            4, // type=2, param_len=4
+            1,
+            2, // cap_code=1, cap_len=2 (should be 4)
+            0x00,
+            0x01, // only 2 bytes of value
         ];
         let body = open_with_raw_opt_params(&params);
         assert!(matches!(
@@ -386,9 +406,12 @@ mod tests {
     fn test_truncated_four_byte_asn_capability_is_error() {
         // cap_code=65 (FourByteAsn), cap_len=2, but FourByteAsn needs 4 bytes.
         let params = [
-            OPT_PARAM_CAPABILITIES, 4,
-            65, 2,     // cap_code=65, cap_len=2
-            0x00, 0x01,
+            OPT_PARAM_CAPABILITIES,
+            4,
+            65,
+            2, // cap_code=65, cap_len=2
+            0x00,
+            0x01,
         ];
         let body = open_with_raw_opt_params(&params);
         assert!(matches!(
@@ -401,9 +424,11 @@ mod tests {
     fn test_truncated_graceful_restart_capability_is_error() {
         // cap_code=64 (GracefulRestart), cap_len=1, but needs at least 2 bytes.
         let params = [
-            OPT_PARAM_CAPABILITIES, 3,
-            64, 1,  // cap_code=64, cap_len=1
-            0x00,   // only 1 byte
+            OPT_PARAM_CAPABILITIES,
+            3,
+            64,
+            1,    // cap_code=64, cap_len=1
+            0x00, // only 1 byte
         ];
         let body = open_with_raw_opt_params(&params);
         assert!(matches!(

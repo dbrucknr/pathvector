@@ -351,7 +351,10 @@ mod tests {
         let mut cur = Cursor::new(&[0x00, 0x01, 0x02]);
         assert!(matches!(
             cur.read_u32(),
-            Err(CodecError::Truncated { needed: 4, available: 3 })
+            Err(CodecError::Truncated {
+                needed: 4,
+                available: 3
+            })
         ));
     }
 

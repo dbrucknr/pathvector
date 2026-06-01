@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use proptest::prelude::*;
 
-use crate::{Asn, AsPath, Community, LargeCommunity, LocalPref, Med, Nlri, Origin};
+use crate::{AsPath, Asn, Community, LargeCommunity, LocalPref, Med, Nlri, Origin};
 
 // ── Strategies ─────────────────────────────────────────────────────────────
 

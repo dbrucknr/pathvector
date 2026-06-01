@@ -74,24 +74,58 @@ pub struct Route<A: IpAddress> {
 impl<A: IpAddress> BgpRoute for Route<A> {
     type Addr = A;
 
-    fn nlri(&self) -> Nlri<A> { self.nlri }
-    fn origin(&self) -> Origin { self.origin }
-    fn local_pref(&self) -> Option<LocalPref> { self.local_pref }
-    fn med(&self) -> Option<Med> { self.med }
-    fn as_path(&self) -> &AsPath { &self.as_path }
-    fn communities(&self) -> &[Community] { &self.communities }
-    fn large_communities(&self) -> &[LargeCommunity] { &self.large_communities }
-    fn extended_communities(&self) -> &[ExtendedCommunity] { &self.extended_communities }
-    fn next_hop(&self) -> Option<NextHop> { self.next_hop }
+    fn nlri(&self) -> Nlri<A> {
+        self.nlri
+    }
+    fn origin(&self) -> Origin {
+        self.origin
+    }
+    fn local_pref(&self) -> Option<LocalPref> {
+        self.local_pref
+    }
+    fn med(&self) -> Option<Med> {
+        self.med
+    }
+    fn as_path(&self) -> &AsPath {
+        &self.as_path
+    }
+    fn communities(&self) -> &[Community] {
+        &self.communities
+    }
+    fn large_communities(&self) -> &[LargeCommunity] {
+        &self.large_communities
+    }
+    fn extended_communities(&self) -> &[ExtendedCommunity] {
+        &self.extended_communities
+    }
+    fn next_hop(&self) -> Option<NextHop> {
+        self.next_hop
+    }
 
-    fn set_origin(&mut self, origin: Origin) { self.origin = origin; }
-    fn set_local_pref(&mut self, lp: Option<LocalPref>) { self.local_pref = lp; }
-    fn set_med(&mut self, med: Option<Med>) { self.med = med; }
-    fn set_as_path(&mut self, path: AsPath) { self.as_path = path; }
-    fn set_communities(&mut self, c: Vec<Community>) { self.communities = c; }
-    fn set_large_communities(&mut self, c: Vec<LargeCommunity>) { self.large_communities = c; }
-    fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) { self.extended_communities = c; }
-    fn set_next_hop(&mut self, nh: Option<NextHop>) { self.next_hop = nh; }
+    fn set_origin(&mut self, origin: Origin) {
+        self.origin = origin;
+    }
+    fn set_local_pref(&mut self, lp: Option<LocalPref>) {
+        self.local_pref = lp;
+    }
+    fn set_med(&mut self, med: Option<Med>) {
+        self.med = med;
+    }
+    fn set_as_path(&mut self, path: AsPath) {
+        self.as_path = path;
+    }
+    fn set_communities(&mut self, c: Vec<Community>) {
+        self.communities = c;
+    }
+    fn set_large_communities(&mut self, c: Vec<LargeCommunity>) {
+        self.large_communities = c;
+    }
+    fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) {
+        self.extended_communities = c;
+    }
+    fn set_next_hop(&mut self, nh: Option<NextHop>) {
+        self.next_hop = nh;
+    }
 }
 
 /// Builder for constructing a [`Route<A>`].
@@ -291,8 +325,8 @@ mod tests {
 
     #[test]
     fn test_route_bgproute_getters() {
-        use pathvector_types::{Asn, LocalPref};
         use pathvector_policy::BgpRoute;
+        use pathvector_types::{Asn, LocalPref};
 
         let route = RouteBuilder::new(
             nlri("10.0.0.0/8"),
@@ -310,8 +344,8 @@ mod tests {
 
     #[test]
     fn test_route_bgproute_setters() {
-        use pathvector_types::{Asn, LocalPref};
         use pathvector_policy::BgpRoute;
+        use pathvector_types::{Asn, LocalPref};
 
         let mut route =
             RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Incomplete, AsPath::new()).build();
@@ -345,8 +379,8 @@ mod tests {
 
     #[test]
     fn test_route_bgproute_remaining_getters() {
-        use pathvector_types::{ExtendedCommunity, LargeCommunity, Med, NextHop};
         use pathvector_policy::BgpRoute;
+        use pathvector_types::{ExtendedCommunity, LargeCommunity, Med, NextHop};
 
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
             .med(Med::new(50))
@@ -357,7 +391,10 @@ mod tests {
             .build();
 
         assert_eq!(route.med(), Some(Med::new(50)));
-        assert_eq!(route.next_hop(), Some(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert_eq!(
+            route.next_hop(),
+            Some(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
         assert_eq!(route.communities().len(), 1);
         assert_eq!(route.large_communities().len(), 1);
         assert_eq!(route.extended_communities().len(), 1);
@@ -365,8 +402,8 @@ mod tests {
 
     #[test]
     fn test_route_bgproute_remaining_setters() {
-        use pathvector_types::{Community, ExtendedCommunity, LargeCommunity, Med, NextHop};
         use pathvector_policy::BgpRoute;
+        use pathvector_types::{Community, ExtendedCommunity, LargeCommunity, Med, NextHop};
 
         let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
 
@@ -377,7 +414,10 @@ mod tests {
         assert_eq!(route.med(), None);
 
         route.set_next_hop(Some(NextHop::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert_eq!(route.next_hop(), Some(NextHop::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert_eq!(
+            route.next_hop(),
+            Some(NextHop::V4(Ipv4Addr::new(192, 168, 1, 1)))
+        );
 
         route.set_next_hop(None);
         assert_eq!(route.next_hop(), None);
@@ -394,8 +434,7 @@ mod tests {
 
     #[test]
     fn test_route_clone() {
-        let original =
-            RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
+        let original = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
         let cloned = original.clone();
         assert_eq!(original, cloned);
     }

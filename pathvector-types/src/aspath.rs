@@ -204,7 +204,9 @@ impl AsPath {
         if asns.is_empty() {
             Self::new()
         } else {
-            Self { segments: vec![AsPathSegment::Sequence(asns)] }
+            Self {
+                segments: vec![AsPathSegment::Sequence(asns)],
+            }
         }
     }
 
@@ -391,7 +393,10 @@ impl AsPath {
             .segments
             .iter()
             .filter(|seg| {
-                !matches!(seg, AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_))
+                !matches!(
+                    seg,
+                    AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)
+                )
             })
             .cloned()
             .collect();
@@ -401,7 +406,11 @@ impl AsPath {
 
 impl std::fmt::Display for AsPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let parts: Vec<String> = self.segments.iter().map(std::string::ToString::to_string).collect();
+        let parts: Vec<String> = self
+            .segments
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         write!(f, "{}", parts.join(" "))
     }
 }
@@ -582,9 +591,8 @@ mod tests {
     #[test]
     fn test_aspath_origin_as_none_without_sequence() {
         // A path with only non-Sequence segments has no determinable origin AS.
-        let path = AsPath::from_segments(vec![
-            AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
-        ]);
+        let path =
+            AsPath::from_segments(vec![AsPathSegment::ConfedSequence(vec![Asn::new(65001)])]);
         assert_eq!(path.origin_as(), None);
     }
 

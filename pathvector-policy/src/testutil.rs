@@ -1,8 +1,8 @@
-use std::net::Ipv4Addr;
+use crate::route::BgpRoute;
 use pathvector_types::{
     AsPath, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop, Nlri, Origin,
 };
-use crate::route::BgpRoute;
+use std::net::Ipv4Addr;
 
 /// A minimal IPv4 BGP route used exclusively in tests.
 ///
@@ -53,24 +53,58 @@ impl TestRoute {
 impl BgpRoute for TestRoute {
     type Addr = Ipv4Addr;
 
-    fn nlri(&self) -> Nlri<Self::Addr> { self.nlri }
-    fn origin(&self) -> Origin { self.origin }
-    fn local_pref(&self) -> Option<LocalPref> { self.local_pref }
-    fn med(&self) -> Option<Med> { self.med }
-    fn as_path(&self) -> &AsPath { &self.as_path }
-    fn communities(&self) -> &[Community] { &self.communities }
-    fn large_communities(&self) -> &[LargeCommunity] { &self.large_communities }
-    fn extended_communities(&self) -> &[ExtendedCommunity] { &self.extended_communities }
-    fn next_hop(&self) -> Option<NextHop> { self.next_hop }
+    fn nlri(&self) -> Nlri<Self::Addr> {
+        self.nlri
+    }
+    fn origin(&self) -> Origin {
+        self.origin
+    }
+    fn local_pref(&self) -> Option<LocalPref> {
+        self.local_pref
+    }
+    fn med(&self) -> Option<Med> {
+        self.med
+    }
+    fn as_path(&self) -> &AsPath {
+        &self.as_path
+    }
+    fn communities(&self) -> &[Community] {
+        &self.communities
+    }
+    fn large_communities(&self) -> &[LargeCommunity] {
+        &self.large_communities
+    }
+    fn extended_communities(&self) -> &[ExtendedCommunity] {
+        &self.extended_communities
+    }
+    fn next_hop(&self) -> Option<NextHop> {
+        self.next_hop
+    }
 
-    fn set_origin(&mut self, origin: Origin) { self.origin = origin; }
-    fn set_local_pref(&mut self, lp: Option<LocalPref>) { self.local_pref = lp; }
-    fn set_med(&mut self, med: Option<Med>) { self.med = med; }
-    fn set_as_path(&mut self, path: AsPath) { self.as_path = path; }
-    fn set_communities(&mut self, c: Vec<Community>) { self.communities = c; }
-    fn set_large_communities(&mut self, c: Vec<LargeCommunity>) { self.large_communities = c; }
-    fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) { self.extended_communities = c; }
-    fn set_next_hop(&mut self, nh: Option<NextHop>) { self.next_hop = nh; }
+    fn set_origin(&mut self, origin: Origin) {
+        self.origin = origin;
+    }
+    fn set_local_pref(&mut self, lp: Option<LocalPref>) {
+        self.local_pref = lp;
+    }
+    fn set_med(&mut self, med: Option<Med>) {
+        self.med = med;
+    }
+    fn set_as_path(&mut self, path: AsPath) {
+        self.as_path = path;
+    }
+    fn set_communities(&mut self, c: Vec<Community>) {
+        self.communities = c;
+    }
+    fn set_large_communities(&mut self, c: Vec<LargeCommunity>) {
+        self.large_communities = c;
+    }
+    fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) {
+        self.extended_communities = c;
+    }
+    fn set_next_hop(&mut self, nh: Option<NextHop>) {
+        self.next_hop = nh;
+    }
 }
 
 #[cfg(test)]

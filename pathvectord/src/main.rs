@@ -48,7 +48,11 @@ fn build_export_policy(default: DefaultAction) -> Policy<Route<Ipv4Addr>> {
 
 /// Derives the peer type (iBGP / eBGP) from the configured AS numbers.
 fn config_peer_type(local_as: u32, remote_as: u32) -> PeerType {
-    if local_as == remote_as { PeerType::Internal } else { PeerType::External }
+    if local_as == remote_as {
+        PeerType::Internal
+    } else {
+        PeerType::External
+    }
 }
 
 /// Applies eBGP outbound transforms to a route clone before insertion into
@@ -97,7 +101,9 @@ fn route_to_update(route: Route<Ipv4Addr>) -> UpdateMessage {
         attributes.push(PathAttribute::LargeCommunities(route.large_communities));
     }
     if !route.extended_communities.is_empty() {
-        attributes.push(PathAttribute::ExtendedCommunities(route.extended_communities));
+        attributes.push(PathAttribute::ExtendedCommunities(
+            route.extended_communities,
+        ));
     }
     if route.atomic_aggregate {
         attributes.push(PathAttribute::AtomicAggregate);
@@ -105,11 +111,19 @@ fn route_to_update(route: Route<Ipv4Addr>) -> UpdateMessage {
     if let Some(agg) = route.aggregator {
         attributes.push(PathAttribute::Aggregator(agg));
     }
-    UpdateMessage { withdrawn: vec![], attributes, announced: vec![route.nlri] }
+    UpdateMessage {
+        withdrawn: vec![],
+        attributes,
+        announced: vec![route.nlri],
+    }
 }
 
 fn withdraw_msg(nlri: Nlri<Ipv4Addr>) -> UpdateMessage {
-    UpdateMessage { withdrawn: vec![nlri], attributes: vec![], announced: vec![] }
+    UpdateMessage {
+        withdrawn: vec![nlri],
+        attributes: vec![],
+        announced: vec![],
+    }
 }
 
 /// Propagates the current best route for `nlri` to one peer's outbound table.
@@ -202,13 +216,23 @@ async fn run(cfg: config::Config) {
     let import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>> = cfg
         .peers
         .iter()
-        .map(|p| (p.address, build_import_policy(DefaultAction::from(p.import_default))))
+        .map(|p| {
+            (
+                p.address,
+                build_import_policy(DefaultAction::from(p.import_default)),
+            )
+        })
         .collect();
 
     let export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>> = cfg
         .peers
         .iter()
-        .map(|p| (p.address, build_export_policy(DefaultAction::from(p.export_default))))
+        .map(|p| {
+            (
+                p.address,
+                build_export_policy(DefaultAction::from(p.export_default)),
+            )
+        })
         .collect();
 
     let mut adj_ribs_in_map: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>> = cfg
@@ -348,7 +372,10 @@ async fn run(cfg: config::Config) {
                     .collect();
 
                 for other_ip in other_peers {
-                    let other_type = peer_types.get(&other_ip).copied().unwrap_or(PeerType::External);
+                    let other_type = peer_types
+                        .get(&other_ip)
+                        .copied()
+                        .unwrap_or(PeerType::External);
                     let export_policy = export_policies
                         .get(&other_ip)
                         .expect("peer IP missing from export_policies — this is a bug");
@@ -408,8 +435,10 @@ async fn run(cfg: config::Config) {
                 let established_peers: Vec<Ipv4Addr> = peer_types.keys().copied().collect();
 
                 for other_ip in established_peers {
-                    let other_type =
-                        peer_types.get(&other_ip).copied().unwrap_or(PeerType::External);
+                    let other_type = peer_types
+                        .get(&other_ip)
+                        .copied()
+                        .unwrap_or(PeerType::External);
                     let export_policy = export_policies
                         .get(&other_ip)
                         .expect("peer IP missing from export_policies — this is a bug");
@@ -1163,19 +1192,27 @@ mod tests {
     }
 
     fn ebgp_route_with_lp(prefix: &str) -> Route<Ipv4Addr> {
-        RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::from_sequence(vec![Asn::new(65002)]))
-            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)))
-            .local_pref(LP::new(200))
-            .peer_type(PeerType::External)
-            .build()
+        RouteBuilder::new(
+            nlri(prefix),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65002)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        .local_pref(LP::new(200))
+        .peer_type(PeerType::External)
+        .build()
     }
 
     fn ibgp_route(prefix: &str) -> Route<Ipv4Addr> {
-        RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::from_sequence(vec![Asn::new(65002)]))
-            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)))
-            .local_pref(LP::new(200))
-            .peer_type(PeerType::Internal)
-            .build()
+        RouteBuilder::new(
+            nlri(prefix),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65002)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        .local_pref(LP::new(200))
+        .peer_type(PeerType::Internal)
+        .build()
     }
 
     #[test]
@@ -1199,7 +1236,10 @@ mod tests {
     fn test_prepare_outbound_ebgp_strips_local_pref() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
         let out = prepare_outbound(route, PeerType::External, 65001, bgp_id());
-        assert!(out.local_pref.is_none(), "LOCAL_PREF must be stripped for eBGP");
+        assert!(
+            out.local_pref.is_none(),
+            "LOCAL_PREF must be stripped for eBGP"
+        );
     }
 
     #[test]
@@ -1227,9 +1267,18 @@ mod tests {
         let msg = route_to_update(route);
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
-        let has_origin = msg.attributes.iter().any(|a| matches!(a, PathAttribute::Origin(_)));
-        let has_aspath = msg.attributes.iter().any(|a| matches!(a, PathAttribute::AsPath(_)));
-        let has_nexthop = msg.attributes.iter().any(|a| matches!(a, PathAttribute::NextHop(_)));
+        let has_origin = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Origin(_)));
+        let has_aspath = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::AsPath(_)));
+        let has_nexthop = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::NextHop(_)));
         assert!(has_origin);
         assert!(has_aspath);
         assert!(has_nexthop);
@@ -1239,8 +1288,14 @@ mod tests {
     fn test_route_to_update_omits_absent_optional_attributes() {
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
         let msg = route_to_update(route);
-        let has_lp = msg.attributes.iter().any(|a| matches!(a, PathAttribute::LocalPref(_)));
-        let has_med = msg.attributes.iter().any(|a| matches!(a, PathAttribute::Med(_)));
+        let has_lp = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::LocalPref(_)));
+        let has_med = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Med(_)));
         assert!(!has_lp, "absent LOCAL_PREF must not appear in UPDATE");
         assert!(!has_med, "absent MED must not appear in UPDATE");
     }
@@ -1264,10 +1319,22 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
 
         let msg = rx.try_recv().expect("should have queued an UPDATE");
-        assert!(!msg.announced.is_empty(), "UPDATE must contain announced NLRIs");
+        assert!(
+            !msg.announced.is_empty(),
+            "UPDATE must contain announced NLRIs"
+        );
         assert_eq!(msg.announced[0], nlri("10.0.0.0/8"));
     }
 
@@ -1279,12 +1346,33 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         // First call populates AdjRibOut.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
         let _ = rx.try_recv();
 
         // Second call with same best route — no UPDATE should be queued.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
-        assert!(rx.try_recv().is_err(), "identical route must not produce a second UPDATE");
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "identical route must not produce a second UPDATE"
+        );
     }
 
     #[test]
@@ -1295,14 +1383,32 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         // Advertise the route.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
         let _ = rx.try_recv();
 
         // Remove the route from the RIB.
         rib.withdraw(&peer(), &nlri("10.0.0.0/8"));
 
         // Should now queue a WITHDRAW.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
         let msg = rx.try_recv().expect("should have queued a WITHDRAW");
         assert!(!msg.withdrawn.is_empty(), "message should be a WITHDRAW");
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
@@ -1317,11 +1423,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         // Initial advertisement.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
         let _ = rx.try_recv();
 
         // Policy now rejects — must send WITHDRAW for the previously advertised route.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &reject_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &reject_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
         let msg = rx.try_recv().expect("should have queued a WITHDRAW");
         assert!(!msg.withdrawn.is_empty());
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
@@ -1334,8 +1458,20 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         // Nothing was ever advertised; no message should be sent.
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &reject_all(), PeerType::External, 65001, bgp_id(), &tx);
-        assert!(rx.try_recv().is_err(), "no message expected for a route that was never advertised");
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &reject_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no message expected for a route that was never advertised"
+        );
     }
 
     #[test]
@@ -1346,9 +1482,24 @@ mod tests {
         let (_, mut aro) = ibgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::Internal, 65001, bgp_id(), &tx);
-        assert!(rx.try_recv().is_err(), "iBGP split-horizon must suppress re-advertisement");
-        assert!(aro.is_empty(), "AdjRibOut must remain empty after split-horizon suppression");
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::Internal,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "iBGP split-horizon must suppress re-advertisement"
+        );
+        assert!(
+            aro.is_empty(),
+            "AdjRibOut must remain empty after split-horizon suppression"
+        );
     }
 
     #[test]
@@ -1358,12 +1509,32 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(nlri("10.0.0.0/8"), &rib, &mut aro, &accept_all(), PeerType::External, 65001, bgp_id(), &tx);
+        propagate_prefix(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
 
         let msg = rx.try_recv().unwrap();
-        let aspath_attr = msg.attributes.iter().find_map(|a| {
-            if let PathAttribute::AsPath(p) = a { Some(p.clone()) } else { None }
-        }).expect("UPDATE must carry AS_PATH");
-        assert!(aspath_attr.contains(Asn::new(65001)), "local AS must be prepended");
+        let aspath_attr = msg
+            .attributes
+            .iter()
+            .find_map(|a| {
+                if let PathAttribute::AsPath(p) = a {
+                    Some(p.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("UPDATE must carry AS_PATH");
+        assert!(
+            aspath_attr.contains(Asn::new(65001)),
+            "local AS must be prepended"
+        );
     }
 }

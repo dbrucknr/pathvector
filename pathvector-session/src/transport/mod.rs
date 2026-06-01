@@ -129,7 +129,11 @@ pub fn spawn(config: SessionConfig) -> SessionHandle {
     };
 
     tokio::spawn(session.run());
-    SessionHandle { cmd_tx, event_rx, update_tx }
+    SessionHandle {
+        cmd_tx,
+        event_rx,
+        update_tx,
+    }
 }
 
 // ── Internal session worker ───────────────────────────────────────────────────
