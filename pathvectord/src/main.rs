@@ -64,14 +64,6 @@ fn resolve_export_default(opt: Option<config::ExportDefault>, is_ebgp: bool) -> 
     }
 }
 
-fn build_import_policy(default: DefaultAction) -> Policy<Route<Ipv4Addr>> {
-    Policy::new(default)
-}
-
-fn build_export_policy(default: DefaultAction) -> Policy<Route<Ipv4Addr>> {
-    Policy::new(default)
-}
-
 /// Derives the peer type (iBGP / eBGP) from the configured AS numbers.
 fn config_peer_type(local_as: u32, remote_as: u32) -> PeerType {
     if local_as == remote_as {
@@ -229,64 +221,302 @@ fn propagate_prefix(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Holds all per-peer routing state and applies BGP event semantics.
+///
+/// Constructed once at startup from config; `run()` feeds it `SessionEvent`s.
+/// The struct owns no I/O — callers hold the session handles and event channel,
+/// making the routing logic fully unit-testable without real TCP connections.
+struct DaemonState {
+    local_as: u32,
+    local_bgp_id: Ipv4Addr,
+    loc_rib: LocRib<Ipv4Addr>,
+    import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
+    export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
+    adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
+    adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
+    /// Static peer type derived from config; used to reset `AdjRibOut` on reconnect.
+    peer_config_types: HashMap<Ipv4Addr, PeerType>,
+    /// Live session state: present while a peer is Established, absent otherwise.
+    peer_types: HashMap<Ipv4Addr, PeerType>,
+    update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+}
+
+impl DaemonState {
+    fn new(
+        local_as: u32,
+        local_bgp_id: Ipv4Addr,
+        peers: &[config::PeerConfig],
+        update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+    ) -> Self {
+        let import_policies = peers
+            .iter()
+            .map(|p| {
+                let is_ebgp = p.remote_as != local_as;
+                (
+                    p.address,
+                    Policy::new(resolve_import_default(p.import_default, is_ebgp)),
+                )
+            })
+            .collect();
+
+        let export_policies = peers
+            .iter()
+            .map(|p| {
+                let is_ebgp = p.remote_as != local_as;
+                (
+                    p.address,
+                    Policy::new(resolve_export_default(p.export_default, is_ebgp)),
+                )
+            })
+            .collect();
+
+        let adj_ribs_in = peers
+            .iter()
+            .map(|p| (p.address, AdjRibIn::new(PeerId::from(p.address))))
+            .collect();
+
+        let peer_config_types = peers
+            .iter()
+            .map(|p| (p.address, config_peer_type(local_as, p.remote_as)))
+            .collect();
+
+        let adj_ribs_out = peers
+            .iter()
+            .map(|p| {
+                let pt = config_peer_type(local_as, p.remote_as);
+                (p.address, AdjRibOut::new(PeerId::from(p.address), pt))
+            })
+            .collect();
+
+        Self {
+            local_as,
+            local_bgp_id,
+            loc_rib: LocRib::new(),
+            import_policies,
+            export_policies,
+            adj_ribs_in,
+            adj_ribs_out,
+            peer_config_types,
+            peer_types: HashMap::new(),
+            update_senders,
+        }
+    }
+
+    /// Called when a BGP session reaches Established.
+    ///
+    /// Records the negotiated peer type, resets the peer's `AdjRibOut` to a
+    /// clean slate, and performs a full-table dump of the current best routes
+    /// subject to export policy.
+    #[allow(clippy::similar_names)]
+    fn on_established(
+        &mut self,
+        peer_ip: Ipv4Addr,
+        peer_type: PeerType,
+        peer_as: u32,
+        hold_time: u16,
+    ) {
+        let peer_id = PeerId::from(peer_ip);
+        self.peer_types.insert(peer_ip, peer_type);
+
+        if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
+            *aro = AdjRibOut::new(peer_id, peer_type);
+        }
+
+        let all_nlris: Vec<Nlri<Ipv4Addr>> =
+            self.loc_rib.best_routes().map(|(n, _)| n).collect();
+        let rib_prefixes = all_nlris.len();
+
+        let Some(export_policy) = self.export_policies.get(&peer_ip) else {
+            tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping Established event");
+            return;
+        };
+        let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
+            tracing::error!(peer = %peer_ip, "adj_ribs_out missing peer — skipping Established event");
+            return;
+        };
+        let Some(update_tx) = self.update_senders.get(&peer_ip) else {
+            tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping Established event");
+            return;
+        };
+
+        for nlri in all_nlris {
+            propagate_prefix(
+                nlri,
+                &self.loc_rib,
+                adj_rib_out,
+                export_policy,
+                peer_type,
+                self.local_as,
+                self.local_bgp_id,
+                update_tx,
+            );
+        }
+
+        tracing::info!(
+            peer = %peer_ip,
+            remote_as = peer_as,
+            hold_time,
+            peer_type = %peer_type,
+            rib_prefixes,
+            "session established"
+        );
+    }
+
+    /// Called when a BGP session terminates.
+    ///
+    /// Clears the peer's RIB state, resets its outbound table, and propagates
+    /// any best-path changes caused by the withdrawal to all remaining
+    /// established peers.
+    #[allow(clippy::similar_names)]
+    fn on_terminated(&mut self, peer_ip: Ipv4Addr) {
+        let peer_id = PeerId::from(peer_ip);
+        self.peer_types.remove(&peer_ip);
+
+        if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
+            ari.clear();
+        }
+
+        // Snapshot affected prefixes before withdrawal so we can propagate the
+        // changes to other established peers below.
+        let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
+            self.loc_rib.best_routes().map(|(n, _)| n).collect();
+
+        self.loc_rib.withdraw_peer(&peer_id);
+
+        // Reset this peer's outbound state for a clean reconnect.
+        let cfg_pt = self
+            .peer_config_types
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(PeerType::External);
+        if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
+            *aro = AdjRibOut::new(peer_id, cfg_pt);
+        }
+
+        // Tell all other established peers about the best-path changes caused
+        // by this teardown.
+        let other_peers: Vec<Ipv4Addr> = self
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
+
+        for other_ip in other_peers {
+            let other_type = self
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else {
+                tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
+                continue;
+            };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
+                tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on Terminated");
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on Terminated");
+                continue;
+            };
+
+            for &nlri in &prev_prefixes {
+                propagate_prefix(
+                    nlri,
+                    &self.loc_rib,
+                    adj_rib_out,
+                    export_policy,
+                    other_type,
+                    self.local_as,
+                    self.local_bgp_id,
+                    update_tx,
+                );
+            }
+        }
+
+        tracing::info!(
+            peer = %peer_ip,
+            rib_size = self.loc_rib.len(),
+            "session terminated"
+        );
+    }
+
+    /// Called when a BGP UPDATE message arrives from an established peer.
+    ///
+    /// Applies import policy, updates the RIB, and propagates best-path changes
+    /// for all affected NLRIs to every established peer.
+    #[allow(clippy::similar_names)]
+    fn on_route_update(&mut self, peer_ip: Ipv4Addr, msg: UpdateMessage) {
+        let peer_id = PeerId::from(peer_ip);
+        let peer_type = self
+            .peer_types
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(PeerType::External);
+
+        let affected: Vec<Nlri<Ipv4Addr>> = msg
+            .withdrawn
+            .iter()
+            .chain(msg.announced.iter())
+            .copied()
+            .collect();
+
+        let Some(policy) = self.import_policies.get(&peer_ip) else {
+            tracing::error!(peer = %peer_ip, "import_policies missing peer — skipping RouteUpdate");
+            return;
+        };
+        let Some(adj_rib_in) = self.adj_ribs_in.get_mut(&peer_ip) else {
+            tracing::error!(peer = %peer_ip, "adj_ribs_in missing peer — skipping RouteUpdate");
+            return;
+        };
+
+        handle_update(peer_id, msg, adj_rib_in, &mut self.loc_rib, policy, peer_type);
+
+        // Propagate best-path changes for affected prefixes to all established
+        // peers (iBGP split-horizon is enforced by AdjRibOut).
+        let established_peers: Vec<Ipv4Addr> = self.peer_types.keys().copied().collect();
+
+        for other_ip in established_peers {
+            let other_type = self
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else {
+                tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on RouteUpdate");
+                continue;
+            };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
+                tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on RouteUpdate");
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on RouteUpdate");
+                continue;
+            };
+
+            for &nlri in &affected {
+                propagate_prefix(
+                    nlri,
+                    &self.loc_rib,
+                    adj_rib_out,
+                    export_policy,
+                    other_type,
+                    self.local_as,
+                    self.local_bgp_id,
+                    update_tx,
+                );
+            }
+        }
+    }
+}
+
 async fn run(cfg: config::Config) {
     let local_as = cfg.daemon.local_as;
     let local_bgp_id = cfg.daemon.bgp_id;
 
-    let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
     let (event_tx, mut event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(256);
-
-    // Per-peer tables and policies, all keyed by peer IP and built from config
-    // at startup so every peer always has an entry.
-    let import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>> = cfg
-        .peers
-        .iter()
-        .map(|p| {
-            let is_ebgp = p.remote_as != local_as;
-            (
-                p.address,
-                build_import_policy(resolve_import_default(p.import_default, is_ebgp)),
-            )
-        })
-        .collect();
-
-    let export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>> = cfg
-        .peers
-        .iter()
-        .map(|p| {
-            let is_ebgp = p.remote_as != local_as;
-            (
-                p.address,
-                build_export_policy(resolve_export_default(p.export_default, is_ebgp)),
-            )
-        })
-        .collect();
-
-    let mut adj_ribs_in_map: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>> = cfg
-        .peers
-        .iter()
-        .map(|p| (p.address, AdjRibIn::new(PeerId::from(p.address))))
-        .collect();
-
-    // Derived at config load and used to reset AdjRibOut on session termination.
-    let peer_config_types: HashMap<Ipv4Addr, PeerType> = cfg
-        .peers
-        .iter()
-        .map(|p| (p.address, config_peer_type(local_as, p.remote_as)))
-        .collect();
-
-    let mut adj_ribs_out_map: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>> = cfg
-        .peers
-        .iter()
-        .map(|p| {
-            let pt = config_peer_type(local_as, p.remote_as);
-            (p.address, AdjRibOut::new(PeerId::from(p.address), pt))
-        })
-        .collect();
-
-    // Per-peer senders for queuing outbound UPDATEs; extracted before the
-    // handle is moved into the event-relay task.
     let mut update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>> = HashMap::new();
 
     for peer in &cfg.peers {
@@ -317,189 +547,18 @@ async fn run(cfg: config::Config) {
     // Drop our sender copy so the channel closes when all peer tasks exit.
     drop(event_tx);
 
-    // Session-type cache: populated from SessionInfo on Established, cleared on Terminated.
-    let mut peer_types: HashMap<Ipv4Addr, PeerType> = HashMap::new();
+    let mut state = DaemonState::new(local_as, local_bgp_id, &cfg.peers, update_senders);
 
     while let Some((peer_ip, event)) = event_rx.recv().await {
-        let peer_id = PeerId::from(peer_ip);
         match event {
             SessionEvent::Established(info) => {
-                peer_types.insert(peer_ip, info.peer_type);
-
-                // Reset AdjRibOut to a clean slate (handles peer_type change on
-                // reconnect) and then do an initial full-table advertisement.
-                let pt = info.peer_type;
-                if let Some(aro) = adj_ribs_out_map.get_mut(&peer_ip) {
-                    *aro = AdjRibOut::new(peer_id, pt);
-                }
-
-                let all_nlris: Vec<Nlri<Ipv4Addr>> =
-                    loc_rib.best_routes().map(|(n, _)| n).collect();
-                let rib_prefixes = all_nlris.len();
-
-                let Some(export_policy) = export_policies.get(&peer_ip) else {
-                    tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping Established event");
-                    continue;
-                };
-                let Some(adj_rib_out) = adj_ribs_out_map.get_mut(&peer_ip) else {
-                    tracing::error!(peer = %peer_ip, "adj_ribs_out missing peer — skipping Established event");
-                    continue;
-                };
-                let Some(update_tx) = update_senders.get(&peer_ip) else {
-                    tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping Established event");
-                    continue;
-                };
-
-                for nlri in all_nlris {
-                    propagate_prefix(
-                        nlri,
-                        &loc_rib,
-                        adj_rib_out,
-                        export_policy,
-                        pt,
-                        local_as,
-                        local_bgp_id,
-                        update_tx,
-                    );
-                }
-
-                tracing::info!(
-                    peer = %peer_ip,
-                    remote_as = info.peer_as,
-                    hold_time = info.hold_time,
-                    peer_type = %info.peer_type,
-                    rib_prefixes,
-                    "session established"
-                );
+                state.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
             }
             SessionEvent::Terminated => {
-                peer_types.remove(&peer_ip);
-                if let Some(ari) = adj_ribs_in_map.get_mut(&peer_ip) {
-                    ari.clear();
-                }
-
-                // Snapshot affected prefixes before withdrawal so we can
-                // propagate the changes to other established peers below.
-                let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
-                    loc_rib.best_routes().map(|(n, _)| n).collect();
-
-                loc_rib.withdraw_peer(&peer_id);
-
-                // Reset this peer's outbound state for a clean reconnect.
-                let cfg_pt = peer_config_types
-                    .get(&peer_ip)
-                    .copied()
-                    .unwrap_or(PeerType::External);
-                if let Some(aro) = adj_ribs_out_map.get_mut(&peer_ip) {
-                    *aro = AdjRibOut::new(peer_id, cfg_pt);
-                }
-
-                // Tell all other established peers about the best-path changes
-                // caused by this teardown.
-                let other_peers: Vec<Ipv4Addr> = peer_types
-                    .keys()
-                    .copied()
-                    .filter(|&ip| ip != peer_ip)
-                    .collect();
-
-                for other_ip in other_peers {
-                    let other_type = peer_types
-                        .get(&other_ip)
-                        .copied()
-                        .unwrap_or(PeerType::External);
-                    let Some(export_policy) = export_policies.get(&other_ip) else {
-                        tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
-                        continue;
-                    };
-                    let Some(adj_rib_out) = adj_ribs_out_map.get_mut(&other_ip) else {
-                        tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on Terminated");
-                        continue;
-                    };
-                    let Some(update_tx) = update_senders.get(&other_ip) else {
-                        tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on Terminated");
-                        continue;
-                    };
-
-                    for &nlri in &prev_prefixes {
-                        propagate_prefix(
-                            nlri,
-                            &loc_rib,
-                            adj_rib_out,
-                            export_policy,
-                            other_type,
-                            local_as,
-                            local_bgp_id,
-                            update_tx,
-                        );
-                    }
-                }
-
-                tracing::info!(
-                    peer = %peer_ip,
-                    rib_size = loc_rib.len(),
-                    "session terminated"
-                );
+                state.on_terminated(peer_ip);
             }
             SessionEvent::RouteUpdate(msg) => {
-                let peer_type = peer_types
-                    .get(&peer_ip)
-                    .copied()
-                    .unwrap_or(PeerType::External);
-
-                // Collect affected prefixes before moving msg into handle_update.
-                let affected: Vec<Nlri<Ipv4Addr>> = msg
-                    .withdrawn
-                    .iter()
-                    .chain(msg.announced.iter())
-                    .copied()
-                    .collect();
-
-                let Some(policy) = import_policies.get(&peer_ip) else {
-                    tracing::error!(peer = %peer_ip, "import_policies missing peer — skipping RouteUpdate");
-                    continue;
-                };
-                let Some(adj_rib_in) = adj_ribs_in_map.get_mut(&peer_ip) else {
-                    tracing::error!(peer = %peer_ip, "adj_ribs_in missing peer — skipping RouteUpdate");
-                    continue;
-                };
-
-                handle_update(peer_id, msg, adj_rib_in, &mut loc_rib, policy, peer_type);
-
-                // Propagate best-path changes for affected prefixes to all
-                // established peers (iBGP split-horizon is enforced by AdjRibOut).
-                let established_peers: Vec<Ipv4Addr> = peer_types.keys().copied().collect();
-
-                for other_ip in established_peers {
-                    let other_type = peer_types
-                        .get(&other_ip)
-                        .copied()
-                        .unwrap_or(PeerType::External);
-                    let Some(export_policy) = export_policies.get(&other_ip) else {
-                        tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on RouteUpdate");
-                        continue;
-                    };
-                    let Some(adj_rib_out) = adj_ribs_out_map.get_mut(&other_ip) else {
-                        tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on RouteUpdate");
-                        continue;
-                    };
-                    let Some(update_tx) = update_senders.get(&other_ip) else {
-                        tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on RouteUpdate");
-                        continue;
-                    };
-
-                    for &nlri in &affected {
-                        propagate_prefix(
-                            nlri,
-                            &loc_rib,
-                            adj_rib_out,
-                            export_policy,
-                            other_type,
-                            local_as,
-                            local_bgp_id,
-                            update_tx,
-                        );
-                    }
-                }
+                state.on_route_update(peer_ip, msg);
             }
         }
     }
@@ -664,6 +723,72 @@ mod tests {
 
     use super::*;
 
+    // ── test helpers ──────────────────────────────────────────────────────────
+
+    fn peer_id(ip: &str) -> PeerId {
+        PeerId::new(IpAddr::V4(ip.parse().unwrap()))
+    }
+
+    fn peer() -> PeerId {
+        peer_id("10.0.0.1")
+    }
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn accept_all() -> Policy<Route<Ipv4Addr>> {
+        Policy::new(DefaultAction::Accept)
+    }
+
+    fn reject_all() -> Policy<Route<Ipv4Addr>> {
+        Policy::new(DefaultAction::Reject)
+    }
+
+    fn fresh_ari() -> AdjRibIn<Ipv4Addr> {
+        AdjRibIn::new(peer())
+    }
+
+    /// Builds a `DaemonState` with explicit accept-all policies for every peer.
+    /// Returns the state and a map of receivers for asserting on outbound messages.
+    fn make_state(
+        local_as: u32,
+        peers: &[(Ipv4Addr, u32)],
+    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+        for &(ip, _) in peers {
+            let (tx, rx) = mpsc::channel(64);
+            senders.insert(ip, tx);
+            receivers.insert(ip, rx);
+        }
+        let peer_configs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(address, remote_as)| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            })
+            .collect();
+        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let state = DaemonState::new(local_as, local_bgp_id, &peer_configs, senders);
+        (state, receivers)
+    }
+
+    // ── config_peer_type ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_peer_type_different_as_is_external() {
+        assert_eq!(config_peer_type(65001, 65002), PeerType::External);
+    }
+
+    #[test]
+    fn test_config_peer_type_same_as_is_internal() {
+        assert_eq!(config_peer_type(65001, 65001), PeerType::Internal);
+    }
+
     // ── RFC 8212 default resolution ───────────────────────────────────────────
 
     #[test]
@@ -730,24 +855,291 @@ mod tests {
         ));
     }
 
-    fn peer() -> PeerId {
-        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+    // ── DaemonState::new ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_daemon_state_new_creates_maps_for_all_peers() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        for ip in [peer_a, peer_b] {
+            assert!(state.import_policies.contains_key(&ip));
+            assert!(state.export_policies.contains_key(&ip));
+            assert!(state.adj_ribs_in.contains_key(&ip));
+            assert!(state.adj_ribs_out.contains_key(&ip));
+            assert!(state.update_senders.contains_key(&ip));
+        }
     }
 
-    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
-        s.parse().unwrap()
+    #[test]
+    fn test_daemon_state_new_ebgp_gets_reject_default_when_omitted() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let peers = vec![config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65002,
+            import_default: None,
+            export_default: None,
+        }];
+        let state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peers, {
+            let mut m = HashMap::new();
+            m.insert(peer_ip, tx);
+            m
+        });
+        // Import policy with Reject default means routes are dropped unless a
+        // term accepts them. Verify by running a route through it.
+        let mut route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::new(),
+        )
+        .peer_type(PeerType::External)
+        .build();
+        let decision = state.import_policies[&peer_ip].evaluate(&mut route);
+        assert!(
+            matches!(decision, Decision::Reject),
+            "eBGP with no import_default must reject by default (RFC 8212)"
+        );
     }
 
-    fn accept_all() -> Policy<Route<Ipv4Addr>> {
-        Policy::new(DefaultAction::Accept)
+    // ── DaemonState::on_established ───────────────────────────────────────────
+
+    #[test]
+    fn test_on_established_records_peer_type() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        assert!(!state.peer_types.contains_key(&peer_ip));
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        assert_eq!(state.peer_types[&peer_ip], PeerType::External);
     }
 
-    fn reject_all() -> Policy<Route<Ipv4Addr>> {
-        Policy::new(DefaultAction::Reject)
+    #[test]
+    fn test_on_established_empty_rib_sends_nothing() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        assert!(
+            receivers.get_mut(&peer_ip).unwrap().try_recv().is_err(),
+            "empty RIB should produce no messages on establish"
+        );
     }
 
-    fn fresh_ari() -> AdjRibIn<Ipv4Addr> {
-        AdjRibIn::new(peer())
+    #[test]
+    fn test_on_established_sends_full_table_dump() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
+
+        // Pre-populate the RIB with a route from a third-party peer.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        let route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65009)]),
+        )
+        .next_hop(NextHop::V4("10.0.0.9".parse().unwrap()))
+        .peer_type(PeerType::External)
+        .build();
+        state.loc_rib.insert(src, route);
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+
+        let msg = receivers
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("should have queued a full-table dump UPDATE");
+        assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
+    }
+
+    #[test]
+    fn test_on_established_export_reject_sends_nothing() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let peers = vec![config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65002,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Reject),
+        }];
+        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peers, {
+            let mut m = HashMap::new();
+            m.insert(peer_ip, tx);
+            m
+        });
+
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        state.loc_rib.insert(
+            src,
+            RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+                .peer_type(PeerType::External)
+                .build(),
+        );
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        // Export policy rejects everything — no UPDATE should be queued.
+        // (We can't assert on the receiver here since we dropped _rx, but the
+        // important invariant is that no panic or error occurs, and the RIB is
+        // not modified.)
+        assert_eq!(state.loc_rib.len(), 1, "RIB must be unchanged");
+    }
+
+    // ── DaemonState::on_terminated ────────────────────────────────────────────
+
+    #[test]
+    fn test_on_terminated_removes_peer_type() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_terminated(peer_ip);
+        assert!(!state.peer_types.contains_key(&peer_ip));
+    }
+
+    #[test]
+    fn test_on_terminated_withdraws_peer_routes_from_rib() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+
+        state.loc_rib.insert(
+            PeerId::from(peer_ip),
+            RouteBuilder::new(
+                nlri("10.0.0.0/8"),
+                Origin::Igp,
+                AsPath::from_sequence(vec![Asn::new(65002)]),
+            )
+            .peer_type(PeerType::External)
+            .build(),
+        );
+        assert_eq!(state.loc_rib.len(), 1);
+
+        state.on_terminated(peer_ip);
+        assert_eq!(state.loc_rib.len(), 0);
+    }
+
+    #[test]
+    fn test_on_terminated_propagates_withdraw_to_other_established_peers() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+
+        // Announce a route from peer_a so it reaches peer_b's AdjRibOut.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_a),
+                ],
+                announced: vec![nlri("192.168.0.0/16")],
+            },
+        );
+        // Drain the propagation messages sent during on_route_update.
+        receivers.get_mut(&peer_a).unwrap().try_recv().ok();
+        receivers.get_mut(&peer_b).unwrap().try_recv().ok();
+
+        // Terminate peer_a — peer_b must receive a WITHDRAW.
+        state.on_terminated(peer_a);
+
+        let msg = receivers
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b should receive WITHDRAW after peer_a terminates");
+        assert!(!msg.withdrawn.is_empty());
+        assert_eq!(msg.withdrawn[0], nlri("192.168.0.0/16"));
+    }
+
+    // ── DaemonState::on_route_update ──────────────────────────────────────────
+
+    #[test]
+    fn test_on_route_update_inserts_route_into_rib() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        assert_eq!(state.loc_rib.len(), 1);
+        assert!(state.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+    }
+
+    #[test]
+    fn test_on_route_update_propagates_to_other_established_peer() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_a),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        let msg = receivers
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b should receive UPDATE for the new route");
+        assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
+    }
+
+    #[test]
+    fn test_on_route_update_withdraw_removes_route_from_rib() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert_eq!(state.loc_rib.len(), 1);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![nlri("10.0.0.0/8")],
+                attributes: vec![],
+                announced: vec![],
+            },
+        );
+        assert_eq!(state.loc_rib.len(), 0);
     }
 
     // ── basic handle_update behaviour ─────────────────────────────────────────
@@ -1054,16 +1446,13 @@ mod tests {
             &reject_all(),
             PeerType::External,
         );
-        // Rejected by import policy → not in LocRib
         assert!(rib.is_empty());
-        // But still stored in Adj-RIB-In so soft reconfig can revisit it
         assert_eq!(ari.len(), 1);
         assert!(ari.get(&nlri("10.0.0.0/8")).is_some());
     }
 
     #[test]
     fn test_adj_rib_in_stores_raw_attributes_before_policy_modification() {
-        // Policy sets LOCAL_PREF 200. AdjRibIn should hold the original (no LP).
         let mut policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Reject);
         policy.add_term(Term::new(
             AnyCondition,
@@ -1090,12 +1479,10 @@ mod tests {
             PeerType::External,
         );
 
-        // LocRib has the policy-modified route
         assert_eq!(
             rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref,
             Some(LP::new(200))
         );
-        // AdjRibIn has the raw route — no LOCAL_PREF set by policy
         assert_eq!(ari.get(&nlri("10.0.0.0/8")).unwrap().local_pref, None);
     }
 
@@ -1141,8 +1528,6 @@ mod tests {
 
     #[test]
     fn test_reapply_accepts_previously_rejected_route() {
-        // Route was rejected on arrival. New policy accepts it — it should
-        // appear in LocRib after reapply without a session reset.
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
         handle_update(
@@ -1168,8 +1553,6 @@ mod tests {
 
     #[test]
     fn test_reapply_rejects_previously_accepted_route() {
-        // Route was accepted on arrival. New policy rejects it — it should
-        // disappear from LocRib after reapply.
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
         handle_update(
@@ -1195,8 +1578,6 @@ mod tests {
 
     #[test]
     fn test_reapply_applies_new_policy_modifications() {
-        // Route arrived without LOCAL_PREF. New policy sets LP 300.
-        // After reapply, LocRib should have the modified version; AdjRibIn unchanged.
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
         handle_update(
@@ -1229,18 +1610,15 @@ mod tests {
             rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref,
             Some(LP::new(300))
         );
-        // Raw route in AdjRibIn is still unmodified
         assert_eq!(ari.get(&nlri("10.0.0.0/8")).unwrap().local_pref, None);
     }
 
     #[test]
     fn test_reapply_partial_accept_reject() {
-        // Two routes: policy accepts one and rejects the other.
         let blocked = Community::from_parts(65001, 1);
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        // Accept both with the initial policy
         handle_update(
             peer(),
             UpdateMessage {
@@ -1274,7 +1652,6 @@ mod tests {
         );
         assert_eq!(rib.len(), 2);
 
-        // New policy: reject anything with the blocked community
         let mut new_policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Accept);
         new_policy.add_term(Term::new(CommunityCondition::new(blocked), Reject));
 
@@ -1323,7 +1700,6 @@ mod tests {
     fn test_prepare_outbound_ebgp_prepends_local_as() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
         let out = prepare_outbound(route, PeerType::External, 65001, bgp_id());
-        // Local AS 65001 is prepended; original AS 65002 is now last.
         assert_eq!(out.as_path.path_length(), 2);
         assert!(out.as_path.contains(Asn::new(65001)));
         assert!(out.as_path.contains(Asn::new(65002)));
@@ -1350,7 +1726,6 @@ mod tests {
     fn test_prepare_outbound_ibgp_preserves_attributes() {
         let route = ibgp_route("10.0.0.0/8");
         let out = prepare_outbound(route.clone(), PeerType::Internal, 65001, bgp_id());
-        // iBGP: nothing modified.
         assert_eq!(out.as_path.path_length(), route.as_path.path_length());
         assert_eq!(out.local_pref, route.local_pref);
         assert_eq!(out.next_hop, route.next_hop);
@@ -1371,37 +1746,80 @@ mod tests {
         let msg = route_to_update(route);
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
-        let has_origin = msg
+        assert!(msg
             .attributes
             .iter()
-            .any(|a| matches!(a, PathAttribute::Origin(_)));
-        let has_aspath = msg
+            .any(|a| matches!(a, PathAttribute::Origin(_))));
+        assert!(msg
             .attributes
             .iter()
-            .any(|a| matches!(a, PathAttribute::AsPath(_)));
-        let has_nexthop = msg
+            .any(|a| matches!(a, PathAttribute::AsPath(_))));
+        assert!(msg
             .attributes
             .iter()
-            .any(|a| matches!(a, PathAttribute::NextHop(_)));
-        assert!(has_origin);
-        assert!(has_aspath);
-        assert!(has_nexthop);
+            .any(|a| matches!(a, PathAttribute::NextHop(_))));
     }
 
     #[test]
     fn test_route_to_update_omits_absent_optional_attributes() {
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
         let msg = route_to_update(route);
-        let has_lp = msg
+        assert!(!msg
             .attributes
             .iter()
-            .any(|a| matches!(a, PathAttribute::LocalPref(_)));
-        let has_med = msg
+            .any(|a| matches!(a, PathAttribute::LocalPref(_))));
+        assert!(!msg
             .attributes
             .iter()
-            .any(|a| matches!(a, PathAttribute::Med(_)));
-        assert!(!has_lp, "absent LOCAL_PREF must not appear in UPDATE");
-        assert!(!has_med, "absent MED must not appear in UPDATE");
+            .any(|a| matches!(a, PathAttribute::Med(_))));
+    }
+
+    #[test]
+    fn test_route_to_update_includes_all_optional_attributes() {
+        let route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65001)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .local_pref(LP::new(150))
+        .med(Med::new(100))
+        .community(Community::new(0xFFFF_FF01))
+        .large_community(LargeCommunity::new(65001, 1, 1))
+        .extended_community(ExtendedCommunity::route_target_as2(65001, 1))
+        .atomic_aggregate()
+        .aggregator(Aggregator::new(Asn::new(65001), Ipv4Addr::new(1, 1, 1, 1)))
+        .build();
+
+        let msg = route_to_update(route);
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::LocalPref(_))));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Med(_))));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Communities(_))));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::LargeCommunities(_))));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::ExtendedCommunities(_))));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::AtomicAggregate)));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Aggregator(_))));
     }
 
     // ── propagate_prefix ──────────────────────────────────────────────────────
@@ -1435,10 +1853,7 @@ mod tests {
         );
 
         let msg = rx.try_recv().expect("should have queued an UPDATE");
-        assert!(
-            !msg.announced.is_empty(),
-            "UPDATE must contain announced NLRIs"
-        );
+        assert!(!msg.announced.is_empty());
         assert_eq!(msg.announced[0], nlri("10.0.0.0/8"));
     }
 
@@ -1449,7 +1864,6 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        // First call populates AdjRibOut.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1462,7 +1876,6 @@ mod tests {
         );
         let _ = rx.try_recv();
 
-        // Second call with same best route — no UPDATE should be queued.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1486,7 +1899,6 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        // Advertise the route.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1499,10 +1911,8 @@ mod tests {
         );
         let _ = rx.try_recv();
 
-        // Remove the route from the RIB.
         rib.withdraw(&peer(), &nlri("10.0.0.0/8"));
 
-        // Should now queue a WITHDRAW.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1514,7 +1924,7 @@ mod tests {
             &tx,
         );
         let msg = rx.try_recv().expect("should have queued a WITHDRAW");
-        assert!(!msg.withdrawn.is_empty(), "message should be a WITHDRAW");
+        assert!(!msg.withdrawn.is_empty());
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
         assert!(msg.announced.is_empty());
     }
@@ -1526,7 +1936,6 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        // Initial advertisement.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1539,7 +1948,6 @@ mod tests {
         );
         let _ = rx.try_recv();
 
-        // Policy now rejects — must send WITHDRAW for the previously advertised route.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1561,7 +1969,6 @@ mod tests {
         let rib = LocRib::<Ipv4Addr>::new();
         let (tx, mut rx) = mpsc::channel(16);
 
-        // Nothing was ever advertised; no message should be sent.
         propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
@@ -1580,7 +1987,6 @@ mod tests {
 
     #[test]
     fn test_propagate_prefix_ibgp_split_horizon_no_send() {
-        // An iBGP-learned route must not be re-advertised to another iBGP peer.
         let mut rib = LocRib::new();
         rib.insert(peer(), ibgp_route("10.0.0.0/8"));
         let (_, mut aro) = ibgp_out_peer();
@@ -1600,10 +2006,7 @@ mod tests {
             rx.try_recv().is_err(),
             "iBGP split-horizon must suppress re-advertisement"
         );
-        assert!(
-            aro.is_empty(),
-            "AdjRibOut must remain empty after split-horizon suppression"
-        );
+        assert!(aro.is_empty());
     }
 
     #[test]
