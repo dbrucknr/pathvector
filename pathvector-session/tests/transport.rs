@@ -395,6 +395,118 @@ async fn test_stop_while_connecting_aborts_pending_task() {
     }
 }
 
+// ── Codec error on received message (transport/mod.rs lines 184-185) ─────────
+//
+// When the peer sends a well-framed message whose payload fails BGP decode,
+// `recv_message` returns `Some(Err(FramingError))`. The session logs a warning,
+// drops the connection, and feeds TcpFailed back to the FSM.
+//
+// We trigger this by writing a raw frame with a valid 16-byte all-ones marker
+// but a length field of 0 — the codec rejects it with `InvalidLength(0)`.
+
+#[tokio::test]
+async fn test_codec_error_emits_terminated() {
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = FramedRead::new(r, BgpCodec);
+        let mut writer = FramedWrite::new(w, BgpCodec);
+
+        // Complete the normal handshake.
+        let _ = reader.next().await.unwrap().unwrap();
+        writer.send(peer_open(65002, 90)).await.unwrap();
+        let _ = reader.next().await.unwrap().unwrap();
+        writer.send(BgpMessage::Keepalive).await.unwrap();
+
+        // Session is now Established. Send a malformed frame:
+        // valid 16-byte all-ones marker, then length = 0 (invalid — must be ≥ 19).
+        let mut raw_writer = writer.into_inner();
+        let mut frame = [0u8; 19];
+        frame[..16].fill(0xFF);                                 // valid marker
+        frame[16..18].copy_from_slice(&0u16.to_be_bytes());    // length = 0 → invalid
+        use tokio::io::AsyncWriteExt;
+        raw_writer.write_all(&frame).await.unwrap();
+
+        // Keep the peer side open while the session processes the error.
+        std::future::pending::<()>().await
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    // The codec error triggers TcpFailed → FSM teardown → Terminated.
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for Terminated after codec error")
+        .expect("session channel closed unexpectedly");
+    assert!(
+        matches!(event, SessionEvent::Terminated),
+        "expected Terminated after codec error, got {event:?}"
+    );
+
+    peer.abort();
+}
+
+// ── Connect-retry timer fires (transport/mod.rs lines 204-205) ────────────────
+//
+// When TcpFailed arrives from Connect state the FSM arms the 120 s retry timer.
+// With `start_paused = true` we advance the clock 121 s without waiting in real
+// time; the timer arm in `wait_for_input` fires (lines 204-205) and the session
+// initiates a fresh TCP connect.
+//
+// Lines 147-148 and 227-228 (TcpFailed recovery when a TCP *send* fails) are not
+// covered here — they require injecting a broken writer, which needs the
+// BgpTransport trait refactor documented in TODO.md.
+
+#[tokio::test(start_paused = true)]
+async fn test_connect_retry_timer_fires_initiates_reconnect() {
+    // Bind a listener, capture its address, then drop it so the first connect
+    // is immediately refused.
+    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = first.local_addr().unwrap();
+    drop(first);
+
+    let handle = spawn(local_config(addr));
+    handle.start().await;
+
+    // Give the runtime enough yields to process:
+    //   ManualStart → spawn connect_task → ECONNREFUSED → recv_connect(Err)
+    //   → TcpFailed → StartConnectRetryTimer(120 s) → retry_deadline set.
+    // Real I/O (the refused connect) still completes even with time paused.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    // Bind the listener BEFORE advancing the clock so it is ready when the
+    // session retries.
+    let listener = TcpListener::bind(addr).await.expect("port should be free after first drop");
+
+    // Advance past the 120 s retry timer.  The `sleep_until` inside
+    // `deadline_fut` resolves; the retry arm in `wait_for_input` fires
+    // (lines 204-205) and feeds ConnectRetryTimerExpired to the FSM.
+    tokio::time::advance(Duration::from_secs(121)).await;
+
+    // Drive the new connect_task (spawned by the FSM response) to completion.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    // The session reconnected — accept it.
+    // `listener.accept()` is real I/O so the runtime handles it without a
+    // paused-time timeout; after the yields above the connect is already in
+    // the kernel accept queue.
+    let accept = listener.accept().await;
+    assert!(accept.is_ok(), "session should have retried and connected after retry timer");
+}
+
 #[tokio::test]
 async fn test_open_with_wrong_peer_as_does_not_establish() {
     let (listener, addr) = loopback_listener().await;

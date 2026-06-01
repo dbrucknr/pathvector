@@ -21,7 +21,7 @@ tracing          = "0.1"
 
 [dev-dependencies]
 proptest = { workspace = true }
-tokio    = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
+tokio    = { version = "1", features = ["net", "io-util", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
 
 [lints]
 workspace = true
