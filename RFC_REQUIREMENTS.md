@@ -115,7 +115,7 @@ The core protocol. Every crate is shaped by it.
 | Step 4: Prefer shortest AS_PATH (AS_SET counts as 1; AS_CONFED_* count as 0) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_shorter_as_path`, `test_aspath_path_length_set_counts_as_one`, `test_aspath_path_length_confed_counts_as_zero` |
 | Step 5: Prefer lowest ORIGIN (IGP < EGP < INCOMPLETE) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_lower_origin` |
 | Step 6: Prefer lowest MED (missing → 0; same-AS comparison only) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_lower_med`, `test_select_best_missing_med_treated_as_zero` |
-| Step 7: Prefer eBGP over iBGP | `pathvector-rib/src/best_path.rs` | ❌ | — |
+| Step 7: Prefer eBGP over iBGP | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_ebgp_over_ibgp`, `test_local_pref_beats_ebgp_preference`, `test_two_ebgp_routes_fall_through_to_tiebreak` |
 | Step 8: Prefer lowest IGP metric to next-hop | `pathvector-rib/src/best_path.rs` | ❌ | — |
 | Step 9: Prefer oldest eBGP route | `pathvector-rib/src/best_path.rs` | ❌ | — |
 | Step 10: Prefer lowest peer IP address (tiebreaker) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_tiebreak_lower_peer_ip` |
@@ -134,7 +134,7 @@ The core protocol. Every crate is shaped by it.
 | Loc-RIB: withdraw last candidate removes the prefix entirely | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_last_candidate_removes_prefix` |
 | Loc-RIB: withdraw one peer promotes the remaining candidate | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_peer_promotes_remaining_candidate` |
 | Adj-RIB-Out: per-peer store of routes to be advertised | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_get`, `test_adj_rib_out_withdraw` |
-| iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ⚠️ | — (AdjRibOut exists; iBGP/eBGP distinction not enforced — see TODO) |
+| iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ⚠️ | — (`PeerType` now available on `Route`; enforcement logic not yet wired into LocRib/AdjRibOut — see TODO) |
 
 ---
 
@@ -202,6 +202,8 @@ The core protocol. Every crate is shaped by it.
 |---|---|---|---|
 | GracefulRestart capability (code 64): restart flags, restart time, per-family forwarding-preserved flag | `pathvector-session/src/message/open.rs` | ✅ | `test_graceful_restart_roundtrip` |
 | Capability forwarded to caller via `SessionInfo` | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_session_info_peer_capabilities_forwarded`, `test_session_info_graceful_restart_capability_forwarded` |
+| `SessionInfo.peer_type` is `External` for different-AS peers (eBGP) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_session_info_external_peer_type_when_different_as` |
+| `SessionInfo.peer_type` is `Internal` for same-AS peers (iBGP) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_session_info_internal_peer_type_when_same_as` |
 | FSM holds forwarding state while control plane restarts | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
 | Stale route timer — mark routes stale and withdraw after timer expires | `pathvector-rib` | ❌ | — |
 

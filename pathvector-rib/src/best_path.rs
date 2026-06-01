@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use ipnetx::interfaces::IpAddress;
-use pathvector_types::LocalPref;
+use pathvector_types::{LocalPref, PeerType};
 
 use crate::{peer::PeerId, route::Route};
 
@@ -112,6 +112,15 @@ fn prefer<A: IpAddress>(
     let med = med_b.cmp(&med_a);
     if med != Ordering::Equal {
         return med; // reverse: lower MED → Greater → preferred
+    }
+
+    // Step 7: Prefer eBGP over iBGP (RFC 4271 §9.1 step 7).
+    // A route learned from an external peer is always preferred over one
+    // learned from an internal peer when all higher-priority criteria tie.
+    // PeerType::External (1) > PeerType::Internal (0).
+    let session = a.peer_type.cmp(&b.peer_type);
+    if session != Ordering::Equal {
+        return session; // External > Internal → preferred
     }
 
     // Step 10: Lowest peer IP address (final tie-breaker).
@@ -245,5 +254,58 @@ mod tests {
         candidates.insert(peer(2), basic(Origin::Igp, 2, Some(100), None));
         let (_, route) = select_best(&candidates).unwrap();
         assert_eq!(route.local_pref, Some(LocalPref::new(200)));
+    }
+
+    // ── Step 7: eBGP preferred over iBGP (RFC 4271 §9.1) ─────────────────────
+
+    #[test]
+    fn test_select_best_prefers_ebgp_over_ibgp() {
+        // All attributes equal — eBGP route wins over iBGP route at step 7.
+        let ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::External)
+            .build();
+        let ibgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::Internal)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), ibgp);
+        candidates.insert(peer(2), ebgp);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // eBGP peer wins
+    }
+
+    #[test]
+    fn test_local_pref_beats_ebgp_preference() {
+        // A higher LOCAL_PREF on an iBGP route overrules the eBGP preference at
+        // step 7 — LOCAL_PREF is evaluated first at step 2.
+        let ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::External)
+            .build();
+        let ibgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(200))
+            .peer_type(PeerType::Internal)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), ibgp);
+        candidates.insert(peer(2), ebgp);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(1)); // higher LOCAL_PREF on iBGP route wins
+    }
+
+    #[test]
+    fn test_two_ebgp_routes_fall_through_to_tiebreak() {
+        // When both routes are eBGP the step-7 comparison is Equal and
+        // resolution continues to step 10 (lower peer IP).
+        let route = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), route.clone());
+        candidates.insert(peer(2), route);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(1)); // step 10: lower peer IP
     }
 }

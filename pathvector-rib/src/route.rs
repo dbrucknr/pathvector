@@ -2,7 +2,7 @@ use ipnetx::interfaces::IpAddress;
 use pathvector_policy::BgpRoute;
 use pathvector_types::{
     Aggregator, AsPath, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop,
-    Nlri, Origin,
+    Nlri, Origin, PeerType,
 };
 
 /// A concrete BGP route stored in the RIB.
@@ -63,6 +63,12 @@ pub struct Route<A: IpAddress> {
     pub atomic_aggregate: bool,
     /// The router that performed aggregation, if known.
     pub aggregator: Option<Aggregator>,
+    /// Whether this route was learned from an iBGP or eBGP peer.
+    ///
+    /// Used in best-path selection (RFC 4271 §9.1 step 7) and iBGP split
+    /// horizon enforcement. Defaults to [`PeerType::External`] when built
+    /// with [`RouteBuilder`] without an explicit call to `.peer_type()`.
+    pub peer_type: PeerType,
 }
 
 impl<A: IpAddress> BgpRoute for Route<A> {
@@ -126,6 +132,7 @@ pub struct RouteBuilder<A: IpAddress> {
     extended_communities: Vec<ExtendedCommunity>,
     atomic_aggregate: bool,
     aggregator: Option<Aggregator>,
+    peer_type: PeerType,
 }
 
 impl<A: IpAddress> RouteBuilder<A> {
@@ -148,6 +155,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             extended_communities: Vec::new(),
             atomic_aggregate: false,
             aggregator: None,
+            peer_type: PeerType::External,
         }
     }
 
@@ -207,6 +215,16 @@ impl<A: IpAddress> RouteBuilder<A> {
         self
     }
 
+    /// Sets the peer type (iBGP or eBGP) for this route.
+    ///
+    /// Defaults to [`PeerType::External`] if not called. Set to
+    /// [`PeerType::Internal`] for routes received from an iBGP peer.
+    #[must_use]
+    pub fn peer_type(mut self, pt: PeerType) -> Self {
+        self.peer_type = pt;
+        self
+    }
+
     /// Consumes the builder and returns a [`Route<A>`].
     #[must_use]
     pub fn build(self) -> Route<A> {
@@ -222,6 +240,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             extended_communities: self.extended_communities,
             atomic_aggregate: self.atomic_aggregate,
             aggregator: self.aggregator,
+            peer_type: self.peer_type,
         }
     }
 }

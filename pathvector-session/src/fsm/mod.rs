@@ -8,6 +8,8 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use pathvector_types::PeerType;
+
 use crate::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
     OpenMsgError, UpdateMessage,
@@ -109,6 +111,11 @@ pub struct SessionInfo {
     pub hold_time: u16,
     /// Capabilities advertised by the peer in its OPEN.
     pub peer_capabilities: Vec<Capability>,
+    /// Whether this is an iBGP or eBGP session.
+    ///
+    /// `Internal` when `peer_as == local_as`; `External` otherwise.
+    /// Used by the RIB layer for best-path step 7 and iBGP split horizon.
+    pub peer_type: PeerType,
 }
 
 // ── States ────────────────────────────────────────────────────────────────────
@@ -492,11 +499,18 @@ impl Fsm {
     /// Construct `SessionInfo` from the stored peer OPEN.
     fn build_session_info(&self) -> Option<SessionInfo> {
         let peer = self.peer_open.as_ref()?;
+        let peer_as = resolve_as(peer);
+        let peer_type = if peer_as == self.config.local_as {
+            PeerType::Internal
+        } else {
+            PeerType::External
+        };
         Some(SessionInfo {
-            peer_as: resolve_as(peer),
+            peer_as,
             peer_bgp_id: peer.bgp_id,
             hold_time: self.negotiated_hold_time,
             peer_capabilities: peer.capabilities.clone(),
+            peer_type,
         })
     }
 }
@@ -686,6 +700,29 @@ mod tests {
         assert!(info.peer_capabilities.iter().any(|c| {
             matches!(c, Capability::MultiProtocol(a) if *a == pathvector_types::AfiSafi::IPV6_UNICAST)
         }));
+    }
+
+    #[test]
+    fn test_session_info_external_peer_type_when_different_as() {
+        // Different local_as (65001) and peer_as (65002) → eBGP → External.
+        let (_, info) = establish(default_config());
+        assert_eq!(info.peer_type, pathvector_types::PeerType::External);
+    }
+
+    #[test]
+    fn test_session_info_internal_peer_type_when_same_as() {
+        // Same AS on both sides → iBGP → Internal.
+        let config = FsmConfig { local_as: 65002, peer_as: Some(65002), ..default_config() };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
+        let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        let info = outputs
+            .iter()
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
+            .expect("SessionEstablished");
+        assert_eq!(info.peer_type, pathvector_types::PeerType::Internal);
     }
 
     #[test]
