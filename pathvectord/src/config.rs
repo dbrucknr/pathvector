@@ -66,6 +66,38 @@ impl From<ImportDefault> for DefaultAction {
     }
 }
 
+/// TOML representation of the export policy default action for a peer.
+///
+/// Controls what happens to best routes that do not match any export policy
+/// term before they are advertised to this peer.  Defaults to `"accept"`,
+/// which re-advertises all best routes subject only to iBGP split-horizon and
+/// confederation-segment stripping.
+///
+/// ```toml
+/// [[peers]]
+/// address        = "10.0.0.2"
+/// remote_as      = 65002
+/// export_default = "reject"   # suppress all outbound advertisements
+/// ```
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportDefault {
+    /// Re-advertise routes that matched no term.
+    #[default]
+    Accept,
+    /// Suppress routes that matched no term.
+    Reject,
+}
+
+impl From<ExportDefault> for DefaultAction {
+    fn from(d: ExportDefault) -> Self {
+        match d {
+            ExportDefault::Accept => DefaultAction::Accept,
+            ExportDefault::Reject => DefaultAction::Reject,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PeerConfig {
     pub address: Ipv4Addr,
@@ -78,6 +110,12 @@ pub struct PeerConfig {
     /// `import_default` is omitted.
     #[serde(default)]
     pub import_default: ImportDefault,
+    /// Default action when no export policy term matches.
+    ///
+    /// Defaults to `"accept"` so all best routes are advertised unless
+    /// explicitly suppressed.
+    #[serde(default)]
+    pub export_default: ExportDefault,
 }
 
 fn default_bgp_port() -> u16 {
@@ -169,5 +207,43 @@ import_default = "reject"
         use pathvector_policy::DefaultAction;
         assert!(matches!(DefaultAction::from(ImportDefault::Accept), DefaultAction::Accept));
         assert!(matches!(DefaultAction::from(ImportDefault::Reject), DefaultAction::Reject));
+    }
+
+    #[test]
+    fn test_export_default_omitted_is_accept() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(cfg.peers[0].export_default, ExportDefault::Accept));
+    }
+
+    #[test]
+    fn test_export_default_reject() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+export_default = "reject"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(cfg.peers[0].export_default, ExportDefault::Reject));
+    }
+
+    #[test]
+    fn test_export_default_converts_to_default_action() {
+        use pathvector_policy::DefaultAction;
+        assert!(matches!(DefaultAction::from(ExportDefault::Accept), DefaultAction::Accept));
+        assert!(matches!(DefaultAction::from(ExportDefault::Reject), DefaultAction::Reject));
     }
 }

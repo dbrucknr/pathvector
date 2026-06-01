@@ -63,6 +63,7 @@ pub enum SessionEvent {
 pub struct SessionHandle {
     cmd_tx: mpsc::Sender<SessionCommand>,
     event_rx: mpsc::Receiver<SessionEvent>,
+    update_tx: mpsc::Sender<UpdateMessage>,
 }
 
 impl SessionHandle {
@@ -81,6 +82,17 @@ impl SessionHandle {
     pub async fn next_event(&mut self) -> Option<SessionEvent> {
         self.event_rx.recv().await
     }
+
+    /// Returns a cloneable sender for queuing outbound UPDATE messages to this
+    /// session.
+    ///
+    /// Messages sent here are written to the TCP connection when the session is
+    /// in the Established state. If the session is not connected, the messages
+    /// are discarded. The channel has capacity 256; senders should treat a full
+    /// channel as a backpressure signal and log a warning.
+    pub fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+        self.update_tx.clone()
+    }
 }
 
 /// Spawn a BGP session task and return a handle to control it.
@@ -91,6 +103,7 @@ impl SessionHandle {
 pub fn spawn(config: SessionConfig) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(64);
+    let (update_tx, update_rx) = mpsc::channel(256);
 
     let fsm_config = FsmConfig {
         local_as: config.local_as,
@@ -111,10 +124,11 @@ pub fn spawn(config: SessionConfig) -> SessionHandle {
         reader: None,
         writer: None,
         connect_task: None,
+        update_rx,
     };
 
     tokio::spawn(session.run());
-    SessionHandle { cmd_tx, event_rx }
+    SessionHandle { cmd_tx, event_rx, update_tx }
 }
 
 // ── Internal session worker ───────────────────────────────────────────────────
@@ -135,6 +149,8 @@ struct Session {
     writer: Option<FramedWrite<OwnedWriteHalf, BgpCodec>>,
     // Pending outbound TCP connect (Connecting state only).
     connect_task: Option<JoinHandle<io::Result<TcpStream>>>,
+    // Outbound UPDATE messages queued by the daemon.
+    update_rx: mpsc::Receiver<UpdateMessage>,
 }
 
 impl Session {
@@ -151,58 +167,77 @@ impl Session {
     }
 
     /// Block until the next [`FsmInput`] arrives from any source.
+    ///
+    /// Outbound UPDATEs queued via [`SessionHandle::update_sender`] are
+    /// forwarded to the TCP writer inline; they do not produce an `FsmInput`
+    /// and the loop continues until a real FSM event arrives. If the write
+    /// fails, `TcpFailed` is returned so the FSM can recover.
     async fn wait_for_input(&mut self) -> FsmInput {
-        let hold = deadline_fut(self.hold_deadline);
-        let keepalive = deadline_fut(self.keepalive_deadline);
-        let retry = deadline_fut(self.retry_deadline);
+        loop {
+            let hold = deadline_fut(self.hold_deadline);
+            let keepalive = deadline_fut(self.keepalive_deadline);
+            let retry = deadline_fut(self.retry_deadline);
 
-        tokio::select! {
-            biased;
+            tokio::select! {
+                biased;
 
-            cmd = self.cmd_rx.recv() => match cmd {
-                Some(SessionCommand::Start) => FsmInput::ManualStart,
-                // None = handle dropped → treat as operator stop.
-                Some(SessionCommand::Stop) | None => FsmInput::ManualStop,
-            },
+                cmd = self.cmd_rx.recv() => return match cmd {
+                    Some(SessionCommand::Start) => FsmInput::ManualStart,
+                    // None = handle dropped → treat as operator stop.
+                    Some(SessionCommand::Stop) | None => FsmInput::ManualStop,
+                },
 
-            result = recv_connect(&mut self.connect_task) => {
-                self.connect_task = None;
-                match result {
-                    Ok(stream) => {
-                        let (r, w) = stream.into_split();
-                        self.reader = Some(FramedRead::new(r, BgpCodec));
-                        self.writer = Some(FramedWrite::new(w, BgpCodec));
-                        FsmInput::TcpConnected
-                    }
-                    Err(_) => FsmInput::TcpFailed,
+                result = recv_connect(&mut self.connect_task) => {
+                    self.connect_task = None;
+                    return match result {
+                        Ok(stream) => {
+                            let (r, w) = stream.into_split();
+                            self.reader = Some(FramedRead::new(r, BgpCodec));
+                            self.writer = Some(FramedWrite::new(w, BgpCodec));
+                            FsmInput::TcpConnected
+                        }
+                        Err(_) => FsmInput::TcpFailed,
+                    };
                 }
-            }
 
-            msg = recv_message(&mut self.reader) => {
-                match msg {
-                    Some(Ok(m)) => return FsmInput::MessageReceived(m),
-                    Some(Err(e)) => {
-                        tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
+                msg = recv_message(&mut self.reader) => {
+                    match msg {
+                        Some(Ok(m)) => return FsmInput::MessageReceived(m),
+                        Some(Err(e)) => {
+                            tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
+                        }
+                        None => {}
                     }
-                    None => {}
+                    self.drop_connection();
+                    return FsmInput::TcpFailed;
                 }
-                self.drop_connection();
-                FsmInput::TcpFailed
-            }
 
-            () = hold => {
-                self.hold_deadline = None;
-                FsmInput::HoldTimerExpired
-            }
+                () = hold => {
+                    self.hold_deadline = None;
+                    return FsmInput::HoldTimerExpired;
+                }
 
-            () = keepalive => {
-                self.keepalive_deadline = None;
-                FsmInput::KeepaliveTimerExpired
-            }
+                () = keepalive => {
+                    self.keepalive_deadline = None;
+                    return FsmInput::KeepaliveTimerExpired;
+                }
 
-            () = retry => {
-                self.retry_deadline = None;
-                FsmInput::ConnectRetryTimerExpired
+                () = retry => {
+                    self.retry_deadline = None;
+                    return FsmInput::ConnectRetryTimerExpired;
+                }
+
+                // Lowest-priority arm: outbound UPDATEs from the daemon.
+                // Written directly to the TCP writer; no FSM transition needed.
+                Some(update) = self.update_rx.recv() => {
+                    if let Some(w) = &mut self.writer {
+                        if w.send(BgpMessage::Update(update)).await.is_err() {
+                            self.drop_connection();
+                            return FsmInput::TcpFailed;
+                        }
+                    }
+                    // Not in Established state yet, or send succeeded — loop.
+                }
             }
         }
     }
