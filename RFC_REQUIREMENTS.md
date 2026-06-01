@@ -141,18 +141,15 @@ The core protocol. Every crate is shaped by it.
 
 ### §9.2 — Update-Send Process
 
-The RIB structures above are implemented. The process that drives outbound UPDATE
-generation from Loc-RIB changes is not yet wired in the daemon.
-
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| Loc-RIB best-path change triggers export policy evaluation per peer | `pathvectord` | ❌ | — |
-| Export policy accepted routes populate per-peer Adj-RIB-Out | `pathvectord` | ❌ | — |
-| Adj-RIB-Out change generates and sends UPDATE (announcement) to peer | `pathvectord` | ❌ | — |
-| Withdrawn best path generates UPDATE with withdrawn NLRI to all peers | `pathvectord` | ❌ | — |
-| LOCAL_PREF not included in UPDATEs sent to eBGP peers | `pathvectord` | ❌ | — |
-| Local AS prepended to AS_PATH in UPDATEs sent to eBGP peers | `pathvectord` | ❌ | — |
-| NEXT_HOP set to local interface address in UPDATEs sent to eBGP peers | `pathvectord` | ❌ | — |
+| Loc-RIB best-path change triggers export policy evaluation per peer | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_sends_withdraw_when_export_policy_rejects` |
+| Export policy accepted routes populate per-peer Adj-RIB-Out | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_no_send_when_route_unchanged` |
+| Adj-RIB-Out change generates and sends UPDATE (announcement) to peer | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message` |
+| Withdrawn best path generates UPDATE with withdrawn NLRI to all peers | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_withdraw_when_route_removed` |
+| LOCAL_PREF not included in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_strips_local_pref` |
+| Local AS prepended to AS_PATH in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_prepends_local_as`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message` |
+| NEXT_HOP set to local interface address in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_rewrites_next_hop` |
 
 ---
 
@@ -486,15 +483,15 @@ which state the unexpected message arrived in.
 
 Mandates that eBGP speakers MUST NOT advertise or accept routes without an explicit
 policy configured. A speaker with no import policy MUST NOT install routes from the
-peer; a speaker with no export policy MUST NOT advertise routes to the peer. The
-current daemon's `import_default` config option defaults to `"accept"`, which is
-non-compliant. The export path is not yet implemented (see TODO), but when it is,
-the default must be reject-all.
+peer; a speaker with no export policy MUST NOT advertise routes to the peer. Both
+`import_default` and `export_default` config fields exist and are configurable per peer,
+but both default to `"accept"` — non-compliant. Operators must explicitly set
+`import_default = "reject"` and `export_default = "reject"` to achieve compliance.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| eBGP session MUST NOT accept routes without an explicit import policy | `pathvectord` | ⚠️ | `import_default` configurable but defaults to `"accept"` — non-compliant default |
-| eBGP session MUST NOT advertise routes without an explicit export policy | `pathvectord` | ❌ | — (export path not yet implemented) |
+| eBGP session MUST NOT accept routes without an explicit import policy | `pathvectord/src/config.rs` | ⚠️ | `import_default` configurable but defaults to `"accept"` — non-compliant default |
+| eBGP session MUST NOT advertise routes without an explicit export policy | `pathvectord/src/config.rs` | ⚠️ | `export_default` configurable but defaults to `"accept"` — non-compliant default |
 | Absence of explicit policy results in no route propagation, not accept-all | `pathvectord` | ❌ | — |
 
 ---
@@ -503,7 +500,7 @@ the default must be reject-all.
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9, collision detection, and full Update-Send Process outstanding |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process implemented |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ |
@@ -522,7 +519,7 @@ the default must be reject-all.
 | RFC 4456 | Route Reflectors | ❌ |
 | RFC 6286 | AS-Wide Unique BGP Identifier | ❌ |
 | RFC 7606 | Revised UPDATE Error Handling | ⚠️ Well-known mandatory errors correctly reset session; optional attribute errors should use discard/withdraw policies but currently reset session |
-| RFC 8212 | Default EBGP Route Propagation | ⚠️ Import default non-compliant (defaults to accept); export not yet implemented |
+| RFC 8212 | Default EBGP Route Propagation | ⚠️ Both import and export defaults non-compliant (default to accept); operators must set reject explicitly |
 | RFC 3107 | MPLS Labeled Unicast | ⚠️ SAFI defined; label encoding not implemented |
 | RFC 4364 | MPLS L3VPN | ⚠️ SAFI defined; VPN-IPv4 NLRI not implemented |
 | RFC 4761 | VPLS | ⚠️ SAFI/AFI defined; NLRI not implemented |

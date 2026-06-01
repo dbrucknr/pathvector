@@ -139,6 +139,7 @@ offer:
 - BGP FSM: Idle → Connect → Active → OpenSent → OpenConfirm → Established (pure state machine, no I/O)
 - Codec error logging in transport — `recv_message` errors are now surfaced via `tracing::warn!` before dropping the connection
 - **GoBGP interoperability validated (2026-05-31)** — full session lifecycle confirmed: OPEN negotiation, KEEPALIVE exchange, UPDATE announce and withdraw, session teardown
+- **Outbound UPDATE send path (2026-06-01)** — `SessionHandle::update_sender()` returns a cloneable `mpsc::Sender<UpdateMessage>`. `wait_for_input()` wraps its `select!` in a `loop` with a lowest-priority arm that writes outbound UPDATEs directly to the TCP framer inline; write failures return `TcpFailed` to the FSM for clean recovery.
 
 ### Remaining
 
@@ -199,28 +200,27 @@ Not yet started. Key work items:
 - RIB integration: `UpdateMessage` → `Route<Ipv4Addr>` conversion, `LocRib` insert/withdraw/peer-teardown
 - Structured logging via `tracing` with `RUST_LOG` env-filter support
 - **GoBGP interoperability validated (2026-05-31)**
+- **Outbound advertisement path (2026-06-01)** — pathvectord is now a full BGP speaker:
+  - `ExportDefault` config enum and per-peer `export_default` field (mirrors `import_default`)
+  - Per-peer export policies evaluated via `propagate_prefix` before `AdjRibOut` insertion
+  - `prepare_outbound` applies eBGP attribute transforms: prepend local AS to `AS_PATH`, rewrite `NEXT_HOP` to local BGP ID, strip `LOCAL_PREF`
+  - `route_to_update` / `withdraw_msg` serialise `AdjRibOut` changes to wire-format `UpdateMessage`
+  - On `Established`: `AdjRibOut` reset to clean slate, full-table dump to the new peer
+  - On `RouteUpdate`: affected NLRIs propagated to all established peers after `handle_update`
+  - On `Terminated`: snapshot-before-withdraw pattern propagates best-path changes to other established peers; `AdjRibOut` reset for clean reconnect
+  - Idempotent: `propagate_prefix` compares new route against what is already in `AdjRibOut` and sends UPDATE/WITHDRAW only when the advertised state actually changes
 
 ### Remaining
 
-- Outbound advertisement (export path) — the daemon currently only processes inbound
-  UPDATEs. It never sends UPDATE messages to peers, making it a route receiver rather
-  than a full BGP speaker. Required work:
-  - Export policy — evaluate LocRib best routes through a per-peer export policy before
-    Adj-RIB-Out population (mirrors the import policy already wired on the receive side)
-  - Adj-RIB-Out population — on each best-path change, push the new best route through
-    export policy and update each peer's AdjRibOut accordingly
-  - UPDATE generation — translate Adj-RIB-Out changes into wire-format UPDATE messages
-    and send them via the session transport's send path
-  - Attribute rewrite for eBGP peers — prepend local AS to AS_PATH, strip LOCAL_PREF,
-    rewrite NEXT_HOP to the local interface address
-  - Withdrawal propagation — when a best path is removed from LocRib, send a withdrawn
-    NLRI UPDATE to all peers that held the route in their Adj-RIB-Out
+- Panic safety in main event loop — the `expect()` calls throughout `run()` would panic
+  the daemon if a peer IP appeared in a `SessionEvent` that was not present in the config
+  maps. The invariant is structural (maps are built from the same config slice as sessions),
+  but is invisible at the call sites and fragile to future refactoring. Replace with
+  `tracing::error!` + graceful skip.
 
-- Panic safety in main event loop — the `expect()` calls at lines 127 and 130 of
-  `main.rs` would panic the entire daemon if a peer IP appeared in a `SessionEvent`
-  that was not present in the config maps. The invariant is currently structural (maps
-  are built from the same config slice as sessions), but is invisible at the call sites
-  and fragile to future refactoring. Replace with `tracing::error!` + graceful skip.
+- Soft reconfiguration → export propagation — `reapply_import_policy` changes which routes
+  are in `LocRib`, but does not currently trigger `propagate_prefix` to update peers. Callers
+  that perform policy reloads must trigger outbound propagation manually until this is wired.
 
 - IPv6 in the daemon — the session layer already speaks IPv6 via MP_REACH_NLRI, but
   `pathvectord` is hardcoded to `Route<Ipv4Addr>`. Extending to IPv6 requires a
