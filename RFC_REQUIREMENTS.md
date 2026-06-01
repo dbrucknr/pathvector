@@ -112,17 +112,17 @@ The core protocol. Every crate is shaped by it.
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
 | Step 1: Prefer routes with reachable next-hop | `pathvector-rib/src/best_path.rs` | ❌ | — |
-| Step 2: Prefer highest LOCAL_PREF (missing → 100) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_higher_local_pref`, `test_select_best_missing_local_pref_treated_as_100`, `test_select_best_local_pref_beats_path_length` |
+| Step 2: Prefer highest LOCAL_PREF (missing → 100) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_higher_local_pref`, `test_select_best_missing_local_pref_treated_as_100`, `test_select_best_local_pref_beats_path_length`, `proptest: prop_select_best_winner_has_highest_local_pref` |
 | Step 3: Prefer locally originated routes | `pathvector-rib/src/best_path.rs` | ❌ | — |
-| Step 4: Prefer shortest AS_PATH (AS_SET counts as 1; AS_CONFED_* count as 0) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_shorter_as_path`, `test_aspath_path_length_set_counts_as_one`, `test_aspath_path_length_confed_counts_as_zero` |
-| Step 5: Prefer lowest ORIGIN (IGP < EGP < INCOMPLETE) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_lower_origin` |
-| Step 6: Prefer lowest MED (missing → 0; same-AS comparison only) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_lower_med`, `test_select_best_missing_med_treated_as_zero` |
-| Step 7: Prefer eBGP over iBGP | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_ebgp_over_ibgp`, `test_local_pref_beats_ebgp_preference`, `test_two_ebgp_routes_fall_through_to_tiebreak` |
+| Step 4: Prefer shortest AS_PATH (AS_SET counts as 1; AS_CONFED_* count as 0) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_shorter_as_path`, `test_aspath_path_length_set_counts_as_one`, `test_aspath_path_length_confed_counts_as_zero`, `proptest: prop_select_best_winner_has_shortest_as_path` |
+| Step 5: Prefer lowest ORIGIN (IGP < EGP < INCOMPLETE) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_lower_origin`, `proptest: prop_select_best_winner_has_lowest_origin` |
+| Step 6: Prefer lowest MED (missing → 0; same-AS comparison only) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_lower_med`, `test_select_best_missing_med_treated_as_zero`, `proptest: prop_select_best_winner_has_lowest_med` |
+| Step 7: Prefer eBGP over iBGP | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_prefers_ebgp_over_ibgp`, `test_local_pref_beats_ebgp_preference`, `test_two_ebgp_routes_fall_through_to_tiebreak`, `proptest: prop_select_best_ebgp_beats_ibgp` |
 | Step 8: Prefer lowest IGP metric to next-hop | `pathvector-rib/src/best_path.rs` | ❌ | — |
 | Step 9: Prefer oldest eBGP route | `pathvector-rib/src/best_path.rs` | ❌ | — |
 | Step 10: Prefer lowest peer IP address (tiebreaker) | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_tiebreak_lower_peer_ip` |
 | select_best returns None for an empty candidate set | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_empty` |
-| select_best returns the correct Route reference, not just PeerId | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_returns_correct_route_reference` |
+| select_best winner is always drawn from the candidate set | `pathvector-rib/src/best_path.rs` | ✅ | `test_select_best_returns_correct_route_reference`, `proptest: prop_select_best_winner_is_in_candidates`, `proptest: prop_select_best_non_empty_returns_some`, `proptest: prop_select_best_deterministic` |
 
 ### §9.2 — RIB Structure
 
@@ -232,8 +232,8 @@ The core protocol. Every crate is shaped by it.
 | Well-known community NO_ADVERTISE (0xFFFFFF02) | `pathvector-types/src/community.rs` | ✅ | `test_community_well_known_no_advertise` |
 | Well-known community NO_EXPORT_SUBCONFED (0xFFFFFF03) | `pathvector-types/src/community.rs` | ✅ | `test_community_well_known_no_export_subconfed` |
 | Operator-assigned community values do not collide with well-known range | `pathvector-types/src/community.rs` | ✅ | `test_community_operator_not_well_known` |
-| Match on community value in policy | `pathvector-policy/src/condition.rs` | ✅ | `test_community_condition` |
-| Add / remove community in policy action | `pathvector-policy/src/action.rs` | ✅ | `test_add_community`, `test_remove_community`, `test_set_communities` |
+| Match on community value in policy | `pathvector-policy/src/condition.rs` | ✅ | `test_community_condition`, `proptest: prop_added_community_is_matched` |
+| Add / remove community in policy action | `pathvector-policy/src/action.rs` | ✅ | `test_add_community`, `test_remove_community`, `test_set_communities`, `proptest: prop_add_community_increases_count_by_one`, `proptest: prop_remove_community_never_increases_count`, `proptest: prop_removed_community_not_matched_if_unique`, `proptest: prop_set_communities_replaces_all` |
 
 ---
 
@@ -257,8 +257,8 @@ The core protocol. Every crate is shaped by it.
 | LARGE_COMMUNITY (type 32): list of 12-byte values (global-admin:local-data-1:local-data-2) | `pathvector-types/src/community.rs` | ✅ | `test_large_community_new`, `test_large_community_bytes_roundtrip`, `test_large_community_display` |
 | Large communities encoded/decoded correctly in UPDATE | `pathvector-session/src/message/update.rs` | ✅ | `test_large_communities_roundtrip` |
 | Large community attribute with bad length is an error | `pathvector-session/src/message/update.rs` | ✅ | `test_large_community_bad_length_is_error` |
-| Match on large community value in policy | `pathvector-policy/src/condition.rs` | ✅ | `test_large_community_condition` |
-| Add / remove large community in policy action | `pathvector-policy/src/action.rs` | ✅ | `test_add_large_community`, `test_remove_large_community` |
+| Match on large community value in policy | `pathvector-policy/src/condition.rs` | ✅ | `test_large_community_condition`, `proptest: prop_added_community_is_matched` |
+| Add / remove large community in policy action | `pathvector-policy/src/action.rs` | ✅ | `test_add_large_community`, `test_remove_large_community`, `proptest: prop_add_community_increases_count_by_one`, `proptest: prop_remove_community_never_increases_count` |
 
 ---
 

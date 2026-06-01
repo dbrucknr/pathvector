@@ -7,9 +7,11 @@ which crate it belongs to and why it was deferred.
 ---
 
 ## General
-Download Relevant RFC's to each module.
-Generate a list of requirements from the RFC's.
-Check whether or not the each module currently meets these requirements.
+~~Download Relevant RFC's to each module.~~
+~~Generate a list of requirements from the RFC's.~~
+~~Check whether or not the each module currently meets these requirements.~~
+**Done** — `RFC_REQUIREMENTS.md` tracks every implemented RFC, its requirements, owning module,
+implementation status, and verified-by test citations.
 
 ### Property testing and fuzz coverage (ordered)
 
@@ -26,12 +28,16 @@ proptests at both the `BgpMessage::encode/decode` layer (`message/prop_tests.rs`
 The generators exposed a real round-trip constraint: `Unknown` sub-variants must exclude codes that
 the decoder maps to named variants — constrained accordingly.
 
-**Phase 2 — `pathvector-rib` best-path invariants**
-Add proptests for structural properties of the decision algorithm:
-- Winner's LOCAL_PREF ≥ all candidates' LOCAL_PREF (when that step is decisive)
-- Winner's AS_PATH length ≤ all candidates' AS_PATH length (when that step is decisive)
-- eBGP winner beats all iBGP candidates when both are present
-- Winner is always drawn from the candidate set (no phantom routes)
+**Phase 2 — `pathvector-rib` best-path invariants** ✓ Done
+Step-by-step isolation proptests for every implemented decision step:
+- `prop_select_best_winner_has_highest_local_pref` (step 2)
+- `prop_select_best_winner_has_shortest_as_path` (step 4)
+- `prop_select_best_winner_has_lowest_origin` (step 5)
+- `prop_select_best_winner_has_lowest_med` (step 6)
+- `prop_select_best_ebgp_beats_ibgp` (step 7)
+- `prop_select_best_winner_is_in_candidates`, `prop_select_best_non_empty_returns_some`,
+  `prop_select_best_deterministic` (structural invariants)
+- LocRib, AdjRibIn, and AdjRibOut structural proptests (insert/withdraw/consistency)
 
 **Phase 3 — `pathvector-policy` semantics** ✓ Done
 Empty-policy default action, catch-all terms, and all-Next fall-through were already covered.
@@ -135,12 +141,13 @@ Covered by `test_keepalive_in_open_confirm_with_missing_peer_open_resets_to_idle
 
 ### Transport layer mocking via `BgpTransport` trait
 
-The `Session` struct has `TcpStream` baked in, making the async I/O paths
-(`transport/mod.rs:147-148,184-185,204-205,227-230`) impossible to unit test without
-real sockets. These paths cover send failure recovery, codec errors on receive, connect
-retry timer firing, and the `TcpFailed` re-entry loop.
+The original motivation — codec error and connect-retry paths were untestable without real
+sockets — is now resolved: `test_codec_error_emits_terminated` and
+`test_connect_retry_timer_fires_initiates_reconnect` cover those paths via real loopback
+sockets in `tests/transport.rs`.
 
-Fix: define a trait in `transport/mod.rs`:
+The `BgpTransport` trait design below remains a valid improvement for faster, more isolated
+unit tests (no port allocation, no OS scheduler involvement), but is no longer urgent.
 
 ```rust
 trait BgpTransport: Send + 'static {
@@ -150,19 +157,10 @@ trait BgpTransport: Send + 'static {
 ```
 
 Make `Session<T: BgpTransport>` generic over `T`. The public `spawn()` function stays
-non-generic — it constructs `Session<FramedBgpTransport>` internally where
-`FramedBgpTransport` wraps the existing `FramedRead` / `FramedWrite` pair. A
-`#[cfg(test)]` helper `spawn_with(config, transport: T)` enables test injection without
-touching the production call sites in `pathvectord`.
-
-Performance: pure static dispatch. Monomorphization means the production binary only
-ever sees `Session<FramedBgpTransport>` — zero vtable overhead, same codegen as today.
-`async fn` in traits is stable since Rust 1.75, well within MSRV 1.86.
-
-Note: `tokio::io::duplex()` is a good alternative for integration-style tests that want
-real framing without a real socket — wrap the duplex halves with `FramedRead` / `FramedWrite`
-and `BgpCodec`, giving `FramedBgpTransport` instances that can be handed to two `Session`s
-to simulate a full session handshake in memory. No mock trait needed for that test pattern.
+non-generic — it constructs `Session<FramedBgpTransport>` internally. A `#[cfg(test)]`
+helper `spawn_with(config, transport: T)` enables injection without touching production
+call sites. `tokio::io::duplex()` is a good alternative for integration-style tests that
+want real framing without a real socket.
 
 ---
 
@@ -213,6 +211,6 @@ schema is finalised. Will contain generated client stubs so users and the
 
 - CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.86)
 - Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range
-- Fuzz testing for the session codec (OPEN/UPDATE parsing are attack surface)
+- Fuzz testing — tracked as Phase 4 in the property testing section above
 - Benchmark suite for `LocRib` insert/best-path under realistic prefix volumes
   (100k IPv4 prefixes, M2 Max baseline)
