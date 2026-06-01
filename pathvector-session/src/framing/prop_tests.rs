@@ -269,6 +269,6 @@ proptest! {
         let mut buf = BytesMut::from([0xFF_u8; 16].as_slice()); // all-FF marker
         buf.extend_from_slice(&bad_len.to_be_bytes());
         buf.extend_from_slice(&[4u8]); // type byte (Keepalive)
-        prop_assert!(matches!(codec.decode(&mut buf), Err(_)));
+        prop_assert!(codec.decode(&mut buf).is_err());
     }
 }

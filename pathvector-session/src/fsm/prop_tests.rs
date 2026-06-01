@@ -145,7 +145,7 @@ proptest! {
             });
             prop_assert_eq!(timer, Some(Duration::from_secs(u64::from(expected))));
         } else {
-            prop_assert!(out.iter().any(|o| *o == FsmOutput::StopHoldTimer));
+            prop_assert!(out.contains(&FsmOutput::StopHoldTimer));
         }
     }
 }
