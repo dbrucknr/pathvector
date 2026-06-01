@@ -33,11 +33,15 @@ Add proptests for structural properties of the decision algorithm:
 - eBGP winner beats all iBGP candidates when both are present
 - Winner is always drawn from the candidate set (no phantom routes)
 
-**Phase 3 — `pathvector-policy` semantics**
-Add proptests for first-match-wins evaluation and term determinism:
-- Same route evaluated twice produces the same result
-- A route accepted by term N is never re-evaluated by term N+1
-- An empty policy returns the configured default action
+**Phase 3 — `pathvector-policy` semantics** ✓ Done
+Empty-policy default action, catch-all terms, and all-Next fall-through were already covered.
+Added the two remaining plan items:
+- `prop_policy_evaluation_is_deterministic`: same route state evaluated twice always produces
+  the same decision — rules out hidden mutable state in Policy or its terms.
+- `prop_first_match_wins_accept_blocks_later_reject`: a route matched by term N (Accept)
+  is never passed to term N+1 (catch-all Reject) — core first-match-wins guarantee.
+Also covers 8 action invariants (PrependAsPath, Add/Remove/SetCommunities, SetLocalPref,
+AnyCondition, ActionSequence).
 
 **Phase 4 — `cargo fuzz` on the codec decode path**
 Add a fuzz target over raw `&[u8]` input to the framing and codec layer.

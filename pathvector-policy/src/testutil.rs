@@ -9,7 +9,7 @@ use crate::route::BgpRoute;
 /// This type implements [`BgpRoute`] so that conditions and actions can be
 /// tested without depending on `pathvector-rib`. It stores every standard
 /// BGP attribute as a plain field — no encoding, no wire format.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TestRoute {
     pub nlri: Nlri<Ipv4Addr>,
     pub origin: Origin,
@@ -25,8 +25,8 @@ pub struct TestRoute {
 impl TestRoute {
     /// Creates a minimal test route for the given CIDR prefix string.
     ///
-    /// Defaults: ORIGIN IGP, no LOCAL_PREF, no MED, empty AS path,
-    /// no communities, no NEXT_HOP.
+    /// Defaults: ORIGIN IGP, no `LOCAL_PREF`, no MED, empty AS path,
+    /// no communities, no `NEXT_HOP`.
     pub fn new(prefix: &str) -> Self {
         Self {
             nlri: prefix.parse().expect("invalid test prefix"),

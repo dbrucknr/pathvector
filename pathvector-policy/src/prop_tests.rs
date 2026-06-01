@@ -104,6 +104,59 @@ proptest! {
     }
 }
 
+// ── First-match-wins and determinism ──────────────────────────────────────
+
+proptest! {
+    /// Evaluating the same route state twice against the same policy always
+    /// produces the same decision.
+    ///
+    /// A policy that returns different decisions for identical input would
+    /// make operator reasoning about filter behaviour impossible and could
+    /// cause oscillating RIB installs across consecutive soft-reconfiguration
+    /// cycles.
+    #[test]
+    fn prop_policy_evaluation_is_deterministic(route in arb_route()) {
+        let mut r1 = route.clone();
+        let mut r2 = route;
+
+        let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Reject)
+            .term(CommunityCondition::new(Community::NO_EXPORT), Reject)
+            .term(AnyCondition, Accept)
+            .build();
+
+        prop_assert_eq!(policy.evaluate(&mut r1), policy.evaluate(&mut r2));
+    }
+
+    /// When term N matches and returns Accept, term N+1 is never evaluated.
+    ///
+    /// This is the core first-match-wins guarantee. A policy where a later
+    /// Reject term fires after an earlier Accept would silently drop routes
+    /// that the operator intended to pass.
+    #[test]
+    fn prop_first_match_wins_accept_blocks_later_reject(
+        mut route in arb_route(),
+        c_val in 0u32..=u32::MAX,
+    ) {
+        let c = Community::new(c_val);
+
+        // Ensure the route carries community c so term 1 will match it.
+        if !route.communities().contains(&c) {
+            let mut comms: Vec<Community> = route.communities().to_vec();
+            comms.push(c);
+            route.set_communities(comms);
+        }
+
+        // Term 1: if route carries c → Accept (should fire and short-circuit).
+        // Term 2: catch-all Reject (must never be reached for this route).
+        let policy: Policy<TestRoute> = PolicyBuilder::new(DefaultAction::Reject)
+            .term(CommunityCondition::new(c), Accept)
+            .term(AnyCondition, Reject)
+            .build();
+
+        prop_assert_eq!(policy.evaluate(&mut route), Decision::Accept);
+    }
+}
+
 // ── Action invariants ──────────────────────────────────────────────────────
 
 proptest! {
