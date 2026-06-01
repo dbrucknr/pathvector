@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::Ipv4Addr};
 
-use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin};
+use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 use proptest::prelude::*;
 
 use crate::{
@@ -65,7 +65,7 @@ fn arb_candidates() -> impl Strategy<Value = HashMap<PeerId, Route<Ipv4Addr>>> {
     proptest::collection::hash_map(arb_peer_id(), arb_route_for(nlri), 1..=4usize)
 }
 
-/// A (peer, route) pair for LocRib insertion with a varying NLRI.
+/// A (peer, route) pair for [`LocRib`] insertion with a varying NLRI.
 fn arb_peer_route() -> impl Strategy<Value = (PeerId, Route<Ipv4Addr>)> {
     (arb_peer_id(), arb_nlri()).prop_flat_map(|(peer, nlri)| {
         arb_route_for(nlri).prop_map(move |route| (peer, route))
@@ -142,6 +142,153 @@ proptest! {
     }
 }
 
+// ── best_path: step-by-step isolation ────────────────────────────────────────
+
+proptest! {
+    /// When all candidates share the same LOCAL_PREF and distinct AS_PATH
+    /// lengths, the winner always has the shortest path.
+    ///
+    /// AS_PATH length is step 4 of the decision process. An incorrect winner
+    /// here means traffic takes a longer route than necessary, violating the
+    /// operator's intended topology.
+    #[test]
+    fn prop_select_best_winner_has_shortest_as_path(
+        path_lengths in proptest::collection::hash_set(1usize..=6usize, 1..=4usize),
+    ) {
+        let peers = [
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 1)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 2)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 3)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 4)),
+        ];
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let len_vec: Vec<usize> = path_lengths.into_iter().collect();
+        let min_len = *len_vec.iter().min().unwrap();
+
+        let mut candidates: HashMap<PeerId, Route<Ipv4Addr>> = HashMap::new();
+        for (i, &len) in len_vec.iter().enumerate() {
+            let asns: Vec<_> = (1..=u32::try_from(len).unwrap()).map(Asn::new).collect();
+            candidates.insert(
+                peers[i],
+                RouteBuilder::new(nlri, Origin::Igp, AsPath::from_sequence(asns))
+                    .local_pref(LocalPref::new(100))
+                    .build(),
+            );
+        }
+
+        let (_, winner) = select_best(&candidates).unwrap();
+        prop_assert_eq!(winner.as_path.path_length(), min_len);
+    }
+
+    /// When all candidates share the same LOCAL_PREF and AS_PATH length but
+    /// have distinct ORIGIN values, the winner always has the lowest ORIGIN.
+    ///
+    /// ORIGIN is step 5: IGP (0) < EGP (1) < INCOMPLETE (2). An incorrect
+    /// winner here means a route learned from an external source is preferred
+    /// over one with complete internal provenance.
+    #[test]
+    fn prop_select_best_winner_has_lowest_origin(
+        include_egp        in any::<bool>(),
+        include_incomplete in any::<bool>(),
+    ) {
+        let peers = [
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 1)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 2)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 3)),
+        ];
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+
+        let mut origins = vec![Origin::Igp];
+        if include_egp        { origins.push(Origin::Egp); }
+        if include_incomplete { origins.push(Origin::Incomplete); }
+        let min_origin = *origins.iter().min().unwrap();
+
+        let mut candidates: HashMap<PeerId, Route<Ipv4Addr>> = HashMap::new();
+        for (i, &origin) in origins.iter().enumerate() {
+            candidates.insert(
+                peers[i],
+                RouteBuilder::new(nlri, origin, AsPath::new())
+                    .local_pref(LocalPref::new(100))
+                    .build(),
+            );
+        }
+
+        let (_, winner) = select_best(&candidates).unwrap();
+        prop_assert_eq!(winner.origin, min_origin);
+    }
+
+    /// When all candidates share LOCAL_PREF, AS_PATH length, and ORIGIN but
+    /// have distinct MED values, the winner always has the lowest MED.
+    ///
+    /// MED is step 6. An incorrect winner here means traffic exits via a
+    /// higher-cost link than the neighboring AS advertised.
+    #[test]
+    fn prop_select_best_winner_has_lowest_med(
+        med_values in proptest::collection::hash_set(0u32..=1000u32, 1..=4usize),
+    ) {
+        let peers = [
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 1)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 2)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 3)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 4)),
+        ];
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let med_vec: Vec<u32> = med_values.into_iter().collect();
+        let min_med = *med_vec.iter().min().unwrap();
+
+        let mut candidates: HashMap<PeerId, Route<Ipv4Addr>> = HashMap::new();
+        for (i, &med) in med_vec.iter().enumerate() {
+            candidates.insert(
+                peers[i],
+                RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+                    .local_pref(LocalPref::new(100))
+                    .med(Med::new(med))
+                    .build(),
+            );
+        }
+
+        let (_, winner) = select_best(&candidates).unwrap();
+        prop_assert_eq!(winner.med, Some(Med::new(min_med)));
+    }
+
+    /// When there is at least one eBGP candidate and all routes share the same
+    /// LOCAL_PREF, AS_PATH length, ORIGIN, and MED, the winner is always eBGP.
+    ///
+    /// eBGP preference is step 7. Returning an iBGP winner in a mixed set
+    /// would violate the fundamental BGP rule that external routes are
+    /// preferred over internal ones.
+    #[test]
+    fn prop_select_best_ebgp_beats_ibgp(
+        is_external in proptest::collection::vec(any::<bool>(), 1..=4usize),
+    ) {
+        let peers = [
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 1)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 2)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 3)),
+            PeerId::from(Ipv4Addr::new(10, 0, 0, 4)),
+        ];
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let has_ebgp = is_external.iter().any(|&ext| ext);
+
+        let mut candidates: HashMap<PeerId, Route<Ipv4Addr>> = HashMap::new();
+        for (i, &ext) in is_external.iter().enumerate() {
+            let pt = if ext { PeerType::External } else { PeerType::Internal };
+            candidates.insert(
+                peers[i],
+                RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+                    .local_pref(LocalPref::new(100))
+                    .peer_type(pt)
+                    .build(),
+            );
+        }
+
+        let (_, winner) = select_best(&candidates).unwrap();
+        if has_ebgp {
+            prop_assert_eq!(winner.peer_type, PeerType::External);
+        }
+    }
+}
+
 // ── LocRib ────────────────────────────────────────────────────────────────────
 
 proptest! {
@@ -153,7 +300,9 @@ proptest! {
     ) {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         for (peer, route) in inserts { rib.insert(peer, route); }
-        prop_assert_eq!(rib.is_empty(), rib.len() == 0);
+        #[allow(clippy::len_zero)]
+        let len_is_zero = rib.len() == 0;
+        prop_assert_eq!(rib.is_empty(), len_is_zero);
     }
 
     /// `best_routes().count()` always equals `len()`.
@@ -228,8 +377,7 @@ proptest! {
             .map(|(_, r)| r.nlri)
             .filter(|nlri| {
                 rib.candidates(nlri)
-                    .map(|c| c.len() == 1 && c.contains_key(&target))
-                    .unwrap_or(false)
+                    .is_some_and(|c| c.len() == 1 && c.contains_key(&target))
             })
             .collect();
 

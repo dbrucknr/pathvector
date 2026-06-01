@@ -148,7 +148,7 @@ mod tests {
     }
 
     fn basic(origin: Origin, path_len: usize, lp: Option<u32>, med: Option<u32>) -> Route<Ipv4Addr> {
-        let asns: Vec<_> = (1..=path_len as u32).map(Asn::new).collect();
+        let asns: Vec<_> = (1..=u32::try_from(path_len).unwrap()).map(Asn::new).collect();
         let mut b = RouteBuilder::new(
             nlri(),
             origin,

@@ -301,7 +301,7 @@ mod tests {
         let stored = rib.get(&nlri("10.0.0.0/8")).unwrap();
         // Confederation segments stripped; only the regular sequence remains.
         assert_eq!(stored.as_path.path_length(), 2);
-        for seg in stored.as_path.segments().iter() {
+        for seg in stored.as_path.segments() {
             assert!(
                 !matches!(seg, AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)),
                 "confed segment survived eBGP advertisement"
