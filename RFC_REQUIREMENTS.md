@@ -156,6 +156,30 @@ generation from Loc-RIB changes is not yet wired in the daemon.
 
 ---
 
+## RFC 7606 — Revised Error Handling for BGP UPDATE Messages
+
+Revises RFC 4271 §6.3. Instead of tearing down the session for every malformed path
+attribute, implementations must apply one of three error policies depending on the
+attribute: _session reset_ (NOTIFICATION + teardown), _treat as withdraw_ (drop the
+announced NLRIs for this UPDATE but keep the session open), or _attribute discard_
+(ignore the bad attribute and continue processing). The current implementation returns
+a `CodecError` for most decode failures, which the transport layer always treats as a
+session reset — the more lenient policies are not yet applied.
+
+| Requirement | Module | Status | Verified by |
+|---|---|---|---|
+| Missing well-known mandatory attribute → session reset (NOTIFICATION code 3, subcode 3) | `pathvector-session/src/message/update.rs` | ✅ | `test_invalid_origin_rejected` |
+| Malformed ORIGIN → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Malformed AS_PATH → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Malformed NEXT_HOP → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Malformed MP_REACH_NLRI → treat as withdraw for that AFI/SAFI, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Malformed MP_UNREACH_NLRI → attribute discard, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Malformed optional non-transitive attribute → attribute discard, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Malformed optional transitive attribute → Partial bit set, forward; otherwise attribute discard | `pathvector-session/src/message/update.rs` | ⚠️ | Partial bit set on re-encode (`test_unknown_optional_transitive_partial_bit_set_on_reencode`); a decode error still causes session reset rather than attribute discard |
+| Duplicate attribute in UPDATE → treat as withdraw | `pathvector-session/src/message/update.rs` | ❌ | — |
+
+---
+
 ## RFC 2918 — Route Refresh Capability
 
 | Requirement | Module | Status | Verified by |
@@ -178,6 +202,22 @@ generation from Loc-RIB changes is not yet wired in the daemon.
 | Truncated MultiProtocol capability (< 4 bytes) is an error | `pathvector-session/src/message/open.rs` | ✅ | `test_truncated_multiprotocol_capability_is_error` |
 | Truncated FourByteAsn capability (< 4 bytes) is an error | `pathvector-session/src/message/open.rs` | ✅ | `test_truncated_four_byte_asn_capability_is_error` |
 | Truncated GracefulRestart capability (< 2 bytes) is an error | `pathvector-session/src/message/open.rs` | ✅ | `test_truncated_graceful_restart_capability_is_error` |
+
+---
+
+## RFC 5492 — Capabilities Advertisement (obsoletes RFC 3392)
+
+Wire-format requirements are inherited from RFC 3392 above and are fully implemented.
+RFC 5492 adds clarity on Unsupported Capability handling: when a peer sends a OPEN
+with a capability this implementation requires but cannot honour, a NOTIFICATION with
+code 2 subcode 7 must be sent listing the unsupported codes, and the speaker MAY
+retry without them.
+
+| Requirement | Module | Status | Verified by |
+|---|---|---|---|
+| NOTIFICATION code 2 subcode 7 (Unsupported Capability) sent when peer requires an unsupported capability | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| Unsupported Capability NOTIFICATION data field contains the list of unsupported capability codes | `pathvector-session/src/message/notification.rs` | ❌ | — |
+| On receiving Unsupported Capability NOTIFICATION, MAY retry OPEN without the offending capabilities | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
 
 ---
 
@@ -214,6 +254,19 @@ generation from Loc-RIB changes is not yet wired in the daemon.
 
 ---
 
+## RFC 6286 — Autonomous System-Wide Unique BGP Identifier
+
+Tightens RFC 4271 §6.2: the BGP Identifier MUST be unique within the AS. An iBGP
+peer advertising the same BGP ID as the local speaker indicates a routing loop or
+misconfiguration rather than a normal connection collision.
+
+| Requirement | Module | Status | Verified by |
+|---|---|---|---|
+| BGP Identifier MUST be unique within the local AS | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| iBGP peer with identical BGP ID treated as routing loop, not a normal collision | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+
+---
+
 ## RFC 4724 — Graceful Restart Mechanism for BGP
 
 | Requirement | Module | Status | Verified by |
@@ -234,6 +287,21 @@ generation from Loc-RIB changes is not yet wired in the daemon.
 | All 10 Cease subcodes encode and decode correctly | `pathvector-session/src/message/notification.rs` | ✅ | `test_cease_all_variants_roundtrip` |
 | Subcode 2 (Administrative Shutdown) carries optional diagnostic data | `pathvector-session/src/message/notification.rs` | ✅ | `test_cease_admin_shutdown_roundtrip` |
 | ManualStop sends Cease over a real session | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_manual_stop_sends_cease_and_emits_terminated` |
+
+---
+
+## RFC 6608 — Subcodes for BGP Finite State Machine Error
+
+Defines subcodes for NOTIFICATION error code 5 (FSM Error). The FSM currently sends
+code 5 with subcode 0 (Unspecified) for all state machine violations regardless of
+which state the unexpected message arrived in.
+
+| Requirement | Module | Status | Verified by |
+|---|---|---|---|
+| FSM error subcode 0 — Unspecified Error | `pathvector-session/src/message/notification.rs` | ✅ | `test_fsm_error_roundtrip` |
+| FSM error subcode 1 — Receive Unexpected Message in OpenSent State | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| FSM error subcode 2 — Receive Unexpected Message in OpenConfirm State | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| FSM error subcode 3 — Receive Unexpected Message in Established State | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
 
 ---
 
@@ -414,17 +482,36 @@ generation from Loc-RIB changes is not yet wired in the daemon.
 
 ---
 
+## RFC 8212 — Default External BGP Route Propagation Behavior Without Policies
+
+Mandates that eBGP speakers MUST NOT advertise or accept routes without an explicit
+policy configured. A speaker with no import policy MUST NOT install routes from the
+peer; a speaker with no export policy MUST NOT advertise routes to the peer. The
+current daemon's `import_default` config option defaults to `"accept"`, which is
+non-compliant. The export path is not yet implemented (see TODO), but when it is,
+the default must be reject-all.
+
+| Requirement | Module | Status | Verified by |
+|---|---|---|---|
+| eBGP session MUST NOT accept routes without an explicit import policy | `pathvectord` | ⚠️ | `import_default` configurable but defaults to `"accept"` — non-compliant default |
+| eBGP session MUST NOT advertise routes without an explicit export policy | `pathvectord` | ❌ | — (export path not yet implemented) |
+| Absence of explicit policy results in no route propagation, not accept-all | `pathvectord` | ❌ | — |
+
+---
+
 ## Summary
 
 | RFC | Subject | Overall Status |
 |---|---|---|
 | RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9, collision detection, and full Update-Send Process outstanding |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
-| RFC 3392 | Capability Advertisement | ✅ |
+| RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ |
+| RFC 5492 | Capability Advertisement (supersedes RFC 3392) | ⚠️ Wire format inherited; Unsupported Capability NOTIFICATION and retry not implemented |
 | RFC 6793 | 4-Byte ASN | ✅ |
 | RFC 4724 | Graceful Restart | ⚠️ Capability parsed; FSM restart behaviour not implemented |
 | RFC 4486 | Cease NOTIFICATION Subcodes | ✅ |
+| RFC 6608 | FSM Error Subcodes | ⚠️ Subcode 0 (Unspecified) implemented; subcodes 1–3 not sent |
 | RFC 1997 | BGP Communities | ✅ |
 | RFC 4360 | Extended Communities | ✅ |
 | RFC 8092 | Large Communities | ✅ |
@@ -433,6 +520,9 @@ generation from Loc-RIB changes is not yet wired in the daemon.
 | RFC 6996 | Private ASN (4-byte) | ✅ |
 | RFC 5065 | BGP Confederations | ✅ |
 | RFC 4456 | Route Reflectors | ❌ |
+| RFC 6286 | AS-Wide Unique BGP Identifier | ❌ |
+| RFC 7606 | Revised UPDATE Error Handling | ⚠️ Well-known mandatory errors correctly reset session; optional attribute errors should use discard/withdraw policies but currently reset session |
+| RFC 8212 | Default EBGP Route Propagation | ⚠️ Import default non-compliant (defaults to accept); export not yet implemented |
 | RFC 3107 | MPLS Labeled Unicast | ⚠️ SAFI defined; label encoding not implemented |
 | RFC 4364 | MPLS L3VPN | ⚠️ SAFI defined; VPN-IPv4 NLRI not implemented |
 | RFC 4761 | VPLS | ⚠️ SAFI/AFI defined; NLRI not implemented |
