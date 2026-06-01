@@ -212,11 +212,9 @@ Not yet started. Key work items:
 
 ### Remaining
 
-- Panic safety in main event loop — the `expect()` calls throughout `run()` would panic
-  the daemon if a peer IP appeared in a `SessionEvent` that was not present in the config
-  maps. The invariant is structural (maps are built from the same config slice as sessions),
-  but is invisible at the call sites and fragile to future refactoring. Replace with
-  `tracing::error!` + graceful skip.
+- **Panic safety in main event loop — Done.** All `expect()` calls in `run()` replaced with
+  `let...else` + `tracing::error!` + `continue`. Unknown peer IPs now log an error and skip
+  the event rather than panicking the daemon.
 
 - Soft reconfiguration → export propagation — `reapply_import_policy` changes which routes
   are in `LocRib`, but does not currently trigger `propagate_prefix` to update peers. Callers

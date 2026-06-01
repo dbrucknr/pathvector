@@ -309,15 +309,18 @@ async fn run(cfg: config::Config) {
                     loc_rib.best_routes().map(|(n, _)| n).collect();
                 let rib_prefixes = all_nlris.len();
 
-                let export_policy = export_policies
-                    .get(&peer_ip)
-                    .expect("peer IP missing from export_policies — this is a bug");
-                let adj_rib_out = adj_ribs_out_map
-                    .get_mut(&peer_ip)
-                    .expect("peer IP missing from adj_ribs_out — this is a bug");
-                let update_tx = update_senders
-                    .get(&peer_ip)
-                    .expect("peer IP missing from update_senders — this is a bug");
+                let Some(export_policy) = export_policies.get(&peer_ip) else {
+                    tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping Established event");
+                    continue;
+                };
+                let Some(adj_rib_out) = adj_ribs_out_map.get_mut(&peer_ip) else {
+                    tracing::error!(peer = %peer_ip, "adj_ribs_out missing peer — skipping Established event");
+                    continue;
+                };
+                let Some(update_tx) = update_senders.get(&peer_ip) else {
+                    tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping Established event");
+                    continue;
+                };
 
                 for nlri in all_nlris {
                     propagate_prefix(
@@ -376,15 +379,18 @@ async fn run(cfg: config::Config) {
                         .get(&other_ip)
                         .copied()
                         .unwrap_or(PeerType::External);
-                    let export_policy = export_policies
-                        .get(&other_ip)
-                        .expect("peer IP missing from export_policies — this is a bug");
-                    let adj_rib_out = adj_ribs_out_map
-                        .get_mut(&other_ip)
-                        .expect("peer IP missing from adj_ribs_out — this is a bug");
-                    let update_tx = update_senders
-                        .get(&other_ip)
-                        .expect("peer IP missing from update_senders — this is a bug");
+                    let Some(export_policy) = export_policies.get(&other_ip) else {
+                        tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
+                        continue;
+                    };
+                    let Some(adj_rib_out) = adj_ribs_out_map.get_mut(&other_ip) else {
+                        tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on Terminated");
+                        continue;
+                    };
+                    let Some(update_tx) = update_senders.get(&other_ip) else {
+                        tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on Terminated");
+                        continue;
+                    };
 
                     for &nlri in &prev_prefixes {
                         propagate_prefix(
@@ -420,13 +426,14 @@ async fn run(cfg: config::Config) {
                     .copied()
                     .collect();
 
-                // Both maps are built from cfg.peers at startup — every peer has an entry.
-                let policy = import_policies
-                    .get(&peer_ip)
-                    .expect("peer IP missing from import_policies — this is a bug");
-                let adj_rib_in = adj_ribs_in_map
-                    .get_mut(&peer_ip)
-                    .expect("peer IP missing from adj_ribs_in — this is a bug");
+                let Some(policy) = import_policies.get(&peer_ip) else {
+                    tracing::error!(peer = %peer_ip, "import_policies missing peer — skipping RouteUpdate");
+                    continue;
+                };
+                let Some(adj_rib_in) = adj_ribs_in_map.get_mut(&peer_ip) else {
+                    tracing::error!(peer = %peer_ip, "adj_ribs_in missing peer — skipping RouteUpdate");
+                    continue;
+                };
 
                 handle_update(peer_id, msg, adj_rib_in, &mut loc_rib, policy, peer_type);
 
@@ -439,15 +446,18 @@ async fn run(cfg: config::Config) {
                         .get(&other_ip)
                         .copied()
                         .unwrap_or(PeerType::External);
-                    let export_policy = export_policies
-                        .get(&other_ip)
-                        .expect("peer IP missing from export_policies — this is a bug");
-                    let adj_rib_out = adj_ribs_out_map
-                        .get_mut(&other_ip)
-                        .expect("peer IP missing from adj_ribs_out — this is a bug");
-                    let update_tx = update_senders
-                        .get(&other_ip)
-                        .expect("peer IP missing from update_senders — this is a bug");
+                    let Some(export_policy) = export_policies.get(&other_ip) else {
+                        tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on RouteUpdate");
+                        continue;
+                    };
+                    let Some(adj_rib_out) = adj_ribs_out_map.get_mut(&other_ip) else {
+                        tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on RouteUpdate");
+                        continue;
+                    };
+                    let Some(update_tx) = update_senders.get(&other_ip) else {
+                        tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on RouteUpdate");
+                        continue;
+                    };
 
                     for &nlri in &affected {
                         propagate_prefix(
