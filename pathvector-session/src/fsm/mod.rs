@@ -654,6 +654,83 @@ mod tests {
         assert_eq!(info.hold_time, 90);
     }
 
+    // ── SessionInfo contents ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_session_info_peer_capabilities_forwarded() {
+        // All capabilities in the peer OPEN must appear in SessionInfo so
+        // the rest of the stack can gate behaviour on what was negotiated.
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let peer = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![
+                Capability::FourByteAsn(65002),
+                Capability::RouteRefresh,
+                Capability::MultiProtocol(pathvector_types::AfiSafi::IPV6_UNICAST),
+            ],
+        });
+        fsm.process(FsmInput::MessageReceived(peer));
+        let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        let info = outputs
+            .iter()
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
+            .expect("SessionEstablished");
+
+        assert!(info.peer_capabilities.iter().any(|c| matches!(c, Capability::FourByteAsn(65002))));
+        assert!(info.peer_capabilities.contains(&Capability::RouteRefresh));
+        assert!(info.peer_capabilities.iter().any(|c| {
+            matches!(c, Capability::MultiProtocol(a) if *a == pathvector_types::AfiSafi::IPV6_UNICAST)
+        }));
+    }
+
+    #[test]
+    fn test_session_info_graceful_restart_capability_forwarded() {
+        // RFC 4724: the GracefulRestart capability received from the peer
+        // must be preserved in SessionInfo so the caller can decide whether
+        // to hold forwarding state during a restart.
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let peer = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![
+                Capability::FourByteAsn(65002),
+                Capability::GracefulRestart {
+                    restart_flags: 0x80, // R bit set — forwarding preserved
+                    restart_time: 120,
+                    families: vec![],
+                },
+            ],
+        });
+        fsm.process(FsmInput::MessageReceived(peer));
+        let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        let info = outputs
+            .iter()
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
+            .expect("SessionEstablished");
+
+        let gr = info.peer_capabilities.iter().find_map(|c| {
+            if let Capability::GracefulRestart { restart_flags, restart_time, .. } = c {
+                Some((*restart_flags, *restart_time))
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            gr,
+            Some((0x80, 120)),
+            "GracefulRestart capability must be forwarded in SessionInfo (RFC 4724)"
+        );
+    }
+
     // ── Hold timer negotiation ────────────────────────────────────────────────
 
     #[test]

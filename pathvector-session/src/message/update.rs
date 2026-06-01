@@ -13,6 +13,7 @@ use super::{Cursor, Writer};
 
 const FLAG_OPTIONAL: u8 = 0x80;
 const FLAG_TRANSITIVE: u8 = 0x40;
+const FLAG_PARTIAL: u8 = 0x20;
 const FLAG_EXT_LEN: u8 = 0x10;
 
 // Well-known mandatory (non-optional, transitive)
@@ -584,7 +585,16 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             flags,
             type_code,
             value,
-        } => (*flags, *type_code, value.clone()),
+        } => {
+            // RFC 4271 §5: the Partial bit MUST be set when forwarding an
+            // unrecognised optional transitive attribute.
+            let flags = if flags & FLAG_OPTIONAL != 0 && flags & FLAG_TRANSITIVE != 0 {
+                flags | FLAG_PARTIAL
+            } else {
+                *flags
+            };
+            (flags, *type_code, value.clone())
+        }
     }
 }
 
@@ -831,16 +841,65 @@ mod tests {
 
     #[test]
     fn test_unknown_attribute_preserved() {
+        // Input already has the Partial bit set (as it would after the first
+        // forwarding hop). The encoder must preserve it and the value unchanged.
         let msg = UpdateMessage {
             withdrawn: vec![],
             attributes: vec![PathAttribute::Unknown {
-                flags: FLAGS_OT,
+                flags: FLAGS_OT | FLAG_PARTIAL,
                 type_code: 200,
                 value: vec![0xDE, 0xAD, 0xBE, 0xEF],
             }],
             announced: vec![],
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_unknown_optional_transitive_partial_bit_set_on_reencode() {
+        // RFC 4271 §5: when forwarding an unrecognised optional transitive
+        // attribute, the Partial bit MUST be set even if the originating
+        // router did not set it.
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::Unknown {
+                flags: FLAGS_OT, // no Partial bit — as received from the originator
+                type_code: 200,
+                value: vec![1, 2, 3],
+            }],
+            announced: vec![],
+        };
+        let decoded = roundtrip(&msg);
+        let PathAttribute::Unknown { flags, .. } = &decoded.attributes[0] else {
+            panic!("expected Unknown attribute");
+        };
+        assert!(
+            flags & FLAG_PARTIAL != 0,
+            "Partial bit must be set on re-encode of unrecognised optional transitive attribute (RFC 4271 §5)"
+        );
+    }
+
+    #[test]
+    fn test_unknown_non_transitive_partial_bit_not_set() {
+        // RFC 4271 §5: the Partial bit must NOT be set for optional
+        // non-transitive attributes, since they are not forwarded.
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::Unknown {
+                flags: FLAGS_ONT, // optional, non-transitive
+                type_code: 201,
+                value: vec![0xAB],
+            }],
+            announced: vec![],
+        };
+        let decoded = roundtrip(&msg);
+        let PathAttribute::Unknown { flags, .. } = &decoded.attributes[0] else {
+            panic!("expected Unknown attribute");
+        };
+        assert!(
+            flags & FLAG_PARTIAL == 0,
+            "Partial bit must NOT be set for optional non-transitive attribute"
+        );
     }
 
     #[test]

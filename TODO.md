@@ -105,7 +105,6 @@ offer:
 
 ### Remaining
 
-- Unknown transitive attribute Partial bit (RFC 4271 §5) — when a router forwards an optional transitive attribute it does not recognise, it must set the Partial flag (bit 5) in the attribute flags byte. Unknown attributes are currently preserved in the `PathAttribute::Unknown` variant but the Partial bit is not actively set on re-encode in `pathvector-session/src/message/update.rs`.
 - MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic

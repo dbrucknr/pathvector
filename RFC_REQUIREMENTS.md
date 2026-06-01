@@ -69,7 +69,7 @@ The core protocol. Every crate is shaped by it.
 | ATOMIC_AGGREGATE (type 6, well-known discretionary, flag only) | `pathvector-types/src/attr.rs` | ✅ | `test_atomic_aggregate_display`, `test_atomic_aggregate_and_aggregator_roundtrip` |
 | AGGREGATOR (type 7, optional transitive): ASN + IPv4 router-id | `pathvector-types/src/attr.rs` | ✅ | `test_aggregator_new`, `test_aggregator_display`, `test_aggregator_too_short_is_error` |
 | Path attribute flag bits: Optional, Transitive, Partial, Extended Length | `pathvector-session/src/message/update.rs` | ✅ | `test_extended_length_encode_path`, `test_extended_length_origin_attribute` |
-| Unknown transitive attributes preserved and Partial bit set on re-encode | `pathvector-session/src/message/update.rs` | ⚠️ | `test_unknown_attribute_preserved` (preserves bytes; Partial bit not set — see TODO) |
+| Unknown transitive attributes preserved and Partial bit set on re-encode | `pathvector-session/src/message/update.rs` | ✅ | `test_unknown_optional_transitive_partial_bit_set_on_reencode`, `test_unknown_non_transitive_partial_bit_not_set`, `test_unknown_attribute_preserved` |
 
 ### §8 — Finite State Machine
 
@@ -201,7 +201,7 @@ The core protocol. Every crate is shaped by it.
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
 | GracefulRestart capability (code 64): restart flags, restart time, per-family forwarding-preserved flag | `pathvector-session/src/message/open.rs` | ✅ | `test_graceful_restart_roundtrip` |
-| Capability forwarded to caller via `SessionInfo` | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_receive_keepalive_enters_established` |
+| Capability forwarded to caller via `SessionInfo` | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_session_info_peer_capabilities_forwarded`, `test_session_info_graceful_restart_capability_forwarded` |
 | FSM holds forwarding state while control plane restarts | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
 | Stale route timer — mark routes stale and withdraw after timer expires | `pathvector-rib` | ❌ | — |
 
