@@ -1,5 +1,7 @@
 # pathvector
 
+[![CI](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml/badge.svg)](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml)
+
 A production-quality BGP implementation in Rust. Fast, memory-efficient, and designed as a library-first stack — usable as a full daemon or embedded directly into an application.
 
 BGP is formally classified as a *path vector* routing protocol, the only widely deployed one at internet scale.

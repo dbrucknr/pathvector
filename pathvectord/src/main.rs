@@ -322,8 +322,7 @@ impl DaemonState {
             *aro = AdjRibOut::new(peer_id, peer_type);
         }
 
-        let all_nlris: Vec<Nlri<Ipv4Addr>> =
-            self.loc_rib.best_routes().map(|(n, _)| n).collect();
+        let all_nlris: Vec<Nlri<Ipv4Addr>> = self.loc_rib.best_routes().map(|(n, _)| n).collect();
         let rib_prefixes = all_nlris.len();
 
         let Some(export_policy) = self.export_policies.get(&peer_ip) else {
@@ -471,7 +470,14 @@ impl DaemonState {
             return;
         };
 
-        handle_update(peer_id, msg, adj_rib_in, &mut self.loc_rib, policy, peer_type);
+        handle_update(
+            peer_id,
+            msg,
+            adj_rib_in,
+            &mut self.loc_rib,
+            policy,
+            peer_type,
+        );
 
         // Propagate best-path changes for affected prefixes to all established
         // peers (iBGP split-horizon is enforced by AdjRibOut).
@@ -754,7 +760,10 @@ mod tests {
     fn make_state(
         local_as: u32,
         peers: &[(Ipv4Addr, u32)],
-    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+    ) -> (
+        DaemonState,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+    ) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
         for &(ip, _) in peers {
@@ -889,13 +898,9 @@ mod tests {
         });
         // Import policy with Reject default means routes are dropped unless a
         // term accepts them. Verify by running a route through it.
-        let mut route = RouteBuilder::new(
-            nlri("10.0.0.0/8"),
-            Origin::Igp,
-            AsPath::new(),
-        )
-        .peer_type(PeerType::External)
-        .build();
+        let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build();
         let decision = state.import_policies[&peer_ip].evaluate(&mut route);
         assert!(
             matches!(decision, Decision::Reject),
@@ -1022,8 +1027,7 @@ mod tests {
     fn test_on_terminated_propagates_withdraw_to_other_established_peers() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) =
-            make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
 
         state.on_established(peer_a, PeerType::External, 65002, 90);
         state.on_established(peer_b, PeerType::External, 65003, 90);
@@ -1085,8 +1089,7 @@ mod tests {
     fn test_on_route_update_propagates_to_other_established_peer() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) =
-            make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
 
         state.on_established(peer_a, PeerType::External, 65002, 90);
         state.on_established(peer_b, PeerType::External, 65003, 90);
@@ -1746,32 +1749,37 @@ mod tests {
         let msg = route_to_update(route);
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::Origin(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::AsPath(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::NextHop(_))));
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Origin(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::AsPath(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::NextHop(_)))
+        );
     }
 
     #[test]
     fn test_route_to_update_omits_absent_optional_attributes() {
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
         let msg = route_to_update(route);
-        assert!(!msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::LocalPref(_))));
-        assert!(!msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::Med(_))));
+        assert!(
+            !msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::LocalPref(_)))
+        );
+        assert!(
+            !msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Med(_)))
+        );
     }
 
     #[test]
@@ -1792,34 +1800,41 @@ mod tests {
         .build();
 
         let msg = route_to_update(route);
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::LocalPref(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::Med(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::Communities(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::LargeCommunities(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::ExtendedCommunities(_))));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::AtomicAggregate)));
-        assert!(msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::Aggregator(_))));
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::LocalPref(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Med(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Communities(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::LargeCommunities(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ExtendedCommunities(_)))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::AtomicAggregate))
+        );
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Aggregator(_)))
+        );
     }
 
     // ── propagate_prefix ──────────────────────────────────────────────────────

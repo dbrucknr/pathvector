@@ -1462,6 +1462,9 @@ mod tests {
                 }
             })
             .expect("SessionEstablished");
-        assert_eq!(info.peer_as, 65002, "peer_as must come from my_as when no FourByteAsn cap");
+        assert_eq!(
+            info.peer_as, 65002,
+            "peer_as must come from my_as when no FourByteAsn cap"
+        );
     }
 }
