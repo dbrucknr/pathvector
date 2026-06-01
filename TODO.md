@@ -156,28 +156,19 @@ to Idle, and returns `[StopHoldTimer, StopKeepaliveTimer, CloseTcpConnection]` �
 same clean teardown as a normal failure, without panicking or leaving stale routes.
 Covered by `test_keepalive_in_open_confirm_with_missing_peer_open_resets_to_idle`.
 
-### Transport layer mocking via `BgpTransport` trait
+### Transport layer mocking via `BgpTransport` trait — **Done**
 
-The original motivation — codec error and connect-retry paths were untestable without real
-sockets — is now resolved: `test_codec_error_emits_terminated` and
-`test_connect_retry_timer_fires_initiates_reconnect` cover those paths via real loopback
-sockets in `tests/transport.rs`.
-
-The `BgpTransport` trait design below remains a valid improvement for faster, more isolated
-unit tests (no port allocation, no OS scheduler involvement), but is no longer urgent.
-
-```rust
-trait BgpTransport: Send + 'static {
-    async fn send(&mut self, msg: BgpMessage) -> io::Result<()>;
-    async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>>;
-}
-```
-
-Make `Session<T: BgpTransport>` generic over `T`. The public `spawn()` function stays
-non-generic — it constructs `Session<FramedBgpTransport>` internally. A `#[cfg(test)]`
-helper `spawn_with(config, transport: T)` enables injection without touching production
-call sites. `tokio::io::duplex()` is a good alternative for integration-style tests that
-want real framing without a real socket.
+`BgpTransport` is a public trait (RPITIT + `+ Send` bounds) in `transport/mod.rs`.
+`FramedBgpTransport` is the production impl wrapping `FramedRead`/`FramedWrite` over TCP.
+`Session<T: BgpTransport>` is generic; `spawn()` stays non-generic (`Session<FramedBgpTransport>`).
+`spawn_with<T: BgpTransport>` (`#[cfg(test)]`) injects a pre-built transport; the first
+`InitiateTcpConnect` output activates it and queues `TcpConnected` via `pending_input`,
+bypassing real TCP. Two previously-uncovered write-failure paths are now covered:
+- `test_send_failure_in_execute_triggers_tcp_failed_recovery` — OPEN send fails before
+  Established; `execute` returns false, `run` feeds `TcpFailed`.
+- `test_outbound_update_write_failure_emits_terminated` — UPDATE write fails after
+  Established; the UPDATE arm in `wait_for_input` returns `TcpFailed`, teardown emits
+  `Terminated`.
 
 ---
 
