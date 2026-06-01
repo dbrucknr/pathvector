@@ -63,21 +63,17 @@ impl FramedBgpTransport {
 }
 
 impl BgpTransport for FramedBgpTransport {
-    fn send(&mut self, msg: BgpMessage) -> impl Future<Output = io::Result<()>> + Send + '_ {
-        async move {
-            self.writer.send(msg).await.map_err(|e| match e {
-                FramingError::Io(io_err) => io_err,
-                FramingError::Codec(_) => {
-                    io::Error::new(io::ErrorKind::InvalidData, "BGP encode error")
-                }
-            })
-        }
+    async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
+        self.writer.send(msg).await.map_err(|e| match e {
+            FramingError::Io(io_err) => io_err,
+            FramingError::Codec(_) => {
+                io::Error::new(io::ErrorKind::InvalidData, "BGP encode error")
+            }
+        })
     }
 
-    fn recv(
-        &mut self,
-    ) -> impl Future<Output = Option<Result<BgpMessage, FramingError>>> + Send + '_ {
-        async move { self.reader.next().await }
+    async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
+        self.reader.next().await
     }
 }
 
@@ -185,7 +181,7 @@ pub fn spawn(config: SessionConfig) -> SessionHandle {
         pending_transport: None,
         pending_input: None,
         connect_task: None,
-        connect_factory: Box::new(FramedBgpTransport::from_stream),
+        connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
         update_rx,
     };
 
@@ -234,7 +230,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Sessi
         pending_transport: Some(transport),
         pending_input: None,
         connect_task: None,
-        connect_factory: Box::new(|_| panic!("TCP connect not expected with injected transport")),
+        connect_factory: None,
         update_rx,
     };
 
@@ -270,8 +266,9 @@ struct Session<T: BgpTransport> {
     pending_input: Option<FsmInput>,
     // Pending outbound TCP connect (production path only).
     connect_task: Option<JoinHandle<io::Result<TcpStream>>>,
-    // Constructs a T from a freshly connected TcpStream (production path).
-    connect_factory: Box<dyn Fn(TcpStream) -> T + Send>,
+    // Constructs a T from a freshly connected TcpStream. None in injected-transport
+    // (test) mode — any reconnect attempt is treated as TcpFailed instead.
+    connect_factory: Option<Box<dyn Fn(TcpStream) -> T + Send>>,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
 }
@@ -321,7 +318,8 @@ impl<T: BgpTransport> Session<T> {
                     self.connect_task = None;
                     return match result {
                         Ok(stream) => {
-                            self.transport = Some((self.connect_factory)(stream));
+                            // connect_task is only spawned when connect_factory is Some.
+                            self.transport = Some(self.connect_factory.as_ref().unwrap()(stream));
                             FsmInput::TcpConnected
                         }
                         Err(_) => FsmInput::TcpFailed,
@@ -382,10 +380,14 @@ impl<T: BgpTransport> Session<T> {
                         // TcpConnected so the FSM advances on the next loop tick.
                         self.transport = Some(t);
                         self.pending_input = Some(FsmInput::TcpConnected);
-                    } else {
+                    } else if self.connect_factory.is_some() {
                         let addr = self.config.peer_addr;
                         self.connect_task =
                             Some(tokio::spawn(async move { TcpStream::connect(addr).await }));
+                    } else {
+                        // Injected-transport mode with no transport remaining — signal
+                        // failure so the FSM can back off rather than hanging forever.
+                        self.pending_input = Some(FsmInput::TcpFailed);
                     }
                 }
                 FsmOutput::CloseTcpConnection => {
@@ -476,15 +478,15 @@ async fn recv_message<T: BgpTransport>(
 mod tests {
     use std::io;
     use std::net::Ipv4Addr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use tokio::sync::mpsc;
 
+    use super::{BgpTransport, SessionConfig, SessionEvent, spawn_with};
     use crate::framing::FramingError;
     use crate::message::{BgpMessage, Capability, OpenMessage, UpdateMessage};
-    use super::{BgpTransport, SessionConfig, SessionEvent, spawn_with};
 
     // ── MockTransport ─────────────────────────────────────────────────────────
 
@@ -521,28 +523,19 @@ mod tests {
     }
 
     impl BgpTransport for MockTransport {
-        fn send(
-            &mut self,
-            msg: BgpMessage,
-        ) -> impl std::future::Future<Output = io::Result<()>> + Send + '_ {
-            async move {
-                if self.fail_send.load(Ordering::SeqCst) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "mock: send failed",
-                    ));
-                }
-                let _ = self.send_tx.send(msg);
-                Ok(())
+        async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
+            if self.fail_send.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "mock: send failed",
+                ));
             }
+            let _ = self.send_tx.send(msg);
+            Ok(())
         }
 
-        fn recv(
-            &mut self,
-        ) -> impl std::future::Future<Output = Option<Result<BgpMessage, FramingError>>>
-               + Send
-               + '_ {
-            async move { self.recv_rx.recv().await }
+        async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
+            self.recv_rx.recv().await
         }
     }
 
@@ -630,8 +623,7 @@ mod tests {
         }
 
         // The session silently retries; it was never Established so no events.
-        let result =
-            tokio::time::timeout(Duration::from_millis(50), handle.next_event()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), handle.next_event()).await;
         assert!(
             result.is_err(),
             "expected no events from a session that failed before Established"

@@ -173,7 +173,7 @@ mod tests {
     }
 
     /// `basic` with `path_len = 0` takes the `asns.is_empty()` branch and builds
-    /// a route with an empty AS_PATH. Exercises the otherwise-uncovered branch.
+    /// a route with an empty `AS_PATH`. Exercises the otherwise-uncovered branch.
     #[test]
     fn test_select_best_with_empty_as_path() {
         let mut candidates = HashMap::new();

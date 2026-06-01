@@ -2048,7 +2048,7 @@ mod tests {
     // ── propagate_prefix — iBGP split-horizon eviction ────────────────────────
 
     /// When the best path for a prefix switches from eBGP to iBGP, the
-    /// previously stored eBGP entry in the iBGP peer's AdjRibOut is evicted
+    /// previously stored eBGP entry in the iBGP peer's `AdjRibOut` is evicted
     /// (`InsertOutcome::Filtered(Some(_))`), triggering a WITHDRAW.
     #[test]
     fn test_propagate_prefix_ibgp_split_horizon_eviction_sends_withdraw() {
@@ -2268,7 +2268,7 @@ mod tests {
     }
 
     /// When `on_route_update` propagates to established peers, a ghost peer
-    /// (in peer_types but absent from policy maps) triggers the error path.
+    /// (in `peer_types` but absent from policy maps) triggers the error path.
     /// Must not panic.
     #[test]
     fn test_on_route_update_ghost_established_peer_does_not_panic() {
