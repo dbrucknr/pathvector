@@ -144,13 +144,55 @@ proptest! {
         error in prop_oneof![
             Just(NotificationError::HoldTimerExpired),
             Just(NotificationError::FsmError),
-            Just(NotificationError::MessageHeader(MsgHeaderError::ConnectionNotSynchronized)),
-            Just(NotificationError::MessageHeader(MsgHeaderError::BadMessageLength)),
-            Just(NotificationError::MessageHeader(MsgHeaderError::BadMessageType)),
-            Just(NotificationError::OpenMessage(OpenMsgError::UnsupportedVersionNumber)),
-            Just(NotificationError::OpenMessage(OpenMsgError::BadPeerAs)),
-            Just(NotificationError::Cease(CeaseError::AdministrativeShutdown)),
-            Just(NotificationError::Cease(CeaseError::AdministrativeReset)),
+            prop_oneof![
+                Just(MsgHeaderError::ConnectionNotSynchronized),
+                Just(MsgHeaderError::BadMessageLength),
+                Just(MsgHeaderError::BadMessageType),
+                // Known subcodes: 1–3. Only generate subcodes the decoder won't
+                // map to a named variant, so the Unknown arm round-trips.
+                prop_oneof![Just(0u8), 4u8..=u8::MAX].prop_map(MsgHeaderError::Unknown),
+            ].prop_map(NotificationError::MessageHeader),
+            prop_oneof![
+                Just(OpenMsgError::UnsupportedVersionNumber),
+                Just(OpenMsgError::BadPeerAs),
+                Just(OpenMsgError::BadBgpIdentifier),
+                Just(OpenMsgError::UnsupportedOptionalParameter),
+                Just(OpenMsgError::UnacceptableHoldTime),
+                Just(OpenMsgError::UnsupportedCapability),
+                // Known subcodes: 1, 2, 3, 4, 6, 7. Exclude those.
+                prop_oneof![Just(0u8), Just(5u8), 8u8..=u8::MAX].prop_map(OpenMsgError::Unknown),
+            ].prop_map(NotificationError::OpenMessage),
+            prop_oneof![
+                Just(UpdateMsgError::MalformedAttributeList),
+                Just(UpdateMsgError::UnrecognizedWellKnownAttribute),
+                Just(UpdateMsgError::MissingWellKnownAttribute),
+                Just(UpdateMsgError::AttributeFlagsError),
+                Just(UpdateMsgError::AttributeLengthError),
+                Just(UpdateMsgError::InvalidOriginAttribute),
+                Just(UpdateMsgError::InvalidNextHopAttribute),
+                Just(UpdateMsgError::OptionalAttributeError),
+                Just(UpdateMsgError::InvalidNetworkField),
+                Just(UpdateMsgError::MalformedAsPath),
+                // Known subcodes: 1–6, 8–11. Exclude those.
+                prop_oneof![Just(0u8), Just(7u8), 12u8..=u8::MAX].prop_map(UpdateMsgError::Unknown),
+            ].prop_map(NotificationError::UpdateMessage),
+            prop_oneof![
+                Just(CeaseError::MaximumNumberOfPrefixesReached),
+                Just(CeaseError::AdministrativeShutdown),
+                Just(CeaseError::PeerDeconfigured),
+                Just(CeaseError::AdministrativeReset),
+                Just(CeaseError::ConnectionRejected),
+                Just(CeaseError::OtherConfigurationChange),
+                Just(CeaseError::ConnectionCollisionResolution),
+                Just(CeaseError::OutOfResources),
+                Just(CeaseError::HardReset),
+                Just(CeaseError::BfdDown),
+                // Known subcodes: 1–10. Exclude those.
+                prop_oneof![Just(0u8), 11u8..=u8::MAX].prop_map(CeaseError::Unknown),
+            ].prop_map(NotificationError::Cease),
+            // Top-level Unknown is only reachable for codes not in 1–6.
+            (prop_oneof![Just(0u8), 7u8..=u8::MAX], any::<u8>())
+                .prop_map(|(code, subcode)| NotificationError::Unknown { code, subcode }),
         ],
         data in prop::collection::vec(any::<u8>(), 0..16),
     ) {

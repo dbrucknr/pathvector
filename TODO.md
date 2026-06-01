@@ -4,8 +4,6 @@ Tracked items that are intentionally deferred — known gaps, planned features,
 and protocol steps that require components not yet built. Each entry notes
 which crate it belongs to and why it was deferred.
 
-- Add cargo fuzz, make sure to include proptest for each module. It's missing
-
 ---
 
 ## General
@@ -13,9 +11,39 @@ Download Relevant RFC's to each module.
 Generate a list of requirements from the RFC's.
 Check whether or not the each module currently meets these requirements.
 
-Add cargo fuzz testing to each module.
-- Should help us catch bugs, and possible security vulnerabilities.
-- We want to try to guarantee our system doesn't panic.
+### Property testing and fuzz coverage (ordered)
+
+Proptests and fuzzing serve different purposes and should be added in this order:
+
+- **Proptests** prove structural invariants hold for all valid inputs — RFC conformance evidence.
+- **Cargo fuzz** proves arbitrary byte input never panics or corrupts state — panic-safety story.
+
+**Phase 1 — `pathvector-session` codec round-trips** ✓ Done
+All four message types (OPEN, UPDATE, NOTIFICATION, KEEPALIVE, ROUTE-REFRESH) have round-trip
+proptests at both the `BgpMessage::encode/decode` layer (`message/prop_tests.rs`) and the
+`BgpCodec` framing layer (`framing/prop_tests.rs`). Full capabilities, path attributes, and all
+`NotificationError` sub-families are exercised. `prop_decode_never_panics` covers both layers.
+The generators exposed a real round-trip constraint: `Unknown` sub-variants must exclude codes that
+the decoder maps to named variants — constrained accordingly.
+
+**Phase 2 — `pathvector-rib` best-path invariants**
+Add proptests for structural properties of the decision algorithm:
+- Winner's LOCAL_PREF ≥ all candidates' LOCAL_PREF (when that step is decisive)
+- Winner's AS_PATH length ≤ all candidates' AS_PATH length (when that step is decisive)
+- eBGP winner beats all iBGP candidates when both are present
+- Winner is always drawn from the candidate set (no phantom routes)
+
+**Phase 3 — `pathvector-policy` semantics**
+Add proptests for first-match-wins evaluation and term determinism:
+- Same route evaluated twice produces the same result
+- A route accepted by term N is never re-evaluated by term N+1
+- An empty policy returns the configured default action
+
+**Phase 4 — `cargo fuzz` on the codec decode path**
+Add a fuzz target over raw `&[u8]` input to the framing and codec layer.
+The decode side of the session codec is the only real external attack surface in a BGP daemon;
+any malformed byte sequence from a peer must never panic.
+Blocked on Phases 1–3 being green so a clean fuzz run is meaningful.
 
 Tests e2e
   - We will use the RFC's to generate test cases for each module.

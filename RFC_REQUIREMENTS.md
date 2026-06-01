@@ -28,26 +28,27 @@ The core protocol. Every crate is shaped by it.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| 16-byte all-ones marker in every message header | `pathvector-session/src/message/header.rs` | ✅ | `test_encode_decode_header_roundtrip`, `test_header_marker_is_correct`, `test_encode_sets_all_ff_marker` |
-| Marker validation — reject messages with a corrupt marker | `pathvector-session/src/message/header.rs` | ✅ | `test_decode_header_invalid_marker`, `test_decode_corrupt_marker_is_error`, `test_decode_rejects_bad_marker` |
-| 2-byte length field (min 19, max 4096) | `pathvector-session/src/message/header.rs` | ✅ | `test_decode_header_length_too_small`, `test_decode_header_length_too_large`, `test_decode_length_too_small_is_error`, `test_decode_length_too_large_is_error` |
+| 16-byte all-ones marker in every message header | `pathvector-session/src/message/header.rs` | ✅ | `test_encode_decode_header_roundtrip`, `test_header_marker_is_correct`, `test_encode_sets_all_ff_marker`, `proptest: prop_encode_decode_roundtrip` |
+| Marker validation — reject messages with a corrupt marker | `pathvector-session/src/message/header.rs` | ✅ | `test_decode_header_invalid_marker`, `test_decode_corrupt_marker_is_error`, `test_decode_rejects_bad_marker`, `proptest: prop_decode_never_panics` |
+| 2-byte length field (min 19, max 4096) | `pathvector-session/src/message/header.rs` | ✅ | `test_decode_header_length_too_small`, `test_decode_header_length_too_large`, `test_decode_length_too_small_is_error`, `test_decode_length_too_large_is_error`, `proptest: prop_out_of_range_length_is_error` |
 | 1-byte type field (OPEN=1, UPDATE=2, NOTIFICATION=3, KEEPALIVE=4) | `pathvector-session/src/message/header.rs` | ✅ | `test_decode_header_keepalive`, `test_decode_header_unknown_type` |
-| OPEN: version=4, my_as, hold_time, bgp_id, optional parameters | `pathvector-session/src/message/open.rs` | ✅ | `test_minimal_open_roundtrip`, `test_open_with_capabilities_roundtrip`, `test_minimal_open_encoded_length` |
+| OPEN: version=4, my_as, hold_time, bgp_id, optional parameters | `pathvector-session/src/message/open.rs` | ✅ | `test_minimal_open_roundtrip`, `test_open_with_capabilities_roundtrip`, `test_minimal_open_encoded_length`, `proptest: prop_open_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
 | OPEN: reject version ≠ 4 with NOTIFICATION | `pathvector-session/src/message/open.rs` | ✅ | `test_unsupported_version_rejected`, `test_unsupported_version_in_open_sends_notification` |
 | OPEN: reject hold_time values of 1 or 2 (must be 0 or ≥ 3) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unacceptable_hold_time_sends_notification` |
 | OPEN: reject bad BGP identifier | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_bad_bgp_id_sends_notification` |
 | OPEN: reject mismatched peer AS | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification` |
-| UPDATE: withdrawn NLRI length + withdrawn NLRIs | `pathvector-session/src/message/update.rs` | ✅ | `test_withdrawal_only_roundtrip`, `test_empty_update_roundtrip` |
-| UPDATE: total path attribute length + path attributes | `pathvector-session/src/message/update.rs` | ✅ | `test_announcement_with_core_attributes` |
-| UPDATE: NLRI (announced prefixes) | `pathvector-session/src/message/update.rs` | ✅ | `test_announcement_with_core_attributes` |
+| UPDATE: withdrawn NLRI length + withdrawn NLRIs | `pathvector-session/src/message/update.rs` | ✅ | `test_withdrawal_only_roundtrip`, `test_empty_update_roundtrip`, `proptest: prop_update_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
+| UPDATE: total path attribute length + path attributes | `pathvector-session/src/message/update.rs` | ✅ | `test_announcement_with_core_attributes`, `proptest: prop_update_roundtrip` |
+| UPDATE: NLRI (announced prefixes) | `pathvector-session/src/message/update.rs` | ✅ | `test_announcement_with_core_attributes`, `proptest: prop_update_roundtrip` |
 | NLRI variable-length prefix encoding (only significant bytes on wire) | `pathvector-session/src/message/update.rs` | ✅ | `test_nlri_variable_length_encoding`, `test_invalid_ipv4_nlri_prefix_too_long`, `test_invalid_ipv6_nlri_prefix_too_long` |
-| NOTIFICATION: error code + subcode + optional data | `pathvector-session/src/message/notification.rs` | ✅ | `test_hold_timer_expired_roundtrip`, `test_cease_admin_shutdown_roundtrip`, `test_encoded_length` |
-| NOTIFICATION error code 1 — Message Header Error (subcodes 1–3) | `pathvector-session/src/message/notification.rs` | ✅ | `test_msg_header_error_roundtrips` |
-| NOTIFICATION error code 2 — OPEN Message Error (subcodes 1–7) | `pathvector-session/src/message/notification.rs` | ✅ | `test_open_msg_error_roundtrips` |
-| NOTIFICATION error code 3 — UPDATE Message Error (subcodes 1–11) | `pathvector-session/src/message/notification.rs` | ✅ | `test_update_msg_error_all_variants_roundtrip` |
-| NOTIFICATION error code 4 — Hold Timer Expired | `pathvector-session/src/message/notification.rs` | ✅ | `test_hold_timer_expired_roundtrip` |
-| NOTIFICATION error code 5 — Finite State Machine Error | `pathvector-session/src/message/notification.rs` | ✅ | `test_fsm_error_roundtrip` |
-| Unknown NOTIFICATION codes preserved without corruption | `pathvector-session/src/message/notification.rs` | ✅ | `test_unknown_code_preserved` |
+| NOTIFICATION: error code + subcode + optional data | `pathvector-session/src/message/notification.rs` | ✅ | `test_hold_timer_expired_roundtrip`, `test_cease_admin_shutdown_roundtrip`, `test_encoded_length`, `proptest: prop_notification_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
+| NOTIFICATION error code 1 — Message Header Error (subcodes 1–3) | `pathvector-session/src/message/notification.rs` | ✅ | `test_msg_header_error_roundtrips`, `proptest: prop_notification_roundtrip` |
+| NOTIFICATION error code 2 — OPEN Message Error (subcodes 1–7) | `pathvector-session/src/message/notification.rs` | ✅ | `test_open_msg_error_roundtrips`, `proptest: prop_notification_roundtrip` |
+| NOTIFICATION error code 3 — UPDATE Message Error (subcodes 1–11) | `pathvector-session/src/message/notification.rs` | ✅ | `test_update_msg_error_all_variants_roundtrip`, `proptest: prop_notification_roundtrip` |
+| NOTIFICATION error code 4 — Hold Timer Expired | `pathvector-session/src/message/notification.rs` | ✅ | `test_hold_timer_expired_roundtrip`, `proptest: prop_notification_roundtrip` |
+| NOTIFICATION error code 5 — Finite State Machine Error | `pathvector-session/src/message/notification.rs` | ✅ | `test_fsm_error_roundtrip`, `proptest: prop_notification_roundtrip` |
+| NOTIFICATION error code 6 — Cease (subcodes 1–10, RFC 4486) | `pathvector-session/src/message/notification.rs` | ✅ | `test_cease_all_variants_roundtrip`, `proptest: prop_notification_roundtrip` |
+| Unknown NOTIFICATION codes preserved without corruption | `pathvector-session/src/message/notification.rs` | ✅ | `test_unknown_code_preserved`, `proptest: prop_notification_roundtrip` |
 | KEEPALIVE: header only, no body | `pathvector-session/src/message/mod.rs` | ✅ | `test_keepalive_roundtrip`, `test_keepalive_is_19_bytes`, `test_encode_keepalive_produces_19_bytes` |
 | KEEPALIVE with unexpected body bytes is an error | `pathvector-session/src/message/mod.rs` | ✅ | `test_keepalive_with_extra_body_is_error` |
 
@@ -77,7 +78,7 @@ The core protocol. Every crate is shaped by it.
 |---|---|---|---|
 | States: Idle, Connect, Active, OpenSent, OpenConfirm, Established | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect`, `test_tcp_connected_from_active_enters_open_sent`, `test_receive_keepalive_enters_established` |
 | ManualStart transitions Idle → Connect and initiates TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect` |
-| ManualStop from any state sends Cease NOTIFICATION and closes TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_stop_from_established_sends_cease`, `test_manual_stop_from_open_sent_sends_cease`, `test_manual_stop_from_open_confirm_sends_cease` |
+| ManualStop from any state sends Cease NOTIFICATION and closes TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_stop_from_established_sends_cease`, `test_manual_stop_from_open_sent_sends_cease`, `test_manual_stop_from_open_confirm_sends_cease`, `interop: test_stop_while_connecting_aborts_pending_task` |
 | ManualStop from Idle is a no-op | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_stop_from_idle_is_noop` |
 | TcpConnected → OpenSent, sends OPEN | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_connected_sends_open`, `test_sent_open_has_correct_fields` |
 | TcpFailed from Connect → Active | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_failed_from_connect_enters_active` |
@@ -87,10 +88,10 @@ The core protocol. Every crate is shaped by it.
 | Receive NOTIFICATION in OpenSent → Idle | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_open_sent_goes_idle` |
 | Receive NOTIFICATION in OpenConfirm → terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_open_confirm_terminates` |
 | Receive NOTIFICATION in Established → session terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_established_emits_session_terminated` |
-| Connect-retry timer (default 120 s) — fires → re-initiate TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_connect_retry_timer_from_connect_reinitiates_tcp`, `test_connect_retry_from_active_enters_connect` |
+| Connect-retry timer (default 120 s) — fires → re-initiate TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_connect_retry_timer_from_connect_reinitiates_tcp`, `test_connect_retry_from_active_enters_connect`, `interop: test_connect_retry_timer_fires_initiates_reconnect` |
 | Hold timer negotiated as min(local, peer) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_negotiated_to_minimum` |
 | Hold time 0 disables the hold and keepalive timers | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |
-| Keepalive interval is 1/3 of negotiated hold time | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time` |
+| Keepalive interval is 1/3 of negotiated hold time | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time`, `interop: test_keepalive_timer_fires_sends_keepalive_to_peer` |
 | HoldTimerExpired in Established → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_established` |
 | HoldTimerExpired in OpenSent → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_open_sent` |
 | Receive UPDATE in Established resets hold timer | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_update_emits_route_update_and_resets_hold` |
@@ -104,6 +105,7 @@ The core protocol. Every crate is shaped by it.
 | Peer disconnect detected and emits SessionTerminated | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_peer_disconnect_emits_terminated` |
 | Wrong peer AS over real TCP does not reach Established | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_open_with_wrong_peer_as_does_not_establish` |
 | UPDATE over real TCP emits RouteUpdate event | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_update_message_emits_route_update_event` |
+| Codec framing error closes the TCP session cleanly | `pathvector-session/src/transport/mod.rs` | ✅ | `interop: test_codec_error_emits_terminated` |
 
 ### §9.1 — Decision Process (Best-Path Selection)
 
@@ -143,7 +145,7 @@ The core protocol. Every crate is shaped by it.
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
 | RouteRefresh capability (code 2) advertised and decoded in OPEN | `pathvector-session/src/message/open.rs` | ✅ | `test_open_with_capabilities_roundtrip` |
-| ROUTE-REFRESH message (type 5): AFI (2) + reserved (1) + SAFI (1) | `pathvector-session/src/message/route_refresh.rs` | ✅ | `test_ipv4_unicast_roundtrip`, `test_ipv6_unicast_roundtrip`, `test_evpn_roundtrip`, `test_known_wire_bytes` |
+| ROUTE-REFRESH message (type 5): AFI (2) + reserved (1) + SAFI (1) | `pathvector-session/src/message/route_refresh.rs` | ✅ | `test_ipv4_unicast_roundtrip`, `test_ipv6_unicast_roundtrip`, `test_evpn_roundtrip`, `test_known_wire_bytes`, `proptest: prop_route_refresh_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
 | ROUTE-REFRESH encoded length is 23 bytes | `pathvector-session/src/message/route_refresh.rs` | ✅ | `test_encoded_length` |
 | ROUTE-REFRESH only sent/honoured when capability was negotiated | `pathvector-session/src/fsm/mod.rs` | ⚠️ | — (capability is parsed; send-guard not enforced — see TODO) |
 

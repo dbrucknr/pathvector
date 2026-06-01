@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc eb5b2e7629f9f206e1a2d66f7e869dbcd176698997799b106e99a9ad43ce0399 # shrinks to first = Keepalive, second = Notification(NotificationMessage { error: UpdateMessage(Unknown(1)), data: [] })
