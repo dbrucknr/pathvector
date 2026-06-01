@@ -106,6 +106,7 @@ The core protocol. Every crate is shaped by it.
 | Wrong peer AS over real TCP does not reach Established | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_open_with_wrong_peer_as_does_not_establish` |
 | UPDATE over real TCP emits RouteUpdate event | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_update_message_emits_route_update_event` |
 | Codec framing error closes the TCP session cleanly | `pathvector-session/src/transport/mod.rs` | ✅ | `interop: test_codec_error_emits_terminated` |
+| Arbitrary byte input to framing + codec layer never panics | `fuzz/fuzz_targets/` | ✅ | `fuzz: session_framing`, `fuzz: session_message` |
 
 ### §9.1 — Decision Process (Best-Path Selection)
 

@@ -49,11 +49,27 @@ Added the two remaining plan items:
 Also covers 8 action invariants (PrependAsPath, Add/Remove/SetCommunities, SetLocalPref,
 AnyCondition, ActionSequence).
 
-**Phase 4 — `cargo fuzz` on the codec decode path**
-Add a fuzz target over raw `&[u8]` input to the framing and codec layer.
-The decode side of the session codec is the only real external attack surface in a BGP daemon;
-any malformed byte sequence from a peer must never panic.
-Blocked on Phases 1–3 being green so a clean fuzz run is meaningful.
+**Phase 4 — `cargo fuzz` on the codec decode path** ✓ Done
+Two fuzz targets live in `fuzz/fuzz_targets/` at the workspace root:
+- `session_framing` — feeds raw `&[u8]` into `BgpCodec::decode` (the entry point for any remote peer byte stream);
+  if the framing layer accepts a frame, the round-trip encode/decode is also exercised.
+- `session_message` — patches the 2-byte length field so `BgpMessage::decode` receives a self-consistent
+  buffer regardless of the fuzz input, driving the body-parsing paths for all five message types.
+
+Seed corpus (`fuzz/corpus/session_{framing,message}/`) pre-populates valid KEEPALIVE, OPEN (minimal and
+with 4-byte ASN capability), NOTIFICATION, UPDATE, and ROUTE-REFRESH examples so the fuzzer
+starts from real message boundaries rather than discovering the `0xFF×16` marker pattern cold.
+
+Both targets compile clean under nightly and ran ~3M executions / 16 seconds with zero panics on
+first smoke run. Run via the Justfile from the workspace root:
+
+```sh
+just fuzz-smoke     # 60 s smoke run of both targets
+just fuzz-framing   # extended run until Ctrl-C
+just fuzz-message   # extended run until Ctrl-C
+```
+
+See TESTING.md for the full explanation of the nightly/Homebrew PATH issue and crash reproduction.
 
 Tests e2e
   - We will use the RFC's to generate test cases for each module.
@@ -209,7 +225,7 @@ schema is finalised. Will contain generated client stubs so users and the
 
 ## Cross-cutting
 
-- CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.86)
+- CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.86) — **Done.** `.github/workflows/ci.yml` has five jobs: `test` (stable), `lint` (clippy + rustfmt, stable), `msrv` (1.86), `docs` (stable, `-D warnings`), and `fuzz` (nightly, `just fuzz-smoke`). A `Justfile` at the workspace root provides matching local recipes so CI and development use the same commands.
 - Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range
 - Fuzz testing — tracked as Phase 4 in the property testing section above
 - Benchmark suite for `LocRib` insert/best-path under realistic prefix volumes

@@ -1,0 +1,30 @@
+[package]
+name = "pathvector-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys      = "0.4"
+pathvector-session = { path = "../pathvector-session" }
+bytes              = "1"
+tokio-util         = { version = "0.7", features = ["codec"] }
+
+# session codec targets
+[[bin]]
+name = "session_framing"
+path = "fuzz_targets/session_framing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "session_message"
+path = "fuzz_targets/session_message.rs"
+test = false
+doc = false
+
+# Fuzz crates must not be part of the workspace.
+[workspace]
