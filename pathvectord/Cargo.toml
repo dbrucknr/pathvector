@@ -12,6 +12,7 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
+pathvector-policy  = { workspace = true }
 pathvector-rib     = { workspace = true }
 pathvector-session = { workspace = true }
 pathvector-types   = { workspace = true }

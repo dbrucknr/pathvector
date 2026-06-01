@@ -161,7 +161,7 @@ Not yet started. Key work items:
   - RIB queries (show route, show best path, show candidates)
   - Policy introspection
   - Runtime policy reload
-- Import policy — apply `pathvector-policy` to routes before `LocRib::insert`; currently all received routes are accepted unconditionally
+- Import policy — **Done.** `handle_update` now evaluates a `Policy<Route<Ipv4Addr>>` per route before `LocRib::insert`; routes that return `Reject` are dropped. Per-peer default action (`import_default = "accept"` / `"reject"`) is configurable in TOML. The infrastructure is in place for adding `Term` conditions (prefix lists, community filters, etc.).
 - BLACKHOLE community discard action (RFC 7999) — `Community::BLACKHOLE` (0xFFFF029A) is defined and detectable via `is_blackhole()`, but there is no null-route or discard action wired in the RIB or daemon; routes tagged with BLACKHOLE should have traffic to their prefix dropped at the forwarding plane
 - `AdjRibIn` — add pre-policy store per peer to support soft reconfiguration without requiring a full session reset
 - CLI binary (`pathvector`) using the gRPC client

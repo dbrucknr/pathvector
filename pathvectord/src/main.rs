@@ -1,13 +1,17 @@
 mod config;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
+use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{LocRib, PeerId, RouteBuilder};
 use pathvector_session::{
     message::{Capability, PathAttribute, UpdateMessage},
     transport::{self, SessionConfig, SessionEvent},
 };
-use pathvector_types::{AsPath, LocalPref, Med, NextHop, Origin};
+use pathvector_types::{AsPath, LocalPref, Med, NextHop, Origin, PeerType};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -34,9 +38,23 @@ async fn main() {
     run(cfg).await;
 }
 
+fn build_import_policy(default: DefaultAction) -> Policy<pathvector_rib::Route<Ipv4Addr>> {
+    Policy::new(default)
+}
+
 async fn run(cfg: config::Config) {
     let mut rib: LocRib<Ipv4Addr> = LocRib::new();
     let (event_tx, mut event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(256);
+
+    // Per-peer import policies, keyed by peer IP. Built once at startup from config.
+    let import_policies: HashMap<Ipv4Addr, Policy<pathvector_rib::Route<Ipv4Addr>>> = cfg
+        .peers
+        .iter()
+        .map(|p| {
+            let default = DefaultAction::from(p.import_default);
+            (p.address, build_import_policy(default))
+        })
+        .collect();
 
     for peer in &cfg.peers {
         let session_cfg = SessionConfig {
@@ -64,24 +82,34 @@ async fn run(cfg: config::Config) {
     // Drop our sender copy so the channel closes when all peer tasks exit.
     drop(event_tx);
 
+    // Session-type cache: populated from SessionInfo on Established, cleared on Terminated.
+    let mut peer_types: HashMap<Ipv4Addr, PeerType> = HashMap::new();
+
     while let Some((peer_ip, event)) = event_rx.recv().await {
         let peer_id = PeerId::from(peer_ip);
         match event {
             SessionEvent::Established(info) => {
+                peer_types.insert(peer_ip, info.peer_type);
                 tracing::info!(
                     peer = %peer_ip,
                     remote_as = info.peer_as,
                     hold_time = info.hold_time,
+                    peer_type = %info.peer_type,
                     "session established"
                 );
             }
             SessionEvent::Terminated => {
+                peer_types.remove(&peer_ip);
                 tracing::info!(peer = %peer_ip, "session terminated");
                 rib.withdraw_peer(&peer_id);
                 tracing::info!(rib_size = rib.len(), "RIB updated after peer teardown");
             }
             SessionEvent::RouteUpdate(msg) => {
-                handle_update(peer_id, msg, &mut rib);
+                let peer_type = peer_types.get(&peer_ip).copied().unwrap_or(PeerType::External);
+                // import_policies is built from cfg.peers at startup so every peer has an entry.
+                let policy = import_policies.get(&peer_ip)
+                    .expect("peer IP missing from import_policies — this is a bug");
+                handle_update(peer_id, msg, &mut rib, policy, peer_type);
             }
         }
     }
@@ -91,7 +119,11 @@ async fn run(cfg: config::Config) {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use pathvector_types::{Aggregator, Asn, Community, ExtendedCommunity, LargeCommunity, Nlri};
+    use pathvector_policy::{
+        AnyCondition, DefaultAction, Policy, Term, Accept, Reject,
+        ActionSequence, SetLocalPref,
+    };
+    use pathvector_types::{Aggregator, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref as LP, Nlri};
 
     use super::*;
 
@@ -101,6 +133,14 @@ mod tests {
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
+    }
+
+    fn accept_all() -> Policy<pathvector_rib::Route<Ipv4Addr>> {
+        Policy::new(DefaultAction::Accept)
+    }
+
+    fn reject_all() -> Policy<pathvector_rib::Route<Ipv4Addr>> {
+        Policy::new(DefaultAction::Reject)
     }
 
     #[test]
@@ -127,7 +167,7 @@ mod tests {
             ],
             announced: vec![nlri("192.168.0.0/16")],
         };
-        handle_update(peer(), msg, &mut rib);
+        handle_update(peer(), msg, &mut rib, &accept_all(), PeerType::External);
 
         let route = rib.best(&nlri("192.168.0.0/16")).unwrap();
         assert_eq!(route.origin, Origin::Egp);
@@ -154,6 +194,8 @@ mod tests {
                 announced: vec![nlri("10.0.0.0/8")],
             },
             &mut rib,
+            &accept_all(),
+            PeerType::External,
         );
         assert_eq!(rib.len(), 1);
 
@@ -165,6 +207,8 @@ mod tests {
                 announced: vec![],
             },
             &mut rib,
+            &accept_all(),
+            PeerType::External,
         );
         assert!(rib.is_empty());
     }
@@ -180,6 +224,8 @@ mod tests {
                 announced: vec![],
             },
             &mut rib,
+            &accept_all(),
+            PeerType::External,
         );
         assert!(rib.is_empty());
     }
@@ -198,18 +244,174 @@ mod tests {
                 announced: vec![nlri("10.0.0.0/8")],
             },
             &mut rib,
+            &accept_all(),
+            PeerType::External,
         );
         assert_eq!(rib.len(), 1);
     }
+
+    // ── import policy ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reject_all_policy_blocks_all_routes() {
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8"), nlri("192.168.0.0/16")],
+            },
+            &mut rib,
+            &reject_all(),
+            PeerType::External,
+        );
+        assert!(rib.is_empty());
+    }
+
+    #[test]
+    fn test_accept_all_policy_passes_all_routes() {
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8"), nlri("192.168.0.0/16")],
+            },
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib.len(), 2);
+    }
+
+    #[test]
+    fn test_policy_modifies_route_before_insert() {
+        // A term that sets LOCAL_PREF 200 on every accepted route.
+        let mut policy: Policy<pathvector_rib::Route<Ipv4Addr>> =
+            Policy::new(DefaultAction::Reject);
+        policy.add_term(Term::new(
+            AnyCondition,
+            ActionSequence::new()
+                .then(SetLocalPref::new(LP::new(200)))
+                .then(Accept),
+        ));
+
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut rib,
+            &policy,
+            PeerType::External,
+        );
+
+        let route = rib.best(&nlri("10.0.0.0/8")).unwrap();
+        assert_eq!(route.local_pref, Some(LP::new(200)));
+    }
+
+    #[test]
+    fn test_policy_partial_reject_only_accepted_routes_inserted() {
+        // Reject routes with communities 65001:1, accept everything else.
+        let blocked = Community::from_parts(65001, 1);
+        let mut policy: Policy<pathvector_rib::Route<Ipv4Addr>> =
+            Policy::new(DefaultAction::Accept);
+        policy.add_term(Term::new(
+            pathvector_policy::CommunityCondition::new(blocked),
+            Reject,
+        ));
+
+        let mut rib = LocRib::new();
+
+        // Route tagged with the blocked community.
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::Communities(vec![blocked]),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut rib,
+            &policy,
+            PeerType::External,
+        );
+
+        // Clean route — no blocked community.
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("192.168.0.0/16")],
+            },
+            &mut rib,
+            &policy,
+            PeerType::External,
+        );
+
+        assert!(rib.best(&nlri("10.0.0.0/8")).is_none(), "blocked route must not be in RIB");
+        assert!(rib.best(&nlri("192.168.0.0/16")).is_some(), "clean route must be in RIB");
+    }
+
+    #[test]
+    fn test_peer_type_tagged_on_route() {
+        let mut rib = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut rib,
+            &accept_all(),
+            PeerType::Internal,
+        );
+        let route = rib.best(&nlri("10.0.0.0/8")).unwrap();
+        assert_eq!(route.peer_type, PeerType::Internal);
+    }
 }
 
-fn handle_update(peer: PeerId, msg: UpdateMessage, rib: &mut LocRib<Ipv4Addr>) {
+fn handle_update(
+    peer: PeerId,
+    msg: UpdateMessage,
+    rib: &mut LocRib<Ipv4Addr>,
+    policy: &Policy<pathvector_rib::Route<Ipv4Addr>>,
+    peer_type: PeerType,
+) {
     let withdrawn_count = msg.withdrawn.len();
     let announced_count = msg.announced.len();
 
     for nlri in &msg.withdrawn {
         rib.withdraw(&peer, nlri);
     }
+
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
 
     if announced_count > 0 {
         let mut origin = Origin::Incomplete;
@@ -240,7 +442,8 @@ fn handle_update(peer: PeerId, msg: UpdateMessage, rib: &mut LocRib<Ipv4Addr>) {
         }
 
         for nlri in msg.announced {
-            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone());
+            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone())
+                .peer_type(peer_type);
             if let Some(nh) = next_hop {
                 builder = builder.next_hop(nh);
             }
@@ -265,14 +468,25 @@ fn handle_update(peer: PeerId, msg: UpdateMessage, rib: &mut LocRib<Ipv4Addr>) {
             if let Some(agg) = aggregator {
                 builder = builder.aggregator(agg);
             }
-            rib.insert(peer, builder.build());
+
+            let mut route = builder.build();
+            match policy.evaluate(&mut route) {
+                Decision::Accept => {
+                    rib.insert(peer, route);
+                    accepted += 1;
+                }
+                Decision::Reject | Decision::Next => {
+                    rejected += 1;
+                }
+            }
         }
     }
 
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
-        announced = announced_count,
+        accepted,
+        rejected,
         rib_size = rib.len(),
         "processed UPDATE"
     );
