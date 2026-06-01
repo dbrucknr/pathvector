@@ -163,7 +163,7 @@ Not yet started. Key work items:
   - Runtime policy reload
 - Import policy — **Done.** `handle_update` now evaluates a `Policy<Route<Ipv4Addr>>` per route before `LocRib::insert`; routes that return `Reject` are dropped. Per-peer default action (`import_default = "accept"` / `"reject"`) is configurable in TOML. The infrastructure is in place for adding `Term` conditions (prefix lists, community filters, etc.).
 - BLACKHOLE community discard action (RFC 7999) — `Community::BLACKHOLE` (0xFFFF029A) is defined and detectable via `is_blackhole()`, but there is no null-route or discard action wired in the RIB or daemon; routes tagged with BLACKHOLE should have traffic to their prefix dropped at the forwarding plane
-- `AdjRibIn` — add pre-policy store per peer to support soft reconfiguration without requiring a full session reset
+- `AdjRibIn` — **Done.** Per-peer `AdjRibIn` tables are built at startup and wired through `handle_update`. Raw (pre-policy) routes are stored on every announcement; withdrawals remove from both `AdjRibIn` and `LocRib`; session teardown calls `AdjRibIn::clear()`. `reapply_import_policy` re-evaluates all stored raw routes against a new policy, inserting accepted routes and withdrawing rejected ones from `LocRib` without a session reset.
 - CLI binary (`pathvector`) using the gRPC client
 - Docker image: `FROM debian:slim`, single binary, config file mount, gRPC port exposed
 

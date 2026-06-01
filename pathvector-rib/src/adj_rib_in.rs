@@ -107,6 +107,15 @@ impl<A: IpAddress> AdjRibIn<A> {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
+
+    /// Removes all routes from this table.
+    ///
+    /// Called when the peer session terminates. The `AdjRibIn` is kept in
+    /// place so it can be repopulated when the session re-establishes, without
+    /// requiring a new allocation.
+    pub fn clear(&mut self) {
+        self.routes.clear();
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +204,17 @@ mod tests {
         rib.insert(route("10.0.0.0/8"));
         rib.insert(route("192.168.0.0/16"));
         assert_eq!(rib.routes().count(), 2);
+    }
+
+    #[test]
+    fn test_adj_rib_in_clear() {
+        let mut rib: AdjRibIn<Ipv4Addr> = AdjRibIn::new(peer());
+        rib.insert(route("10.0.0.0/8"));
+        rib.insert(route("192.168.0.0/16"));
+        assert_eq!(rib.len(), 2);
+        rib.clear();
+        assert!(rib.is_empty());
+        assert_eq!(rib.peer(), peer()); // peer identity preserved
     }
 
     #[test]
