@@ -291,7 +291,8 @@ The core protocol. Every crate is shaped by it.
 |---|---|---|---|
 | AS_CONFED_SEQUENCE (segment type 3) and AS_CONFED_SET (segment type 4) encode and decode | `pathvector-types/src/aspath.rs` | ✅ | `test_segment_display_confed_sequence`, `test_segment_display_confed_set`, `test_as_path_confed_segments_roundtrip` |
 | Confederation segments count as 0 in AS path length (best-path step 4) | `pathvector-rib/src/best_path.rs` | ✅ | `test_aspath_path_length_confed_counts_as_zero` |
-| Confederation segments stripped from AS_PATH before advertising to eBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ❌ | — |
+| `AsPath::strip_confed_segments()` removes all ConfedSequence/ConfedSet segments | `pathvector-types/src/aspath.rs` | ✅ | `test_strip_confed_segments_removes_confed_sequence_and_set`, `test_strip_confed_segments_preserves_sequence_and_set`, `test_strip_confed_segments_all_confed_yields_empty`, `test_strip_confed_segments_empty_path_stays_empty`, `test_strip_confed_segments_does_not_mutate_original`, `test_strip_confed_segments_preserves_segment_order` |
+| Confederation segments stripped from AS_PATH before advertising to eBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ⚠️ | — (blocked on session-type tagging; `strip_confed_segments()` ready to call) |
 
 ---
 

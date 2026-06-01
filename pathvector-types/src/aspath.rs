@@ -360,6 +360,43 @@ impl AsPath {
     pub fn from_segments(segments: Vec<AsPathSegment>) -> Self {
         Self { segments }
     }
+
+    /// Returns a new `AsPath` with all confederation segments removed.
+    ///
+    /// RFC 5065 §5.1 requires that `AS_CONFED_SEQUENCE` and `AS_CONFED_SET`
+    /// segments are stripped before a route is advertised to an eBGP peer.
+    /// Confederation topology is an internal implementation detail — external
+    /// peers must not see it.
+    ///
+    /// The original path is not modified. Non-confederation segments
+    /// (`Sequence`, `Set`) are preserved in their original order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath, AsPathSegment};
+    ///
+    /// let path = AsPath::from_segments(vec![
+    ///     AsPathSegment::ConfedSequence(vec![Asn::new(65001), Asn::new(65002)]),
+    ///     AsPathSegment::Sequence(vec![Asn::new(100), Asn::new(200)]),
+    ///     AsPathSegment::ConfedSet(vec![Asn::new(65003)]),
+    /// ]);
+    /// let stripped = path.strip_confed_segments();
+    /// assert_eq!(stripped.segments().len(), 1);
+    /// assert_eq!(stripped.path_length(), 2);
+    /// ```
+    #[must_use]
+    pub fn strip_confed_segments(&self) -> Self {
+        let segments = self
+            .segments
+            .iter()
+            .filter(|seg| {
+                !matches!(seg, AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_))
+            })
+            .cloned()
+            .collect();
+        Self { segments }
+    }
 }
 
 impl std::fmt::Display for AsPath {
@@ -549,5 +586,81 @@ mod tests {
             AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
         ]);
         assert_eq!(path.origin_as(), None);
+    }
+
+    // ── strip_confed_segments (RFC 5065 §5.1) ────────────────────────────────
+
+    #[test]
+    fn test_strip_confed_segments_removes_confed_sequence_and_set() {
+        // RFC 5065 §5.1: both AS_CONFED_SEQUENCE and AS_CONFED_SET must be
+        // removed; plain Sequence segments must be preserved.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001), Asn::new(65002)]),
+            AsPathSegment::Sequence(vec![Asn::new(100), Asn::new(200)]),
+            AsPathSegment::ConfedSet(vec![Asn::new(65003)]),
+        ]);
+        let stripped = path.strip_confed_segments();
+        assert_eq!(stripped.segments().len(), 1);
+        assert!(matches!(stripped.segments()[0], AsPathSegment::Sequence(_)));
+        assert_eq!(stripped.path_length(), 2);
+    }
+
+    #[test]
+    fn test_strip_confed_segments_preserves_sequence_and_set() {
+        // Plain Sequence and Set segments must survive unchanged.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::Sequence(vec![Asn::new(100)]),
+            AsPathSegment::Set(vec![Asn::new(200), Asn::new(201)]),
+        ]);
+        let stripped = path.strip_confed_segments();
+        assert_eq!(stripped.segments().len(), 2);
+        assert_eq!(stripped.path_length(), path.path_length());
+    }
+
+    #[test]
+    fn test_strip_confed_segments_all_confed_yields_empty() {
+        // A path consisting only of confederation segments collapses to empty.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
+            AsPathSegment::ConfedSet(vec![Asn::new(65002)]),
+        ]);
+        let stripped = path.strip_confed_segments();
+        assert!(stripped.is_empty());
+        assert_eq!(stripped.path_length(), 0);
+    }
+
+    #[test]
+    fn test_strip_confed_segments_empty_path_stays_empty() {
+        let stripped = AsPath::new().strip_confed_segments();
+        assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn test_strip_confed_segments_does_not_mutate_original() {
+        // strip_confed_segments must return a new path; the original is unchanged.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
+            AsPathSegment::Sequence(vec![Asn::new(100)]),
+        ]);
+        let stripped = path.strip_confed_segments();
+        assert_eq!(path.segments().len(), 2, "original must not be modified");
+        assert_eq!(stripped.segments().len(), 1);
+    }
+
+    #[test]
+    fn test_strip_confed_segments_preserves_segment_order() {
+        // The relative order of surviving segments must be maintained.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::Sequence(vec![Asn::new(300)]),
+            AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
+            AsPathSegment::Set(vec![Asn::new(100), Asn::new(101)]),
+            AsPathSegment::ConfedSet(vec![Asn::new(65002)]),
+            AsPathSegment::Sequence(vec![Asn::new(200)]),
+        ]);
+        let stripped = path.strip_confed_segments();
+        assert_eq!(stripped.segments().len(), 3);
+        assert!(matches!(stripped.segments()[0], AsPathSegment::Sequence(_)));
+        assert!(matches!(stripped.segments()[1], AsPathSegment::Set(_)));
+        assert!(matches!(stripped.segments()[2], AsPathSegment::Sequence(_)));
     }
 }
