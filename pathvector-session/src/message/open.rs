@@ -348,7 +348,7 @@ mod tests {
             0x00, 0x5A,    // hold_time = 90
             10, 0, 0, 1,   // bgp_id
         ];
-        body.push(opt_params.len() as u8);
+        body.push(u8::try_from(opt_params.len()).unwrap());
         body.extend_from_slice(opt_params);
         body
     }

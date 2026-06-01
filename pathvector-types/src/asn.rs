@@ -224,8 +224,8 @@ mod tests {
 
     #[test]
     fn test_asn_from_u32() {
-        let asn = Asn::from(131072u32);
-        assert_eq!(asn.as_u32(), 131072);
+        let asn = Asn::from(131_072_u32);
+        assert_eq!(asn.as_u32(), 131_072);
         assert!(asn.is_four_byte());
     }
 

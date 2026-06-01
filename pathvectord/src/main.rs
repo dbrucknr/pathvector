@@ -54,9 +54,9 @@ fn config_peer_type(local_as: u32, remote_as: u32) -> PeerType {
 /// Applies eBGP outbound transforms to a route clone before insertion into
 /// `AdjRibOut` or serialisation into an UPDATE message:
 ///
-/// - Prepend local AS to AS_PATH (RFC 4271 §9.2.1.2)
-/// - Rewrite NEXT_HOP to the local BGP identifier (RFC 4271 §5.1.3)
-/// - Strip LOCAL_PREF (RFC 4271 §5.1.5 — must not be sent to eBGP peers)
+/// - Prepend local AS to `AS_PATH` (RFC 4271 §9.2.1.2)
+/// - Rewrite `NEXT_HOP` to the local BGP identifier (RFC 4271 §5.1.3)
+/// - Strip `LOCAL_PREF` (RFC 4271 §5.1.5 — must not be sent to eBGP peers)
 ///
 /// iBGP peers receive the route unmodified; confederation segment stripping
 /// for eBGP is handled separately by `AdjRibOut::insert`.
@@ -121,6 +121,7 @@ fn withdraw_msg(nlri: Nlri<Ipv4Addr>) -> UpdateMessage {
 ///
 /// Only call this for established peers; `update_tx` for non-established peers
 /// is not drained until they come up, which can produce stale advertisements.
+#[allow(clippy::too_many_arguments)]
 fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &LocRib<Ipv4Addr>,
@@ -138,14 +139,14 @@ fn propagate_prefix(
                 Decision::Accept => {
                     match adj_rib_out.insert(route.clone()) {
                         InsertOutcome::Accepted(prev) => {
-                            if prev.as_ref() != Some(&route) {
-                                if update_tx.try_send(route_to_update(route)).is_err() {
-                                    tracing::warn!(
-                                        peer = %adj_rib_out.peer(),
-                                        prefix = %nlri,
-                                        "outbound UPDATE channel full, dropping"
-                                    );
-                                }
+                            if prev.as_ref() != Some(&route)
+                                && update_tx.try_send(route_to_update(route)).is_err()
+                            {
+                                tracing::warn!(
+                                    peer = %adj_rib_out.peer(),
+                                    prefix = %nlri,
+                                    "outbound UPDATE channel full, dropping"
+                                );
                             }
                         }
                         InsertOutcome::Filtered(Some(_)) => {
@@ -162,32 +163,33 @@ fn propagate_prefix(
                     }
                 }
                 Decision::Reject | Decision::Next => {
-                    if adj_rib_out.withdraw(&nlri).is_some() {
-                        if update_tx.try_send(withdraw_msg(nlri)).is_err() {
-                            tracing::warn!(
-                                peer = %adj_rib_out.peer(),
-                                prefix = %nlri,
-                                "outbound WITHDRAW channel full, dropping"
-                            );
-                        }
+                    if adj_rib_out.withdraw(&nlri).is_some()
+                        && update_tx.try_send(withdraw_msg(nlri)).is_err()
+                    {
+                        tracing::warn!(
+                            peer = %adj_rib_out.peer(),
+                            prefix = %nlri,
+                            "outbound WITHDRAW channel full, dropping"
+                        );
                     }
                 }
             }
         }
         None => {
-            if adj_rib_out.withdraw(&nlri).is_some() {
-                if update_tx.try_send(withdraw_msg(nlri)).is_err() {
-                    tracing::warn!(
-                        peer = %adj_rib_out.peer(),
-                        prefix = %nlri,
-                        "outbound WITHDRAW channel full, dropping"
-                    );
-                }
+            if adj_rib_out.withdraw(&nlri).is_some()
+                && update_tx.try_send(withdraw_msg(nlri)).is_err()
+            {
+                tracing::warn!(
+                    peer = %adj_rib_out.peer(),
+                    prefix = %nlri,
+                    "outbound WITHDRAW channel full, dropping"
+                );
             }
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(cfg: config::Config) {
     let local_as = cfg.daemon.local_as;
     let local_bgp_id = cfg.daemon.bgp_id;
@@ -476,6 +478,108 @@ pub fn reapply_import_policy(
         rejected,
         rib_size = loc_rib.len(),
         "soft reconfig complete"
+    );
+}
+
+fn handle_update(
+    peer: PeerId,
+    msg: UpdateMessage,
+    adj_rib_in: &mut AdjRibIn<Ipv4Addr>,
+    loc_rib: &mut LocRib<Ipv4Addr>,
+    policy: &Policy<Route<Ipv4Addr>>,
+    peer_type: PeerType,
+) {
+    let withdrawn_count = msg.withdrawn.len();
+    let announced_count = msg.announced.len();
+
+    for nlri in &msg.withdrawn {
+        adj_rib_in.withdraw(nlri);
+        loc_rib.withdraw(&peer, nlri);
+    }
+
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+
+    if announced_count > 0 {
+        let mut origin = Origin::Incomplete;
+        let mut as_path = AsPath::new();
+        let mut next_hop: Option<NextHop> = None;
+        let mut local_pref: Option<LocalPref> = None;
+        let mut med: Option<Med> = None;
+        let mut communities = Vec::new();
+        let mut large_communities = Vec::new();
+        let mut extended_communities = Vec::new();
+        let mut atomic_aggregate = false;
+        let mut aggregator = None;
+
+        for attr in &msg.attributes {
+            match attr {
+                PathAttribute::Origin(o) => origin = *o,
+                PathAttribute::AsPath(p) => as_path = p.clone(),
+                PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
+                PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
+                PathAttribute::Med(m) => med = Some(Med::new(*m)),
+                PathAttribute::Communities(cs) => communities.clone_from(cs),
+                PathAttribute::LargeCommunities(lcs) => large_communities.clone_from(lcs),
+                PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
+                PathAttribute::AtomicAggregate => atomic_aggregate = true,
+                PathAttribute::Aggregator(a) => aggregator = Some(*a),
+                _ => {}
+            }
+        }
+
+        for nlri in msg.announced {
+            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+            if let Some(nh) = next_hop {
+                builder = builder.next_hop(nh);
+            }
+            if let Some(lp) = local_pref {
+                builder = builder.local_pref(lp);
+            }
+            if let Some(m) = med {
+                builder = builder.med(m);
+            }
+            for &c in &communities {
+                builder = builder.community(c);
+            }
+            for &lc in &large_communities {
+                builder = builder.large_community(lc);
+            }
+            for &ec in &extended_communities {
+                builder = builder.extended_community(ec);
+            }
+            if atomic_aggregate {
+                builder = builder.atomic_aggregate();
+            }
+            if let Some(agg) = aggregator {
+                builder = builder.aggregator(agg);
+            }
+
+            let raw = builder.build();
+            // Store the pre-policy route for soft reconfiguration.
+            adj_rib_in.insert(raw.clone());
+
+            // Apply import policy to a working copy; only insert if accepted.
+            let mut route = raw;
+            match policy.evaluate(&mut route) {
+                Decision::Accept => {
+                    loc_rib.insert(peer, route);
+                    accepted += 1;
+                }
+                Decision::Reject | Decision::Next => {
+                    rejected += 1;
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        peer = %peer,
+        withdrawn = withdrawn_count,
+        accepted,
+        rejected,
+        rib_size = loc_rib.len(),
+        "processed UPDATE"
     );
 }
 
@@ -1262,106 +1366,4 @@ mod tests {
         }).expect("UPDATE must carry AS_PATH");
         assert!(aspath_attr.contains(Asn::new(65001)), "local AS must be prepended");
     }
-}
-
-fn handle_update(
-    peer: PeerId,
-    msg: UpdateMessage,
-    adj_rib_in: &mut AdjRibIn<Ipv4Addr>,
-    loc_rib: &mut LocRib<Ipv4Addr>,
-    policy: &Policy<Route<Ipv4Addr>>,
-    peer_type: PeerType,
-) {
-    let withdrawn_count = msg.withdrawn.len();
-    let announced_count = msg.announced.len();
-
-    for nlri in &msg.withdrawn {
-        adj_rib_in.withdraw(nlri);
-        loc_rib.withdraw(&peer, nlri);
-    }
-
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-
-    if announced_count > 0 {
-        let mut origin = Origin::Incomplete;
-        let mut as_path = AsPath::new();
-        let mut next_hop: Option<NextHop> = None;
-        let mut local_pref: Option<LocalPref> = None;
-        let mut med: Option<Med> = None;
-        let mut communities = Vec::new();
-        let mut large_communities = Vec::new();
-        let mut extended_communities = Vec::new();
-        let mut atomic_aggregate = false;
-        let mut aggregator = None;
-
-        for attr in &msg.attributes {
-            match attr {
-                PathAttribute::Origin(o) => origin = *o,
-                PathAttribute::AsPath(p) => as_path = p.clone(),
-                PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
-                PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
-                PathAttribute::Med(m) => med = Some(Med::new(*m)),
-                PathAttribute::Communities(cs) => communities.clone_from(cs),
-                PathAttribute::LargeCommunities(lcs) => large_communities.clone_from(lcs),
-                PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
-                PathAttribute::AtomicAggregate => atomic_aggregate = true,
-                PathAttribute::Aggregator(a) => aggregator = Some(*a),
-                _ => {}
-            }
-        }
-
-        for nlri in msg.announced {
-            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
-            if let Some(nh) = next_hop {
-                builder = builder.next_hop(nh);
-            }
-            if let Some(lp) = local_pref {
-                builder = builder.local_pref(lp);
-            }
-            if let Some(m) = med {
-                builder = builder.med(m);
-            }
-            for &c in &communities {
-                builder = builder.community(c);
-            }
-            for &lc in &large_communities {
-                builder = builder.large_community(lc);
-            }
-            for &ec in &extended_communities {
-                builder = builder.extended_community(ec);
-            }
-            if atomic_aggregate {
-                builder = builder.atomic_aggregate();
-            }
-            if let Some(agg) = aggregator {
-                builder = builder.aggregator(agg);
-            }
-
-            let raw = builder.build();
-            // Store the pre-policy route for soft reconfiguration.
-            adj_rib_in.insert(raw.clone());
-
-            // Apply import policy to a working copy; only insert if accepted.
-            let mut route = raw;
-            match policy.evaluate(&mut route) {
-                Decision::Accept => {
-                    loc_rib.insert(peer, route);
-                    accepted += 1;
-                }
-                Decision::Reject | Decision::Next => {
-                    rejected += 1;
-                }
-            }
-        }
-    }
-
-    tracing::info!(
-        peer = %peer,
-        withdrawn = withdrawn_count,
-        accepted,
-        rejected,
-        rib_size = loc_rib.len(),
-        "processed UPDATE"
-    );
 }

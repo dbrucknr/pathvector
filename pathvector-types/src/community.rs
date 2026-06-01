@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn test_community_into_u32() {
         let v: u32 = Community::from_parts(65000, 100).into();
-        assert_eq!(v, (65000u32 << 16) | 100);
+        assert_eq!(v, (65000u32 << 16) | 0x64);
     }
 
     // --- LargeCommunity ---

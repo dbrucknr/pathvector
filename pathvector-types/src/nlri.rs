@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_nlri_new_invalid_mask() {
-        assert!(Nlri::new(Ipv4Addr::new(0, 0, 0, 0), 33).is_err());
+        assert!(Nlri::new(Ipv4Addr::UNSPECIFIED, 33).is_err());
         assert!(Nlri::new(Ipv6Addr::UNSPECIFIED, 129).is_err());
     }
 

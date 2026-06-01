@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_as4_path_roundtrip() {
-        let path = AsPath::from_sequence(vec![Asn::new(131072), Asn::new(131073)]);
+        let path = AsPath::from_sequence(vec![Asn::new(131_072), Asn::new(131_073)]);
         let msg = UpdateMessage {
             withdrawn: vec![],
             attributes: vec![PathAttribute::As4Path(path)],
@@ -977,7 +977,7 @@ mod tests {
         let msg = UpdateMessage {
             withdrawn: vec![],
             attributes: vec![PathAttribute::As4Aggregator {
-                asn: 131072,
+                asn: 131_072,
                 bgp_id: Ipv4Addr::new(10, 0, 0, 1),
             }],
             announced: vec![],
@@ -1066,10 +1066,10 @@ mod tests {
     fn update_with_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
         let attr_total = 3 + value.len(); // flags + type + 1-byte len + value
         let mut body = vec![0u8, 0]; // withdrawn_len = 0
-        body.extend_from_slice(&(attr_total as u16).to_be_bytes());
+        body.extend_from_slice(&u16::try_from(attr_total).unwrap().to_be_bytes());
         body.push(flags);
         body.push(type_code);
-        body.push(value.len() as u8);
+        body.push(u8::try_from(value.len()).unwrap());
         body.extend_from_slice(value);
         body
     }
@@ -1078,10 +1078,10 @@ mod tests {
     fn update_with_ext_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
         let attr_total = 4 + value.len(); // flags + type + 2-byte len + value
         let mut body = vec![0u8, 0];
-        body.extend_from_slice(&(attr_total as u16).to_be_bytes());
+        body.extend_from_slice(&u16::try_from(attr_total).unwrap().to_be_bytes());
         body.push(flags | FLAG_EXT_LEN);
         body.push(type_code);
-        body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        body.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
         body.extend_from_slice(value);
         body
     }

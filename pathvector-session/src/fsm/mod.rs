@@ -577,7 +577,7 @@ mod tests {
     fn peer_open(as_: u32, hold_time: u16) -> BgpMessage {
         BgpMessage::Open(OpenMessage {
             version: 4,
-            my_as: if as_ > 0xFFFF { AS_TRANS } else { as_ as u16 },
+            my_as: u16::try_from(as_).unwrap_or(AS_TRANS),
             hold_time,
             bgp_id: Ipv4Addr::new(10, 0, 0, 2),
             capabilities: vec![Capability::FourByteAsn(as_)],
@@ -1038,11 +1038,11 @@ mod tests {
     #[test]
     fn test_four_byte_asn_preferred_over_my_as() {
         let config = FsmConfig {
-            local_as: 131072, // > 65535
+            local_as: 131_072, // > 65535
             local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
             hold_time: 90,
-            capabilities: vec![Capability::FourByteAsn(131072)],
-            peer_as: Some(131073),
+            capabilities: vec![Capability::FourByteAsn(131_072)],
+            peer_as: Some(131_073),
         };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
@@ -1053,12 +1053,12 @@ mod tests {
         };
         assert_eq!(open.my_as, AS_TRANS);
         // Verify we accept a peer with 4-byte ASN via capability.
-        fsm.process(FsmInput::MessageReceived(peer_open(131073, 90)));
+        fsm.process(FsmInput::MessageReceived(peer_open(131_073, 90)));
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = out.iter().find_map(|o| {
             if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None }
         });
-        assert_eq!(info.unwrap().peer_as, 131073);
+        assert_eq!(info.unwrap().peer_as, 131_073);
     }
 
     // ── No configured peer_as → accept any ───────────────────────────────────

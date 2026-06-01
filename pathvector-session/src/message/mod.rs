@@ -314,7 +314,7 @@ mod tests {
     fn make_raw_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
         let total_len = 19 + body.len();
         let mut bytes = vec![0xFF_u8; 16];
-        bytes.extend_from_slice(&(total_len as u16).to_be_bytes());
+        bytes.extend_from_slice(&u16::try_from(total_len).unwrap().to_be_bytes());
         bytes.push(msg_type);
         bytes.extend_from_slice(body);
         bytes

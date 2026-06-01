@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -22,7 +23,7 @@ use pathvector_session::transport::{SessionConfig, SessionEvent, spawn};
 fn peer_open(peer_as: u32, hold_time: u16) -> BgpMessage {
     BgpMessage::Open(OpenMessage {
         version: 4,
-        my_as: if peer_as > 0xFFFF { 23456 } else { peer_as as u16 },
+        my_as: u16::try_from(peer_as).unwrap_or(23456),
         hold_time,
         bgp_id: Ipv4Addr::new(10, 0, 0, 2),
         capabilities: vec![Capability::FourByteAsn(peer_as)],
@@ -339,7 +340,7 @@ async fn test_hold_timer_fires_terminates_session() {
         // NOTIFICATION when the hold timer fires.
         loop {
             match reader.next().await {
-                Some(Ok(BgpMessage::Keepalive)) => continue,
+                Some(Ok(BgpMessage::Keepalive)) => {}
                 Some(Ok(BgpMessage::Notification(_))) | None => break,
                 other => panic!("unexpected: {other:?}"),
             }
@@ -426,11 +427,10 @@ async fn test_codec_error_emits_terminated() {
         let mut frame = [0u8; 19];
         frame[..16].fill(0xFF);                                 // valid marker
         frame[16..18].copy_from_slice(&0u16.to_be_bytes());    // length = 0 → invalid
-        use tokio::io::AsyncWriteExt;
         raw_writer.write_all(&frame).await.unwrap();
 
         // Keep the peer side open while the session processes the error.
-        std::future::pending::<()>().await
+        std::future::pending::<()>().await;
     });
 
     let mut handle = spawn(local_config(addr));

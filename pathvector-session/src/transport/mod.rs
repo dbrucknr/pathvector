@@ -90,6 +90,7 @@ impl SessionHandle {
     /// in the Established state. If the session is not connected, the messages
     /// are discarded. The channel has capacity 256; senders should treat a full
     /// channel as a backpressure signal and log a warning.
+    #[must_use]
     pub fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
         self.update_tx.clone()
     }

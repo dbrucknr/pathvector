@@ -76,7 +76,7 @@ proptest! {
     /// when talking to 2-byte-only peers (AS_TRANS substitution, RFC 6793).
     #[test]
     fn prop_asn_is_four_byte_iff_exceeds_u16(val in 0u32..=u32::MAX) {
-        prop_assert_eq!(Asn::new(val).is_four_byte(), val > u16::MAX as u32);
+        prop_assert_eq!(Asn::new(val).is_four_byte(), val > u32::from(u16::MAX));
     }
 
     /// Private ASNs fall in exactly the two IANA-defined private ranges.
@@ -86,8 +86,8 @@ proptest! {
     /// applied to public ASNs or extended beyond the private ranges.
     #[test]
     fn prop_asn_is_private_matches_defined_ranges(val in 0u32..=u32::MAX) {
-        let in_2b_range = val >= 64512 && val <= 65534;
-        let in_4b_range = val >= 4_200_000_000 && val <= 4_294_967_294;
+        let in_2b_range = (64512..=65534).contains(&val);
+        let in_4b_range = (4_200_000_000..=4_294_967_294).contains(&val);
         prop_assert_eq!(Asn::new(val).is_private(), in_2b_range || in_4b_range);
     }
 }
