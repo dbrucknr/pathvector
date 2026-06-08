@@ -64,16 +64,18 @@ These crates are independently useful and published separately. pathvector depen
 
 ## Status
 
-Early development. Crates are not yet published to crates.io.
+Active development. Crates are not yet published to crates.io.
 
-| Crate | Status |
-|---|---|
-| `pathvector-types` | In progress |
-| `pathvector-policy` | Planned |
-| `pathvector-rib` | Planned |
-| `pathvector-session` | Planned |
-| `pathvector-bmp` | Planned |
-| `pathvectord` | Planned |
+| Crate | Status | Notes |
+|---|---|---|
+| `pathvector-types` | Stable | Newtypes, AS path, communities, NLRI, all path attributes |
+| `pathvector-policy` | Stable | Prefix-list, community, AS-path, local-pref, MED conditions and actions |
+| `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2, 4–7, 10; LPM forwarding queries |
+| `pathvector-session` | Stable | Full BGP FSM; all five message types; 4-byte ASN; GoBGP-validated |
+| `pathvector-bmp` | Not started | — |
+| `pathvectord` | Active | Full BGP speaker; gRPC management API; GoBGP-validated |
+
+See [DAEMON.md](DAEMON.md) for build instructions, configuration reference, and how to query the gRPC management API.
 
 ---
 

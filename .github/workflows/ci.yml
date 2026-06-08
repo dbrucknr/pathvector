@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test
 
   # ── Lint ────────────────────────────────────────────────────────────────────
@@ -31,19 +33,23 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --check
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
   msrv:
-    name: MSRV (1.86)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.86
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test
 
   # ── Docs ────────────────────────────────────────────────────────────────────
@@ -54,6 +60,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
   # ── Fuzz ────────────────────────────────────────────────────────────────────

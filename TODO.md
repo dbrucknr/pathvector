@@ -220,11 +220,7 @@ Not yet started. Key work items:
   traditional fields are handled correctly. Non-IPv4 AFI/SAFIs are logged at DEBUG
   and skipped. Full IPv6 RIB support still requires the dual-stack work above.
 
-- gRPC management API — define `.proto` schema for:
-  - Peer state queries (session state, uptime, prefixes received/advertised)
-  - RIB queries (show route, show best path, show candidates)
-  - Policy introspection
-  - Runtime policy reload
+- gRPC management API — **Done (2026-06-08).** `PeerService` and `RibService` are live on a configurable port (default 50051). Proto schema at `proto/pathvector/v1/management.proto`. See [DAEMON.md](DAEMON.md) for the full operational guide and `grpcurl` query examples. Remaining: policy introspection and runtime policy reload (blocked on wiring `reapply_import_policy` to export propagation).
 - Import policy — **Done.** `handle_update` now evaluates a `Policy<Route<Ipv4Addr>>` per route before `LocRib::insert`; routes that return `Reject` are dropped. Per-peer default action (`import_default = "accept"` / `"reject"`) is configurable in TOML; eBGP peers default to `"reject"` (RFC 8212) when omitted, iBGP peers default to `"accept"`. The infrastructure is in place for adding `Term` conditions (prefix lists, community filters, etc.).
 - BLACKHOLE community discard action (RFC 7999) — `Community::BLACKHOLE` (0xFFFF029A) is defined and detectable via `is_blackhole()`, but there is no null-route or discard action wired in the RIB or daemon; routes tagged with BLACKHOLE should have traffic to their prefix dropped at the forwarding plane
 - `AdjRibIn` — **Done.** Per-peer `AdjRibIn` tables are built at startup and wired through `handle_update`. Raw (pre-policy) routes are stored on every announcement; withdrawals remove from both `AdjRibIn` and `LocRib`; session teardown calls `AdjRibIn::clear()`. `reapply_import_policy` re-evaluates all stored raw routes against a new policy, inserting accepted routes and withdrawing rejected ones from `LocRib` without a session reset.
@@ -243,7 +239,7 @@ schema is finalised. Will contain generated client stubs so users and the
 
 ## Cross-cutting
 
-- CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.86) — **Done.** `.github/workflows/ci.yml` has five jobs: `test` (stable), `lint` (clippy + rustfmt, stable), `msrv` (1.86), `docs` (stable, `-D warnings`), and `fuzz` (nightly, `just fuzz-smoke`). A `Justfile` at the workspace root provides matching local recipes so CI and development use the same commands.
+- CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.88) — **Done.** `.github/workflows/ci.yml` has five jobs: `test` (stable), `lint` (clippy + rustfmt, stable), `msrv` (1.88), `docs` (stable, `-D warnings`), and `fuzz` (nightly, `just fuzz-smoke`). A `Justfile` at the workspace root provides matching local recipes so CI and development use the same commands. All jobs install `protoc` (required by `pathvectord`'s gRPC codegen build script).
 - Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range
 - Fuzz testing — tracked as Phase 4 in the property testing section above
 - Benchmark suite for `LocRib` insert/best-path under realistic prefix volumes
