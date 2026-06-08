@@ -41,13 +41,6 @@ fmt-check:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
-# Check MSRV (mirrors the CI msrv job — requires `rustup toolchain install 1.88`)
-msrv:
-    rustup run 1.88 cargo test
-
-# Run all CI checks locally: test · lint · fmt · doc · msrv
-ci: test lint fmt-check doc msrv
-
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
 # Compile all fuzz targets (no fuzzing — fast compile check)
