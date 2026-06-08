@@ -24,6 +24,14 @@ use crate::DaemonState;
 
 mod proto {
     tonic::include_proto!("pathvector.v1");
+
+    /// Binary file descriptor set emitted by `build.rs`.
+    ///
+    /// Used by the gRPC server reflection service so clients (e.g. `grpcurl`)
+    /// can discover all services and their schemas without needing `--proto`
+    /// flags.
+    pub(super) const FILE_DESCRIPTOR_SET: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/pathvector_descriptor.bin"));
 }
 
 use proto::{
@@ -358,10 +366,15 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
         state: Arc::clone(&state),
     });
     let rib_svc = RibServiceServer::new(RibServiceImpl { state });
+    let reflection_svc = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("file descriptor set is valid");
 
     if let Err(e) = tonic::transport::Server::builder()
         .add_service(peer_svc)
         .add_service(rib_svc)
+        .add_service(reflection_svc)
         .serve(addr)
         .await
     {

@@ -146,23 +146,24 @@ brew install grpcurl
 go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 ```
 
-Because pathvectord does not yet expose gRPC server reflection, pass the proto file and include path explicitly:
+pathvectord registers gRPC server reflection at startup, so `grpcurl` works without any `--proto` flags. All services and their schemas are discoverable at runtime:
 
 ```bash
-PROTO_FLAGS="-proto proto/pathvector/v1/management.proto -import-path proto"
+# List all registered services
+grpcurl -plaintext localhost:50051 list
+
+# Describe a service
+grpcurl -plaintext localhost:50051 describe pathvector.v1.PeerService
 ```
 
-All examples below assume the daemon is running locally on the default port. Run them from the workspace root so the proto path resolves correctly.
+All examples below assume the daemon is running locally on the default port.
 
 ---
 
 #### List all configured peers
 
 ```bash
-grpcurl -plaintext \
-  -proto proto/pathvector/v1/management.proto \
-  -import-path proto \
-  localhost:50051 pathvector.v1.PeerService/ListPeers
+grpcurl -plaintext localhost:50051 pathvector.v1.PeerService/ListPeers
 ```
 
 Example response:
@@ -189,10 +190,7 @@ Example response:
 #### Get a single peer
 
 ```bash
-grpcurl -plaintext \
-  -proto proto/pathvector/v1/management.proto \
-  -import-path proto \
-  -d '{"address": "10.0.0.1"}' \
+grpcurl -plaintext -d '{"address": "10.0.0.1"}' \
   localhost:50051 pathvector.v1.PeerService/GetPeer
 ```
 
@@ -203,10 +201,7 @@ Returns `NOT_FOUND` if the address is not a configured peer, `INVALID_ARGUMENT` 
 #### Get the best route for a prefix
 
 ```bash
-grpcurl -plaintext \
-  -proto proto/pathvector/v1/management.proto \
-  -import-path proto \
-  -d '{"prefix": "192.168.100.0/24"}' \
+grpcurl -plaintext -d '{"prefix": "192.168.100.0/24"}' \
   localhost:50051 pathvector.v1.RibService/GetBestRoute
 ```
 
@@ -233,19 +228,13 @@ When no route exists: `{ "found": false }`.
 #### List all best routes in the Loc-RIB
 
 ```bash
-grpcurl -plaintext \
-  -proto proto/pathvector/v1/management.proto \
-  -import-path proto \
-  localhost:50051 pathvector.v1.RibService/ListRoutes
+grpcurl -plaintext localhost:50051 pathvector.v1.RibService/ListRoutes
 ```
 
 #### List best routes from a specific peer
 
 ```bash
-grpcurl -plaintext \
-  -proto proto/pathvector/v1/management.proto \
-  -import-path proto \
-  -d '{"peer_address": "10.0.0.1"}' \
+grpcurl -plaintext -d '{"peer_address": "10.0.0.1"}' \
   localhost:50051 pathvector.v1.RibService/ListRoutes
 ```
 
@@ -254,10 +243,7 @@ grpcurl -plaintext \
 Returns every route for the prefix that passed import policy, across all peers. The best route among them is the one returned by `GetBestRoute`.
 
 ```bash
-grpcurl -plaintext \
-  -proto proto/pathvector/v1/management.proto \
-  -import-path proto \
-  -d '{"prefix": "192.168.100.0/24"}' \
+grpcurl -plaintext -d '{"prefix": "192.168.100.0/24"}' \
   localhost:50051 pathvector.v1.RibService/ListCandidates
 ```
 
@@ -314,7 +300,6 @@ The short version: pathvectord has been validated against GoBGP 4.x with full se
 
 | Feature | Notes |
 |---|---|
-| gRPC server reflection | Required for `grpcurl` without `--proto` flags; not yet added |
 | `pathvector` CLI | Typed gRPC client CLI — on the roadmap as `pathvector-client` |
 | Runtime policy reload via gRPC | `reapply_import_policy` exists but export propagation not yet wired |
 | IPv6 RIB | Session layer parses IPv6 MP_REACH/UNREACH; daemon tables are IPv4-only |
