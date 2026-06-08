@@ -18,6 +18,9 @@ default:
 
 # ── Standard suite ────────────────────────────────────────────────────────────
 
+# Run every check that CI runs, in the same order.  Green here = green on push.
+ci: test lint fmt-check doc
+
 # Run the full test suite
 test:
     cargo test
