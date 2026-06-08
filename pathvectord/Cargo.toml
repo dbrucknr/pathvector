@@ -18,14 +18,16 @@ pathvector-session = { workspace = true }
 pathvector-types   = { workspace = true }
 tokio              = { workspace = true }
 tonic              = { workspace = true }
+tonic-prost        = { workspace = true }
 prost              = { workspace = true }
+prost-types        = { workspace = true }
 serde              = { version = "1", features = ["derive"] }
 toml               = "0.8"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 proptest = { workspace = true }

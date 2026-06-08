@@ -10,11 +10,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("pathvectord crate must live inside a workspace directory")
         .join("proto");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(false)
         .compile_protos(
             &[proto_root.join("pathvector/v1/management.proto")],
-            &[&proto_root],
+            &[proto_root],
         )?;
 
     Ok(())
