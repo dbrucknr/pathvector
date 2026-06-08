@@ -19,11 +19,15 @@ default:
 # ── Standard suite ────────────────────────────────────────────────────────────
 
 # Run every check that CI runs, in the same order.  Green here = green on push.
-ci: test lint fmt-check doc
+ci: test lint fmt-check doc msrv
 
 # Run the full test suite
 test:
     cargo test
+
+# Test against the minimum supported Rust version (mirrors the msrv CI job)
+msrv:
+    rustup run 1.88 cargo test
 
 # Clippy across all targets (warnings promoted to errors, matching CI)
 lint:
