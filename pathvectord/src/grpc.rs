@@ -16,23 +16,18 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use pathvector_rib::PeerId;
-use pathvector_types::{AsPathSegment, NextHop, Origin, PeerType};
+use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType};
 
 use crate::DaemonState;
 
 // ── Generated protobuf/gRPC code ─────────────────────────────────────────────
+//
+// The proto types live in a separate `proto.rs` source file so that a
+// file-level `#![allow(clippy::all)]` can suppress lints on prost-generated
+// code without affecting the rest of this module.  Inner attributes cannot
+// appear inside an `include!` expansion in an inline `mod { }` block.
 
-mod proto {
-    tonic::include_proto!("pathvector.v1");
-
-    /// Binary file descriptor set emitted by `build.rs`.
-    ///
-    /// Used by the gRPC server reflection service so clients (e.g. `grpcurl`)
-    /// can discover all services and their schemas without needing `--proto`
-    /// flags.
-    pub(super) const FILE_DESCRIPTOR_SET: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/pathvector_descriptor.bin"));
-}
+use crate::proto;
 
 use proto::{
     peer_service_server::{PeerService, PeerServiceServer},
@@ -143,8 +138,8 @@ fn route_to_proto(
         next_hop,
         as_path,
         origin: proto_origin(route.origin),
-        local_pref: route.local_pref.map(|lp| lp.as_u32()),
-        med: route.med.map(|m| m.as_u32()),
+        local_pref: route.local_pref.map(LocalPref::as_u32),
+        med: route.med.map(Med::as_u32),
         communities,
         large_communities,
         extended_communities,
@@ -191,19 +186,21 @@ fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
     let prefixes_received = s
         .adj_ribs_in
         .get(&addr)
-        .map_or(0, |ari| ari.len() as u32);
+        .map_or(0, |ari| u32::try_from(ari.len()).unwrap_or(u32::MAX));
 
     // Count best-path wins: routes in the Loc-RIB whose winner is this peer.
-    let prefixes_accepted = s
-        .loc_rib
-        .best_routes()
-        .filter(|(nlri, _)| s.loc_rib.best_peer(nlri) == Some(peer_id))
-        .count() as u32;
+    let prefixes_accepted = u32::try_from(
+        s.loc_rib
+            .best_routes()
+            .filter(|(nlri, _)| s.loc_rib.best_peer(nlri) == Some(peer_id))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
 
     let prefixes_advertised = s
         .adj_ribs_out
         .get(&addr)
-        .map_or(0, |aro| aro.len() as u32);
+        .map_or(0, |aro| u32::try_from(aro.len()).unwrap_or(u32::MAX));
 
     Some(PeerState {
         address: addr.to_string(),
@@ -249,7 +246,7 @@ impl PeerService for PeerServiceImpl {
 
         let s = self.state.read().await;
         build_peer_state(&s, addr)
-            .map(|ps| Response::new(ps))
+            .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("peer {addr} is not configured")))
     }
 }

@@ -33,5 +33,21 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 proptest = { workspace = true }
 
-[lints]
-workspace = true
+# pathvectord generates code via tonic_prost_build.  The generated file
+# triggers four pedantic lints (doc_markdown, trivially_copy_pass_by_ref,
+# default_trait_access, too_many_lines) that we cannot suppress with an
+# `#[allow]` because clippy attributes the spans to the OUT_DIR file, not to
+# the `mod proto` declaration.  We therefore define the lint table directly
+# instead of inheriting `workspace = true`, allowing us to carve out these
+# four exceptions while keeping everything else identical to the workspace set.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all                       = { level = "warn", priority = -1 }
+pedantic                  = { level = "warn", priority = -1 }
+# Allow lints that fire in prost/tonic generated code only
+doc_markdown              = "allow"
+trivially_copy_pass_by_ref = "allow"
+default_trait_access      = "allow"
+too_many_lines            = "allow"

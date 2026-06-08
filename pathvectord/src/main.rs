@@ -1,5 +1,6 @@
 mod config;
 mod grpc;
+mod proto;
 
 use std::{
     collections::HashMap,
@@ -678,6 +679,10 @@ pub fn reapply_import_policy(
     );
 }
 
+// UPDATE processing dispatches across all path attribute types in one pass.
+// Splitting this function further would produce artificial helpers with no
+// independent utility.
+#[allow(clippy::too_many_lines)]
 fn handle_update(
     peer: PeerId,
     msg: UpdateMessage,

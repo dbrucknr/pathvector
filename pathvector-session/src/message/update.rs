@@ -275,7 +275,7 @@ fn decode_attr_value(
         }
 
         ATTR_COMMUNITY => {
-            if cur.remaining() % 4 != 0 {
+            if !cur.remaining().is_multiple_of(4) {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
                     detail: "COMMUNITY length must be a multiple of 4",
@@ -326,7 +326,7 @@ fn decode_attr_value(
         }
 
         ATTR_EXTENDED_COMMUNITIES => {
-            if cur.remaining() % 8 != 0 {
+            if !cur.remaining().is_multiple_of(8) {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
                     detail: "EXTENDED_COMMUNITIES length must be a multiple of 8",
@@ -359,7 +359,7 @@ fn decode_attr_value(
         }
 
         ATTR_LARGE_COMMUNITY => {
-            if cur.remaining() % 12 != 0 {
+            if !cur.remaining().is_multiple_of(12) {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
                     detail: "LARGE_COMMUNITY length must be a multiple of 12",
