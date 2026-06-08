@@ -296,10 +296,7 @@ impl DaemonState {
             })
             .collect();
 
-        let peer_remote_as = peers
-            .iter()
-            .map(|p| (p.address, p.remote_as))
-            .collect();
+        let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
         Self {
             local_as,
@@ -333,7 +330,8 @@ impl DaemonState {
     ) {
         let peer_id = PeerId::from(peer_ip);
         self.peer_types.insert(peer_ip, peer_type);
-        self.established_at.insert(peer_ip, std::time::Instant::now());
+        self.established_at
+            .insert(peer_ip, std::time::Instant::now());
         self.hold_times.insert(peer_ip, hold_time);
 
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
