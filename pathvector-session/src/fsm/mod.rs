@@ -489,10 +489,10 @@ impl Fsm {
             ));
         }
 
-        if let Some(expected) = self.config.peer_as {
-            if resolve_as(peer) != expected {
-                return Err(NotificationError::OpenMessage(OpenMsgError::BadPeerAs));
-            }
+        if let Some(expected) = self.config.peer_as
+            && resolve_as(peer) != expected
+        {
+            return Err(NotificationError::OpenMessage(OpenMsgError::BadPeerAs));
         }
 
         // RFC 4271 §6.2: hold time values 1 and 2 are unacceptable.

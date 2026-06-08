@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use pathvector_rib::PeerId;
-use pathvector_types::{AsPathSegment, NextHop, Origin, PeerType};
+use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType};
 
 use crate::DaemonState;
 
@@ -35,11 +35,11 @@ mod proto {
 }
 
 use proto::{
-    peer_service_server::{PeerService, PeerServiceServer},
-    rib_service_server::{RibService, RibServiceServer},
     Aggregator, AsSegment, GetBestRouteRequest, GetPeerRequest, LargeCommunity,
     ListCandidatesRequest, ListPeersRequest, ListPeersResponse, ListRoutesRequest,
     ListRoutesResponse, PeerState, Route, RouteResponse,
+    peer_service_server::{PeerService, PeerServiceServer},
+    rib_service_server::{RibService, RibServiceServer},
 };
 
 // ── Type-conversion helpers ───────────────────────────────────────────────────
@@ -109,11 +109,7 @@ fn route_to_proto(
         .map(proto_as_segment)
         .collect();
 
-    let communities: Vec<u32> = route
-        .communities
-        .iter()
-        .map(|c| c.as_u32())
-        .collect();
+    let communities: Vec<u32> = route.communities.iter().map(|c| c.as_u32()).collect();
 
     let large_communities: Vec<LargeCommunity> = route
         .large_communities
@@ -143,8 +139,8 @@ fn route_to_proto(
         next_hop,
         as_path,
         origin: proto_origin(route.origin),
-        local_pref: route.local_pref.map(|lp| lp.as_u32()),
-        med: route.med.map(|m| m.as_u32()),
+        local_pref: route.local_pref.map(LocalPref::as_u32),
+        med: route.med.map(Med::as_u32),
         communities,
         large_communities,
         extended_communities,
@@ -191,19 +187,20 @@ fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
     let prefixes_received = s
         .adj_ribs_in
         .get(&addr)
-        .map_or(0, |ari| ari.len() as u32);
+        .map_or(0, |ari| u32::try_from(ari.len()).unwrap_or(u32::MAX));
 
     // Count best-path wins: routes in the Loc-RIB whose winner is this peer.
     let prefixes_accepted = s
         .loc_rib
         .best_routes()
         .filter(|(nlri, _)| s.loc_rib.best_peer(nlri) == Some(peer_id))
-        .count() as u32;
+        .count();
+    let prefixes_accepted = u32::try_from(prefixes_accepted).unwrap_or(u32::MAX);
 
     let prefixes_advertised = s
         .adj_ribs_out
         .get(&addr)
-        .map_or(0, |aro| aro.len() as u32);
+        .map_or(0, |aro| u32::try_from(aro.len()).unwrap_or(u32::MAX));
 
     Some(PeerState {
         address: addr.to_string(),
@@ -249,7 +246,7 @@ impl PeerService for PeerServiceImpl {
 
         let s = self.state.read().await;
         build_peer_state(&s, addr)
-            .map(|ps| Response::new(ps))
+            .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("peer {addr} is not configured")))
     }
 }
@@ -277,9 +274,10 @@ impl RibService for RibServiceImpl {
         let s = self.state.read().await;
         let resp = match s.loc_rib.best(&nlri) {
             Some(route) => {
-                let peer_id = s.loc_rib.best_peer(&nlri).unwrap_or_else(|| {
-                    PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                });
+                let peer_id = s
+                    .loc_rib
+                    .best_peer(&nlri)
+                    .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
                 RouteResponse {
                     found: true,
                     route: Some(route_to_proto(peer_id, nlri, route)),
@@ -303,9 +301,9 @@ impl RibService for RibServiceImpl {
         let peer_filter: Option<PeerId> = if peer_filter_str.is_empty() {
             None
         } else {
-            let addr: Ipv4Addr = peer_filter_str
-                .parse()
-                .map_err(|_| Status::invalid_argument("peer_address must be a valid IPv4 address"))?;
+            let addr: Ipv4Addr = peer_filter_str.parse().map_err(|_| {
+                Status::invalid_argument("peer_address must be a valid IPv4 address")
+            })?;
             Some(PeerId::from(addr))
         };
 
@@ -393,11 +391,11 @@ mod tests {
 
     use super::{build_peer_state, proto, route_to_proto};
     use crate::{
-        config::{self, ImportDefault, ExportDefault},
         DaemonState,
+        config::{self, ExportDefault, ImportDefault},
     };
-    use tokio::sync::mpsc;
     use std::collections::HashMap;
+    use tokio::sync::mpsc;
 
     fn make_state(local_as: u32, peers: &[(Ipv4Addr, u32)]) -> DaemonState {
         let mut senders = HashMap::new();
@@ -532,7 +530,10 @@ mod tests {
         let r = route_to_proto(peer("10.0.0.3"), n, &route);
         assert_eq!(r.local_pref, Some(200));
         assert_eq!(r.med, Some(100));
-        assert_eq!(r.communities, vec![Community::from_parts(65000, 1).as_u32()]);
+        assert_eq!(
+            r.communities,
+            vec![Community::from_parts(65000, 1).as_u32()]
+        );
         assert_eq!(r.peer_type, proto::PeerType::Internal as i32);
     }
 

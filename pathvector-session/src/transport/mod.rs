@@ -356,11 +356,11 @@ impl<T: BgpTransport> Session<T> {
                 // Lowest-priority arm: outbound UPDATEs from the daemon.
                 // Written directly to the transport; no FSM transition needed.
                 Some(update) = self.update_rx.recv() => {
-                    if let Some(t) = &mut self.transport {
-                        if t.send(BgpMessage::Update(update)).await.is_err() {
-                            self.drop_connection();
-                            return FsmInput::TcpFailed;
-                        }
+                    if let Some(t) = &mut self.transport
+                        && t.send(BgpMessage::Update(update)).await.is_err()
+                    {
+                        self.drop_connection();
+                        return FsmInput::TcpFailed;
                     }
                     // Not yet Established, or send succeeded — loop.
                 }
@@ -394,11 +394,11 @@ impl<T: BgpTransport> Session<T> {
                     self.drop_connection();
                 }
                 FsmOutput::SendMessage(msg) => {
-                    if let Some(t) = &mut self.transport {
-                        if t.send(msg).await.is_err() {
-                            self.drop_connection();
-                            return false;
-                        }
+                    if let Some(t) = &mut self.transport
+                        && t.send(msg).await.is_err()
+                    {
+                        self.drop_connection();
+                        return false;
                     }
                 }
                 FsmOutput::StartHoldTimer(d) => {
