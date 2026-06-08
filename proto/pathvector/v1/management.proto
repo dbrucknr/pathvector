@@ -1,0 +1,197 @@
+syntax = "proto3";
+
+package pathvector.v1;
+
+// ── Common types ──────────────────────────────────────────────────────────────
+
+/// BGP session state for a configured peer.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_IDLE        = 1;
+  SESSION_STATE_ESTABLISHED = 2;
+}
+
+/// Whether a peer is iBGP (same AS) or eBGP (different AS).
+enum PeerType {
+  PEER_TYPE_UNSPECIFIED = 0;
+  PEER_TYPE_EXTERNAL    = 1;
+  PEER_TYPE_INTERNAL    = 2;
+}
+
+/// BGP ORIGIN path attribute (RFC 4271 §4.3).
+enum Origin {
+  ORIGIN_IGP        = 0;
+  ORIGIN_EGP        = 1;
+  ORIGIN_INCOMPLETE = 2;
+}
+
+/// One segment of a BGP AS_PATH attribute (RFC 4271 §4.3).
+///
+/// A path is composed of one or more segments, each of which is either an
+/// ordered sequence (the common case) or an unordered set (produced by
+/// aggregation).  Confederation segments (RFC 5065) are preserved for
+/// operators running confederation topologies.
+message AsSegment {
+  enum Type {
+    TYPE_UNSPECIFIED     = 0;
+    TYPE_SEQUENCE        = 1;  // AS_SEQUENCE — ordered list
+    TYPE_SET             = 2;  // AS_SET — unordered, from aggregation
+    TYPE_CONFED_SEQUENCE = 3;  // AS_CONFED_SEQUENCE — ordered, intra-confed
+    TYPE_CONFED_SET      = 4;  // AS_CONFED_SET — unordered, intra-confed
+  }
+  Type            type = 1;
+  repeated uint32 asns = 2;
+}
+
+/// RFC 8092 LARGE_COMMUNITY — three 4-byte unsigned integers.
+message LargeCommunity {
+  uint32 global_admin = 1;
+  uint32 local_data1  = 2;
+  uint32 local_data2  = 3;
+}
+
+/// BGP AGGREGATOR attribute — identifies the router that created an aggregate.
+message Aggregator {
+  /// AS number of the aggregating router.
+  uint32 asn     = 1;
+  /// BGP ID (router-id) of the aggregating router in dotted-decimal notation.
+  string address = 2;
+}
+
+/// A single BGP route with all path attributes intact.
+///
+/// Peer address is included so callers can correlate routes to sessions without
+/// a separate lookup.
+message Route {
+  /// Advertised prefix in CIDR notation, e.g. "10.0.0.0/8".
+  string prefix = 1;
+  /// Dotted-decimal address of the peer that sent this route.
+  string peer_address = 2;
+  /// Whether the peer is iBGP or eBGP.
+  PeerType peer_type = 3;
+  /// Forwarding next-hop address in dotted-decimal; empty string if absent.
+  string next_hop = 4;
+  /// AS_PATH segments in order; empty for locally originated routes.
+  repeated AsSegment as_path = 5;
+  /// ORIGIN attribute.
+  Origin origin = 6;
+  /// LOCAL_PREF (RFC 4271 §5.1.5); present for iBGP routes, absent otherwise.
+  optional uint32 local_pref = 7;
+  /// MULTI_EXIT_DISC (RFC 4271 §5.1.4); absent if the peer did not advertise it.
+  optional uint32 med = 8;
+  /// Standard BGP communities (RFC 1997), encoded as raw uint32 values.
+  /// Decode as high 16 bits = AS, low 16 bits = value.
+  repeated uint32 communities = 9;
+  /// Large communities (RFC 8092).
+  repeated LargeCommunity large_communities = 10;
+  /// Extended communities (RFC 4360), each serialised as exactly 8 bytes.
+  repeated bytes extended_communities = 11;
+  /// True if the ATOMIC_AGGREGATE attribute is present (RFC 4271 §5.1.6).
+  bool atomic_aggregate = 12;
+  /// AGGREGATOR attribute (RFC 4271 §5.1.7); absent if not set.
+  optional Aggregator aggregator = 13;
+}
+
+// ── Peer service ──────────────────────────────────────────────────────────────
+
+service PeerService {
+  /// Returns the state of every configured peer.
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  /// Returns the state of a single peer identified by its IP address.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc GetPeer(GetPeerRequest) returns (PeerState);
+}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated PeerState peers = 1;
+}
+
+message GetPeerRequest {
+  /// Dotted-decimal IPv4 address of the peer to look up.
+  string address = 1;
+}
+
+/// Operational state of a single BGP peer.
+message PeerState {
+  /// Configured peer IP address in dotted-decimal notation.
+  string address = 1;
+  /// Remote AS number from configuration.
+  uint32 remote_as = 2;
+  /// Local AS number.
+  uint32 local_as = 3;
+  /// Current BGP FSM state.
+  SessionState session_state = 4;
+  /// Peer relationship type; UNSPECIFIED when the session is not established.
+  PeerType peer_type = 5;
+  /// Negotiated hold-timer value in seconds; 0 if not established.
+  uint32 hold_time = 6;
+  /// Seconds since the session reached Established; 0 if not established.
+  uint64 uptime_seconds = 7;
+  /// Routes stored in Adj-RIB-In (pre-policy, all prefixes received from peer).
+  uint32 prefixes_received = 8;
+  /// Routes from this peer that are currently the best path in the Loc-RIB.
+  uint32 prefixes_accepted = 9;
+  /// Routes currently being advertised to this peer (Adj-RIB-Out size).
+  uint32 prefixes_advertised = 10;
+}
+
+// ── RIB service ───────────────────────────────────────────────────────────────
+
+service RibService {
+  /// Returns the best route for a single prefix.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — prefix is not valid CIDR notation
+  rpc GetBestRoute(GetBestRouteRequest) returns (RouteResponse);
+
+  /// Returns every best route in the Loc-RIB, optionally filtered by peer.
+  ///
+  /// If peer_address is non-empty, only routes whose best-path winner is that
+  /// peer are returned.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — peer_address is non-empty and not a valid IPv4 address
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+
+  /// Returns all candidate routes (from all peers) for a single prefix.
+  ///
+  /// Candidates are routes that passed import policy and are tracked in the
+  /// Loc-RIB candidate map.  The best route among them is indicated by the
+  /// RouteResponse returned from GetBestRoute.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — prefix is not valid CIDR notation
+  rpc ListCandidates(ListCandidatesRequest) returns (ListRoutesResponse);
+}
+
+message GetBestRouteRequest {
+  /// Prefix in CIDR notation, e.g. "10.0.0.0/8".
+  string prefix = 1;
+}
+
+message RouteResponse {
+  /// True if a best route exists for the requested prefix.
+  bool found = 1;
+  /// The best route; present only when found is true.
+  optional Route route = 2;
+}
+
+message ListRoutesRequest {
+  /// If non-empty, return only routes whose best-path winner is this peer.
+  /// Dotted-decimal IPv4 address.
+  string peer_address = 1;
+}
+
+message ListRoutesResponse {
+  repeated Route routes = 1;
+}
+
+message ListCandidatesRequest {
+  /// Prefix in CIDR notation for which to list all candidate routes.
+  string prefix = 1;
+}

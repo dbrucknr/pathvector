@@ -10,6 +10,7 @@ use serde::Deserialize;
 /// local_as  = 65002
 /// bgp_id    = "127.0.0.2"
 /// hold_time = 90          # optional, default 90 s
+/// grpc_port = 50051       # optional, default 50051
 ///
 /// [[peers]]
 /// address   = "127.0.0.1"
@@ -29,10 +30,21 @@ pub struct DaemonConfig {
     pub bgp_id: Ipv4Addr,
     #[serde(default = "default_hold_time")]
     pub hold_time: u16,
+    /// TCP port on which the gRPC management API listens.
+    ///
+    /// Binds on all interfaces (`0.0.0.0:<grpc_port>`).  Set to `0` to
+    /// disable the API entirely (not yet implemented — the server always
+    /// starts when the daemon runs).
+    #[serde(default = "default_grpc_port")]
+    pub grpc_port: u16,
 }
 
 fn default_hold_time() -> u16 {
     90
+}
+
+fn default_grpc_port() -> u16 {
+    50051
 }
 
 /// TOML representation of the import policy default action for a peer.
@@ -122,6 +134,29 @@ fn default_bgp_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_grpc_port_defaults_to_50051() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.daemon.grpc_port, 50051);
+    }
+
+    #[test]
+    fn test_config_grpc_port_explicit() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+grpc_port = 9090
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.daemon.grpc_port, 9090);
+    }
 
     #[test]
     fn test_config_defaults_hold_time_and_port() {

@@ -12,7 +12,7 @@ use crate::{outcome::Decision, route::BgpRoute};
 /// For simple cases use the built-in actions directly. For compound cases —
 /// "set local-pref, add a community, then accept" — use [`ActionSequence`],
 /// which chains multiple actions with one vtable call per step.
-pub trait Action<R: BgpRoute> {
+pub trait Action<R: BgpRoute>: Send + Sync {
     /// Applies this action to `route` and returns the resulting [`Decision`].
     fn apply(&self, route: &mut R) -> Decision;
 }
@@ -363,7 +363,7 @@ impl<R: BgpRoute> Action<R> for RemoveLargeCommunity {
 ///     .then(Accept);
 /// ```
 pub struct ActionSequence<R: BgpRoute> {
-    steps: Vec<Box<dyn Action<R>>>,
+    steps: Vec<Box<dyn Action<R> + Send + Sync>>,
 }
 
 impl<R: BgpRoute> ActionSequence<R> {
@@ -375,7 +375,7 @@ impl<R: BgpRoute> ActionSequence<R> {
 
     /// Appends a step to the sequence and returns `self` for chaining.
     #[must_use]
-    pub fn then<A: Action<R> + 'static>(mut self, action: A) -> Self {
+    pub fn then<A: Action<R> + Send + Sync + 'static>(mut self, action: A) -> Self {
         self.steps.push(Box::new(action));
         self
     }

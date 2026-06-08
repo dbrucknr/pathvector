@@ -15,7 +15,7 @@ use crate::{
 /// This trait is sealed — it cannot be implemented outside this crate.
 /// Users compose policies by creating [`Term<C, A>`] values, not by
 /// implementing `EvaluateTerm` directly.
-pub(crate) trait EvaluateTerm<R: BgpRoute> {
+pub(crate) trait EvaluateTerm<R: BgpRoute>: Send + Sync {
     /// Evaluates this term against `route`.
     ///
     /// Returns `Some(decision)` if the condition matched — `decision` is
@@ -125,8 +125,8 @@ impl<R: BgpRoute> Policy<R> {
     /// if all earlier terms' conditions failed to match or returned `Next`.
     pub fn add_term<C, A>(&mut self, term: Term<C, A>)
     where
-        C: Condition<R> + 'static,
-        A: Action<R> + 'static,
+        C: Condition<R> + Send + Sync + 'static,
+        A: Action<R> + Send + Sync + 'static,
     {
         self.terms.push(Box::new(term));
     }
@@ -204,8 +204,8 @@ impl<R: BgpRoute> PolicyBuilder<R> {
     #[must_use]
     pub fn term<C, A>(mut self, condition: C, action: A) -> Self
     where
-        C: Condition<R> + 'static,
-        A: Action<R> + 'static,
+        C: Condition<R> + Send + Sync + 'static,
+        A: Action<R> + Send + Sync + 'static,
     {
         self.terms.push(Box::new(Term::new(condition, action)));
         self

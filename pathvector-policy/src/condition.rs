@@ -10,7 +10,7 @@ use crate::route::BgpRoute;
 ///
 /// Implement this trait to create custom match logic. The built-in conditions
 /// cover the most common BGP policy match criteria.
-pub trait Condition<R: BgpRoute> {
+pub trait Condition<R: BgpRoute>: Send + Sync {
     /// Returns `true` if this condition matches the given route.
     fn matches(&self, route: &R) -> bool;
 }
@@ -91,7 +91,7 @@ impl<A: IpAddress> PrefixListCondition<A> {
     }
 }
 
-impl<A: IpAddress, R: BgpRoute<Addr = A>> Condition<R> for PrefixListCondition<A> {
+impl<A: IpAddress + Send + Sync, R: BgpRoute<Addr = A>> Condition<R> for PrefixListCondition<A> {
     fn matches(&self, route: &R) -> bool {
         self.set.contains_ip(route.nlri().prefix().masked().ip())
     }

@@ -1,8 +1,10 @@
 mod config;
+mod grpc;
 
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
 };
 
 use pathvector_policy::{Decision, DefaultAction, Policy};
@@ -12,7 +14,7 @@ use pathvector_session::{
     transport::{self, SessionConfig, SessionEvent},
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 #[tokio::main]
 async fn main() {
@@ -227,18 +229,24 @@ fn propagate_prefix(
 /// The struct owns no I/O — callers hold the session handles and event channel,
 /// making the routing logic fully unit-testable without real TCP connections.
 struct DaemonState {
-    local_as: u32,
-    local_bgp_id: Ipv4Addr,
-    loc_rib: LocRib<Ipv4Addr>,
-    import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
-    export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
-    adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
-    adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
+    pub(crate) local_as: u32,
+    pub(crate) local_bgp_id: Ipv4Addr,
+    pub(crate) loc_rib: LocRib<Ipv4Addr>,
+    pub(crate) import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
+    pub(crate) export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
+    pub(crate) adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
+    pub(crate) adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
     /// Static peer type derived from config; used to reset `AdjRibOut` on reconnect.
-    peer_config_types: HashMap<Ipv4Addr, PeerType>,
+    pub(crate) peer_config_types: HashMap<Ipv4Addr, PeerType>,
     /// Live session state: present while a peer is Established, absent otherwise.
-    peer_types: HashMap<Ipv4Addr, PeerType>,
-    update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+    pub(crate) peer_types: HashMap<Ipv4Addr, PeerType>,
+    pub(crate) update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+    /// Remote AS number for each configured peer (immutable after startup).
+    pub(crate) peer_remote_as: HashMap<Ipv4Addr, u32>,
+    /// Wall-clock instant at which each peer last reached Established.
+    pub(crate) established_at: HashMap<Ipv4Addr, std::time::Instant>,
+    /// Negotiated hold-timer value per established peer.
+    pub(crate) hold_times: HashMap<Ipv4Addr, u16>,
 }
 
 impl DaemonState {
@@ -288,6 +296,11 @@ impl DaemonState {
             })
             .collect();
 
+        let peer_remote_as = peers
+            .iter()
+            .map(|p| (p.address, p.remote_as))
+            .collect();
+
         Self {
             local_as,
             local_bgp_id,
@@ -299,6 +312,9 @@ impl DaemonState {
             peer_config_types,
             peer_types: HashMap::new(),
             update_senders,
+            peer_remote_as,
+            established_at: HashMap::new(),
+            hold_times: HashMap::new(),
         }
     }
 
@@ -317,6 +333,8 @@ impl DaemonState {
     ) {
         let peer_id = PeerId::from(peer_ip);
         self.peer_types.insert(peer_ip, peer_type);
+        self.established_at.insert(peer_ip, std::time::Instant::now());
+        self.hold_times.insert(peer_ip, hold_time);
 
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = AdjRibOut::new(peer_id, peer_type);
@@ -370,6 +388,8 @@ impl DaemonState {
     fn on_terminated(&mut self, peer_ip: Ipv4Addr) {
         let peer_id = PeerId::from(peer_ip);
         self.peer_types.remove(&peer_ip);
+        self.established_at.remove(&peer_ip);
+        self.hold_times.remove(&peer_ip);
 
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
@@ -585,18 +605,31 @@ async fn run(cfg: config::Config) {
     // Drop our sender copy so the channel closes when all peer tasks exit.
     drop(event_tx);
 
-    let mut state = DaemonState::new(local_as, local_bgp_id, &cfg.peers, update_senders);
+    let state = Arc::new(RwLock::new(DaemonState::new(
+        local_as,
+        local_bgp_id,
+        &cfg.peers,
+        update_senders,
+    )));
+
+    // Spawn the gRPC management API server alongside the BGP event loop.
+    let grpc_state = Arc::clone(&state);
+    let grpc_port = cfg.daemon.grpc_port;
+    tokio::spawn(async move {
+        grpc::serve(grpc_state, grpc_port).await;
+    });
 
     while let Some((peer_ip, event)) = event_rx.recv().await {
+        let mut s = state.write().await;
         match event {
             SessionEvent::Established(info) => {
-                state.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
+                s.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
             }
             SessionEvent::Terminated => {
-                state.on_terminated(peer_ip);
+                s.on_terminated(peer_ip);
             }
             SessionEvent::RouteUpdate(msg) => {
-                state.on_route_update(peer_ip, msg);
+                s.on_route_update(peer_ip, msg);
             }
         }
     }

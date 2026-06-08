@@ -1,0 +1,21 @@
+//! Code generation for the gRPC management API.
+//!
+//! Requires `protoc` on `PATH`.  On macOS: `brew install protobuf`.
+//! On Debian/Ubuntu: `apt install -y protobuf-compiler`.
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
+    let proto_root = std::path::Path::new(&manifest)
+        .parent()
+        .expect("pathvectord crate must live inside a workspace directory")
+        .join("proto");
+
+    tonic_build::configure()
+        .build_client(false)
+        .compile_protos(
+            &[proto_root.join("pathvector/v1/management.proto")],
+            &[&proto_root],
+        )?;
+
+    Ok(())
+}
