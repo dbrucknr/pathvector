@@ -1161,6 +1161,42 @@ mod tests {
         assert_eq!(info.unwrap().peer_as, 131_073);
     }
 
+    // ── resolve_as: non-FourByteAsn capabilities yield the None branch ───────
+
+    #[test]
+    fn test_resolve_as_falls_back_to_my_as_when_no_four_byte_asn_cap() {
+        // When the peer sends only RouteRefresh (no FourByteAsn capability),
+        // `resolve_as` iterates RouteRefresh, the `else { None }` branch fires,
+        // find_map returns None, and the fallback `u32::from(open.my_as)` is used.
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        let peer = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::RouteRefresh], // no FourByteAsn
+        });
+        fsm.process(FsmInput::MessageReceived(peer));
+        let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+
+        let info = outputs
+            .iter()
+            .find_map(|o| {
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("SessionEstablished");
+
+        // peer_as should be the 2-byte my_as value since there is no FourByteAsn cap.
+        assert_eq!(info.peer_as, 65002);
+    }
+
     // ── No configured peer_as → accept any ───────────────────────────────────
 
     #[test]

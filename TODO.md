@@ -214,6 +214,11 @@ Not yet started. Key work items:
 - IPv6 in the daemon — the session layer already speaks IPv6 via MP_REACH_NLRI, but
   `pathvectord` is hardcoded to `Route<Ipv4Addr>`. Extending to IPv6 requires a
   dual-stack RIB or a generic event dispatch on address family.
+  **IPv4 MP path done (2026-06-08):** `handle_update` now processes `MP_UNREACH_NLRI`
+  and `MP_REACH_NLRI` attributes for AFI/SAFI=IPv4 unicast. Peers that send IPv4
+  withdrawals or announcements via the multiprotocol attributes instead of the
+  traditional fields are handled correctly. Non-IPv4 AFI/SAFIs are logged at DEBUG
+  and skipped. Full IPv6 RIB support still requires the dual-stack work above.
 
 - gRPC management API — define `.proto` schema for:
   - Peer state queries (session state, uptime, prefixes received/advertised)

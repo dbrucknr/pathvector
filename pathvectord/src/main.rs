@@ -8,10 +8,10 @@ use std::{
 use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
-    message::{Capability, PathAttribute, UpdateMessage},
+    message::{Capability, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage},
     transport::{self, SessionConfig, SessionEvent},
 };
-use pathvector_types::{AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
+use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -454,12 +454,44 @@ impl DaemonState {
             .copied()
             .unwrap_or(PeerType::External);
 
-        let affected: Vec<Nlri<Ipv4Addr>> = msg
+        // Collect all IPv4 prefixes that may change best-path: traditional
+        // fields plus any IPv4 NLRIs carried in MP_REACH/MP_UNREACH attributes
+        // (RFC 4760). These are used after `handle_update` to drive outbound
+        // propagation, so they must be collected before `msg` is moved.
+        let mut affected: Vec<Nlri<Ipv4Addr>> = msg
             .withdrawn
             .iter()
             .chain(msg.announced.iter())
             .copied()
             .collect();
+
+        for attr in &msg.attributes {
+            match attr {
+                PathAttribute::MpUnreachNlri(MpUnreachNlri { afi_safi, prefixes })
+                    if *afi_safi == AfiSafi::IPV4_UNICAST =>
+                {
+                    affected.extend(prefixes.iter().filter_map(|p| {
+                        if let Prefix::V4(nlri) = p {
+                            Some(*nlri)
+                        } else {
+                            None
+                        }
+                    }));
+                }
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi, prefixes, ..
+                }) if *afi_safi == AfiSafi::IPV4_UNICAST => {
+                    affected.extend(prefixes.iter().filter_map(|p| {
+                        if let Prefix::V4(nlri) = p {
+                            Some(*nlri)
+                        } else {
+                            None
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
 
         let Some(policy) = self.import_policies.get(&peer_ip) else {
             tracing::error!(peer = %peer_ip, "import_policies missing peer — skipping RouteUpdate");
@@ -622,85 +654,142 @@ fn handle_update(
     peer_type: PeerType,
 ) {
     let withdrawn_count = msg.withdrawn.len();
-    let announced_count = msg.announced.len();
 
+    // ── Traditional IPv4 withdrawals (RFC 4271 §4.3) ──────────────────────
     for nlri in &msg.withdrawn {
         adj_rib_in.withdraw(nlri);
         loc_rib.withdraw(&peer, nlri);
     }
 
+    // ── Single pass over path attributes ─────────────────────────────────
+    // Extracts scalar attributes shared by all announced NLRIs, and collects
+    // IPv4 NLRIs from MP_REACH_NLRI / MP_UNREACH_NLRI (RFC 4760). Non-IPv4
+    // AFI/SAFIs are logged and skipped; the daemon is IPv4-only for now.
+    let mut origin = Origin::Incomplete;
+    let mut as_path = AsPath::new();
+    let mut next_hop: Option<NextHop> = None;
+    let mut local_pref: Option<LocalPref> = None;
+    let mut med: Option<Med> = None;
+    let mut communities = Vec::new();
+    let mut large_communities = Vec::new();
+    let mut extended_communities = Vec::new();
+    let mut atomic_aggregate = false;
+    let mut aggregator = None;
+    // (nlri, next_hop) pairs from MP_REACH_NLRI; next_hop is mandatory there.
+    let mut mp_v4_announced: Vec<(Nlri<Ipv4Addr>, NextHop)> = Vec::new();
+    let mut mp_v4_withdrawn: Vec<Nlri<Ipv4Addr>> = Vec::new();
+
+    for attr in &msg.attributes {
+        match attr {
+            PathAttribute::Origin(o) => origin = *o,
+            PathAttribute::AsPath(p) => as_path = p.clone(),
+            PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
+            PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
+            PathAttribute::Med(m) => med = Some(Med::new(*m)),
+            PathAttribute::Communities(cs) => communities.clone_from(cs),
+            PathAttribute::LargeCommunities(lcs) => large_communities.clone_from(lcs),
+            PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
+            PathAttribute::AtomicAggregate => atomic_aggregate = true,
+            PathAttribute::Aggregator(a) => aggregator = Some(*a),
+            PathAttribute::MpReachNlri(mp) => {
+                if mp.afi_safi == AfiSafi::IPV4_UNICAST {
+                    for prefix in &mp.prefixes {
+                        if let Prefix::V4(nlri) = prefix {
+                            mp_v4_announced.push((*nlri, mp.next_hop));
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        peer = %peer,
+                        afi_safi = %mp.afi_safi,
+                        "MP_REACH_NLRI for unsupported AFI/SAFI — skipping"
+                    );
+                }
+            }
+            PathAttribute::MpUnreachNlri(mp) => {
+                if mp.afi_safi == AfiSafi::IPV4_UNICAST {
+                    for prefix in &mp.prefixes {
+                        if let Prefix::V4(nlri) = prefix {
+                            mp_v4_withdrawn.push(*nlri);
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        peer = %peer,
+                        afi_safi = %mp.afi_safi,
+                        "MP_UNREACH_NLRI for unsupported AFI/SAFI — skipping"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── MP_UNREACH_NLRI withdrawals (RFC 4760) ────────────────────────────
+    let mp_withdrawn_count = mp_v4_withdrawn.len();
+    for nlri in &mp_v4_withdrawn {
+        adj_rib_in.withdraw(nlri);
+        loc_rib.withdraw(&peer, nlri);
+    }
+
+    // ── Announcements: traditional NLRIs + MP_REACH_NLRI V4 prefixes ─────
+    // Both paths share the same scalar attributes extracted above. The only
+    // difference is the next-hop source: traditional NLRIs use the NEXT_HOP
+    // path attribute (optional); MP_REACH_NLRI carries next-hop inline
+    // (mandatory) and takes precedence when present.
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
-    if announced_count > 0 {
-        let mut origin = Origin::Incomplete;
-        let mut as_path = AsPath::new();
-        let mut next_hop: Option<NextHop> = None;
-        let mut local_pref: Option<LocalPref> = None;
-        let mut med: Option<Med> = None;
-        let mut communities = Vec::new();
-        let mut large_communities = Vec::new();
-        let mut extended_communities = Vec::new();
-        let mut atomic_aggregate = false;
-        let mut aggregator = None;
+    let all_announced = msg
+        .announced
+        .into_iter()
+        .map(|nlri| (nlri, next_hop))
+        .chain(
+            mp_v4_announced
+                .into_iter()
+                .map(|(nlri, nh)| (nlri, Some(nh))),
+        );
 
-        for attr in &msg.attributes {
-            match attr {
-                PathAttribute::Origin(o) => origin = *o,
-                PathAttribute::AsPath(p) => as_path = p.clone(),
-                PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
-                PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
-                PathAttribute::Med(m) => med = Some(Med::new(*m)),
-                PathAttribute::Communities(cs) => communities.clone_from(cs),
-                PathAttribute::LargeCommunities(lcs) => large_communities.clone_from(lcs),
-                PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
-                PathAttribute::AtomicAggregate => atomic_aggregate = true,
-                PathAttribute::Aggregator(a) => aggregator = Some(*a),
-                _ => {}
-            }
+    for (nlri, nh) in all_announced {
+        let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+        if let Some(nh) = nh {
+            builder = builder.next_hop(nh);
+        }
+        if let Some(lp) = local_pref {
+            builder = builder.local_pref(lp);
+        }
+        if let Some(m) = med {
+            builder = builder.med(m);
+        }
+        for &c in &communities {
+            builder = builder.community(c);
+        }
+        for &lc in &large_communities {
+            builder = builder.large_community(lc);
+        }
+        for &ec in &extended_communities {
+            builder = builder.extended_community(ec);
+        }
+        if atomic_aggregate {
+            builder = builder.atomic_aggregate();
+        }
+        if let Some(agg) = aggregator {
+            builder = builder.aggregator(agg);
         }
 
-        for nlri in msg.announced {
-            let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
-            if let Some(nh) = next_hop {
-                builder = builder.next_hop(nh);
-            }
-            if let Some(lp) = local_pref {
-                builder = builder.local_pref(lp);
-            }
-            if let Some(m) = med {
-                builder = builder.med(m);
-            }
-            for &c in &communities {
-                builder = builder.community(c);
-            }
-            for &lc in &large_communities {
-                builder = builder.large_community(lc);
-            }
-            for &ec in &extended_communities {
-                builder = builder.extended_community(ec);
-            }
-            if atomic_aggregate {
-                builder = builder.atomic_aggregate();
-            }
-            if let Some(agg) = aggregator {
-                builder = builder.aggregator(agg);
-            }
+        let raw = builder.build();
+        // Store the pre-policy route for soft reconfiguration.
+        adj_rib_in.insert(raw.clone());
 
-            let raw = builder.build();
-            // Store the pre-policy route for soft reconfiguration.
-            adj_rib_in.insert(raw.clone());
-
-            // Apply import policy to a working copy; only insert if accepted.
-            let mut route = raw;
-            match policy.evaluate(&mut route) {
-                Decision::Accept => {
-                    loc_rib.insert(peer, route);
-                    accepted += 1;
-                }
-                Decision::Reject | Decision::Next => {
-                    rejected += 1;
-                }
+        // Apply import policy to a working copy; only insert if accepted.
+        let mut route = raw;
+        match policy.evaluate(&mut route) {
+            Decision::Accept => {
+                loc_rib.insert(peer, route);
+                accepted += 1;
+            }
+            Decision::Reject | Decision::Next => {
+                rejected += 1;
             }
         }
     }
@@ -708,6 +797,7 @@ fn handle_update(
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
+        mp_withdrawn = mp_withdrawn_count,
         accepted,
         rejected,
         rib_size = loc_rib.len(),
@@ -1273,6 +1363,254 @@ mod tests {
             PeerType::External,
         );
         assert_eq!(rib.len(), 1);
+    }
+
+    // ── MP_UNREACH_NLRI / MP_REACH_NLRI (RFC 4760) ───────────────────────────
+
+    #[test]
+    fn test_handle_update_mp_unreach_withdraws_ipv4_route() {
+        // Peer first announces a route via the traditional field, then
+        // withdraws it via MP_UNREACH_NLRI (AFI=1, SAFI=1) — valid per RFC 4760
+        // and done by some modern implementations when multiprotocol is negotiated.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib.len(), 1);
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    prefixes: vec![Prefix::V4(nlri("10.0.0.0/8"))],
+                })],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert!(
+            rib.is_empty(),
+            "MP_UNREACH_NLRI should have removed the route"
+        );
+        assert!(ari.is_empty(), "AdjRibIn should also be cleared");
+    }
+
+    #[test]
+    fn test_handle_update_mp_reach_announces_ipv4_route() {
+        // Peer announces via MP_REACH_NLRI instead of the traditional NLRI field.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::LocalPref(150),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV4_UNICAST,
+                        next_hop: NextHop::V4("10.0.0.2".parse().unwrap()),
+                        prefixes: vec![
+                            Prefix::V4(nlri("192.168.1.0/24")),
+                            Prefix::V4(nlri("192.168.2.0/24")),
+                        ],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert_eq!(rib.len(), 2, "both MP_REACH prefixes should be in LocRib");
+        assert_eq!(ari.len(), 2, "both MP_REACH prefixes should be in AdjRibIn");
+
+        let route = rib.best(&nlri("192.168.1.0/24")).unwrap();
+        assert_eq!(route.local_pref, Some(LP::new(150)));
+        assert_eq!(
+            route.next_hop,
+            Some(NextHop::V4("10.0.0.2".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_handle_update_mp_reach_mixed_with_traditional() {
+        // Traditional NLRI + MP_REACH_NLRI V4 in the same UPDATE — both should land.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::NextHop("10.0.0.2".parse().unwrap()),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV4_UNICAST,
+                        next_hop: NextHop::V4("10.0.0.3".parse().unwrap()),
+                        prefixes: vec![Prefix::V4(nlri("172.16.0.0/12"))],
+                    }),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert_eq!(rib.len(), 2);
+        // Traditional NLRI uses NEXT_HOP attribute
+        assert_eq!(
+            rib.best(&nlri("10.0.0.0/8")).unwrap().next_hop,
+            Some(NextHop::V4("10.0.0.2".parse().unwrap()))
+        );
+        // MP_REACH_NLRI uses its own embedded next-hop
+        assert_eq!(
+            rib.best(&nlri("172.16.0.0/12")).unwrap().next_hop,
+            Some(NextHop::V4("10.0.0.3".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_handle_update_mp_unreach_non_ipv4_is_skipped() {
+        // MP_UNREACH_NLRI for a non-IPv4 AFI/SAFI is silently skipped —
+        // no panic, no crash, IPv4 RIB unchanged.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    prefixes: vec![], // IPv6 prefixes; we have none to construct here
+                })],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert!(rib.is_empty());
+    }
+
+    #[test]
+    fn test_handle_update_mp_reach_import_policy_applied() {
+        // Import policy must be evaluated for MP_REACH_NLRI routes just as
+        // it is for traditional NLRIs.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV4_UNICAST,
+                        next_hop: NextHop::V4("10.0.0.2".parse().unwrap()),
+                        prefixes: vec![Prefix::V4(nlri("10.0.0.0/8"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &reject_all(),
+            PeerType::External,
+        );
+
+        // Policy rejected it: AdjRibIn stores the raw route, LocRib stays empty.
+        assert_eq!(ari.len(), 1, "pre-policy route stored in AdjRibIn");
+        assert!(rib.is_empty(), "rejected route must not enter LocRib");
+    }
+
+    #[test]
+    fn test_on_route_update_mp_unreach_propagates_withdraw_to_peers() {
+        // End-to-end: a peer withdraws via MP_UNREACH_NLRI, and the best-path
+        // change must reach all other established peers as a WITHDRAW UPDATE.
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+
+        // Peer A announces 10.0.0.0/8 via traditional field.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        // Drain the announcement that went to peer B.
+        let _ = rxs.get_mut(&peer_b).unwrap().try_recv();
+
+        // Peer A now withdraws via MP_UNREACH_NLRI.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    prefixes: vec![Prefix::V4(nlri("10.0.0.0/8"))],
+                })],
+                announced: vec![],
+            },
+        );
+
+        assert_eq!(
+            state.loc_rib.len(),
+            0,
+            "LocRib must be empty after MP_UNREACH_NLRI"
+        );
+
+        let withdraw_msg = rxs
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer B should receive a WITHDRAW");
+        assert!(
+            withdraw_msg.withdrawn.contains(&nlri("10.0.0.0/8")),
+            "WITHDRAW must contain the MP-withdrawn prefix"
+        );
     }
 
     // ── import policy ─────────────────────────────────────────────────────────
@@ -2241,6 +2579,288 @@ mod tests {
         state.on_established(unknown, PeerType::External, 65099, 90);
         // Invariant: no state changes (the unknown IP is absent from maps).
         assert!(!state.peer_types.contains_key(&peer_ip));
+    }
+
+    // ── on_established error paths ────────────────────────────────────────────
+
+    #[test]
+    fn test_on_established_missing_adj_rib_out_logs_and_returns() {
+        // export_policies is present but adj_ribs_out was removed — the second
+        // let-else guard fires; must not panic and peer_type is still recorded.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.adj_ribs_out.remove(&peer_ip);
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+
+        // peer_type is inserted before the guard, so it should be present.
+        assert!(state.peer_types.contains_key(&peer_ip));
+    }
+
+    #[test]
+    fn test_on_established_missing_update_sender_logs_and_returns() {
+        // export_policies and adj_ribs_out are present but update_senders was
+        // removed — the third let-else guard fires; must not panic.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.update_senders.remove(&peer_ip);
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+
+        assert!(state.peer_types.contains_key(&peer_ip));
+    }
+
+    // ── on_terminated propagation error paths ────────────────────────────────
+
+    #[test]
+    fn test_on_terminated_propagation_missing_adj_rib_out_continues() {
+        // Peer B's adj_rib_out is removed. When peer A terminates, propagation
+        // to peer B hits the adj_rib_out guard and continues — no panic.
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.adj_ribs_out.remove(&peer_b);
+
+        state.on_terminated(peer_a);
+
+        assert!(!state.peer_types.contains_key(&peer_a));
+        assert!(state.peer_types.contains_key(&peer_b));
+    }
+
+    #[test]
+    fn test_on_terminated_propagation_missing_update_sender_continues() {
+        // Peer B's update_sender is removed. Propagation hits the update_sender
+        // guard and continues — no panic.
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.update_senders.remove(&peer_b);
+
+        state.on_terminated(peer_a);
+
+        assert!(!state.peer_types.contains_key(&peer_a));
+    }
+
+    // ── on_route_update error paths ───────────────────────────────────────────
+
+    #[test]
+    fn test_on_route_update_missing_adj_rib_in_logs_and_returns() {
+        // import_policy is present but adj_ribs_in was removed — the second
+        // let-else guard fires; must not panic and RIB stays empty.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.adj_ribs_in.remove(&peer_ip);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        assert_eq!(state.loc_rib.len(), 0);
+    }
+
+    #[test]
+    fn test_on_route_update_propagation_missing_adj_rib_out_continues() {
+        // Peer B's adj_rib_out is removed. When peer A sends an UPDATE,
+        // propagation to peer B hits the adj_rib_out guard and continues.
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.adj_ribs_out.remove(&peer_b);
+
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        // Route lands in the RIB; missing peer B did not cause a panic.
+        assert_eq!(state.loc_rib.len(), 1);
+    }
+
+    #[test]
+    fn test_on_route_update_propagation_missing_update_sender_continues() {
+        // Peer B's update_sender is removed. Propagation hits the update_sender
+        // guard and continues — no panic and route still lands.
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.update_senders.remove(&peer_b);
+
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        assert_eq!(state.loc_rib.len(), 1);
+    }
+
+    // ── propagate_prefix channel-full warn paths ──────────────────────────────
+
+    /// Returns a `Sender` whose single-slot channel is already full so that
+    /// the very next `try_send` returns `Err(Full)`.
+    fn full_channel() -> (mpsc::Sender<UpdateMessage>, mpsc::Receiver<UpdateMessage>) {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .expect("pre-fill");
+        (tx, rx)
+    }
+
+    #[test]
+    fn test_propagate_prefix_channel_full_update_dropped() {
+        // Best route → export accepted → INSERT into empty AdjRibOut → try_send
+        // UPDATE fails because the channel is full. Must warn and not panic.
+        let n = nlri("10.0.0.0/8");
+        let mut loc_rib = LocRib::new();
+        loc_rib.insert(
+            peer(),
+            RouteBuilder::new(n, Origin::Igp, AsPath::new()).build(),
+        );
+
+        let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
+        let mut aro = AdjRibOut::new(out_peer, PeerType::External);
+
+        let (tx, _rx) = full_channel();
+        propagate_prefix(
+            n,
+            &loc_rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &tx,
+        );
+        // aro now has the route even though the UPDATE could not be delivered.
+        assert_eq!(aro.len(), 1);
+    }
+
+    #[test]
+    fn test_propagate_prefix_channel_full_split_horizon_eviction_dropped() {
+        // iBGP peer's AdjRibOut has a pre-stored eBGP route. The new best is an
+        // iBGP route → InsertOutcome::Filtered(Some(_)) → WITHDRAW → channel full.
+        let n = nlri("10.0.0.0/8");
+
+        // Best route in LocRib is iBGP-sourced.
+        let mut loc_rib = LocRib::new();
+        loc_rib.insert(
+            peer(),
+            RouteBuilder::new(n, Origin::Igp, AsPath::new())
+                .peer_type(PeerType::Internal)
+                .build(),
+        );
+
+        // iBGP peer's outbound table already holds an eBGP-sourced route.
+        let out_peer = PeerId::new(IpAddr::V4("10.0.0.3".parse().unwrap()));
+        let mut aro = AdjRibOut::new(out_peer, PeerType::Internal);
+        aro.insert(
+            RouteBuilder::new(n, Origin::Igp, AsPath::new())
+                .peer_type(PeerType::External)
+                .build(),
+        );
+
+        let (tx, _rx) = full_channel();
+        propagate_prefix(
+            n,
+            &loc_rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::Internal,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &tx,
+        );
+        // Route was evicted by split-horizon; AdjRibOut should be empty.
+        assert!(aro.is_empty());
+    }
+
+    #[test]
+    fn test_propagate_prefix_channel_full_export_reject_withdraw_dropped() {
+        // Best route exists but export policy rejects it. AdjRibOut had a prior
+        // route → WITHDRAW generated → channel full → warn, no panic.
+        let n = nlri("10.0.0.0/8");
+
+        let mut loc_rib = LocRib::new();
+        loc_rib.insert(
+            peer(),
+            RouteBuilder::new(n, Origin::Igp, AsPath::new()).build(),
+        );
+
+        let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
+        let mut aro = AdjRibOut::new(out_peer, PeerType::External);
+        // Pre-existing route that now needs to be withdrawn.
+        aro.insert(RouteBuilder::new(n, Origin::Igp, AsPath::new()).build());
+
+        let (tx, _rx) = full_channel();
+        propagate_prefix(
+            n,
+            &loc_rib,
+            &mut aro,
+            &reject_all(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &tx,
+        );
+        // Route was removed from AdjRibOut by the reject.
+        assert!(aro.is_empty());
+    }
+
+    #[test]
+    fn test_propagate_prefix_channel_full_no_best_withdraw_dropped() {
+        // No best route in LocRib. AdjRibOut has a stale route → WITHDRAW →
+        // channel full → warn, no panic.
+        let n = nlri("10.0.0.0/8");
+        let loc_rib: LocRib<Ipv4Addr> = LocRib::new(); // empty
+
+        let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
+        let mut aro = AdjRibOut::new(out_peer, PeerType::External);
+        aro.insert(RouteBuilder::new(n, Origin::Igp, AsPath::new()).build());
+
+        let (tx, _rx) = full_channel();
+        propagate_prefix(
+            n,
+            &loc_rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &tx,
+        );
+        assert!(aro.is_empty());
     }
 
     /// When `on_terminated` propagates to other established peers, a ghost peer

@@ -4,6 +4,8 @@ Tracks every RFC that pathvector sets out to implement, the concrete
 requirements it imposes, which module owns each requirement, and the current
 implementation status.
 
+- [RFC-Source](https://datatracker.ietf.org/doc/html/rfc4271)
+
 **Status key**
 - ✅ Implemented and tested
 - ⚠️ Partial — see notes
@@ -231,6 +233,9 @@ retry without them.
 | MP_UNREACH_NLRI (type 15): AFI, SAFI, withdrawn NLRI — IPv6 | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_ipv6_roundtrip` |
 | MP_UNREACH_NLRI: truncated body is an error | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_nlri_too_short_is_error` |
 | MP_UNREACH_NLRI: unknown AFI produces empty prefix list (no panic) | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_unknown_afi_produces_empty_prefixes` |
+| IPv4 MP_UNREACH_NLRI processed by daemon (withdraw from AdjRibIn + LocRib + propagate) | `pathvectord/src/main.rs` | ✅ | `test_handle_update_mp_unreach_withdraws_ipv4_route`, `test_on_route_update_mp_unreach_propagates_withdraw_to_peers` |
+| IPv4 MP_REACH_NLRI processed by daemon (insert into AdjRibIn + LocRib, policy applied) | `pathvectord/src/main.rs` | ✅ | `test_handle_update_mp_reach_announces_ipv4_route`, `test_handle_update_mp_reach_import_policy_applied`, `test_handle_update_mp_reach_mixed_with_traditional` |
+| Non-IPv4 MP_REACH_NLRI / MP_UNREACH_NLRI silently skipped by daemon (no panic) | `pathvectord/src/main.rs` | ✅ | `test_handle_update_mp_unreach_non_ipv4_is_skipped` |
 | IPv6 next-hop may carry both global unicast and link-local addresses | `pathvector-types/src/attr.rs` | ✅ | `test_next_hop_v6_with_link_local`, `test_mp_reach_ipv6_link_local_roundtrip` |
 | AFI and SAFI type registry (IPv4, IPv6, L2VPN, and well-known SAFIs) | `pathvector-types/src/afi.rs` | ✅ | `test_afi_constants`, `test_safi_constants`, `test_afisafi_constants` |
 
@@ -504,7 +509,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 | RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process implemented |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
-| RFC 4760 | Multiprotocol Extensions | ✅ |
+| RFC 4760 | Multiprotocol Extensions | ✅ Wire format + IPv4 daemon processing; IPv6 daemon support deferred (see TODO) |
 | RFC 5492 | Capability Advertisement (supersedes RFC 3392) | ⚠️ Wire format inherited; Unsupported Capability NOTIFICATION and retry not implemented |
 | RFC 6793 | 4-Byte ASN | ✅ |
 | RFC 4724 | Graceful Restart | ⚠️ Capability parsed; FSM restart behaviour not implemented |
