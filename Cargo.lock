@@ -566,6 +566,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathvector-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "prost",
+ "prost-types",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "pathvector-policy"
 version = "0.1.0"
 dependencies = [

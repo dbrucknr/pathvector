@@ -232,9 +232,29 @@ Not yet started. Key work items:
 
 ## pathvector-client
 
-Not yet started. To be added to the workspace when the gRPC management API
-schema is finalised. Will contain generated client stubs so users and the
-`pathvector` CLI can talk to `pathvectord` with a typed Rust API.
+**Done (2026-06-08).** Self-contained gRPC client library for the `pathvectord`
+management API. No dependency on any internal `pathvector-*` crate — all domain
+types are defined independently in `src/types.rs`.
+
+### Done
+
+- `PathvectorClient::connect(addr)` — lazy channel construction; no async required
+- `list_peers()`, `get_peer(addr)` — full `PeerState` conversion from proto
+- `get_best_route(prefix)` → `Option<Route>`, `list_routes(peer_filter)`, `list_candidates(prefix)`
+- `TryFrom` conversion layer (`src/convert.rs`) with explicit error variants:
+  `InvalidAddress`, `UnknownEnumValue`, `BadExtendedCommunityLen`
+- Three error types: `ConnectError`, `ClientError`, `ConvertError` — all with
+  `Display`, `Error::source`, and `From` impls; no `thiserror`
+- 83 unit tests (including 10 proptest properties) + 12 integration tests driven
+  by an in-process mock gRPC server; all pass under `just ci` (MSRV 1.88)
+- Optional `serde` feature flag on all domain types
+
+### Remaining
+
+- `serde` feature: `Serialize`/`Deserialize` derives are gated but not yet
+  implemented on the domain types (blocked on deciding JSON schema conventions)
+- Policy introspection RPC (`ListTerms`, `EvalRoute`) — blocked on
+  `reapply_import_policy` being wired to export propagation in `pathvectord`
 
 ---
 

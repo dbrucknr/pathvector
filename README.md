@@ -83,6 +83,8 @@ See [DAEMON.md](DAEMON.md) for build instructions, configuration reference, and 
 
 pathvector takes correctness seriously. The test suite combines unit tests, compiled documentation examples, property-based tests, and line coverage measurement. See [TESTING.md](TESTING.md) for a full description of the testing philosophy, patterns, and how to run the suite.
 
+If you'd like to run all the CI tests locally, use `just ci`.
+
 ---
 
 ## License

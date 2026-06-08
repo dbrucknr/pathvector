@@ -185,13 +185,12 @@ fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
         .map_or(0, |ari| u32::try_from(ari.len()).unwrap_or(u32::MAX));
 
     // Count best-path wins: routes in the Loc-RIB whose winner is this peer.
-    let prefixes_accepted = u32::try_from(
-        s.loc_rib
-            .best_routes()
-            .filter(|(nlri, _)| s.loc_rib.best_peer(nlri) == Some(peer_id))
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
+    let prefixes_accepted = s
+        .loc_rib
+        .best_routes()
+        .filter(|(nlri, _)| s.loc_rib.best_peer(nlri) == Some(peer_id))
+        .count();
+    let prefixes_accepted = u32::try_from(prefixes_accepted).unwrap_or(u32::MAX);
 
     let prefixes_advertised = s
         .adj_ribs_out

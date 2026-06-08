@@ -44,10 +44,11 @@ proptest = { workspace = true }
 unsafe_code = "forbid"
 
 [lints.clippy]
-all                       = { level = "warn", priority = -1 }
-pedantic                  = { level = "warn", priority = -1 }
-# Allow lints that fire in prost/tonic generated code only
-doc_markdown              = "allow"
+all          = { level = "warn", priority = -1 }
+pedantic     = { level = "warn", priority = -1 }
+# Suppress lints that fire in prost/tonic generated code included via OUT_DIR.
+# clippy uses physical file spans so crate-level allow is the only reliable fix.
+doc_markdown               = "allow"
 trivially_copy_pass_by_ref = "allow"
-default_trait_access      = "allow"
-too_many_lines            = "allow"
+default_trait_access       = "allow"
+too_many_lines             = "allow"
