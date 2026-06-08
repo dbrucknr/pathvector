@@ -575,6 +575,7 @@ dependencies = [
  "prost-types",
  "serde",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
