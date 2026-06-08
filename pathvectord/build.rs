@@ -13,9 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_prost_build::configure()
         .build_client(false)
-        .file_descriptor_set_path(
-            std::path::Path::new(&out_dir).join("pathvector_descriptor.bin"),
-        )
+        .file_descriptor_set_path(std::path::Path::new(&out_dir).join("pathvector_descriptor.bin"))
         .compile_protos(
             &[proto_root.join("pathvector/v1/management.proto")],
             &[proto_root],
