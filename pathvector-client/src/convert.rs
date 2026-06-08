@@ -204,3 +204,781 @@ impl TryFrom<proto::PeerState> for PeerState {
         })
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::error::ConvertError;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a minimal valid proto Route (all required fields populated, all
+    /// optional fields absent) for use as a base in targeted tests.
+    fn minimal_proto_route() -> proto::Route {
+        proto::Route {
+            prefix: "10.0.0.0/8".into(),
+            peer_address: "192.0.2.1".into(),
+            peer_type: 1, // External
+            next_hop: String::new(),
+            as_path: vec![],
+            origin: 0, // Igp
+            local_pref: None,
+            med: None,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            atomic_aggregate: false,
+            aggregator: None,
+        }
+    }
+
+    /// Build a minimal valid proto PeerState.
+    fn minimal_proto_peer_state() -> proto::PeerState {
+        proto::PeerState {
+            address: "192.0.2.1".into(),
+            remote_as: 65001,
+            local_as: 65000,
+            session_state: 1, // Idle
+            peer_type: 0,     // Unspecified → None
+            hold_time: 0,
+            uptime_seconds: 0,
+            prefixes_received: 0,
+            prefixes_accepted: 0,
+            prefixes_advertised: 0,
+        }
+    }
+
+    // ── parse_addr ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_addr_ipv4() {
+        let ip = parse_addr("192.0.2.1").unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    }
+
+    #[test]
+    fn parse_addr_ipv6() {
+        let ip = parse_addr("2001:db8::1").unwrap();
+        assert_eq!(ip, IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()));
+    }
+
+    #[test]
+    fn parse_addr_empty_is_error() {
+        assert!(matches!(
+            parse_addr(""),
+            Err(ConvertError::InvalidAddress(s)) if s.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_addr_garbage_is_error() {
+        assert!(matches!(
+            parse_addr("not-an-ip"),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    // ── parse_addr_opt ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_addr_opt_empty_is_none() {
+        assert_eq!(parse_addr_opt("").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_addr_opt_valid_ipv4() {
+        let ip = parse_addr_opt("10.0.0.1").unwrap();
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    }
+
+    #[test]
+    fn parse_addr_opt_valid_ipv6() {
+        let ip = parse_addr_opt("::1").unwrap();
+        assert_eq!(ip, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn parse_addr_opt_garbage_is_error() {
+        assert!(matches!(
+            parse_addr_opt("garbage"),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    // ── SessionState ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn session_state_unspecified_maps_to_idle() {
+        // Proto SESSION_STATE_UNSPECIFIED = 0. We treat it as Idle rather than
+        // returning an error so that old/forward-compatible daemons don't break
+        // the client.
+        assert_eq!(SessionState::try_from(0).unwrap(), SessionState::Idle);
+    }
+
+    #[test]
+    fn session_state_idle() {
+        assert_eq!(SessionState::try_from(1).unwrap(), SessionState::Idle);
+    }
+
+    #[test]
+    fn session_state_established() {
+        assert_eq!(
+            SessionState::try_from(2).unwrap(),
+            SessionState::Established
+        );
+    }
+
+    #[test]
+    fn session_state_unknown_is_error() {
+        for v in [3, 99, -1, i32::MAX, i32::MIN] {
+            assert!(
+                matches!(
+                    SessionState::try_from(v),
+                    Err(ConvertError::UnknownEnumValue("SessionState", _))
+                ),
+                "expected Err for SessionState discriminant {v}"
+            );
+        }
+    }
+
+    // ── PeerType ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn peer_type_external() {
+        assert_eq!(PeerType::try_from(1).unwrap(), PeerType::External);
+    }
+
+    #[test]
+    fn peer_type_internal() {
+        assert_eq!(PeerType::try_from(2).unwrap(), PeerType::Internal);
+    }
+
+    /// Discriminant 0 is PEER_TYPE_UNSPECIFIED. Routes must have a concrete
+    /// type, so this is an error via `TryFrom` — unlike `PeerState` where
+    /// `peer_type_from_i32` returns `None` for unspecified.
+    #[test]
+    fn peer_type_unspecified_is_error_via_try_from() {
+        assert!(matches!(
+            PeerType::try_from(0),
+            Err(ConvertError::UnknownEnumValue("PeerType", 0))
+        ));
+    }
+
+    #[test]
+    fn peer_type_unknown_is_error() {
+        for v in [3, 99, -1, i32::MAX] {
+            assert!(
+                matches!(
+                    PeerType::try_from(v),
+                    Err(ConvertError::UnknownEnumValue("PeerType", _))
+                ),
+                "expected Err for PeerType discriminant {v}"
+            );
+        }
+    }
+
+    /// `peer_type_from_i32` is the fallible-to-option variant used for
+    /// `PeerState`, where unspecified is valid (session not yet established).
+    #[test]
+    fn peer_type_from_i32_unspecified_is_none() {
+        assert_eq!(peer_type_from_i32(0), None);
+    }
+
+    #[test]
+    fn peer_type_from_i32_known_values() {
+        assert_eq!(peer_type_from_i32(1), Some(PeerType::External));
+        assert_eq!(peer_type_from_i32(2), Some(PeerType::Internal));
+    }
+
+    #[test]
+    fn peer_type_from_i32_unknown_is_none() {
+        for v in [3, 99, -1, i32::MAX] {
+            assert_eq!(
+                peer_type_from_i32(v),
+                None,
+                "expected None for unknown discriminant {v}"
+            );
+        }
+    }
+
+    // ── Origin ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn origin_all_known_values() {
+        assert_eq!(Origin::try_from(0).unwrap(), Origin::Igp);
+        assert_eq!(Origin::try_from(1).unwrap(), Origin::Egp);
+        assert_eq!(Origin::try_from(2).unwrap(), Origin::Incomplete);
+    }
+
+    #[test]
+    fn origin_unknown_is_error() {
+        for v in [3, 99, -1, i32::MAX] {
+            assert!(
+                matches!(
+                    Origin::try_from(v),
+                    Err(ConvertError::UnknownEnumValue("Origin", _))
+                ),
+                "expected Err for Origin discriminant {v}"
+            );
+        }
+    }
+
+    // ── AsSegmentType ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn as_segment_type_all_known_values() {
+        assert_eq!(AsSegmentType::try_from(1).unwrap(), AsSegmentType::Sequence);
+        assert_eq!(AsSegmentType::try_from(2).unwrap(), AsSegmentType::Set);
+        assert_eq!(
+            AsSegmentType::try_from(3).unwrap(),
+            AsSegmentType::ConfedSequence
+        );
+        assert_eq!(
+            AsSegmentType::try_from(4).unwrap(),
+            AsSegmentType::ConfedSet
+        );
+    }
+
+    /// Discriminant 0 is TYPE_UNSPECIFIED — the proto allows it but we reject
+    /// it because a segment with no type is meaningless in path processing.
+    #[test]
+    fn as_segment_type_unspecified_is_error() {
+        assert!(matches!(
+            AsSegmentType::try_from(0),
+            Err(ConvertError::UnknownEnumValue("AsSegmentType", 0))
+        ));
+    }
+
+    #[test]
+    fn as_segment_type_unknown_is_error() {
+        for v in [5, 99, -1, i32::MAX] {
+            assert!(
+                matches!(
+                    AsSegmentType::try_from(v),
+                    Err(ConvertError::UnknownEnumValue("AsSegmentType", _))
+                ),
+                "expected Err for AsSegmentType discriminant {v}"
+            );
+        }
+    }
+
+    // ── ext_community_from_bytes ──────────────────────────────────────────────
+
+    #[test]
+    fn ext_community_exactly_8_bytes_ok() {
+        let arr = ext_community_from_bytes(vec![0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        assert_eq!(arr, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn ext_community_preserves_byte_values() {
+        let bytes = vec![0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64];
+        let arr = ext_community_from_bytes(bytes).unwrap();
+        assert_eq!(arr[1], 0x02);
+        assert_eq!(arr[7], 0x64);
+    }
+
+    #[test]
+    fn ext_community_wrong_lengths_are_errors() {
+        for len in [0usize, 1, 7, 9, 16, 100] {
+            let bytes = vec![0u8; len];
+            assert!(
+                matches!(
+                    ext_community_from_bytes(bytes),
+                    Err(ConvertError::BadExtendedCommunityLen(n)) if n == len
+                ),
+                "expected Err for ext community of {len} bytes"
+            );
+        }
+    }
+
+    // ── AsSegment ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn as_segment_valid_sequence() {
+        let p = proto::AsSegment {
+            r#type: 1, // Sequence
+            asns: vec![65000, 65001, 65002],
+        };
+        let seg = AsSegment::try_from(p).unwrap();
+        assert_eq!(seg.kind, AsSegmentType::Sequence);
+        assert_eq!(seg.asns, vec![65000, 65001, 65002]);
+    }
+
+    #[test]
+    fn as_segment_invalid_type_is_error() {
+        let p = proto::AsSegment {
+            r#type: 0, // Unspecified
+            asns: vec![65000],
+        };
+        assert!(matches!(
+            AsSegment::try_from(p),
+            Err(ConvertError::UnknownEnumValue("AsSegmentType", 0))
+        ));
+    }
+
+    #[test]
+    fn as_segment_empty_asns_is_valid() {
+        let p = proto::AsSegment {
+            r#type: 1,
+            asns: vec![],
+        };
+        let seg = AsSegment::try_from(p).unwrap();
+        assert!(seg.asns.is_empty());
+    }
+
+    // ── LargeCommunity ────────────────────────────────────────────────────────
+
+    #[test]
+    fn large_community_field_preservation() {
+        let p = proto::LargeCommunity {
+            global_admin: 65000,
+            local_data1: 100,
+            local_data2: 200,
+        };
+        let lc = LargeCommunity::from(p);
+        assert_eq!(lc.global_admin, 65000);
+        assert_eq!(lc.local_data1, 100);
+        assert_eq!(lc.local_data2, 200);
+    }
+
+    #[test]
+    fn large_community_max_values() {
+        let p = proto::LargeCommunity {
+            global_admin: u32::MAX,
+            local_data1: u32::MAX,
+            local_data2: u32::MAX,
+        };
+        let lc = LargeCommunity::from(p);
+        assert_eq!(lc.global_admin, u32::MAX);
+    }
+
+    // ── Aggregator ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn aggregator_valid_ipv4() {
+        let p = proto::Aggregator {
+            asn: 65001,
+            address: "10.0.0.1".into(),
+        };
+        let agg = Aggregator::try_from(p).unwrap();
+        assert_eq!(agg.asn, 65001);
+        assert_eq!(agg.address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn aggregator_valid_ipv6() {
+        let p = proto::Aggregator {
+            asn: 65001,
+            address: "2001:db8::1".into(),
+        };
+        let agg = Aggregator::try_from(p).unwrap();
+        assert_eq!(agg.asn, 65001);
+        assert!(matches!(agg.address, IpAddr::V6(_)));
+    }
+
+    #[test]
+    fn aggregator_invalid_address_is_error() {
+        let p = proto::Aggregator {
+            asn: 65001,
+            address: "not-an-ip".into(),
+        };
+        assert!(matches!(
+            Aggregator::try_from(p),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    // ── Route ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn route_minimal_valid() {
+        let r = Route::try_from(minimal_proto_route()).unwrap();
+        assert_eq!(r.prefix, "10.0.0.0/8");
+        assert_eq!(r.peer_address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(r.peer_type, PeerType::External);
+        assert_eq!(r.next_hop, None);
+        assert!(r.as_path.is_empty());
+        assert_eq!(r.origin, Origin::Igp);
+        assert_eq!(r.local_pref, None);
+        assert_eq!(r.med, None);
+        assert!(r.communities.is_empty());
+        assert!(r.large_communities.is_empty());
+        assert!(r.extended_communities.is_empty());
+        assert!(!r.atomic_aggregate);
+        assert_eq!(r.aggregator, None);
+    }
+
+    #[test]
+    fn route_with_next_hop() {
+        let mut p = minimal_proto_route();
+        p.next_hop = "10.0.0.254".into();
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.next_hop, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254))));
+    }
+
+    #[test]
+    fn route_with_local_pref_and_med() {
+        let mut p = minimal_proto_route();
+        p.local_pref = Some(100);
+        p.med = Some(50);
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.local_pref, Some(100));
+        assert_eq!(r.med, Some(50));
+    }
+
+    #[test]
+    fn route_with_communities() {
+        let mut p = minimal_proto_route();
+        p.communities = vec![0x0001_0064, 0xFFFF_FFFE];
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.communities, vec![0x0001_0064, 0xFFFF_FFFE]);
+    }
+
+    #[test]
+    fn route_with_large_communities() {
+        let mut p = minimal_proto_route();
+        p.large_communities = vec![proto::LargeCommunity {
+            global_admin: 65000,
+            local_data1: 1,
+            local_data2: 2,
+        }];
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.large_communities.len(), 1);
+        assert_eq!(r.large_communities[0].global_admin, 65000);
+    }
+
+    #[test]
+    fn route_with_extended_communities() {
+        let mut p = minimal_proto_route();
+        p.extended_communities = vec![vec![0, 2, 0, 0, 0, 0, 0, 100]];
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.extended_communities.len(), 1);
+        assert_eq!(r.extended_communities[0], [0, 2, 0, 0, 0, 0, 0, 100]);
+    }
+
+    #[test]
+    fn route_with_as_path() {
+        let mut p = minimal_proto_route();
+        p.as_path = vec![proto::AsSegment {
+            r#type: 1, // Sequence
+            asns: vec![65001, 65002],
+        }];
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.as_path.len(), 1);
+        assert_eq!(r.as_path[0].asns, vec![65001, 65002]);
+    }
+
+    #[test]
+    fn route_with_aggregator() {
+        let mut p = minimal_proto_route();
+        p.aggregator = Some(proto::Aggregator {
+            asn: 65001,
+            address: "10.0.0.1".into(),
+        });
+        p.atomic_aggregate = true;
+        let r = Route::try_from(p).unwrap();
+        assert!(r.atomic_aggregate);
+        let agg = r.aggregator.unwrap();
+        assert_eq!(agg.asn, 65001);
+    }
+
+    #[test]
+    fn route_ibgp_peer_type() {
+        let mut p = minimal_proto_route();
+        p.peer_type = 2; // Internal
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.peer_type, PeerType::Internal);
+    }
+
+    #[test]
+    fn route_bad_peer_address_is_error() {
+        let mut p = minimal_proto_route();
+        p.peer_address = "bad".into();
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn route_bad_next_hop_is_error() {
+        let mut p = minimal_proto_route();
+        p.next_hop = "bad-ip".into();
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn route_unspecified_peer_type_is_error() {
+        // Routes must have a concrete peer type. PeerType::try_from(0) is Err.
+        let mut p = minimal_proto_route();
+        p.peer_type = 0;
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::UnknownEnumValue("PeerType", 0))
+        ));
+    }
+
+    #[test]
+    fn route_unknown_origin_is_error() {
+        let mut p = minimal_proto_route();
+        p.origin = 99;
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::UnknownEnumValue("Origin", 99))
+        ));
+    }
+
+    #[test]
+    fn route_bad_as_segment_type_is_error() {
+        let mut p = minimal_proto_route();
+        p.as_path = vec![proto::AsSegment {
+            r#type: 0, // Unspecified
+            asns: vec![65001],
+        }];
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::UnknownEnumValue("AsSegmentType", 0))
+        ));
+    }
+
+    #[test]
+    fn route_bad_extended_community_len_is_error() {
+        let mut p = minimal_proto_route();
+        p.extended_communities = vec![vec![0u8; 7]]; // 7 bytes — not 8
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::BadExtendedCommunityLen(7))
+        ));
+    }
+
+    #[test]
+    fn route_bad_aggregator_address_is_error() {
+        let mut p = minimal_proto_route();
+        p.aggregator = Some(proto::Aggregator {
+            asn: 1,
+            address: "not-an-ip".into(),
+        });
+        assert!(matches!(
+            Route::try_from(p),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    // ── PeerState ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn peer_state_minimal_valid() {
+        let ps = PeerState::try_from(minimal_proto_peer_state()).unwrap();
+        assert_eq!(ps.address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(ps.remote_as, 65001);
+        assert_eq!(ps.local_as, 65000);
+        assert_eq!(ps.session_state, SessionState::Idle);
+        assert_eq!(ps.peer_type, None); // unspecified
+    }
+
+    #[test]
+    fn peer_state_established() {
+        let mut p = minimal_proto_peer_state();
+        p.session_state = 2; // Established
+        p.peer_type = 1; // External
+        p.hold_time = 90;
+        p.uptime_seconds = 3600;
+        let ps = PeerState::try_from(p).unwrap();
+        assert_eq!(ps.session_state, SessionState::Established);
+        assert_eq!(ps.peer_type, Some(PeerType::External));
+        assert_eq!(ps.hold_time, 90);
+        assert_eq!(ps.uptime_seconds, 3600);
+    }
+
+    #[test]
+    fn peer_state_ibgp() {
+        let mut p = minimal_proto_peer_state();
+        p.session_state = 2;
+        p.peer_type = 2; // Internal
+        let ps = PeerState::try_from(p).unwrap();
+        assert_eq!(ps.peer_type, Some(PeerType::Internal));
+    }
+
+    #[test]
+    fn peer_state_prefix_counters() {
+        let mut p = minimal_proto_peer_state();
+        p.prefixes_received = 100;
+        p.prefixes_accepted = 80;
+        p.prefixes_advertised = 50;
+        let ps = PeerState::try_from(p).unwrap();
+        assert_eq!(ps.prefixes_received, 100);
+        assert_eq!(ps.prefixes_accepted, 80);
+        assert_eq!(ps.prefixes_advertised, 50);
+    }
+
+    #[test]
+    fn peer_state_bad_address_is_error() {
+        let mut p = minimal_proto_peer_state();
+        p.address = "not-an-ip".into();
+        assert!(matches!(
+            PeerState::try_from(p),
+            Err(ConvertError::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn peer_state_unknown_session_state_is_error() {
+        let mut p = minimal_proto_peer_state();
+        p.session_state = 99;
+        assert!(matches!(
+            PeerState::try_from(p),
+            Err(ConvertError::UnknownEnumValue("SessionState", 99))
+        ));
+    }
+
+    /// Unknown peer_type discriminants in PeerState silently map to None
+    /// (not an error) because the peer_type field is optional.
+    #[test]
+    fn peer_state_unknown_peer_type_maps_to_none() {
+        let mut p = minimal_proto_peer_state();
+        p.peer_type = 99;
+        let ps = PeerState::try_from(p).unwrap();
+        assert_eq!(ps.peer_type, None);
+    }
+
+    // ── Error Display ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn convert_error_display_invalid_address() {
+        let e = ConvertError::InvalidAddress("bad".into());
+        assert_eq!(e.to_string(), r#"invalid IP address: "bad""#);
+    }
+
+    #[test]
+    fn convert_error_display_unknown_enum() {
+        let e = ConvertError::UnknownEnumValue("Origin", 99);
+        assert_eq!(e.to_string(), "unknown Origin discriminant: 99");
+    }
+
+    #[test]
+    fn convert_error_display_bad_ext_community() {
+        let e = ConvertError::BadExtendedCommunityLen(7);
+        assert_eq!(e.to_string(), "extended community must be 8 bytes, got 7");
+    }
+
+    // ── Proptest ──────────────────────────────────────────────────────────────
+
+    proptest! {
+        /// Any Vec<u8> of length != 8 must fail; length == 8 must succeed.
+        #[test]
+        fn prop_ext_community_succeeds_iff_exactly_8_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..=32)) {
+            let len = bytes.len();
+            let result = ext_community_from_bytes(bytes);
+            if len == 8 {
+                prop_assert!(result.is_ok());
+            } else {
+                prop_assert!(matches!(result, Err(ConvertError::BadExtendedCommunityLen(n)) if n == len));
+            }
+        }
+
+        /// SessionState conversion must never panic and must succeed only for
+        /// discriminants 0, 1, 2.
+        #[test]
+        fn prop_session_state_total(v: i32) {
+            let result = SessionState::try_from(v);
+            match v {
+                0 | 1 => prop_assert_eq!(result.unwrap(), SessionState::Idle),
+                2     => prop_assert_eq!(result.unwrap(), SessionState::Established),
+                _     => prop_assert!(result.is_err()),
+            }
+        }
+
+        /// Origin conversion must never panic and must succeed only for 0, 1, 2.
+        #[test]
+        fn prop_origin_total(v: i32) {
+            let result = Origin::try_from(v);
+            match v {
+                0 => prop_assert_eq!(result.unwrap(), Origin::Igp),
+                1 => prop_assert_eq!(result.unwrap(), Origin::Egp),
+                2 => prop_assert_eq!(result.unwrap(), Origin::Incomplete),
+                _ => prop_assert!(result.is_err()),
+            }
+        }
+
+        /// AsSegmentType conversion must never panic; succeeds only for 1–4.
+        #[test]
+        fn prop_as_segment_type_total(v: i32) {
+            let result = AsSegmentType::try_from(v);
+            match v {
+                1 => prop_assert_eq!(result.unwrap(), AsSegmentType::Sequence),
+                2 => prop_assert_eq!(result.unwrap(), AsSegmentType::Set),
+                3 => prop_assert_eq!(result.unwrap(), AsSegmentType::ConfedSequence),
+                4 => prop_assert_eq!(result.unwrap(), AsSegmentType::ConfedSet),
+                _ => prop_assert!(result.is_err()),
+            }
+        }
+
+        /// PeerType try_from must never panic; succeeds only for 1 and 2.
+        #[test]
+        fn prop_peer_type_total(v: i32) {
+            let result = PeerType::try_from(v);
+            match v {
+                1 => prop_assert_eq!(result.unwrap(), PeerType::External),
+                2 => prop_assert_eq!(result.unwrap(), PeerType::Internal),
+                _ => prop_assert!(result.is_err()),
+            }
+        }
+
+        /// peer_type_from_i32 must never panic; returns None for anything
+        /// other than 1 and 2.
+        #[test]
+        fn prop_peer_type_from_i32_total(v: i32) {
+            let result = peer_type_from_i32(v);
+            match v {
+                1 => prop_assert_eq!(result, Some(PeerType::External)),
+                2 => prop_assert_eq!(result, Some(PeerType::Internal)),
+                _ => prop_assert_eq!(result, None),
+            }
+        }
+
+        /// parse_addr must never panic, regardless of input.
+        #[test]
+        fn prop_parse_addr_never_panics(s in ".*") {
+            let _ = parse_addr(&s);
+        }
+
+        /// parse_addr_opt must never panic; empty string always returns Ok(None).
+        #[test]
+        fn prop_parse_addr_opt_empty_always_none(s in ".*") {
+            let _ = parse_addr_opt(&s);
+        }
+
+        #[test]
+        fn prop_parse_addr_opt_empty_string_is_always_none(_: ()) {
+            prop_assert_eq!(parse_addr_opt("").unwrap(), None);
+        }
+
+        /// A Route conversion with a valid peer_address, peer_type, and origin
+        /// but an arbitrarily-lengthed extended community should succeed iff
+        /// every byte slice is exactly 8 bytes.
+        #[test]
+        fn prop_route_ext_community_gatekeeping(
+            lens in proptest::collection::vec(0usize..=16, 0..=8)
+        ) {
+            let mut p = minimal_proto_route();
+            p.extended_communities = lens.iter().map(|&n| vec![0u8; n]).collect();
+            let all_8 = lens.iter().all(|&n| n == 8);
+            let result = Route::try_from(p);
+            if all_8 {
+                prop_assert!(result.is_ok());
+            } else {
+                prop_assert!(matches!(result, Err(ConvertError::BadExtendedCommunityLen(_))));
+            }
+        }
+    }
+}

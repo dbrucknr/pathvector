@@ -23,6 +23,9 @@ serde       = { version = "1", features = ["derive"], optional = true }
 [build-dependencies]
 tonic-prost-build = "0.14"
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [features]
 serde = ["dep:serde"]
 

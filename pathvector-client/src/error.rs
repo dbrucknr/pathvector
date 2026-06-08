@@ -1,7 +1,5 @@
 //! Error types for `pathvector-client`.
 
-use std::net::IpAddr;
-
 /// Error returned by [`PathvectorClient::connect`].
 ///
 /// [`PathvectorClient::connect`]: crate::PathvectorClient::connect
@@ -83,8 +81,6 @@ impl From<ConvertError> for ClientError {
 pub enum ConvertError {
     /// A string field that should be an IP address could not be parsed.
     InvalidAddress(String),
-    /// A peer address that should be a known peer was not found.
-    UnknownPeer(IpAddr),
     /// An enum discriminant was outside the set of known values.
     UnknownEnumValue(&'static str, i32),
     /// An extended community byte slice was not exactly 8 bytes.
@@ -95,7 +91,6 @@ impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidAddress(s) => write!(f, "invalid IP address: {s:?}"),
-            Self::UnknownPeer(addr) => write!(f, "unknown peer: {addr}"),
             Self::UnknownEnumValue(ty, v) => write!(f, "unknown {ty} discriminant: {v}"),
             Self::BadExtendedCommunityLen(n) => {
                 write!(f, "extended community must be 8 bytes, got {n}")
