@@ -29,6 +29,7 @@ COPY pathvector-rib/      pathvector-rib/
 COPY pathvector-session/  pathvector-session/
 COPY pathvector-bmp/      pathvector-bmp/
 COPY pathvector-client/   pathvector-client/
+COPY pathvector/          pathvector/
 COPY pathvectord/         pathvectord/
 COPY e2e/                 e2e/
 COPY proto/               proto/
