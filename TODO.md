@@ -382,5 +382,106 @@ Any function that can fail should say so in its return type. Conduct a systemati
 - CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.88) — **Done.** `.github/workflows/ci.yml` has five jobs: `test` (stable), `lint` (clippy + rustfmt, stable), `msrv` (1.88), `docs` (stable, `-D warnings`), and `fuzz` (nightly, `just fuzz-smoke`). A `Justfile` at the workspace root provides matching local recipes so CI and development use the same commands. All jobs install `protoc` (required by `pathvectord`'s gRPC codegen build script).
 - Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range
 - Fuzz testing — tracked as Phase 4 in the property testing section above
-- Benchmark suite for `LocRib` insert/best-path under realistic prefix volumes
-  (100k IPv4 prefixes, M2 Max baseline)
+
+### Performance
+
+#### Known architectural concerns
+
+These are structural decisions in the current implementation worth measuring before
+deciding whether to address them. All are acceptable at small peer counts and RIB
+sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 prefixes).
+
+1. **`try_send` failure on the outbound UPDATE channel** — `propagate_prefix` calls
+   `update_tx.try_send(msg)` and discards the error silently if the channel is full.
+   A discarded UPDATE means a peer's view of the RIB permanently diverges from reality;
+   BGP has no self-healing mechanism for this. Correct behaviour on a full channel is one
+   of: block with back-pressure, close the session, or trigger a ROUTE-REFRESH.
+   **Audit priority: highest** — this is the only item that is potentially a correctness
+   bug rather than a pure performance concern.
+
+2. **Single event loop for all peers** — all peer sessions funnel into one `mpsc` channel;
+   `DaemonState` processes events sequentially under a write lock. A large UPDATE from one
+   peer (e.g., a full-table session establishment) blocks event processing for every other
+   peer for the duration, creating hold-timer pressure at high peer counts. Sharding
+   `DaemonState` by address family or introducing a per-peer processing pipeline would fix
+   this, but requires significant ownership rework.
+
+3. **No NLRI batching in outbound UPDATEs** — each affected prefix generates its own
+   `UpdateMessage` and wire frame. RFC 4271 allows packing multiple NLRIs with identical
+   path attributes into a single UPDATE. Batching reduces TCP segment count and framing
+   overhead, which matters most during full-table dumps to newly established peers.
+
+4. **Full-table dump on peer establishment holds the write lock** — `on_established`
+   iterates the entire `LocRib` and calls `propagate_prefix` for every best route before
+   releasing the write lock. At ~950k routes this is a multi-millisecond stall that blocks
+   both the BGP event loop and all concurrent gRPC reads. Fix: generate the dump
+   asynchronously, releasing the lock between batches.
+
+#### Per-crate criterion benchmarks
+
+Each crate should have a `benches/` directory with criterion benchmarks. The goal is
+a stable baseline on M2 Max hardware that can detect regressions as the implementation
+evolves. Suggested targets:
+
+| Crate | Benchmark | What to measure |
+|---|---|---|
+| `pathvector-types` | `as_path_prepend` | Prepend one AS to paths of length 0, 10, 100 |
+| `pathvector-types` | `community_match` | Match a community against a set of 1, 10, 100 communities |
+| `pathvector-policy` | `policy_evaluate` | Evaluate a policy of 1, 10, 50 terms against a single route |
+| `pathvector-rib` | `loc_rib_insert` | Insert 100 / 1k / 10k routes from a single peer |
+| `pathvector-rib` | `best_path_select` | Run `select_best` over 1, 4, 16, 64 candidates per prefix |
+| `pathvector-rib` | `loc_rib_lpm` | `longest_match` over a 10k-route table (random IPv4 addrs) |
+| `pathvector-rib` | `adj_rib_out_propagate` | `propagate_prefix` for 1k prefixes × 4 peers |
+| `pathvector-session` | `codec_decode_update` | Decode an UPDATE carrying 1 / 100 / 1k NLRIs |
+| `pathvector-session` | `codec_encode_update` | Encode the same UPDATE payloads |
+| `pathvector-session` | `codec_roundtrip` | End-to-end encode → decode for all five message types |
+
+All benchmarks should be reported with the three-size pattern (small / medium / large)
+and a Takeaway column noting whether cost scales linearly, is O(log n), or is flat.
+Hardware citation: Apple M2 Max, 96 GB RAM.
+
+Add to `Justfile`:
+
+```sh
+bench:
+    cargo bench --workspace
+```
+
+#### System-level benchmarks against GoBGP and BIRD
+
+Measuring the end-to-end convergence time and memory footprint of a real BGP speaker
+under a realistic internet-scale prefix load requires a traffic generator.
+**[ExaBGP](https://github.com/Exa-Networks/exabgp)** is the standard tool: it is a
+Python BGP implementation that can replay MRT dumps as a BGP UPDATE stream, acting as
+a fully conformant peer. MRT dump files from [RouteViews](http://www.routeviews.org/)
+or [RIPE RIS](https://ris.ripe.net/dumps/) provide real internet routing tables
+(~950k IPv4 prefixes as of 2026).
+
+**Proposed benchmark scenario:**
+
+1. Stand up ExaBGP (or a dedicated `exabgp` Docker container) configured to replay a
+   full RouteViews MRT dump toward a single DUT (device under test).
+2. Measure from the moment BGP `Established` is reached:
+   - **Convergence time** — seconds from first UPDATE to RIB stable (no new best-path
+     changes for 5 consecutive seconds)
+   - **Peak RSS** — resident set size at the end of the full-table load
+   - **Steady-state CPU** — CPU% after convergence with periodic keepalives only
+   - **Hold-timer health** — did any KEEPALIVE interval slip during the flood?
+3. Run the same scenario against GoBGP 4.x and BIRD 2.x on the same hardware with
+   equivalent configuration (one eBGP peer, accept-all import policy).
+
+**Docker composition** — the same testcontainers architecture used in the e2e suite
+applies here. A `bench/` crate (or a standalone binary) could:
+- Start an `exabgp` container serving the MRT dump
+- Start the DUT container (pathvectord / gobgpd / bird)
+- Poll via gRPC (pathvectord) or CLI (gobgp/birdc) until RIB prefix count stabilises
+- Record wall-clock time, RSS (`docker stats --no-stream`), CPU
+
+**Prerequisites before this is actionable:**
+- NLRI batching (concern #3 above) should be addressed first so outbound performance
+  is not artificially penalised
+- The full-table dump lock-hold (concern #4) should be measured separately from the
+  inbound convergence benchmark
+- A RouteViews MRT dump needs to be converted to ExaBGP's `announce` format (the
+  `exabgp-mrt` tool does this); the converted file should be committed to `bench/fixtures/`
+  (or downloaded by the benchmark harness to avoid repo bloat)
