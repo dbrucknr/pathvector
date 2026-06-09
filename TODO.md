@@ -193,8 +193,14 @@ Remaining e2e work:
   `TwoPeerHarness::new_no_export_policy()` configures import-accept + no export.
   Four tests in `e2e/tests/policy.rs` prove both directions: routes are blocked
   without an explicit policy and flow correctly with one.
-- Adversarial inputs — malformed BGP messages injected directly over TCP to verify the
-  daemon handles them gracefully without panicking
+- **Fault injection / chaos tests** — inject TCP resets mid-session, corrupt
+  bytes at the framing layer, and drop packets during the OPEN exchange; verify
+  the FSM recovers cleanly rather than wedging. Prerequisite: RFC 7606 error
+  handling (Tier 2, item 3) so there is a defined response to malformed input.
+- **Backpressure / sustained churn tests** — verify the channel-full stall
+  detection and recovery under sustained route churn, not just a single crafted
+  test case. Candidate scenario: ExaBGP replaying a partial MRT dump at high
+  rate while a second peer's UPDATE channel is artificially constrained.
 - **GitHub Actions e2e workflow** — **Done (2026-06-09).** Separate `e2e` job in
   `.github/workflows/ci.yml` on `ubuntu-latest` (Docker pre-installed). Uses
   `docker/setup-buildx-action` + `docker/build-push-action` with `type=gha` layer
@@ -223,6 +229,19 @@ they require information the RIB layer does not yet have.
 | 3 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally (`network` statement) vs learned from a peer |
 | 8 | Prefer lowest IGP metric to next-hop | IGP integration — requires the router's own IGP topology view |
 | 9 | Prefer oldest eBGP route | Route age tracking — the RIB would need to record when each route was first received |
+
+### Trait-based RIB and policy seams
+
+`pathvectord` currently depends concretely on `LocRib<Ipv4Addr>`, `AdjRibIn`,
+`AdjRibOut`, and `Policy<Route<Ipv4Addr>>`. The library-first promise — that
+someone embedding `pathvector-session` can bring their own RIB — is not fully
+delivered until these are abstracted behind traits (`impl RibStore`,
+`impl PolicyEngine`). This would also make the daemon itself unit-testable at
+the RIB boundary without constructing full `DaemonState` instances.
+
+Prerequisites: decide whether the trait lives in `pathvector-rib` (risking
+an upward dependency) or in a new thin `pathvector-core` crate that both the
+RIB and the daemon depend on.
 
 ### Longest-prefix-match queries
 
@@ -279,6 +298,16 @@ offer:
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
+
+### Hold timer expiry — active FSM enforcement
+
+The FSM tracks hold time but does not currently fire a `HoldTimerExpired`
+event when the timer elapses without a KEEPALIVE or UPDATE arriving. RFC 4271
+§8.5.3 requires sending `NOTIFICATION(Hold Timer Expired)` and transitioning
+to Idle. Without this, a peer that silently stops sending KEEPALIVEs is never
+detected as dead — the session stays open indefinitely. Implement as a
+`tokio::time::sleep` arm in `wait_for_input` alongside the existing keepalive
+interval arm.
 
 ### RFC 7606 — Revised UPDATE error handling
 
@@ -485,6 +514,48 @@ overflow (same pattern as Tokio's `broadcast::channel`).
 - DaemonState owns no I/O — all side effects flow through mpsc channels
 - Key design invariants (pure FSM, zero-dep types, idempotent propagate_prefix, etc.)
 
+### Internal documentation on hard algorithms
+
+The implementation has good API-level doc comments but the non-obvious logic
+lacks prose explanation. A new contributor should not need to reconstruct the
+RFC in their head to understand the code. Priority targets:
+
+- **Best-path selection** (`pathvector-rib/src/best_path.rs`) — annotate each
+  step with the RFC 4271 §9.1 section it implements and why the tie-breaking
+  order is what it is
+- **RIB eviction on `Terminated`** (`pathvectord/src/main.rs`, `on_terminated`)
+  — explain the snapshot-before-withdraw pattern and why order matters
+- **FSM state transitions** (`pathvector-session/src/fsm/`) — a table or
+  diagram mapping each `(State, Input) → (State, Vec<Output>)` transition,
+  with the RFC §8 reference for each arc
+
+### Async cancellation safety audit
+
+The forwarding tasks and event loop are correct under normal shutdown but have
+not been audited for cancellation safety — specifically, what happens when a
+future is dropped while awaiting `mpsc::Sender::send` or `recv`. Tokio's
+channel operations are cancel-safe but any `select!` branch that performs
+multi-step work (read + send) can lose progress if cancelled between steps.
+Audit every `select!` site and every task spawn; document which futures are
+cancel-safe and add `#[doc(cancel_safe)]` or inline comments where it matters.
+
+### Structured error types
+
+The current error story is a mix of `String`, ad-hoc enums, and `tonic::Status`
+messages. A systematic pass should:
+
+- Define typed error variants for the daemon event loop (`DaemonError`) so
+  callers can match on "peer not found" vs "channel closed" vs "policy error"
+  rather than inspecting strings
+- Ensure every `tonic::Status` returned from a gRPC handler carries a
+  meaningful `code` (not just `Internal`) and includes the original error in
+  its message
+- Verify `ConvertError` in `pathvector-client` covers all failure modes in the
+  `TryFrom` impls with no hidden `unwrap()`
+
+This partially overlaps with the Result/Option audit below but focuses on the
+*shape* of errors at API boundaries rather than just their presence.
+
 ### Logging audit
 
 The current `tracing` usage grew organically and needs a systematic review:
@@ -590,6 +661,12 @@ Add to `Justfile`:
 bench:
     cargo bench --workspace
 ```
+
+Once the baseline is established, wire benchmark regression detection into CI:
+store the criterion output (JSON) as a CI artifact and fail the build if any
+benchmark regresses by more than a configurable threshold (e.g. 10%). The
+[`critcmp`](https://github.com/BurntSushi/critcmp) tool compares criterion
+baselines and is straightforward to integrate into a GitHub Actions step.
 
 #### System-level benchmarks against GoBGP and BIRD
 
