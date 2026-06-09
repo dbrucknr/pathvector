@@ -401,9 +401,7 @@ mod tests {
     };
     use proto::{
         GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListPeersRequest,
-        ListRoutesRequest,
-        peer_service_server::PeerService,
-        rib_service_server::RibService,
+        ListRoutesRequest, peer_service_server::PeerService, rib_service_server::RibService,
     };
 
     fn make_state(local_as: u32, peers: &[(Ipv4Addr, u32)]) -> DaemonState {
@@ -437,7 +435,10 @@ mod tests {
         Arc::new(RwLock::new(make_state(local_as, peers)))
     }
 
-    fn route_igp(n: pathvector_types::Nlri<Ipv4Addr>, pt: PeerType) -> pathvector_rib::Route<Ipv4Addr> {
+    fn route_igp(
+        n: pathvector_types::Nlri<Ipv4Addr>,
+        pt: PeerType,
+    ) -> pathvector_rib::Route<Ipv4Addr> {
         RouteBuilder::new(n, Origin::Igp, AsPath::from_sequence(vec![Asn::new(65002)]))
             .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
             .peer_type(pt)
@@ -581,7 +582,10 @@ mod tests {
 
     #[test]
     fn test_proto_origin_incomplete() {
-        assert_eq!(proto_origin(Origin::Incomplete), proto::Origin::Incomplete as i32);
+        assert_eq!(
+            proto_origin(Origin::Incomplete),
+            proto::Origin::Incomplete as i32
+        );
     }
 
     // ── proto_as_segment — confederation variants ─────────────────────────────
@@ -634,7 +638,10 @@ mod tests {
     async fn test_list_peers_empty_state() {
         let state = arc_state(65001, &[]);
         let svc = PeerServiceImpl { state };
-        let resp = svc.list_peers(Request::new(ListPeersRequest {})).await.unwrap();
+        let resp = svc
+            .list_peers(Request::new(ListPeersRequest {}))
+            .await
+            .unwrap();
         assert!(resp.into_inner().peers.is_empty());
     }
 
@@ -644,7 +651,10 @@ mod tests {
         let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         let svc = PeerServiceImpl { state };
-        let resp = svc.list_peers(Request::new(ListPeersRequest {})).await.unwrap();
+        let resp = svc
+            .list_peers(Request::new(ListPeersRequest {}))
+            .await
+            .unwrap();
         let peers = resp.into_inner().peers;
 
         assert_eq!(peers.len(), 2);
@@ -659,14 +669,23 @@ mod tests {
     async fn test_list_peers_established_peer_shows_established_state() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
-        state.write().await.on_established(addr, PeerType::External, 65002, 90);
+        state
+            .write()
+            .await
+            .on_established(addr, PeerType::External, 65002, 90);
 
         let svc = PeerServiceImpl { state };
-        let resp = svc.list_peers(Request::new(ListPeersRequest {})).await.unwrap();
+        let resp = svc
+            .list_peers(Request::new(ListPeersRequest {}))
+            .await
+            .unwrap();
         let peers = resp.into_inner().peers;
 
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].session_state, proto::SessionState::Established as i32);
+        assert_eq!(
+            peers[0].session_state,
+            proto::SessionState::Established as i32
+        );
     }
 
     // ── PeerService::get_peer ─────────────────────────────────────────────────
@@ -678,7 +697,9 @@ mod tests {
         let svc = PeerServiceImpl { state };
 
         let resp = svc
-            .get_peer(Request::new(GetPeerRequest { address: "10.0.0.2".into() }))
+            .get_peer(Request::new(GetPeerRequest {
+                address: "10.0.0.2".into(),
+            }))
             .await
             .unwrap();
         let ps = resp.into_inner();
@@ -693,7 +714,9 @@ mod tests {
         let svc = PeerServiceImpl { state };
 
         let err = svc
-            .get_peer(Request::new(GetPeerRequest { address: "10.0.0.99".into() }))
+            .get_peer(Request::new(GetPeerRequest {
+                address: "10.0.0.99".into(),
+            }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
@@ -705,7 +728,9 @@ mod tests {
         let svc = PeerServiceImpl { state };
 
         let err = svc
-            .get_peer(Request::new(GetPeerRequest { address: "not-an-ip".into() }))
+            .get_peer(Request::new(GetPeerRequest {
+                address: "not-an-ip".into(),
+            }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -719,7 +744,9 @@ mod tests {
         let svc = RibServiceImpl { state };
 
         let resp = svc
-            .get_best_route(Request::new(GetBestRouteRequest { prefix: "10.0.0.0/8".into() }))
+            .get_best_route(Request::new(GetBestRouteRequest {
+                prefix: "10.0.0.0/8".into(),
+            }))
             .await
             .unwrap();
         let rr = resp.into_inner();
@@ -742,7 +769,9 @@ mod tests {
 
         let svc = RibServiceImpl { state };
         let resp = svc
-            .get_best_route(Request::new(GetBestRouteRequest { prefix: "10.0.0.0/8".into() }))
+            .get_best_route(Request::new(GetBestRouteRequest {
+                prefix: "10.0.0.0/8".into(),
+            }))
             .await
             .unwrap();
         let rr = resp.into_inner();
@@ -758,7 +787,9 @@ mod tests {
         let svc = RibServiceImpl { state };
 
         let err = svc
-            .get_best_route(Request::new(GetBestRouteRequest { prefix: "bad/prefix".into() }))
+            .get_best_route(Request::new(GetBestRouteRequest {
+                prefix: "bad/prefix".into(),
+            }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -772,7 +803,9 @@ mod tests {
         let svc = RibServiceImpl { state };
 
         let resp = svc
-            .list_routes(Request::new(ListRoutesRequest { peer_address: String::new() }))
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+            }))
             .await
             .unwrap();
         assert!(resp.into_inner().routes.is_empty());
@@ -801,7 +834,9 @@ mod tests {
 
         let svc = RibServiceImpl { state };
         let resp = svc
-            .list_routes(Request::new(ListRoutesRequest { peer_address: String::new() }))
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+            }))
             .await
             .unwrap();
         assert_eq!(resp.into_inner().routes.len(), 2);
@@ -862,7 +897,9 @@ mod tests {
         let svc = RibServiceImpl { state };
 
         let resp = svc
-            .list_candidates(Request::new(ListCandidatesRequest { prefix: "10.0.0.0/8".into() }))
+            .list_candidates(Request::new(ListCandidatesRequest {
+                prefix: "10.0.0.0/8".into(),
+            }))
             .await
             .unwrap();
         assert!(resp.into_inner().routes.is_empty());
@@ -883,7 +920,9 @@ mod tests {
 
         let svc = RibServiceImpl { state };
         let resp = svc
-            .list_candidates(Request::new(ListCandidatesRequest { prefix: "10.0.0.0/8".into() }))
+            .list_candidates(Request::new(ListCandidatesRequest {
+                prefix: "10.0.0.0/8".into(),
+            }))
             .await
             .unwrap();
         let routes = resp.into_inner().routes;
@@ -898,7 +937,9 @@ mod tests {
         let svc = RibServiceImpl { state };
 
         let err = svc
-            .list_candidates(Request::new(ListCandidatesRequest { prefix: "bad".into() }))
+            .list_candidates(Request::new(ListCandidatesRequest {
+                prefix: "bad".into(),
+            }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);

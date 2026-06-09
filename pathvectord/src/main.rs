@@ -2923,7 +2923,10 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &tx,
         );
-        assert!(!ok, "full WITHDRAW channel (split-horizon eviction) must return false");
+        assert!(
+            !ok,
+            "full WITHDRAW channel (split-horizon eviction) must return false"
+        );
         assert!(aro.is_empty());
     }
 
@@ -2954,7 +2957,10 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &tx,
         );
-        assert!(!ok, "full WITHDRAW channel (export reject) must return false");
+        assert!(
+            !ok,
+            "full WITHDRAW channel (export reject) must return false"
+        );
         assert!(aro.is_empty());
     }
 
