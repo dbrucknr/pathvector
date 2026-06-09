@@ -2,21 +2,36 @@
 //!
 //! Each test creates a [`Harness`], which:
 //!
-//! 1. Starts a GoBGP container (via testcontainers) with a static config that
-//!    accepts any incoming AS 65002 connection (dynamic neighbors).
-//! 2. Spawns a `pathvectord` subprocess configured to dial the container's
-//!    mapped BGP port on `127.0.0.1`.
-//! 3. Polls [`PathvectorClient::get_peer`] until the session reaches
-//!    `Established` — no fixed sleeps anywhere.
+//! 1. Creates an isolated Docker bridge network for this test.
+//! 2. Starts a `gobgpd` container on that network, listening for BGP on
+//!    port 179 (the standard well-known port — privileged inside a container).
+//! 3. Inspects the container to learn gobgpd's IP on the network.
+//! 4. Starts a `pathvectord` container on the same network, configured to
+//!    dial gobgpd's IP on port 179.
+//! 5. Polls [`PathvectorClient::get_peer`] until the session reaches
+//!    `Established`.
 //!
-//! Dropping a [`Harness`] kills the daemon subprocess and lets testcontainers
-//! stop the container.
+//! **Why Docker containers (not native subprocesses)?**
+//!
+//! GoBGP's upstream releases only ship Linux binaries; there are no macOS
+//! prebuilts.  Running both services as containers on the same Docker bridge
+//! network means BGP traffic is **container-to-container** — it never touches
+//! the macOS Docker Desktop TCP proxy that was causing OPENCONFIRM to stall.
+//! Only pathvectord's gRPC management port is mapped to the host (for
+//! [`PathvectorClient`]), and HTTP/2 is unaffected by the proxy.
+//!
+//! **Image names**
+//!
+//! `just e2e` builds two images before running the suite:
+//! - `pathvector-gobgpd-test:latest` — GoBGP from `e2e/Dockerfile`
+//! - `pathvector-e2e:latest`         — pathvectord from `e2e/Dockerfile.pathvectord`
 
 use std::{
+    io::Write as _,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU16, Ordering},
+    process::{Command, Stdio},
+    sync::atomic::{AtomicU32, AtomicU16, Ordering},
     time::Duration,
 };
 
@@ -27,80 +42,174 @@ use pathvector_client::{
 use tempfile::NamedTempFile;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
-    core::{ExecCommand, WaitFor},
+    core::{ContainerPort, Mount, WaitFor, wait::HealthWaitStrategy},
     runners::AsyncRunner,
 };
 
-// ── Port allocation ───────────────────────────────────────────────────────────
+// ── Docker image names ────────────────────────────────────────────────────────
 
-/// Atomically-allocated gRPC port base.  Tests must run with `--test-threads=1`
-/// to avoid races, but the counter provides a safety net.
+/// GoBGP image built by `just e2e` from `e2e/Dockerfile`.
+const GOBGPD_IMAGE: &str = "pathvector-gobgpd-test";
+
+/// pathvectord image built by `just e2e` from `e2e/Dockerfile.pathvectord`.
+const PATHVECTORD_IMAGE: &str = "pathvector-e2e";
+
+// ── Fixed container-internal ports ───────────────────────────────────────────
+
+/// BGP listen port inside the gobgpd container.
+const GOBGPD_BGP_PORT: u16 = 179;
+
+/// gRPC management port inside the pathvectord container.
+const PATHVECTORD_GRPC_PORT: u16 = 51_200;
+
+// ── Port / ID allocation ──────────────────────────────────────────────────────
+
+/// Per-test unique ID — used to name Docker networks and containers so
+/// concurrent (or back-to-back) tests never collide.
+static NEXT_TEST_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Host-side port base for pathvectord's gRPC mapping.
 static NEXT_GRPC_PORT: AtomicU16 = AtomicU16::new(51_200);
+
+fn alloc_test_id() -> u32 {
+    NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 fn alloc_grpc_port() -> u16 {
     NEXT_GRPC_PORT.fetch_add(1, Ordering::Relaxed)
 }
 
-// ── Binary path ───────────────────────────────────────────────────────────────
+// ── Binary / workspace paths ──────────────────────────────────────────────────
 
-/// Resolves the path to the `pathvectord` binary built by `just e2e`.
+/// Returns the workspace root (parent of `e2e/`).
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("e2e/ must be inside a workspace")
+        .to_owned()
+}
+
+/// Resolves the path to the `target/` directory, honouring `CARGO_TARGET_DIR`.
+fn target_dir() -> PathBuf {
+    std::env::var("CARGO_TARGET_DIR")
+        .map_or_else(|_| workspace_root().join("target"), PathBuf::from)
+}
+
+/// Resolves the path to the `pathvectord` binary built by the host toolchain.
 ///
-/// `just e2e` runs `cargo build -p pathvectord` before executing tests, so
-/// `target/debug/pathvectord` is always up to date when this is called.
+/// Used only to verify that the binary was built before Docker image creation.
+#[must_use]
+pub fn daemon_binary() -> PathBuf {
+    target_dir().join("debug").join("pathvectord")
+}
+
+// ── Docker network management ─────────────────────────────────────────────────
+
+/// A Docker bridge network that is removed on drop.
+///
+/// Placed **last** in [`Harness`] so it is dropped after the containers that
+/// use it.
+struct DockerNetwork {
+    name: String,
+}
+
+impl DockerNetwork {
+    /// Create a new Docker bridge network with the given name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network create` fails.
+    fn create(name: String) -> Self {
+        let status = Command::new("docker")
+            .args(["network", "create", &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("docker network create");
+        assert!(status.success(), "docker network create {name} failed: {status}");
+        Self { name }
+    }
+}
+
+impl Drop for DockerNetwork {
+    fn drop(&mut self) {
+        Command::new("docker")
+            .args(["network", "rm", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+    }
+}
+
+// ── Container IP lookup ───────────────────────────────────────────────────────
+
+/// Returns the IP address assigned to `container_id` on `network`.
+///
+/// Runs `docker inspect` synchronously and parses the `IPAddress` field.
+/// This is a quick, one-shot CLI call so blocking is acceptable.
 ///
 /// # Panics
 ///
-/// Panics if `CARGO_MANIFEST_DIR` does not have a parent directory (which
-/// would mean the `e2e/` crate is not inside a workspace).
-pub fn daemon_binary() -> PathBuf {
-    // CARGO_MANIFEST_DIR is e2e/ — go up one level to reach the workspace root.
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("e2e/ must be inside the workspace")
+/// Panics if `docker inspect` fails or the output is not a valid IPv4 address.
+fn container_network_ip(container_id: &str, network: &str) -> Ipv4Addr {
+    let fmt = format!(
+        r#"{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}"#
+    );
+    let output = Command::new("docker")
+        .args(["inspect", container_id, "--format", &fmt])
+        .output()
+        .expect("docker inspect");
+    let ip_str = std::str::from_utf8(&output.stdout)
+        .expect("docker inspect output is UTF-8")
+        .trim()
         .to_owned();
-
-    // Respect CARGO_TARGET_DIR when set; otherwise use the default target/.
-    let target =
-        std::env::var("CARGO_TARGET_DIR").map_or_else(|_| workspace.join("target"), PathBuf::from);
-
-    target.join("debug").join("pathvectord")
+    ip_str
+        .parse()
+        .unwrap_or_else(|_| panic!("docker inspect returned non-IPv4 address: {ip_str:?}"))
 }
 
-// ── GoBGP container ───────────────────────────────────────────────────────────
+// ── Config generation ─────────────────────────────────────────────────────────
 
-/// Path inside the container where GoBGP reads its config.
-const GOBGP_CONFIG_PATH: &str = "/etc/gobgp/gobgpd.conf";
-
-/// GoBGP Docker image.  Pin the digest in production; `latest` is fine for
-/// local development and CI where we accept slow drift.
-const GOBGP_IMAGE: &str = "osrg/gobgp";
-const GOBGP_TAG: &str = "latest";
-
-async fn start_gobgp() -> ContainerAsync<GenericImage> {
-    let config_bytes = include_bytes!("../fixtures/gobgp.toml").to_vec();
-
-    // `with_wait_for` and `with_exposed_port` are `GenericImage` methods and
-    // must be called before the `ImageExt` methods (`with_copy_to`, `with_cmd`)
-    // which consume `GenericImage` into `ContainerRequest<GenericImage>`.
-    GenericImage::new(GOBGP_IMAGE, GOBGP_TAG)
-        .with_wait_for(WaitFor::seconds(2))
-        .with_copy_to(GOBGP_CONFIG_PATH, config_bytes)
-        .with_cmd(["gobgpd", "-f", GOBGP_CONFIG_PATH, "--log-level", "warn"])
-        .start()
-        .await
-        .expect("GoBGP container failed to start — is Docker running?")
-}
-
-// ── pathvectord subprocess ────────────────────────────────────────────────────
-
-/// Writes a `pathvectord` config to a temporary file.
+/// Writes the gobgpd config file for the test container.
 ///
-/// The returned [`NamedTempFile`] must be kept alive for the lifetime of the
-/// `pathvectord` subprocess; dropping it removes the file from disk.
-fn write_daemon_config(bgp_port: u16, grpc_port: u16) -> NamedTempFile {
-    use std::io::Write as _;
+/// The container uses port 179 (default; no `port =` key needed).
+/// gRPC defaults to `0.0.0.0:50051` which is accessible via `docker exec`.
+fn write_gobgp_config() -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
 
-    let mut f = NamedTempFile::new().expect("create temp config");
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp config");
+    f
+}
+
+/// Writes the pathvectord config file for the test container.
+///
+/// `gobgpd_ip` is the gobgpd container's IP on the shared Docker network,
+/// obtained via [`container_network_ip`] after gobgpd is started.
+fn write_daemon_config(gobgpd_ip: Ipv4Addr) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
     write!(
         f,
         r#"
@@ -108,62 +217,23 @@ fn write_daemon_config(bgp_port: u16, grpc_port: u16) -> NamedTempFile {
 local_as  = 65002
 bgp_id    = "10.0.0.2"
 hold_time = 9
-grpc_port = {grpc_port}
+grpc_port = {PATHVECTORD_GRPC_PORT}
 
 [[peers]]
-address        = "127.0.0.1"
-port           = {bgp_port}
+address        = "{gobgpd_ip}"
+port           = {GOBGPD_BGP_PORT}
 remote_as      = 65001
 import_default = "accept"
 export_default = "accept"
 "#
     )
-    .expect("write config");
+    .expect("write pathvectord config");
     f
-}
-
-/// A running `pathvectord` subprocess that is killed on drop.
-pub struct DaemonProcess {
-    child: Child,
-    // Keep the temp file alive for as long as the subprocess runs.
-    _config: NamedTempFile,
-}
-
-impl DaemonProcess {
-    fn spawn(config: NamedTempFile) -> Self {
-        let bin = daemon_binary();
-        assert!(
-            bin.exists(),
-            "pathvectord binary not found at {} — run `just e2e` to build it first",
-            bin.display()
-        );
-
-        let child = Command::new(&bin)
-            .arg(config.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin.display()));
-
-        Self {
-            child,
-            _config: config,
-        }
-    }
-}
-
-impl Drop for DaemonProcess {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-    }
 }
 
 // ── Polling helpers ───────────────────────────────────────────────────────────
 
 /// Polls until the BGP session with `peer` reaches `Established`.
-///
-/// Polls every 200 ms.
 ///
 /// # Panics
 ///
@@ -190,8 +260,6 @@ pub async fn wait_for_established(
 
 /// Polls until the best route for `prefix` is present, then returns it.
 ///
-/// Polls every 200 ms.
-///
 /// # Panics
 ///
 /// Panics if the route does not appear within `timeout`.
@@ -214,8 +282,6 @@ pub async fn wait_for_route(
 }
 
 /// Polls until the best route for `prefix` is absent (withdrawn).
-///
-/// Polls every 200 ms.
 ///
 /// # Panics
 ///
@@ -240,23 +306,36 @@ pub async fn wait_for_route_withdrawn(
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
-/// A fully-wired test environment: GoBGP container + `pathvectord` subprocess +
-/// connected [`PathvectorClient`], with the BGP session already `Established`.
+/// A fully-wired test environment: isolated Docker network + `gobgpd`
+/// container + `pathvectord` container + connected [`PathvectorClient`],
+/// with the BGP session already `Established`.
 ///
-/// All resources are cleaned up when the `Harness` is dropped.
+/// All resources (containers, network) are cleaned up when `Harness` drops.
 ///
 /// # Panics
 ///
 /// [`Harness::new`] panics if:
 /// - Docker is not running.
-/// - The `pathvectord` binary has not been built (run `just e2e`).
+/// - Either image has not been built (run `just e2e`).
 /// - The BGP session does not reach `Established` within 15 seconds.
 pub struct Harness {
-    gobgp: ContainerAsync<GenericImage>,
-    _daemon: DaemonProcess,
+    // Containers must be dropped before the network.
+    // Rust drops struct fields in declaration order (top to bottom), so
+    // _gobgpd and _pathvectord drop first, then _network.
+    _gobgpd: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    /// Container ID of gobgpd — used by `gobgp_announce` / `gobgp_withdraw`
+    /// to run `docker exec gobgp ...` against the container.
+    gobgpd_id: String,
+    // Keep config files alive until the containers stop.
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
     pub client: PathvectorClient,
-    /// IPv4 address of the GoBGP peer as seen by `pathvectord`.
+    /// IP address that gobgpd appears as to pathvectord (its container IP on
+    /// the shared Docker network).  Used in tests that assert `route.peer_address`.
     pub peer: Ipv4Addr,
+    // Dropped LAST so the network outlives the containers using it.
+    _network: DockerNetwork,
 }
 
 impl Harness {
@@ -266,66 +345,122 @@ impl Harness {
     ///
     /// See the struct-level documentation.
     pub async fn new() -> Self {
-        let grpc_port = alloc_grpc_port();
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
 
-        // 1. Start GoBGP container; get its mapped BGP port.
-        let gobgp = start_gobgp().await;
-        let bgp_port = gobgp
-            .get_host_port_ipv4(179)
+        // Create an isolated network for this test so containers from
+        // different tests don't interfere.
+        let network_name = format!("pathvector-test-{test_id}");
+        let network = DockerNetwork::create(network_name.clone());
+
+        // Write gobgpd config.
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config
+            .path()
+            .to_str()
+            .expect("gobgpd config path is valid UTF-8")
+            .to_owned();
+
+        // Start gobgpd.  The HEALTHCHECK in the Dockerfile ensures `start()`
+        // only returns once gobgpd's gRPC API is accepting connections.
+        let gobgpd = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-{test_id}"))
+            .with_mount(Mount::bind_mount(gobgpd_config_path, "/etc/gobgp/gobgpd.conf"))
+            .start()
             .await
-            .expect("GoBGP container did not expose port 179");
+            .expect("start gobgpd container");
 
-        // 2. Write pathvectord config and spawn subprocess.
-        let config = write_daemon_config(bgp_port, grpc_port);
-        let daemon = DaemonProcess::spawn(config);
+        let gobgpd_container_id = gobgpd.id().to_owned();
 
-        // 3. Give the daemon a moment to bind its gRPC port.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Discover gobgpd's IP on the shared network.  pathvectord's
+        // PeerConfig.address is Ipv4Addr, so we need the real IP.
+        let gobgpd_ip = container_network_ip(&gobgpd_container_id, &network_name);
 
-        // 4. Connect the management client.
+        // Write pathvectord config referencing gobgpd's container IP.
+        let pathvectord_config = write_daemon_config(gobgpd_ip);
+        let pathvectord_config_path = pathvectord_config
+            .path()
+            .to_str()
+            .expect("pathvectord config path is valid UTF-8")
+            .to_owned();
+
+        // Start pathvectord.  Map its internal gRPC port to a fixed host port
+        // using with_mapped_port so we bypass the PortNotExposed issue that
+        // testcontainers exhibits on macOS (Docker Desktop returns HostIp=""
+        // in port bindings, which the library cannot parse).
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        // Connect the management client to pathvectord's host-mapped gRPC port.
         let mut client =
-            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_port}")).unwrap();
+            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+                .expect("connect PathvectorClient");
 
-        // 5. Wait for the BGP session.
-        let peer = Ipv4Addr::LOCALHOST;
-        wait_for_established(&mut client, peer, Duration::from_secs(15)).await;
+        // Wait for the BGP session.  gobgpd is passive (never initiates), so
+        // pathvectord dials it.  Both containers are on the same bridge network
+        // so the TCP connection goes container-to-container — no proxy involved.
+        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30)).await;
 
         Self {
-            gobgp,
-            _daemon: daemon,
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            gobgpd_id: gobgpd_container_id,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
             client,
-            peer,
+            peer: gobgpd_ip,
+            _network: network,
         }
     }
 
-    /// Announce a route from GoBGP into `pathvectord`'s RIB.
+    /// Announce a prefix from GoBGP into pathvectord's RIB.
     ///
-    /// Equivalent to:
-    /// ```text
-    /// gobgp global rib add <prefix> nexthop <nexthop>
-    /// ```
+    /// Runs `gobgp global rib add <prefix> nexthop <nexthop>` inside the
+    /// gobgpd container via `docker exec`.  GoBGP's gRPC API is never mapped
+    /// to the host; all CLI access goes through the container directly.
     ///
     /// # Panics
     ///
-    /// Panics if the `docker exec` call fails.
-    pub async fn gobgp_announce(&self, prefix: &str, nexthop: &str) {
-        let cmd = ExecCommand::new(["gobgp", "global", "rib", "add", prefix, "nexthop", nexthop]);
-        self.gobgp
-            .exec(cmd)
-            .await
-            .expect("gobgp announce exec failed");
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn gobgp_announce(&self, prefix: &str, nexthop: &str) {
+        // Pass `origin igp` explicitly: GoBGP defaults to INCOMPLETE for
+        // manually injected routes, but the test suite validates IGP origin
+        // handling throughout.
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp", "global", "rib", "add",
+                prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp announce");
+        assert!(status.success(), "gobgp announce {prefix} failed: {status}");
     }
 
-    /// Withdraw a route from GoBGP.
+    /// Withdraw a prefix from GoBGP.
     ///
     /// # Panics
     ///
-    /// Panics if the `docker exec` call fails.
-    pub async fn gobgp_withdraw(&self, prefix: &str) {
-        let cmd = ExecCommand::new(["gobgp", "global", "rib", "del", prefix]);
-        self.gobgp
-            .exec(cmd)
-            .await
-            .expect("gobgp withdraw exec failed");
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn gobgp_withdraw(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args(["gobgp", "global", "rib", "del", prefix])
+            .status()
+            .expect("docker exec gobgp withdraw");
+        assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
     }
 }

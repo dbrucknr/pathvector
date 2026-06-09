@@ -1,0 +1,56 @@
+# pathvectord image for pathvector-e2e tests.
+#
+# Multi-stage build: Stage 1 compiles pathvectord inside a Rust toolchain
+# container (linux/arm64 on Apple Silicon — native speed, no QEMU).
+# Stage 2 copies only the binary into a slim runtime image.
+#
+# Built from the workspace root so all crate members are in context:
+#   docker build -f e2e/Dockerfile.pathvectord -t pathvector-e2e:latest .
+
+# ── Stage 1: compile ──────────────────────────────────────────────────────────
+
+FROM rust:1.88-slim-bookworm AS builder
+
+# protoc is required by prost-build's code-generation step.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Copy workspace manifest and lock file first so dependency fetching is
+# cached as a separate layer — only invalidated when Cargo.lock changes.
+COPY Cargo.toml Cargo.lock ./
+
+# Copy every workspace member.
+COPY pathvector-types/    pathvector-types/
+COPY pathvector-policy/   pathvector-policy/
+COPY pathvector-rib/      pathvector-rib/
+COPY pathvector-session/  pathvector-session/
+COPY pathvector-bmp/      pathvector-bmp/
+COPY pathvector-client/   pathvector-client/
+COPY pathvectord/         pathvectord/
+COPY e2e/                 e2e/
+COPY proto/               proto/
+
+RUN cargo build -p pathvectord
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+
+FROM debian:bookworm-slim
+
+# netcat-openbsd provides `nc` for the HEALTHCHECK TCP probe.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/target/debug/pathvectord /usr/local/bin/pathvectord
+
+# 51200 — gRPC management API (mapped to a dynamic host port by testcontainers)
+EXPOSE 51200
+
+# Verify the gRPC port is accepting TCP connections.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 51200 || exit 1
+
+ENTRYPOINT ["pathvectord"]

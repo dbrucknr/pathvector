@@ -19,7 +19,7 @@ use pathvector_e2e::{Harness, wait_for_route, wait_for_route_withdrawn};
 async fn announced_route_appears_in_rib() {
     let mut h = Harness::new().await;
 
-    h.gobgp_announce("10.0.0.0/8", "10.0.0.1").await;
+    h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
     let route = wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10)).await;
 
     assert_eq!(route.prefix, "10.0.0.0/8");
@@ -33,10 +33,10 @@ async fn announced_route_appears_in_rib() {
 async fn withdrawn_route_removed_from_rib() {
     let mut h = Harness::new().await;
 
-    h.gobgp_announce("192.168.0.0/16", "10.0.0.1").await;
+    h.gobgp_announce("192.168.0.0/16", "10.0.0.1");
     wait_for_route(&mut h.client, "192.168.0.0/16", Duration::from_secs(10)).await;
 
-    h.gobgp_withdraw("192.168.0.0/16").await;
+    h.gobgp_withdraw("192.168.0.0/16");
     wait_for_route_withdrawn(&mut h.client, "192.168.0.0/16", Duration::from_secs(10)).await;
 }
 
@@ -47,7 +47,7 @@ async fn multiple_routes_all_installed() {
 
     let prefixes = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
     for prefix in prefixes {
-        h.gobgp_announce(prefix, "10.0.0.1").await;
+        h.gobgp_announce(prefix, "10.0.0.1");
     }
 
     for prefix in prefixes {
@@ -68,12 +68,12 @@ async fn multiple_routes_all_installed() {
 async fn partial_withdrawal_leaves_others_intact() {
     let mut h = Harness::new().await;
 
-    h.gobgp_announce("10.0.0.0/8", "10.0.0.1").await;
-    h.gobgp_announce("172.16.0.0/12", "10.0.0.1").await;
+    h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
+    h.gobgp_announce("172.16.0.0/12", "10.0.0.1");
     wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10)).await;
     wait_for_route(&mut h.client, "172.16.0.0/12", Duration::from_secs(10)).await;
 
-    h.gobgp_withdraw("10.0.0.0/8").await;
+    h.gobgp_withdraw("10.0.0.0/8");
     wait_for_route_withdrawn(&mut h.client, "10.0.0.0/8", Duration::from_secs(10)).await;
 
     // 172.16.0.0/12 must still be present.
@@ -90,7 +90,7 @@ async fn partial_withdrawal_leaves_others_intact() {
 async fn list_candidates_returns_peer_route() {
     let mut h = Harness::new().await;
 
-    h.gobgp_announce("203.0.113.0/24", "10.0.0.1").await;
+    h.gobgp_announce("203.0.113.0/24", "10.0.0.1");
     wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(10)).await;
 
     let candidates = h.client.list_candidates("203.0.113.0/24").await.unwrap();

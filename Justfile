@@ -43,12 +43,59 @@ doc:
 
 # ── End-to-end ────────────────────────────────────────────────────────────────
 
-# Run end-to-end tests against a live GoBGP container.
-# Requires Docker.  Tests are serialised (--test-threads=1) because each test
-# binds its own ports; parallel execution risks port collisions.
-e2e:
-    cargo build -p pathvectord
+# GoBGP version embedded in the gobgpd Docker image.
+gobgp-version := "4.6.0"
+
+# Build the gobgpd test image.
+# GoBGP only ships Linux binaries, so both images are always Linux containers.
+# On Apple Silicon, Docker Desktop runs a native linux/arm64 VM — no QEMU.
+_build-gobgpd-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    echo "Building pathvector-gobgpd-test:latest (linux/${ARCH})..."
+    docker build \
+        --build-arg TARGETARCH="${ARCH}" \
+        --build-arg GOBGP_VERSION={{gobgp-version}} \
+        -f e2e/Dockerfile \
+        -t pathvector-gobgpd-test:latest \
+        .
+
+# Build the pathvectord test image (multi-stage Rust build inside Docker).
+_build-pathvectord-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-e2e:latest..."
+    docker build \
+        -f e2e/Dockerfile.pathvectord \
+        -t pathvector-e2e:latest \
+        .
+
+# Build both test images (idempotent — Docker layer cache keeps rebuilds fast).
+e2e-images: _build-gobgpd-image _build-pathvectord-image
+
+# Run end-to-end tests.
+# Both gobgpd and pathvectord run as Docker containers on an isolated bridge
+# network per test.  BGP is container-to-container — the macOS Docker Desktop
+# TCP proxy never touches it.  Only pathvectord's gRPC port is mapped to the
+# host (for PathvectorClient), and HTTP/2 is unaffected by the proxy.
+e2e: e2e-images
     cargo test -p pathvector-e2e -- --test-threads=1 --nocapture
+
+# Start the compose dev environment (manual inspection / debugging).
+e2e-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+        docker compose -f e2e/docker-compose.yml up --build -d
+
+# Stop and remove the compose dev environment.
+e2e-down:
+    docker compose -f e2e/docker-compose.yml down
+
+# Stream logs from the compose dev environment.
+e2e-logs:
+    docker compose -f e2e/docker-compose.yml logs -f
 
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 

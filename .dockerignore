@@ -1,0 +1,5 @@
+# Exclude the build artefacts and version-control history from Docker build
+# contexts.  Both e2e Dockerfiles use the workspace root as their context.
+
+target/
+.git/

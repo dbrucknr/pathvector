@@ -1,0 +1,20 @@
+# pathvectord configuration for the docker-compose manual dev environment.
+#
+# gobgpd is assigned the static IP 172.20.0.10 in the compose file.
+# pathvectord.PeerConfig.address is Ipv4Addr so a DNS hostname cannot be used.
+#
+# This file is NOT used by the automated test suite — the harness generates a
+# config with the actual container IP obtained via `docker inspect`.
+
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = 51200
+
+[[peers]]
+address        = "172.20.0.10"
+port           = 179
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"

@@ -64,24 +64,31 @@ async fn list_peers_includes_gobgp_peer() {
 /// correctly rather than hanging forever.
 #[tokio::test]
 async fn wait_for_established_respects_deadline() {
-    // Connect to a port with nothing listening — session will never establish.
-    let mut client = pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
-    // Deadline of 1 second — should panic quickly, not hang.
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
+    // Spawn into a separate task so that when `wait_for_established` panics
+    // (its deadline assertion fires) the panic surfaces as a JoinError rather
+    // than propagating through the test future and crashing the test thread.
+    let handle = tokio::spawn(async {
+        // Connect to a port with nothing listening — session will never establish.
+        let mut client =
+            pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
+        // Deadline of 1 second — the assert inside wait_for_established fires.
         wait_for_established(
             &mut client,
             "127.0.0.1".parse().unwrap(),
             Duration::from_secs(1),
-        ),
-    )
-    .await;
+        )
+        .await;
+    });
 
-    // The inner wait_for_established panics on timeout; catch_unwind is
-    // unavailable in async, so we assert the outer timeout did NOT fire —
-    // meaning the inner deadline terminated the loop within 1 s as expected.
+    // Give the task 3 s.  If the deadline fired correctly the JoinHandle
+    // resolves with Err(JoinError) well within that window.
+    let result = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+    // Outer timeout must NOT have fired — the inner deadline terminated first.
+    assert!(result.is_ok(), "wait_for_established hung for > 3 s");
+    // Task must have panicked (deadline assertion) rather than completing normally.
     assert!(
-        result.is_ok(),
-        "wait_for_established did not respect its deadline within 3 s"
+        result.unwrap().is_err(),
+        "wait_for_established should have panicked on deadline, not returned Ok"
     );
 }
