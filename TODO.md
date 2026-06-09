@@ -38,12 +38,11 @@ daemon event loop — and gets harder to retrofit as the codebase grows. Doing
 it now means every future attribute decode arm gets the correct error policy
 for free. See the dedicated section below.
 
-**4. CLI tool (`pathvector`)** (new crate, uses `pathvector-client`)
-The management API exists and `pathvector-client` wraps it cleanly. A CLI is
-the lowest-friction way for an operator (or a developer evaluating the project)
-to inspect peers and routes without writing Rust or using grpcurl. Commands:
-`peer list`, `peer get <addr>`, `route get <prefix>`, `route list`. Straightforward
-to implement; high value for the "would I use this?" question.
+**4. CLI tool (`pathvector`)** (new crate, uses `pathvector-client`) — **Done (2026-06-09)**
+Implemented as `pathvector/` workspace member. Subcommands: `peer list`,
+`peer get`, `route list [--peer]`, `route best`, `route candidates`,
+`policy set-import`, `policy set-export`, and `dashboard` (live ratatui TUI).
+Global `--address` flag + `PATHVECTOR_ADDRESS` env var select the daemon endpoint.
 
 **5. IPv6 RIB — inbound half** (`pathvectord`)
 After item 1 (MultiProtocol capability) is done, advertising IPv6 capability
