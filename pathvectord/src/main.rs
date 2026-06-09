@@ -765,10 +765,62 @@ impl DaemonState {
 }
 
 async fn run(cfg: config::Config) {
+    run_with(cfg, transport::spawn).await;
+}
+
+/// Runs the BGP daemon using `spawn_fn` to create session handles.
+///
+/// `run()` calls this with [`transport::spawn`]; tests call it with a mock
+/// `spawn_fn` so the session-spawning setup phase can be exercised without
+/// real TCP connections.
+pub(crate) async fn run_with<H, F>(cfg: config::Config, spawn_fn: F)
+where
+    H: SessionHandle,
+    F: Fn(SessionConfig) -> H,
+{
+    let grpc_port = cfg.daemon.grpc_port;
+    let (state, event_rx, stop_senders) = build_daemon(&cfg, spawn_fn).await;
+
+    // Spawn the gRPC management API server alongside the BGP event loop.
+    let grpc_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        grpc::serve(grpc_state, grpc_port).await;
+    });
+
+    run_event_loop(event_rx, state, stop_senders).await;
+}
+
+/// Sets up BGP sessions for every configured peer and constructs the initial
+/// [`DaemonState`].
+///
+/// `spawn_fn` is called once per peer to create a [`SessionHandle`]; `start()`
+/// is then called on each handle so the session task begins the TCP connect /
+/// BGP open exchange.  The returned tuple contains:
+///
+/// - The shared daemon state (pre-populated with per-peer RIBs and policies).
+/// - The event receiver that drains `(peer_ip, SessionEvent)` messages from
+///   the per-peer forwarding tasks.
+/// - The stop-sender map so the event loop can close a session whose outbound
+///   channel overflowed.
+///
+/// Extracted from `run_with()` so it can be driven in tests by supplying a
+/// mock `spawn_fn` — no real TCP sockets needed.
+pub(crate) async fn build_daemon<H, F>(
+    cfg: &config::Config,
+    spawn_fn: F,
+) -> (
+    Arc<RwLock<DaemonState>>,
+    mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
+    HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
+)
+where
+    H: SessionHandle,
+    F: Fn(SessionConfig) -> H,
+{
     let local_as = cfg.daemon.local_as;
     let local_bgp_id = cfg.daemon.bgp_id;
 
-    let (event_tx, mut event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(256);
+    let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(256);
     let mut update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>> = HashMap::new();
     // Stop senders are kept here so the event loop can close a session whose
     // outbound UPDATE channel overflowed.  The session handle itself is moved
@@ -788,7 +840,7 @@ async fn run(cfg: config::Config) {
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
         };
 
-        let mut handle = transport::spawn(session_cfg);
+        let mut handle = spawn_fn(session_cfg);
         handle.start().await;
 
         update_senders.insert(peer.address, handle.update_sender());
@@ -814,14 +866,7 @@ async fn run(cfg: config::Config) {
         update_senders,
     )));
 
-    // Spawn the gRPC management API server alongside the BGP event loop.
-    let grpc_state = Arc::clone(&state);
-    let grpc_port = cfg.daemon.grpc_port;
-    tokio::spawn(async move {
-        grpc::serve(grpc_state, grpc_port).await;
-    });
-
-    run_event_loop(event_rx, state, stop_senders).await;
+    (state, event_rx, stop_senders)
 }
 
 /// Core BGP event loop.
@@ -4003,5 +4048,195 @@ mod prop_tests {
             prop_assert_eq!(result.next_hop, Some(NextHop::V4(bgp_id)), "NEXT_HOP must be rewritten");
             prop_assert!(result.local_pref.is_none(), "LOCAL_PREF must be stripped for eBGP");
         }
+    }
+}
+
+// ── run_with / build_daemon tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod run_with_tests {
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use pathvector_session::message::UpdateMessage;
+    use pathvector_session::transport::{SessionCommand, SessionConfig, SessionEvent, SessionHandle};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::config;
+
+    // ── MockSessionHandle ─────────────────────────────────────────────────────
+
+    /// A zero-cost session handle for unit tests: no TCP, no background tasks.
+    ///
+    /// Events are injected through a channel whose sender is held by
+    /// [`MockPeer`]; `start()` records that it was called via an `AtomicBool`.
+    struct MockSessionHandle {
+        event_rx: mpsc::Receiver<SessionEvent>,
+        update_tx: mpsc::Sender<UpdateMessage>,
+        stop_tx: mpsc::Sender<SessionCommand>,
+        started: Arc<AtomicBool>,
+    }
+
+    impl SessionHandle for MockSessionHandle {
+        fn start(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+            async {
+                self.started.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn next_event(
+            &mut self,
+        ) -> impl std::future::Future<Output = Option<SessionEvent>> + Send + '_ {
+            async { self.event_rx.recv().await }
+        }
+
+        fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+            self.update_tx.clone()
+        }
+
+        fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+            self.stop_tx.clone()
+        }
+    }
+
+    /// Test-side view of a spawned mock session.
+    struct MockPeer {
+        /// Send events into the forwarding task that `build_daemon` spawned.
+        event_tx: mpsc::Sender<SessionEvent>,
+        /// `true` after `start()` has been called on the handle.
+        started: Arc<AtomicBool>,
+    }
+
+    /// Returns a `spawn_fn` compatible with [`build_daemon`] together with a
+    /// shared list that is appended to on each invocation.
+    fn make_mock_spawn() -> (
+        impl Fn(SessionConfig) -> MockSessionHandle,
+        Arc<Mutex<Vec<MockPeer>>>,
+    ) {
+        let peers: Arc<Mutex<Vec<MockPeer>>> = Arc::new(Mutex::new(vec![]));
+        let peers_clone = Arc::clone(&peers);
+        let spawn_fn = move |_cfg: SessionConfig| {
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let (update_tx, _update_rx) = mpsc::channel(8);
+            let (stop_tx, _stop_rx) = mpsc::channel(8);
+            let started = Arc::new(AtomicBool::new(false));
+            peers_clone.lock().unwrap().push(MockPeer {
+                event_tx,
+                started: Arc::clone(&started),
+            });
+            MockSessionHandle {
+                event_rx,
+                update_tx,
+                stop_tx,
+                started,
+            }
+        };
+        (spawn_fn, peers)
+    }
+
+    fn make_config(peer_ips: &[(Ipv4Addr, u32)]) -> config::Config {
+        config::Config {
+            daemon: config::DaemonConfig {
+                local_as: 65001,
+                bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+                hold_time: 90,
+                grpc_port: 0,
+            },
+            peers: peer_ips
+                .iter()
+                .map(|&(address, remote_as)| config::PeerConfig {
+                    address,
+                    port: 179,
+                    remote_as,
+                    import_default: None,
+                    export_default: None,
+                })
+                .collect(),
+        }
+    }
+
+    // ── tests ─────────────────────────────────────────────────────────────────
+
+    /// `build_daemon` calls the spawn function exactly once per configured peer.
+    #[tokio::test]
+    async fn build_daemon_calls_spawn_once_per_peer() {
+        let (spawn_fn, peers) = make_mock_spawn();
+        let cfg = make_config(&[
+            (Ipv4Addr::new(10, 0, 0, 1), 65002),
+            (Ipv4Addr::new(10, 0, 0, 2), 65003),
+        ]);
+        let _ = build_daemon(&cfg, spawn_fn).await;
+        assert_eq!(peers.lock().unwrap().len(), 2);
+    }
+
+    /// `build_daemon` calls `start()` on every handle it spawns.
+    #[tokio::test]
+    async fn build_daemon_starts_each_session() {
+        let (spawn_fn, peers) = make_mock_spawn();
+        let cfg = make_config(&[
+            (Ipv4Addr::new(10, 0, 0, 1), 65002),
+            (Ipv4Addr::new(10, 0, 0, 2), 65003),
+        ]);
+        let _ = build_daemon(&cfg, spawn_fn).await;
+        for peer in peers.lock().unwrap().iter() {
+            assert!(peer.started.load(Ordering::SeqCst), "start() not called");
+        }
+    }
+
+    /// The returned stop-sender map contains an entry for every peer address.
+    #[tokio::test]
+    async fn build_daemon_provides_stop_sender_per_peer() {
+        let peer_a = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_b = Ipv4Addr::new(10, 0, 0, 2);
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
+        let (_state, _rx, stop_senders) = build_daemon(&cfg, spawn_fn).await;
+        assert!(stop_senders.contains_key(&peer_a));
+        assert!(stop_senders.contains_key(&peer_b));
+    }
+
+    /// An event injected through a mock peer's sender appears on the returned
+    /// event receiver — verifying the per-peer forwarding task is wired up.
+    #[tokio::test]
+    async fn build_daemon_forwards_events_to_receiver() {
+        let peer_a = Ipv4Addr::new(10, 0, 0, 1);
+        let (spawn_fn, peers) = make_mock_spawn();
+        let cfg = make_config(&[(peer_a, 65002)]);
+        let (_state, mut event_rx, _stop) = build_daemon(&cfg, spawn_fn).await;
+
+        let event_tx = peers.lock().unwrap()[0].event_tx.clone();
+        event_tx.send(SessionEvent::Terminated).await.unwrap();
+
+        let (ip, event) = event_rx.recv().await.unwrap();
+        assert_eq!(ip, peer_a);
+        assert!(matches!(event, SessionEvent::Terminated));
+    }
+
+    /// The returned `DaemonState` has an update-sender entry for every
+    /// configured peer — i.e. the state is fully pre-populated at startup.
+    #[tokio::test]
+    async fn build_daemon_state_has_entry_per_peer() {
+        let peer_a = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_b = Ipv4Addr::new(10, 0, 0, 2);
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
+        let (state, _rx, _stop) = build_daemon(&cfg, spawn_fn).await;
+        let s = state.read().await;
+        assert!(s.update_senders.contains_key(&peer_a));
+        assert!(s.update_senders.contains_key(&peer_b));
+    }
+
+    /// With no configured peers `build_daemon` succeeds and the event receiver
+    /// closes immediately (all senders were dropped, no peers to forward from).
+    #[tokio::test]
+    async fn build_daemon_no_peers_closes_event_channel() {
+        let (spawn_fn, peers) = make_mock_spawn();
+        let cfg = make_config(&[]);
+        let (_state, mut event_rx, _stop) = build_daemon(&cfg, spawn_fn).await;
+        assert_eq!(peers.lock().unwrap().len(), 0);
+        // No senders remain; recv() returns None immediately.
+        assert!(event_rx.recv().await.is_none());
     }
 }
