@@ -61,34 +61,30 @@ async fn list_peers_includes_gobgp_peer() {
 
 /// After the daemon is stopped, re-connecting a fresh client should time out
 /// on session establishment.  This test verifies the polling deadline fires
-/// correctly rather than hanging forever.
+/// correctly — returning `Err` — rather than hanging forever.
 #[tokio::test]
 async fn wait_for_established_respects_deadline() {
-    // Spawn into a separate task so that when `wait_for_established` panics
-    // (its deadline assertion fires) the panic surfaces as a JoinError rather
-    // than propagating through the test future and crashing the test thread.
-    let handle = tokio::spawn(async {
-        // Connect to a port with nothing listening — session will never establish.
-        let mut client =
-            pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
-        // Deadline of 1 second — the assert inside wait_for_established fires.
+    // Connect to a port with nothing listening — the session will never establish.
+    let mut client =
+        pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
+
+    // The deadline fires after 1 s and returns Err; the whole call completes
+    // well within our 3 s guard.
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
         wait_for_established(
             &mut client,
             "127.0.0.1".parse().unwrap(),
             Duration::from_secs(1),
-        )
-        .await;
-    });
+        ),
+    )
+    .await;
 
-    // Give the task 3 s.  If the deadline fired correctly the JoinHandle
-    // resolves with Err(JoinError) well within that window.
-    let result = tokio::time::timeout(Duration::from_secs(3), handle).await;
-
-    // Outer timeout must NOT have fired — the inner deadline terminated first.
+    // Outer timeout must NOT have fired — the inner deadline returned first.
     assert!(result.is_ok(), "wait_for_established hung for > 3 s");
-    // Task must have panicked (deadline assertion) rather than completing normally.
+    // Must have returned Err (deadline expired), not Ok.
     assert!(
         result.unwrap().is_err(),
-        "wait_for_established should have panicked on deadline, not returned Ok"
+        "wait_for_established should return Err on deadline, not Ok"
     );
 }

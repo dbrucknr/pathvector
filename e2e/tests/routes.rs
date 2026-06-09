@@ -20,7 +20,9 @@ async fn announced_route_appears_in_rib() {
     let mut h = Harness::new().await;
 
     h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
-    let route = wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10)).await;
+    let route = wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("10.0.0.0/8 did not appear in RIB within 10 s");
 
     assert_eq!(route.prefix, "10.0.0.0/8");
     assert_eq!(route.peer_address, h.peer);
@@ -34,10 +36,14 @@ async fn withdrawn_route_removed_from_rib() {
     let mut h = Harness::new().await;
 
     h.gobgp_announce("192.168.0.0/16", "10.0.0.1");
-    wait_for_route(&mut h.client, "192.168.0.0/16", Duration::from_secs(10)).await;
+    wait_for_route(&mut h.client, "192.168.0.0/16", Duration::from_secs(10))
+        .await
+        .expect("192.168.0.0/16 did not appear in RIB within 10 s");
 
     h.gobgp_withdraw("192.168.0.0/16");
-    wait_for_route_withdrawn(&mut h.client, "192.168.0.0/16", Duration::from_secs(10)).await;
+    wait_for_route_withdrawn(&mut h.client, "192.168.0.0/16", Duration::from_secs(10))
+        .await
+        .expect("192.168.0.0/16 was not withdrawn from RIB within 10 s");
 }
 
 /// Multiple prefixes announced in sequence must all appear in the RIB.
@@ -51,7 +57,9 @@ async fn multiple_routes_all_installed() {
     }
 
     for prefix in prefixes {
-        let route = wait_for_route(&mut h.client, prefix, Duration::from_secs(10)).await;
+        let route = wait_for_route(&mut h.client, prefix, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(route.prefix, prefix);
     }
 
@@ -70,11 +78,17 @@ async fn partial_withdrawal_leaves_others_intact() {
 
     h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
     h.gobgp_announce("172.16.0.0/12", "10.0.0.1");
-    wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10)).await;
-    wait_for_route(&mut h.client, "172.16.0.0/12", Duration::from_secs(10)).await;
+    wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("10.0.0.0/8 did not appear in RIB within 10 s");
+    wait_for_route(&mut h.client, "172.16.0.0/12", Duration::from_secs(10))
+        .await
+        .expect("172.16.0.0/12 did not appear in RIB within 10 s");
 
     h.gobgp_withdraw("10.0.0.0/8");
-    wait_for_route_withdrawn(&mut h.client, "10.0.0.0/8", Duration::from_secs(10)).await;
+    wait_for_route_withdrawn(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("10.0.0.0/8 was not withdrawn from RIB within 10 s");
 
     // 172.16.0.0/12 must still be present.
     let remaining = h.client.get_best_route("172.16.0.0/12").await.unwrap();
@@ -91,7 +105,9 @@ async fn list_candidates_returns_peer_route() {
     let mut h = Harness::new().await;
 
     h.gobgp_announce("203.0.113.0/24", "10.0.0.1");
-    wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(10)).await;
+    wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(10))
+        .await
+        .expect("203.0.113.0/24 did not appear in RIB within 10 s");
 
     let candidates = h.client.list_candidates("203.0.113.0/24").await.unwrap();
     assert_eq!(candidates.len(), 1);

@@ -235,71 +235,74 @@ export_default = "accept"
 
 /// Polls until the BGP session with `peer` reaches `Established`.
 ///
-/// # Panics
-///
-/// Panics if the session does not reach `Established` within `timeout`.
+/// Returns `Ok(())` once the session is `Established`, or `Err(String)` if
+/// `timeout` expires before that happens.  Callers that treat a timeout as a
+/// test failure should call `.expect("…")` on the return value.
 pub async fn wait_for_established(
     client: &mut PathvectorClient,
     peer: Ipv4Addr,
     timeout: Duration,
-) {
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            tokio::time::Instant::now() <= deadline,
-            "timed out waiting for BGP session to reach Established with {peer}"
-        );
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for BGP session to reach Established with {peer}"
+            ));
+        }
         if let Ok(p) = client.get_peer(IpAddr::V4(peer)).await
             && p.session_state == SessionState::Established
         {
-            return;
+            return Ok(());
         }
     }
 }
 
 /// Polls until the best route for `prefix` is present, then returns it.
 ///
-/// # Panics
-///
-/// Panics if the route does not appear within `timeout`.
+/// Returns `Ok(Route)` once the route appears, or `Err(String)` if `timeout`
+/// expires first.  Callers that treat a timeout as a test failure should call
+/// `.expect("…")` on the return value.
 pub async fn wait_for_route(
     client: &mut PathvectorClient,
     prefix: &str,
     timeout: Duration,
-) -> Route {
+) -> Result<Route, String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            tokio::time::Instant::now() <= deadline,
-            "timed out waiting for route {prefix} to appear in RIB"
-        );
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for route {prefix} to appear in RIB"
+            ));
+        }
         if let Ok(Some(route)) = client.get_best_route(prefix).await {
-            return route;
+            return Ok(route);
         }
     }
 }
 
 /// Polls until the best route for `prefix` is absent (withdrawn).
 ///
-/// # Panics
-///
-/// Panics if the route is not withdrawn within `timeout`.
+/// Returns `Ok(())` once the route is gone, or `Err(String)` if `timeout`
+/// expires first.  Callers that treat a timeout as a test failure should call
+/// `.expect("…")` on the return value.
 pub async fn wait_for_route_withdrawn(
     client: &mut PathvectorClient,
     prefix: &str,
     timeout: Duration,
-) {
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            tokio::time::Instant::now() <= deadline,
-            "timed out waiting for route {prefix} to be withdrawn from RIB"
-        );
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for route {prefix} to be withdrawn from RIB"
+            ));
+        }
         if let Ok(None) = client.get_best_route(prefix).await {
-            return;
+            return Ok(());
         }
     }
 }
@@ -412,7 +415,9 @@ impl Harness {
         // Wait for the BGP session.  gobgpd is passive (never initiates), so
         // pathvectord dials it.  Both containers are on the same bridge network
         // so the TCP connection goes container-to-container — no proxy involved.
-        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30)).await;
+        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
 
         Self {
             _gobgpd: gobgpd,
