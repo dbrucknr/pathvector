@@ -122,6 +122,309 @@ fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Rout
     peer_b.cmp(peer_a) // reverse: lower peer IP → Greater → preferred
 }
 
+// ── Property tests ────────────────────────────────────────────────────────────
+//
+// Each proptest targets a specific RFC 4271 §9.1 decision step in isolation.
+// Higher-priority criteria are held constant so the step under test is the
+// only discriminator, giving us confidence the implementation is correct for
+// *all* valid inputs, not just the hand-crafted cases in the unit tests below.
+
+#[cfg(test)]
+mod prop_tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use proptest::prelude::*;
+    use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
+
+    use super::select_best;
+    use crate::{PeerId, RouteBuilder};
+
+    // ── Shared helpers ────────────────────────────────────────────────────────
+
+    fn nlri() -> Nlri<Ipv4Addr> {
+        "10.0.0.0/8".parse().unwrap()
+    }
+
+    fn peer(last_octet: u8) -> PeerId {
+        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)))
+    }
+
+    fn make_path(len: usize) -> AsPath {
+        if len == 0 {
+            AsPath::new()
+        } else {
+            let asns: Vec<Asn> = (1..=u32::try_from(len).unwrap()).map(Asn::new).collect();
+            AsPath::from_sequence(asns)
+        }
+    }
+
+    fn arb_origin() -> impl Strategy<Value = Origin> {
+        prop_oneof![
+            Just(Origin::Igp),
+            Just(Origin::Egp),
+            Just(Origin::Incomplete),
+        ]
+    }
+
+    // ── Structural invariants ─────────────────────────────────────────────────
+
+    // A non-empty candidate set always yields Some.
+    proptest! {
+        #[test]
+        fn prop_select_best_non_empty_returns_some(
+            lp  in 0u32..=500u32,
+            len in 0usize..=8usize,
+            origin in arb_origin(),
+        ) {
+            let mut candidates = HashMap::new();
+            candidates.insert(
+                peer(1),
+                RouteBuilder::new(nlri(), origin, make_path(len))
+                    .local_pref(LocalPref::new(lp))
+                    .build(),
+            );
+            prop_assert!(select_best(&candidates).is_some());
+        }
+    }
+
+    // The winner is always one of the input candidates (no phantom routes).
+    proptest! {
+        #[test]
+        fn prop_select_best_winner_is_in_candidates(
+            lp_a in 0u32..=500u32,
+            lp_b in 0u32..=500u32,
+        ) {
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(lp_a)).build());
+            candidates.insert(peer(2), RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(lp_b)).build());
+
+            let (winner, _) = select_best(&candidates).unwrap();
+            prop_assert!(candidates.contains_key(&winner));
+        }
+    }
+
+    // ── Step 2: LOCAL_PREF (RFC 4271 §9.1.2) ─────────────────────────────────
+
+    // Winner's effective LOCAL_PREF is always >= every other candidate's.
+    // All other attributes are equal so LOCAL_PREF is the only discriminator.
+    proptest! {
+        #[test]
+        fn prop_select_best_winner_has_highest_local_pref(
+            lp_a in 0u32..=500u32,
+            lp_b in 0u32..=500u32,
+        ) {
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(lp_a)).build());
+            candidates.insert(peer(2), RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(lp_b)).build());
+
+            let (winner, winning_route) = select_best(&candidates).unwrap();
+            let winning_lp = winning_route.local_pref.unwrap().as_u32();
+
+            prop_assert!(winning_lp >= lp_a, "winner LP {} < lp_a {}", winning_lp, lp_a);
+            prop_assert!(winning_lp >= lp_b, "winner LP {} < lp_b {}", winning_lp, lp_b);
+
+            if lp_a > lp_b {
+                prop_assert_eq!(winner, peer(1), "peer(1) has higher LP");
+            } else if lp_b > lp_a {
+                prop_assert_eq!(winner, peer(2), "peer(2) has higher LP");
+            }
+            // Equal LP: falls through to tiebreaker — verified by the invariant above.
+        }
+    }
+
+    // Absent LOCAL_PREF is treated as the conventional default (100).
+    proptest! {
+        #[test]
+        fn prop_select_best_missing_local_pref_treated_as_100(
+            explicit in 0u32..=500u32,
+        ) {
+            let with_lp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(explicit))
+                .build();
+            let without_lp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .build(); // no LOCAL_PREF → treated as 100
+
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), with_lp);
+            candidates.insert(peer(2), without_lp);
+
+            let (winner, _) = select_best(&candidates).unwrap();
+            if explicit > 100 {
+                prop_assert_eq!(winner, peer(1),
+                    "explicit {} > default 100 — peer(1) should win", explicit);
+            } else if explicit < 100 {
+                prop_assert_eq!(winner, peer(2),
+                    "default 100 > explicit {} — peer(2) should win", explicit);
+            }
+            // explicit == 100: tie, falls to tiebreaker.
+        }
+    }
+
+    // ── Step 4: AS path length (RFC 4271 §9.1.2.2) ───────────────────────────
+
+    // Winner's AS path length is always <= every other candidate's.
+    // LOCAL_PREF is identical so AS path length is the first discriminator.
+    proptest! {
+        #[test]
+        fn prop_select_best_winner_has_shortest_as_path(
+            len_a in 0usize..=8usize,
+            len_b in 0usize..=8usize,
+        ) {
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), RouteBuilder::new(nlri(), Origin::Igp, make_path(len_a))
+                .local_pref(LocalPref::new(100)).build());
+            candidates.insert(peer(2), RouteBuilder::new(nlri(), Origin::Igp, make_path(len_b))
+                .local_pref(LocalPref::new(100)).build());
+
+            let (winner, winning_route) = select_best(&candidates).unwrap();
+            let winning_len = winning_route.as_path.path_length();
+
+            prop_assert!(winning_len <= len_a,
+                "winner path len {} > len_a {}", winning_len, len_a);
+            prop_assert!(winning_len <= len_b,
+                "winner path len {} > len_b {}", winning_len, len_b);
+
+            if len_a < len_b {
+                prop_assert_eq!(winner, peer(1), "peer(1) has shorter path");
+            } else if len_b < len_a {
+                prop_assert_eq!(winner, peer(2), "peer(2) has shorter path");
+            }
+        }
+    }
+
+    // ── Step 5: ORIGIN (RFC 4271 §9.1.2.2) ───────────────────────────────────
+
+    // Winner's ORIGIN is always <= (lower = more preferred) every candidate's.
+    // LOCAL_PREF and AS path are equal so ORIGIN is the first discriminator.
+    proptest! {
+        #[test]
+        fn prop_select_best_winner_has_lowest_origin(
+            origin_a in arb_origin(),
+            origin_b in arb_origin(),
+        ) {
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), RouteBuilder::new(nlri(), origin_a, AsPath::new())
+                .local_pref(LocalPref::new(100)).build());
+            candidates.insert(peer(2), RouteBuilder::new(nlri(), origin_b, AsPath::new())
+                .local_pref(LocalPref::new(100)).build());
+
+            let (winner, winning_route) = select_best(&candidates).unwrap();
+
+            prop_assert!(winning_route.origin <= origin_a,
+                "winner origin {:?} > origin_a {:?}", winning_route.origin, origin_a);
+            prop_assert!(winning_route.origin <= origin_b,
+                "winner origin {:?} > origin_b {:?}", winning_route.origin, origin_b);
+
+            if origin_a < origin_b {
+                prop_assert_eq!(winner, peer(1), "peer(1) has lower origin");
+            } else if origin_b < origin_a {
+                prop_assert_eq!(winner, peer(2), "peer(2) has lower origin");
+            }
+        }
+    }
+
+    // ── Step 6: MED (RFC 4271 §9.1.2.2) ─────────────────────────────────────
+
+    // Winner's effective MED (None = 0) is always <= every candidate's.
+    // LOCAL_PREF, AS path, and ORIGIN are equal so MED is the first discriminator.
+    proptest! {
+        #[test]
+        fn prop_select_best_winner_has_lowest_med(
+            med_a in proptest::option::of(0u32..=1_000u32),
+            med_b in proptest::option::of(0u32..=1_000u32),
+        ) {
+            let eff_a = med_a.unwrap_or(0);
+            let eff_b = med_b.unwrap_or(0);
+
+            let mut ra = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(100));
+            if let Some(m) = med_a { ra = ra.med(Med::new(m)); }
+
+            let mut rb = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(100));
+            if let Some(m) = med_b { rb = rb.med(Med::new(m)); }
+
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), ra.build());
+            candidates.insert(peer(2), rb.build());
+
+            let (winner, winning_route) = select_best(&candidates).unwrap();
+            let winning_med = winning_route.med.map_or(0, Med::as_u32);
+
+            prop_assert!(winning_med <= eff_a,
+                "winner MED {} > eff_a {}", winning_med, eff_a);
+            prop_assert!(winning_med <= eff_b,
+                "winner MED {} > eff_b {}", winning_med, eff_b);
+
+            if eff_a < eff_b {
+                prop_assert_eq!(winner, peer(1), "peer(1) has lower MED");
+            } else if eff_b < eff_a {
+                prop_assert_eq!(winner, peer(2), "peer(2) has lower MED");
+            }
+        }
+    }
+
+    // ── Step 7: eBGP preferred over iBGP (RFC 4271 §9.1.2.2) ────────────────
+
+    // eBGP always beats iBGP when all higher steps tie.
+    // The iBGP route is given the lower peer IP to confirm step 7 overrides
+    // the IP tiebreaker at step 10.
+    proptest! {
+        #[test]
+        fn prop_select_best_ebgp_beats_ibgp(
+            lp  in 0u32..=300u32,
+            len in 0usize..=5usize,
+            origin in arb_origin(),
+        ) {
+            let ebgp = RouteBuilder::new(nlri(), origin, make_path(len))
+                .local_pref(LocalPref::new(lp))
+                .peer_type(PeerType::External)
+                .build();
+            let ibgp = RouteBuilder::new(nlri(), origin, make_path(len))
+                .local_pref(LocalPref::new(lp))
+                .peer_type(PeerType::Internal)
+                .build();
+
+            // iBGP gets the lower peer IP — if step 7 were skipped it would win.
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), ibgp);  // lower IP, iBGP
+            candidates.insert(peer(2), ebgp);  // higher IP, eBGP
+
+            let (winner, _) = select_best(&candidates).unwrap();
+            prop_assert_eq!(winner, peer(2), "eBGP must beat iBGP regardless of peer IP");
+        }
+    }
+
+    // ── Step 10: tiebreaker — lowest peer IP (RFC 4271 §9.1.2.2) ────────────
+
+    // When every attribute is identical, the numerically lowest peer IP wins.
+    // ip_a (1..=127) is always < ip_b (128..=254) by construction.
+    proptest! {
+        #[test]
+        fn prop_select_best_lower_peer_ip_wins_on_full_tie(
+            ip_a in 1u8..=127u8,
+            ip_b in 128u8..=254u8,
+        ) {
+            let route = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(100))
+                .build();
+
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(ip_a), route.clone());
+            candidates.insert(peer(ip_b), route);
+
+            let (winner, _) = select_best(&candidates).unwrap();
+            prop_assert_eq!(winner, peer(ip_a),
+                "peer ...{} should beat ...{}", ip_a, ip_b);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

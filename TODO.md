@@ -28,15 +28,17 @@ proptests at both the `BgpMessage::encode/decode` layer (`message/prop_tests.rs`
 The generators exposed a real round-trip constraint: `Unknown` sub-variants must exclude codes that
 the decoder maps to named variants — constrained accordingly.
 
-**Phase 2 — `pathvector-rib` best-path invariants** ✓ Done
-Step-by-step isolation proptests for every implemented decision step:
-- `prop_select_best_winner_has_highest_local_pref` (step 2)
-- `prop_select_best_winner_has_shortest_as_path` (step 4)
-- `prop_select_best_winner_has_lowest_origin` (step 5)
-- `prop_select_best_winner_has_lowest_med` (step 6)
-- `prop_select_best_ebgp_beats_ibgp` (step 7)
-- `prop_select_best_winner_is_in_candidates`, `prop_select_best_non_empty_returns_some`,
-  `prop_select_best_deterministic` (structural invariants)
+**Phase 2 — `pathvector-rib` best-path invariants** ✓ Done (2026-06-09)
+Step-by-step isolation proptests in `pathvector-rib/src/best_path.rs::prop_tests`:
+- `prop_select_best_winner_has_highest_local_pref` — winner LP ≥ all others (step 2)
+- `prop_select_best_missing_local_pref_treated_as_100` — None → 100 default (step 2)
+- `prop_select_best_winner_has_shortest_as_path` — winner len ≤ all others (step 4)
+- `prop_select_best_winner_has_lowest_origin` — winner origin ≤ all others (step 5)
+- `prop_select_best_winner_has_lowest_med` — winner MED ≤ all others, None=0 (step 6)
+- `prop_select_best_ebgp_beats_ibgp` — eBGP beats iBGP even with lower peer IP (step 7)
+- `prop_select_best_lower_peer_ip_wins_on_full_tie` — full-tie tiebreaker (step 10)
+- `prop_select_best_non_empty_returns_some`, `prop_select_best_winner_is_in_candidates`
+  (structural invariants)
 - LocRib, AdjRibIn, and AdjRibOut structural proptests (insert/withdraw/consistency)
 
 **Phase 3 — `pathvector-policy` semantics** ✓ Done
