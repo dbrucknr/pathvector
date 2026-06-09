@@ -286,13 +286,257 @@ grpcurl -plaintext -d '{"prefix": "192.168.100.0/24"}' \
 
 ## Interoperability
 
-For automated end-to-end testing against GoBGP (Docker-based, works on macOS and Linux), see [TESTING.md — End-to-end tests](TESTING.md#end-to-end-tests). For protocol validation notes from the initial interoperability work, see [TESTING.md — Protocol validation notes](TESTING.md#protocol-validation-notes).
+pathvectord has been validated against GoBGP 4.x with full session lifecycle: OPEN
+negotiation, KEEPALIVE exchange, UPDATE announce and withdraw, and clean session
+teardown. See [TESTING.md — End-to-end tests](TESTING.md#end-to-end-tests) for the
+Docker-based automated suite. The sections below cover manual exploration against
+GoBGP and BIRD on the same host — useful for stepping through protocol behaviour,
+inspecting logs in real time, or validating a specific config change by hand.
 
-The short version: pathvectord has been validated against GoBGP 4.x with full session lifecycle (OPEN negotiation, KEEPALIVE exchange, UPDATE announce and withdraw). The key config requirements are:
+**Easiest path — Docker Compose (no native install required):**
 
-- `bgp_id` must not be a loopback address
-- Include `Capability::FourByteAsn` (already the default — do not remove it)
-- Use `passive-mode = true` in GoBGP to avoid self-connection loops
+```sh
+just e2e-images   # build both images once
+just e2e-up       # start gobgpd + pathvectord in the background
+just e2e-logs     # stream logs from both containers
+just e2e-down     # stop and clean up
+```
+
+Port 51200 (pathvectord gRPC) is mapped to the host so `grpcurl` and
+`pathvector-client` work normally against the compose environment.
+
+---
+
+### Manual peering with GoBGP
+
+GoBGP is a pure-Go BGP implementation with a convenient CLI for route injection.
+It only ships Linux binaries, so macOS users must use the Docker path above or
+cross-compile from source. On Linux:
+
+```sh
+go install github.com/osrg/gobgp/v4/cmd/gobgpd@v4.6.0
+go install github.com/osrg/gobgp/v4/cmd/gobgp@v4.6.0
+```
+
+**GoBGP configuration** (`gobgp.toml`):
+
+```toml
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "127.0.0.1"
+    peer-as          = 65002
+  [neighbors.transport.config]
+    passive-mode = true   # accept incoming connections; do not dial out
+```
+
+`passive-mode = true` is required. Without it GoBGP also dials `127.0.0.1:179`
+and connects to its own listener, producing a flood of NOTIFICATION Code 2
+Subcode 3 rejections before pathvectord even starts.
+
+**pathvectord configuration** (`config.toml`):
+
+```toml
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"   # must not be a loopback address
+hold_time = 90
+
+[[peers]]
+address        = "127.0.0.1"
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"
+```
+
+**Start GoBGP** (requires root for port 179):
+
+```sh
+sudo gobgpd -f gobgp.toml --pprof-disable
+```
+
+**Start pathvectord** (in a separate terminal):
+
+```sh
+RUST_LOG=info cargo run -p pathvectord -- config.toml
+```
+
+Expected log on a successful handshake:
+
+```
+INFO pathvectord: session established peer=127.0.0.1 remote_as=65001 hold_time=90 peer_type=External rib_prefixes=0
+```
+
+**Announce a route from GoBGP:**
+
+```sh
+gobgp global rib add 192.168.100.0/24 nexthop 10.0.0.1 origin igp
+```
+
+pathvectord logs:
+
+```
+INFO pathvectord: processed UPDATE peer=127.0.0.1 withdrawn=0 accepted=1 rib_size=1
+```
+
+Query the route through the management API:
+
+```sh
+grpcurl -plaintext localhost:51200 pathvector.v1.RibService/GetBestRoute \
+  '{"prefix": "192.168.100.0/24"}'
+```
+
+**Withdraw the route:**
+
+```sh
+gobgp global rib del 192.168.100.0/24
+```
+
+pathvectord logs:
+
+```
+INFO pathvectord: processed UPDATE peer=127.0.0.1 withdrawn=1 accepted=0 rib_size=0
+```
+
+**Inspect the GoBGP session from GoBGP's side:**
+
+```sh
+gobgp neighbor 127.0.0.1          # session state and counters
+gobgp global rib                   # routes GoBGP has in its own RIB
+gobgp neighbor 127.0.0.1 adj-in   # routes received from pathvectord
+```
+
+---
+
+### Manual peering with BIRD
+
+BIRD is a widely-deployed BGP implementation (used by many IXP route servers) and
+is stricter about RFC compliance than GoBGP — a useful second data point.
+
+**Install:**
+
+```sh
+# macOS
+brew install bird
+
+# Debian/Ubuntu
+sudo apt install bird2
+```
+
+BIRD also requires root for port 179.
+
+**BIRD configuration** (`bird.conf`, BIRD 2.x syntax):
+
+```
+# bird.conf — peer with pathvectord on the same host
+router id 1.0.0.1;
+
+log stderr all;   # log to stderr for interactive sessions
+
+protocol device {}
+
+# Static routes to export to pathvectord.
+# Edit this block and run `birdc configure` to add/remove routes at runtime.
+protocol static announce {
+    ipv4;
+    route 192.168.100.0/24 blackhole;
+    route 10.10.0.0/16    blackhole;
+}
+
+protocol bgp pathvector {
+    local as 65001;
+    neighbor 127.0.0.1 as 65002;
+    passive;   # accept incoming connections; pathvectord dials us
+
+    ipv4 {
+        import all;                            # accept routes from pathvectord
+        export where source ~ [ RTS_STATIC ];  # send only our static routes
+    };
+}
+```
+
+The `blackhole` next-hop is correct for static routes that exist only to be
+advertised via BGP — BIRD will not try to forward packets to them.
+
+**pathvectord configuration** (same as the GoBGP example above).
+
+**Start BIRD** (foreground for easy Ctrl-C):
+
+```sh
+# macOS / Linux
+sudo bird -c bird.conf -f
+```
+
+On Linux with the system package, BIRD may expect its config at
+`/etc/bird/bird.conf`. Use `-c /path/to/bird.conf` to override.
+
+**Start pathvectord** (in a separate terminal):
+
+```sh
+RUST_LOG=info cargo run -p pathvectord -- config.toml
+```
+
+**Inspect the session from BIRD's side:**
+
+```sh
+sudo birdc show protocols                      # all protocols and their state
+sudo birdc show protocols pathvector           # detail for the BGP session
+sudo birdc show route                          # BIRD's full RIB
+sudo birdc show route protocol pathvector      # routes learned from pathvectord
+sudo birdc show bgp sessions                   # BGP session table
+```
+
+A healthy session shows `pathvector  BGP        ---        up` in
+`show protocols`.
+
+**Announce a new route at runtime:**
+
+BIRD does not have a `gobgp global rib add`-style CLI. The standard approach
+is to add a `route` line to the `static announce` protocol block and reload:
+
+```sh
+# 1. Edit bird.conf — add to the static announce protocol:
+#      route 203.0.113.0/24 blackhole;
+
+# 2. Reload without resetting BGP sessions:
+sudo birdc configure
+```
+
+pathvectord will receive the UPDATE and log the install.
+
+**Withdraw a route:**
+
+Remove the `route` line from the `static announce` block and reload:
+
+```sh
+sudo birdc configure
+```
+
+---
+
+### What to look for in both cases
+
+| Signal | Meaning |
+|---|---|
+| `session established` in pathvectord logs | OPEN + KEEPALIVE exchange succeeded; 4-byte ASN negotiated |
+| `processed UPDATE … accepted=N` | Route passed import policy and is in the Loc-RIB |
+| `GetBestRoute` returns the prefix | Management API and RIB are consistent |
+| Hold timer maintained (keepalives every 30 s at hold_time=90) | Timer logic and KEEPALIVE encoding are correct |
+| `session terminated` after Ctrl-C on peer | NOTIFICATION teardown is clean; RIB cleared |
+| No unexpected NOTIFICATION messages | Codec and capability negotiation are RFC-compliant |
+
+### Known gotchas
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| NOTIFICATION Code 2 Subcode 3 (Bad BGP Identifier) | `bgp_id` is in `127.0.0.0/8` — real BGP implementations reject loopback BGP IDs | Use a non-loopback address, e.g. `10.0.0.2` |
+| Session drops on first UPDATE | `FourByteAsn` capability omitted — peer sends 2-byte AS_PATH, decoder reads 4 bytes per ASN | `Capability::FourByteAsn(local_as)` is already added by default; do not remove it |
+| Repeated self-connection NOTIFICATIONs (GoBGP) | GoBGP dials its own listener when `passive-mode` is not set | Set `passive-mode = true` in the GoBGP neighbor transport config |
+| `Permission denied` binding port 179 | BGP uses a privileged port | Run the peer daemon with `sudo`; pathvectord connects outbound so does not need root |
+| BIRD session stays `Active` | BIRD is in passive mode — pathvectord must connect first | Confirm pathvectord is running and pointing to the correct address |
 
 ---
 
@@ -303,4 +547,4 @@ The short version: pathvectord has been validated against GoBGP 4.x with full se
 | `pathvector` CLI | Typed gRPC client CLI — on the roadmap as `pathvector-client` |
 | Runtime policy reload via gRPC | `reapply_import_policy` exists but export propagation not yet wired |
 | IPv6 RIB | Session layer parses IPv6 MP_REACH/UNREACH; daemon tables are IPv4-only |
-| Docker image | Planned: `FROM debian:slim`, single binary, config mount, gRPC port exposed |
+| Docker image | Done — `e2e/Dockerfile.pathvectord`; see `just e2e-images`. A standalone production image (separate from the test image) is not yet published. |
