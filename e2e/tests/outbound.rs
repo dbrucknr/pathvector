@@ -76,11 +76,7 @@ async fn source_route_visible_in_pathvectord_rib() {
 
     h.source_announce("198.51.100.0/24", "10.0.0.1");
 
-    pathvector_e2e::wait_for_route(
-        &mut h.client,
-        "198.51.100.0/24",
-        Duration::from_secs(10),
-    )
-    .await
-    .expect("198.51.100.0/24 did not appear in pathvectord's RIB within 10 s");
+    pathvector_e2e::wait_for_route(&mut h.client, "198.51.100.0/24", Duration::from_secs(10))
+        .await
+        .expect("198.51.100.0/24 did not appear in pathvectord's RIB within 10 s");
 }

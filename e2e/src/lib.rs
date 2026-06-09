@@ -651,7 +651,10 @@ impl TwoPeerHarness {
             .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
             .with_network(&network_name)
             .with_container_name(format!("gobgpd-sink-{test_id}"))
-            .with_mount(Mount::bind_mount(sink_config_path, "/etc/gobgp/gobgpd.conf"))
+            .with_mount(Mount::bind_mount(
+                sink_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
             .start()
             .await
             .expect("start gobgpd-sink container");
@@ -688,14 +691,16 @@ impl TwoPeerHarness {
             .with_network(&network_name)
             .with_container_name(format!("pathvectord-{test_id}"))
             .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
-            .with_mount(Mount::bind_mount(daemon_config_path, "/etc/pathvectord.toml"))
+            .with_mount(Mount::bind_mount(
+                daemon_config_path,
+                "/etc/pathvectord.toml",
+            ))
             .start()
             .await
             .expect("start pathvectord container");
 
-        let mut client =
-            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
-                .expect("connect PathvectorClient");
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient");
 
         // Wait for both BGP sessions to establish.
         wait_for_established(&mut client, sink_addr, Duration::from_secs(30))
