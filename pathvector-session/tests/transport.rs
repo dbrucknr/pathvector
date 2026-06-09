@@ -16,7 +16,7 @@ use pathvector_session::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
     UpdateMessage,
 };
-use pathvector_session::transport::{SessionConfig, SessionEvent, spawn};
+use pathvector_session::transport::{SessionConfig, SessionEvent, SessionHandle, spawn};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

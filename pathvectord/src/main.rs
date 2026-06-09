@@ -12,7 +12,7 @@ use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
     message::{Capability, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage},
-    transport::{self, SessionCommand, SessionConfig, SessionEvent},
+    transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::{RwLock, mpsc};
@@ -821,35 +821,49 @@ async fn run(cfg: config::Config) {
         grpc::serve(grpc_state, grpc_port).await;
     });
 
-    while let Some((peer_ip, event)) = event_rx.recv().await {
-        {
-            let mut s = state.write().await;
-            match event {
-                SessionEvent::Established(info) => {
-                    s.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
-                }
-                SessionEvent::Terminated => {
-                    s.on_terminated(peer_ip);
-                }
-                SessionEvent::RouteUpdate(msg) => {
-                    s.on_route_update(peer_ip, msg);
-                }
-            }
-            // Collect any peers whose outbound channel overflowed.  These are
-            // drained outside the write-lock block so we don't hold the lock
-            // across the async stop-sender sends.
-            let stalled = s.take_stalled_peers();
-            drop(s);
+    run_event_loop(event_rx, state, stop_senders).await;
+}
 
-            for peer in stalled {
-                tracing::error!(
-                    peer = %peer,
-                    "closing session: outbound UPDATE channel overflowed; \
-                     session will re-establish and perform a fresh full-table dump"
-                );
-                if let Some(tx) = stop_senders.get(&peer) {
-                    let _ = tx.send(SessionCommand::Stop).await;
-                }
+/// Core BGP event loop.
+///
+/// Drains `event_rx`, dispatches each `(peer_ip, SessionEvent)` to the shared
+/// [`DaemonState`], then closes any sessions whose outbound UPDATE channel
+/// overflowed during that dispatch.
+///
+/// Extracted from `run()` so it can be driven in unit tests by injecting a
+/// pre-built channel and a pre-populated `DaemonState` — no TCP connections
+/// or real session tasks required.
+pub(crate) async fn run_event_loop(
+    mut event_rx: mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
+    state: Arc<RwLock<DaemonState>>,
+    stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
+) {
+    while let Some((peer_ip, event)) = event_rx.recv().await {
+        let mut s = state.write().await;
+        match event {
+            SessionEvent::Established(info) => {
+                s.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
+            }
+            SessionEvent::Terminated => {
+                s.on_terminated(peer_ip);
+            }
+            SessionEvent::RouteUpdate(msg) => {
+                s.on_route_update(peer_ip, msg);
+            }
+        }
+        // Collect any peers whose outbound channel overflowed.  Drain outside
+        // the write-lock so we don't hold it across the async stop-sender sends.
+        let stalled = s.take_stalled_peers();
+        drop(s);
+
+        for peer in stalled {
+            tracing::error!(
+                peer = %peer,
+                "closing session: outbound UPDATE channel overflowed; \
+                 session will re-establish and perform a fresh full-table dump"
+            );
+            if let Some(tx) = stop_senders.get(&peer) {
+                let _ = tx.send(SessionCommand::Stop).await;
             }
         }
     }
@@ -3561,6 +3575,283 @@ mod stall_tests {
             !state.take_stalled_peers().is_empty(),
             "peer must be stalled when channel is full during set_export_default propagation"
         );
+    }
+}
+
+// ── Event loop tests ──────────────────────────────────────────────────────────
+//
+// These tests drive `run_event_loop` by injecting `SessionEvent`s through an
+// mpsc channel.  No TCP connections or real session tasks are required.
+
+#[cfg(test)]
+mod event_loop_tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pathvector_session::fsm::SessionInfo;
+    use pathvector_session::message::{Capability, UpdateMessage};
+    use pathvector_session::transport::{SessionCommand, SessionEvent};
+    use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::config;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn established_info(peer_as: u32) -> SessionInfo {
+        SessionInfo {
+            peer_as,
+            peer_bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            hold_time: 90,
+            peer_capabilities: vec![Capability::FourByteAsn(peer_as)],
+            peer_type: PeerType::External,
+        }
+    }
+
+    /// Build a `DaemonState` + receivers for a set of peers with accept-all
+    /// policies and channels of the given capacity.
+    fn make_state(
+        peers: &[(Ipv4Addr, u32)],
+        channel_cap: usize,
+    ) -> (
+        Arc<RwLock<DaemonState>>,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+        HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
+    ) {
+        let mut update_senders = HashMap::new();
+        let mut update_receivers = HashMap::new();
+        let mut stop_senders = HashMap::new();
+        let mut stop_receivers: HashMap<Ipv4Addr, mpsc::Receiver<SessionCommand>> = HashMap::new();
+
+        for &(ip, _) in peers {
+            let (tx, rx) = mpsc::channel(channel_cap);
+            update_senders.insert(ip, tx);
+            update_receivers.insert(ip, rx);
+            let (stx, srx) = mpsc::channel(8);
+            stop_senders.insert(ip, stx);
+            stop_receivers.insert(ip, srx);
+        }
+
+        let peer_configs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(address, remote_as)| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            })
+            .collect();
+
+        let state = Arc::new(RwLock::new(DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peer_configs,
+            update_senders,
+        )));
+
+        (state, update_receivers, stop_senders)
+    }
+
+    // ── Established dispatch ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn event_loop_dispatches_established() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        event_tx
+            .send((peer_ip, SessionEvent::Established(established_info(65002))))
+            .await
+            .unwrap();
+        drop(event_tx); // close channel so event loop exits after one event
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+
+        let s = state.read().await;
+        assert!(
+            s.peer_types.contains_key(&peer_ip),
+            "Established event must register peer type in DaemonState"
+        );
+    }
+
+    // ── Terminated dispatch ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn event_loop_dispatches_terminated() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
+
+        // Establish first so there is state to tear down.
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65002, 90);
+        }
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+
+        let s = state.read().await;
+        assert!(
+            !s.peer_types.contains_key(&peer_ip),
+            "Terminated event must remove peer type from DaemonState"
+        );
+    }
+
+    // ── RouteUpdate dispatch ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn event_loop_dispatches_route_update() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
+
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65002, 90);
+        }
+
+        let update = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop(peer_ip),
+            ],
+            announced: vec![nlri("10.0.0.0/8")],
+        };
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        event_tx
+            .send((peer_ip, SessionEvent::RouteUpdate(update)))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+
+        let s = state.read().await;
+        assert_eq!(s.loc_rib.len(), 1, "RouteUpdate must insert route into Loc-RIB");
+    }
+
+    // ── Stalled peer → stop command ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn event_loop_sends_stop_to_stalled_peer() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+
+        // Give peer_b a channel of capacity 1 so it stalls during propagation.
+        let (tx_a, _rx_a) = mpsc::channel::<UpdateMessage>(64);
+        let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
+        let (stop_tx_a, _stop_rx_a) = mpsc::channel::<SessionCommand>(8);
+        let (stop_tx_b, mut stop_rx_b) = mpsc::channel::<SessionCommand>(8);
+
+        let peer_configs = vec![
+            config::PeerConfig {
+                address: peer_a,
+                port: 179,
+                remote_as: 65002,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            },
+            config::PeerConfig {
+                address: peer_b,
+                port: 179,
+                remote_as: 65003,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            },
+        ];
+        let mut update_senders = HashMap::new();
+        update_senders.insert(peer_a, tx_a);
+        update_senders.insert(peer_b, tx_b);
+        let state = Arc::new(RwLock::new(DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peer_configs,
+            update_senders,
+        )));
+        let mut stop_senders = HashMap::new();
+        stop_senders.insert(peer_a, stop_tx_a);
+        stop_senders.insert(peer_b, stop_tx_b);
+
+        // Establish both peers.
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_a, PeerType::External, 65002, 90);
+            s.on_established(peer_b, PeerType::External, 65003, 90);
+        }
+
+        // Pre-fill peer_b's cap-1 UPDATE channel so the propagation try_send fails.
+        {
+            let s = state.read().await;
+            s.update_senders[&peer_b]
+                .try_send(UpdateMessage {
+                    withdrawn: vec![nlri("0.0.0.0/0")],
+                    attributes: vec![],
+                    announced: vec![],
+                })
+                .expect("channel must have room for the fill message");
+        }
+
+        // Announce a route from peer_a — propagation to peer_b will fail
+        // (channel already full) and peer_b must be recorded as stalled.
+        let (event_tx, event_rx) = mpsc::channel(8);
+        event_tx
+            .send((
+                peer_a,
+                SessionEvent::RouteUpdate(UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                        PathAttribute::NextHop(peer_a),
+                    ],
+                    announced: vec![nlri("10.0.0.0/8")],
+                }),
+            ))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+
+        // The event loop must have sent SessionCommand::Stop to peer_b.
+        let cmd = stop_rx_b
+            .try_recv()
+            .expect("event loop must send Stop to stalled peer_b");
+        assert!(
+            matches!(cmd, SessionCommand::Stop),
+            "expected Stop command, got {cmd:?}"
+        );
+    }
+
+    // ── Channel closed → loop exits ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn event_loop_exits_when_channel_closes() {
+        let (state, _rxs, stop_senders) = make_state(&[], 64);
+        let (_event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
+        // Drop the sender immediately — the loop must exit without hanging.
+        drop(_event_tx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_event_loop(event_rx, state, stop_senders),
+        )
+        .await
+        .expect("run_event_loop must exit when the event channel is closed");
     }
 }
 

@@ -2,7 +2,8 @@
 //!
 //! Wires the [`crate::framing::BgpCodec`] and [`crate::fsm::Fsm`] together
 //! over a real TCP connection. Call [`spawn`] to start a session task and
-//! interact with it via the returned [`SessionHandle`].
+//! interact with it via the returned [`SpawnedSessionHandle`], which
+//! implements the [`SessionHandle`] trait.
 
 #[cfg(test)]
 mod prop_tests;
@@ -77,6 +78,34 @@ impl BgpTransport for FramedBgpTransport {
     }
 }
 
+// ── SessionHandle trait ───────────────────────────────────────────────────────
+
+/// Caller-facing interface for controlling a running BGP session.
+///
+/// The trait abstracts over both the real TCP-backed session ([`SpawnedSessionHandle`]
+/// returned by [`spawn`]) and test doubles so that the daemon event loop can be
+/// driven in unit tests without opening real TCP connections.
+///
+/// All methods mirror those on [`SpawnedSessionHandle`]; see the struct-level
+/// docs there for full semantics.
+pub trait SessionHandle: Send + 'static {
+    /// Signal the session to begin its TCP connect / FSM start sequence.
+    fn start(&self) -> impl Future<Output = ()> + Send + '_;
+
+    /// Receive the next [`SessionEvent`] from the session.
+    ///
+    /// Returns `None` when the session task has exited and no further events
+    /// will arrive.
+    fn next_event(&mut self) -> impl Future<Output = Option<SessionEvent>> + Send + '_;
+
+    /// Clone the outbound UPDATE sender for this session.
+    fn update_sender(&self) -> mpsc::Sender<UpdateMessage>;
+
+    /// Clone the stop-command sender so the event loop can close a session
+    /// whose outbound UPDATE channel overflowed.
+    fn stop_sender(&self) -> mpsc::Sender<SessionCommand>;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Configuration for a BGP session.
@@ -115,26 +144,32 @@ pub enum SessionEvent {
 }
 
 /// Caller-facing handle returned by [`spawn`].
-pub struct SessionHandle {
+///
+/// Implements [`SessionHandle`]. The concrete type is an implementation detail;
+/// callers that need to be generic over session implementations should use the
+/// [`SessionHandle`] trait bound instead.
+pub struct SpawnedSessionHandle {
     cmd_tx: mpsc::Sender<SessionCommand>,
     event_rx: mpsc::Receiver<SessionEvent>,
     update_tx: mpsc::Sender<UpdateMessage>,
 }
 
-impl SessionHandle {
-    /// Send a [`SessionCommand::Start`] to the session.
-    pub async fn start(&self) {
-        let _ = self.cmd_tx.send(SessionCommand::Start).await;
-    }
-
+impl SpawnedSessionHandle {
     /// Send a [`SessionCommand::Stop`] to the session.
+    ///
+    /// Unlike [`SessionHandle::stop_sender`], this consumes the handle and
+    /// waits for the send to complete — use it for direct, one-shot teardown.
     pub async fn stop(&self) {
         let _ = self.cmd_tx.send(SessionCommand::Stop).await;
     }
+}
 
-    /// Receive the next [`SessionEvent`]. Returns `None` when the session task
-    /// has exited.
-    pub async fn next_event(&mut self) -> Option<SessionEvent> {
+impl SessionHandle for SpawnedSessionHandle {
+    async fn start(&self) {
+        let _ = self.cmd_tx.send(SessionCommand::Start).await;
+    }
+
+    async fn next_event(&mut self) -> Option<SessionEvent> {
         self.event_rx.recv().await
     }
 
@@ -145,10 +180,7 @@ impl SessionHandle {
     /// in the Established state. If the session is not connected, the messages
     /// are discarded. The channel has capacity 256; senders should treat a full
     /// channel as a signal to stop the session (see [`stop_sender`]).
-    ///
-    /// [`stop_sender`]: SessionHandle::stop_sender
-    #[must_use]
-    pub fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+    fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
         self.update_tx.clone()
     }
 
@@ -161,8 +193,7 @@ impl SessionHandle {
     /// partial-update recovery mechanism, so the only way to restore a
     /// consistent peer view is to close the session and let it re-establish
     /// (which triggers a full-table dump from a clean `AdjRibOut`).
-    #[must_use]
-    pub fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+    fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
         self.cmd_tx.clone()
     }
 }
@@ -172,7 +203,7 @@ impl SessionHandle {
 /// The session starts in `Idle`. Call [`SessionHandle::start`] to initiate the
 /// TCP connection.
 #[must_use]
-pub fn spawn(config: SessionConfig) -> SessionHandle {
+pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(64);
     let (update_tx, update_rx) = mpsc::channel(256);
@@ -202,7 +233,7 @@ pub fn spawn(config: SessionConfig) -> SessionHandle {
     };
 
     tokio::spawn(session.run());
-    SessionHandle {
+    SpawnedSessionHandle {
         cmd_tx,
         event_rx,
         update_tx,
@@ -221,7 +252,7 @@ pub fn spawn(config: SessionConfig) -> SessionHandle {
 /// Intended exclusively for tests that need a controllable transport without
 /// binding real TCP sockets.
 #[cfg(test)]
-pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> SessionHandle {
+pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> SpawnedSessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(64);
     let (update_tx, update_rx) = mpsc::channel(256);
@@ -251,7 +282,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Sessi
     };
 
     tokio::spawn(session.run());
-    SessionHandle {
+    SpawnedSessionHandle {
         cmd_tx,
         event_rx,
         update_tx,
@@ -500,7 +531,7 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{BgpTransport, SessionConfig, SessionEvent, spawn_with};
+    use super::{BgpTransport, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, spawn_with};
     use crate::framing::FramingError;
     use crate::message::{BgpMessage, Capability, OpenMessage, UpdateMessage};
 
@@ -582,7 +613,7 @@ mod tests {
     /// Drive the session through a full OPEN/KEEPALIVE handshake and wait for
     /// the `Established` event. The caller must have already called
     /// `spawn_with` and NOT yet called `start`.
-    async fn drive_to_established(handle: &mut super::SessionHandle, peer: &mut MockPeer) {
+    async fn drive_to_established(handle: &mut SpawnedSessionHandle, peer: &mut MockPeer) {
         handle.start().await;
 
         let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())

@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use proptest::prelude::*;
 
-use super::{SessionConfig, spawn};
+use super::{SessionConfig, SessionHandle, spawn};
 
 fn arb_config() -> impl Strategy<Value = SessionConfig> {
     (1u32..=u32::MAX, 0u16..=65535u16, any::<bool>()).prop_map(
