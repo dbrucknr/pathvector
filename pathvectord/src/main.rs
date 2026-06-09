@@ -12,7 +12,7 @@ use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
     message::{Capability, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage},
-    transport::{self, SessionConfig, SessionEvent},
+    transport::{self, SessionCommand, SessionConfig, SessionEvent},
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::{RwLock, mpsc};
@@ -157,6 +157,15 @@ fn withdraw_msg(nlri: Nlri<Ipv4Addr>) -> UpdateMessage {
 /// Only call this for established peers; `update_tx` for non-established peers
 /// is not drained until they come up, which can produce stale advertisements.
 #[allow(clippy::too_many_arguments)]
+/// Propagate the current best route for `nlri` to a single peer.
+///
+/// Returns `true` if all outbound channel sends succeeded, or `false` if any
+/// [`try_send`] returned `Err` (the channel was full).  A `false` return means
+/// the peer's view of the RIB has diverged and the session must be closed and
+/// re-established to restore consistency — BGP has no partial-update recovery.
+/// Callers are responsible for scheduling the session close via [`SessionCommand::Stop`].
+///
+/// [`try_send`]: tokio::sync::mpsc::Sender::try_send
 fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &LocRib<Ipv4Addr>,
@@ -166,7 +175,7 @@ fn propagate_prefix(
     local_as: u32,
     local_bgp_id: Ipv4Addr,
     update_tx: &mpsc::Sender<UpdateMessage>,
-) {
+) -> bool {
     match loc_rib.best(&nlri) {
         Some(best) => {
             let mut route = prepare_outbound(best.clone(), peer_type, local_as, local_bgp_id);
@@ -177,21 +186,25 @@ fn propagate_prefix(
                             if prev.as_ref() != Some(&route)
                                 && update_tx.try_send(route_to_update(route)).is_err()
                             {
-                                tracing::warn!(
+                                tracing::error!(
                                     peer = %adj_rib_out.peer(),
                                     prefix = %nlri,
-                                    "outbound UPDATE channel full, dropping"
+                                    "outbound UPDATE channel full — session will be closed \
+                                     to restore consistent peer view"
                                 );
+                                return false;
                             }
                         }
                         InsertOutcome::Filtered(Some(_)) => {
                             // iBGP split-horizon evicted a previously stored route.
                             if update_tx.try_send(withdraw_msg(nlri)).is_err() {
-                                tracing::warn!(
+                                tracing::error!(
                                     peer = %adj_rib_out.peer(),
                                     prefix = %nlri,
-                                    "outbound WITHDRAW channel full, dropping"
+                                    "outbound WITHDRAW channel full — session will be closed \
+                                     to restore consistent peer view"
                                 );
+                                return false;
                             }
                         }
                         InsertOutcome::Filtered(None) => {}
@@ -201,11 +214,13 @@ fn propagate_prefix(
                     if adj_rib_out.withdraw(&nlri).is_some()
                         && update_tx.try_send(withdraw_msg(nlri)).is_err()
                     {
-                        tracing::warn!(
+                        tracing::error!(
                             peer = %adj_rib_out.peer(),
                             prefix = %nlri,
-                            "outbound WITHDRAW channel full, dropping"
+                            "outbound WITHDRAW channel full — session will be closed \
+                             to restore consistent peer view"
                         );
+                        return false;
                     }
                 }
             }
@@ -214,14 +229,17 @@ fn propagate_prefix(
             if adj_rib_out.withdraw(&nlri).is_some()
                 && update_tx.try_send(withdraw_msg(nlri)).is_err()
             {
-                tracing::warn!(
+                tracing::error!(
                     peer = %adj_rib_out.peer(),
                     prefix = %nlri,
-                    "outbound WITHDRAW channel full, dropping"
+                    "outbound WITHDRAW channel full — session will be closed \
+                     to restore consistent peer view"
                 );
+                return false;
             }
         }
     }
+    true
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -248,6 +266,14 @@ struct DaemonState {
     pub(crate) established_at: HashMap<Ipv4Addr, std::time::Instant>,
     /// Negotiated hold-timer value per established peer.
     pub(crate) hold_times: HashMap<Ipv4Addr, u16>,
+    /// Peers whose outbound UPDATE channel overflowed during the current event.
+    ///
+    /// The event loop drains this list after each event via [`take_stalled_peers`]
+    /// and sends [`SessionCommand::Stop`] to each affected session so it can
+    /// re-establish and perform a clean full-table dump.
+    ///
+    /// [`take_stalled_peers`]: DaemonState::take_stalled_peers
+    stalled_peers: Vec<Ipv4Addr>,
 }
 
 impl DaemonState {
@@ -313,7 +339,18 @@ impl DaemonState {
             peer_remote_as,
             established_at: HashMap::new(),
             hold_times: HashMap::new(),
+            stalled_peers: Vec::new(),
         }
+    }
+
+    /// Drains and returns the list of peers whose outbound UPDATE channel
+    /// overflowed during the most recent event.
+    ///
+    /// The event loop calls this after each event and sends
+    /// [`SessionCommand::Stop`] to each returned peer so the session can
+    /// re-establish and perform a fresh full-table dump.
+    fn take_stalled_peers(&mut self) -> Vec<Ipv4Addr> {
+        std::mem::take(&mut self.stalled_peers)
     }
 
     /// Called when a BGP session reaches Established.
@@ -355,8 +392,9 @@ impl DaemonState {
             return;
         };
 
+        let mut stalled = false;
         for nlri in all_nlris {
-            propagate_prefix(
+            if !propagate_prefix(
                 nlri,
                 &self.loc_rib,
                 adj_rib_out,
@@ -365,7 +403,13 @@ impl DaemonState {
                 self.local_as,
                 self.local_bgp_id,
                 update_tx,
-            );
+            ) {
+                stalled = true;
+                break;
+            }
+        }
+        if stalled {
+            self.stalled_peers.push(peer_ip);
         }
 
         tracing::info!(
@@ -439,8 +483,9 @@ impl DaemonState {
                 continue;
             };
 
+            let mut stalled = false;
             for &nlri in &prev_prefixes {
-                propagate_prefix(
+                if !propagate_prefix(
                     nlri,
                     &self.loc_rib,
                     adj_rib_out,
@@ -449,7 +494,13 @@ impl DaemonState {
                     self.local_as,
                     self.local_bgp_id,
                     update_tx,
-                );
+                ) {
+                    stalled = true;
+                    break;
+                }
+            }
+            if stalled {
+                self.stalled_peers.push(other_ip);
             }
         }
 
@@ -553,8 +604,9 @@ impl DaemonState {
                 continue;
             };
 
+            let mut stalled = false;
             for &nlri in &affected {
-                propagate_prefix(
+                if !propagate_prefix(
                     nlri,
                     &self.loc_rib,
                     adj_rib_out,
@@ -563,7 +615,13 @@ impl DaemonState {
                     self.local_as,
                     self.local_bgp_id,
                     update_tx,
-                );
+                ) {
+                    stalled = true;
+                    break;
+                }
+            }
+            if stalled {
+                self.stalled_peers.push(other_ip);
             }
         }
     }
@@ -575,6 +633,10 @@ async fn run(cfg: config::Config) {
 
     let (event_tx, mut event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(256);
     let mut update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>> = HashMap::new();
+    // Stop senders are kept here so the event loop can close a session whose
+    // outbound UPDATE channel overflowed.  The session handle itself is moved
+    // into the per-peer forwarding task, so this is the only retained handle.
+    let mut stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
 
     for peer in &cfg.peers {
         let session_cfg = SessionConfig {
@@ -590,6 +652,7 @@ async fn run(cfg: config::Config) {
         handle.start().await;
 
         update_senders.insert(peer.address, handle.update_sender());
+        stop_senders.insert(peer.address, handle.stop_sender());
 
         let peer_addr = peer.address;
         let tx = event_tx.clone();
@@ -619,16 +682,34 @@ async fn run(cfg: config::Config) {
     });
 
     while let Some((peer_ip, event)) = event_rx.recv().await {
-        let mut s = state.write().await;
-        match event {
-            SessionEvent::Established(info) => {
-                s.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
+        {
+            let mut s = state.write().await;
+            match event {
+                SessionEvent::Established(info) => {
+                    s.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
+                }
+                SessionEvent::Terminated => {
+                    s.on_terminated(peer_ip);
+                }
+                SessionEvent::RouteUpdate(msg) => {
+                    s.on_route_update(peer_ip, msg);
+                }
             }
-            SessionEvent::Terminated => {
-                s.on_terminated(peer_ip);
-            }
-            SessionEvent::RouteUpdate(msg) => {
-                s.on_route_update(peer_ip, msg);
+            // Collect any peers whose outbound channel overflowed.  These are
+            // drained outside the write-lock block so we don't hold the lock
+            // across the async stop-sender sends.
+            let stalled = s.take_stalled_peers();
+            drop(s);
+
+            for peer in stalled {
+                tracing::error!(
+                    peer = %peer,
+                    "closing session: outbound UPDATE channel overflowed; \
+                     session will re-establish and perform a fresh full-table dump"
+                );
+                if let Some(tx) = stop_senders.get(&peer) {
+                    let _ = tx.send(SessionCommand::Stop).await;
+                }
             }
         }
     }
@@ -2481,12 +2562,12 @@ mod tests {
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
     }
 
-    // ── propagate_prefix — channel-full warnings ──────────────────────────────
+    // ── propagate_prefix — channel-full stall detection ──────────────────────
 
-    /// When the outbound UPDATE channel is full, a warning is logged but no
-    /// panic occurs.  Fill the channel before propagating a new route.
+    /// When the outbound UPDATE channel is full, propagate_prefix returns false
+    /// so the caller can close the session and restore a consistent peer view.
     #[test]
-    fn test_propagate_prefix_full_update_channel_does_not_panic() {
+    fn test_propagate_prefix_full_update_channel_returns_false() {
         let mut rib = LocRib::new();
         rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
         let (_, mut aro) = ebgp_out_peer();
@@ -2500,8 +2581,7 @@ mod tests {
         })
         .unwrap();
 
-        // propagate_prefix must log a warning and not panic.
-        propagate_prefix(
+        let ok = propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2511,19 +2591,20 @@ mod tests {
             bgp_id(),
             &tx,
         );
+        assert!(!ok, "full channel must return false");
     }
 
     /// When the outbound WITHDRAW channel is full (Reject/Next decision path),
-    /// a warning is logged and no panic occurs.
+    /// propagate_prefix returns false.
     #[test]
-    fn test_propagate_prefix_full_withdraw_on_reject_does_not_panic() {
+    fn test_propagate_prefix_full_withdraw_on_reject_returns_false() {
         let mut rib = LocRib::new();
         rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(1);
 
         // Advertise the route so it is stored in AdjRibOut.
-        propagate_prefix(
+        let ok = propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2533,6 +2614,7 @@ mod tests {
             bgp_id(),
             &tx,
         );
+        assert!(ok);
         let _ = rx.try_recv();
 
         // Fill the channel before the second call so try_send fails.
@@ -2544,7 +2626,7 @@ mod tests {
         .unwrap();
 
         // Export policy now rejects — triggers WITHDRAW try_send on a full channel.
-        propagate_prefix(
+        let ok = propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2554,19 +2636,20 @@ mod tests {
             bgp_id(),
             &tx,
         );
+        assert!(!ok, "full channel on WITHDRAW (reject) must return false");
     }
 
     /// When the outbound WITHDRAW channel is full (no best route / None path),
-    /// a warning is logged and no panic occurs.
+    /// propagate_prefix returns false.
     #[test]
-    fn test_propagate_prefix_full_withdraw_on_empty_rib_does_not_panic() {
+    fn test_propagate_prefix_full_withdraw_on_empty_rib_returns_false() {
         let mut rib = LocRib::new();
         rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(1);
 
         // Store the route in AdjRibOut.
-        propagate_prefix(
+        let ok = propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2576,6 +2659,7 @@ mod tests {
             bgp_id(),
             &tx,
         );
+        assert!(ok);
         let _ = rx.try_recv();
 
         // Remove the route so loc_rib.best returns None.
@@ -2589,8 +2673,7 @@ mod tests {
         })
         .unwrap();
 
-        // propagate_prefix with empty rib + full channel: must log, not panic.
-        propagate_prefix(
+        let ok = propagate_prefix(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2600,6 +2683,7 @@ mod tests {
             bgp_id(),
             &tx,
         );
+        assert!(!ok, "full channel on WITHDRAW (no best) must return false");
     }
 
     // ── DaemonState — unknown peer defensive paths ────────────────────────────
@@ -2759,7 +2843,7 @@ mod tests {
         assert_eq!(state.loc_rib.len(), 1);
     }
 
-    // ── propagate_prefix channel-full warn paths ──────────────────────────────
+    // ── propagate_prefix channel-full stall paths ────────────────────────────
 
     /// Returns a `Sender` whose single-slot channel is already full so that
     /// the very next `try_send` returns `Err(Full)`.
@@ -2775,9 +2859,9 @@ mod tests {
     }
 
     #[test]
-    fn test_propagate_prefix_channel_full_update_dropped() {
+    fn test_propagate_prefix_channel_full_update_returns_false() {
         // Best route → export accepted → INSERT into empty AdjRibOut → try_send
-        // UPDATE fails because the channel is full. Must warn and not panic.
+        // UPDATE fails because the channel is full. Must return false.
         let n = nlri("10.0.0.0/8");
         let mut loc_rib = LocRib::new();
         loc_rib.insert(
@@ -2789,7 +2873,7 @@ mod tests {
         let mut aro = AdjRibOut::new(out_peer, PeerType::External);
 
         let (tx, _rx) = full_channel();
-        propagate_prefix(
+        let ok = propagate_prefix(
             n,
             &loc_rib,
             &mut aro,
@@ -2799,17 +2883,19 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &tx,
         );
-        // aro now has the route even though the UPDATE could not be delivered.
+        assert!(!ok, "full UPDATE channel must return false");
+        // AdjRibOut records the route even though the wire message was not sent;
+        // the caller is responsible for closing the session to restore consistency.
         assert_eq!(aro.len(), 1);
     }
 
     #[test]
-    fn test_propagate_prefix_channel_full_split_horizon_eviction_dropped() {
+    fn test_propagate_prefix_channel_full_split_horizon_eviction_returns_false() {
         // iBGP peer's AdjRibOut has a pre-stored eBGP route. The new best is an
-        // iBGP route → InsertOutcome::Filtered(Some(_)) → WITHDRAW → channel full.
+        // iBGP route → InsertOutcome::Filtered(Some(_)) → WITHDRAW → channel full
+        // → returns false.
         let n = nlri("10.0.0.0/8");
 
-        // Best route in LocRib is iBGP-sourced.
         let mut loc_rib = LocRib::new();
         loc_rib.insert(
             peer(),
@@ -2818,7 +2904,6 @@ mod tests {
                 .build(),
         );
 
-        // iBGP peer's outbound table already holds an eBGP-sourced route.
         let out_peer = PeerId::new(IpAddr::V4("10.0.0.3".parse().unwrap()));
         let mut aro = AdjRibOut::new(out_peer, PeerType::Internal);
         aro.insert(
@@ -2828,7 +2913,7 @@ mod tests {
         );
 
         let (tx, _rx) = full_channel();
-        propagate_prefix(
+        let ok = propagate_prefix(
             n,
             &loc_rib,
             &mut aro,
@@ -2838,14 +2923,14 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &tx,
         );
-        // Route was evicted by split-horizon; AdjRibOut should be empty.
+        assert!(!ok, "full WITHDRAW channel (split-horizon eviction) must return false");
         assert!(aro.is_empty());
     }
 
     #[test]
-    fn test_propagate_prefix_channel_full_export_reject_withdraw_dropped() {
+    fn test_propagate_prefix_channel_full_export_reject_returns_false() {
         // Best route exists but export policy rejects it. AdjRibOut had a prior
-        // route → WITHDRAW generated → channel full → warn, no panic.
+        // route → WITHDRAW generated → channel full → returns false.
         let n = nlri("10.0.0.0/8");
 
         let mut loc_rib = LocRib::new();
@@ -2856,11 +2941,10 @@ mod tests {
 
         let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
         let mut aro = AdjRibOut::new(out_peer, PeerType::External);
-        // Pre-existing route that now needs to be withdrawn.
         aro.insert(RouteBuilder::new(n, Origin::Igp, AsPath::new()).build());
 
         let (tx, _rx) = full_channel();
-        propagate_prefix(
+        let ok = propagate_prefix(
             n,
             &loc_rib,
             &mut aro,
@@ -2870,23 +2954,23 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &tx,
         );
-        // Route was removed from AdjRibOut by the reject.
+        assert!(!ok, "full WITHDRAW channel (export reject) must return false");
         assert!(aro.is_empty());
     }
 
     #[test]
-    fn test_propagate_prefix_channel_full_no_best_withdraw_dropped() {
+    fn test_propagate_prefix_channel_full_no_best_returns_false() {
         // No best route in LocRib. AdjRibOut has a stale route → WITHDRAW →
-        // channel full → warn, no panic.
+        // channel full → returns false.
         let n = nlri("10.0.0.0/8");
-        let loc_rib: LocRib<Ipv4Addr> = LocRib::new(); // empty
+        let loc_rib: LocRib<Ipv4Addr> = LocRib::new();
 
         let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
         let mut aro = AdjRibOut::new(out_peer, PeerType::External);
         aro.insert(RouteBuilder::new(n, Origin::Igp, AsPath::new()).build());
 
         let (tx, _rx) = full_channel();
-        propagate_prefix(
+        let ok = propagate_prefix(
             n,
             &loc_rib,
             &mut aro,
@@ -2896,6 +2980,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &tx,
         );
+        assert!(!ok, "full WITHDRAW channel (no best) must return false");
         assert!(aro.is_empty());
     }
 

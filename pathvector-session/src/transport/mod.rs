@@ -144,10 +144,26 @@ impl SessionHandle {
     /// Messages sent here are written to the TCP connection when the session is
     /// in the Established state. If the session is not connected, the messages
     /// are discarded. The channel has capacity 256; senders should treat a full
-    /// channel as a backpressure signal and log a warning.
+    /// channel as a signal to stop the session (see [`stop_sender`]).
+    ///
+    /// [`stop_sender`]: SessionHandle::stop_sender
     #[must_use]
     pub fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
         self.update_tx.clone()
+    }
+
+    /// Returns a sender that can be used to stop the session from outside the
+    /// session task.
+    ///
+    /// Sending [`SessionCommand::Stop`] causes the session to send a CEASE
+    /// NOTIFICATION, close the TCP connection, and reset the FSM to Idle.
+    /// Use this when the outbound UPDATE channel overflows: BGP has no
+    /// partial-update recovery mechanism, so the only way to restore a
+    /// consistent peer view is to close the session and let it re-establish
+    /// (which triggers a full-table dump from a clean `AdjRibOut`).
+    #[must_use]
+    pub fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+        self.cmd_tx.clone()
     }
 }
 
