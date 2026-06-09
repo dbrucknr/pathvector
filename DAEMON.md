@@ -286,7 +286,7 @@ grpcurl -plaintext -d '{"prefix": "192.168.100.0/24"}' \
 
 ## Interoperability
 
-For a full walkthrough of peering pathvectord against GoBGP and announcing routes, see [TESTING.md — Interoperability testing](TESTING.md#interoperability-testing).
+For automated end-to-end testing against GoBGP (Docker-based, works on macOS and Linux), see [TESTING.md — End-to-end tests](TESTING.md#end-to-end-tests). For protocol validation notes from the initial interoperability work, see [TESTING.md — Protocol validation notes](TESTING.md#protocol-validation-notes).
 
 The short version: pathvectord has been validated against GoBGP 4.x with full session lifecycle (OPEN negotiation, KEEPALIVE exchange, UPDATE announce and withdraw). The key config requirements are:
 

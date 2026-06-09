@@ -19,7 +19,7 @@ The implementation is split into focused, independently published crates. Each l
 | [`pathvector-rib`](pathvector-rib) | Adj-RIB-In, Loc-RIB, Adj-RIB-Out, and best-path selection |
 | [`pathvector-session`](pathvector-session) | BGP FSM, TCP transport, and message codec |
 | [`pathvector-bmp`](pathvector-bmp) | BMP receiver (RFC 7854): route monitoring and peer state |
-| [`pathvectord`](pathvectord) | BGP daemon: TOML config, CLI, and management API |
+| [`pathvectord`](pathvectord) | BGP daemon: TOML config and gRPC management API |
 
 Dependency flow:
 
@@ -81,9 +81,11 @@ See [DAEMON.md](DAEMON.md) for build instructions, configuration reference, and 
 
 ## Testing
 
-pathvector takes correctness seriously. The test suite combines unit tests, compiled documentation examples, property-based tests, and line coverage measurement. See [TESTING.md](TESTING.md) for a full description of the testing philosophy, patterns, and how to run the suite.
+pathvector takes correctness seriously. The test suite combines five layers: unit tests, compiled documentation examples, property-based tests (proptest), fuzz targets on the codec decode path, and Docker-based end-to-end tests against a real GoBGP peer. See [TESTING.md](TESTING.md) for the full description of each layer and how to run them.
 
-If you'd like to run all the CI tests locally, use `just ci`.
+To run the standard suite locally: `just ci`. To run the end-to-end suite (requires Docker): `just e2e`.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime data flow and crate design.
 
 ---
 
