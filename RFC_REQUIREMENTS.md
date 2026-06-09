@@ -54,9 +54,9 @@ The core protocol. Every crate is shaped by it.
 | 1-byte type field (OPEN=1, UPDATE=2, NOTIFICATION=3, KEEPALIVE=4) | `pathvector-session/src/message/header.rs` | ✅ | `test_decode_header_keepalive`, `test_decode_header_unknown_type` |
 | OPEN: version=4, my_as, hold_time, bgp_id, optional parameters | `pathvector-session/src/message/open.rs` | ✅ | `test_minimal_open_roundtrip`, `test_open_with_capabilities_roundtrip`, `test_minimal_open_encoded_length`, `proptest: prop_open_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
 | OPEN: reject version ≠ 4 with NOTIFICATION | `pathvector-session/src/message/open.rs` | ✅ | `test_unsupported_version_rejected`, `test_unsupported_version_in_open_sends_notification` |
-| OPEN: reject hold_time values of 1 or 2 (must be 0 or ≥ 3) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unacceptable_hold_time_sends_notification` |
-| OPEN: reject bad BGP identifier | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_bad_bgp_id_sends_notification` |
-| OPEN: reject mismatched peer AS | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification` |
+| OPEN: reject hold_time values of 1 or 2 (must be 0 or ≥ 3) | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_unacceptable_hold_time_sends_notification` (no interop/e2e; requires peer to send illegal hold_time) |
+| OPEN: reject bad BGP identifier | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_bad_bgp_id_sends_notification` (no interop/e2e; requires peer to send an invalid BGP ID) |
+| OPEN: reject mismatched peer AS | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification`, `interop: test_open_with_wrong_peer_as_does_not_establish` |
 | UPDATE: withdrawn NLRI length + withdrawn NLRIs | `pathvector-session/src/message/update.rs` | ✅ | `test_withdrawal_only_roundtrip`, `test_empty_update_roundtrip`, `proptest: prop_update_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
 | UPDATE: total path attribute length + path attributes | `pathvector-session/src/message/update.rs` | ✅ | `test_announcement_with_core_attributes`, `proptest: prop_update_roundtrip` |
 | UPDATE: NLRI (announced prefixes) | `pathvector-session/src/message/update.rs` | ✅ | `test_announcement_with_core_attributes`, `proptest: prop_update_roundtrip` |
@@ -96,28 +96,28 @@ The core protocol. Every crate is shaped by it.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| States: Idle, Connect, Active, OpenSent, OpenConfirm, Established | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect`, `test_tcp_connected_from_active_enters_open_sent`, `test_receive_keepalive_enters_established` |
-| ManualStart transitions Idle → Connect and initiates TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect` |
+| States: Idle, Connect, Active, OpenSent, OpenConfirm, Established | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect`, `test_tcp_connected_from_active_enters_open_sent`, `test_receive_keepalive_enters_established`, `interop: test_session_reaches_established`, `e2e: session_reaches_established` |
+| ManualStart transitions Idle → Connect and initiates TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect`, `interop: test_session_reaches_established`, `e2e: session_reaches_established` |
 | ManualStop from any state sends Cease NOTIFICATION and closes TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_stop_from_established_sends_cease`, `test_manual_stop_from_open_sent_sends_cease`, `test_manual_stop_from_open_confirm_sends_cease`, `interop: test_stop_while_connecting_aborts_pending_task` |
 | ManualStop from Idle is a no-op | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_manual_stop_from_idle_is_noop` |
-| TcpConnected → OpenSent, sends OPEN | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_connected_sends_open`, `test_sent_open_has_correct_fields` |
-| TcpFailed from Connect → Active | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_failed_from_connect_enters_active` |
-| TcpFailed from Established → session terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_failed_in_established_terminates_session` |
-| Receive OPEN in OpenSent → send KEEPALIVE → OpenConfirm | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_receive_open_sends_keepalive_enters_open_confirm` |
-| Receive KEEPALIVE in OpenConfirm → Established | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_receive_keepalive_enters_established` |
-| Receive NOTIFICATION in OpenSent → Idle | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_open_sent_goes_idle` |
-| Receive NOTIFICATION in OpenConfirm → terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_open_confirm_terminates` |
-| Receive NOTIFICATION in Established → session terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_established_emits_session_terminated` |
+| TcpConnected → OpenSent, sends OPEN | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_connected_sends_open`, `test_sent_open_has_correct_fields`, `interop: test_session_reaches_established` |
+| TcpFailed from Connect → Active | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_failed_from_connect_enters_active`, `interop: test_connect_retry_timer_fires_initiates_reconnect` |
+| TcpFailed from Established → session terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_tcp_failed_in_established_terminates_session`, `interop: test_peer_disconnect_emits_terminated` |
+| Receive OPEN in OpenSent → send KEEPALIVE → OpenConfirm | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_receive_open_sends_keepalive_enters_open_confirm`, `interop: test_session_reaches_established` |
+| Receive KEEPALIVE in OpenConfirm → Established | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_receive_keepalive_enters_established`, `interop: test_session_reaches_established`, `e2e: session_reaches_established` |
+| Receive NOTIFICATION in OpenSent → Idle | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_notification_in_open_sent_goes_idle` (no interop/e2e; real peers don't send NOTIFICATION in OpenSent under normal operation) |
+| Receive NOTIFICATION in OpenConfirm → terminated | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_notification_in_open_confirm_terminates` (no interop/e2e; requires peer to send NOTIFICATION before reaching Established) |
+| Receive NOTIFICATION in Established → session terminated | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_notification_in_established_emits_session_terminated` (no interop/e2e; adversarial peer test not yet implemented) |
 | Connect-retry timer (default 120 s) — fires → re-initiate TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_connect_retry_timer_from_connect_reinitiates_tcp`, `test_connect_retry_from_active_enters_connect`, `interop: test_connect_retry_timer_fires_initiates_reconnect` |
 | Hold timer negotiated as min(local, peer) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_negotiated_to_minimum`, `e2e: peer_state_fields_correct_after_established` |
 | Hold time 0 disables the hold and keepalive timers | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |
 | Keepalive interval is 1/3 of negotiated hold time | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time`, `interop: test_keepalive_timer_fires_sends_keepalive_to_peer`, `e2e: session_reaches_established` |
-| HoldTimerExpired in Established → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_established` |
-| HoldTimerExpired in OpenSent → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_open_sent` |
-| Receive UPDATE in Established resets hold timer | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_update_emits_route_update_and_resets_hold` |
-| Receive KEEPALIVE in Established resets hold timer | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_message_in_established_resets_hold_timer` |
+| HoldTimerExpired in Established → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_established`, `interop: test_hold_timer_fires_terminates_session` |
+| HoldTimerExpired in OpenSent → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_hold_timer_expired_in_open_sent` (no interop/e2e; 240 s timer impractical to hold in integration tests) |
+| Receive UPDATE in Established resets hold timer | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_update_emits_route_update_and_resets_hold`, `interop: test_update_message_emits_route_update_event` |
+| Receive KEEPALIVE in Established resets hold timer | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_message_in_established_resets_hold_timer`, `interop: test_keepalive_timer_fires_sends_keepalive_to_peer` |
 | Unhandled inputs in non-Established states are no-ops | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unhandled_input_in_connect_is_noop`, `test_unhandled_input_in_active_is_noop`, `test_unhandled_input_in_open_sent_is_noop`, `test_unhandled_input_in_open_confirm_is_noop` |
-| Open hold timer (240 s) while awaiting peer OPEN in OpenSent | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_open_sent` |
+| Open hold timer (240 s) while awaiting peer OPEN in OpenSent | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_hold_timer_expired_in_open_sent` (no interop/e2e; 240 s timer impractical to hold in integration tests) |
 | Peer AS validation skipped when peer_as is unconfigured | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_open_accepted_when_peer_as_unconfigured` |
 | Connection collision detection (higher BGP ID keeps outbound connection) | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
 | Full session lifecycle over real TCP sockets | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_session_reaches_established`, `e2e: session_reaches_established` |
@@ -156,20 +156,20 @@ The core protocol. Every crate is shaped by it.
 | Loc-RIB: longest-prefix match for forwarding lookups | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_longest_match` |
 | Loc-RIB: withdraw last candidate removes the prefix entirely | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_last_candidate_removes_prefix`, `e2e: withdrawn_route_removed_from_rib` |
 | Loc-RIB: withdraw one peer promotes the remaining candidate | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_peer_promotes_remaining_candidate`, `e2e: partial_withdrawal_leaves_others_intact` |
-| Adj-RIB-Out: per-peer store of routes to be advertised | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_get`, `test_adj_rib_out_withdraw` |
-| iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_ibgp_route_not_advertised_to_ibgp_peer`, `test_ibgp_split_horizon_evicts_previously_stored_route`, `test_ebgp_route_advertised_to_ibgp_peer`, `test_ibgp_route_advertised_to_ebgp_peer` |
+| Adj-RIB-Out: per-peer store of routes to be advertised | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_get`, `test_adj_rib_out_withdraw`, `e2e: announced_route_propagates_to_sink`, `e2e: multiple_routes_all_propagate_to_sink` |
+| iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ⚠️ | `test_ibgp_route_not_advertised_to_ibgp_peer`, `test_ibgp_split_horizon_evicts_previously_stored_route`, `test_ebgp_route_advertised_to_ibgp_peer`, `test_ibgp_route_advertised_to_ebgp_peer` (behavioral; iBGP e2e topology not yet implemented) |
 
 ### §9.2 — Update-Send Process
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| Loc-RIB best-path change triggers export policy evaluation per peer | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_sends_withdraw_when_export_policy_rejects` |
-| Export policy accepted routes populate per-peer Adj-RIB-Out | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_no_send_when_route_unchanged` |
-| Adj-RIB-Out change generates and sends UPDATE (announcement) to peer | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message` |
-| Withdrawn best path generates UPDATE with withdrawn NLRI to all peers | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_withdraw_when_route_removed` |
-| LOCAL_PREF not included in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_strips_local_pref` |
-| Local AS prepended to AS_PATH in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_prepends_local_as`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message` |
-| NEXT_HOP set to local interface address in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_rewrites_next_hop` |
+| Loc-RIB best-path change triggers export policy evaluation per peer | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_sends_withdraw_when_export_policy_rejects`, `e2e: announced_route_propagates_to_sink`, `e2e: no_export_policy_suppresses_advertisement_to_peer` |
+| Export policy accepted routes populate per-peer Adj-RIB-Out | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_no_send_when_route_unchanged`, `e2e: announced_route_propagates_to_sink`, `e2e: multiple_routes_all_propagate_to_sink` |
+| Adj-RIB-Out change generates and sends UPDATE (announcement) to peer | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_update_for_new_route`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message`, `e2e: announced_route_propagates_to_sink`, `e2e: multiple_routes_all_propagate_to_sink` |
+| Withdrawn best path generates UPDATE with withdrawn NLRI to all peers | `pathvectord/src/main.rs` | ✅ | `test_propagate_prefix_sends_withdraw_when_route_removed`, `e2e: withdrawn_route_removed_from_sink` |
+| LOCAL_PREF not included in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ⚠️ | `test_prepare_outbound_ebgp_strips_local_pref`, `e2e: announced_route_propagates_to_sink` (exercises `prepare_outbound` path; GoBGP acceptance does not directly assert attribute absence) |
+| Local AS prepended to AS_PATH in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_prepends_local_as`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message`, `e2e: announced_route_propagates_to_sink` |
+| NEXT_HOP set to local interface address in UPDATEs sent to eBGP peers | `pathvectord/src/main.rs` | ✅ | `test_prepare_outbound_ebgp_rewrites_next_hop`, `e2e: announced_route_propagates_to_sink` |
 
 ---
 
@@ -251,8 +251,8 @@ retry without them.
 | MP_UNREACH_NLRI (type 15): AFI, SAFI, withdrawn NLRI — IPv6 | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_ipv6_roundtrip` |
 | MP_UNREACH_NLRI: truncated body is an error | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_nlri_too_short_is_error` |
 | MP_UNREACH_NLRI: unknown AFI produces empty prefix list (no panic) | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_unknown_afi_produces_empty_prefixes` |
-| IPv4 MP_UNREACH_NLRI processed by daemon (withdraw from AdjRibIn + LocRib + propagate) | `pathvectord/src/main.rs` | ✅ | `test_handle_update_mp_unreach_withdraws_ipv4_route`, `test_on_route_update_mp_unreach_propagates_withdraw_to_peers` |
-| IPv4 MP_REACH_NLRI processed by daemon (insert into AdjRibIn + LocRib, policy applied) | `pathvectord/src/main.rs` | ✅ | `test_handle_update_mp_reach_announces_ipv4_route`, `test_handle_update_mp_reach_import_policy_applied`, `test_handle_update_mp_reach_mixed_with_traditional` |
+| IPv4 MP_UNREACH_NLRI processed by daemon (withdraw from AdjRibIn + LocRib + propagate) | `pathvectord/src/main.rs` | ⚠️ | `test_handle_update_mp_unreach_withdraws_ipv4_route`, `test_on_route_update_mp_unreach_propagates_withdraw_to_peers` (no e2e; pathvectord does not advertise MultiProtocol capability so GoBGP uses traditional WITHDRAW, not MP_UNREACH) |
+| IPv4 MP_REACH_NLRI processed by daemon (insert into AdjRibIn + LocRib, policy applied) | `pathvectord/src/main.rs` | ⚠️ | `test_handle_update_mp_reach_announces_ipv4_route`, `test_handle_update_mp_reach_import_policy_applied`, `test_handle_update_mp_reach_mixed_with_traditional` (no e2e; pathvectord does not advertise MultiProtocol capability so GoBGP uses traditional NLRI, not MP_REACH) |
 | Non-IPv4 MP_REACH_NLRI / MP_UNREACH_NLRI silently skipped by daemon (no panic) | `pathvectord/src/main.rs` | ✅ | `test_handle_update_mp_unreach_non_ipv4_is_skipped` |
 | IPv6 next-hop may carry both global unicast and link-local addresses | `pathvector-types/src/attr.rs` | ✅ | `test_next_hop_v6_with_link_local`, `test_mp_reach_ipv6_link_local_roundtrip` |
 | AFI and SAFI type registry (IPv4, IPv6, L2VPN, and well-known SAFIs) | `pathvector-types/src/afi.rs` | ✅ | `test_afi_constants`, `test_safi_constants`, `test_afisafi_constants` |
@@ -524,7 +524,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process implemented; session lifecycle and route announce/withdraw validated e2e against GoBGP |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process e2e-verified (announce, withdraw, export policy, attribute transforms); LOCAL_PREF stripping unit-tested but not directly observable e2e; session lifecycle and route announce/withdraw validated e2e against GoBGP |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ Wire format + IPv4 daemon processing; IPv6 daemon support deferred (see TODO) |
