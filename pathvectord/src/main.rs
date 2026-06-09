@@ -3379,9 +3379,7 @@ mod stall_tests {
     fn on_terminated_marks_stalled_when_channel_full() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, _rxs) = make_capped(&[(peer_a, 64), (peer_b, 1)], 1);
-        // Give peer_a a large-enough channel for announcement; peer_b gets cap 1.
-        // Rebuild with mixed capacities.
+        // Build with mixed capacities: peer_a gets a large channel, peer_b gets cap 1.
         let (tx_a, _rx_a) = mpsc::channel::<UpdateMessage>(64);
         let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
         let peer_configs = vec![
@@ -3631,18 +3629,24 @@ mod stall_tests {
 #[cfg(test)]
 mod event_loop_tests {
     use std::collections::HashMap;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     use pathvector_session::fsm::SessionInfo;
     use pathvector_session::message::{Capability, UpdateMessage};
     use pathvector_session::transport::{SessionCommand, SessionEvent};
-    use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
+    use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
     use tokio::sync::mpsc;
 
     use super::*;
     use crate::config;
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    type StateBundle = (
+        Arc<RwLock<DaemonState>>,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+        HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
+    );
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -3660,14 +3664,7 @@ mod event_loop_tests {
 
     /// Build a `DaemonState` + receivers for a set of peers with accept-all
     /// policies and channels of the given capacity.
-    fn make_state(
-        peers: &[(Ipv4Addr, u32)],
-        channel_cap: usize,
-    ) -> (
-        Arc<RwLock<DaemonState>>,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-        HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
-    ) {
+    fn make_state(peers: &[(Ipv4Addr, u32)], channel_cap: usize) -> StateBundle {
         let mut update_senders = HashMap::new();
         let mut update_receivers = HashMap::new();
         let mut stop_senders = HashMap::new();
@@ -3787,7 +3784,11 @@ mod event_loop_tests {
         run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
 
         let s = state.read().await;
-        assert_eq!(s.loc_rib.len(), 1, "RouteUpdate must insert route into Loc-RIB");
+        assert_eq!(
+            s.loc_rib.len(),
+            1,
+            "RouteUpdate must insert route into Loc-RIB"
+        );
     }
 
     // ── Stalled peer → stop command ───────────────────────────────────────────
@@ -3798,10 +3799,10 @@ mod event_loop_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
 
         // Give peer_b a channel of capacity 1 so it stalls during propagation.
-        let (tx_a, _rx_a) = mpsc::channel::<UpdateMessage>(64);
-        let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
-        let (stop_tx_a, _stop_rx_a) = mpsc::channel::<SessionCommand>(8);
-        let (stop_tx_b, mut stop_rx_b) = mpsc::channel::<SessionCommand>(8);
+        let (update_tx_a, _update_rx_a) = mpsc::channel::<UpdateMessage>(64);
+        let (update_tx_b, _update_rx_b) = mpsc::channel::<UpdateMessage>(1);
+        let (sess_stop_a, _sess_stop_rx_a) = mpsc::channel::<SessionCommand>(8);
+        let (sess_stop_b, mut cmd_rx_b) = mpsc::channel::<SessionCommand>(8);
 
         let peer_configs = vec![
             config::PeerConfig {
@@ -3820,8 +3821,8 @@ mod event_loop_tests {
             },
         ];
         let mut update_senders = HashMap::new();
-        update_senders.insert(peer_a, tx_a);
-        update_senders.insert(peer_b, tx_b);
+        update_senders.insert(peer_a, update_tx_a);
+        update_senders.insert(peer_b, update_tx_b);
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -3829,8 +3830,8 @@ mod event_loop_tests {
             update_senders,
         )));
         let mut stop_senders = HashMap::new();
-        stop_senders.insert(peer_a, stop_tx_a);
-        stop_senders.insert(peer_b, stop_tx_b);
+        stop_senders.insert(peer_a, sess_stop_a);
+        stop_senders.insert(peer_b, sess_stop_b);
 
         // Establish both peers.
         {
@@ -3874,7 +3875,7 @@ mod event_loop_tests {
         run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
 
         // The event loop must have sent SessionCommand::Stop to peer_b.
-        let cmd = stop_rx_b
+        let cmd = cmd_rx_b
             .try_recv()
             .expect("event loop must send Stop to stalled peer_b");
         assert!(
@@ -3888,9 +3889,9 @@ mod event_loop_tests {
     #[tokio::test]
     async fn event_loop_exits_when_channel_closes() {
         let (state, _rxs, stop_senders) = make_state(&[], 64);
-        let (_event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
+        let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
         // Drop the sender immediately — the loop must exit without hanging.
-        drop(_event_tx);
+        drop(event_tx);
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
             run_event_loop(event_rx, state, stop_senders),
@@ -4060,7 +4061,9 @@ mod run_with_tests {
     use std::sync::{Arc, Mutex};
 
     use pathvector_session::message::UpdateMessage;
-    use pathvector_session::transport::{SessionCommand, SessionConfig, SessionEvent, SessionHandle};
+    use pathvector_session::transport::{
+        SessionCommand, SessionConfig, SessionEvent, SessionHandle,
+    };
     use tokio::sync::mpsc;
 
     use super::*;
@@ -4080,16 +4083,12 @@ mod run_with_tests {
     }
 
     impl SessionHandle for MockSessionHandle {
-        fn start(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
-            async {
-                self.started.store(true, Ordering::SeqCst);
-            }
+        async fn start(&self) {
+            self.started.store(true, Ordering::SeqCst);
         }
 
-        fn next_event(
-            &mut self,
-        ) -> impl std::future::Future<Output = Option<SessionEvent>> + Send + '_ {
-            async { self.event_rx.recv().await }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.event_rx.recv().await
         }
 
         fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {

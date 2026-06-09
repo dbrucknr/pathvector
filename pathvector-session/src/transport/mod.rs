@@ -179,7 +179,7 @@ impl SessionHandle for SpawnedSessionHandle {
     /// Messages sent here are written to the TCP connection when the session is
     /// in the Established state. If the session is not connected, the messages
     /// are discarded. The channel has capacity 256; senders should treat a full
-    /// channel as a signal to stop the session (see [`stop_sender`]).
+    /// channel as a signal to stop the session (see [`SessionHandle::stop_sender`]).
     fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
         self.update_tx.clone()
     }
@@ -531,7 +531,9 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{BgpTransport, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, spawn_with};
+    use super::{
+        BgpTransport, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, spawn_with,
+    };
     use crate::framing::FramingError;
     use crate::message::{BgpMessage, Capability, OpenMessage, UpdateMessage};
 
