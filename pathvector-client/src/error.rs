@@ -7,15 +7,12 @@
 pub enum ConnectError {
     /// The endpoint URI could not be parsed.
     InvalidEndpoint(String),
-    /// The transport-level connection failed.
-    Transport(tonic::transport::Error),
 }
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEndpoint(s) => write!(f, "invalid endpoint URI: {s}"),
-            Self::Transport(e) => write!(f, "transport error: {e}"),
         }
     }
 }
@@ -24,14 +21,7 @@ impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidEndpoint(_) => None,
-            Self::Transport(e) => Some(e),
         }
-    }
-}
-
-impl From<tonic::transport::Error> for ConnectError {
-    fn from(e: tonic::transport::Error) -> Self {
-        Self::Transport(e)
     }
 }
 

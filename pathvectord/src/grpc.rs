@@ -379,18 +379,32 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
 
     use pathvector_rib::{PeerId, RouteBuilder};
-    use pathvector_types::{AsPath, Asn, Community, LargeCommunity as TypesLargeCommunity, Origin};
+    use pathvector_types::{
+        AsPath, AsPathSegment, Asn, Community, LargeCommunity as TypesLargeCommunity, NextHop,
+        Origin, PeerType,
+    };
+    use tokio::sync::{RwLock, mpsc};
+    use tonic::Request;
 
-    use super::{build_peer_state, proto, route_to_proto};
+    use super::{
+        PeerServiceImpl, RibServiceImpl, build_peer_state, parse_nlri, proto, proto_as_segment,
+        proto_origin, route_to_proto,
+    };
     use crate::{
         DaemonState,
         config::{self, ExportDefault, ImportDefault},
     };
-    use std::collections::HashMap;
-    use tokio::sync::mpsc;
+    use proto::{
+        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListPeersRequest,
+        ListRoutesRequest,
+        peer_service_server::PeerService,
+        rib_service_server::RibService,
+    };
 
     fn make_state(local_as: u32, peers: &[(Ipv4Addr, u32)]) -> DaemonState {
         let mut senders = HashMap::new();
@@ -417,6 +431,17 @@ mod tests {
 
     fn peer(ip: &str) -> PeerId {
         PeerId::from(ip.parse::<Ipv4Addr>().unwrap())
+    }
+
+    fn arc_state(local_as: u32, peers: &[(Ipv4Addr, u32)]) -> Arc<RwLock<DaemonState>> {
+        Arc::new(RwLock::new(make_state(local_as, peers)))
+    }
+
+    fn route_igp(n: pathvector_types::Nlri<Ipv4Addr>, pt: PeerType) -> pathvector_rib::Route<Ipv4Addr> {
+        RouteBuilder::new(n, Origin::Igp, AsPath::from_sequence(vec![Asn::new(65002)]))
+            .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
+            .peer_type(pt)
+            .build()
     }
 
     // ── build_peer_state ──────────────────────────────────────────────────────
@@ -545,5 +570,337 @@ mod tests {
         assert_eq!(r.large_communities[0].global_admin, 65000);
         assert_eq!(r.large_communities[0].local_data1, 1);
         assert_eq!(r.large_communities[0].local_data2, 2);
+    }
+
+    // ── proto_origin ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_proto_origin_egp() {
+        assert_eq!(proto_origin(Origin::Egp), proto::Origin::Egp as i32);
+    }
+
+    #[test]
+    fn test_proto_origin_incomplete() {
+        assert_eq!(proto_origin(Origin::Incomplete), proto::Origin::Incomplete as i32);
+    }
+
+    // ── proto_as_segment — confederation variants ─────────────────────────────
+
+    #[test]
+    fn test_proto_as_segment_set() {
+        let asns = vec![Asn::new(65100), Asn::new(65101)];
+        let seg = proto_as_segment(&AsPathSegment::Set(asns));
+        assert_eq!(seg.r#type, proto::as_segment::Type::Set as i32);
+        assert_eq!(seg.asns, vec![65100, 65101]);
+    }
+
+    #[test]
+    fn test_proto_as_segment_confed_sequence() {
+        let asns = vec![Asn::new(65100)];
+        let seg = proto_as_segment(&AsPathSegment::ConfedSequence(asns));
+        assert_eq!(seg.r#type, proto::as_segment::Type::ConfedSequence as i32);
+        assert_eq!(seg.asns, vec![65100]);
+    }
+
+    #[test]
+    fn test_proto_as_segment_confed_set() {
+        let asns = vec![Asn::new(65200), Asn::new(65201)];
+        let seg = proto_as_segment(&AsPathSegment::ConfedSet(asns));
+        assert_eq!(seg.r#type, proto::as_segment::Type::ConfedSet as i32);
+        assert_eq!(seg.asns, vec![65200, 65201]);
+    }
+
+    // ── parse_nlri ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_nlri_valid_cidrs() {
+        assert!(parse_nlri("10.0.0.0/8").is_ok());
+        assert!(parse_nlri("192.168.1.0/24").is_ok());
+        assert!(parse_nlri("0.0.0.0/0").is_ok());
+    }
+
+    #[test]
+    fn test_parse_nlri_invalid_returns_invalid_argument() {
+        let err = parse_nlri("not-a-cidr").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let err2 = parse_nlri("10.0.0.0/99").unwrap_err();
+        assert_eq!(err2.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── PeerService::list_peers ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_peers_empty_state() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state };
+        let resp = svc.list_peers(Request::new(ListPeersRequest {})).await.unwrap();
+        assert!(resp.into_inner().peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_peers_returns_all_configured_peers_sorted() {
+        let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
+        let svc = PeerServiceImpl { state };
+        let resp = svc.list_peers(Request::new(ListPeersRequest {})).await.unwrap();
+        let peers = resp.into_inner().peers;
+
+        assert_eq!(peers.len(), 2);
+        // Sorted by address string.
+        assert_eq!(peers[0].address, "10.0.0.2");
+        assert_eq!(peers[0].remote_as, 65002);
+        assert_eq!(peers[1].address, "10.0.0.3");
+        assert_eq!(peers[1].remote_as, 65003);
+    }
+
+    #[tokio::test]
+    async fn test_list_peers_established_peer_shows_established_state() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        state.write().await.on_established(addr, PeerType::External, 65002, 90);
+
+        let svc = PeerServiceImpl { state };
+        let resp = svc.list_peers(Request::new(ListPeersRequest {})).await.unwrap();
+        let peers = resp.into_inner().peers;
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].session_state, proto::SessionState::Established as i32);
+    }
+
+    // ── PeerService::get_peer ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_peer_idle() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PeerServiceImpl { state };
+
+        let resp = svc
+            .get_peer(Request::new(GetPeerRequest { address: "10.0.0.2".into() }))
+            .await
+            .unwrap();
+        let ps = resp.into_inner();
+        assert_eq!(ps.address, "10.0.0.2");
+        assert_eq!(ps.remote_as, 65002);
+        assert_eq!(ps.session_state, proto::SessionState::Idle as i32);
+    }
+
+    #[tokio::test]
+    async fn test_get_peer_not_found_returns_not_found_status() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state };
+
+        let err = svc
+            .get_peer(Request::new(GetPeerRequest { address: "10.0.0.99".into() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_get_peer_invalid_address_returns_invalid_argument() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state };
+
+        let err = svc
+            .get_peer(Request::new(GetPeerRequest { address: "not-an-ip".into() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── RibService::get_best_route ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_best_route_not_found() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+
+        let resp = svc
+            .get_best_route(Request::new(GetBestRouteRequest { prefix: "10.0.0.0/8".into() }))
+            .await
+            .unwrap();
+        let rr = resp.into_inner();
+        assert!(!rr.found);
+        assert!(rr.route.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_best_route_found() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(addr, PeerType::External, 65002, 90);
+            let n = nlri("10.0.0.0/8");
+            let route = route_igp(n, PeerType::External);
+            s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+            s.loc_rib.insert(peer("10.0.0.2"), route);
+        }
+
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .get_best_route(Request::new(GetBestRouteRequest { prefix: "10.0.0.0/8".into() }))
+            .await
+            .unwrap();
+        let rr = resp.into_inner();
+        assert!(rr.found);
+        let r = rr.route.unwrap();
+        assert_eq!(r.prefix, "10.0.0.0/8");
+        assert_eq!(r.peer_address, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn test_get_best_route_invalid_cidr_returns_invalid_argument() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+
+        let err = svc
+            .get_best_route(Request::new(GetBestRouteRequest { prefix: "bad/prefix".into() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── RibService::list_routes ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_routes_empty_rib() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+
+        let resp = svc
+            .list_routes(Request::new(ListRoutesRequest { peer_address: String::new() }))
+            .await
+            .unwrap();
+        assert!(resp.into_inner().routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_routes_all_routes_no_filter() {
+        let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(a1, PeerType::External, 65002, 90);
+            s.on_established(a2, PeerType::External, 65003, 90);
+
+            let n1 = nlri("10.0.0.0/8");
+            let r1 = route_igp(n1, PeerType::External);
+            s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
+            s.loc_rib.insert(peer("10.0.0.2"), r1);
+
+            let n2 = nlri("192.168.0.0/24");
+            let r2 = route_igp(n2, PeerType::External);
+            s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
+            s.loc_rib.insert(peer("10.0.0.3"), r2);
+        }
+
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .list_routes(Request::new(ListRoutesRequest { peer_address: String::new() }))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().routes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_routes_with_peer_filter() {
+        let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(a1, PeerType::External, 65002, 90);
+            s.on_established(a2, PeerType::External, 65003, 90);
+
+            let n1 = nlri("10.0.0.0/8");
+            let r1 = route_igp(n1, PeerType::External);
+            s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
+            s.loc_rib.insert(peer("10.0.0.2"), r1);
+
+            let n2 = nlri("192.168.0.0/24");
+            let r2 = route_igp(n2, PeerType::External);
+            s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
+            s.loc_rib.insert(peer("10.0.0.3"), r2);
+        }
+
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: "10.0.0.2".into(),
+            }))
+            .await
+            .unwrap();
+        let routes = resp.into_inner().routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].peer_address, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn test_list_routes_bad_peer_filter_returns_invalid_argument() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+
+        let err = svc
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: "not-an-ip".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── RibService::list_candidates ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_candidates_empty_returns_empty() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+
+        let resp = svc
+            .list_candidates(Request::new(ListCandidatesRequest { prefix: "10.0.0.0/8".into() }))
+            .await
+            .unwrap();
+        assert!(resp.into_inner().routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_candidates_found() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(addr, PeerType::External, 65002, 90);
+            let n = nlri("10.0.0.0/8");
+            let route = route_igp(n, PeerType::External);
+            s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+            s.loc_rib.insert(peer("10.0.0.2"), route);
+        }
+
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .list_candidates(Request::new(ListCandidatesRequest { prefix: "10.0.0.0/8".into() }))
+            .await
+            .unwrap();
+        let routes = resp.into_inner().routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "10.0.0.0/8");
+        assert_eq!(routes[0].peer_address, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn test_list_candidates_invalid_cidr_returns_invalid_argument() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+
+        let err = svc
+            .list_candidates(Request::new(ListCandidatesRequest { prefix: "bad".into() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

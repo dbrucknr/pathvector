@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use pathvector_client::types::{PeerType, SessionState};
-use pathvector_e2e::{Harness, wait_for_established};
+use pathvector_e2e::{Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn};
 
 /// RFC 4271 §8 — verify the FSM reaches Established and the management API
 /// reflects the correct session state.
@@ -85,5 +85,47 @@ async fn wait_for_established_respects_deadline() {
     assert!(
         result.unwrap().is_err(),
         "wait_for_established should return Err on deadline, not Ok"
+    );
+}
+
+/// `wait_for_route` must fire its deadline and return `Err` rather than
+/// hanging forever when no route ever appears.
+#[tokio::test]
+async fn wait_for_route_respects_deadline() {
+    // Nothing is listening on port 1 — every gRPC call will fail, so the
+    // route will never appear and the deadline must fire.
+    let mut client = pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_route(&mut client, "10.0.0.0/8", Duration::from_secs(1)),
+    )
+    .await;
+
+    assert!(result.is_ok(), "wait_for_route hung for > 3 s");
+    assert!(
+        result.unwrap().is_err(),
+        "wait_for_route should return Err on deadline, not Ok"
+    );
+}
+
+/// `wait_for_route_withdrawn` must fire its deadline and return `Err` rather
+/// than hanging forever when the route is never withdrawn.
+#[tokio::test]
+async fn wait_for_route_withdrawn_respects_deadline() {
+    // Nothing is listening on port 1 — every gRPC call fails, so
+    // `Ok(None)` (route absent) is never observed and the deadline must fire.
+    let mut client = pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_route_withdrawn(&mut client, "10.0.0.0/8", Duration::from_secs(1)),
+    )
+    .await;
+
+    assert!(result.is_ok(), "wait_for_route_withdrawn hung for > 3 s");
+    assert!(
+        result.unwrap().is_err(),
+        "wait_for_route_withdrawn should return Err on deadline, not Ok"
     );
 }

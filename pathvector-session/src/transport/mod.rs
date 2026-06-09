@@ -678,4 +678,32 @@ mod tests {
             "expected Terminated after UPDATE write failure, got {event:?}"
         );
     }
+
+    /// `stop_sender` returns a live `Sender` that can enqueue a `Stop` command.
+    ///
+    /// The clone must share the underlying channel with `handle.cmd_tx` so that
+    /// a `Stop` sent through it is received by the session task.
+    #[tokio::test]
+    async fn test_stop_sender_can_stop_session() {
+        use crate::transport::SessionCommand;
+
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        // Obtain a stop sender and use it to send a Stop command.
+        let stop_tx = handle.stop_sender();
+        stop_tx.send(SessionCommand::Stop).await.unwrap();
+
+        // The session should emit Terminated in response to Stop.
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for event after Stop")
+            .expect("session exited without emitting an event");
+        assert!(
+            matches!(event, SessionEvent::Terminated),
+            "expected Terminated after Stop command, got {event:?}"
+        );
+    }
 }
