@@ -44,7 +44,17 @@ Implemented as `pathvector/` workspace member. Subcommands: `peer list`,
 `policy set-import`, `policy set-export`, and `dashboard` (live ratatui TUI).
 Global `--address` flag + `PATHVECTOR_ADDRESS` env var select the daemon endpoint.
 
-**5. IPv6 RIB — inbound half** (`pathvectord`)
+**5. Dashboard: surface all refresh errors, not just the last one** (`pathvector`)
+`DashboardState::refresh` makes two sequential calls (`list_peers`, then
+`list_routes`).  If both fail, only the `list_routes` error is shown in the
+status bar — the `list_peers` error is silently overwritten.  In practice
+both failing at the same time means "daemon is down" and either message is
+equally useful.  The right fix is to collect all errors into a `Vec<String>`
+and render them as a multi-line status area, or join them with `"; "` in the
+single-line bar.  Deferred because the single-error case is the overwhelmingly
+common one and the fix requires a UI layout decision.
+
+**6. IPv6 RIB — inbound half** (`pathvectord`)
 After item 1 (MultiProtocol capability) is done, advertising IPv6 capability
 becomes a matter of adding parallel `LocRib<Ipv6Addr>` / `AdjRibIn<Ipv6Addr>`
 tables to `DaemonState` and routing `AfiSafi::IPV6_UNICAST` events to them.
@@ -53,17 +63,17 @@ UPDATE messages with a valid IPv6 next-hop) is harder and can follow separately.
 
 ### Tier 3 — Larger scope, important but not blocking
 
-**6. BIRD interoperability**
+**7. BIRD interoperability**
 BIRD is stricter than GoBGP about RFC compliance. Running the existing e2e suite
 against BIRD would surface any GoBGP-specific leniency the implementation
 currently relies on. Mostly infrastructure work (Dockerfile.bird, bird.conf).
 
-**7. Criterion benchmark suite**
+**8. Criterion benchmark suite**
 Per-crate benchmarks with the three-size pattern (small/medium/large).
 Establishes the baseline before performance optimisations. Described in detail
 under Cross-cutting → Performance below.
 
-**8. Adversarial input / NOTIFICATION path testing**
+**9. Adversarial input / NOTIFICATION path testing**
 RFC 7606 (item 3) is the prerequisite — once the error handling architecture
 exists, injecting malformed UPDATEs and NOTIFICATIONs over real TCP becomes
 the natural way to verify it. Before RFC 7606 there is less to test.
