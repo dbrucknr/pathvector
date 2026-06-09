@@ -6,6 +6,70 @@ which crate it belongs to and why it was deferred.
 
 ---
 
+## Prioritized next steps
+
+Items are grouped by what they unlock, not just by effort. A small correctness
+fix that unblocks a larger feature is worth doing before the feature itself.
+
+### Tier 1 — Small scope, high correctness or coverage value
+
+**1. Advertise `MultiProtocol(IPv4_UNICAST)` capability** (`pathvectord`)
+One line in the session config construction. Brings the OPEN into RFC 4760
+compliance and causes GoBGP to send IPv4 routes via MP_REACH_NLRI — the first
+time the MP code path runs against a real peer. Also the mandatory first step
+before advertising IPv6 capability. Low risk, immediate coverage gain.
+
+**2. Wire `reapply_import_policy` → export propagation** (`pathvectord`)
+Currently policy reloads update the Loc-RIB but do not trigger outbound
+UPDATEs to peers. This is a silent correctness hole: after a policy change,
+peers continue to receive routes based on the old policy until they reconnect.
+Fixing it unblocks the gRPC policy introspection RPC and completes the
+import-policy story that RFC 8212 e2e tests already exercise on the inbound
+side.
+
+### Tier 2 — Medium scope, architectural or user-facing value
+
+**3. RFC 7606 revised UPDATE error handling** (`pathvector-session`, `pathvectord`)
+Currently every malformed attribute resets the session. RFC 7606 requires
+per-attribute error policies (session reset / treat-as-withdraw / attribute
+discard). This is architectural — it touches the codec, transport layer, and
+daemon event loop — and gets harder to retrofit as the codebase grows. Doing
+it now means every future attribute decode arm gets the correct error policy
+for free. See the dedicated section below.
+
+**4. CLI tool (`pathvector`)** (new crate, uses `pathvector-client`)
+The management API exists and `pathvector-client` wraps it cleanly. A CLI is
+the lowest-friction way for an operator (or a developer evaluating the project)
+to inspect peers and routes without writing Rust or using grpcurl. Commands:
+`peer list`, `peer get <addr>`, `route get <prefix>`, `route list`. Straightforward
+to implement; high value for the "would I use this?" question.
+
+**5. IPv6 RIB — inbound half** (`pathvectord`)
+After item 1 (MultiProtocol capability) is done, advertising IPv6 capability
+becomes a matter of adding parallel `LocRib<Ipv6Addr>` / `AdjRibIn<Ipv6Addr>`
+tables to `DaemonState` and routing `AfiSafi::IPV6_UNICAST` events to them.
+The RIB library is already generic. The outbound half (constructing MP_REACH_NLRI
+UPDATE messages with a valid IPv6 next-hop) is harder and can follow separately.
+
+### Tier 3 — Larger scope, important but not blocking
+
+**6. BIRD interoperability**
+BIRD is stricter than GoBGP about RFC compliance. Running the existing e2e suite
+against BIRD would surface any GoBGP-specific leniency the implementation
+currently relies on. Mostly infrastructure work (Dockerfile.bird, bird.conf).
+
+**7. Criterion benchmark suite**
+Per-crate benchmarks with the three-size pattern (small/medium/large).
+Establishes the baseline before performance optimisations. Described in detail
+under Cross-cutting → Performance below.
+
+**8. Adversarial input / NOTIFICATION path testing**
+RFC 7606 (item 3) is the prerequisite — once the error handling architecture
+exists, injecting malformed UPDATEs and NOTIFICATIONs over real TCP becomes
+the natural way to verify it. Before RFC 7606 there is less to test.
+
+---
+
 ## General
 ~~Download Relevant RFC's to each module.~~
 ~~Generate a list of requirements from the RFC's.~~
@@ -206,6 +270,43 @@ offer:
 - Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 
+### RFC 7606 — Revised UPDATE error handling
+
+Currently any decode error in `BgpCodec` / `UpdateMessage::decode` propagates as a
+`CodecError`, which the transport layer always treats as a session reset (send
+NOTIFICATION, close TCP). RFC 7606 requires a finer-grained response depending on
+which attribute is malformed:
+
+- **Session reset** — missing well-known mandatory attribute; malformed AS_PATH (some
+  subcases)
+- **Treat as withdraw** — malformed ORIGIN, NEXT_HOP, MP_REACH_NLRI; the NLRIs
+  carried by the bad UPDATE are withdrawn but the session stays up
+- **Attribute discard** — malformed optional non-transitive attributes; the attribute
+  is silently dropped, the rest of the UPDATE is processed normally
+
+**Why this matters:** session reset on a malformed optional attribute is operationally
+disruptive — a single bad community value in a large-scale peer's announcement brings
+down the session rather than dropping the one route. Real networks rely on the lenient
+behaviour.
+
+**Architectural impact:** this requires changes at multiple layers:
+
+1. `BgpCodec` / `UpdateMessage::decode` — instead of `Err(CodecError)` on every
+   malformed attribute, return a richer type that carries the decoded-so-far UPDATE
+   together with a per-attribute error and its RFC 7606 policy
+   (`SessionReset | TreatAsWithdraw | AttributeDiscard`)
+2. `Session<T>` transport layer — currently maps any codec error to `TcpFailed`;
+   must instead inspect the error policy and act accordingly: log + continue for
+   `AttributeDiscard`, log + withdraw NLRIs for `TreatAsWithdraw`, send NOTIFICATION
+   for `SessionReset`
+3. New `SessionEvent` variant (or extend `RouteUpdate`) to surface discarded
+   attributes and treat-as-withdraw decisions to `pathvectord` for logging
+
+This is an architectural change that touches the codec, the transport layer, and the
+daemon event loop. It is best addressed before the codec grows further (every new
+attribute decode arm will otherwise inherit the session-reset default). See
+RFC_REQUIREMENTS.md §RFC 7606 for the per-attribute policy table.
+
 ### Panic safety — replace `expect()` in `build_session_info`
 
 **Done.** `build_session_info` now returns `Option<SessionInfo>`. The `on_open_confirm`
@@ -268,6 +369,21 @@ Not yet started. Key work items:
 - Soft reconfiguration → export propagation — `reapply_import_policy` changes which routes
   are in `LocRib`, but does not currently trigger `propagate_prefix` to update peers. Callers
   that perform policy reloads must trigger outbound propagation manually until this is wired.
+
+- **Advertise `MultiProtocol(IPv4_UNICAST)` capability** — pathvectord currently only
+  advertises `Capability::FourByteAsn`. RFC 4760 requires speakers that support
+  MP_REACH_NLRI / MP_UNREACH_NLRI for an AFI/SAFI to advertise the corresponding
+  `MultiProtocol` capability in their OPEN. Without it, well-behaved peers (including
+  newer GoBGP versions) will use traditional NLRI format rather than MP_REACH_NLRI,
+  which means the `handle_update` MP code path — though implemented and unit-tested —
+  has never run against a real peer. Adding `Capability::MultiProtocol(AfiSafi::IPV4_UNICAST)`
+  to the session config:
+  - Brings the implementation into RFC 4760 compliance
+  - Causes GoBGP to send IPv4 routes via MP_REACH_NLRI, exercising the MP code path e2e
+  - Is the prerequisite step for advertising IPv6 capability later
+
+  One-line change in `pathvectord/src/main.rs` where capabilities are constructed;
+  the codec already encodes/decodes the capability correctly.
 
 - IPv6 in the daemon — the session layer already speaks IPv6 via MP_REACH_NLRI, but
   `pathvectord` is hardcoded to `Route<Ipv4Addr>`. Extending to IPv6 requires a
