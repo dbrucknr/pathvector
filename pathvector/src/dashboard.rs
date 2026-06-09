@@ -616,4 +616,63 @@ mod tests {
         });
         insta::assert_snapshot!(output);
     }
+
+    // --- render_status_bar ---
+    //
+    // `render_status_bar` calls `state.last_refresh.elapsed().as_secs()`.
+    // `DashboardState::new()` sets `last_refresh = Instant::now()`, so elapsed
+    // is 0 for any synchronous test — the snapshot reliably shows "—".
+
+    #[test]
+    fn snapshot_render_status_bar_ok() {
+        let state = DashboardState::new();
+        let output = render_to_string(80, 1, |f| {
+            let area = f.area();
+            render_status_bar(f, &state, "http://127.0.0.1:50051", area);
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_render_status_bar_error() {
+        let mut state = DashboardState::new();
+        state.last_error = Some("connection refused".to_owned());
+        let output = render_to_string(80, 1, |f| {
+            let area = f.area();
+            render_status_bar(f, &state, "http://127.0.0.1:50051", area);
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    // --- render (full layout) ---
+    //
+    // Exercises the top-level `render` dispatcher which composes all three panes
+    // via a `Layout` split.  This is the only test that calls `render()` directly
+    // and therefore the one that covers the layout code path.
+
+    #[test]
+    fn snapshot_render_full_populated() {
+        let mut state = DashboardState::new();
+        let mut peer = make_peer(SessionState::Established, Some(PeerType::External));
+        peer.uptime_seconds = 7322; // 02:02:02
+        peer.prefixes_received = 10;
+        peer.prefixes_accepted = 8;
+        peer.prefixes_advertised = 6;
+        state.peers = vec![peer];
+        state.routes = vec![make_route()];
+
+        let output = render_to_string(80, 20, |f| {
+            render(f, &state, "http://127.0.0.1:50051");
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_render_full_empty() {
+        let state = DashboardState::new();
+        let output = render_to_string(80, 20, |f| {
+            render(f, &state, "http://127.0.0.1:50051");
+        });
+        insta::assert_snapshot!(output);
+    }
 }

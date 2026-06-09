@@ -1,0 +1,6 @@
+---
+source: pathvector/src/dashboard.rs
+assertion_line: 644
+expression: output
+---
+" error: connection refused | q: quit                                            "

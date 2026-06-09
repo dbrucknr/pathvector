@@ -47,33 +47,33 @@ async fn main() {
 /// Entry point: parse the CLI then hand off to the testable core.
 async fn run() -> Result<(), CliError> {
     let args = Cli::parse();
-    run_with(args, |addr| {
-        PathvectorClient::connect(addr).map_err(CliError::from)
-    })
+    run_with(
+        args,
+        |addr| PathvectorClient::connect(addr).map_err(CliError::from),
+        dashboard::run_dashboard,
+    )
     .await
 }
 
 /// Testable dispatch core.
 ///
 /// Accepts a `connect` closure so that tests can inject a `MockDaemonClient`
-/// without any network I/O.  Production code passes a closure that wraps
-/// [`PathvectorClient::connect`].
+/// without any network I/O, and a `run_dashboard_fn` so that tests can stub
+/// the TUI dashboard without opening a real terminal.
 ///
-/// The `Dashboard` command does not go through `connect` — it creates its own
-/// client inside [`dashboard::run_dashboard`] because the dashboard event loop
-/// needs to reconnect on error and needs to own the client for the full
-/// duration of the TUI session.
-async fn run_with<C, F>(args: Cli, connect: F) -> Result<(), CliError>
+/// Production code passes `dashboard::run_dashboard` directly.
+async fn run_with<C, F, D, Fut>(args: Cli, connect: F, run_dashboard_fn: D) -> Result<(), CliError>
 where
     C: DaemonClient,
     F: FnOnce(&str) -> Result<C, CliError>,
+    D: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), CliError>>,
 {
     let addr = args.address.as_str();
 
     match args.command {
-        // Dashboard spins up its own client internally.
         Commands::Dashboard => {
-            dashboard::run_dashboard(args.address).await?;
+            run_dashboard_fn(args.address).await?;
         }
 
         Commands::Peer { command } => {
@@ -196,9 +196,12 @@ mod tests {
     }
 
     /// Helper: build `Cli` from a string slice and call `run_with` with a mock.
+    ///
+    /// The dashboard is stubbed as a no-op so that `Commands::Dashboard` can be
+    /// tested without opening a real terminal.
     async fn run_cmd(args: &[&str], mock: MockDaemonClient) -> Result<(), CliError> {
         let cli = Cli::parse_from(args);
-        run_with(cli, |_addr| Ok(mock)).await
+        run_with(cli, |_addr| Ok(mock), |_addr| async { Ok(()) }).await
     }
 
     // ── peer list ─────────────────────────────────────────────────────────────
@@ -374,5 +377,108 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── dashboard dispatch ────────────────────────────────────────────────────
+
+    /// Verify that `Commands::Dashboard` is routed to `run_dashboard_fn`.
+    /// The `connect` closure is never invoked for the dashboard command.
+    /// The stub `run_dashboard_fn` returns `Ok(())` — no real terminal is opened.
+    #[tokio::test]
+    async fn dashboard_command_dispatches() {
+        run_cmd(&["pv", "dashboard"], MockDaemonClient::new())
+            .await
+            .unwrap();
+    }
+
+    // ── MockDaemonClient error paths ──────────────────────────────────────────
+    //
+    // Each test covers the `return Err(e)` path inside the relevant mock method
+    // when `force_error` is set.  Together with `peer_list_propagates_error` and
+    // `refresh_sets_last_error_on_peer_failure` (which cover `list_peers` and
+    // `list_routes`), these tests exhaust all six error branches in the mock.
+
+    #[tokio::test]
+    async fn peer_get_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "peer", "get", "10.0.0.1"], mock)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn route_best_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "route", "best", "192.0.2.0/24"], mock)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn route_candidates_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "route", "candidates", "192.0.2.0/24"], mock)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_set_import_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "policy", "set-import", "10.0.0.1", "accept"], mock)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_set_export_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "policy", "set-export", "10.0.0.1", "reject"], mock)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Exercises the `ClientError::Convert` arm of `MockDaemonClient::check_error`.
+    /// This path maps `Convert(c)` → `Rpc(internal(c.to_string()))` before returning
+    /// the error to the caller.
+    #[tokio::test]
+    async fn convert_error_variant_propagates() {
+        use pathvector_client::error::ConvertError;
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Convert(
+            ConvertError::InvalidAddress("not-an-ip".to_owned()),
+        ));
+        let err = run_cmd(&["pv", "peer", "list"], mock).await.unwrap_err();
+        // Convert is re-wrapped as an Rpc(internal) by check_error, so the
+        // original message should appear in the Display output.
+        assert!(
+            err.to_string().contains("not-an-ip"),
+            "convert error message must propagate: {err}"
+        );
     }
 }
