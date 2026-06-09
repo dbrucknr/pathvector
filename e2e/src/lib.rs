@@ -241,8 +241,10 @@ fn write_gobgp_source_config() -> NamedTempFile {
 /// Writes the pathvectord config file for the test container.
 ///
 /// `peers` is a list of `(address, remote_as)` pairs for every BGP peer
-/// pathvectord should dial.  Pass a single pair for the simple single-peer
-/// harness; pass two pairs for the two-peer outbound harness.
+/// pathvectord should dial.  Every peer gets `import_default = "accept"` and
+/// `export_default = "accept"` so that routes flow freely in both directions.
+/// Use [`write_daemon_config_no_policy`] or [`write_daemon_config_import_only`]
+/// when testing RFC 8212 default-reject semantics.
 fn write_daemon_config(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp pathvectord config");
     write!(
@@ -267,6 +269,75 @@ port           = {GOBGPD_BGP_PORT}
 remote_as      = {remote_as}
 import_default = "accept"
 export_default = "accept"
+"#
+        )
+        .expect("write pathvectord peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with **no** import or export policy on any peer.
+///
+/// For eBGP peers this activates the RFC 8212 defaults: both import and export
+/// default to `Reject`.  No routes are accepted into the Loc-RIB and no routes
+/// are advertised to peers unless an explicit policy term matches.
+fn write_daemon_config_no_policy(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address   = "{ip}"
+port      = {GOBGPD_BGP_PORT}
+remote_as = {remote_as}
+"#
+        )
+        .expect("write pathvectord peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `import_default = "accept"` but **no**
+/// `export_default` on any peer.
+///
+/// Routes are accepted into the Loc-RIB but not re-advertised to any peer:
+/// for eBGP peers the RFC 8212 export default is `Reject`.
+fn write_daemon_config_import_only(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
 "#
         )
         .expect("write pathvectord peer config");
@@ -399,10 +470,35 @@ pub struct Harness {
 impl Harness {
     /// Stand up the full environment and wait for the BGP session.
     ///
+    /// pathvectord is configured with `import_default = "accept"` and
+    /// `export_default = "accept"` on the GoBGP peer so that routes flow
+    /// freely in both directions.
+    ///
     /// # Panics
     ///
     /// See the struct-level documentation.
     pub async fn new() -> Self {
+        Self::new_inner(write_daemon_config).await
+    }
+
+    /// Same as [`new`] but with **no** import or export policy on the peer.
+    ///
+    /// For an eBGP peer this activates RFC 8212 defaults: both import and
+    /// export default to `Reject`.  Use this harness to assert that routes
+    /// are blocked when no policy explicitly permits them.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_rfc8212() -> Self {
+        Self::new_inner(write_daemon_config_no_policy).await
+    }
+
+    /// Internal constructor — spins up one GoBGP + one pathvectord container.
+    ///
+    /// `make_cfg` is the config-writing function that produces the pathvectord
+    /// TOML.  The caller chooses the policy variant.
+    async fn new_inner(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
@@ -440,7 +536,7 @@ impl Harness {
         let gobgpd_ip = container_network_ip(&gobgpd_container_id, &network_name);
 
         // Write pathvectord config referencing gobgpd's container IP.
-        let pathvectord_config = write_daemon_config(&[(gobgpd_ip, 65001)]);
+        let pathvectord_config = make_cfg(&[(gobgpd_ip, 65001)]);
         let pathvectord_config_path = pathvectord_config
             .path()
             .to_str()
@@ -632,11 +728,39 @@ pub struct TwoPeerHarness {
 impl TwoPeerHarness {
     /// Stand up the full two-peer environment and wait for both BGP sessions.
     ///
+    /// pathvectord is configured with `import_default = "accept"` and
+    /// `export_default = "accept"` on both peers so routes flow freely from
+    /// source through to sink.
+    ///
     /// # Panics
     ///
     /// Panics if Docker is not running, either image is missing, or either BGP
     /// session does not reach `Established` within 30 seconds.
     pub async fn new() -> Self {
+        Self::new_inner(write_daemon_config).await
+    }
+
+    /// Same as [`new`] but with `import_default = "accept"` and **no**
+    /// `export_default` on either peer.
+    ///
+    /// Routes from GoBGP-source are accepted into pathvectord's Loc-RIB, but
+    /// the RFC 8212 eBGP export default (`Reject`) prevents pathvectord from
+    /// re-advertising them to GoBGP-sink.  Use this harness to assert that the
+    /// export-policy default actually suppresses advertisements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing, or either BGP
+    /// session does not reach `Established` within 30 seconds.
+    pub async fn new_no_export_policy() -> Self {
+        Self::new_inner(write_daemon_config_import_only).await
+    }
+
+    /// Internal constructor — spins up GoBGP-sink + GoBGP-source + pathvectord.
+    ///
+    /// `make_cfg` is the config-writing function that produces the pathvectord
+    /// TOML.  The caller chooses the policy variant.
+    async fn new_inner(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
@@ -682,7 +806,7 @@ impl TwoPeerHarness {
         let source_addr = container_network_ip(&source_id, &network_name);
 
         // ── pathvectord (dials both peers) ────────────────────────────────────
-        let daemon_config = write_daemon_config(&[(sink_addr, 65001), (source_addr, 65003)]);
+        let daemon_config = make_cfg(&[(sink_addr, 65001), (source_addr, 65003)]);
         let daemon_config_path = daemon_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
