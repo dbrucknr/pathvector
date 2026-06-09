@@ -21,7 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test
+      # pathvector-e2e requires pre-built Docker images and runs in its own job.
+      - run: cargo test --workspace --exclude pathvector-e2e
 
   # ── Lint ────────────────────────────────────────────────────────────────────
   lint:
@@ -50,7 +51,8 @@ jobs:
           key: msrv
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test
+      # pathvector-e2e requires pre-built Docker images and runs in its own job.
+      - run: cargo test --workspace --exclude pathvector-e2e
 
   # ── Docs ────────────────────────────────────────────────────────────────────
   docs:
@@ -63,6 +65,57 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  # ── End-to-end ──────────────────────────────────────────────────────────────
+  #
+  # Runs both gobgpd and pathvectord as Docker containers on a per-test bridge
+  # network.  BGP peering is container-to-container; only pathvectord's gRPC
+  # port is mapped to the host.  ubuntu-latest runners have Docker pre-installed.
+  #
+  # Docker layer caching via type=gha keeps the GoBGP image build near-instant
+  # on repeat runs (the binary is a fixed download).  The pathvectord image
+  # caches its Rust dependency layer separately from the source layer so only
+  # the final compile step is invalidated when source changes.
+  e2e:
+    name: End-to-end (Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build GoBGP image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/Dockerfile
+          load: true
+          tags: pathvector-gobgpd-test:latest
+          build-args: |
+            TARGETARCH=amd64
+            GOBGP_VERSION=4.6.0
+          cache-from: type=gha,scope=gobgpd
+          cache-to: type=gha,mode=max,scope=gobgpd
+
+      - name: Build pathvectord image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/Dockerfile.pathvectord
+          load: true
+          tags: pathvector-e2e:latest
+          cache-from: type=gha,scope=pathvectord
+          cache-to: type=gha,mode=max,scope=pathvectord
+
+      - name: Run e2e tests
+        run: cargo test -p pathvector-e2e -- --test-threads=1
 
   # ── Fuzz ────────────────────────────────────────────────────────────────────
   # fuzz:

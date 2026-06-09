@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the end-to-end suite before pushing to a remote.
+#
+# Install once with:
+#   git config core.hooksPath .githooks
+# or via the Justfile:
+#   just install-hooks
+#
+# Skip for a specific push with:
+#   git push --no-verify
+#
+# The hook exits 0 (allow push) only if all 10 e2e tests pass.
+# It exits 1 (block push) if any test fails or if Docker is not running.
+
+set -euo pipefail
+
+# Check that Docker is available and running before spending time on the build.
+if ! docker info > /dev/null 2>&1; then
+    echo "pre-push: Docker is not running — skipping e2e suite." >&2
+    echo "pre-push: Start Docker Desktop and re-push, or use --no-verify to skip." >&2
+    exit 1
+fi
+
+echo "pre-push: running e2e suite (use --no-verify to skip)..."
+just e2e
