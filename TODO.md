@@ -49,6 +49,17 @@ Added the two remaining plan items:
 Also covers 8 action invariants (PrependAsPath, Add/Remove/SetCommunities, SetLocalPref,
 AnyCondition, ActionSequence).
 
+**Phase 6 — `pathvector-client` conversion layer fuzz target** (deferred)
+The `pathvector-client` crate is a trust boundary — it parses responses from a daemon over
+the network, and the daemon could be buggy or compromised. The conversion layer
+(`src/convert.rs`) does address parsing from `String`, enum coercion with unknown-value
+handling, and fixed-width extended-community byte slicing (8 bytes each). A fuzz target that
+generates arbitrary proto-encoded `Route` / `PeerState` bytes and drives the full `TryFrom`
+chain would catch panics in these paths. Unlike the codec fuzz targets (which test
+adversarial *peer* input), this tests adversarial *daemon* responses — a different attack
+surface. Add to `fuzz/fuzz_targets/client_convert.rs` once the proto message structures
+stabilise (adding streaming RPCs will change the generated types).
+
 **Phase 4 — `cargo fuzz` on the codec decode path** ✓ Done
 Two fuzz targets live in `fuzz/fuzz_targets/` at the workspace root:
 - `session_framing` — feeds raw `&[u8]` into `BgpCodec::decode` (the entry point for any remote peer byte stream);
@@ -98,6 +109,12 @@ Remaining e2e work:
 - Adversarial inputs — malformed BGP messages injected directly over TCP to verify the
   daemon handles them gracefully without panicking
 - GitHub Actions e2e workflow — separate CI job that builds both images and runs the suite
+- **BIRD interoperability** — add a second peer implementation. BIRD is stricter about RFC
+  compliance than GoBGP (it's the reference implementation for many IXP route servers) and
+  will catch things GoBGP tolerates. A `e2e/Dockerfile.bird` wrapping the official BIRD
+  package + `e2e/fixtures/bird.conf` is all that's needed; the `Harness` architecture already
+  supports multiple peer images. Target: run the same 10 session + route tests against BIRD
+  to confirm the handshake and UPDATE exchange is broadly interoperable, not just GoBGP-specific.
 
 ## pathvector-rib
 
@@ -281,9 +298,101 @@ types are defined independently in `src/types.rs`.
 - Policy introspection RPC (`ListTerms`, `EvalRoute`) — blocked on
   `reapply_import_policy` being wired to export propagation in `pathvectord`
 
+### gRPC streaming watch RPCs
+
+The current management API is purely request/response — operators and tests must poll to
+observe changes. Adding server-side streaming RPCs would make the API event-driven:
+
+```protobuf
+rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteEvent);
+rpc WatchPeers(WatchPeersRequest)  returns (stream PeerEvent);
+```
+
+Where `RouteEvent` carries `oneof { Route announced = 1; string withdrawn_prefix = 2; }`
+and `PeerEvent` carries the updated `PeerState`.
+
+Benefits:
+- **e2e tests** — replace `wait_for_route` polling loops with an event-driven subscription;
+  tests become faster and have no arbitrary sleep timeouts
+- **CLI** — `pathvector watch routes` / `pathvector watch peers` become natural commands
+- **Operators** — live monitoring without external polling scripts
+
+Implementation touches: proto schema, daemon event fan-out (the session event channel
+already carries all the information — each watch stream registers as a receiver), and the
+client library (`watch_routes() -> impl Stream<Item = RouteEvent>`). The daemon side
+requires careful backpressure handling: a slow watch client must not block the main loop.
+Consider a bounded broadcast channel per watch stream with the oldest entry dropped on
+overflow (same pattern as Tokio's `broadcast::channel`).
+
 ---
 
 ## Cross-cutting
+
+### Architecture overview document
+
+`ARCHITECTURE.md` is the missing onboarding artifact. A new contributor today has to
+reconstruct the runtime data flow by reading across five crates. A single document should
+trace the full path:
+
+```
+TcpStream
+  → BgpCodec (framing + message decode)
+  → Session<T> FSM events
+  → SessionEvent channel (per-peer task → pathvectord main loop)
+  → handle_update / AdjRibIn
+  → LocRib (best-path selection)
+  → propagate_prefix → AdjRibOut
+  → route_to_update → UpdateMessage → peer TcpStream
+```
+
+And the management plane:
+
+```
+gRPC request → PeerService / RibService handler
+  → shared Arc<Mutex<State>> read
+  → proto response
+```
+
+Include the crate dependency graph, explain why `pathvector-client` has no internal
+dependencies (the trust boundary reasoning), and document the `BgpTransport` trait seam
+that allows transport mocking in tests.
+
+### Logging audit
+
+The current `tracing` usage grew organically and needs a systematic review:
+
+1. **Structured fields** — every log site should include typed fields rather than string
+   interpolation. The convention should be `peer_addr = %addr` (Display) and
+   `prefix = %prefix` consistently across all crates.
+2. **Per-session spans** — each session task should be instrumented with a `tracing::span!`
+   carrying `peer_addr` and `local_as` so that log output can be filtered per-peer without
+   grepping. Currently logs from concurrent sessions are interleaved without a key.
+3. **Level discipline** — establish and enforce:
+   - `ERROR`: logic invariants violated (should never happen); always actionable
+   - `WARN`: expected-but-bad external input (malformed message, peer misbehaviour)
+   - `INFO`: operator-relevant lifecycle events (session established/terminated, route count changes)
+   - `DEBUG`: per-message events useful for tracing protocol state
+   - `TRACE`: raw byte-level detail; acceptable performance cost only in debug builds
+4. **Hot paths** — the UPDATE processing path (`handle_update` → `LocRib::insert` →
+   `propagate_prefix`) runs for every route change. Verify no `INFO`-or-above log sites
+   sit inside the inner loop without rate-limiting.
+
+### Result/Option return type audit
+
+Any function that can fail should say so in its return type. Conduct a systematic pass:
+
+1. **`expect()` / `unwrap()` survivors** — grep the entire workspace for `expect(` and
+   `unwrap()` outside of `#[cfg(test)]` blocks; each one is either a legitimate invariant
+   (document why it cannot fail) or should be replaced with a `Result` return and `?`.
+2. **`()` returns that can fail silently** — functions returning `()` that perform I/O or
+   parse input should return `Result<(), E>` and let the caller decide how to handle failure.
+   The gRPC handler functions are the highest-risk area here.
+3. **gRPC error propagation** — verify that every `tonic::Status` returned from a handler
+   carries a meaningful `code` and `message`. An internal conversion error that maps to
+   `Status::internal("unknown error")` is opaque to the caller; it should include the
+   original error in the message.
+4. **`ConvertError` completeness** — the `pathvector-client` conversion layer has explicit
+   error variants. Verify no `unwrap()` or `expect()` hides inside any `TryFrom` impl.
 
 - CI pipeline: `cargo test`, `cargo clippy`, `cargo doc`, MSRV check (1.88) — **Done.** `.github/workflows/ci.yml` has five jobs: `test` (stable), `lint` (clippy + rustfmt, stable), `msrv` (1.88), `docs` (stable, `-D warnings`), and `fuzz` (nightly, `just fuzz-smoke`). A `Justfile` at the workspace root provides matching local recipes so CI and development use the same commands. All jobs install `protoc` (required by `pathvectord`'s gRPC codegen build script).
 - Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range

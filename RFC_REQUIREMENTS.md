@@ -15,10 +15,28 @@ implementation status.
 - `test_name` — unit test that would fail if this requirement broke
 - `proptest` — property-based test providing randomised coverage
 - `interop: test_name` — integration test using real TCP sockets / a real BGP peer
+- `e2e: test_name` — end-to-end test running pathvectord + a real BGP peer in Docker
+- `fuzz: target_name` — fuzz target that would surface a panic or crash
 - `—` — no automated verification; a test must be written
 
 A ✅ with `—` in "Verified by" means the code exists but the correctness claim
 is unprotected. Treat it the same as ⚠️ for test-coverage purposes.
+
+**Integration test policy**
+
+Not every requirement needs an integration test — the right bar depends on what the
+requirement claims:
+
+- *Pure encoding/decoding* (wire format, flag bits, length fields): `proptest` + `fuzz`
+  is sufficient. The claim is stateless and fully expressible as input→output.
+- *Behavioral / protocol-sequencing* (FSM transitions triggered by peer messages, route
+  propagation, policy application on real routes, timer interactions): requires at minimum
+  one `interop:` or `e2e:` citation. The claim depends on *what a real peer does in
+  response*, which unit tests cannot exercise.
+
+A ✅ on a behavioral requirement with only `test_name` / `proptest` in "Verified by"
+should be treated as ⚠️ until an `interop:` or `e2e:` test is added. See TODO.md for
+the planned BIRD interoperability suite.
 
 ---
 
