@@ -1,0 +1,24 @@
+[package]
+name    = "pathvector-e2e"
+version = "0.1.0"
+edition.workspace   = true
+rust-version.workspace = true
+license.workspace   = true
+authors.workspace   = true
+repository.workspace = true
+# Never publish — this crate is a test harness only.
+publish = false
+
+[dependencies]
+pathvector-client = { workspace = true }
+tokio             = { workspace = true }
+tempfile          = "3"
+testcontainers    = "0.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all          = { level = "warn", priority = -1 }
+pedantic     = { level = "warn", priority = -1 }
+doc_markdown = "allow"

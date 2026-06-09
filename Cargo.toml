@@ -7,6 +7,7 @@ members = [
     "pathvector-bmp",
     "pathvector-client",
     "pathvectord",
+    "e2e",
 ]
 resolver = "2"
 

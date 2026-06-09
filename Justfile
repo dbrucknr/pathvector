@@ -41,6 +41,15 @@ fmt-check:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+# ── End-to-end ────────────────────────────────────────────────────────────────
+
+# Run end-to-end tests against a live GoBGP container.
+# Requires Docker.  Tests are serialised (--test-threads=1) because each test
+# binds its own ports; parallel execution risks port collisions.
+e2e:
+    cargo build -p pathvectord
+    cargo test -p pathvector-e2e -- --test-threads=1 --nocapture
+
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
 # Compile all fuzz targets (no fuzzing — fast compile check)

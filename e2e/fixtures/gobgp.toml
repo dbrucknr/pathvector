@@ -1,0 +1,31 @@
+# GoBGP configuration for e2e testing.
+#
+# Design notes:
+#   - GoBGP runs AS 65001, pathvectord runs AS 65002 (matches manual interop
+#     validation in gobgp.toml / config.toml at the workspace root).
+#   - Dynamic neighbors (prefix = "0.0.0.0/0") means GoBGP accepts any
+#     incoming BGP connection presenting AS 65002.  This is necessary because
+#     the source IP that pathvectord appears as inside the container varies by
+#     platform (Docker bridge gateway on Linux, VM NAT address on Mac).
+#   - passive-mode = true: GoBGP never initiates; pathvectord always dials.
+#   - hold-time = 9 / keepalive = 3: shortest values the RFC allows (minimum
+#     hold-time is 3 s; we use 9 to give headroom without slowing tests).
+
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time           = 9
+    keepalive-interval  = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
