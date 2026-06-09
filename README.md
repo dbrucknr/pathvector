@@ -19,22 +19,26 @@ The implementation is split into focused, independently published crates. Each l
 | [`pathvector-rib`](pathvector-rib) | Adj-RIB-In, Loc-RIB, Adj-RIB-Out, and best-path selection |
 | [`pathvector-session`](pathvector-session) | BGP FSM, TCP transport, and message codec |
 | [`pathvector-bmp`](pathvector-bmp) | BMP receiver (RFC 7854): route monitoring and peer state |
+| [`pathvector-client`](pathvector-client) | Typed async Rust client for the gRPC management API |
 | [`pathvectord`](pathvectord) | BGP daemon: TOML config and gRPC management API |
+| [`pathvector`](pathvector) | CLI management tool (`pathvector peer`, `route`, `policy`, `dashboard`) |
 
 Dependency flow:
 
 ```
-pathvectord
-├── pathvector-session
-├── pathvector-rib
-│   ├── pathvector-policy
-│   │   ├── pathvector-types
-│   │   ├── ipnetx
-│   │   └── routemap
-│   └── pathvector-types
-├── pathvector-bmp
-│   └── pathvector-types
-└── pathvector-types
+pathvector (CLI)
+└── pathvector-client
+    └── pathvectord (gRPC server)
+        ├── pathvector-session
+        ├── pathvector-rib
+        │   ├── pathvector-policy
+        │   │   ├── pathvector-types
+        │   │   ├── ipnetx
+        │   │   └── routemap
+        │   └── pathvector-types
+        ├── pathvector-bmp
+        │   └── pathvector-types
+        └── pathvector-types
 ```
 
 ---
@@ -73,9 +77,12 @@ Active development. Crates are not yet published to crates.io.
 | `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2, 4–7, 10; LPM forwarding queries |
 | `pathvector-session` | Stable | Full BGP FSM; all five message types; 4-byte ASN; GoBGP-validated |
 | `pathvector-bmp` | Not started | — |
+| `pathvector-client` | Stable | Typed async Rust client wrapping all three gRPC services |
 | `pathvectord` | Active | Full BGP speaker; gRPC management API; GoBGP-validated |
+| `pathvector` | Active | CLI: peer/route/policy subcommands; live ratatui dashboard |
 
-See [DAEMON.md](DAEMON.md) for build instructions, configuration reference, and how to query the gRPC management API.
+See [DAEMON.md](DAEMON.md) for build instructions, daemon configuration reference, and raw gRPC API examples.
+See [CLI.md](CLI.md) for the `pathvector` CLI reference: installation, all subcommands, and policy reload workflow.
 
 ---
 

@@ -131,8 +131,11 @@ The management API starts automatically alongside the BGP event loop. It is unau
 |---|---|
 | `pathvector.v1.PeerService` | `ListPeers`, `GetPeer` |
 | `pathvector.v1.RibService` | `GetBestRoute`, `ListRoutes`, `ListCandidates` |
+| `pathvector.v1.PolicyService` | `SetImportDefault`, `SetExportDefault` |
 
 The full schema is at [`proto/pathvector/v1/management.proto`](proto/pathvector/v1/management.proto).
+
+The `pathvector` CLI wraps all three services with a typed, human-friendly interface — see [CLI.md](CLI.md). `grpcurl` works for ad-hoc queries or automation without a compiled client.
 
 ### Querying with grpcurl
 
@@ -544,7 +547,6 @@ sudo birdc configure
 
 | Feature | Notes |
 |---|---|
-| `pathvector` CLI | Typed gRPC client CLI — on the roadmap as `pathvector-client` |
-| Runtime policy reload via gRPC | `reapply_import_policy` exists but export propagation not yet wired |
 | IPv6 RIB | Session layer parses IPv6 MP_REACH/UNREACH; daemon tables are IPv4-only |
-| Docker image | Done — `e2e/Dockerfile.pathvectord`; see `just e2e-images`. A standalone production image (separate from the test image) is not yet published. |
+| RFC 7606 revised UPDATE error handling | Treat malformed path attributes as withdrawals rather than session resets |
+| Production Docker image | The test image (`e2e/Dockerfile.pathvectord`) exists; a standalone published image does not yet |

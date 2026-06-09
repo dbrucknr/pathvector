@@ -62,6 +62,7 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+    use pathvector_client::error::ClientError;
 
     #[test]
     fn connect_error_display() {
@@ -77,5 +78,35 @@ mod tests {
         let e = CliError::Terminal(io);
         assert!(e.to_string().contains("terminal error"));
         assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn client_error_display_and_source() {
+        let status = tonic::Status::not_found("no such peer");
+        let e = CliError::Client(ClientError::Rpc(status));
+        assert!(e.to_string().contains("no such peer"), "Display: {e}");
+        assert!(e.source().is_some(), "source() must be Some");
+    }
+
+    #[test]
+    fn from_client_error() {
+        let status = tonic::Status::internal("boom");
+        let client_err = ClientError::Rpc(status);
+        let cli_err = CliError::from(client_err);
+        assert!(matches!(cli_err, CliError::Client(_)));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let cli_err = CliError::from(io);
+        assert!(matches!(cli_err, CliError::Terminal(_)));
+    }
+
+    #[test]
+    fn from_connect_error() {
+        let conn_err = ConnectError::InvalidEndpoint("x".into());
+        let cli_err = CliError::from(conn_err);
+        assert!(matches!(cli_err, CliError::Connect(_)));
     }
 }

@@ -39,6 +39,7 @@ use pathvector_client::{
 };
 
 use crate::{
+    client_trait::DaemonClient,
     error::CliError,
     output::{format_as_path, format_opt_u32, format_uptime},
 };
@@ -92,7 +93,7 @@ impl DashboardState {
         }
     }
 
-    async fn refresh(&mut self, client: &mut PathvectorClient) {
+    pub(crate) async fn refresh(&mut self, client: &mut impl DaemonClient) {
         match client.list_peers().await {
             Ok(peers) => self.peers = peers,
             Err(e) => self.last_error = Some(e.to_string()),
@@ -324,5 +325,155 @@ fn format_origin(origin: pathvector_client::types::Origin) -> &'static str {
         pathvector_client::types::Origin::Igp => "IGP",
         pathvector_client::types::Origin::Egp => "EGP",
         _ => "?",
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+    use pathvector_client::types::{Origin, PeerState, PeerType, SessionState};
+
+    fn make_peer(session_state: SessionState, peer_type: Option<PeerType>) -> PeerState {
+        PeerState {
+            address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            remote_as: 65001,
+            local_as: 65002,
+            session_state,
+            peer_type,
+            hold_time: 90,
+            uptime_seconds: 0,
+            prefixes_received: 0,
+            prefixes_accepted: 0,
+            prefixes_advertised: 0,
+        }
+    }
+
+    #[test]
+    fn peer_type_str_external() {
+        let p = make_peer(SessionState::Established, Some(PeerType::External));
+        assert_eq!(peer_type_str(&p), "eBGP");
+    }
+
+    #[test]
+    fn peer_type_str_internal() {
+        let p = make_peer(SessionState::Established, Some(PeerType::Internal));
+        assert_eq!(peer_type_str(&p), "iBGP");
+    }
+
+    #[test]
+    fn peer_type_str_none() {
+        let p = make_peer(SessionState::Idle, None);
+        assert_eq!(peer_type_str(&p), "\u{2014}");
+    }
+
+    #[test]
+    fn session_state_str_established() {
+        let p = make_peer(SessionState::Established, None);
+        assert_eq!(session_state_str(&p), "Established");
+    }
+
+    #[test]
+    fn session_state_str_idle() {
+        let p = make_peer(SessionState::Idle, None);
+        assert_eq!(session_state_str(&p), "Idle");
+    }
+
+    #[test]
+    fn format_origin_variants() {
+        assert_eq!(format_origin(Origin::Igp), "IGP");
+        assert_eq!(format_origin(Origin::Egp), "EGP");
+        assert_eq!(format_origin(Origin::Incomplete), "?");
+    }
+
+    #[test]
+    fn dashboard_state_new_is_empty() {
+        let s = DashboardState::new();
+        assert!(s.peers.is_empty());
+        assert!(s.routes.is_empty());
+        assert!(s.last_error.is_none());
+    }
+
+    // ── DashboardState::refresh ───────────────────────────────────────────────
+
+    use crate::client_trait::MockDaemonClient;
+    use pathvector_client::types::{AsSegment, AsSegmentType, Route};
+    use std::net::Ipv4Addr as V4;
+
+    fn make_route() -> Route {
+        Route {
+            prefix: "192.0.2.0/24".to_owned(),
+            peer_address: IpAddr::V4(V4::new(10, 0, 0, 1)),
+            peer_type: PeerType::External,
+            next_hop: None,
+            as_path: vec![AsSegment {
+                kind: AsSegmentType::Sequence,
+                asns: vec![65001],
+            }],
+            origin: pathvector_client::types::Origin::Igp,
+            local_pref: None,
+            med: None,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            atomic_aggregate: false,
+            aggregator: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_populates_peers_and_routes() {
+        let mut state = DashboardState::new();
+        let mut mock = MockDaemonClient::new();
+        mock.peers = vec![make_peer(
+            SessionState::Established,
+            Some(PeerType::External),
+        )];
+        mock.routes = vec![make_route()];
+
+        state.refresh(&mut mock).await;
+
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.routes.len(), 1);
+        assert!(state.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_sets_last_error_on_peer_failure() {
+        let mut state = DashboardState::new();
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("daemon down"),
+        ));
+
+        state.refresh(&mut mock).await;
+
+        assert!(
+            state.last_error.is_some(),
+            "last_error must be set on RPC failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_clears_stale_data_on_successive_success() {
+        let mut state = DashboardState::new();
+        let mut mock = MockDaemonClient::new();
+        mock.peers = vec![make_peer(
+            SessionState::Established,
+            Some(PeerType::External),
+        )];
+
+        // First refresh — populates peers.
+        state.refresh(&mut mock).await;
+        assert_eq!(state.peers.len(), 1);
+
+        // Second refresh with empty mock — peers list clears.
+        let mut empty = MockDaemonClient::new();
+        state.refresh(&mut empty).await;
+        assert_eq!(state.peers.len(), 0);
+        assert!(state.last_error.is_none());
     }
 }

@@ -366,9 +366,7 @@ Not yet started. Key work items:
   `let...else` + `tracing::error!` + `continue`. Unknown peer IPs now log an error and skip
   the event rather than panicking the daemon.
 
-- Soft reconfiguration → export propagation — `reapply_import_policy` changes which routes
-  are in `LocRib`, but does not currently trigger `propagate_prefix` to update peers. Callers
-  that perform policy reloads must trigger outbound propagation manually until this is wired.
+- **Soft reconfiguration → export propagation — Done (2026-06-09).** `set_import_default` and `set_export_default` on `DaemonState` call `reapply_import_policy` and then immediately call `propagate_prefix` for every affected NLRI to all established peers. Exposed via `PolicyService` gRPC; `pathvector policy set-import/set-export` CLI subcommands wrap it. Two e2e tests confirm the full chain.
 
 - **Advertise `MultiProtocol(IPv4_UNICAST)` capability** — pathvectord currently only
   advertises `Capability::FourByteAsn`. RFC 4760 requires speakers that support
@@ -394,12 +392,12 @@ Not yet started. Key work items:
   traditional fields are handled correctly. Non-IPv4 AFI/SAFIs are logged at DEBUG
   and skipped. Full IPv6 RIB support still requires the dual-stack work above.
 
-- gRPC management API — **Done (2026-06-08).** `PeerService` and `RibService` are live on a configurable port (default 50051). Proto schema at `proto/pathvector/v1/management.proto`. See [DAEMON.md](DAEMON.md) for the full operational guide and `grpcurl` query examples. Remaining: policy introspection and runtime policy reload (blocked on wiring `reapply_import_policy` to export propagation).
+- gRPC management API — **Done (2026-06-09).** `PeerService`, `RibService`, and `PolicyService` are live. Proto schema at `proto/pathvector/v1/management.proto`. See [DAEMON.md](DAEMON.md) for the full operational guide and `grpcurl` examples; see [CLI.md](CLI.md) for the `pathvector` CLI reference.
 - gRPC server reflection — **Done (2026-06-08).** `tonic-reflection` registered at startup. `grpcurl` now works without `--proto` flags; `grpcurl -plaintext localhost:50051 list` discovers all services at runtime.
 - Import policy — **Done.** `handle_update` now evaluates a `Policy<Route<Ipv4Addr>>` per route before `LocRib::insert`; routes that return `Reject` are dropped. Per-peer default action (`import_default = "accept"` / `"reject"`) is configurable in TOML; eBGP peers default to `"reject"` (RFC 8212) when omitted, iBGP peers default to `"accept"`. The infrastructure is in place for adding `Term` conditions (prefix lists, community filters, etc.).
 - BLACKHOLE community discard action (RFC 7999) — `Community::BLACKHOLE` (0xFFFF029A) is defined and detectable via `is_blackhole()`, but there is no null-route or discard action wired in the RIB or daemon; routes tagged with BLACKHOLE should have traffic to their prefix dropped at the forwarding plane
 - `AdjRibIn` — **Done.** Per-peer `AdjRibIn` tables are built at startup and wired through `handle_update`. Raw (pre-policy) routes are stored on every announcement; withdrawals remove from both `AdjRibIn` and `LocRib`; session teardown calls `AdjRibIn::clear()`. `reapply_import_policy` re-evaluates all stored raw routes against a new policy, inserting accepted routes and withdrawing rejected ones from `LocRib` without a session reset.
-- CLI binary (`pathvector`) using the gRPC client
+- **CLI binary (`pathvector`) — Done (2026-06-09).** `peer list/get`, `route list/best/candidates`, `policy set-import/set-export`, and `dashboard` (live ratatui TUI). See [CLI.md](CLI.md).
 - **Docker image** — **Done (2026-06-09).** `e2e/Dockerfile.pathvectord` is a multi-stage build:
   `rust:1.88-slim-bookworm` builder (with `protobuf-compiler`), `debian:bookworm-slim` runtime
   (with `netcat-openbsd` for HEALTHCHECK). Config file is bind-mounted at container start.

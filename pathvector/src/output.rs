@@ -207,7 +207,7 @@ pub fn print_route_detail(route: &Route) {
     }
 }
 
-fn format_origin(origin: pathvector_client::types::Origin) -> &'static str {
+pub(crate) fn format_origin(origin: pathvector_client::types::Origin) -> &'static str {
     match origin {
         pathvector_client::types::Origin::Igp => "IGP",
         pathvector_client::types::Origin::Egp => "EGP",
@@ -219,8 +219,15 @@ fn format_origin(origin: pathvector_client::types::Origin) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
-    use pathvector_client::types::AsSegment;
+    use pathvector_client::types::{
+        Aggregator, AsSegment, AsSegmentType, LargeCommunity, Origin, PeerState, PeerType, Route,
+        SessionState,
+    };
+
+    // ── Scalar helpers ────────────────────────────────────────────────────────
 
     #[test]
     fn uptime_zero_is_dash() {
@@ -257,6 +264,30 @@ mod tests {
     }
 
     #[test]
+    fn as_path_confed_set_uses_braces() {
+        let seg = AsSegment {
+            kind: AsSegmentType::ConfedSet,
+            asns: vec![65003],
+        };
+        assert_eq!(format_as_path(&[seg]), "{65003}");
+    }
+
+    #[test]
+    fn as_path_multiple_segments() {
+        let segs = vec![
+            AsSegment {
+                kind: AsSegmentType::Sequence,
+                asns: vec![65001],
+            },
+            AsSegment {
+                kind: AsSegmentType::Set,
+                asns: vec![65002, 65003],
+            },
+        ];
+        assert_eq!(format_as_path(&segs), "65001 {65002 65003}");
+    }
+
+    #[test]
     fn opt_u32_none_is_dash() {
         assert_eq!(format_opt_u32(None), "\u{2014}");
     }
@@ -264,5 +295,157 @@ mod tests {
     #[test]
     fn opt_u32_some_is_value() {
         assert_eq!(format_opt_u32(Some(100)), "100");
+    }
+
+    #[test]
+    fn format_origin_variants() {
+        assert_eq!(format_origin(Origin::Igp), "IGP");
+        assert_eq!(format_origin(Origin::Egp), "EGP");
+        assert_eq!(format_origin(Origin::Incomplete), "?");
+    }
+
+    // ── Peer table helpers ────────────────────────────────────────────────────
+
+    fn make_peer(session_state: SessionState, peer_type: Option<PeerType>) -> PeerState {
+        PeerState {
+            address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            remote_as: 65001,
+            local_as: 65002,
+            session_state,
+            peer_type,
+            hold_time: 90,
+            uptime_seconds: 3661,
+            prefixes_received: 5,
+            prefixes_accepted: 4,
+            prefixes_advertised: 3,
+        }
+    }
+
+    #[test]
+    fn print_peer_table_empty() {
+        // Must not panic; emits "No peers configured." to stdout.
+        print_peer_table(&[]);
+    }
+
+    #[test]
+    fn print_peer_table_established_external() {
+        let peers = vec![make_peer(
+            SessionState::Established,
+            Some(PeerType::External),
+        )];
+        print_peer_table(&peers);
+    }
+
+    #[test]
+    fn print_peer_table_idle_internal() {
+        let peers = vec![make_peer(SessionState::Idle, Some(PeerType::Internal))];
+        print_peer_table(&peers);
+    }
+
+    #[test]
+    fn print_peer_table_unknown_type() {
+        // peer_type = None → "—" column
+        let peers = vec![make_peer(SessionState::Idle, None)];
+        print_peer_table(&peers);
+    }
+
+    #[test]
+    fn print_peer_detail_smoke() {
+        let peer = make_peer(SessionState::Established, Some(PeerType::External));
+        print_peer_detail(&peer);
+    }
+
+    #[test]
+    fn print_peer_detail_internal() {
+        let peer = make_peer(SessionState::Idle, Some(PeerType::Internal));
+        print_peer_detail(&peer);
+    }
+
+    #[test]
+    fn print_peer_detail_unknown_type() {
+        let peer = make_peer(SessionState::Idle, None);
+        print_peer_detail(&peer);
+    }
+
+    // ── Route table helpers ───────────────────────────────────────────────────
+
+    fn make_route_minimal() -> Route {
+        Route {
+            prefix: "192.0.2.0/24".to_owned(),
+            peer_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            peer_type: PeerType::External,
+            next_hop: None,
+            as_path: vec![],
+            origin: Origin::Igp,
+            local_pref: None,
+            med: None,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            atomic_aggregate: false,
+            aggregator: None,
+        }
+    }
+
+    fn make_route_full() -> Route {
+        Route {
+            prefix: "10.0.0.0/8".to_owned(),
+            peer_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_type: PeerType::Internal,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+            as_path: vec![AsSegment {
+                kind: AsSegmentType::Sequence,
+                asns: vec![65001, 65002],
+            }],
+            origin: Origin::Egp,
+            local_pref: Some(100),
+            med: Some(50),
+            communities: vec![(65001 << 16) | 0x64],
+            large_communities: vec![LargeCommunity {
+                global_admin: 65001,
+                local_data1: 1,
+                local_data2: 2,
+            }],
+            extended_communities: vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]],
+            atomic_aggregate: true,
+            aggregator: Some(Aggregator {
+                asn: 65001,
+                address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            }),
+        }
+    }
+
+    #[test]
+    fn print_route_table_empty() {
+        print_route_table(&[]);
+    }
+
+    #[test]
+    fn print_route_table_minimal() {
+        print_route_table(&[make_route_minimal()]);
+    }
+
+    #[test]
+    fn print_route_table_full_attrs() {
+        print_route_table(&[make_route_full()]);
+    }
+
+    #[test]
+    fn print_route_detail_minimal() {
+        // No next-hop, no path attrs, no optional fields.
+        print_route_detail(&make_route_minimal());
+    }
+
+    #[test]
+    fn print_route_detail_full() {
+        // Exercises communities, large_communities, atomic_aggregate, aggregator.
+        print_route_detail(&make_route_full());
+    }
+
+    #[test]
+    fn print_route_detail_incomplete_origin() {
+        let mut r = make_route_minimal();
+        r.origin = Origin::Incomplete;
+        print_route_detail(&r);
     }
 }

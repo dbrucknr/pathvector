@@ -15,10 +15,13 @@
 //! }
 //! ```
 
+mod client_trait;
 mod convert;
 pub mod error;
 mod proto;
 pub mod types;
+
+pub use client_trait::DaemonClient;
 
 use std::net::IpAddr;
 
