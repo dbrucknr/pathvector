@@ -91,9 +91,9 @@ The core protocol. Every crate is shaped by it.
 | Receive NOTIFICATION in OpenConfirm → terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_open_confirm_terminates` |
 | Receive NOTIFICATION in Established → session terminated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_notification_in_established_emits_session_terminated` |
 | Connect-retry timer (default 120 s) — fires → re-initiate TCP | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_connect_retry_timer_from_connect_reinitiates_tcp`, `test_connect_retry_from_active_enters_connect`, `interop: test_connect_retry_timer_fires_initiates_reconnect` |
-| Hold timer negotiated as min(local, peer) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_negotiated_to_minimum` |
+| Hold timer negotiated as min(local, peer) | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_negotiated_to_minimum`, `e2e: peer_state_fields_correct_after_established` |
 | Hold time 0 disables the hold and keepalive timers | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |
-| Keepalive interval is 1/3 of negotiated hold time | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time`, `interop: test_keepalive_timer_fires_sends_keepalive_to_peer` |
+| Keepalive interval is 1/3 of negotiated hold time | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time`, `interop: test_keepalive_timer_fires_sends_keepalive_to_peer`, `e2e: session_reaches_established` |
 | HoldTimerExpired in Established → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_established` |
 | HoldTimerExpired in OpenSent → NOTIFICATION + teardown | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_open_sent` |
 | Receive UPDATE in Established resets hold timer | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_update_emits_route_update_and_resets_hold` |
@@ -102,7 +102,7 @@ The core protocol. Every crate is shaped by it.
 | Open hold timer (240 s) while awaiting peer OPEN in OpenSent | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_open_sent` |
 | Peer AS validation skipped when peer_as is unconfigured | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_open_accepted_when_peer_as_unconfigured` |
 | Connection collision detection (higher BGP ID keeps outbound connection) | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
-| Full session lifecycle over real TCP sockets | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_session_reaches_established` |
+| Full session lifecycle over real TCP sockets | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_session_reaches_established`, `e2e: session_reaches_established` |
 | Hold timer fires over real TCP → session terminated | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_hold_timer_fires_terminates_session` |
 | Peer disconnect detected and emits SessionTerminated | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_peer_disconnect_emits_terminated` |
 | Wrong peer AS over real TCP does not reach Established | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_open_with_wrong_peer_as_does_not_establish` |
@@ -131,13 +131,13 @@ The core protocol. Every crate is shaped by it.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| Adj-RIB-In: per-peer store of received routes before policy | `pathvector-rib/src/adj_rib_in.rs` | ✅ | `test_adj_rib_in_insert_and_get`, `test_adj_rib_in_withdraw`, `test_adj_rib_in_multiple_prefixes` |
+| Adj-RIB-In: per-peer store of received routes before policy | `pathvector-rib/src/adj_rib_in.rs` | ✅ | `test_adj_rib_in_insert_and_get`, `test_adj_rib_in_withdraw`, `test_adj_rib_in_multiple_prefixes`, `e2e: list_candidates_returns_peer_route` |
 | Adj-RIB-In: insert returns previous route for the same prefix | `pathvector-rib/src/adj_rib_in.rs` | ✅ | `test_adj_rib_in_insert_returns_old` |
 | Adj-RIB-In: withdraw on absent prefix is a no-op | `pathvector-rib/src/adj_rib_in.rs` | ✅ | `test_adj_rib_in_withdraw_absent` |
-| Loc-RIB: post-policy best routes selected for use | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_insert_single`, `test_loc_rib_best_path_selects_higher_local_pref`, `test_loc_rib_best_updated_on_insert` |
+| Loc-RIB: post-policy best routes selected for use | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_insert_single`, `test_loc_rib_best_path_selects_higher_local_pref`, `test_loc_rib_best_updated_on_insert`, `e2e: announced_route_appears_in_rib`, `e2e: multiple_routes_all_installed` |
 | Loc-RIB: longest-prefix match for forwarding lookups | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_longest_match` |
-| Loc-RIB: withdraw last candidate removes the prefix entirely | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_last_candidate_removes_prefix` |
-| Loc-RIB: withdraw one peer promotes the remaining candidate | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_peer_promotes_remaining_candidate` |
+| Loc-RIB: withdraw last candidate removes the prefix entirely | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_last_candidate_removes_prefix`, `e2e: withdrawn_route_removed_from_rib` |
+| Loc-RIB: withdraw one peer promotes the remaining candidate | `pathvector-rib/src/loc_rib.rs` | ✅ | `test_loc_rib_withdraw_peer_promotes_remaining_candidate`, `e2e: partial_withdrawal_leaves_others_intact` |
 | Adj-RIB-Out: per-peer store of routes to be advertised | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_get`, `test_adj_rib_out_withdraw` |
 | iBGP split horizon: routes from iBGP not re-advertised to iBGP peers | `pathvector-rib/src/adj_rib_out.rs` | ✅ | `test_ibgp_route_not_advertised_to_ibgp_peer`, `test_ibgp_split_horizon_evicts_previously_stored_route`, `test_ebgp_route_advertised_to_ibgp_peer`, `test_ibgp_route_advertised_to_ebgp_peer` |
 
@@ -252,7 +252,7 @@ retry without them.
 | AS4_PATH (type 17): 4-byte AS path during 2-byte/4-byte transition | `pathvector-session/src/message/update.rs` | ✅ | `test_as4_path_roundtrip` |
 | AS4_AGGREGATOR (type 18): 4-byte aggregator during transition | `pathvector-session/src/message/update.rs` | ✅ | `test_as4_aggregator_roundtrip`, `test_as4_aggregator_too_short_is_error` |
 | When both peers support 4-byte ASN, FourByteAsn capability preferred over my_as field | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_four_byte_asn_preferred_over_my_as` |
-| Full 4-byte ASN session confirmed against GoBGP | — | ✅ | `interop: GoBGP validation 2026-05-31` |
+| Full 4-byte ASN session confirmed against GoBGP | — | ✅ | `interop: GoBGP validation 2026-05-31`, `e2e: session_reaches_established`, `e2e: peer_state_fields_correct_after_established` |
 
 ---
 
@@ -506,7 +506,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process implemented |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process implemented; session lifecycle and route announce/withdraw validated e2e against GoBGP |
 | RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ Wire format + IPv4 daemon processing; IPv6 daemon support deferred (see TODO) |

@@ -71,11 +71,33 @@ just fuzz-message   # extended run until Ctrl-C
 
 See TESTING.md for the full explanation of the nightly/Homebrew PATH issue and crash reproduction.
 
-Tests e2e
-  - We will use the RFC's to generate test cases for each module.
-  - I think the RFC's should provide .conf files (or otherwise) to define test scenarios. They will try to cover the requirements
-    specified in the RFC's.
-- We should also try and simulate adversarial inputs to the daemon to ensure it can handle unexpected situations.
+**Phase 5 — `pathvector-e2e` Docker-based end-to-end suite** ✓ Done (2026-06-09)
+Both gobgpd and pathvectord run as Linux containers on an isolated Docker bridge network
+per test. BGP (port 179) is container-to-container — the macOS Docker Desktop TCP proxy
+never touches it. Only pathvectord's gRPC port is mapped to the host for `PathvectorClient`.
+
+Infrastructure committed on branch `e2e` (commit `19a8605`):
+- `e2e/Dockerfile` — GoBGP 4.6.0 Alpine image (Linux arm64/amd64, no macOS prebuilt needed)
+- `e2e/Dockerfile.pathvectord` — multi-stage Rust build; debian:bookworm-slim runtime
+- `e2e/docker-compose.yml` — manual dev environment with fixed `172.20.0.0/24` subnet
+- `e2e/src/lib.rs` — `Harness` using testcontainers-rs 0.23; per-test `docker network create/rm`;
+  `docker inspect` for container IP; `docker exec` for gobgp CLI
+
+10 tests passing (6 route + 4 session):
+- `routes.rs`: `announced_route_appears_in_rib`, `list_candidates_returns_peer_route`,
+  `multiple_routes_all_installed`, `partial_withdrawal_leaves_others_intact`,
+  `unknown_prefix_returns_none`, `withdrawn_route_removed_from_rib`
+- `session.rs`: `list_peers_includes_gobgp_peer`, `peer_state_fields_correct_after_established`,
+  `session_reaches_established`, `wait_for_established_respects_deadline`
+
+Remaining e2e work:
+- Outbound advertisement tests — verify pathvectord sends UPDATEs that GoBGP installs
+  (currently only inbound: GoBGP → pathvectord direction is tested)
+- Import-policy reject tests — announce a prefix with no import policy configured, verify it
+  does NOT appear in the RIB (RFC 8212 default-reject for eBGP)
+- Adversarial inputs — malformed BGP messages injected directly over TCP to verify the
+  daemon handles them gracefully without panicking
+- GitHub Actions e2e workflow — separate CI job that builds both images and runs the suite
 
 ## pathvector-rib
 
@@ -226,7 +248,10 @@ Not yet started. Key work items:
 - BLACKHOLE community discard action (RFC 7999) — `Community::BLACKHOLE` (0xFFFF029A) is defined and detectable via `is_blackhole()`, but there is no null-route or discard action wired in the RIB or daemon; routes tagged with BLACKHOLE should have traffic to their prefix dropped at the forwarding plane
 - `AdjRibIn` — **Done.** Per-peer `AdjRibIn` tables are built at startup and wired through `handle_update`. Raw (pre-policy) routes are stored on every announcement; withdrawals remove from both `AdjRibIn` and `LocRib`; session teardown calls `AdjRibIn::clear()`. `reapply_import_policy` re-evaluates all stored raw routes against a new policy, inserting accepted routes and withdrawing rejected ones from `LocRib` without a session reset.
 - CLI binary (`pathvector`) using the gRPC client
-- Docker image: `FROM debian:slim`, single binary, config file mount, gRPC port exposed
+- **Docker image** — **Done (2026-06-09).** `e2e/Dockerfile.pathvectord` is a multi-stage build:
+  `rust:1.88-slim-bookworm` builder (with `protobuf-compiler`), `debian:bookworm-slim` runtime
+  (with `netcat-openbsd` for HEALTHCHECK). Config file is bind-mounted at container start.
+  gRPC port 51200 is exposed and mapped dynamically by testcontainers. Built via `just e2e-images`.
 
 ---
 
