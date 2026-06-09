@@ -108,7 +108,13 @@ Remaining e2e work:
   does NOT appear in the RIB (RFC 8212 default-reject for eBGP)
 - Adversarial inputs — malformed BGP messages injected directly over TCP to verify the
   daemon handles them gracefully without panicking
-- GitHub Actions e2e workflow — separate CI job that builds both images and runs the suite
+- **GitHub Actions e2e workflow** — **Done (2026-06-09).** Separate `e2e` job in
+  `.github/workflows/ci.yml` on `ubuntu-latest` (Docker pre-installed). Uses
+  `docker/setup-buildx-action` + `docker/build-push-action` with `type=gha` layer
+  caching (separate scopes for `gobgpd` and `pathvectord` images). GoBGP image is a
+  cache hit on repeat runs. `test` and `msrv` jobs now pass `--exclude pathvector-e2e`
+  so the crate is not exercised without its required images. A `.githooks/pre-push` hook
+  (installed via `just install-hooks`) runs `just e2e` locally before each push.
 - **BIRD interoperability** — add a second peer implementation. BIRD is stricter about RFC
   compliance than GoBGP (it's the reference implementation for many IXP route servers) and
   will catch things GoBGP tolerates. A `e2e/Dockerfile.bird` wrapping the official BIRD
@@ -391,13 +397,14 @@ These are structural decisions in the current implementation worth measuring bef
 deciding whether to address them. All are acceptable at small peer counts and RIB
 sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 prefixes).
 
-1. **`try_send` failure on the outbound UPDATE channel** — `propagate_prefix` calls
-   `update_tx.try_send(msg)` and discards the error silently if the channel is full.
-   A discarded UPDATE means a peer's view of the RIB permanently diverges from reality;
-   BGP has no self-healing mechanism for this. Correct behaviour on a full channel is one
-   of: block with back-pressure, close the session, or trigger a ROUTE-REFRESH.
-   **Audit priority: highest** — this is the only item that is potentially a correctness
-   bug rather than a pure performance concern.
+1. ~~**`try_send` failure on the outbound UPDATE channel**~~ — **Fixed (2026-06-09).**
+   `propagate_prefix` now returns `bool`; a `false` return means the channel was full.
+   The three `DaemonState` event methods collect stalled peers into `self.stalled_peers`.
+   After each event, `run()` sends `SessionCommand::Stop` to each stalled session via a
+   retained `stop_senders` map (populated from a new `SessionHandle::stop_sender()`
+   method). The session re-establishes and `on_established` performs a fresh full-table
+   dump from a clean `AdjRibOut`, restoring a consistent peer view. Overflow is logged
+   at `ERROR`. Tests updated from "does not panic" to "returns false" assertions.
 
 2. **Single event loop for all peers** — all peer sessions funnel into one `mpsc` channel;
    `DaemonState` processes events sequentially under a write lock. A large UPDATE from one

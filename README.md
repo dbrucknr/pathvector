@@ -83,7 +83,13 @@ See [DAEMON.md](DAEMON.md) for build instructions, configuration reference, and 
 
 pathvector takes correctness seriously. The test suite combines five layers: unit tests, compiled documentation examples, property-based tests (proptest), fuzz targets on the codec decode path, and Docker-based end-to-end tests against a real GoBGP peer. See [TESTING.md](TESTING.md) for the full description of each layer and how to run them.
 
-To run the standard suite locally: `just ci`. To run the end-to-end suite (requires Docker): `just e2e`.
+```sh
+just ci          # unit + property + doc tests, clippy, fmt, MSRV — no Docker required
+just e2e         # Docker-based end-to-end suite against a real GoBGP peer
+just install-hooks  # install the pre-push hook (run once after cloning)
+```
+
+The pre-push hook runs `just e2e` automatically before each push. Skip it for a specific push with `git push --no-verify`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime data flow and crate design.
 
