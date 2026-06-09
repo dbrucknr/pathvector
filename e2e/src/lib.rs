@@ -481,7 +481,7 @@ impl Harness {
         Self::new_inner(write_daemon_config).await
     }
 
-    /// Same as [`new`] but with **no** import or export policy on the peer.
+    /// Same as [`Self::new`] but with **no** import or export policy on the peer.
     ///
     /// For an eBGP peer this activates RFC 8212 defaults: both import and
     /// export default to `Reject`.  Use this harness to assert that routes
@@ -740,7 +740,7 @@ impl TwoPeerHarness {
         Self::new_inner(write_daemon_config).await
     }
 
-    /// Same as [`new`] but with `import_default = "accept"` and **no**
+    /// Same as [`Self::new`] but with `import_default = "accept"` and **no**
     /// `export_default` on either peer.
     ///
     /// Routes from GoBGP-source are accepted into pathvectord's Loc-RIB, but
