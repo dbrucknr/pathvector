@@ -134,8 +134,8 @@ mod prop_tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use proptest::prelude::*;
     use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
+    use proptest::prelude::*;
 
     use super::select_best;
     use crate::{PeerId, RouteBuilder};
