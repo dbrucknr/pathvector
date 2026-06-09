@@ -885,3 +885,56 @@ impl TwoPeerHarness {
         );
     }
 }
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+//
+// These tests cover the pure path-calculation helpers that do not require
+// Docker.  They are intentionally lightweight — just enough to execute the
+// code paths that the e2e Docker harness is the only other caller of.
+//
+// Note: `std::env::set_var` / `remove_var` require `unsafe` on Rust 1.86+,
+// and this crate forbids unsafe code.  The `CARGO_TARGET_DIR` override branch
+// is therefore only exercised by the Docker harness itself, not here.
+
+#[cfg(test)]
+mod tests {
+    use super::{daemon_binary, target_dir, workspace_root};
+
+    /// `workspace_root()` resolves `env!("CARGO_MANIFEST_DIR").parent()`, which
+    /// must be the directory that owns the workspace `Cargo.toml`.
+    #[test]
+    fn workspace_root_contains_cargo_toml() {
+        let root = workspace_root();
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "workspace root must contain Cargo.toml — got {root:?}"
+        );
+    }
+
+    /// `target_dir()` returns a `PathBuf` whose last component is `target`
+    /// when `CARGO_TARGET_DIR` is not set (the standard `cargo test` env).
+    #[test]
+    fn target_dir_has_target_component() {
+        // In a normal `cargo test` run CARGO_TARGET_DIR is unset, so the
+        // map_or_else Err-branch fires — covering the default path.
+        // If CARGO_TARGET_DIR happens to be set, the Ok-branch fires instead;
+        // either way the function executes and its lines are covered.
+        let dir = target_dir();
+        let has_target = dir.components().any(|c| c.as_os_str() == "target");
+        let has_override = std::env::var("CARGO_TARGET_DIR").is_ok();
+        assert!(
+            has_target || has_override,
+            "target_dir must contain a 'target' component unless overridden — got {dir:?}"
+        );
+    }
+
+    /// `daemon_binary()` always appends `debug/pathvectord` to `target_dir()`.
+    #[test]
+    fn daemon_binary_ends_with_debug_pathvectord() {
+        let bin = daemon_binary();
+        assert!(
+            bin.ends_with("debug/pathvectord"),
+            "daemon_binary must end with debug/pathvectord — got {bin:?}"
+        );
+    }
+}

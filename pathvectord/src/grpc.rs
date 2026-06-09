@@ -479,8 +479,9 @@ mod tests {
     use tonic::Request;
 
     use super::{
-        PeerServiceImpl, RibServiceImpl, build_peer_state, parse_nlri, proto, proto_as_segment,
-        proto_origin, route_to_proto,
+        PeerServiceImpl, PolicyServiceImpl, RibServiceImpl, build_peer_state, parse_nlri,
+        parse_peer_address, parse_policy_action, proto, proto_as_segment, proto_origin,
+        route_to_proto,
     };
     use crate::{
         DaemonState,
@@ -488,7 +489,9 @@ mod tests {
     };
     use proto::{
         GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListPeersRequest,
-        ListRoutesRequest, peer_service_server::PeerService, rib_service_server::RibService,
+        ListRoutesRequest, SetExportDefaultRequest, SetImportDefaultRequest,
+        peer_service_server::PeerService, policy_service_server::PolicyService,
+        rib_service_server::RibService,
     };
 
     fn make_state(local_as: u32, peers: &[(Ipv4Addr, u32)]) -> DaemonState {
@@ -1026,6 +1029,253 @@ mod tests {
         let err = svc
             .list_candidates(Request::new(ListCandidatesRequest {
                 prefix: "bad".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── route_to_proto — aggregator ──────────────────────────────────────────
+
+    #[test]
+    fn test_route_to_proto_aggregator() {
+        use pathvector_types::{Aggregator, Asn, PeerType};
+
+        let n = nlri("10.0.0.0/8");
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .aggregator(Aggregator {
+                asn: Asn::new(65000),
+                ip: "192.0.2.1".parse().unwrap(),
+            })
+            .peer_type(PeerType::External)
+            .build();
+
+        let r = route_to_proto(peer("10.0.0.2"), n, &route);
+        let agg = r.aggregator.expect("aggregator must be present");
+        assert_eq!(agg.asn, 65000);
+        assert_eq!(agg.address, "192.0.2.1");
+    }
+
+    // ── route_to_proto — V6 next-hop branches ────────────────────────────────
+
+    #[test]
+    fn test_route_to_proto_v6_nexthop() {
+        use pathvector_types::{NextHop, PeerType};
+        use std::net::Ipv6Addr;
+
+        let n = nlri("10.0.0.0/8");
+        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6(v6))
+            .peer_type(PeerType::External)
+            .build();
+
+        let r = route_to_proto(peer("10.0.0.2"), n, &route);
+        assert_eq!(r.next_hop, "2001:db8::1");
+    }
+
+    #[test]
+    fn test_route_to_proto_v6_with_link_local_nexthop() {
+        use pathvector_types::{NextHop, PeerType};
+        use std::net::Ipv6Addr;
+
+        let n = nlri("10.0.0.0/8");
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6WithLinkLocal { global, link_local })
+            .peer_type(PeerType::External)
+            .build();
+
+        // V6WithLinkLocal renders as the global address.
+        let r = route_to_proto(peer("10.0.0.2"), n, &route);
+        assert_eq!(r.next_hop, "2001:db8::1");
+    }
+
+    // ── parse_peer_address ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_peer_address_valid() {
+        let ip = parse_peer_address("10.0.0.1").unwrap();
+        assert_eq!(ip, "10.0.0.1".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_parse_peer_address_invalid_returns_invalid_argument() {
+        let err = parse_peer_address("not-an-ip").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("not-an-ip"));
+    }
+
+    // ── parse_policy_action ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_policy_action_accept() {
+        use pathvector_policy::DefaultAction;
+        let action = parse_policy_action(proto::PolicyAction::Accept as i32).unwrap();
+        assert!(matches!(action, DefaultAction::Accept));
+    }
+
+    #[test]
+    fn test_parse_policy_action_reject() {
+        use pathvector_policy::DefaultAction;
+        let action = parse_policy_action(proto::PolicyAction::Reject as i32).unwrap();
+        assert!(matches!(action, DefaultAction::Reject));
+    }
+
+    #[test]
+    fn test_parse_policy_action_unspecified_returns_invalid_argument() {
+        // PolicyAction::Unspecified (value 0) must be rejected.
+        let err = parse_policy_action(proto::PolicyAction::Unspecified as i32).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── PolicyService::set_import_default ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_set_import_default_accept_success() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PolicyServiceImpl { state };
+
+        svc.set_import_default(Request::new(SetImportDefaultRequest {
+            peer_address: "10.0.0.2".into(),
+            action: proto::PolicyAction::Accept as i32,
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_import_default_reject_success() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PolicyServiceImpl { state };
+
+        svc.set_import_default(Request::new(SetImportDefaultRequest {
+            peer_address: "10.0.0.2".into(),
+            action: proto::PolicyAction::Reject as i32,
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_import_default_invalid_address_returns_invalid_argument() {
+        let state = arc_state(65001, &[]);
+        let svc = PolicyServiceImpl { state };
+
+        let err = svc
+            .set_import_default(Request::new(SetImportDefaultRequest {
+                peer_address: "not-an-ip".into(),
+                action: proto::PolicyAction::Accept as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_set_import_default_unknown_peer_returns_not_found() {
+        let state = arc_state(65001, &[]);
+        let svc = PolicyServiceImpl { state };
+
+        let err = svc
+            .set_import_default(Request::new(SetImportDefaultRequest {
+                peer_address: "10.0.0.99".into(),
+                action: proto::PolicyAction::Accept as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_set_import_default_invalid_action_returns_invalid_argument() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PolicyServiceImpl { state };
+
+        let err = svc
+            .set_import_default(Request::new(SetImportDefaultRequest {
+                peer_address: "10.0.0.2".into(),
+                action: proto::PolicyAction::Unspecified as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── PolicyService::set_export_default ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_set_export_default_accept_success() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PolicyServiceImpl { state };
+
+        svc.set_export_default(Request::new(SetExportDefaultRequest {
+            peer_address: "10.0.0.2".into(),
+            action: proto::PolicyAction::Accept as i32,
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_export_default_reject_success() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PolicyServiceImpl { state };
+
+        svc.set_export_default(Request::new(SetExportDefaultRequest {
+            peer_address: "10.0.0.2".into(),
+            action: proto::PolicyAction::Reject as i32,
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_export_default_invalid_address_returns_invalid_argument() {
+        let state = arc_state(65001, &[]);
+        let svc = PolicyServiceImpl { state };
+
+        let err = svc
+            .set_export_default(Request::new(SetExportDefaultRequest {
+                peer_address: "bad-addr".into(),
+                action: proto::PolicyAction::Accept as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_set_export_default_unknown_peer_returns_not_found() {
+        let state = arc_state(65001, &[]);
+        let svc = PolicyServiceImpl { state };
+
+        let err = svc
+            .set_export_default(Request::new(SetExportDefaultRequest {
+                peer_address: "10.0.0.99".into(),
+                action: proto::PolicyAction::Reject as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_set_export_default_invalid_action_returns_invalid_argument() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PolicyServiceImpl { state };
+
+        let err = svc
+            .set_export_default(Request::new(SetExportDefaultRequest {
+                peer_address: "10.0.0.2".into(),
+                action: proto::PolicyAction::Unspecified as i32,
             }))
             .await
             .unwrap_err();

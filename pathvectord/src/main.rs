@@ -3196,6 +3196,374 @@ mod tests {
     }
 }
 
+// ── DaemonState stalled-channel paths ────────────────────────────────────────
+//
+// The following tests cover the `stalled_peers` tracking paths that fire when
+// an outbound UPDATE channel is full.  They require a bounded channel with
+// capacity 1 that is pre-filled before the method under test runs.
+
+#[cfg(test)]
+mod stall_tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pathvector_policy::DefaultAction;
+    use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
+
+    use super::*;
+    use crate::config;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn base_route(prefix: &str, nh: Ipv4Addr, pt: PeerType) -> pathvector_rib::Route<Ipv4Addr> {
+        RouteBuilder::new(
+            nlri(prefix),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65002)]),
+        )
+        .next_hop(NextHop::V4(nh))
+        .peer_type(pt)
+        .build()
+    }
+
+    /// Build a `DaemonState` where every peer's outbound channel has `capacity`.
+    /// Returns the state and a map of receivers so the caller can drain channels.
+    fn make_capped(
+        peers: &[(Ipv4Addr, u32)],
+        capacity: usize,
+    ) -> (
+        DaemonState,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+    ) {
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+        for &(ip, _) in peers {
+            let (tx, rx) = mpsc::channel(capacity);
+            senders.insert(ip, tx);
+            receivers.insert(ip, rx);
+        }
+        let peer_configs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(address, remote_as)| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            })
+            .collect();
+        let state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders);
+        (state, receivers)
+    }
+
+    /// Fill a channel with a dummy UPDATE so the next `try_send` fails.
+    fn fill_channel(state: &DaemonState, peer: Ipv4Addr) {
+        let tx = state.update_senders.get(&peer).unwrap();
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![nlri("0.0.0.0/0")],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .expect("channel must have room for the fill message");
+    }
+
+    // ── take_stalled_peers ────────────────────────────────────────────────────
+
+    #[test]
+    fn take_stalled_peers_returns_and_clears() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_capped(&[(peer_ip, 64)], 64);
+
+        assert!(state.take_stalled_peers().is_empty(), "initially empty");
+        state.stalled_peers.push(peer_ip);
+        let stalled = state.take_stalled_peers();
+        assert_eq!(stalled, vec![peer_ip]);
+        assert!(state.take_stalled_peers().is_empty(), "cleared after take");
+    }
+
+    // ── on_established stalled path ───────────────────────────────────────────
+
+    #[test]
+    fn on_established_marks_stalled_when_channel_full() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) = make_capped(&[(peer_ip, 1)], 1);
+
+        // Pre-populate the Loc-RIB from a third-party peer so that on_established
+        // has something to propagate.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.loc_rib.insert(
+            src,
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
+        );
+
+        // Saturate the channel; propagate_prefix's try_send will fail.
+        fill_channel(&state, peer_ip);
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        assert!(
+            !state.take_stalled_peers().is_empty(),
+            "peer must be stalled when outbound channel is full during table dump"
+        );
+    }
+
+    // ── on_terminated stalled path ────────────────────────────────────────────
+
+    #[test]
+    fn on_terminated_marks_stalled_when_channel_full() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, _rxs) = make_capped(&[(peer_a, 64), (peer_b, 1)], 1);
+        // Give peer_a a large-enough channel for announcement; peer_b gets cap 1.
+        // Rebuild with mixed capacities.
+        let (tx_a, _rx_a) = mpsc::channel::<UpdateMessage>(64);
+        let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
+        let peer_configs = vec![
+            config::PeerConfig {
+                address: peer_a,
+                port: 179,
+                remote_as: 65002,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            },
+            config::PeerConfig {
+                address: peer_b,
+                port: 179,
+                remote_as: 65003,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            },
+        ];
+        let mut senders = HashMap::new();
+        senders.insert(peer_a, tx_a);
+        senders.insert(peer_b, tx_b.clone());
+        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+
+        // Announce a route from peer_a → it ends up in Loc-RIB.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_a),
+                ],
+                announced: vec![nlri("192.168.0.0/16")],
+            },
+        );
+
+        // Drain the messages that on_route_update sent so channels are not pre-filled.
+        // (peer_b channel cap = 1; we need exactly that one slot to be free
+        //  so we can fill it ourselves.)
+        // peer_b received the propagation — drain it.
+        // peer_b's channel had capacity 1; one UPDATE was sent during on_route_update.
+        // We intentionally do NOT drain it — that fill is the one we rely on.
+
+        // Terminate peer_a: the withdraw for peer_b's channel will fail (full).
+        state.on_terminated(peer_a);
+        assert!(
+            !state.take_stalled_peers().is_empty(),
+            "peer_b must be stalled when its channel is full during termination propagation"
+        );
+    }
+
+    // ── set_import_default propagation loop ───────────────────────────────────
+
+    #[test]
+    fn set_import_default_propagates_to_established_peer() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_capped(&[(peer_a, 65002), (peer_b, 65003)], 64);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+
+        // Announce a route from peer_a via on_route_update so that it is
+        // properly recorded in Adj-RIB-In, Loc-RIB, AND peer_b's Adj-RIB-Out.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_a),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        // Drain the UPDATE that on_route_update propagated so receivers are clear.
+        receivers.get_mut(&peer_b).unwrap().try_recv().ok();
+        receivers.get_mut(&peer_a).unwrap().try_recv().ok();
+
+        // Flip the import policy to Reject — route evicted from Loc-RIB;
+        // peer_b must receive a WITHDRAW.
+        state.set_import_default(peer_a, DefaultAction::Reject);
+
+        receivers
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b must receive a WITHDRAW after set_import_default → Reject");
+    }
+
+    #[test]
+    fn set_import_default_marks_stalled_when_channel_full() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+
+        // peer_a gets a large channel; peer_b gets capacity 1.
+        let (tx_a, _rx_a) = mpsc::channel::<UpdateMessage>(64);
+        let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
+        let peer_configs = vec![
+            config::PeerConfig {
+                address: peer_a,
+                port: 179,
+                remote_as: 65002,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            },
+            config::PeerConfig {
+                address: peer_b,
+                port: 179,
+                remote_as: 65003,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+            },
+        ];
+        let mut senders = HashMap::new();
+        senders.insert(peer_a, tx_a);
+        senders.insert(peer_b, tx_b);
+        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_b, PeerType::External, 65003, 90);
+
+        // Announce via on_route_update so adj_rib_out[peer_b] has the route.
+        // The UPDATE fills peer_b's channel (capacity 1).
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_a),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        // peer_b's channel is now full (UPDATE from on_route_update).
+        // Do NOT drain it.
+
+        // set_import_default tries to send WITHDRAW to peer_b but channel is full.
+        state.set_import_default(peer_a, DefaultAction::Reject);
+        assert!(
+            !state.take_stalled_peers().is_empty(),
+            "peer_b must be stalled when channel is full during set_import_default propagation"
+        );
+    }
+
+    // ── set_export_default propagation loop ───────────────────────────────────
+
+    #[test]
+    fn set_export_default_propagates_to_established_peer() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) = make_capped(&[(peer_ip, 65002)], 64);
+
+        // Populate Loc-RIB BEFORE establishing so the table dump sends the
+        // route to peer_ip's Adj-RIB-Out.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.loc_rib.insert(
+            src,
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
+        );
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        // Drain the table-dump UPDATE so the receiver is clean.
+        receivers.get_mut(&peer_ip).unwrap().try_recv().ok();
+
+        // Reject all exports — peer_ip must receive a WITHDRAW.
+        state.set_export_default(peer_ip, DefaultAction::Reject);
+
+        receivers
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("peer must receive WITHDRAW after set_export_default → Reject");
+    }
+
+    #[test]
+    fn set_export_default_no_send_when_peer_not_established() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) = make_capped(&[(peer_ip, 65002)], 64);
+
+        // Peer is configured but never established — set_export_default must
+        // return early without sending anything to the channel.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.loc_rib.insert(
+            src,
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
+        );
+
+        state.set_export_default(peer_ip, DefaultAction::Reject);
+        assert!(
+            receivers.get_mut(&peer_ip).unwrap().try_recv().is_err(),
+            "no message must be sent when peer is not established"
+        );
+    }
+
+    #[test]
+    fn set_export_default_marks_stalled_when_channel_full() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) = make_capped(&[(peer_ip, 65002)], 1);
+
+        // Pre-populate Loc-RIB so the table dump fills the channel (cap 1).
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.loc_rib.insert(
+            src,
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
+        );
+
+        // on_established table-dumps the route → fills the cap-1 channel.
+        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        // Do NOT drain the channel — it is now full.
+
+        // Reject forces a WITHDRAW for the route already in adj_rib_out.
+        // try_send(withdraw) finds the channel full → propagate_prefix returns
+        // false → peer is pushed into stalled_peers.
+        state.set_export_default(peer_ip, DefaultAction::Reject);
+        assert!(
+            !state.take_stalled_peers().is_empty(),
+            "peer must be stalled when channel is full during set_export_default propagation"
+        );
+    }
+}
+
 // ── Property tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
