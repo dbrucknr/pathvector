@@ -22,5 +22,8 @@ crossterm         = "0.28"
 tokio             = { workspace = true }
 tonic             = { workspace = true }
 
+[dev-dependencies]
+insta = "1"
+
 [lints]
 workspace = true

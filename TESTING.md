@@ -1,12 +1,15 @@
 # Testing in pathvector
 
 This document describes the testing philosophy, patterns, and tooling used across the
-pathvector workspace. It covers all five test layers — unit, doc, property-based, fuzz,
-and end-to-end — and is intended as a reference for contributors.
+pathvector workspace. It covers all seven test layers — unit, doc, property-based, fuzz,
+snapshot, end-to-end, and dependency-inversion — and is intended as a reference for
+contributors.
 
 ---
 
 ## Philosophy
+
+We strive for transparency and aim for perfection in terms of system reliability.
 
 BGP is a protocol where bugs have real consequences. A routing loop, a missed community
 strip, or an incorrect best-path decision can cause traffic to be misdirected or dropped
@@ -15,7 +18,8 @@ at internet scale. Testing in pathvector reflects that seriousness:
 - **Tests are not an afterthought.** Every public function has at least one unit test.
   Every module maintains close to 100% line coverage.
 - **Coverage is measured, not assumed.** We use `llvm-cov` to identify uncovered lines
-  after every implementation session and close gaps before moving on.
+  after every implementation session and close gaps before moving on. The workspace
+  currently targets ≥ 80% line coverage across all crates.
 - **Example code is compiled.** All `# Examples` blocks in documentation are compiled
   and executed as part of `cargo test`. A documentation example that drifts from the
   actual API is caught immediately.
@@ -25,9 +29,16 @@ at internet scale. Testing in pathvector reflects that seriousness:
 - **The trust boundary is fuzz-tested.** Arbitrary byte input from a remote peer is
   fed through the codec decode path to ensure no panics or memory errors are possible
   regardless of what an adversarial peer sends.
+- **UIs are snapshot-tested.** The TUI dashboard render functions are verified against
+  stored golden snapshots. Any change to screen layout or text is caught immediately,
+  and intentional changes are reviewed and accepted before they become the new baseline.
 - **Protocol behaviour is validated against real peers.** The Docker-based e2e suite
   runs `pathvectord` and GoBGP as containers on an isolated bridge network and asserts
   on the full session and route lifecycle.
+- **I/O is inverted out of business logic.** The `DaemonClient` trait separates gRPC
+  I/O from command dispatch. Every CLI subcommand is unit-tested using `MockDaemonClient`
+  without any network connection, giving fast, deterministic, hermetic tests for the
+  entire command surface.
 
 ---
 
@@ -39,7 +50,9 @@ at internet scale. Testing in pathvector reflects that seriousness:
 | Doc tests | All `# Examples` blocks compiled and executed | `cargo test` |
 | Property tests | Invariants over thousands of random inputs | `cargo test prop_` |
 | Fuzz targets | Arbitrary bytes into the codec — no panics ever | `just fuzz-smoke` |
+| Snapshot tests | TUI render output locked to golden `.snap` files | `cargo test` |
 | End-to-end tests | Full session + route lifecycle against real GoBGP | `just e2e` |
+| Dependency inversion | CLI commands tested via `MockDaemonClient`, no network | `cargo test` |
 
 ---
 
@@ -220,6 +233,146 @@ LSP support. Other editors: add `"rust-analyzer.linkedProjects": ["fuzz/Cargo.to
 
 ---
 
+## Snapshot tests
+
+The TUI dashboard (`pathvector/src/dashboard.rs`) renders peers and routes into a
+ratatui widget tree. Snapshot testing locks the exact text output of each render
+function to a golden file. If a commit accidentally changes column widths, truncates
+values, or drops a row, the test fails immediately — before the change ships.
+
+### How it works
+
+[`insta`](https://crates.io/crates/insta) stores golden files in
+`pathvector/src/snapshots/`. Each test renders a private widget function into a
+`ratatui::backend::TestBackend` (an in-memory, headless terminal buffer), converts
+the buffer to a string via `TestBackend`'s `Display` impl, and asserts it matches
+the stored snapshot:
+
+```rust
+let output = render_to_string(80, 6, |f| {
+    let area = f.area();
+    render_peers(f, &state, area);
+});
+insta::assert_snapshot!(output);
+```
+
+The snapshot files are plain text and look exactly like the terminal output:
+
+```
+"┌ Peers ───────────────────────────────────────────────────────────────────────┐"
+"│ADDRESS          REMOTE-AS  TYPE  STATE        UPTIME    RCV   ACC   ADV      │"
+"│10.0.0.1         65001      eBGP  Established  01:01:01  5     4     3        │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+```
+
+### The elapsed-time problem
+
+The status bar renders `last_refresh.elapsed()` — a value that changes every
+second. To make snapshots deterministic, the elapsed calculation is extracted into
+a pure helper:
+
+```rust
+pub(crate) fn build_status_bar_line(
+    addr: &str,
+    elapsed_secs: u64,
+    error: Option<&str>,
+) -> Line<'static> { ... }
+```
+
+The live render path calls this with the real elapsed seconds; tests call it with
+a fixed value such as `0` or `65`. The status bar branches (normal vs. error) are
+covered by targeted `assert!` tests on the span content and style, not snapshots.
+
+### Reviewing snapshot changes
+
+When you intentionally change the dashboard layout:
+
+1. Run `cargo test -p pathvector` — failing tests produce `.snap.new` files alongside
+   the existing `.snap` files in `pathvector/src/snapshots/`.
+2. Inspect the diff to confirm the change is intentional.
+3. Accept: `cargo insta review` (interactive) or rename `.snap.new` → `.snap` manually.
+4. Commit both the code change and the updated `.snap` files together.
+
+Never accept a snapshot change you haven't read. The diff is the contract.
+
+### Snapshot coverage
+
+| Test | What it locks |
+|---|---|
+| `snapshot_render_peers_empty` | Peers pane with no peers (header + empty body) |
+| `snapshot_render_peers_established` | Peers pane with one eBGP established peer |
+| `snapshot_render_peers_idle` | Peers pane with one iBGP idle peer (yellow state colour) |
+| `snapshot_render_routes_empty` | Routes pane with no routes (header + empty body) |
+| `snapshot_render_routes_with_route` | Routes pane with one route (all columns populated) |
+
+---
+
+## Dependency inversion
+
+The `DaemonClient` trait in `pathvector-client` is the seam between I/O and logic.
+Any code that calls the daemon accepts `impl DaemonClient` instead of the concrete
+`PathvectorClient`, which lets tests inject a `MockDaemonClient` without any network
+or process dependency.
+
+### Pattern
+
+```rust
+// Production
+async fn run() -> Result<(), CliError> {
+    let args = Cli::parse();
+    run_with(args, |addr| PathvectorClient::connect(addr).map_err(CliError::from)).await
+}
+
+// Testable core
+async fn run_with<C: DaemonClient, F: FnOnce(&str) -> Result<C, CliError>>(
+    args: Cli,
+    connect: F,
+) -> Result<(), CliError> { ... }
+
+// Test
+async fn run_cmd(args: &[&str], mock: MockDaemonClient) -> Result<(), CliError> {
+    let cli = Cli::parse_from(args);
+    run_with(cli, |_addr| Ok(mock)).await
+}
+```
+
+### MockDaemonClient
+
+`MockDaemonClient` lives in `pathvector/src/client_trait.rs` under `#[cfg(test)]`.
+It stores canned responses for every `DaemonClient` method and records calls for
+later inspection:
+
+```rust
+let mut mock = MockDaemonClient::new();
+mock.peers = vec![...];                    // canned list_peers response
+mock.force_error = Some(ClientError::...); // force all methods to fail
+// after run:
+assert_eq!(mock.import_calls, [("10.0.0.1".to_owned(), true)]);
+```
+
+The `DashboardState::refresh` method follows the same pattern — it accepts
+`&mut impl DaemonClient`, so the same mock works for dashboard tests too.
+
+### CLI test coverage
+
+Every subcommand is covered by at least one happy-path and one error-path test,
+giving deterministic, sub-millisecond feedback for the full command surface without
+spinning up a daemon:
+
+| Area | Tests |
+|---|---|
+| `peer list` | empty, with peers, propagates error |
+| `peer get` | found, not found, invalid IP |
+| `route list` | empty, with routes, peer filter, invalid peer filter |
+| `route best` | found, not found |
+| `route candidates` | empty, with results |
+| `policy set-import` | accept, reject |
+| `policy set-export` | accept, reject |
+
+---
+
 ## End-to-end tests
 
 Unit tests and property tests verify *internal consistency* — roundtrips, invariants,
@@ -347,8 +500,22 @@ cargo llvm-cov --workspace
 cargo llvm-cov -p pathvector-policy --show-missing-lines
 ```
 
+**Current coverage (approximate, measured on M2 Max):**
+
+| Crate | Lines |
+|---|---|
+| `pathvector-types` | ≈ 95% |
+| `pathvector-session` | ≈ 90% |
+| `pathvector-policy` | ≈ 95% |
+| `pathvector-rib` | ≈ 90% |
+| `pathvector-client` | ≈ 75% |
+| `pathvector` (CLI) | ≈ 80% |
+
 **Deliberately uncovered:**
-- `pathvectord/src/main.rs` — the binary entry point; unit tests cannot call `main`.
+- `pathvectord/src/main.rs` — binary entry point; cannot call `main` in unit tests.
+- `pathvector/src/main.rs::main` — same reason; the `run_with` core is covered.
+- `dashboard::run_dashboard` — requires a real crossterm terminal; covered indirectly
+  by `DashboardState::refresh` and snapshot tests of the render functions.
 - Doc examples marked `ignore` — require a concrete route type not available in doc-test scope.
 
 ---
@@ -431,4 +598,9 @@ When adding a new type or function:
    proptest.
 5. If the function is on the external attack surface (decode path, gRPC handler), add a
    fuzz target or extend an existing one.
-6. Run coverage and close any remaining gaps before committing.
+6. If the function renders a TUI widget or formats visible output, add a snapshot test
+   using `ratatui::backend::TestBackend` and `insta::assert_snapshot!`. Commit the
+   generated `.snap` file alongside the code.
+7. If the function makes network or I/O calls, extract an `impl Trait` seam so tests
+   can inject a mock. Follow the `DaemonClient` / `MockDaemonClient` pattern.
+8. Run coverage and close any remaining gaps before committing.

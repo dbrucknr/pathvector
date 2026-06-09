@@ -281,28 +281,39 @@ fn render_status_bar(
     addr: &str,
     area: ratatui::layout::Rect,
 ) {
-    let elapsed = state.last_refresh.elapsed();
-    let elapsed_str = format_uptime(elapsed.as_secs());
-
-    let text = if let Some(err) = &state.last_error {
-        Line::from(vec![
-            Span::styled(" error: ", Style::default().fg(Color::Red)),
-            Span::raw(err.as_str()),
-            Span::raw(" | q: quit"),
-        ])
-    } else {
-        Line::from(vec![
-            Span::raw(format!(" Daemon: {addr} | Refreshed: {elapsed_str} ago | ")),
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(": quit"),
-        ])
-    };
-
+    let elapsed_secs = state.last_refresh.elapsed().as_secs();
+    let text = build_status_bar_line(addr, elapsed_secs, state.last_error.as_deref());
     let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(paragraph, area);
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
+
+/// Build the status-bar [`Line`] from pure inputs.
+///
+/// Extracted from `render_status_bar` so the render path can be tested without
+/// a live [`Instant`].  Pass `elapsed_secs = 0` in tests; the live path calls
+/// `state.last_refresh.elapsed().as_secs()`.
+pub(crate) fn build_status_bar_line(
+    addr: &str,
+    elapsed_secs: u64,
+    error: Option<&str>,
+) -> Line<'static> {
+    if let Some(err) = error {
+        Line::from(vec![
+            Span::styled(" error: ", Style::default().fg(Color::Red)),
+            Span::raw(err.to_owned()),
+            Span::raw(" | q: quit"),
+        ])
+    } else {
+        let elapsed_str = format_uptime(elapsed_secs);
+        Line::from(vec![
+            Span::raw(format!(" Daemon: {addr} | Refreshed: {elapsed_str} ago | ")),
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(": quit"),
+        ])
+    }
+}
 
 fn peer_type_str(p: &PeerState) -> &'static str {
     match p.peer_type {
@@ -475,5 +486,134 @@ mod tests {
         state.refresh(&mut empty).await;
         assert_eq!(state.peers.len(), 0);
         assert!(state.last_error.is_none());
+    }
+
+    // ── build_status_bar_line unit tests ──────────────────────────────────────
+
+    #[test]
+    fn status_bar_ok_zero_elapsed() {
+        let line = build_status_bar_line("http://localhost:50051", 0, None);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("Daemon: http://localhost:50051"),
+            "addr present: {text}"
+        );
+        // 0 secs → format_uptime returns em-dash
+        assert!(
+            text.contains('\u{2014}'),
+            "0 secs renders as em-dash: {text}"
+        );
+        assert!(text.contains('q'), "quit hint present: {text}");
+    }
+
+    #[test]
+    fn status_bar_ok_nonzero_elapsed() {
+        let line = build_status_bar_line("http://127.0.0.1:50051", 65, None);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("00:01:05"),
+            "65 s renders as 00:01:05: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_error_state() {
+        let line = build_status_bar_line("http://localhost:50051", 0, Some("connection refused"));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("error:"), "error label present: {text}");
+        assert!(
+            text.contains("connection refused"),
+            "error message present: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_error_style_first_span_is_red() {
+        let line = build_status_bar_line("http://localhost:50051", 0, Some("oops"));
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(Color::Red),
+            "first span must carry red style"
+        );
+    }
+
+    // ── Snapshot tests (ratatui TestBackend) ─────────────────────────────────
+    //
+    // Each test renders a private widget function into a fixed-size in-memory
+    // terminal buffer and snapshots the text output.  On first run the snapshot
+    // files are created in `src/snapshots/`; after that, any change to the
+    // rendered output fails the test until `cargo insta review` accepts it.
+
+    use ratatui::backend::TestBackend;
+
+    /// Render `draw` into a `width × height` test buffer and return the
+    /// rendered text as a string suitable for snapshot testing.
+    fn render_to_string(width: u16, height: u16, draw: impl FnOnce(&mut ratatui::Frame)) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal.backend().to_string()
+    }
+
+    // --- render_peers ---
+
+    #[test]
+    fn snapshot_render_peers_empty() {
+        let state = DashboardState::new();
+        let output = render_to_string(80, 6, |f| {
+            let area = f.area();
+            render_peers(f, &state, area);
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_render_peers_established() {
+        let mut state = DashboardState::new();
+        let mut peer = make_peer(SessionState::Established, Some(PeerType::External));
+        peer.uptime_seconds = 3661;
+        peer.prefixes_received = 5;
+        peer.prefixes_accepted = 4;
+        peer.prefixes_advertised = 3;
+        state.peers = vec![peer];
+        let output = render_to_string(80, 6, |f| {
+            let area = f.area();
+            render_peers(f, &state, area);
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_render_peers_idle() {
+        let mut state = DashboardState::new();
+        state.peers = vec![make_peer(SessionState::Idle, Some(PeerType::Internal))];
+        let output = render_to_string(80, 6, |f| {
+            let area = f.area();
+            render_peers(f, &state, area);
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    // --- render_routes ---
+
+    #[test]
+    fn snapshot_render_routes_empty() {
+        let state = DashboardState::new();
+        let output = render_to_string(90, 6, |f| {
+            let area = f.area();
+            render_routes(f, &state, area);
+        });
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_render_routes_with_route() {
+        let mut state = DashboardState::new();
+        state.routes = vec![make_route()];
+        let output = render_to_string(90, 6, |f| {
+            let area = f.area();
+            render_routes(f, &state, area);
+        });
+        insta::assert_snapshot!(output);
     }
 }
