@@ -27,7 +27,8 @@ use tonic::transport::Channel;
 use error::{ClientError, ConnectError};
 use proto::{
     GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListPeersRequest,
-    ListRoutesRequest, peer_service_client::PeerServiceClient,
+    ListRoutesRequest, PolicyAction, SetExportDefaultRequest, SetImportDefaultRequest,
+    peer_service_client::PeerServiceClient, policy_service_client::PolicyServiceClient,
     rib_service_client::RibServiceClient,
 };
 use types::{PeerState, Route};
@@ -41,6 +42,7 @@ use types::{PeerState, Route};
 pub struct PathvectorClient {
     peers: PeerServiceClient<Channel>,
     rib: RibServiceClient<Channel>,
+    policy: PolicyServiceClient<Channel>,
 }
 
 impl PathvectorClient {
@@ -62,7 +64,8 @@ impl PathvectorClient {
 
         Ok(Self {
             peers: PeerServiceClient::new(channel.clone()),
-            rib: RibServiceClient::new(channel),
+            rib: RibServiceClient::new(channel.clone()),
+            policy: PolicyServiceClient::new(channel),
         })
     }
 
@@ -167,6 +170,73 @@ impl PathvectorClient {
             .map(|r| Route::try_from(r).map_err(ClientError::from))
             .collect()
     }
+
+    // ── PolicyService ─────────────────────────────────────────────────────────
+
+    /// Replace the import-policy default for `peer_address` and immediately
+    /// re-evaluate the peer's Adj-RIB-In against the new policy.  Routes that
+    /// change accepted/rejected status are reflected in the Loc-RIB, and the
+    /// resulting best-path changes are propagated to all established peers.
+    ///
+    /// `accept` — `true` to set the default to **Accept**, `false` for **Reject**.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with status `INVALID_ARGUMENT` if
+    /// `peer_address` is not a valid IPv4 address, `NOT_FOUND` if it is not a
+    /// configured peer.
+    pub async fn set_import_default(
+        &mut self,
+        peer_address: impl Into<String>,
+        accept: bool,
+    ) -> Result<(), ClientError> {
+        let action = if accept {
+            PolicyAction::Accept as i32
+        } else {
+            PolicyAction::Reject as i32
+        };
+        self.policy
+            .set_import_default(SetImportDefaultRequest {
+                peer_address: peer_address.into(),
+                action,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Replace the export-policy default for `peer_address` and immediately
+    /// re-evaluate the Loc-RIB for that peer against the new policy.  The peer
+    /// receives UPDATEs for newly accepted prefixes and WITHDRAWs for newly
+    /// rejected ones.  Has no effect on the wire if the peer is not currently
+    /// established.
+    ///
+    /// `accept` — `true` to set the default to **Accept**, `false` for **Reject**.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with status `INVALID_ARGUMENT` if
+    /// `peer_address` is not a valid IPv4 address, `NOT_FOUND` if it is not a
+    /// configured peer.
+    pub async fn set_export_default(
+        &mut self,
+        peer_address: impl Into<String>,
+        accept: bool,
+    ) -> Result<(), ClientError> {
+        let action = if accept {
+            PolicyAction::Accept as i32
+        } else {
+            PolicyAction::Reject as i32
+        };
+        self.policy
+            .set_export_default(SetExportDefaultRequest {
+                peer_address: peer_address.into(),
+                action,
+            })
+            .await?;
+        Ok(())
+    }
+
+    // ── RibService (continued) ────────────────────────────────────────────────
 
     /// Return all candidate routes (from every peer) for a single prefix.
     ///

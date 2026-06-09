@@ -11,21 +11,22 @@ which crate it belongs to and why it was deferred.
 Items are grouped by what they unlock, not just by effort. A small correctness
 fix that unblocks a larger feature is worth doing before the feature itself.
 
-### Tier 1 — Small scope, high correctness or coverage value
+### Tier 1 — Small scope, high correctness or coverage value — **Done (2026-06-09)**
 
-**1. Advertise `MultiProtocol(IPv4_UNICAST)` capability** (`pathvectord`)
-One line in the session config construction. Brings the OPEN into RFC 4760
-compliance and causes GoBGP to send IPv4 routes via MP_REACH_NLRI — the first
-time the MP code path runs against a real peer. Also the mandatory first step
-before advertising IPv6 capability. Low risk, immediate coverage gain.
+**1. Advertise `MultiProtocol(IPv4_UNICAST)` capability** (`pathvectord`) — **Done (2026-06-09)**
+Added `Capability::MultiProtocol(AfiSafi::IPV4_UNICAST)` to the session
+config. Brings the OPEN into RFC 4760 compliance and causes GoBGP to send IPv4
+routes via MP_REACH_NLRI, exercising the MP code path against a real peer for
+the first time. Also the mandatory first step before advertising IPv6 capability.
 
-**2. Wire `reapply_import_policy` → export propagation** (`pathvectord`)
-Currently policy reloads update the Loc-RIB but do not trigger outbound
-UPDATEs to peers. This is a silent correctness hole: after a policy change,
-peers continue to receive routes based on the old policy until they reconnect.
-Fixing it unblocks the gRPC policy introspection RPC and completes the
-import-policy story that RFC 8212 e2e tests already exercise on the inbound
-side.
+**2. Wire `reapply_import_policy` → export propagation** (`pathvectord`) — **Done (2026-06-09)**
+Added `DaemonState::set_import_default` and `set_export_default` methods that
+update the relevant policy, call `reapply_import_policy`, and immediately
+propagate any Loc-RIB changes to all established peers via `propagate_prefix`.
+Exposed as `SetImportDefault` / `SetExportDefault` gRPC RPCs in the new
+`PolicyService`. Two soft-reconfig e2e tests confirm the full chain
+(`e2e/tests/policy.rs`: `soft_reconfig_import_accept_installs_route`,
+`soft_reconfig_export_accept_propagates_to_sink`).
 
 ### Tier 2 — Medium scope, architectural or user-facing value
 

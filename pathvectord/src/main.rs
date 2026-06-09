@@ -625,6 +625,143 @@ impl DaemonState {
             }
         }
     }
+
+    /// Replaces the import-policy default for `peer_ip` and re-evaluates the
+    /// peer's entire Adj-RIB-In against the new policy.  Routes that change
+    /// accepted/rejected status are written into Loc-RIB, and the resulting
+    /// best-path changes are propagated to all currently established peers.
+    ///
+    /// This is the "soft reconfiguration" path: no session reset, no full-table
+    /// dump — only the delta between the old and new policy is forwarded.
+    pub(crate) fn set_import_default(&mut self, peer_ip: Ipv4Addr, action: DefaultAction) {
+        if !self.import_policies.contains_key(&peer_ip) {
+            tracing::warn!(peer = %peer_ip, "set_import_default: unknown peer — ignoring");
+            return;
+        }
+        self.import_policies.insert(peer_ip, Policy::new(action));
+
+        // Collect affected NLRIs before the mutable borrow of loc_rib so the
+        // borrow checker does not see two simultaneous borrows of `self`.
+        let nlris: Vec<Nlri<Ipv4Addr>> = self
+            .adj_ribs_in
+            .get(&peer_ip)
+            .map(|a| a.routes().map(|(n, _)| *n).collect())
+            .unwrap_or_default();
+
+        // Re-evaluate the peer's Adj-RIB-In against the new policy.
+        // `adj_ribs_in`, `import_policies`, and `loc_rib` are separate struct
+        // fields; Rust allows simultaneous (im)mutable borrows of distinct fields.
+        reapply_import_policy(
+            PeerId::from(peer_ip),
+            &self.adj_ribs_in[&peer_ip],
+            &mut self.loc_rib,
+            &self.import_policies[&peer_ip],
+        );
+
+        // Propagate updated Loc-RIB state for every affected NLRI to all
+        // established peers.
+        let established: Vec<Ipv4Addr> = self.peer_types.keys().copied().collect();
+        for other_ip in established {
+            let other_type = self
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else {
+                tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation in set_import_default");
+                continue;
+            };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
+                tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation in set_import_default");
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation in set_import_default");
+                continue;
+            };
+
+            let mut stalled = false;
+            for &nlri in &nlris {
+                if !propagate_prefix(
+                    nlri,
+                    &self.loc_rib,
+                    adj_rib_out,
+                    export_policy,
+                    other_type,
+                    self.local_as,
+                    self.local_bgp_id,
+                    update_tx,
+                ) {
+                    stalled = true;
+                    break;
+                }
+            }
+            if stalled {
+                self.stalled_peers.push(other_ip);
+            }
+        }
+    }
+
+    /// Replaces the export-policy default for `peer_ip` and re-evaluates the
+    /// entire Loc-RIB against the new policy for that peer.  Newly accepted
+    /// prefixes are sent as UPDATEs; newly rejected ones trigger WITHDRAWs.
+    ///
+    /// Has no effect on the wire if the peer is not currently established — the
+    /// new policy will be applied on the next session's opening table dump.
+    pub(crate) fn set_export_default(&mut self, peer_ip: Ipv4Addr, action: DefaultAction) {
+        if !self.export_policies.contains_key(&peer_ip) {
+            tracing::warn!(peer = %peer_ip, "set_export_default: unknown peer — ignoring");
+            return;
+        }
+        self.export_policies.insert(peer_ip, Policy::new(action));
+
+        if !self.peer_types.contains_key(&peer_ip) {
+            tracing::debug!(
+                peer = %peer_ip,
+                "set_export_default: peer not established — new policy applies on reconnect"
+            );
+            return;
+        }
+
+        let peer_type = self
+            .peer_types
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(PeerType::External);
+
+        // Collect all Loc-RIB NLRIs; the borrow is dropped after the collect.
+        let nlris: Vec<Nlri<Ipv4Addr>> = self.loc_rib.best_routes().map(|(n, _)| n).collect();
+
+        let Some(export_policy) = self.export_policies.get(&peer_ip) else {
+            return;
+        };
+        let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
+            return;
+        };
+        let Some(update_tx) = self.update_senders.get(&peer_ip) else {
+            return;
+        };
+
+        let mut stalled = false;
+        for nlri in nlris {
+            if !propagate_prefix(
+                nlri,
+                &self.loc_rib,
+                adj_rib_out,
+                export_policy,
+                peer_type,
+                self.local_as,
+                self.local_bgp_id,
+                update_tx,
+            ) {
+                stalled = true;
+                break;
+            }
+        }
+        if stalled {
+            self.stalled_peers.push(peer_ip);
+        }
+    }
 }
 
 async fn run(cfg: config::Config) {
@@ -643,7 +780,10 @@ async fn run(cfg: config::Config) {
             local_as,
             local_bgp_id,
             hold_time: cfg.daemon.hold_time,
-            capabilities: vec![Capability::FourByteAsn(local_as)],
+            capabilities: vec![
+                Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+                Capability::FourByteAsn(local_as),
+            ],
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
         };

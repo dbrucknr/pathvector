@@ -195,3 +195,54 @@ message ListCandidatesRequest {
   /// Prefix in CIDR notation for which to list all candidate routes.
   string prefix = 1;
 }
+
+// ── Policy service ────────────────────────────────────────────────────────────
+
+/// Default policy action: whether routes are accepted or rejected when no
+/// explicit policy term matches.
+enum PolicyAction {
+  POLICY_ACTION_UNSPECIFIED = 0;
+  POLICY_ACTION_ACCEPT      = 1;
+  POLICY_ACTION_REJECT      = 2;
+}
+
+service PolicyService {
+  /// Replaces the import-policy default action for a single eBGP peer and
+  /// immediately re-evaluates the peer's Adj-RIB-In against the new policy.
+  /// Any routes that change accepted/rejected status are reflected in Loc-RIB,
+  /// and the resulting best-path changes are propagated to all established peers.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc SetImportDefault(SetImportDefaultRequest) returns (SetImportDefaultResponse);
+
+  /// Replaces the export-policy default action for a single eBGP peer and
+  /// immediately re-evaluates the entire Loc-RIB against the new policy for
+  /// that peer.  The peer receives UPDATEs for newly-accepted prefixes and
+  /// WITHDRAWs for newly-rejected ones.  Has no effect if the peer is not
+  /// currently established (changes apply on the next session).
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc SetExportDefault(SetExportDefaultRequest) returns (SetExportDefaultResponse);
+}
+
+message SetImportDefaultRequest {
+  /// Dotted-decimal IPv4 address of the peer whose import policy to update.
+  string peer_address = 1;
+  /// New default action.
+  PolicyAction action = 2;
+}
+
+message SetImportDefaultResponse {}
+
+message SetExportDefaultRequest {
+  /// Dotted-decimal IPv4 address of the peer whose export policy to update.
+  string peer_address = 1;
+  /// New default action.
+  PolicyAction action = 2;
+}
+
+message SetExportDefaultResponse {}

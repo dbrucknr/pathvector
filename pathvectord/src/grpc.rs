@@ -1,20 +1,25 @@
 //! gRPC management API server.
 //!
-//! Exposes two services over a single `tonic` server:
+//! Exposes three services over a single `tonic` server:
 //!
 //! - [`PeerService`] — per-peer session state (addresses, AS numbers, uptime,
 //!   prefix counts).
 //! - [`RibService`] — Loc-RIB queries: best route for a prefix, all best
 //!   routes, and all candidate routes for a prefix.
+//! - [`PolicyService`] — runtime policy management: replace the import or
+//!   export default action for a peer and immediately propagate the change.
 //!
-//! Both services hold an `Arc<RwLock<DaemonState>>` and acquire a **read**
-//! lock for every request, so they never block the BGP event loop.
+//! `PeerService` and `RibService` hold an `Arc<RwLock<DaemonState>>` and
+//! acquire a **read** lock for every request.  `PolicyService` requires a
+//! **write** lock because it mutates import/export policy maps and re-evaluates
+//! RIB state.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
+use pathvector_policy::DefaultAction;
 use pathvector_rib::PeerId;
 use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType};
 
@@ -32,8 +37,10 @@ use crate::proto;
 use proto::{
     Aggregator, AsSegment, GetBestRouteRequest, GetPeerRequest, LargeCommunity,
     ListCandidatesRequest, ListPeersRequest, ListPeersResponse, ListRoutesRequest,
-    ListRoutesResponse, PeerState, Route, RouteResponse,
+    ListRoutesResponse, PeerState, PolicyAction, Route, RouteResponse, SetExportDefaultRequest,
+    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse,
     peer_service_server::{PeerService, PeerServiceServer},
+    policy_service_server::{PolicyService, PolicyServiceServer},
     rib_service_server::{RibService, RibServiceServer},
 };
 
@@ -341,6 +348,82 @@ impl RibService for RibServiceImpl {
     }
 }
 
+// ── PolicyService ─────────────────────────────────────────────────────────────
+
+struct PolicyServiceImpl {
+    state: Arc<tokio::sync::RwLock<DaemonState>>,
+}
+
+/// Parse a dotted-decimal IPv4 address from a gRPC request field, returning a
+/// gRPC `INVALID_ARGUMENT` status on failure.
+fn parse_peer_address(raw: &str) -> Result<Ipv4Addr, Status> {
+    raw.parse::<Ipv4Addr>()
+        .map_err(|_| Status::invalid_argument(format!("'{raw}' is not a valid IPv4 address")))
+}
+
+/// Map a `PolicyAction` proto enum to a [`DefaultAction`], returning
+/// `INVALID_ARGUMENT` for the unspecified/unknown variant.
+fn parse_policy_action(action: i32) -> Result<DefaultAction, Status> {
+    match PolicyAction::try_from(action) {
+        Ok(PolicyAction::Accept) => Ok(DefaultAction::Accept),
+        Ok(PolicyAction::Reject) => Ok(DefaultAction::Reject),
+        _ => Err(Status::invalid_argument(
+            "action must be POLICY_ACTION_ACCEPT or POLICY_ACTION_REJECT",
+        )),
+    }
+}
+
+#[tonic::async_trait]
+impl PolicyService for PolicyServiceImpl {
+    async fn set_import_default(
+        &self,
+        request: Request<SetImportDefaultRequest>,
+    ) -> Result<Response<SetImportDefaultResponse>, Status> {
+        let req = request.into_inner();
+        let peer_ip = parse_peer_address(&req.peer_address)?;
+        let action = parse_policy_action(req.action)?;
+
+        let mut s = self.state.write().await;
+        if !s.import_policies.contains_key(&peer_ip) {
+            return Err(Status::not_found(format!(
+                "peer {peer_ip} is not configured"
+            )));
+        }
+
+        tracing::info!(
+            peer = %peer_ip,
+            ?action,
+            "SetImportDefault: replacing import policy and reapplying to Adj-RIB-In"
+        );
+        s.set_import_default(peer_ip, action);
+        Ok(Response::new(SetImportDefaultResponse {}))
+    }
+
+    async fn set_export_default(
+        &self,
+        request: Request<SetExportDefaultRequest>,
+    ) -> Result<Response<SetExportDefaultResponse>, Status> {
+        let req = request.into_inner();
+        let peer_ip = parse_peer_address(&req.peer_address)?;
+        let action = parse_policy_action(req.action)?;
+
+        let mut s = self.state.write().await;
+        if !s.export_policies.contains_key(&peer_ip) {
+            return Err(Status::not_found(format!(
+                "peer {peer_ip} is not configured"
+            )));
+        }
+
+        tracing::info!(
+            peer = %peer_ip,
+            ?action,
+            "SetExportDefault: replacing export policy and re-evaluating Loc-RIB for peer"
+        );
+        s.set_export_default(peer_ip, action);
+        Ok(Response::new(SetExportDefaultResponse {}))
+    }
+}
+
 // ── Server entrypoint ─────────────────────────────────────────────────────────
 
 /// Start the gRPC management server on `0.0.0.0:<port>`.
@@ -358,7 +441,10 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
     let peer_svc = PeerServiceServer::new(PeerServiceImpl {
         state: Arc::clone(&state),
     });
-    let rib_svc = RibServiceServer::new(RibServiceImpl { state });
+    let rib_svc = RibServiceServer::new(RibServiceImpl {
+        state: Arc::clone(&state),
+    });
+    let policy_svc = PolicyServiceServer::new(PolicyServiceImpl { state });
     let reflection_svc = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build_v1()
@@ -367,6 +453,7 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
     if let Err(e) = tonic::transport::Server::builder()
         .add_service(peer_svc)
         .add_service(rib_svc)
+        .add_service(policy_svc)
         .add_service(reflection_svc)
         .serve(addr)
         .await
