@@ -7,6 +7,7 @@ members = [
     "pathvector-bmp",
     "pathvector-client",
     "pathvectord",
+    "pathvector",
     "e2e",
 ]
 resolver = "2"
@@ -30,6 +31,7 @@ pathvector-bmp     = { path = "pathvector-bmp",     version = "0.1.0" }
 pathvector-client  = { path = "pathvector-client",  version = "0.1.0" }
 
 # External dependencies
+clap       = { version = "4", features = ["derive", "env"] }
 bytes      = "1"
 futures    = "0.3"
 ipnetx     = "0.2.2"
