@@ -88,7 +88,7 @@ See [CLI.md](CLI.md) for the `pathvector` CLI reference: installation, all subco
 
 ## Testing
 
-pathvector takes correctness seriously. The test suite combines five layers: unit tests, compiled documentation examples, property-based tests (proptest), fuzz targets on the codec decode path, and Docker-based end-to-end tests against a real GoBGP peer. See [TESTING.md](TESTING.md) for the full description of each layer and how to run them.
+pathvector takes correctness seriously. The test suite combines seven layers: unit tests, compiled documentation examples, property-based tests (proptest), fuzz targets on the codec decode path, ratatui snapshot tests for the TUI dashboard, Docker-based end-to-end tests against a real GoBGP peer, and dependency-inversion tests that exercise every CLI subcommand through `MockDaemonClient` without a live daemon. See [TESTING.md](TESTING.md) for the full description of each layer and how to run them.
 
 ```sh
 just ci          # unit + property + doc tests, clippy, fmt, MSRV — no Docker required

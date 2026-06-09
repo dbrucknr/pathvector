@@ -94,6 +94,11 @@ impl DashboardState {
     }
 
     pub(crate) async fn refresh(&mut self, client: &mut impl DaemonClient) {
+        // Clear any stale error from the previous poll so that a recovery is
+        // reflected immediately rather than leaving the status bar stuck in the
+        // error state indefinitely.
+        self.last_error = None;
+
         match client.list_peers().await {
             Ok(peers) => self.peers = peers,
             Err(e) => self.last_error = Some(e.to_string()),
@@ -465,6 +470,33 @@ mod tests {
         assert!(
             state.last_error.is_some(),
             "last_error must be set on RPC failure"
+        );
+    }
+
+    /// After a failed poll, a subsequent successful poll must clear `last_error`.
+    /// Without the `self.last_error = None` reset at the top of `refresh`, the
+    /// error message would remain in the status bar indefinitely after recovery.
+    #[tokio::test]
+    async fn refresh_clears_error_on_recovery() {
+        let mut state = DashboardState::new();
+        let mut failing = MockDaemonClient::new();
+        failing.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("daemon down"),
+        ));
+
+        // First poll — daemon is down.
+        state.refresh(&mut failing).await;
+        assert!(
+            state.last_error.is_some(),
+            "error must be set after failure"
+        );
+
+        // Second poll — daemon has recovered.
+        let mut recovered = MockDaemonClient::new();
+        state.refresh(&mut recovered).await;
+        assert!(
+            state.last_error.is_none(),
+            "error must be cleared after recovery"
         );
     }
 
