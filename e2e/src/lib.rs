@@ -236,9 +236,13 @@ export_default = "accept"
 
 /// Polls until the BGP session with `peer` reaches `Established`.
 ///
-/// Returns `Ok(())` once the session is `Established`, or `Err(String)` if
-/// `timeout` expires before that happens.  Callers that treat a timeout as a
-/// test failure should call `.expect("…")` on the return value.
+/// Callers that treat a timeout as a test failure should call `.expect("…")`
+/// on the return value.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the session reaches
+/// `Established`.
 pub async fn wait_for_established(
     client: &mut PathvectorClient,
     peer: Ipv4Addr,
@@ -262,9 +266,13 @@ pub async fn wait_for_established(
 
 /// Polls until the best route for `prefix` is present, then returns it.
 ///
-/// Returns `Ok(Route)` once the route appears, or `Err(String)` if `timeout`
-/// expires first.  Callers that treat a timeout as a test failure should call
-/// `.expect("…")` on the return value.
+/// Callers that treat a timeout as a test failure should call `.expect("…")`
+/// on the return value.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the route appears in the
+/// RIB.
 pub async fn wait_for_route(
     client: &mut PathvectorClient,
     prefix: &str,
@@ -286,9 +294,13 @@ pub async fn wait_for_route(
 
 /// Polls until the best route for `prefix` is absent (withdrawn).
 ///
-/// Returns `Ok(())` once the route is gone, or `Err(String)` if `timeout`
-/// expires first.  Callers that treat a timeout as a test failure should call
-/// `.expect("…")` on the return value.
+/// Callers that treat a timeout as a test failure should call `.expect("…")`
+/// on the return value.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the route is removed from
+/// the RIB.
 pub async fn wait_for_route_withdrawn(
     client: &mut PathvectorClient,
     prefix: &str,
