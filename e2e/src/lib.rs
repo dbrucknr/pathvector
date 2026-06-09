@@ -205,11 +205,45 @@ fn write_gobgp_config() -> NamedTempFile {
     f
 }
 
+/// Writes the gobgpd config for a **route-source** container (AS 65003).
+///
+/// This is used in two-peer outbound tests: the source announces prefixes to
+/// pathvectord, which then propagates them to the sink (AS 65001).
+fn write_gobgp_source_config() -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp source config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65003
+  router-id = "1.0.0.3"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp source config");
+    f
+}
+
 /// Writes the pathvectord config file for the test container.
 ///
-/// `gobgpd_ip` is the gobgpd container's IP on the shared Docker network,
-/// obtained via [`container_network_ip`] after gobgpd is started.
-fn write_daemon_config(gobgpd_ip: Ipv4Addr) -> NamedTempFile {
+/// `peers` is a list of `(address, remote_as)` pairs for every BGP peer
+/// pathvectord should dial.  Pass a single pair for the simple single-peer
+/// harness; pass two pairs for the two-peer outbound harness.
+fn write_daemon_config(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp pathvectord config");
     write!(
         f,
@@ -219,16 +253,24 @@ local_as  = 65002
 bgp_id    = "10.0.0.2"
 hold_time = 9
 grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
 
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
 [[peers]]
-address        = "{gobgpd_ip}"
+address        = "{ip}"
 port           = {GOBGPD_BGP_PORT}
-remote_as      = 65001
+remote_as      = {remote_as}
 import_default = "accept"
 export_default = "accept"
 "#
-    )
-    .expect("write pathvectord config");
+        )
+        .expect("write pathvectord peer config");
+    }
     f
 }
 
@@ -398,7 +440,7 @@ impl Harness {
         let gobgpd_ip = container_network_ip(&gobgpd_container_id, &network_name);
 
         // Write pathvectord config referencing gobgpd's container IP.
-        let pathvectord_config = write_daemon_config(gobgpd_ip);
+        let pathvectord_config = write_daemon_config(&[(gobgpd_ip, 65001)]);
         let pathvectord_config_path = pathvectord_config
             .path()
             .to_str()
@@ -481,5 +523,236 @@ impl Harness {
             .status()
             .expect("docker exec gobgp withdraw");
         assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
+    }
+}
+
+// ── Outbound advertisement helpers ────────────────────────────────────────────
+
+/// Polls `gobgp global rib` inside `container_id` until `prefix` appears.
+///
+/// Used to verify that a prefix announced by pathvectord has been received
+/// and installed by a GoBGP sink peer.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix appears.
+pub async fn wait_for_gobgp_rib_entry(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for prefix {prefix} to appear in GoBGP global RIB"
+            ));
+        }
+        let out = Command::new("docker")
+            .args(["exec", container_id, "gobgp", "global", "rib"])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains(prefix) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Polls `gobgp global rib` until `prefix` is absent (withdrawn from the RIB).
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix disappears.
+pub async fn wait_for_gobgp_rib_withdrawn(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for prefix {prefix} to be withdrawn from GoBGP global RIB"
+            ));
+        }
+        let out = Command::new("docker")
+            .args(["exec", container_id, "gobgp", "global", "rib"])
+            .output();
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if !text.contains(prefix) {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()), // container gone — route is certainly absent
+        }
+    }
+}
+
+// ── TwoPeerHarness ────────────────────────────────────────────────────────────
+
+/// A two-peer test environment for verifying outbound advertisement:
+///
+/// ```text
+/// GoBGP-source (AS 65003) ──BGP──► pathvectord (AS 65002) ──BGP──► GoBGP-sink (AS 65001)
+/// ```
+///
+/// pathvectord dials both GoBGP containers on the same Docker bridge network.
+/// Tests call [`TwoPeerHarness::source_announce`] to inject a route at the
+/// source, then poll [`wait_for_gobgp_rib_entry`] on the sink container to
+/// confirm pathvectord forwarded it.
+///
+/// # Panics
+///
+/// [`TwoPeerHarness::new`] panics if Docker is not running, either image is
+/// missing, or either BGP session does not establish within 30 seconds.
+pub struct TwoPeerHarness {
+    _gobgpd_sink: ContainerAsync<GenericImage>,
+    _gobgpd_source: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _sink_config: NamedTempFile,
+    _source_config: NamedTempFile,
+    _daemon_config: NamedTempFile,
+    /// Container ID of GoBGP-source — used for `source_announce` / `source_withdraw`.
+    pub source_id: String,
+    /// Container ID of GoBGP-sink — pass to [`wait_for_gobgp_rib_entry`].
+    pub sink_id: String,
+    /// IP of the GoBGP-sink container (the `peer` address as seen by pathvectord).
+    pub sink_peer: Ipv4Addr,
+    /// pathvectord management client.
+    pub client: PathvectorClient,
+    _network: DockerNetwork,
+}
+
+impl TwoPeerHarness {
+    /// Stand up the full two-peer environment and wait for both BGP sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing, or either BGP
+    /// session does not reach `Established` within 30 seconds.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-test-{test_id}");
+        let network = DockerNetwork::create(network_name.clone());
+
+        // ── GoBGP-sink (AS 65001) ─────────────────────────────────────────────
+        let sink_config = write_gobgp_config();
+        let sink_config_path = sink_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd_sink = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-sink-{test_id}"))
+            .with_mount(Mount::bind_mount(sink_config_path, "/etc/gobgp/gobgpd.conf"))
+            .start()
+            .await
+            .expect("start gobgpd-sink container");
+
+        let sink_id = gobgpd_sink.id().to_owned();
+        let sink_addr = container_network_ip(&sink_id, &network_name);
+
+        // ── GoBGP-source (AS 65003) ───────────────────────────────────────────
+        let source_config = write_gobgp_source_config();
+        let source_config_path = source_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd_source = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-source-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                source_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-source container");
+
+        let source_id = gobgpd_source.id().to_owned();
+        let source_addr = container_network_ip(&source_id, &network_name);
+
+        // ── pathvectord (dials both peers) ────────────────────────────────────
+        let daemon_config = write_daemon_config(&[(sink_addr, 65001), (source_addr, 65003)]);
+        let daemon_config_path = daemon_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(daemon_config_path, "/etc/pathvectord.toml"))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client =
+            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+                .expect("connect PathvectorClient");
+
+        // Wait for both BGP sessions to establish.
+        wait_for_established(&mut client, sink_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with sink did not reach Established within 30 s");
+        wait_for_established(&mut client, source_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with source did not reach Established within 30 s");
+
+        Self {
+            _gobgpd_sink: gobgpd_sink,
+            _gobgpd_source: gobgpd_source,
+            _pathvectord: pathvectord,
+            _sink_config: sink_config,
+            _source_config: source_config,
+            _daemon_config: daemon_config,
+            source_id,
+            sink_id,
+            sink_peer: sink_addr,
+            client,
+            _network: network,
+        }
+    }
+
+    /// Announce a prefix from GoBGP-source into pathvectord.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn source_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.source_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp source announce");
+        assert!(
+            status.success(),
+            "gobgp source announce {prefix} failed: {status}"
+        );
+    }
+
+    /// Withdraw a prefix from GoBGP-source.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn source_withdraw(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.source_id])
+            .args(["gobgp", "global", "rib", "del", prefix])
+            .status()
+            .expect("docker exec gobgp source withdraw");
+        assert!(
+            status.success(),
+            "gobgp source withdraw {prefix} failed: {status}"
+        );
     }
 }

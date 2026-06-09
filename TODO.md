@@ -102,8 +102,11 @@ Infrastructure committed on branch `e2e` (commit `19a8605`):
   `session_reaches_established`, `wait_for_established_respects_deadline`
 
 Remaining e2e work:
-- Outbound advertisement tests — verify pathvectord sends UPDATEs that GoBGP installs
-  (currently only inbound: GoBGP → pathvectord direction is tested)
+- **Outbound advertisement tests** — **Done (2026-06-09).** Two-peer topology:
+  GoBGP-source (AS 65003) → pathvectord (AS 65002) → GoBGP-sink (AS 65001).
+  `TwoPeerHarness` in `e2e/src/lib.rs`; four tests in `e2e/tests/outbound.rs`
+  cover: single prefix propagation, multi-prefix, withdrawal, and management-API
+  visibility. `write_daemon_config` generalized to accept a slice of peers.
 - Import-policy reject tests — announce a prefix with no import policy configured, verify it
   does NOT appear in the RIB (RFC 8212 default-reject for eBGP)
 - Adversarial inputs — malformed BGP messages injected directly over TCP to verify the
