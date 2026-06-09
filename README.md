@@ -1,10 +1,43 @@
 # pathvector
 
 [![CI](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml/badge.svg)](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A production-quality BGP implementation in Rust. Fast, memory-efficient, and designed as a library-first stack — usable as a full daemon or embedded directly into an application.
 
 BGP is formally classified as a *path vector* routing protocol, the only widely deployed one at internet scale.
+
+---
+
+## Quick start
+
+**Prerequisites:** Rust ≥ 1.88 and `protoc` ≥ 3 (`brew install protobuf` / `apt install protobuf-compiler`).
+
+```toml
+# config.toml — minimal eBGP peer config
+[daemon]
+local_as = 65002
+bgp_id   = "10.0.0.2"
+
+[[peers]]
+address   = "10.0.0.1"
+remote_as = 65001
+```
+
+```bash
+# Build and run the daemon
+cargo build --release -p pathvectord
+./target/release/pathvectord config.toml
+
+# In another terminal — inspect peers and routes via the CLI
+cargo run -p pathvector -- peer list
+cargo run -p pathvector -- route list
+cargo run -p pathvector -- dashboard        # live ratatui TUI
+```
+
+See [DAEMON.md](DAEMON.md) for the full configuration reference and gRPC API examples.
+See [CLI.md](CLI.md) for all subcommands and the policy reload workflow.
 
 ---
 
@@ -23,22 +56,16 @@ The implementation is split into focused, independently published crates. Each l
 | [`pathvectord`](pathvectord) | BGP daemon: TOML config and gRPC management API |
 | [`pathvector`](pathvector) | CLI management tool (`pathvector peer`, `route`, `policy`, `dashboard`) |
 
-Dependency flow:
+Dependency flow (compile-time crate graph):
 
 ```
-pathvector (CLI)
-└── pathvector-client
-    └── pathvectord (gRPC server)
-        ├── pathvector-session
-        ├── pathvector-rib
-        │   ├── pathvector-policy
-        │   │   ├── pathvector-types
-        │   │   ├── ipnetx
-        │   │   └── routemap
-        │   └── pathvector-types
-        ├── pathvector-bmp
-        │   └── pathvector-types
-        └── pathvector-types
+pathvector-types
+├── pathvector-policy
+│   └── pathvector-rib
+│       └── pathvectord ──── gRPC API (runtime) ──── pathvector-client
+│                                                          └── pathvector (CLI)
+└── pathvector-session
+    └── pathvectord
 ```
 
 ---
@@ -76,13 +103,10 @@ Active development. Crates are not yet published to crates.io.
 | `pathvector-policy` | Stable | Prefix-list, community, AS-path, local-pref, MED conditions and actions |
 | `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2, 4–7, 10; LPM forwarding queries |
 | `pathvector-session` | Stable | Full BGP FSM; all five message types; 4-byte ASN; GoBGP-validated |
-| `pathvector-bmp` | Not started | — |
 | `pathvector-client` | Stable | Typed async Rust client wrapping all three gRPC services |
 | `pathvectord` | Active | Full BGP speaker; gRPC management API; GoBGP-validated |
 | `pathvector` | Active | CLI: peer/route/policy subcommands; live ratatui dashboard |
-
-See [DAEMON.md](DAEMON.md) for build instructions, daemon configuration reference, and raw gRPC API examples.
-See [CLI.md](CLI.md) for the `pathvector` CLI reference: installation, all subcommands, and policy reload workflow.
+| `pathvector-bmp` | Planned | BMP receiver for passive route monitoring |
 
 ---
 
@@ -104,4 +128,4 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime data flow and crate desig
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
