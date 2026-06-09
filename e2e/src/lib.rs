@@ -31,7 +31,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicU32, AtomicU16, Ordering},
+    sync::atomic::{AtomicU16, AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -126,7 +126,10 @@ impl DockerNetwork {
             .stderr(Stdio::null())
             .status()
             .expect("docker network create");
-        assert!(status.success(), "docker network create {name} failed: {status}");
+        assert!(
+            status.success(),
+            "docker network create {name} failed: {status}"
+        );
         Self { name }
     }
 }
@@ -153,9 +156,7 @@ impl Drop for DockerNetwork {
 ///
 /// Panics if `docker inspect` fails or the output is not a valid IPv4 address.
 fn container_network_ip(container_id: &str, network: &str) -> Ipv4Addr {
-    let fmt = format!(
-        r#"{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}"#
-    );
+    let fmt = format!(r#"{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}"#);
     let output = Command::new("docker")
         .args(["inspect", container_id, "--format", &fmt])
         .output()
@@ -370,7 +371,10 @@ impl Harness {
             .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
             .with_network(&network_name)
             .with_container_name(format!("gobgpd-{test_id}"))
-            .with_mount(Mount::bind_mount(gobgpd_config_path, "/etc/gobgp/gobgpd.conf"))
+            .with_mount(Mount::bind_mount(
+                gobgpd_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
             .start()
             .await
             .expect("start gobgpd container");
@@ -408,9 +412,8 @@ impl Harness {
             .expect("start pathvectord container");
 
         // Connect the management client to pathvectord's host-mapped gRPC port.
-        let mut client =
-            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
-                .expect("connect PathvectorClient");
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient");
 
         // Wait for the BGP session.  gobgpd is passive (never initiates), so
         // pathvectord dials it.  Both containers are on the same bridge network
@@ -447,8 +450,7 @@ impl Harness {
         let status = Command::new("docker")
             .args(["exec", &self.gobgpd_id])
             .args([
-                "gobgp", "global", "rib", "add",
-                prefix, "nexthop", nexthop, "origin", "igp",
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
             ])
             .status()
             .expect("docker exec gobgp announce");

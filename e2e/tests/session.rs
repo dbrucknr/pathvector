@@ -65,8 +65,7 @@ async fn list_peers_includes_gobgp_peer() {
 #[tokio::test]
 async fn wait_for_established_respects_deadline() {
     // Connect to a port with nothing listening — the session will never establish.
-    let mut client =
-        pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
+    let mut client = pathvector_client::PathvectorClient::connect("http://127.0.0.1:1").unwrap();
 
     // The deadline fires after 1 s and returns Err; the whole call completes
     // well within our 3 s guard.
