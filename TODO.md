@@ -330,32 +330,17 @@ overflow (same pattern as Tokio's `broadcast::channel`).
 
 ### Architecture overview document
 
-`ARCHITECTURE.md` is the missing onboarding artifact. A new contributor today has to
-reconstruct the runtime data flow by reading across five crates. A single document should
-trace the full path:
-
-```
-TcpStream
-  → BgpCodec (framing + message decode)
-  → Session<T> FSM events
-  → SessionEvent channel (per-peer task → pathvectord main loop)
-  → handle_update / AdjRibIn
-  → LocRib (best-path selection)
-  → propagate_prefix → AdjRibOut
-  → route_to_update → UpdateMessage → peer TcpStream
-```
-
-And the management plane:
-
-```
-gRPC request → PeerService / RibService handler
-  → shared Arc<Mutex<State>> read
-  → proto response
-```
-
-Include the crate dependency graph, explain why `pathvector-client` has no internal
-dependencies (the trust boundary reasoning), and document the `BgpTransport` trait seam
-that allows transport mocking in tests.
+**Done (2026-06-09).** `ARCHITECTURE.md` at the workspace root covers:
+- Crate dependency graph with rationale for `pathvector-client` having no internal deps
+- Full inbound route path: TCP socket → codec → FSM → SessionEvent → DaemonState →
+  AdjRibIn → import policy → LocRib
+- Full outbound route path: LocRib best-path change → propagate_prefix → export policy →
+  AdjRibOut → outbound UPDATE channel → Session → TCP socket
+- Session lifecycle events table (Established / Terminated / RouteUpdate)
+- Management plane: Arc<RwLock<DaemonState>>, read/write lock split rationale
+- BgpTransport trait seam and how spawn_with injects a mock transport in tests
+- DaemonState owns no I/O — all side effects flow through mpsc channels
+- Key design invariants (pure FSM, zero-dep types, idempotent propagate_prefix, etc.)
 
 ### Logging audit
 
