@@ -96,12 +96,17 @@ Infrastructure committed on branch `e2e` (commit `19a8605`):
 - `e2e/src/lib.rs` — `Harness` using testcontainers-rs 0.23; per-test `docker network create/rm`;
   `docker inspect` for container IP; `docker exec` for gobgp CLI
 
-10 tests passing (6 route + 4 session):
-- `routes.rs`: `announced_route_appears_in_rib`, `list_candidates_returns_peer_route`,
+20 tests passing across 4 files:
+- `routes.rs` (6): `announced_route_appears_in_rib`, `list_candidates_returns_peer_route`,
   `multiple_routes_all_installed`, `partial_withdrawal_leaves_others_intact`,
   `unknown_prefix_returns_none`, `withdrawn_route_removed_from_rib`
-- `session.rs`: `list_peers_includes_gobgp_peer`, `peer_state_fields_correct_after_established`,
-  `session_reaches_established`, `wait_for_established_respects_deadline`
+- `session.rs` (6): `list_peers_includes_gobgp_peer`, `peer_state_fields_correct_after_established`,
+  `session_reaches_established`, `wait_for_established_respects_deadline`,
+  `wait_for_route_respects_deadline`, `wait_for_route_withdrawn_respects_deadline`
+- `outbound.rs` (4): `announced_route_propagates_to_sink`, `multiple_routes_all_propagate_to_sink`,
+  `withdrawn_route_removed_from_sink`, `source_route_visible_in_pathvectord_rib`
+- `policy.rs` (4): `no_import_policy_rejects_ebgp_prefix`, `explicit_import_accept_installs_ebgp_prefix`,
+  `no_export_policy_suppresses_advertisement_to_peer`, `explicit_export_accept_propagates_to_sink`
 
 Remaining e2e work:
 - **Outbound advertisement tests** — **Done (2026-06-09).** Two-peer topology:
@@ -109,8 +114,11 @@ Remaining e2e work:
   `TwoPeerHarness` in `e2e/src/lib.rs`; four tests in `e2e/tests/outbound.rs`
   cover: single prefix propagation, multi-prefix, withdrawal, and management-API
   visibility. `write_daemon_config` generalized to accept a slice of peers.
-- Import-policy reject tests — announce a prefix with no import policy configured, verify it
-  does NOT appear in the RIB (RFC 8212 default-reject for eBGP)
+- **Import/export-policy reject tests (RFC 8212)** — **Done (2026-06-09).**
+  `Harness::new_rfc8212()` configures pathvectord with no policy on the peer;
+  `TwoPeerHarness::new_no_export_policy()` configures import-accept + no export.
+  Four tests in `e2e/tests/policy.rs` prove both directions: routes are blocked
+  without an explicit policy and flow correctly with one.
 - Adversarial inputs — malformed BGP messages injected directly over TCP to verify the
   daemon handles them gracefully without panicking
 - **GitHub Actions e2e workflow** — **Done (2026-06-09).** Separate `e2e` job in
