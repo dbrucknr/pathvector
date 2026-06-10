@@ -46,8 +46,11 @@ detail, and RFC 7606 policy. See RFC_REQUIREMENTS.md §RFC 7606 for full coverag
 **4. CLI tool (`pathvector`)** (new crate, uses `pathvector-client`) — **Done (2026-06-09)**
 Implemented as `pathvector/` workspace member. Subcommands: `peer list`,
 `peer get`, `route list [--peer]`, `route best`, `route candidates`,
-`policy set-import`, `policy set-export`, and `dashboard` (live ratatui TUI).
-Global `--address` flag + `PATHVECTOR_ADDRESS` env var select the daemon endpoint.
+`policy set-import`, `policy set-export`, `route originate`, `route withdraw`,
+`route list-originated`, `watch routes [--peer]`, `watch peers`, and `dashboard`
+(live ratatui TUI). Global `--address` flag + `PATHVECTOR_ADDRESS` env var select
+the daemon endpoint. `watch routes` and `watch peers` stream events to stdout until
+Ctrl-C using `tokio::select!` on the stream and `tokio::signal::ctrl_c()`.
 
 **5. Dashboard: surface all refresh errors, not just the last one** (`pathvector`)
 `DashboardState::refresh` makes two sequential calls (`list_peers`, then
@@ -500,6 +503,11 @@ types are defined independently in `src/types.rs`.
 - **`Route.peer_address: Option<IpAddr>` (2026-06-10):** Changed from `IpAddr`
   to `Option<IpAddr>`; `None` means locally originated route.  `convert.rs` maps
   proto `"local"` string → `None`; output rendering shows `"local"` for CLI/dashboard.
+- **Test coverage 97%+ workspace-wide (2026-06-10):** Comprehensive unit and
+  integration tests added across all crates. Key gaps closed: grpc origination
+  handlers, watch stream deadlock fix (drop sender before polling), lib.rs watch
+  conversion closures, transport retry/ExtendedMessage/MpReachNlri paths. All
+  clippy `-D warnings` errors resolved.
 
 ### Remaining
 
@@ -522,16 +530,15 @@ Snapshot-then-stream: subscribe to broadcast channel first (no race), send curre
 `CURRENT` events, send `END_INITIAL` sentinel, then stream live deltas.  `broadcast::channel`
 capacity 1024; slow subscribers receive `RecvError::Lagged` and must reconnect.
 
-**Remaining (client + CLI):**
-- `pathvector-client`: add `originate_route`, `originate_routes`, `withdraw_originated_route`,
-  `withdraw_originated_routes`, `list_originated_routes` to `DaemonClient` trait and impl;
-  add `watch_routes` / `watch_peers` as inherent methods on `PathvectorClient` (streams are
-  not included in the trait — too complex to mock generically); add `OriginateRouteParams`,
-  `RouteEvent`, `PeerEvent` domain types in `types.rs`; add `OriginationServiceClient` field
-  to `PathvectorClient`; add `convert.rs` helpers
-- CLI: `pathvector route originate <PREFIX> --next-hop <IP> [--community N]...`,
-  `pathvector route withdraw <PREFIX>`, `pathvector watch routes [--peer IP]`,
-  `pathvector watch peers`
+`pathvector-client` exposes the full origination surface on `DaemonClient` trait and
+`PathvectorClient` impl. `watch_routes` and `watch_peers` are inherent methods returning
+`impl Stream`. `OriginateRouteParams`, `RouteEvent`, `PeerEvent`, `RouteEventType`,
+`PeerEventType` domain types added to `types.rs`; `From`/`TryFrom` impls in `convert.rs`.
+
+CLI subcommands `route originate`, `route withdraw`, `route list-originated`, `watch routes
+[--peer]`, and `watch peers` all wired and tested (2026-06-10).
+
+**Remaining:**
 - **RouteEvent payload** — `route_tx.send()` in `originate_routes`/`withdraw_originated_routes`
   currently sends `route: None`.  For `WatchRoutes` subscribers to receive complete route
   data, the events should carry the full `proto::Route`.  Requires constructing the proto
