@@ -5,6 +5,18 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// BGP origin attribute for an originated route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum OriginArg {
+    /// Interior Gateway Protocol (most common; use for static/originated routes).
+    #[default]
+    Igp,
+    /// Exterior Gateway Protocol.
+    Egp,
+    /// Origin cannot be determined.
+    Incomplete,
+}
+
 /// CLI management tool for the pathvector BGP daemon.
 ///
 /// Connects to a running `pathvectord` over its gRPC management API and
@@ -50,6 +62,12 @@ pub enum Commands {
         command: PolicyCommands,
     },
 
+    /// Subscribe to live BGP events (streams to stdout; press Ctrl-C to stop).
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommands,
+    },
+
     /// Live-updating TUI dashboard showing peers and routes (press q to quit).
     Dashboard,
 }
@@ -90,6 +108,71 @@ pub enum RouteCommands {
         /// Prefix in CIDR notation, e.g. 10.0.0.0/8.
         prefix: String,
     },
+
+    /// Inject a locally originated route into the Loc-RIB.
+    ///
+    /// Idempotent: re-originating the same prefix replaces the existing route.
+    /// Export policy still applies; the route is advertised to all eligible peers.
+    Originate {
+        /// Prefix in CIDR notation, e.g. 192.0.2.0/24 or 198.51.100.1/32.
+        prefix: String,
+
+        /// Next-hop IP address.
+        #[arg(long, value_name = "IP")]
+        next_hop: String,
+
+        /// BGP origin attribute (default: igp).
+        #[arg(long, value_enum, default_value_t = OriginArg::Igp)]
+        origin: OriginArg,
+
+        /// Standard community values in AS:value notation, e.g. 65000:666.
+        /// May be repeated.
+        #[arg(long = "community", value_name = "AS:VALUE")]
+        communities: Vec<String>,
+
+        /// Local preference (iBGP only).
+        #[arg(long, value_name = "N")]
+        local_pref: Option<u32>,
+
+        /// Multi-exit discriminator.
+        #[arg(long, value_name = "N")]
+        med: Option<u32>,
+    },
+
+    /// Withdraw a locally originated route from the Loc-RIB.
+    ///
+    /// No-op if the prefix was not previously originated.
+    Withdraw {
+        /// Prefix in CIDR notation, e.g. 192.0.2.0/24.
+        prefix: String,
+    },
+
+    /// List all locally originated routes.
+    ListOriginated,
+}
+
+// ── watch subcommands ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Subcommand)]
+pub enum WatchCommands {
+    /// Stream live Loc-RIB changes to stdout.
+    ///
+    /// Delivers a snapshot of current best routes (CURRENT events), an
+    /// `END_INITIAL` sentinel, then live ANNOUNCED/WITHDRAWN deltas until
+    /// Ctrl-C or the daemon closes the stream.
+    Routes {
+        /// Filter the initial snapshot to routes from this peer address.
+        /// Use "local" to see only locally originated routes.
+        #[arg(long, value_name = "ADDRESS")]
+        peer: Option<String>,
+    },
+
+    /// Stream live peer session changes to stdout.
+    ///
+    /// Delivers a snapshot of current peer states (CURRENT events), an
+    /// `END_INITIAL` sentinel, then live CHANGED events until Ctrl-C or the
+    /// daemon closes the stream.
+    Peers,
 }
 
 // ── policy subcommands ────────────────────────────────────────────────────────
@@ -168,5 +251,90 @@ mod tests {
             "list",
         ]);
         assert_eq!(cli.address, "http://10.0.0.1:9090");
+    }
+
+    #[test]
+    fn route_originate_defaults() {
+        let cli = Cli::parse_from([
+            "pathvector", "route", "originate", "192.0.2.0/24",
+            "--next-hop", "10.0.0.1",
+        ]);
+        if let Commands::Route { command: RouteCommands::Originate { origin, communities, local_pref, med, .. } } = cli.command {
+            assert_eq!(origin, OriginArg::Igp);
+            assert!(communities.is_empty());
+            assert!(local_pref.is_none());
+            assert!(med.is_none());
+        } else {
+            panic!("expected Originate");
+        }
+    }
+
+    #[test]
+    fn route_originate_all_flags() {
+        let cli = Cli::parse_from([
+            "pathvector", "route", "originate", "198.51.100.1/32",
+            "--next-hop", "10.0.0.1",
+            "--origin", "incomplete",
+            "--community", "65000:666",
+            "--local-pref", "200",
+            "--med", "50",
+        ]);
+        if let Commands::Route { command: RouteCommands::Originate { prefix, next_hop, origin, communities, local_pref, med } } = cli.command {
+            assert_eq!(prefix, "198.51.100.1/32");
+            assert_eq!(next_hop, "10.0.0.1");
+            assert_eq!(origin, OriginArg::Incomplete);
+            assert_eq!(communities, vec!["65000:666"]);
+            assert_eq!(local_pref, Some(200));
+            assert_eq!(med, Some(50));
+        } else {
+            panic!("expected Originate");
+        }
+    }
+
+    #[test]
+    fn route_withdraw_parses() {
+        let cli = Cli::parse_from(["pathvector", "route", "withdraw", "192.0.2.0/24"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Route { command: RouteCommands::Withdraw { .. } }
+        ));
+    }
+
+    #[test]
+    fn route_list_originated_parses() {
+        let cli = Cli::parse_from(["pathvector", "route", "list-originated"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Route { command: RouteCommands::ListOriginated }
+        ));
+    }
+
+    #[test]
+    fn watch_routes_no_filter() {
+        let cli = Cli::parse_from(["pathvector", "watch", "routes"]);
+        if let Commands::Watch { command: WatchCommands::Routes { peer } } = cli.command {
+            assert!(peer.is_none());
+        } else {
+            panic!("expected Watch Routes");
+        }
+    }
+
+    #[test]
+    fn watch_routes_with_peer_filter() {
+        let cli = Cli::parse_from(["pathvector", "watch", "routes", "--peer", "10.0.0.1"]);
+        if let Commands::Watch { command: WatchCommands::Routes { peer } } = cli.command {
+            assert_eq!(peer.as_deref(), Some("10.0.0.1"));
+        } else {
+            panic!("expected Watch Routes --peer");
+        }
+    }
+
+    #[test]
+    fn watch_peers_parses() {
+        let cli = Cli::parse_from(["pathvector", "watch", "peers"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Watch { command: WatchCommands::Peers }
+        ));
     }
 }

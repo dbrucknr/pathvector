@@ -8,14 +8,19 @@
 //! pathvector [--address <url>] <COMMAND>
 //!
 //! Commands:
-//!   peer list                            List all configured peers
-//!   peer get <ADDRESS>                   Show detailed state for one peer
-//!   route list [--peer <ADDRESS>]        List all best routes (optional peer filter)
-//!   route best <PREFIX>                  Best route for a CIDR prefix
-//!   route candidates <PREFIX>            All candidate routes for a prefix
-//!   policy set-import <ADDR> <DECISION>  Change import-policy default (no session reset)
-//!   policy set-export <ADDR> <DECISION>  Change export-policy default (no session reset)
-//!   dashboard                            Live-updating TUI (press q to quit)
+//!   peer list                                         List all configured peers
+//!   peer get <ADDRESS>                                Show detailed state for one peer
+//!   route list [--peer <ADDRESS>]                     List all best routes (optional peer filter)
+//!   route best <PREFIX>                               Best route for a CIDR prefix
+//!   route candidates <PREFIX>                         All candidate routes for a prefix
+//!   route originate <PREFIX> --next-hop <IP> [opts]   Inject a locally originated route
+//!   route withdraw <PREFIX>                           Withdraw a locally originated route
+//!   route list-originated                             List all locally originated routes
+//!   policy set-import <ADDR> <DECISION>               Change import-policy default (no session reset)
+//!   policy set-export <ADDR> <DECISION>               Change export-policy default (no session reset)
+//!   watch routes [--peer <ADDRESS>]                   Stream live Loc-RIB changes to stdout
+//!   watch peers                                       Stream live peer session changes to stdout
+//!   dashboard                                         Live-updating TUI (press q to quit)
 //! ```
 //!
 //! The `--address` flag and `PATHVECTOR_ADDRESS` environment variable both
@@ -30,9 +35,10 @@ mod output;
 use std::net::IpAddr;
 
 use clap::Parser;
-use pathvector_client::PathvectorClient;
+use futures::StreamExt as _;
+use pathvector_client::{PathvectorClient, types::OriginateRouteParams};
 
-use cli::{Cli, Commands, PeerCommands, PolicyCommands, RouteCommands};
+use cli::{Cli, Commands, OriginArg, PeerCommands, PolicyCommands, RouteCommands, WatchCommands};
 use client_trait::DaemonClient;
 use error::CliError;
 
@@ -47,12 +53,60 @@ async fn main() {
 /// Entry point: parse the CLI then hand off to the testable core.
 async fn run() -> Result<(), CliError> {
     let args = Cli::parse();
+
+    // Watch commands require PathvectorClient directly (streaming RPCs are not
+    // on the DaemonClient trait), so they bypass run_with.
+    if let Commands::Watch { command } = args.command {
+        let mut client = PathvectorClient::connect(&args.address).map_err(CliError::from)?;
+        return run_watch(&mut client, command).await;
+    }
+
     run_with(
         args,
         |addr| PathvectorClient::connect(addr).map_err(CliError::from),
         dashboard::run_dashboard,
     )
     .await
+}
+
+/// Drive watch commands against a live `PathvectorClient`.
+///
+/// Streams events to stdout until the daemon closes the stream or the user
+/// presses Ctrl-C.
+async fn run_watch(client: &mut PathvectorClient, command: WatchCommands) -> Result<(), CliError> {
+    match command {
+        WatchCommands::Routes { peer } => {
+            let mut stream = client.watch_routes(peer.as_deref()).await?;
+            loop {
+                tokio::select! {
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(event)) => output::print_route_event(&event),
+                            Some(Err(e)) => return Err(CliError::from(e)),
+                            None => break,
+                        }
+                    }
+                    _ = tokio::signal::ctrl_c() => break,
+                }
+            }
+        }
+        WatchCommands::Peers => {
+            let mut stream = client.watch_peers().await?;
+            loop {
+                tokio::select! {
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(event)) => output::print_peer_event(&event),
+                            Some(Err(e)) => return Err(CliError::from(e)),
+                            None => break,
+                        }
+                    }
+                    _ = tokio::signal::ctrl_c() => break,
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Testable dispatch core.
@@ -122,6 +176,34 @@ where
                     let routes = client.list_candidates(&prefix).await?;
                     output::print_route_table(&routes);
                 }
+                RouteCommands::Originate { prefix, next_hop, origin, communities, local_pref, med } => {
+                    let communities = communities
+                        .iter()
+                        .map(|s| parse_community(s))
+                        .collect::<Result<Vec<u32>, _>>()?;
+                    let params = OriginateRouteParams {
+                        prefix,
+                        next_hop,
+                        origin: match origin {
+                            OriginArg::Igp => pathvector_client::types::Origin::Igp,
+                            OriginArg::Egp => pathvector_client::types::Origin::Egp,
+                            OriginArg::Incomplete => pathvector_client::types::Origin::Incomplete,
+                        },
+                        communities,
+                        large_communities: vec![],
+                        extended_communities: vec![],
+                        local_pref,
+                        med,
+                    };
+                    client.originate_route(params).await?;
+                }
+                RouteCommands::Withdraw { prefix } => {
+                    client.withdraw_originated_route(&prefix).await?;
+                }
+                RouteCommands::ListOriginated => {
+                    let routes = client.list_originated_routes().await?;
+                    output::print_route_table(&routes);
+                }
             }
         }
 
@@ -140,9 +222,41 @@ where
                 }
             }
         }
+
+        // Handled in `run()` before `run_with` is called; unreachable here.
+        Commands::Watch { .. } => {}
     }
 
     Ok(())
+}
+
+/// Parse a community string in `AS:value` notation into a packed `u32`.
+fn parse_community(s: &str) -> Result<u32, CliError> {
+    let (as_part, val_part) = s.split_once(':').ok_or_else(|| {
+        CliError::from(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::invalid_argument(format!(
+                "'{s}' is not a valid community — expected AS:value notation"
+            )),
+        ))
+    })?;
+    let asn: u32 = as_part.parse().map_err(|_| {
+        CliError::from(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::invalid_argument(format!("'{as_part}' is not a valid AS number")),
+        ))
+    })?;
+    let val: u32 = val_part.parse().map_err(|_| {
+        CliError::from(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::invalid_argument(format!("'{val_part}' is not a valid community value")),
+        ))
+    })?;
+    if asn > 0xFFFF || val > 0xFFFF {
+        return Err(CliError::from(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::invalid_argument(format!(
+                "'{s}' — AS and value must both fit in 16 bits (0–65535)"
+            )),
+        )));
+    }
+    Ok((asn << 16) | val)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -156,6 +270,39 @@ mod tests {
     use pathvector_client::types::{
         AsSegment, AsSegmentType, Origin, PeerState, PeerType, Route, SessionState,
     };
+
+    // ── parse_community ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_community_valid() {
+        assert_eq!(parse_community("65000:666").unwrap(), (65000 << 16) | 666);
+    }
+
+    #[test]
+    fn parse_community_zero_values() {
+        assert_eq!(parse_community("0:0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_community_max_values() {
+        assert_eq!(parse_community("65535:65535").unwrap(), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn parse_community_missing_colon() {
+        assert!(parse_community("65000").is_err());
+    }
+
+    #[test]
+    fn parse_community_non_numeric() {
+        assert!(parse_community("abc:def").is_err());
+    }
+
+    #[test]
+    fn parse_community_overflow() {
+        assert!(parse_community("65536:0").is_err());
+        assert!(parse_community("0:65536").is_err());
+    }
 
     // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -333,6 +480,89 @@ mod tests {
         let mut mock = MockDaemonClient::new();
         mock.candidates = vec![make_route()];
         run_cmd(&["pv", "route", "candidates", "192.0.2.0/24"], mock)
+            .await
+            .unwrap();
+    }
+
+    // ── route originate ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_originate_basic() {
+        run_cmd(
+            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_originate_with_community() {
+        run_cmd(
+            &[
+                "pv", "route", "originate", "192.0.2.0/24",
+                "--next-hop", "10.0.0.1",
+                "--community", "65000:666",
+            ],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_originate_invalid_community() {
+        let err = run_cmd(
+            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1", "--community", "notvalid"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not a valid community"));
+    }
+
+    #[tokio::test]
+    async fn route_originate_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::invalid_argument("bad prefix"),
+        ));
+        assert!(
+            run_cmd(
+                &["pv", "route", "originate", "bad/prefix", "--next-hop", "10.0.0.1"],
+                mock,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    // ── route withdraw ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_withdraw_basic() {
+        run_cmd(
+            &["pv", "route", "withdraw", "192.0.2.0/24"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_withdraw_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(run_cmd(&["pv", "route", "withdraw", "192.0.2.0/24"], mock).await.is_err());
+    }
+
+    // ── route list-originated ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_list_originated_empty() {
+        run_cmd(&["pv", "route", "list-originated"], MockDaemonClient::new())
             .await
             .unwrap();
     }

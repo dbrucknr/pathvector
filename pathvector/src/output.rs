@@ -3,7 +3,10 @@
 //! All output goes to stdout via `println!`.  Functions are kept pure (no I/O
 //! side-effects beyond printing) so they are easy to unit-test.
 
-use pathvector_client::types::{AsSegment, AsSegmentType, PeerState, Route, SessionState};
+use pathvector_client::types::{
+    AsSegment, AsSegmentType, PeerEvent, PeerEventType, PeerState, Route, RouteEvent,
+    RouteEventType, SessionState,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -205,6 +208,73 @@ pub fn print_route_detail(route: &Route) {
 
     if let Some(agg) = &route.aggregator {
         println!("Aggregator: AS{} {}", agg.asn, agg.address);
+    }
+}
+
+// ── Watch event output ────────────────────────────────────────────────────────
+
+/// Print a single route event as one line to stdout.
+///
+/// ```text
+/// CURRENT     10.0.0.0/8         via 192.0.2.1
+/// END_INITIAL
+/// ANNOUNCED   198.51.100.1/32    via local
+/// WITHDRAWN   10.2.0.0/24
+/// ```
+pub fn print_route_event(event: &RouteEvent) {
+    if event.event_type == RouteEventType::EndInitial {
+        println!("END_INITIAL");
+    } else if event.event_type == RouteEventType::Withdrawn {
+        let prefix = event.withdrawn_prefix.as_deref().unwrap_or("?");
+        println!("{:<12} {prefix}", "WITHDRAWN");
+    } else {
+        let label = if event.event_type == RouteEventType::Current {
+            "CURRENT"
+        } else {
+            "ANNOUNCED"
+        };
+        if let Some(route) = &event.route {
+            let via = route
+                .peer_address
+                .map_or_else(|| "local".to_owned(), |a| a.to_string());
+            println!("{:<12} {:<22} via {via}", label, route.prefix);
+        } else {
+            println!("{label}");
+        }
+    }
+}
+
+/// Print a single peer event as one line to stdout.
+///
+/// ```text
+/// CURRENT     192.0.2.1          AS65001  Established
+/// END_INITIAL
+/// CHANGED     192.0.2.1          AS65001  Idle
+/// ```
+pub fn print_peer_event(event: &PeerEvent) {
+    if event.event_type == PeerEventType::EndInitial {
+        println!("END_INITIAL");
+    } else {
+        let label = if event.event_type == PeerEventType::Current {
+            "CURRENT"
+        } else {
+            "CHANGED"
+        };
+        if let Some(peer) = &event.peer {
+            let state = match peer.session_state {
+                SessionState::Established => "Established",
+                SessionState::Idle => "Idle",
+                _ => "Unknown",
+            };
+            println!(
+                "{:<12} {:<22} AS{:<8} {state}",
+                label,
+                peer.address.to_string(),
+                peer.remote_as,
+            );
+        } else {
+            println!("{label}");
+        }
     }
 }
 
