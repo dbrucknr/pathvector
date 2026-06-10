@@ -294,8 +294,8 @@ mod tests {
 
     use super::*;
     use pathvector_client::types::{
-        Aggregator, AsSegment, AsSegmentType, LargeCommunity, Origin, PeerState, PeerType, Route,
-        SessionState,
+        Aggregator, AsSegment, AsSegmentType, LargeCommunity, Origin, PeerEvent, PeerEventType,
+        PeerState, PeerType, Route, RouteEvent, RouteEventType, SessionState,
     };
 
     // ── Scalar helpers ────────────────────────────────────────────────────────
@@ -519,4 +519,121 @@ mod tests {
         r.origin = Origin::Incomplete;
         print_route_detail(&r);
     }
+
+    #[test]
+    fn print_route_detail_internal_peer_type() {
+        let mut r = make_route_minimal();
+        r.peer_type = PeerType::Internal;
+        print_route_detail(&r);
+    }
+
+    // ── Watch event output ────────────────────────────────────────────────────
+
+    fn make_route_event_current() -> RouteEvent {
+        RouteEvent {
+            event_type: RouteEventType::Current,
+            route: Some(make_route_minimal()),
+            withdrawn_prefix: None,
+        }
+    }
+
+    #[test]
+    fn print_route_event_end_initial() {
+        print_route_event(&RouteEvent {
+            event_type: RouteEventType::EndInitial,
+            route: None,
+            withdrawn_prefix: None,
+        });
+    }
+
+    #[test]
+    fn print_route_event_current_with_peer() {
+        print_route_event(&make_route_event_current());
+    }
+
+    #[test]
+    fn print_route_event_current_local_origin() {
+        let mut ev = make_route_event_current();
+        if let Some(ref mut r) = ev.route {
+            r.peer_address = None;
+        }
+        print_route_event(&ev);
+    }
+
+    #[test]
+    fn print_route_event_announced() {
+        print_route_event(&RouteEvent {
+            event_type: RouteEventType::Announced,
+            route: Some(make_route_minimal()),
+            withdrawn_prefix: None,
+        });
+    }
+
+    #[test]
+    fn print_route_event_announced_no_route() {
+        print_route_event(&RouteEvent {
+            event_type: RouteEventType::Announced,
+            route: None,
+            withdrawn_prefix: None,
+        });
+    }
+
+    #[test]
+    fn print_route_event_withdrawn_with_prefix() {
+        print_route_event(&RouteEvent {
+            event_type: RouteEventType::Withdrawn,
+            route: None,
+            withdrawn_prefix: Some("192.0.2.0/24".to_owned()),
+        });
+    }
+
+    #[test]
+    fn print_route_event_withdrawn_no_prefix() {
+        print_route_event(&RouteEvent {
+            event_type: RouteEventType::Withdrawn,
+            route: None,
+            withdrawn_prefix: None,
+        });
+    }
+
+    #[test]
+    fn print_peer_event_end_initial() {
+        print_peer_event(&PeerEvent {
+            event_type: PeerEventType::EndInitial,
+            peer: None,
+        });
+    }
+
+    #[test]
+    fn print_peer_event_current_established() {
+        print_peer_event(&PeerEvent {
+            event_type: PeerEventType::Current,
+            peer: Some(make_peer(SessionState::Established, Some(PeerType::External))),
+        });
+    }
+
+    #[test]
+    fn print_peer_event_current_idle() {
+        print_peer_event(&PeerEvent {
+            event_type: PeerEventType::Current,
+            peer: Some(make_peer(SessionState::Idle, Some(PeerType::External))),
+        });
+    }
+
+    #[test]
+    fn print_peer_event_changed() {
+        print_peer_event(&PeerEvent {
+            event_type: PeerEventType::Changed,
+            peer: Some(make_peer(SessionState::Established, Some(PeerType::External))),
+        });
+    }
+
+    #[test]
+    fn print_peer_event_no_peer() {
+        print_peer_event(&PeerEvent {
+            event_type: PeerEventType::Changed,
+            peer: None,
+        });
+    }
+
 }

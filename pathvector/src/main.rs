@@ -304,6 +304,11 @@ mod tests {
         assert!(parse_community("0:65536").is_err());
     }
 
+    #[test]
+    fn parse_community_bad_value() {
+        assert!(parse_community("65000:abc").is_err());
+    }
+
     // ── Fixtures ──────────────────────────────────────────────────────────────
 
     fn make_peer() -> PeerState {
@@ -497,6 +502,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_originate_egp_origin() {
+        run_cmd(
+            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1", "--origin", "egp"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_originate_incomplete_origin() {
+        run_cmd(
+            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1", "--origin", "incomplete"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_command_no_ops_in_run_with() {
+        // Commands::Watch is handled before run_with in run(); passing it directly
+        // to run_with hits the no-op arm and returns Ok.
+        let cli = Cli::parse_from(["pv", "watch", "peers"]);
+        run_with(cli, |_addr| Ok(MockDaemonClient::new()), |_addr| async { Ok(()) })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn route_originate_with_community() {
         run_cmd(
             &[
@@ -537,6 +572,18 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn route_originate_batch_propagates_error() {
+        // originate_routes (batch) is not exposed as a CLI command but its mock
+        // method must be reachable; exercise it via the trait directly.
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        let err = mock.originate_routes(vec![]).await.unwrap_err();
+        assert!(matches!(err, pathvector_client::error::ClientError::Rpc(_)));
+    }
+
     // ── route withdraw ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -565,6 +612,47 @@ mod tests {
         run_cmd(&["pv", "route", "list-originated"], MockDaemonClient::new())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_originate_batch_success() {
+        let count = MockDaemonClient::new()
+            .originate_routes(vec![])
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn route_withdraw_batch_success() {
+        let count = MockDaemonClient::new()
+            .withdraw_originated_routes(vec!["192.0.2.0/24".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn route_withdraw_batch_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        let err = mock.withdraw_originated_routes(vec![]).await.unwrap_err();
+        assert!(matches!(err, pathvector_client::error::ClientError::Rpc(_)));
+    }
+
+    #[tokio::test]
+    async fn route_list_originated_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "route", "list-originated"], mock)
+                .await
+                .is_err()
+        );
     }
 
     // ── policy set-import ─────────────────────────────────────────────────────
