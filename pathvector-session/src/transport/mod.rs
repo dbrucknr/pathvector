@@ -606,11 +606,18 @@ mod tests {
 
     use tokio::sync::mpsc;
 
+    use std::net::Ipv4Addr as StdIpv4Addr;
+
     use super::{
         BgpTransport, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, spawn_with,
     };
     use crate::framing::FramingError;
-    use crate::message::{BgpMessage, Capability, OpenMessage, UpdateMessage};
+    use pathvector_types::Nlri;
+
+    use crate::message::{
+        AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, MalformedUpdate,
+        OpenMessage, PathAttribute, UpdateMessage,
+    };
 
     // ── MockTransport ─────────────────────────────────────────────────────────
 
@@ -812,6 +819,145 @@ mod tests {
         assert!(
             matches!(event, SessionEvent::Terminated),
             "expected Terminated after Stop command, got {event:?}"
+        );
+    }
+
+    /// RFC 7606 treat-as-withdraw: a [`MalformedUpdate`] with `treat_as_withdraw=true`
+    /// must keep the session alive and emit a [`SessionEvent::RouteUpdate`] whose
+    /// withdrawn set contains every announced NLRI from the original message.
+    #[tokio::test]
+    async fn test_rfc7606_treat_as_withdraw_keeps_session_up_and_withdraws_nlri() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        // Build a MalformedUpdate: ORIGIN was bad (treat-as-withdraw), two
+        // announced prefixes.  The decoder would produce this when it encounters
+        // a malformed ORIGIN attribute alongside valid NLRI in an UPDATE.
+        let prefix_a: Nlri<StdIpv4Addr> =
+            Nlri::new(StdIpv4Addr::new(10, 1, 0, 0), 24).unwrap();
+        let prefix_b: Nlri<StdIpv4Addr> =
+            Nlri::new(StdIpv4Addr::new(10, 2, 0, 0), 24).unwrap();
+
+        let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
+            update: UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::Med(100)],
+                announced: vec![prefix_a, prefix_b],
+            },
+            errors: vec![AttributeDecodeError {
+                type_code: 1, // ORIGIN
+                policy: AttributeErrorPolicy::TreatAsWithdraw,
+                detail: "invalid origin value",
+            }],
+            treat_as_withdraw: true,
+        });
+        peer.recv_tx.send(Ok(malformed)).unwrap();
+
+        // Session must not emit Terminated — it must stay up.
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for RouteUpdate after malformed UPDATE")
+            .expect("session exited unexpectedly");
+
+        match event {
+            SessionEvent::RouteUpdate(u) => {
+                // treat-as-withdraw: announced list must be empty.
+                assert!(
+                    u.announced.is_empty(),
+                    "treat-as-withdraw must clear announced, got {:?}",
+                    u.announced
+                );
+                // Both prefixes must appear in withdrawn.
+                assert!(
+                    u.withdrawn.contains(&prefix_a),
+                    "withdrawn must contain {prefix_a:?}"
+                );
+                assert!(
+                    u.withdrawn.contains(&prefix_b),
+                    "withdrawn must contain {prefix_b:?}"
+                );
+            }
+            other => panic!("expected RouteUpdate, got {other:?}"),
+        }
+
+        // Confirm the session is still alive: send a KEEPALIVE and verify the
+        // session does NOT emit Terminated within a short window.
+        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
+        assert!(
+            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
+            "session must not terminate after a treat-as-withdraw malformed UPDATE"
+        );
+    }
+
+    /// RFC 7606 attribute-discard: a [`MalformedUpdate`] with `treat_as_withdraw=false`
+    /// must keep the session alive and forward the cleaned UPDATE (bad attributes
+    /// already stripped by the decoder) as a [`SessionEvent::RouteUpdate`].
+    #[tokio::test]
+    async fn test_rfc7606_attribute_discard_keeps_session_up_and_forwards_update() {
+        use pathvector_types::Origin;
+
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        // MED was malformed (attribute-discard).  The decoder strips it and
+        // keeps ORIGIN.  The cleaned update still announces a prefix.
+        let prefix: Nlri<StdIpv4Addr> =
+            Nlri::new(StdIpv4Addr::new(192, 168, 1, 0), 24).unwrap();
+
+        let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
+            update: UpdateMessage {
+                withdrawn: vec![],
+                // MED was bad and has been dropped; only ORIGIN and NEXT_HOP survive.
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::NextHop(StdIpv4Addr::new(10, 0, 0, 1)),
+                ],
+                announced: vec![prefix],
+            },
+            errors: vec![AttributeDecodeError {
+                type_code: 4, // MED
+                policy: AttributeErrorPolicy::AttributeDiscard,
+                detail: "wrong length for MED",
+            }],
+            treat_as_withdraw: false,
+        });
+        peer.recv_tx.send(Ok(malformed)).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for RouteUpdate after attribute-discard UPDATE")
+            .expect("session exited unexpectedly");
+
+        match event {
+            SessionEvent::RouteUpdate(u) => {
+                // attribute-discard: announcement must be preserved.
+                assert!(
+                    u.announced.contains(&prefix),
+                    "announced must contain {prefix:?} after attribute-discard"
+                );
+                // No spurious withdrawals.
+                assert!(
+                    u.withdrawn.is_empty(),
+                    "withdrawn must be empty after attribute-discard, got {:?}",
+                    u.withdrawn
+                );
+            }
+            other => panic!("expected RouteUpdate, got {other:?}"),
+        }
+
+        // Confirm session is still alive.
+        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
+        assert!(
+            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
+            "session must not terminate after an attribute-discard malformed UPDATE"
         );
     }
 }
