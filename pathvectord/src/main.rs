@@ -797,11 +797,16 @@ impl DaemonState {
         for route in routes {
             let nlri = route.nlri;
             self.originated_routes.insert(nlri, route.clone());
-            self.loc_rib.insert(PeerId::from(LOCAL_ORIGIN_PEER), route);
+            self.loc_rib
+                .insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Announced as i32,
-                route: None, // filled by gRPC handler from loc_rib snapshot
+                route: Some(grpc::route_to_proto(
+                    PeerId::from(LOCAL_ORIGIN_PEER),
+                    nlri,
+                    &route,
+                )),
                 withdrawn_prefix: None,
             });
         }

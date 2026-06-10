@@ -130,7 +130,7 @@ pub struct Route {
     /// Advertised prefix in CIDR notation, e.g. `"10.0.0.0/8"`.
     pub prefix: String,
     /// IP address of the peer that sent this route, or [`None`] for locally
-    /// originated routes (injected via [`OriginationService`]).
+    /// originated routes (injected via the `OriginationService` gRPC API).
     pub peer_address: Option<IpAddr>,
     /// Whether the peer is iBGP or eBGP.
     pub peer_type: PeerType,

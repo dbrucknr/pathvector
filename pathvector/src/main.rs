@@ -283,7 +283,10 @@ mod tests {
 
     #[test]
     fn parse_community_valid() {
-        assert_eq!(parse_community("65000:666").unwrap(), (65000_u32 << 16) | 0x29A);
+        assert_eq!(
+            parse_community("65000:666").unwrap(),
+            (65000_u32 << 16) | 0x29A
+        );
     }
 
     #[test]

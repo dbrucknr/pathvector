@@ -99,7 +99,7 @@ fn proto_as_segment(seg: &AsPathSegment) -> AsSegment {
 ///
 /// `peer_id` is the peer from which the route was received; it is stored
 /// separately from the route itself in the RIB structures.
-fn route_to_proto(
+pub(crate) fn route_to_proto(
     peer_id: PeerId,
     nlri: pathvector_types::Nlri<Ipv4Addr>,
     route: &pathvector_rib::Route<Ipv4Addr>,
@@ -1685,6 +1685,35 @@ mod tests {
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
         assert!(s.originated_routes.contains_key(&nlri));
+    }
+
+    #[tokio::test]
+    async fn test_originate_route_event_carries_route_payload() {
+        let state = arc_state(65001, &[]);
+        // Subscribe before originating so we catch the event.
+        let mut rx = state.read().await.route_tx.subscribe();
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        svc.originate_route(Request::new(minimal_originate_req()))
+            .await
+            .expect("originate_route");
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_millis(100), async {
+            rx.recv().await
+        })
+        .await
+        .expect("timed out waiting for RouteEvent")
+        .expect("channel closed");
+
+        assert_eq!(event.r#type, proto::RouteEventType::Announced as i32);
+        let route = event
+            .route
+            .expect("Announced event must carry route payload");
+        assert_eq!(route.prefix, "192.0.2.0/24");
+        assert_eq!(route.peer_address, "0.0.0.0"); // LOCAL_ORIGIN_PEER
+        assert_eq!(route.next_hop, "10.0.0.1");
     }
 
     #[tokio::test]
