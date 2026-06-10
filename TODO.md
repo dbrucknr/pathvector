@@ -66,6 +66,25 @@ tables to `DaemonState` and routing `AfiSafi::IPV6_UNICAST` events to them.
 The RIB library is already generic. The outbound half (constructing MP_REACH_NLRI
 UPDATE messages with a valid IPv6 next-hop) is harder and can follow separately.
 
+**10. ROUTE-REFRESH send-guard** (`pathvector-session`) — correctness bug
+The `ROUTE-REFRESH` capability is correctly parsed and stored during OPEN
+negotiation, but `FsmOutput::SendRouteRefresh` is emitted without checking
+whether the peer advertised the capability. RFC 2918 §3 requires the sender
+to suppress ROUTE-REFRESH messages to peers that did not negotiate it; sending
+one anyway would trigger a NOTIFICATION and session reset on a strict peer.
+Fix: gate `FsmOutput::SendRouteRefresh` emission on
+`SessionInfo::peer_capabilities.contains(RouteRefresh)`. Small scope, one FSM
+guard + one unit test confirming the guard fires.
+
+**11. FSM error subcodes 1/2/3** (`pathvector-session`) — correctness gap
+RFC 4271 §6.5 defines three FSM Error subcodes:
+- Subcode 1: Receive Unexpected Message in OpenSent State
+- Subcode 2: Receive Unexpected Message in OpenConfirm State
+- Subcode 3: Receive Unexpected Message in Established State
+Currently the FSM sends subcode 0 (Unspecific) in all three cases. Each case
+is a small match arm change; combined with one unit test per subcode this
+closes three `❌` rows in RFC_REQUIREMENTS.md.
+
 ### Tier 3 — Larger scope, important but not blocking
 
 **7. BIRD interoperability**
