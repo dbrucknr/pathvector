@@ -6,7 +6,9 @@ pub(super) const MARKER: [u8; 16] = [0xFF; 16];
 /// The fixed size of the BGP message header in bytes.
 pub(super) const HEADER_LEN: usize = 19;
 /// Maximum total BGP message length (header + body) per RFC 4271.
-pub(super) const MAX_LEN: usize = 4096;
+pub const MAX_LEN: usize = 4096;
+/// Maximum total BGP message length when Extended Message is negotiated (RFC 8654).
+pub const MAX_LEN_EXTENDED: usize = 65535;
 
 /// The five BGP message types defined in RFC 4271 and RFC 2918.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,15 +45,22 @@ impl MessageType {
 
 /// Parse the 19-byte BGP header from `cur`.
 ///
+/// `max_len` is the negotiated upper bound on total message size — use
+/// [`MAX_LEN`] for the default RFC 4271 limit or [`MAX_LEN_EXTENDED`] when
+/// RFC 8654 Extended Message is in effect.
+///
 /// On success returns `(message_type, total_length)` where `total_length`
 /// includes the header itself. The cursor is advanced past the header.
-pub(super) fn decode_header(cur: &mut Cursor<'_>) -> Result<(MessageType, u16), CodecError> {
+pub(super) fn decode_header(
+    cur: &mut Cursor<'_>,
+    max_len: usize,
+) -> Result<(MessageType, u16), CodecError> {
     let marker = cur.read_bytes(16)?;
     if marker != MARKER {
         return Err(CodecError::InvalidMarker);
     }
     let length = cur.read_u16()?;
-    if (length as usize) < HEADER_LEN || (length as usize) > MAX_LEN {
+    if (length as usize) < HEADER_LEN || (length as usize) > max_len {
         return Err(CodecError::InvalidLength(length));
     }
     let msg_type = MessageType::from_u8(cur.read_u8()?)?;
@@ -86,7 +95,7 @@ mod tests {
     fn test_decode_header_keepalive() {
         let bytes = valid_header(4, 19);
         let mut cur = Cursor::new(&bytes);
-        let (t, len) = decode_header(&mut cur).unwrap();
+        let (t, len) = decode_header(&mut cur, MAX_LEN).unwrap();
         assert_eq!(t, MessageType::Keepalive);
         assert_eq!(len, 19);
         assert_eq!(cur.remaining(), 0);
@@ -97,24 +106,40 @@ mod tests {
         let mut bytes = valid_header(4, 19);
         bytes[0] = 0x00; // corrupt marker
         let mut cur = Cursor::new(&bytes);
-        assert_eq!(decode_header(&mut cur), Err(CodecError::InvalidMarker));
+        assert_eq!(
+            decode_header(&mut cur, MAX_LEN),
+            Err(CodecError::InvalidMarker)
+        );
     }
 
     #[test]
     fn test_decode_header_length_too_small() {
         let bytes = valid_header(4, 18); // below minimum
         let mut cur = Cursor::new(&bytes);
-        assert_eq!(decode_header(&mut cur), Err(CodecError::InvalidLength(18)));
+        assert_eq!(
+            decode_header(&mut cur, MAX_LEN),
+            Err(CodecError::InvalidLength(18))
+        );
     }
 
     #[test]
     fn test_decode_header_length_too_large() {
-        let bytes = valid_header(4, 4097); // above maximum
+        let bytes = valid_header(4, 4097); // above RFC 4271 maximum
         let mut cur = Cursor::new(&bytes);
         assert_eq!(
-            decode_header(&mut cur),
+            decode_header(&mut cur, MAX_LEN),
             Err(CodecError::InvalidLength(4097))
         );
+    }
+
+    #[test]
+    fn test_decode_header_length_valid_in_extended_mode() {
+        // 4097 is valid when RFC 8654 Extended Message is negotiated.
+        let mut header = vec![0xFF; 16];
+        header.extend_from_slice(&4097_u16.to_be_bytes());
+        header.push(4); // Keepalive type
+        let mut cur = Cursor::new(&header);
+        assert!(decode_header(&mut cur, MAX_LEN_EXTENDED).is_ok());
     }
 
     #[test]
@@ -122,7 +147,7 @@ mod tests {
         let bytes = valid_header(99, 19);
         let mut cur = Cursor::new(&bytes);
         assert_eq!(
-            decode_header(&mut cur),
+            decode_header(&mut cur, MAX_LEN),
             Err(CodecError::UnknownMessageType(99))
         );
     }
@@ -134,7 +159,7 @@ mod tests {
         let encoded = w.finish();
         assert_eq!(encoded.len(), HEADER_LEN);
         let mut cur = Cursor::new(&encoded);
-        let (t, len) = decode_header(&mut cur).unwrap();
+        let (t, len) = decode_header(&mut cur, MAX_LEN).unwrap();
         assert_eq!(t, MessageType::Open);
         assert_eq!(len as usize, HEADER_LEN + 10);
     }

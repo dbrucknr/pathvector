@@ -9,14 +9,12 @@ use std::io;
 use bytes::{BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::message::{BgpMessage, CodecError};
+use crate::message::{BgpMessage, CodecError, MAX_LEN, MAX_LEN_EXTENDED};
 
 /// Total size of the BGP message header in bytes (marker + length + type).
 const HEADER_LEN: usize = 19;
 /// Offset of the 2-byte length field within the header.
 const LEN_OFFSET: usize = 16;
-/// Maximum total BGP message size (RFC 4271 §4.1).
-const MAX_MSG_LEN: usize = 4096;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +66,10 @@ impl From<CodecError> for FramingError {
 /// accumulates bytes until that many are available, then calls
 /// [`BgpMessage::decode`] on the complete frame.
 ///
+/// By default the codec enforces the RFC 4271 4096-byte maximum. Call
+/// [`BgpCodec::set_extended_message`] after Extended Message capability
+/// (RFC 8654) is negotiated to raise the limit to 65535 bytes.
+///
 /// Wrap a [`tokio::net::TcpStream`] to get an async stream of decoded messages:
 ///
 /// ```rust,ignore
@@ -75,12 +77,36 @@ impl From<CodecError> for FramingError {
 /// use pathvector_session::framing::BgpCodec;
 ///
 /// let (reader, writer) = tcp_stream.into_split();
-/// let mut framed = FramedRead::new(reader, BgpCodec);
+/// let mut framed = FramedRead::new(reader, BgpCodec::new());
 /// while let Some(msg) = framed.next().await.transpose()? {
 ///     // msg: BgpMessage
 /// }
 /// ```
-pub struct BgpCodec;
+pub struct BgpCodec {
+    max_msg_len: usize,
+}
+
+impl BgpCodec {
+    /// Create a codec with the default RFC 4271 4096-byte limit.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_msg_len: MAX_LEN,
+        }
+    }
+
+    /// Raise the message size limit to 65535 bytes (RFC 8654 Extended Message).
+    /// Call this after Extended Message capability is negotiated by both peers.
+    pub fn set_extended_message(&mut self, enabled: bool) {
+        self.max_msg_len = if enabled { MAX_LEN_EXTENDED } else { MAX_LEN };
+    }
+}
+
+impl Default for BgpCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Decoder for BgpCodec {
     type Item = BgpMessage;
@@ -98,7 +124,7 @@ impl Decoder for BgpCodec {
 
         // Validate before waiting for the rest of the body — a bad length
         // means the framing is broken and the connection must be closed.
-        if !(HEADER_LEN..=MAX_MSG_LEN).contains(&msg_len) {
+        if !(HEADER_LEN..=self.max_msg_len).contains(&msg_len) {
             return Err(FramingError::Codec(CodecError::InvalidLength(raw_len)));
         }
 
@@ -155,14 +181,14 @@ mod tests {
 
     #[test]
     fn test_partial_header_returns_none() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::from(&[0xFF_u8; 10][..]);
         assert!(matches!(codec.decode(&mut buf), Ok(None)));
     }
 
     #[test]
     fn test_complete_header_but_incomplete_body_returns_none() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         // OPEN is longer than 19 bytes; truncate to exactly 19.
         let mut buf = open_bytes();
         let full_len = buf.len();
@@ -173,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_decode_keepalive() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = keepalive_bytes();
         let msg = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(msg, BgpMessage::Keepalive);
@@ -182,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_decode_open() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = open_bytes();
         let msg = codec.decode(&mut buf).unwrap().unwrap();
         assert!(matches!(msg, BgpMessage::Open(_)));
@@ -191,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_decode_two_messages_in_one_buffer() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = keepalive_bytes();
         buf.extend_from_slice(&BgpMessage::Keepalive.encode());
 
@@ -206,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_decode_message_followed_by_partial() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = keepalive_bytes();
         buf.extend_from_slice(&[0xFF_u8; 5]); // partial of a second message
 
@@ -219,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_decode_length_too_small_is_error() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         // Build a header with length=10 (below the 19-byte minimum).
         let mut buf = BytesMut::from([0xFF_u8; 16].as_slice());
         buf.extend_from_slice(&10_u16.to_be_bytes()); // length = 10
@@ -232,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_decode_length_too_large_is_error() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::from([0xFF_u8; 16].as_slice());
         buf.extend_from_slice(&4097_u16.to_be_bytes()); // length = 4097
         buf.extend_from_slice(&[4_u8]);
@@ -244,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_decode_corrupt_marker_is_error() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut bytes = BgpMessage::Keepalive.encode();
         bytes[0] = 0x00; // corrupt the first marker byte
         let mut buf = BytesMut::from(bytes.as_slice());
@@ -258,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_encode_keepalive_produces_19_bytes() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::new();
         codec.encode(BgpMessage::Keepalive, &mut buf).unwrap();
         assert_eq!(buf.len(), HEADER_LEN);
@@ -266,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_encode_sets_all_ff_marker() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::new();
         codec.encode(BgpMessage::Keepalive, &mut buf).unwrap();
         assert!(buf[..16].iter().all(|&b| b == 0xFF));
@@ -316,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let original = BgpMessage::Open(OpenMessage {
             version: 4,
             my_as: 65001,

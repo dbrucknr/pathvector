@@ -835,6 +835,7 @@ where
             capabilities: vec![
                 Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
                 Capability::FourByteAsn(local_as),
+                Capability::ExtendedMessage,
             ],
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
@@ -1741,7 +1742,10 @@ mod tests {
             PeerType::External,
         );
         // Pre-policy route stored in AdjRibIn for soft-reconfig visibility.
-        assert!(ari.get(&prefix).is_some(), "BLACKHOLE route must be in AdjRibIn");
+        assert!(
+            ari.get(&prefix).is_some(),
+            "BLACKHOLE route must be in AdjRibIn"
+        );
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub trait BgpTransport: Send + 'static {
     fn recv(
         &mut self,
     ) -> impl Future<Output = Option<Result<BgpMessage, FramingError>>> + Send + '_;
+    /// Raise (or lower) the message size limit after Extended Message capability
+    /// (RFC 8654) is negotiated. Default implementation is a no-op.
+    fn set_extended_message(&mut self, _enabled: bool) {}
 }
 
 // ── Production transport impl ─────────────────────────────────────────────────
@@ -59,8 +62,8 @@ impl FramedBgpTransport {
     fn from_stream(stream: TcpStream) -> Self {
         let (r, w) = stream.into_split();
         Self {
-            reader: FramedRead::new(r, BgpCodec),
-            writer: FramedWrite::new(w, BgpCodec),
+            reader: FramedRead::new(r, BgpCodec::new()),
+            writer: FramedWrite::new(w, BgpCodec::new()),
         }
     }
 }
@@ -77,6 +80,10 @@ impl BgpTransport for FramedBgpTransport {
 
     async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
         self.reader.next().await
+    }
+
+    fn set_extended_message(&mut self, enabled: bool) {
+        self.reader.decoder_mut().set_extended_message(enabled);
     }
 }
 
@@ -481,6 +488,18 @@ impl<T: BgpTransport> Session<T> {
                     self.retry_deadline = None;
                 }
                 FsmOutput::SessionEstablished(info) => {
+                    // RFC 8654: raise the codec limit if both sides negotiated
+                    // Extended Message capability.
+                    let extended = info
+                        .peer_capabilities
+                        .contains(&Capability::ExtendedMessage)
+                        && self
+                            .config
+                            .capabilities
+                            .contains(&Capability::ExtendedMessage);
+                    if let Some(t) = &mut self.transport {
+                        t.set_extended_message(extended);
+                    }
                     let _ = self.event_tx.send(SessionEvent::Established(info)).await;
                 }
                 FsmOutput::SessionTerminated => {

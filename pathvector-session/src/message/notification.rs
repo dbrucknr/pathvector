@@ -406,7 +406,10 @@ mod tests {
             NotificationError::FsmErrorEstablished,
         ];
         for error in cases {
-            let msg = NotificationMessage { error, data: vec![] };
+            let msg = NotificationMessage {
+                error,
+                data: vec![],
+            };
             assert_eq!(roundtrip(&msg), msg);
         }
     }

@@ -8,7 +8,7 @@ mod route_refresh;
 mod update;
 
 pub use error::CodecError;
-pub use header::MessageType;
+pub use header::{MAX_LEN, MAX_LEN_EXTENDED, MessageType};
 pub use notification::{
     CeaseError, MsgHeaderError, NotificationError, NotificationMessage, OpenMsgError,
     UpdateMsgError,
@@ -201,8 +201,21 @@ impl BgpMessage {
     /// Returns `CodecError` if the marker is corrupt, the length is out of
     /// range, the type is unknown, or any field within the body is malformed.
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+        Self::decode_with_limit(buf, MAX_LEN_EXTENDED)
+    }
+
+    /// Decode from wire bytes, enforcing `max_len` as the upper bound on total
+    /// message size. Use [`MAX_LEN`] for the RFC 4271 default or
+    /// [`MAX_LEN_EXTENDED`] when RFC 8654 Extended Message is in effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CodecError` if the marker is corrupt, the length is out of
+    /// range or exceeds `max_len`, the type is unknown, or any field within
+    /// the body is malformed.
+    pub fn decode_with_limit(buf: &[u8], max_len: usize) -> Result<Self, CodecError> {
         let mut cur = Cursor::new(buf);
-        let (msg_type, total_len) = decode_header(&mut cur)?;
+        let (msg_type, total_len) = decode_header(&mut cur, max_len)?;
 
         if buf.len() != total_len as usize {
             return Err(CodecError::InvalidLength(total_len));

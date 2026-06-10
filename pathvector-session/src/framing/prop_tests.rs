@@ -231,7 +231,7 @@ proptest! {
     /// leaves the buffer empty.
     #[test]
     fn prop_encode_decode_roundtrip(msg in arb_bgp_message()) {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::new();
         codec.encode(msg.clone(), &mut buf).unwrap();
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -242,7 +242,7 @@ proptest! {
     /// The decoder must never panic on arbitrary byte input.
     #[test]
     fn prop_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::from(bytes.as_slice());
         let _ = codec.decode(&mut buf);
     }
@@ -254,7 +254,7 @@ proptest! {
         first  in arb_bgp_message(),
         second in arb_bgp_message(),
     ) {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::new();
         codec.encode(first.clone(), &mut buf).unwrap();
         codec.encode(second.clone(), &mut buf).unwrap();
@@ -272,7 +272,7 @@ proptest! {
     /// Ok(None) — the codec waits for more bytes rather than erroring.
     #[test]
     fn prop_partial_message_returns_none(msg in arb_bgp_message()) {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let full = msg.encode();
         for trunc_len in 0..full.len() {
             let mut buf = BytesMut::from(&full[..trunc_len]);
@@ -284,7 +284,8 @@ proptest! {
         }
     }
 
-    /// A length field outside [19, 4096] is rejected before the body arrives.
+    /// A length field outside [19, 4096] is rejected before the body arrives
+    /// (default codec, no Extended Message negotiated).
     #[test]
     fn prop_out_of_range_length_is_error(
         bad_len in prop_oneof![
@@ -292,10 +293,90 @@ proptest! {
             4097u16..=u16::MAX,
         ],
     ) {
-        let mut codec = BgpCodec;
+        let mut codec = BgpCodec::new();
         let mut buf = BytesMut::from([0xFF_u8; 16].as_slice()); // all-FF marker
         buf.extend_from_slice(&bad_len.to_be_bytes());
         buf.extend_from_slice(&[4u8]); // type byte (Keepalive)
         prop_assert!(codec.decode(&mut buf).is_err());
+    }
+
+    /// UPDATE messages with many NLRIs roundtrip correctly through an
+    /// Extended Message (RFC 8654) codec — verifies large-message encode/decode.
+    #[test]
+    fn prop_large_update_roundtrip_extended_message(
+        nlri_count in 100usize..=2000usize,
+    ) {
+        let nlris: Vec<Nlri<Ipv4Addr>> = (0..nlri_count)
+            .map(|i| {
+                // Distribute across /24 space: 10.x.y.0/24
+                let a = u8::try_from((i / 256) % 256).unwrap();
+                let b = u8::try_from(i % 256).unwrap();
+                Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap()
+            })
+            .collect();
+
+        let msg = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(
+                    pathvector_types::AsPath::from_sequence(vec![
+                        pathvector_types::Asn::new(65001),
+                    ])
+                ),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)),
+            ],
+            announced: nlris.clone(),
+        });
+
+        let encoded = msg.encode();
+        // Only test if the message fits in the extended limit.
+        prop_assume!(encoded.len() <= 65535);
+
+        let mut codec = BgpCodec::new();
+        codec.set_extended_message(true);
+        let mut buf = BytesMut::from(encoded.as_slice());
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+
+        if let BgpMessage::Update(u) = decoded {
+            prop_assert_eq!(u.announced.len(), nlri_count);
+        } else {
+            prop_assert!(false, "expected Update message");
+        }
+    }
+
+    /// Large UPDATE rejected by default codec but accepted after set_extended_message.
+    #[test]
+    fn prop_large_update_rejected_without_extended_message(
+        nlri_count in 200usize..=2000usize,
+    ) {
+        let nlris: Vec<Nlri<Ipv4Addr>> = (0..nlri_count)
+            .map(|i| {
+                let a = u8::try_from((i / 256) % 256).unwrap();
+                let b = u8::try_from(i % 256).unwrap();
+                Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap()
+            })
+            .collect();
+
+        let msg = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::Origin(Origin::Igp)],
+            announced: nlris,
+        });
+        let encoded = msg.encode();
+
+        // Skip test cases that happen to fit in 4096 bytes.
+        prop_assume!(encoded.len() > 4096 && encoded.len() <= 65535);
+
+        // Default codec rejects.
+        let mut default_codec = BgpCodec::new();
+        let mut buf = BytesMut::from(encoded.as_slice());
+        prop_assert!(default_codec.decode(&mut buf).is_err(), "default codec should reject large message");
+
+        // Extended codec accepts.
+        let mut ext_codec = BgpCodec::new();
+        ext_codec.set_extended_message(true);
+        let mut buf2 = BytesMut::from(encoded.as_slice());
+        prop_assert!(ext_codec.decode(&mut buf2).unwrap().is_some(), "extended codec should accept large message");
     }
 }

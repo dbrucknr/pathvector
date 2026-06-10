@@ -60,8 +60,8 @@ async fn accept_and_handshake(
 ) {
     let (stream, _) = listener.accept().await.unwrap();
     let (r, w) = stream.into_split();
-    let mut reader = FramedRead::new(r, BgpCodec);
-    let mut writer = FramedWrite::new(w, BgpCodec);
+    let mut reader = FramedRead::new(r, BgpCodec::new());
+    let mut writer = FramedWrite::new(w, BgpCodec::new());
 
     // Receive OPEN from session under test.
     let msg = reader.next().await.unwrap().unwrap();
@@ -243,8 +243,8 @@ async fn accept_and_handshake_short(
 ) {
     let (stream, _) = listener.accept().await.unwrap();
     let (r, w) = stream.into_split();
-    let mut reader = FramedRead::new(r, BgpCodec);
-    let mut writer = FramedWrite::new(w, BgpCodec);
+    let mut reader = FramedRead::new(r, BgpCodec::new());
+    let mut writer = FramedWrite::new(w, BgpCodec::new());
 
     let msg = reader.next().await.unwrap().unwrap();
     assert!(matches!(msg, BgpMessage::Open(_)));
@@ -417,8 +417,8 @@ async fn test_codec_error_emits_terminated() {
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (r, w) = stream.into_split();
-        let mut reader = FramedRead::new(r, BgpCodec);
-        let mut writer = FramedWrite::new(w, BgpCodec);
+        let mut reader = FramedRead::new(r, BgpCodec::new());
+        let mut writer = FramedWrite::new(w, BgpCodec::new());
 
         // Complete the normal handshake.
         let _ = reader.next().await.unwrap().unwrap();
@@ -525,8 +525,8 @@ async fn test_open_with_wrong_peer_as_does_not_establish() {
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (r, w) = stream.into_split();
-        let mut reader = FramedRead::new(r, BgpCodec);
-        let mut writer = FramedWrite::new(w, BgpCodec);
+        let mut reader = FramedRead::new(r, BgpCodec::new());
+        let mut writer = FramedWrite::new(w, BgpCodec::new());
 
         let _ = reader.next().await; // receive OPEN
         writer.send(peer_open(99999, 90)).await.unwrap(); // wrong AS

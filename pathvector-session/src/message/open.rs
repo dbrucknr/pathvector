@@ -121,6 +121,8 @@ fn decode_capability(code: u8, cur: &mut Cursor<'_>) -> Result<Capability, Codec
         }
         // Route Refresh (RFC 2918): no value
         2 => Ok(Capability::RouteRefresh),
+        // Extended Message (RFC 8654): no value
+        6 => Ok(Capability::ExtendedMessage),
         // 4-byte ASN (RFC 6793): 4-byte AS number
         65 => {
             if cur.remaining() < 4 {
@@ -183,7 +185,7 @@ fn encode_capability_value(cap: &Capability) -> Vec<u8> {
             v.put_u8(0); // reserved
             v.put_u8(afi_safi.safi.as_u8());
         }
-        Capability::RouteRefresh => {}
+        Capability::RouteRefresh | Capability::ExtendedMessage => {}
         Capability::FourByteAsn(asn) => {
             v.put_u32(*asn);
         }
@@ -240,6 +242,12 @@ pub enum Capability {
         families: Vec<GracefulRestartFamily>,
     },
 
+    /// Extended Message support (RFC 8654, code 6).
+    ///
+    /// When both peers advertise this, UPDATE (and other) messages may be up
+    /// to 65535 bytes instead of the default 4096-byte limit.
+    ExtendedMessage,
+
     /// Any capability code not recognised above. The raw value bytes are
     /// preserved so unknown capabilities can be forwarded without corruption.
     Unknown { code: u8, value: Vec<u8> },
@@ -250,6 +258,7 @@ impl Capability {
         match self {
             Self::MultiProtocol(_) => 1,
             Self::RouteRefresh => 2,
+            Self::ExtendedMessage => 6,
             Self::FourByteAsn(_) => 65,
             Self::GracefulRestart { .. } => 64,
             Self::Unknown { code, .. } => *code,

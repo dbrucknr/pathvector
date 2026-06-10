@@ -562,6 +562,17 @@ impl Fsm {
             ));
         }
 
+        // RFC 6286: BGP Identifier must be unique within the AS. An iBGP peer
+        // with the same BGP ID as the local speaker indicates a routing loop or
+        // misconfiguration — reject with BadBgpIdentifier.
+        let peer_as = resolve_as(peer);
+        if peer_as == self.config.local_as && peer.bgp_id == self.config.local_bgp_id {
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
+                vec![],
+            ));
+        }
+
         if let Some(expected) = self.config.peer_as
             && resolve_as(peer) != expected
         {
@@ -1422,7 +1433,11 @@ mod tests {
 
         // UPDATE is not valid in OpenConfirm — expect FSM Error subcode 2.
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Update(
-            UpdateMessage { withdrawn: vec![], attributes: vec![], announced: vec![] },
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![],
+                announced: vec![],
+            },
         )));
 
         assert_eq!(fsm.state(), State::Idle);
@@ -1533,15 +1548,13 @@ mod tests {
         let (mut fsm, _) = establish(default_config());
 
         // OPEN is never valid in Established — expect FSM Error subcode 3.
-        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Open(
-            OpenMessage {
-                version: 4,
-                my_as: 65002,
-                hold_time: 90,
-                bgp_id: std::net::Ipv4Addr::new(10, 0, 0, 2),
-                capabilities: vec![],
-            },
-        )));
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: std::net::Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![],
+        })));
 
         assert_eq!(fsm.state(), State::Idle);
         assert!(matches!(
@@ -1607,7 +1620,10 @@ mod tests {
         )));
 
         assert_eq!(fsm.state(), State::Established, "session must stay up");
-        assert!(out.is_empty(), "no outputs expected until re-advert is wired");
+        assert!(
+            out.is_empty(),
+            "no outputs expected until re-advert is wired"
+        );
     }
 
     #[test]
@@ -1743,6 +1759,64 @@ mod tests {
         );
     }
 
+    // ── RFC 6286 — AS-wide unique BGP identifier ──────────────────────────────
+
+    #[test]
+    fn test_ibgp_peer_with_same_bgp_id_is_rejected() {
+        // iBGP peer (same AS) sending our own BGP ID — routing loop / misconfiguration.
+        let config = FsmConfig {
+            local_as: 65001,
+            peer_as: Some(65001), // iBGP
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        let duplicate_id_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65001,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 1), // same as local_bgp_id in default_config
+            capabilities: vec![Capability::FourByteAsn(65001)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(duplicate_id_open));
+
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(
+            matches!(
+                find_send(&out),
+                Some(BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
+                    ..
+                }))
+            ),
+            "expected BadBgpIdentifier NOTIFICATION"
+        );
+    }
+
+    #[test]
+    fn test_ebgp_peer_with_same_bgp_id_is_allowed() {
+        // eBGP peer may legitimately share a BGP ID (different AS, different operator).
+        let mut fsm = Fsm::new(default_config()); // peer_as = Some(65002) — eBGP
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        let ebgp_same_id = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 1), // same as our local_bgp_id
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        fsm.process(FsmInput::MessageReceived(ebgp_same_id));
+        assert_eq!(
+            fsm.state(),
+            State::OpenConfirm,
+            "eBGP peer with same BGP ID should not be rejected"
+        );
+    }
+
     // ── RFC 5492 — Unsupported Capability ─────────────────────────────────────
 
     #[test]
@@ -1805,7 +1879,11 @@ mod tests {
             capabilities: vec![Capability::FourByteAsn(65002), Capability::RouteRefresh],
         });
         fsm.process(FsmInput::MessageReceived(peer_open_with_rr));
-        assert_eq!(fsm.state(), State::OpenConfirm, "session should proceed to OpenConfirm");
+        assert_eq!(
+            fsm.state(),
+            State::OpenConfirm,
+            "session should proceed to OpenConfirm"
+        );
     }
 
     #[test]
