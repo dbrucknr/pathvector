@@ -27,12 +27,13 @@ mod proto {
 }
 
 use proto::{
-    ListOriginatedRoutesResponse, ListPeersResponse, ListRoutesResponse,
-    OriginateRouteResponse, OriginateRoutesResponse, PeerEvent, PeerState as ProtoPeerState,
-    Route as ProtoRoute, RouteEvent, RouteResponse, WithdrawOriginatedRouteResponse,
-    WithdrawOriginatedRoutesResponse,
+    ListOriginatedRoutesResponse, ListPeersResponse, ListRoutesResponse, OriginateRouteResponse,
+    OriginateRoutesResponse, PeerEvent, PeerState as ProtoPeerState, Route as ProtoRoute,
+    RouteEvent, RouteResponse, SetExportDefaultResponse, SetImportDefaultResponse,
+    WithdrawOriginatedRouteResponse, WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
+    policy_service_server::{PolicyService, PolicyServiceServer},
     rib_service_server::{RibService, RibServiceServer},
 };
 
@@ -110,6 +111,40 @@ impl PeerService for MockPeer {
     }
 }
 
+struct MockPeerWithEvents;
+
+#[tonic::async_trait]
+impl PeerService for MockPeerWithEvents {
+    async fn list_peers(
+        &self,
+        _req: Request<proto::ListPeersRequest>,
+    ) -> Result<Response<ListPeersResponse>, Status> {
+        Ok(Response::new(ListPeersResponse { peers: vec![] }))
+    }
+
+    async fn get_peer(
+        &self,
+        _req: Request<proto::GetPeerRequest>,
+    ) -> Result<Response<proto::PeerState>, Status> {
+        Err(Status::not_found("no peers"))
+    }
+
+    type WatchPeersStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
+
+    async fn watch_peers(
+        &self,
+        _req: Request<proto::WatchPeersRequest>,
+    ) -> Result<Response<Self::WatchPeersStream>, Status> {
+        let event = PeerEvent {
+            r#type: proto::PeerEventType::EndInitial as i32,
+            peer: None,
+        };
+        let stream = futures::stream::once(async move { Ok(event) });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
 #[tonic::async_trait]
 impl RibService for MockRib {
     async fn get_best_route(
@@ -163,6 +198,70 @@ impl RibService for MockRib {
     }
 }
 
+struct MockRibWithEvents;
+
+#[tonic::async_trait]
+impl RibService for MockRibWithEvents {
+    async fn get_best_route(
+        &self,
+        _req: Request<proto::GetBestRouteRequest>,
+    ) -> Result<Response<RouteResponse>, Status> {
+        Ok(Response::new(RouteResponse {
+            found: false,
+            route: None,
+        }))
+    }
+
+    async fn list_routes(
+        &self,
+        _req: Request<proto::ListRoutesRequest>,
+    ) -> Result<Response<ListRoutesResponse>, Status> {
+        Ok(Response::new(ListRoutesResponse { routes: vec![] }))
+    }
+
+    async fn list_candidates(
+        &self,
+        _req: Request<proto::ListCandidatesRequest>,
+    ) -> Result<Response<ListRoutesResponse>, Status> {
+        Ok(Response::new(ListRoutesResponse { routes: vec![] }))
+    }
+
+    type WatchRoutesStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<RouteEvent, Status>> + Send>>;
+
+    async fn watch_routes(
+        &self,
+        _req: Request<proto::WatchRoutesRequest>,
+    ) -> Result<Response<Self::WatchRoutesStream>, Status> {
+        let event = RouteEvent {
+            r#type: proto::RouteEventType::EndInitial as i32,
+            route: None,
+            withdrawn_prefix: None,
+        };
+        let stream = futures::stream::once(async move { Ok(event) });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+struct MockPolicy;
+
+#[tonic::async_trait]
+impl PolicyService for MockPolicy {
+    async fn set_import_default(
+        &self,
+        _req: Request<proto::SetImportDefaultRequest>,
+    ) -> Result<Response<SetImportDefaultResponse>, Status> {
+        Ok(Response::new(SetImportDefaultResponse {}))
+    }
+
+    async fn set_export_default(
+        &self,
+        _req: Request<proto::SetExportDefaultRequest>,
+    ) -> Result<Response<SetExportDefaultResponse>, Status> {
+        Ok(Response::new(SetExportDefaultResponse {}))
+    }
+}
+
 struct MockOrigination;
 
 #[tonic::async_trait]
@@ -178,7 +277,7 @@ impl OriginationService for MockOrigination {
         &self,
         req: Request<proto::OriginateRoutesRequest>,
     ) -> Result<Response<OriginateRoutesResponse>, Status> {
-        let count = req.into_inner().routes.len() as u32;
+        let count = u32::try_from(req.into_inner().routes.len()).unwrap_or(u32::MAX);
         Ok(Response::new(OriginateRoutesResponse { count }))
     }
 
@@ -193,7 +292,7 @@ impl OriginationService for MockOrigination {
         &self,
         req: Request<proto::WithdrawOriginatedRoutesRequest>,
     ) -> Result<Response<WithdrawOriginatedRoutesResponse>, Status> {
-        let count = req.into_inner().prefixes.len() as u32;
+        let count = u32::try_from(req.into_inner().prefixes.len()).unwrap_or(u32::MAX);
         Ok(Response::new(WithdrawOriginatedRoutesResponse { count }))
     }
 
@@ -201,7 +300,9 @@ impl OriginationService for MockOrigination {
         &self,
         _req: Request<proto::ListOriginatedRoutesRequest>,
     ) -> Result<Response<ListOriginatedRoutesResponse>, Status> {
-        Ok(Response::new(ListOriginatedRoutesResponse { routes: vec![] }))
+        Ok(Response::new(ListOriginatedRoutesResponse {
+            routes: vec![],
+        }))
     }
 }
 
@@ -218,6 +319,7 @@ async fn start_server() -> SocketAddr {
         tonic::transport::Server::builder()
             .add_service(PeerServiceServer::new(MockPeer))
             .add_service(RibServiceServer::new(MockRib))
+            .add_service(PolicyServiceServer::new(MockPolicy))
             .add_service(OriginationServiceServer::new(MockOrigination))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
@@ -412,4 +514,245 @@ async fn list_candidates_returns_candidates() {
         candidates[0].peer_address.map(|a| a.to_string()),
         Some("192.0.2.1".to_owned())
     );
+}
+
+// ── set_import_default() / set_export_default() ───────────────────────────────
+
+#[tokio::test]
+async fn set_import_default_accept_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    client
+        .set_import_default("192.0.2.1", true)
+        .await
+        .expect("set_import_default accept");
+}
+
+#[tokio::test]
+async fn set_import_default_reject_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    client
+        .set_import_default("192.0.2.1", false)
+        .await
+        .expect("set_import_default reject");
+}
+
+#[tokio::test]
+async fn set_export_default_accept_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    client
+        .set_export_default("192.0.2.1", true)
+        .await
+        .expect("set_export_default accept");
+}
+
+#[tokio::test]
+async fn set_export_default_reject_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    client
+        .set_export_default("192.0.2.1", false)
+        .await
+        .expect("set_export_default reject");
+}
+
+// ── origination — inherent methods (covers lib.rs) ────────────────────────────
+
+fn make_params(prefix: &str) -> pathvector_client::types::OriginateRouteParams {
+    pathvector_client::types::OriginateRouteParams {
+        prefix: prefix.to_owned(),
+        next_hop: "10.0.0.1".to_owned(),
+        origin: pathvector_client::types::Origin::Igp,
+        communities: vec![],
+        large_communities: vec![],
+        extended_communities: vec![],
+        local_pref: None,
+        med: None,
+    }
+}
+
+#[tokio::test]
+async fn originate_route_inherent_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    client
+        .originate_route(make_params("192.0.2.0/24"))
+        .await
+        .expect("originate_route");
+}
+
+#[tokio::test]
+async fn originate_routes_inherent_returns_count() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let count = client
+        .originate_routes(vec![
+            make_params("192.0.2.0/24"),
+            make_params("198.51.100.0/24"),
+        ])
+        .await
+        .expect("originate_routes");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn withdraw_originated_route_inherent_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    client
+        .withdraw_originated_route("192.0.2.0/24")
+        .await
+        .expect("withdraw_originated_route");
+}
+
+#[tokio::test]
+async fn withdraw_originated_routes_inherent_returns_count() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let count = client
+        .withdraw_originated_routes(vec![
+            "192.0.2.0/24".to_owned(),
+            "198.51.100.0/24".to_owned(),
+        ])
+        .await
+        .expect("withdraw_originated_routes");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn list_originated_routes_inherent_returns_empty() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let routes = client
+        .list_originated_routes()
+        .await
+        .expect("list_originated_routes");
+    assert!(routes.is_empty());
+}
+
+// ── origination — via DaemonClient trait (covers client_trait.rs) ────────────
+
+/// Call origination methods through a generic DaemonClient bound so the
+/// trait impl in client_trait.rs is exercised rather than the inherent methods.
+async fn originate_via_trait<C: DaemonClient>(client: &mut C) {
+    client
+        .originate_route(make_params("10.0.0.0/8"))
+        .await
+        .expect("trait originate_route");
+    let count = client
+        .originate_routes(vec![make_params("10.1.0.0/16"), make_params("10.2.0.0/16")])
+        .await
+        .expect("trait originate_routes");
+    assert_eq!(count, 2);
+    client
+        .withdraw_originated_route("10.0.0.0/8")
+        .await
+        .expect("trait withdraw_originated_route");
+    let wcount = client
+        .withdraw_originated_routes(vec!["10.1.0.0/16".to_owned()])
+        .await
+        .expect("trait withdraw_originated_routes");
+    assert_eq!(wcount, 1);
+    let routes = client
+        .list_originated_routes()
+        .await
+        .expect("trait list_originated_routes");
+    assert!(routes.is_empty());
+}
+
+#[tokio::test]
+async fn origination_methods_via_trait_dispatch() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    originate_via_trait(&mut client).await;
+}
+
+// ── watch_routes() / watch_peers() ───────────────────────────────────────────
+
+#[tokio::test]
+async fn watch_routes_empty_stream_terminates() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    // The mock returns an empty stream; collecting it should yield no items.
+    let stream = client.watch_routes(None).await.expect("watch_routes call");
+    let items: Vec<_> = stream.collect().await;
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
+async fn watch_routes_with_peer_filter_terminates() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let stream = client
+        .watch_routes(Some("192.0.2.1"))
+        .await
+        .expect("watch_routes with peer filter");
+    let items: Vec<_> = stream.collect().await;
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
+async fn watch_routes_with_local_filter_terminates() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let stream = client
+        .watch_routes(Some("local"))
+        .await
+        .expect("watch_routes with local filter");
+    let items: Vec<_> = stream.collect().await;
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
+async fn watch_peers_empty_stream_terminates() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let stream = client.watch_peers().await.expect("watch_peers call");
+    let items: Vec<_> = stream.collect().await;
+    assert!(items.is_empty());
+}
+
+/// Starts a server whose watch mocks emit one real event each, ensuring the
+/// `.map()` conversion closures in `watch_routes` and `watch_peers` execute.
+async fn start_server_with_events() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(PeerServiceServer::new(MockPeerWithEvents))
+            .add_service(RibServiceServer::new(MockRibWithEvents))
+            .add_service(PolicyServiceServer::new(MockPolicy))
+            .add_service(OriginationServiceServer::new(MockOrigination))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    addr
+}
+
+#[tokio::test]
+async fn watch_routes_conversion_closure_executes() {
+    let addr = start_server_with_events().await;
+    let mut client = client_for(addr);
+    let stream = client.watch_routes(None).await.expect("watch_routes call");
+    let items: Vec<_> = stream.collect().await;
+    // One EndInitial event from the mock — conversion closure ran.
+    assert_eq!(items.len(), 1);
+    assert!(items[0].is_ok());
+}
+
+#[tokio::test]
+async fn watch_peers_conversion_closure_executes() {
+    let addr = start_server_with_events().await;
+    let mut client = client_for(addr);
+    let stream = client.watch_peers().await.expect("watch_peers call");
+    let items: Vec<_> = stream.collect().await;
+    // One EndInitial event from the mock — conversion closure ran.
+    assert_eq!(items.len(), 1);
+    assert!(items[0].is_ok());
 }

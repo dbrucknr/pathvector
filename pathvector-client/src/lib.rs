@@ -29,10 +29,8 @@ use tonic::transport::Channel;
 
 use error::{ClientError, ConnectError};
 use proto::{
-    origination_service_client::OriginationServiceClient,
-    peer_service_client::PeerServiceClient,
-    policy_service_client::PolicyServiceClient,
-    rib_service_client::RibServiceClient,
+    origination_service_client::OriginationServiceClient, peer_service_client::PeerServiceClient,
+    policy_service_client::PolicyServiceClient, rib_service_client::RibServiceClient,
 };
 use types::{OriginateRouteParams, PeerEvent, RouteEvent};
 
@@ -83,7 +81,10 @@ impl PathvectorClient {
     ///
     /// Returns [`ClientError::Rpc`] with `INVALID_ARGUMENT` if the prefix or
     /// next_hop in `params` is malformed.
-    pub async fn originate_route(&mut self, params: OriginateRouteParams) -> Result<(), ClientError> {
+    pub async fn originate_route(
+        &mut self,
+        params: OriginateRouteParams,
+    ) -> Result<(), ClientError> {
         self.origination
             .originate_route(proto::OriginateRouteRequest::from(params))
             .await?;
@@ -107,7 +108,10 @@ impl PathvectorClient {
         let resp = self
             .origination
             .originate_routes(proto::OriginateRoutesRequest {
-                routes: routes.into_iter().map(proto::OriginateRouteRequest::from).collect(),
+                routes: routes
+                    .into_iter()
+                    .map(proto::OriginateRouteRequest::from)
+                    .collect(),
             })
             .await?
             .into_inner();
@@ -157,9 +161,7 @@ impl PathvectorClient {
     ///
     /// Returns [`ClientError::Rpc`] on gRPC failure, or [`ClientError::Convert`]
     /// if the server returns malformed data.
-    pub async fn list_originated_routes(
-        &mut self,
-    ) -> Result<Vec<types::Route>, ClientError> {
+    pub async fn list_originated_routes(&mut self) -> Result<Vec<types::Route>, ClientError> {
         let resp = self
             .origination
             .list_originated_routes(proto::ListOriginatedRoutesRequest {})

@@ -116,6 +116,7 @@ async fn run_watch(client: &mut PathvectorClient, command: WatchCommands) -> Res
 /// the TUI dashboard without opening a real terminal.
 ///
 /// Production code passes `dashboard::run_dashboard` directly.
+#[allow(clippy::too_many_lines)]
 async fn run_with<C, F, D, Fut>(args: Cli, connect: F, run_dashboard_fn: D) -> Result<(), CliError>
 where
     C: DaemonClient,
@@ -176,7 +177,14 @@ where
                     let routes = client.list_candidates(&prefix).await?;
                     output::print_route_table(&routes);
                 }
-                RouteCommands::Originate { prefix, next_hop, origin, communities, local_pref, med } => {
+                RouteCommands::Originate {
+                    prefix,
+                    next_hop,
+                    origin,
+                    communities,
+                    local_pref,
+                    med,
+                } => {
                     let communities = communities
                         .iter()
                         .map(|s| parse_community(s))
@@ -275,7 +283,7 @@ mod tests {
 
     #[test]
     fn parse_community_valid() {
-        assert_eq!(parse_community("65000:666").unwrap(), (65000 << 16) | 666);
+        assert_eq!(parse_community("65000:666").unwrap(), (65000_u32 << 16) | 0x29A);
     }
 
     #[test]
@@ -494,7 +502,14 @@ mod tests {
     #[tokio::test]
     async fn route_originate_basic() {
         run_cmd(
-            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1"],
+            &[
+                "pv",
+                "route",
+                "originate",
+                "192.0.2.0/24",
+                "--next-hop",
+                "10.0.0.1",
+            ],
             MockDaemonClient::new(),
         )
         .await
@@ -504,7 +519,16 @@ mod tests {
     #[tokio::test]
     async fn route_originate_egp_origin() {
         run_cmd(
-            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1", "--origin", "egp"],
+            &[
+                "pv",
+                "route",
+                "originate",
+                "192.0.2.0/24",
+                "--next-hop",
+                "10.0.0.1",
+                "--origin",
+                "egp",
+            ],
             MockDaemonClient::new(),
         )
         .await
@@ -514,7 +538,16 @@ mod tests {
     #[tokio::test]
     async fn route_originate_incomplete_origin() {
         run_cmd(
-            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1", "--origin", "incomplete"],
+            &[
+                "pv",
+                "route",
+                "originate",
+                "192.0.2.0/24",
+                "--next-hop",
+                "10.0.0.1",
+                "--origin",
+                "incomplete",
+            ],
             MockDaemonClient::new(),
         )
         .await
@@ -526,18 +559,27 @@ mod tests {
         // Commands::Watch is handled before run_with in run(); passing it directly
         // to run_with hits the no-op arm and returns Ok.
         let cli = Cli::parse_from(["pv", "watch", "peers"]);
-        run_with(cli, |_addr| Ok(MockDaemonClient::new()), |_addr| async { Ok(()) })
-            .await
-            .unwrap();
+        run_with(
+            cli,
+            |_addr| Ok(MockDaemonClient::new()),
+            |_addr| async { Ok(()) },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn route_originate_with_community() {
         run_cmd(
             &[
-                "pv", "route", "originate", "192.0.2.0/24",
-                "--next-hop", "10.0.0.1",
-                "--community", "65000:666",
+                "pv",
+                "route",
+                "originate",
+                "192.0.2.0/24",
+                "--next-hop",
+                "10.0.0.1",
+                "--community",
+                "65000:666",
             ],
             MockDaemonClient::new(),
         )
@@ -548,7 +590,16 @@ mod tests {
     #[tokio::test]
     async fn route_originate_invalid_community() {
         let err = run_cmd(
-            &["pv", "route", "originate", "192.0.2.0/24", "--next-hop", "10.0.0.1", "--community", "notvalid"],
+            &[
+                "pv",
+                "route",
+                "originate",
+                "192.0.2.0/24",
+                "--next-hop",
+                "10.0.0.1",
+                "--community",
+                "notvalid",
+            ],
             MockDaemonClient::new(),
         )
         .await
@@ -564,7 +615,14 @@ mod tests {
         ));
         assert!(
             run_cmd(
-                &["pv", "route", "originate", "bad/prefix", "--next-hop", "10.0.0.1"],
+                &[
+                    "pv",
+                    "route",
+                    "originate",
+                    "bad/prefix",
+                    "--next-hop",
+                    "10.0.0.1"
+                ],
                 mock,
             )
             .await
@@ -602,7 +660,11 @@ mod tests {
         mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
             tonic::Status::unavailable("no daemon"),
         ));
-        assert!(run_cmd(&["pv", "route", "withdraw", "192.0.2.0/24"], mock).await.is_err());
+        assert!(
+            run_cmd(&["pv", "route", "withdraw", "192.0.2.0/24"], mock)
+                .await
+                .is_err()
+        );
     }
 
     // ── route list-originated ─────────────────────────────────────────────────

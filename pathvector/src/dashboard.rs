@@ -254,7 +254,10 @@ fn render_routes(f: &mut Frame, state: &DashboardState, area: ratatui::layout::R
                 .map_or_else(|| "\u{2014}".to_owned(), |ip| ip.to_string());
             Row::new([
                 Cell::from(r.prefix.clone()),
-                Cell::from(r.peer_address.map_or_else(|| "local".to_owned(), |a| a.to_string())),
+                Cell::from(
+                    r.peer_address
+                        .map_or_else(|| "local".to_owned(), |a| a.to_string()),
+                ),
                 Cell::from(next_hop),
                 Cell::from(format_as_path(&r.as_path)),
                 Cell::from(format_origin(r.origin)),

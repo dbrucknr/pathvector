@@ -334,10 +334,7 @@ impl DaemonClient for PathvectorClient {
         Ok(())
     }
 
-    async fn originate_route(
-        &mut self,
-        params: OriginateRouteParams,
-    ) -> Result<(), ClientError> {
+    async fn originate_route(&mut self, params: OriginateRouteParams) -> Result<(), ClientError> {
         self.origination
             .originate_route(OriginateRouteRequest::from(params))
             .await?;
@@ -361,10 +358,7 @@ impl DaemonClient for PathvectorClient {
         Ok(resp.count)
     }
 
-    async fn withdraw_originated_route(
-        &mut self,
-        prefix: &str,
-    ) -> Result<(), ClientError> {
+    async fn withdraw_originated_route(&mut self, prefix: &str) -> Result<(), ClientError> {
         self.origination
             .withdraw_originated_route(WithdrawOriginatedRouteRequest {
                 prefix: prefix.into(),
@@ -454,7 +448,7 @@ mod tests {
             &mut self,
             routes: Vec<OriginateRouteParams>,
         ) -> Result<u32, ClientError> {
-            Ok(routes.len() as u32)
+            Ok(u32::try_from(routes.len()).unwrap_or(u32::MAX))
         }
 
         async fn withdraw_originated_route(&mut self, _: &str) -> Result<(), ClientError> {
@@ -465,7 +459,7 @@ mod tests {
             &mut self,
             prefixes: Vec<String>,
         ) -> Result<u32, ClientError> {
-            Ok(prefixes.len() as u32)
+            Ok(u32::try_from(prefixes.len()).unwrap_or(u32::MAX))
         }
 
         async fn list_originated_routes(&mut self) -> Result<Vec<Route>, ClientError> {
@@ -473,7 +467,7 @@ mod tests {
         }
     }
 
-    use crate::types::{LargeCommunity, Origin, OriginateRouteParams};
+    use crate::types::{Origin, OriginateRouteParams};
 
     fn make_params() -> OriginateRouteParams {
         OriginateRouteParams {
@@ -506,7 +500,12 @@ mod tests {
         assert!(c.set_import_default("10.0.0.1", true).await.is_ok());
         assert!(c.set_export_default("10.0.0.1", false).await.is_ok());
         assert!(c.originate_route(make_params()).await.is_ok());
-        assert_eq!(c.originate_routes(vec![make_params(), make_params()]).await.unwrap(), 2);
+        assert_eq!(
+            c.originate_routes(vec![make_params(), make_params()])
+                .await
+                .unwrap(),
+            2
+        );
         assert!(c.withdraw_originated_route("1.2.3.4/32").await.is_ok());
         assert_eq!(
             c.withdraw_originated_routes(vec!["1.2.3.4/32".into(), "5.6.7.8/32".into()])
@@ -584,7 +583,8 @@ mod tests {
             Err(ClientError::Rpc(_))
         ));
         assert!(matches!(
-            c.withdraw_originated_routes(vec!["1.2.3.4/32".into()]).await,
+            c.withdraw_originated_routes(vec!["1.2.3.4/32".into()])
+                .await,
             Err(ClientError::Rpc(_))
         ));
         assert!(matches!(

@@ -150,7 +150,8 @@ pub fn print_route_table(routes: &[Route]) {
         println!(
             "{:<20} {:<16} {:<16} {:<20} {:<6}  {}",
             r.prefix,
-            r.peer_address.map_or_else(|| "local".to_owned(), |a| a.to_string()),
+            r.peer_address
+                .map_or_else(|| "local".to_owned(), |a| a.to_string()),
             next_hop,
             format_as_path(&r.as_path),
             format_origin(r.origin),
@@ -166,7 +167,9 @@ pub fn print_route_detail(route: &Route) {
         .map_or_else(|| "\u{2014}".to_owned(), |ip| ip.to_string());
 
     println!("Prefix:     {}", route.prefix);
-    let peer_addr_str = route.peer_address.map_or_else(|| "local".to_owned(), |a| a.to_string());
+    let peer_addr_str = route
+        .peer_address
+        .map_or_else(|| "local".to_owned(), |a| a.to_string());
     println!("Peer:       {} ({})", peer_addr_str, {
         match route.peer_type {
             pathvector_client::types::PeerType::External => "eBGP",
@@ -608,7 +611,10 @@ mod tests {
     fn print_peer_event_current_established() {
         print_peer_event(&PeerEvent {
             event_type: PeerEventType::Current,
-            peer: Some(make_peer(SessionState::Established, Some(PeerType::External))),
+            peer: Some(make_peer(
+                SessionState::Established,
+                Some(PeerType::External),
+            )),
         });
     }
 
@@ -624,7 +630,10 @@ mod tests {
     fn print_peer_event_changed() {
         print_peer_event(&PeerEvent {
             event_type: PeerEventType::Changed,
-            peer: Some(make_peer(SessionState::Established, Some(PeerType::External))),
+            peer: Some(make_peer(
+                SessionState::Established,
+                Some(PeerType::External),
+            )),
         });
     }
 
@@ -635,5 +644,4 @@ mod tests {
             peer: None,
         });
     }
-
 }

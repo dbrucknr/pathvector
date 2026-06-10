@@ -12,8 +12,8 @@ use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
     message::{
-        Capability, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage,
-        encode_attributes, nlri_encoded_len, MAX_LEN, MAX_LEN_EXTENDED,
+        Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
+        UpdateMessage, encode_attributes, nlri_encoded_len,
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
@@ -820,7 +820,8 @@ impl DaemonState {
     pub(crate) fn withdraw_originated_routes(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
         for nlri in nlris {
             self.originated_routes.remove(nlri);
-            self.loc_rib.withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            self.loc_rib
+                .withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Withdrawn as i32,
                 route: None,
@@ -1485,11 +1486,17 @@ mod tests {
             import_default: None,
             export_default: None,
         }];
-        let state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peers, {
-            let mut m = HashMap::new();
-            m.insert(peer_ip, tx);
-            m
-        }, vec![]);
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peers,
+            {
+                let mut m = HashMap::new();
+                m.insert(peer_ip, tx);
+                m
+            },
+            vec![],
+        );
         // Import policy with Reject default means routes are dropped unless a
         // term accepts them. Verify by running a route through it.
         let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
@@ -1562,11 +1569,17 @@ mod tests {
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
         }];
-        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peers, {
-            let mut m = HashMap::new();
-            m.insert(peer_ip, tx);
-            m
-        }, vec![]);
+        let mut state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peers,
+            {
+                let mut m = HashMap::new();
+                m.insert(peer_ip, tx);
+                m
+            },
+            vec![],
+        );
 
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
         state.loc_rib.insert(
@@ -2656,9 +2669,12 @@ mod tests {
 
     // ── route_to_attributes ───────────────────────────────────────────────────
 
-    fn route_to_update_for_test(route: Route<Ipv4Addr>) -> UpdateMessage {
-        let nlri = route.nlri;
-        UpdateMessage { withdrawn: vec![], attributes: route_to_attributes(&route), announced: vec![nlri] }
+    fn route_to_update_for_test(route: &Route<Ipv4Addr>) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: route_to_attributes(route),
+            announced: vec![route.nlri],
+        }
     }
 
     #[test]
@@ -2671,7 +2687,7 @@ mod tests {
         .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
         .build();
 
-        let msg = route_to_update_for_test(route);
+        let msg = route_to_update_for_test(&route);
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
         assert!(
@@ -2694,7 +2710,7 @@ mod tests {
     #[test]
     fn test_route_to_update_omits_absent_optional_attributes() {
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
-        let msg = route_to_update_for_test(route);
+        let msg = route_to_update_for_test(&route);
         assert!(
             !msg.attributes
                 .iter()
@@ -2724,7 +2740,7 @@ mod tests {
         .aggregator(Aggregator::new(Asn::new(65001), Ipv4Addr::new(1, 1, 1, 1)))
         .build();
 
-        let msg = route_to_update_for_test(route);
+        let msg = route_to_update_for_test(&route);
         assert!(
             msg.attributes
                 .iter()
@@ -3603,7 +3619,13 @@ mod stall_tests {
                 export_default: Some(config::ExportDefault::Accept),
             })
             .collect();
-        let state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![]);
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peer_configs,
+            senders,
+            vec![],
+        );
         (state, receivers)
     }
 
@@ -3689,7 +3711,13 @@ mod stall_tests {
         let mut senders = HashMap::new();
         senders.insert(peer_a, tx_a);
         senders.insert(peer_b, tx_b.clone());
-        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![]);
+        let mut state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peer_configs,
+            senders,
+            vec![],
+        );
 
         state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
         state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
@@ -3791,7 +3819,13 @@ mod stall_tests {
         let mut senders = HashMap::new();
         senders.insert(peer_a, tx_a);
         senders.insert(peer_b, tx_b);
-        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![]);
+        let mut state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peer_configs,
+            senders,
+            vec![],
+        );
 
         state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
         state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
@@ -3915,12 +3949,12 @@ mod stall_tests {
 mod flush_updates_tests {
     use std::net::Ipv4Addr;
 
-    use pathvector_rib::{AdjRibOut, PeerId, Route, RouteBuilder};
-    use pathvector_session::message::{PathAttribute, UpdateMessage, MAX_LEN};
-    use pathvector_types::{AsPath, IpAddress, Nlri, Origin, PeerType};
+    use pathvector_rib::{Route, RouteBuilder};
+    use pathvector_session::message::{MAX_LEN, UpdateMessage};
+    use pathvector_types::{AsPath, Nlri, Origin};
     use tokio::sync::mpsc;
 
-    use super::{PrefixDecision, flush_updates, route_to_attributes};
+    use super::{PrefixDecision, flush_updates};
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -3961,17 +3995,14 @@ mod flush_updates_tests {
     /// Two routes with different attributes produce two separate UPDATEs.
     #[test]
     fn test_flush_different_attrs_two_messages() {
-        use pathvector_types::{LocalPref, NextHop};
+        use pathvector_types::NextHop;
 
         let r1 = base_route("10.0.0.0/8");
         // r2 has a NEXT_HOP, r1 does not — different attribute set.
         let r2 = RouteBuilder::new(nlri("192.168.0.0/16"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .build();
-        let decisions = vec![
-            PrefixDecision::Announce(r1),
-            PrefixDecision::Announce(r2),
-        ];
+        let decisions = vec![PrefixDecision::Announce(r1), PrefixDecision::Announce(r2)];
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(decisions, MAX_LEN, &tx));
         let first = rx.try_recv().expect("first UPDATE");
@@ -3989,8 +4020,10 @@ mod flush_updates_tests {
         // 1000 NLRIs × 4 bytes = 4000 bytes of NLRIs, plus overhead > 4096.
         let decisions: Vec<PrefixDecision> = (0u32..1000)
             .map(|i| {
-                let a = (i / 256) as u8;
-                let b = (i % 256) as u8;
+                #[allow(clippy::cast_possible_truncation)]
+                let a = (i / 256) as u8; // i < 1000, so i/256 ≤ 3
+                #[allow(clippy::cast_possible_truncation)]
+                let b = (i % 256) as u8; // always ≤ 255
                 let route = RouteBuilder::new(
                     Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap(),
                     Origin::Igp,

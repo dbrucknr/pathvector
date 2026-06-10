@@ -703,7 +703,10 @@ mod tests {
     fn route_minimal_valid() {
         let r = Route::try_from(minimal_proto_route()).unwrap();
         assert_eq!(r.prefix, "10.0.0.0/8");
-        assert_eq!(r.peer_address, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        assert_eq!(
+            r.peer_address,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
         assert_eq!(r.peer_type, PeerType::External);
         assert_eq!(r.next_hop, None);
         assert!(r.as_path.is_empty());
@@ -1090,5 +1093,268 @@ mod tests {
                 prop_assert!(matches!(result, Err(ConvertError::BadExtendedCommunityLen(_))));
             }
         }
+    }
+
+    // ── OriginateRouteParams → proto::OriginateRouteRequest ───────────────────
+
+    fn minimal_originate_params() -> OriginateRouteParams {
+        OriginateRouteParams {
+            prefix: "192.0.2.0/24".to_owned(),
+            next_hop: "10.0.0.1".to_owned(),
+            origin: Origin::Igp,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        }
+    }
+
+    #[test]
+    fn originate_params_minimal_converts() {
+        let req = proto::OriginateRouteRequest::from(minimal_originate_params());
+        assert_eq!(req.prefix, "192.0.2.0/24");
+        assert_eq!(req.next_hop, "10.0.0.1");
+        assert_eq!(req.origin, 0); // Igp
+        assert!(req.communities.is_empty());
+        assert!(req.large_communities.is_empty());
+        assert!(req.extended_communities.is_empty());
+        assert!(req.local_pref.is_none());
+        assert!(req.med.is_none());
+    }
+
+    #[test]
+    fn originate_params_all_origins() {
+        for (origin, expected) in [(Origin::Igp, 0), (Origin::Egp, 1), (Origin::Incomplete, 2)] {
+            let mut p = minimal_originate_params();
+            p.origin = origin;
+            let req = proto::OriginateRouteRequest::from(p);
+            assert_eq!(req.origin, expected, "origin mismatch for {origin:?}");
+        }
+    }
+
+    #[test]
+    fn originate_params_with_large_communities() {
+        use crate::types::LargeCommunity;
+        let mut p = minimal_originate_params();
+        p.large_communities = vec![LargeCommunity {
+            global_admin: 65000,
+            local_data1: 1,
+            local_data2: 2,
+        }];
+        let req = proto::OriginateRouteRequest::from(p);
+        assert_eq!(req.large_communities.len(), 1);
+        assert_eq!(req.large_communities[0].global_admin, 65000);
+        assert_eq!(req.large_communities[0].local_data1, 1);
+        assert_eq!(req.large_communities[0].local_data2, 2);
+    }
+
+    #[test]
+    fn originate_params_with_extended_communities() {
+        let mut p = minimal_originate_params();
+        p.extended_communities = vec![[0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]];
+        let req = proto::OriginateRouteRequest::from(p);
+        assert_eq!(req.extended_communities.len(), 1);
+        assert_eq!(
+            req.extended_communities[0],
+            vec![0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64]
+        );
+    }
+
+    #[test]
+    fn originate_params_with_local_pref_and_med() {
+        let mut p = minimal_originate_params();
+        p.local_pref = Some(200);
+        p.med = Some(50);
+        let req = proto::OriginateRouteRequest::from(p);
+        assert_eq!(req.local_pref, Some(200));
+        assert_eq!(req.med, Some(50));
+    }
+
+    // ── RouteEventType ────────────────────────────────────────────────────────
+
+    #[test]
+    fn route_event_type_all_valid_values() {
+        assert_eq!(
+            RouteEventType::try_from(1).unwrap(),
+            RouteEventType::Current
+        );
+        assert_eq!(
+            RouteEventType::try_from(2).unwrap(),
+            RouteEventType::EndInitial
+        );
+        assert_eq!(
+            RouteEventType::try_from(3).unwrap(),
+            RouteEventType::Announced
+        );
+        assert_eq!(
+            RouteEventType::try_from(4).unwrap(),
+            RouteEventType::Withdrawn
+        );
+    }
+
+    #[test]
+    fn route_event_type_unknown_is_error() {
+        for v in [0, 5, 99, -1, i32::MAX] {
+            assert!(
+                matches!(
+                    RouteEventType::try_from(v),
+                    Err(ConvertError::UnknownEnumValue("RouteEventType", _))
+                ),
+                "expected Err for RouteEventType discriminant {v}"
+            );
+        }
+    }
+
+    // ── RouteEvent ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn route_event_current_with_route() {
+        let ev = proto::RouteEvent {
+            r#type: 1, // Current
+            route: Some(minimal_proto_route()),
+            withdrawn_prefix: None,
+        };
+        let result = RouteEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, RouteEventType::Current);
+        assert!(result.route.is_some());
+        assert!(result.withdrawn_prefix.is_none());
+    }
+
+    #[test]
+    fn route_event_end_initial_no_route() {
+        let ev = proto::RouteEvent {
+            r#type: 2, // EndInitial
+            route: None,
+            withdrawn_prefix: None,
+        };
+        let result = RouteEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, RouteEventType::EndInitial);
+        assert!(result.route.is_none());
+    }
+
+    #[test]
+    fn route_event_announced() {
+        let ev = proto::RouteEvent {
+            r#type: 3, // Announced
+            route: Some(minimal_proto_route()),
+            withdrawn_prefix: None,
+        };
+        let result = RouteEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, RouteEventType::Announced);
+    }
+
+    #[test]
+    fn route_event_withdrawn_with_prefix() {
+        let ev = proto::RouteEvent {
+            r#type: 4, // Withdrawn
+            route: None,
+            withdrawn_prefix: Some("192.0.2.0/24".to_owned()),
+        };
+        let result = RouteEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, RouteEventType::Withdrawn);
+        assert_eq!(result.withdrawn_prefix.as_deref(), Some("192.0.2.0/24"));
+    }
+
+    #[test]
+    fn route_event_invalid_type_is_error() {
+        let ev = proto::RouteEvent {
+            r#type: 99,
+            route: None,
+            withdrawn_prefix: None,
+        };
+        assert!(RouteEvent::try_from(ev).is_err());
+    }
+
+    #[test]
+    fn route_event_bad_route_propagates_error() {
+        let mut bad_route = minimal_proto_route();
+        bad_route.peer_address = "not-an-ip".to_owned();
+        let ev = proto::RouteEvent {
+            r#type: 1, // Current
+            route: Some(bad_route),
+            withdrawn_prefix: None,
+        };
+        assert!(RouteEvent::try_from(ev).is_err());
+    }
+
+    // ── PeerEventType ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn peer_event_type_all_valid_values() {
+        assert_eq!(PeerEventType::try_from(1).unwrap(), PeerEventType::Current);
+        assert_eq!(
+            PeerEventType::try_from(2).unwrap(),
+            PeerEventType::EndInitial
+        );
+        assert_eq!(PeerEventType::try_from(3).unwrap(), PeerEventType::Changed);
+    }
+
+    #[test]
+    fn peer_event_type_unknown_is_error() {
+        for v in [0, 4, 99, -1, i32::MAX] {
+            assert!(
+                matches!(
+                    PeerEventType::try_from(v),
+                    Err(ConvertError::UnknownEnumValue("PeerEventType", _))
+                ),
+                "expected Err for PeerEventType discriminant {v}"
+            );
+        }
+    }
+
+    // ── PeerEvent ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn peer_event_current_with_peer() {
+        let ev = proto::PeerEvent {
+            r#type: 1, // Current
+            peer: Some(minimal_proto_peer_state()),
+        };
+        let result = PeerEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, PeerEventType::Current);
+        assert!(result.peer.is_some());
+    }
+
+    #[test]
+    fn peer_event_end_initial_no_peer() {
+        let ev = proto::PeerEvent {
+            r#type: 2, // EndInitial
+            peer: None,
+        };
+        let result = PeerEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, PeerEventType::EndInitial);
+        assert!(result.peer.is_none());
+    }
+
+    #[test]
+    fn peer_event_changed_with_peer() {
+        let ev = proto::PeerEvent {
+            r#type: 3, // Changed
+            peer: Some(minimal_proto_peer_state()),
+        };
+        let result = PeerEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, PeerEventType::Changed);
+        assert!(result.peer.is_some());
+    }
+
+    #[test]
+    fn peer_event_invalid_type_is_error() {
+        let ev = proto::PeerEvent {
+            r#type: 99,
+            peer: None,
+        };
+        assert!(PeerEvent::try_from(ev).is_err());
+    }
+
+    #[test]
+    fn peer_event_bad_peer_propagates_error() {
+        let mut bad_peer = minimal_proto_peer_state();
+        bad_peer.address = "not-an-ip".to_owned();
+        let ev = proto::PeerEvent {
+            r#type: 1,
+            peer: Some(bad_peer),
+        };
+        assert!(PeerEvent::try_from(ev).is_err());
     }
 }

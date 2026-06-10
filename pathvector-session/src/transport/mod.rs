@@ -980,4 +980,143 @@ mod tests {
             "session must not terminate after an attribute-discard malformed UPDATE"
         );
     }
+
+    /// When `spawn_with` injects a transport that immediately fails (send error on OPEN),
+    /// the FSM receives `TcpFailed` and queues a 120 s `ConnectRetryTimer`.  After advancing
+    /// mock time past that deadline the timer fires, the FSM emits a second
+    /// `InitiateTcpConnect`, and since there is no pending transport AND no connect
+    /// factory (injected-transport mode), `pending_input` is set to `TcpFailed`,
+    /// keeping the session in its retry backoff loop.
+    #[tokio::test]
+    async fn test_no_pending_transport_on_retry_sets_tcp_failed_input() {
+        tokio::time::pause();
+
+        let (mock, peer) = MockTransport::pair();
+        // Fail the very first send so the FSM never establishes.
+        peer.fail_send.store(true, Ordering::SeqCst);
+
+        let mut handle = spawn_with(test_config(), mock);
+        handle.start().await;
+
+        // Let the session task run: ManualStart → InitiateTcpConnect (consumes the
+        // injected transport) → TcpConnected → SendMessage(OPEN) fails →
+        // execute returns false → TcpFailed → FSM schedules ConnectRetryTimer(120 s).
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance past the 120 s retry deadline so ConnectRetryTimerExpired fires,
+        // which triggers a second InitiateTcpConnect — now with no pending transport
+        // and no connect factory (lines 455-459: pending_input = TcpFailed).
+        tokio::time::advance(Duration::from_secs(121)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Session silently retries; it was never Established so no events.
+        let result = tokio::time::timeout(Duration::from_millis(10), handle.next_event()).await;
+        assert!(
+            result.is_err(),
+            "session should not emit events while retrying without a transport"
+        );
+    }
+
+    /// When the peer OPEN advertises `ExtendedMessage` but the local config does
+    /// not include it, `extended` evaluates to `false` via short-circuit on the
+    /// second operand (lines 496-499), and `set_extended_message(false)` is
+    /// called on the transport.
+    #[tokio::test]
+    async fn test_extended_message_not_negotiated_when_local_lacks_capability() {
+        let (mock, mut peer) = MockTransport::pair();
+
+        // Local config has only FourByteAsn — no ExtendedMessage.
+        let config = test_config(); // capabilities: [FourByteAsn(65001)]
+        let mut handle = spawn_with(config, mock);
+        handle.start().await;
+
+        // Peer OPEN includes ExtendedMessage; local does not → extended = false.
+        let open_with_ext = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::FourByteAsn(65002), Capability::ExtendedMessage],
+        });
+
+        // Drain the outbound OPEN.
+        let _ = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for OPEN");
+
+        peer.recv_tx.send(Ok(open_with_ext)).unwrap();
+
+        // Drain the KEEPALIVE.
+        let _ = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE");
+
+        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+
+        // Session reaches Established with extended_message = false.
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("no event");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "expected Established, got {event:?}"
+        );
+    }
+
+    /// `make_treat_as_withdraw` must convert `MpReachNlri` attributes into
+    /// `MpUnreachNlri` (lines 567-570) so that IPv6 prefixes are also withdrawn.
+    #[tokio::test]
+    async fn test_treat_as_withdraw_converts_mp_reach_to_mp_unreach() {
+        use crate::message::{MpReachNlri, Prefix};
+        use pathvector_types::{AfiSafi, NextHop, Nlri};
+        use std::net::Ipv6Addr;
+
+        let prefix_v6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+        drive_to_established(&mut handle, &mut peer).await;
+
+        let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
+            update: UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                    prefixes: vec![Prefix::V6(prefix_v6)],
+                })],
+                announced: vec![],
+            },
+            errors: vec![AttributeDecodeError {
+                type_code: 14, // MP_REACH_NLRI
+                policy: AttributeErrorPolicy::TreatAsWithdraw,
+                detail: "malformed mp_reach",
+            }],
+            treat_as_withdraw: true,
+        });
+        peer.recv_tx.send(Ok(malformed)).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for RouteUpdate")
+            .expect("session exited");
+
+        match event {
+            SessionEvent::RouteUpdate(u) => {
+                let has_unreach = u.attributes.iter().any(|a| {
+                    matches!(a, PathAttribute::MpUnreachNlri(m) if m.afi_safi == AfiSafi::IPV6_UNICAST)
+                });
+                assert!(
+                    has_unreach,
+                    "expected MpUnreachNlri in treat-as-withdraw result"
+                );
+            }
+            other => panic!("expected RouteUpdate, got {other:?}"),
+        }
+    }
 }

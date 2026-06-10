@@ -256,10 +256,24 @@ mod tests {
     #[test]
     fn route_originate_defaults() {
         let cli = Cli::parse_from([
-            "pathvector", "route", "originate", "192.0.2.0/24",
-            "--next-hop", "10.0.0.1",
+            "pathvector",
+            "route",
+            "originate",
+            "192.0.2.0/24",
+            "--next-hop",
+            "10.0.0.1",
         ]);
-        if let Commands::Route { command: RouteCommands::Originate { origin, communities, local_pref, med, .. } } = cli.command {
+        if let Commands::Route {
+            command:
+                RouteCommands::Originate {
+                    origin,
+                    communities,
+                    local_pref,
+                    med,
+                    ..
+                },
+        } = cli.command
+        {
             assert_eq!(origin, OriginArg::Igp);
             assert!(communities.is_empty());
             assert!(local_pref.is_none());
@@ -272,14 +286,33 @@ mod tests {
     #[test]
     fn route_originate_all_flags() {
         let cli = Cli::parse_from([
-            "pathvector", "route", "originate", "198.51.100.1/32",
-            "--next-hop", "10.0.0.1",
-            "--origin", "incomplete",
-            "--community", "65000:666",
-            "--local-pref", "200",
-            "--med", "50",
+            "pathvector",
+            "route",
+            "originate",
+            "198.51.100.1/32",
+            "--next-hop",
+            "10.0.0.1",
+            "--origin",
+            "incomplete",
+            "--community",
+            "65000:666",
+            "--local-pref",
+            "200",
+            "--med",
+            "50",
         ]);
-        if let Commands::Route { command: RouteCommands::Originate { prefix, next_hop, origin, communities, local_pref, med } } = cli.command {
+        if let Commands::Route {
+            command:
+                RouteCommands::Originate {
+                    prefix,
+                    next_hop,
+                    origin,
+                    communities,
+                    local_pref,
+                    med,
+                },
+        } = cli.command
+        {
             assert_eq!(prefix, "198.51.100.1/32");
             assert_eq!(next_hop, "10.0.0.1");
             assert_eq!(origin, OriginArg::Incomplete);
@@ -296,7 +329,9 @@ mod tests {
         let cli = Cli::parse_from(["pathvector", "route", "withdraw", "192.0.2.0/24"]);
         assert!(matches!(
             cli.command,
-            Commands::Route { command: RouteCommands::Withdraw { .. } }
+            Commands::Route {
+                command: RouteCommands::Withdraw { .. }
+            }
         ));
     }
 
@@ -305,14 +340,19 @@ mod tests {
         let cli = Cli::parse_from(["pathvector", "route", "list-originated"]);
         assert!(matches!(
             cli.command,
-            Commands::Route { command: RouteCommands::ListOriginated }
+            Commands::Route {
+                command: RouteCommands::ListOriginated
+            }
         ));
     }
 
     #[test]
     fn watch_routes_no_filter() {
         let cli = Cli::parse_from(["pathvector", "watch", "routes"]);
-        if let Commands::Watch { command: WatchCommands::Routes { peer } } = cli.command {
+        if let Commands::Watch {
+            command: WatchCommands::Routes { peer },
+        } = cli.command
+        {
             assert!(peer.is_none());
         } else {
             panic!("expected Watch Routes");
@@ -322,7 +362,10 @@ mod tests {
     #[test]
     fn watch_routes_with_peer_filter() {
         let cli = Cli::parse_from(["pathvector", "watch", "routes", "--peer", "10.0.0.1"]);
-        if let Commands::Watch { command: WatchCommands::Routes { peer } } = cli.command {
+        if let Commands::Watch {
+            command: WatchCommands::Routes { peer },
+        } = cli.command
+        {
             assert_eq!(peer.as_deref(), Some("10.0.0.1"));
         } else {
             panic!("expected Watch Routes --peer");
@@ -334,7 +377,9 @@ mod tests {
         let cli = Cli::parse_from(["pathvector", "watch", "peers"]);
         assert!(matches!(
             cli.command,
-            Commands::Watch { command: WatchCommands::Peers }
+            Commands::Watch {
+                command: WatchCommands::Peers
+            }
         ));
     }
 }

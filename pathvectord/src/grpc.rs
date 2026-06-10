@@ -32,8 +32,8 @@ use crate::DaemonState;
 // code without affecting the rest of this module.  Inner attributes cannot
 // appear inside an `include!` expansion in an inline `mod { }` block.
 
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::proto;
 
@@ -45,8 +45,8 @@ use proto::{
     PeerEvent, PeerEventType, PeerState, PolicyAction, Route, RouteEvent, RouteEventType,
     RouteResponse, SetExportDefaultRequest, SetExportDefaultResponse, SetImportDefaultRequest,
     SetImportDefaultResponse, WatchPeersRequest, WatchRoutesRequest,
-    WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse, WithdrawOriginatedRoutesRequest,
-    WithdrawOriginatedRoutesResponse,
+    WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse,
+    WithdrawOriginatedRoutesRequest, WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
     policy_service_server::{PolicyService, PolicyServiceServer},
@@ -227,8 +227,10 @@ fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
     })
 }
 
-type PeerEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
-type RouteEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<RouteEvent, Status>> + Send>>;
+type PeerEventStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
+type RouteEventStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<RouteEvent, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl PeerService for PeerServiceImpl {
@@ -405,9 +407,7 @@ impl RibService for RibServiceImpl {
             Some(PeerId::from(crate::LOCAL_ORIGIN_PEER))
         } else {
             let addr: Ipv4Addr = peer_filter_str.parse().map_err(|_| {
-                Status::invalid_argument(
-                    "peer_address must be a valid IPv4 address or \"local\"",
-                )
+                Status::invalid_argument("peer_address must be a valid IPv4 address or \"local\"")
             })?;
             Some(PeerId::from(addr))
         };
@@ -568,22 +568,21 @@ struct OriginationServiceImpl {
 }
 
 /// Parse an `OriginateRouteRequest` into a `Route<Ipv4Addr>`.
-fn parse_originate_request(req: OriginateRouteRequest) -> Result<pathvector_rib::Route<Ipv4Addr>, Status> {
+fn parse_originate_request(
+    req: OriginateRouteRequest,
+) -> Result<pathvector_rib::Route<Ipv4Addr>, Status> {
     use pathvector_rib::RouteBuilder;
     use pathvector_types::{
-        Community, ExtendedCommunity, LargeCommunity as TypesLargeCommunity, Nlri, Origin,
-        PeerType,
+        Community, ExtendedCommunity, LargeCommunity as TypesLargeCommunity, Nlri, Origin, PeerType,
     };
 
-    let nlri: Nlri<Ipv4Addr> = req
-        .prefix
-        .parse()
-        .map_err(|_| Status::invalid_argument(format!("'{}' is not valid CIDR notation", req.prefix)))?;
+    let nlri: Nlri<Ipv4Addr> = req.prefix.parse().map_err(|_| {
+        Status::invalid_argument(format!("'{}' is not valid CIDR notation", req.prefix))
+    })?;
 
-    let next_hop_ip: Ipv4Addr = req
-        .next_hop
-        .parse()
-        .map_err(|_| Status::invalid_argument(format!("'{}' is not a valid IPv4 next-hop", req.next_hop)))?;
+    let next_hop_ip: Ipv4Addr = req.next_hop.parse().map_err(|_| {
+        Status::invalid_argument(format!("'{}' is not a valid IPv4 next-hop", req.next_hop))
+    })?;
 
     let origin = match proto::Origin::try_from(req.origin) {
         Ok(proto::Origin::Igp) => Origin::Igp,
@@ -614,13 +613,9 @@ fn parse_originate_request(req: OriginateRouteRequest) -> Result<pathvector_rib:
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut builder = RouteBuilder::new(
-        nlri,
-        origin,
-        pathvector_types::AsPath::new(),
-    )
-    .next_hop(pathvector_types::NextHop::V4(next_hop_ip))
-    .peer_type(PeerType::Internal);
+    let mut builder = RouteBuilder::new(nlri, origin, pathvector_types::AsPath::new())
+        .next_hop(pathvector_types::NextHop::V4(next_hop_ip))
+        .peer_type(PeerType::Internal);
 
     for c in communities {
         builder = builder.community(c);
@@ -774,19 +769,23 @@ mod tests {
     use tonic::Request;
 
     use super::{
-        PeerServiceImpl, PolicyServiceImpl, RibServiceImpl, build_peer_state, parse_nlri,
-        parse_peer_address, parse_policy_action, proto, proto_as_segment, proto_origin,
-        route_to_proto,
+        OriginationServiceImpl, PeerServiceImpl, PolicyServiceImpl, RibServiceImpl,
+        build_peer_state, parse_nlri, parse_originate_request, parse_peer_address,
+        parse_policy_action, proto, proto_as_segment, proto_origin, route_to_proto,
     };
+    use tokio_stream::StreamExt as _;
+
     use crate::{
         DaemonState,
         config::{self, ExportDefault, ImportDefault},
     };
     use proto::{
-        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListPeersRequest,
-        ListRoutesRequest, SetExportDefaultRequest, SetImportDefaultRequest,
-        peer_service_server::PeerService, policy_service_server::PolicyService,
-        rib_service_server::RibService,
+        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListOriginatedRoutesRequest,
+        ListPeersRequest, ListRoutesRequest, OriginateRouteRequest, OriginateRoutesRequest,
+        SetExportDefaultRequest, SetImportDefaultRequest, WatchPeersRequest, WatchRoutesRequest,
+        WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
+        origination_service_server::OriginationService, peer_service_server::PeerService,
+        policy_service_server::PolicyService, rib_service_server::RibService,
     };
 
     fn make_state(local_as: u32, peers: &[(Ipv4Addr, u32)]) -> DaemonState {
@@ -805,7 +804,13 @@ mod tests {
                 export_default: Some(ExportDefault::Accept),
             })
             .collect();
-        DaemonState::new(local_as, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![])
+        DaemonState::new(
+            local_as,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &peer_configs,
+            senders,
+            vec![],
+        )
     }
 
     fn nlri(s: &str) -> pathvector_types::Nlri<Ipv4Addr> {
@@ -1575,5 +1580,399 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── parse_originate_request ───────────────────────────────────────────────
+
+    fn minimal_originate_req() -> OriginateRouteRequest {
+        OriginateRouteRequest {
+            prefix: "192.0.2.0/24".to_owned(),
+            next_hop: "10.0.0.1".to_owned(),
+            origin: proto::Origin::Igp as i32,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_originate_request_valid() {
+        let route = parse_originate_request(minimal_originate_req()).unwrap();
+        assert_eq!(route.nlri.to_string(), "192.0.2.0/24");
+    }
+
+    #[test]
+    fn test_parse_originate_request_invalid_prefix() {
+        let mut req = minimal_originate_req();
+        req.prefix = "not-cidr".to_owned();
+        let err = parse_originate_request(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_originate_request_invalid_next_hop() {
+        let mut req = minimal_originate_req();
+        req.next_hop = "not-an-ip".to_owned();
+        let err = parse_originate_request(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_originate_request_invalid_ext_community_length() {
+        let mut req = minimal_originate_req();
+        req.extended_communities = vec![vec![0x00; 7]]; // wrong length
+        let err = parse_originate_request(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_originate_request_with_communities() {
+        let mut req = minimal_originate_req();
+        req.communities = vec![(65000_u32 << 16) | 0x29A];
+        req.large_communities = vec![proto::LargeCommunity {
+            global_admin: 65000,
+            local_data1: 1,
+            local_data2: 2,
+        }];
+        req.extended_communities = vec![vec![0u8; 8]];
+        let route = parse_originate_request(req).unwrap();
+        assert!(!route.communities.is_empty());
+        assert!(!route.large_communities.is_empty());
+        assert!(!route.extended_communities.is_empty());
+    }
+
+    #[test]
+    fn test_parse_originate_request_with_local_pref_and_med() {
+        let mut req = minimal_originate_req();
+        req.local_pref = Some(200);
+        req.med = Some(50);
+        let route = parse_originate_request(req).unwrap();
+        assert!(route.local_pref.is_some());
+        assert!(route.med.is_some());
+    }
+
+    #[test]
+    fn test_parse_originate_request_egp_origin() {
+        let mut req = minimal_originate_req();
+        req.origin = proto::Origin::Egp as i32;
+        let route = parse_originate_request(req).unwrap();
+        assert_eq!(route.origin, pathvector_types::Origin::Egp);
+    }
+
+    #[test]
+    fn test_parse_originate_request_incomplete_origin() {
+        let mut req = minimal_originate_req();
+        req.origin = proto::Origin::Incomplete as i32;
+        let route = parse_originate_request(req).unwrap();
+        assert_eq!(route.origin, pathvector_types::Origin::Incomplete);
+    }
+
+    // ── OriginationService handlers ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_originate_route_inserts_into_loc_rib() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        svc.originate_route(Request::new(minimal_originate_req()))
+            .await
+            .expect("originate_route");
+
+        let s = state.read().await;
+        let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        assert!(s.originated_routes.contains_key(&nlri));
+    }
+
+    #[tokio::test]
+    async fn test_originate_route_invalid_prefix_returns_error() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl { state };
+        let mut req = minimal_originate_req();
+        req.prefix = "bad".to_owned();
+        let err = svc.originate_route(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_originate_routes_batch_inserts_all() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        let resp = svc
+            .originate_routes(Request::new(OriginateRoutesRequest {
+                routes: vec![
+                    OriginateRouteRequest {
+                        prefix: "192.0.2.0/24".to_owned(),
+                        ..minimal_originate_req()
+                    },
+                    OriginateRouteRequest {
+                        prefix: "198.51.100.0/24".to_owned(),
+                        ..minimal_originate_req()
+                    },
+                ],
+            }))
+            .await
+            .expect("originate_routes")
+            .into_inner();
+
+        assert_eq!(resp.count, 2);
+        let s = state.read().await;
+        assert_eq!(s.originated_routes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_originate_routes_batch_invalid_returns_error() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl { state };
+        let err = svc
+            .originate_routes(Request::new(OriginateRoutesRequest {
+                routes: vec![OriginateRouteRequest {
+                    prefix: "bad".to_owned(),
+                    ..minimal_originate_req()
+                }],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_originated_route_removes_from_loc_rib() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        svc.originate_route(Request::new(minimal_originate_req()))
+            .await
+            .unwrap();
+        svc.withdraw_originated_route(Request::new(WithdrawOriginatedRouteRequest {
+            prefix: "192.0.2.0/24".to_owned(),
+        }))
+        .await
+        .expect("withdraw_originated_route");
+
+        let s = state.read().await;
+        let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        assert!(!s.originated_routes.contains_key(&nlri));
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_originated_route_invalid_prefix_returns_error() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl { state };
+        let err = svc
+            .withdraw_originated_route(Request::new(WithdrawOriginatedRouteRequest {
+                prefix: "bad".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_originated_routes_batch() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        svc.originate_routes(Request::new(OriginateRoutesRequest {
+            routes: vec![
+                OriginateRouteRequest {
+                    prefix: "192.0.2.0/24".to_owned(),
+                    ..minimal_originate_req()
+                },
+                OriginateRouteRequest {
+                    prefix: "198.51.100.0/24".to_owned(),
+                    ..minimal_originate_req()
+                },
+            ],
+        }))
+        .await
+        .unwrap();
+
+        let resp = svc
+            .withdraw_originated_routes(Request::new(WithdrawOriginatedRoutesRequest {
+                prefixes: vec!["192.0.2.0/24".to_owned(), "198.51.100.0/24".to_owned()],
+            }))
+            .await
+            .expect("withdraw_originated_routes")
+            .into_inner();
+
+        assert_eq!(resp.count, 2);
+        assert!(state.read().await.originated_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_originated_routes_invalid_prefix_returns_error() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl { state };
+        let err = svc
+            .withdraw_originated_routes(Request::new(WithdrawOriginatedRoutesRequest {
+                prefixes: vec!["bad".to_owned()],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_list_originated_routes_empty() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl { state };
+        let resp = svc
+            .list_originated_routes(Request::new(ListOriginatedRoutesRequest {}))
+            .await
+            .expect("list_originated_routes")
+            .into_inner();
+        assert!(resp.routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_originated_routes_after_originate() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl { state };
+
+        svc.originate_route(Request::new(minimal_originate_req()))
+            .await
+            .unwrap();
+
+        let resp = svc
+            .list_originated_routes(Request::new(ListOriginatedRoutesRequest {}))
+            .await
+            .expect("list_originated_routes")
+            .into_inner();
+
+        assert_eq!(resp.routes.len(), 1);
+        assert_eq!(resp.routes[0].prefix, "192.0.2.0/24");
+        assert_eq!(resp.routes[0].peer_address, "local");
+    }
+
+    // ── WatchPeers / WatchRoutes streaming handlers ───────────────────────────
+
+    #[tokio::test]
+    async fn test_watch_peers_empty_state_yields_end_initial() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state };
+        let resp = svc
+            .watch_peers(Request::new(WatchPeersRequest {}))
+            .await
+            .expect("watch_peers");
+        // Drop svc so the broadcast sender closes, which terminates the stream.
+        drop(svc);
+        let mut stream = resp.into_inner();
+        // No peers configured → only EndInitial event
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.r#type, proto::PeerEventType::EndInitial as i32);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_watch_peers_with_peer_yields_current_then_end_initial() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PeerServiceImpl { state };
+        let resp = svc
+            .watch_peers(Request::new(WatchPeersRequest {}))
+            .await
+            .expect("watch_peers");
+        drop(svc);
+        let mut stream = resp.into_inner();
+
+        let current = stream.next().await.unwrap().unwrap();
+        assert_eq!(current.r#type, proto::PeerEventType::Current as i32);
+
+        let end = stream.next().await.unwrap().unwrap();
+        assert_eq!(end.r#type, proto::PeerEventType::EndInitial as i32);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_watch_routes_empty_state_yields_end_initial() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .watch_routes(Request::new(WatchRoutesRequest {
+                peer_address: String::new(),
+            }))
+            .await
+            .expect("watch_routes");
+        drop(svc);
+        let mut stream = resp.into_inner();
+        // No routes → only EndInitial
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.r#type, proto::RouteEventType::EndInitial as i32);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_watch_routes_invalid_peer_address_returns_error() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+        let result = svc
+            .watch_routes(Request::new(WatchRoutesRequest {
+                peer_address: "not-an-ip".to_owned(),
+            }))
+            .await;
+        match result {
+            Err(status) => assert_eq!(status.code(), tonic::Code::InvalidArgument),
+            Ok(_) => panic!("expected InvalidArgument error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watch_routes_local_filter_yields_end_initial() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .watch_routes(Request::new(WatchRoutesRequest {
+                peer_address: "local".to_owned(),
+            }))
+            .await
+            .expect("watch_routes local");
+        drop(svc);
+        let mut stream = resp.into_inner();
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.r#type, proto::RouteEventType::EndInitial as i32);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_watch_routes_with_routes_yields_current_events() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let mut s = make_state(65001, &[(addr, 65002)]);
+        s.on_established(addr, pathvector_types::PeerType::External, 65002, 90, &[]);
+        let n = nlri("192.0.2.0/24");
+        s.loc_rib.insert(
+            peer(addr.to_string().as_str()),
+            route_igp(n, PeerType::External),
+        );
+        let state = Arc::new(RwLock::new(s));
+
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .watch_routes(Request::new(WatchRoutesRequest {
+                peer_address: String::new(),
+            }))
+            .await
+            .expect("watch_routes with routes");
+        drop(svc);
+        let mut stream = resp.into_inner();
+
+        let current = stream.next().await.unwrap().unwrap();
+        assert_eq!(current.r#type, proto::RouteEventType::Current as i32);
+        assert!(current.route.is_some());
+
+        let end = stream.next().await.unwrap().unwrap();
+        assert_eq!(end.r#type, proto::RouteEventType::EndInitial as i32);
+        assert!(stream.next().await.is_none());
     }
 }
