@@ -185,15 +185,16 @@ session reset — the more lenient policies are not yet applied.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| Missing well-known mandatory attribute → session reset (NOTIFICATION code 3, subcode 3) | `pathvector-session/src/message/update.rs` | ✅ | `test_invalid_origin_rejected` |
-| Malformed ORIGIN → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
-| Malformed AS_PATH → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
-| Malformed NEXT_HOP → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
-| Malformed MP_REACH_NLRI → treat as withdraw for that AFI/SAFI, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
-| Malformed MP_UNREACH_NLRI → attribute discard, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
-| Malformed optional non-transitive attribute → attribute discard, not session reset | `pathvector-session/src/message/update.rs` | ❌ | — |
-| Malformed optional transitive attribute → Partial bit set, forward; otherwise attribute discard | `pathvector-session/src/message/update.rs` | ⚠️ | Partial bit set on re-encode (`test_unknown_optional_transitive_partial_bit_set_on_reencode`); a decode error still causes session reset rather than attribute discard |
-| Duplicate attribute in UPDATE → treat as withdraw | `pathvector-session/src/message/update.rs` | ❌ | — |
+| Missing well-known mandatory attribute → session reset (NOTIFICATION code 3, subcode 3) | `pathvector-session/src/message/update.rs` | ✅ | `test_invalid_origin_is_treat_as_withdraw` (malformed value); missing-attribute detection not yet implemented |
+| Malformed ORIGIN → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ✅ | `test_invalid_origin_is_treat_as_withdraw`, `test_origin_too_short_is_treat_as_withdraw` |
+| Malformed AS_PATH → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ✅ | `test_as_path_unknown_segment_is_treat_as_withdraw`, `test_truncated_asn_in_as_path_is_treat_as_withdraw` |
+| Malformed NEXT_HOP → treat as withdraw, not session reset | `pathvector-session/src/message/update.rs` | ✅ | `test_next_hop_too_short_is_treat_as_withdraw` |
+| Malformed MP_REACH_NLRI → treat as withdraw for that AFI/SAFI, not session reset | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_reach_nlri_too_short_is_treat_as_withdraw`, `test_mp_reach_invalid_next_hop_length_is_treat_as_withdraw` |
+| Malformed MP_UNREACH_NLRI → attribute discard, not session reset | `pathvector-session/src/message/update.rs` | ✅ | `test_mp_unreach_nlri_too_short_is_attribute_discard`, `test_invalid_ipv6_nlri_prefix_too_long_is_attribute_discard` |
+| Malformed optional non-transitive attribute (MED, AGGREGATOR, COMMUNITY, etc.) → attribute discard | `pathvector-session/src/message/update.rs` | ✅ | `test_med_too_short_is_attribute_discard`, `test_aggregator_too_short_is_attribute_discard`, `test_community_bad_length_is_attribute_discard`, `test_extended_communities_bad_length_is_attribute_discard`, `test_as4_aggregator_too_short_is_attribute_discard`, `test_large_community_bad_length_is_attribute_discard` |
+| Malformed optional transitive attribute → Partial bit set, forward; otherwise attribute discard | `pathvector-session/src/message/update.rs` | ✅ | Partial bit preserved (`test_unknown_optional_transitive_partial_bit_set_on_reencode`); decode error → attribute discard (handled by `rfc7606_policy` catch-all) |
+| Duplicate attribute in UPDATE → treat as withdraw | `pathvector-session/src/message/update.rs` | ✅ | `test_duplicate_attribute_is_treat_as_withdraw` |
+| Good attributes in same UPDATE survive alongside a discarded attribute | `pathvector-session/src/message/update.rs` | ✅ | `test_attribute_discard_preserves_other_attrs` |
 
 ---
 
@@ -542,7 +543,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 | RFC 5065 | BGP Confederations | ✅ |
 | RFC 4456 | Route Reflectors | ❌ |
 | RFC 6286 | AS-Wide Unique BGP Identifier | ❌ |
-| RFC 7606 | Revised UPDATE Error Handling | ⚠️ Well-known mandatory errors correctly reset session; optional attribute errors should use discard/withdraw policies but currently reset session |
+| RFC 7606 | Revised UPDATE Error Handling | ✅ Per-attribute error policies implemented: treat-as-withdraw (ORIGIN, AS_PATH, NEXT_HOP, LOCAL_PREF, MP_REACH_NLRI) and attribute-discard (optional attributes); duplicate attribute detection; session stays up |
 | RFC 8212 | Default EBGP Route Propagation | ✅ eBGP peers default to Reject when policy is omitted; iBGP peers default to Accept; explicit config overrides; both import and export directions verified e2e |
 | RFC 3107 | MPLS Labeled Unicast | ⚠️ SAFI defined; label encoding not implemented |
 | RFC 4364 | MPLS L3VPN | ⚠️ SAFI defined; VPN-IPv4 NLRI not implemented |

@@ -205,6 +205,13 @@ fn arb_bgp_message() -> impl Strategy<Value = BgpMessage> {
             prop::collection::vec(arb_nlri_v4(), 0..5),
         )
             .prop_map(|(withdrawn, attributes, announced)| {
+                // Deduplicate by type code so roundtrip holds (RFC 7606 §7.3
+                // treats duplicates as errors, breaking the encode/decode invariant).
+                let mut seen = std::collections::HashSet::new();
+                let attributes: Vec<_> = attributes
+                    .into_iter()
+                    .filter(|a| seen.insert(a.type_code()))
+                    .collect();
                 BgpMessage::Update(UpdateMessage {
                     withdrawn,
                     attributes,

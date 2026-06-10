@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 5aefc7b48ba8e295163b871a94f4a7895cbd41f649c7729d31dc39a207eabea4 # shrinks to error = Unknown { code: 1, subcode: 0 }, data = []
+cc c60c874bb99e13714d0844599db226cbe8598ca6b45eac504345c961cf17054b # shrinks to withdrawn = [], attributes = [Communities([]), Communities([])], announced = []

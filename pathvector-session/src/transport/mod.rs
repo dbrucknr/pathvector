@@ -22,7 +22,9 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
-use crate::message::{BgpMessage, Capability, UpdateMessage};
+use crate::message::{
+    BgpMessage, Capability, MalformedUpdate, MpUnreachNlri, PathAttribute, UpdateMessage,
+};
 
 // ── Transport trait ───────────────────────────────────────────────────────────
 
@@ -375,14 +377,21 @@ impl<T: BgpTransport> Session<T> {
 
                 msg = recv_message(&mut self.transport) => {
                     match msg {
+                        Some(Ok(BgpMessage::MalformedUpdate(m))) => {
+                            self.handle_malformed_update(m).await;
+                            // Session stays up — continue the select! loop.
+                        }
                         Some(Ok(m)) => return FsmInput::MessageReceived(m),
                         Some(Err(e)) => {
                             tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
+                            self.drop_connection();
+                            return FsmInput::TcpFailed;
                         }
-                        None => {}
+                        None => {
+                            self.drop_connection();
+                            return FsmInput::TcpFailed;
+                        }
                     }
-                    self.drop_connection();
-                    return FsmInput::TcpFailed;
                 }
 
                 () = hold => {
@@ -480,11 +489,71 @@ impl<T: BgpTransport> Session<T> {
         true
     }
 
+    /// Apply RFC 7606 error policy for a malformed UPDATE.
+    ///
+    /// - `TreatAsWithdraw`: synthesise a withdrawal UPDATE for all NLRIs that
+    ///   were announced in this message, then forward it as a `RouteUpdate`.
+    /// - `AttributeDiscard` (all errors): forward the cleaned UPDATE (bad
+    ///   attributes already removed by the decoder).
+    ///
+    /// The session is not reset in either case.
+    async fn handle_malformed_update(&mut self, m: MalformedUpdate) {
+        for e in &m.errors {
+            tracing::warn!(
+                peer = %self.config.peer_addr,
+                type_code = e.type_code,
+                detail = e.detail,
+                policy = ?e.policy,
+                "RFC 7606: malformed path attribute"
+            );
+        }
+
+        let update = if m.treat_as_withdraw {
+            make_treat_as_withdraw(m.update)
+        } else {
+            m.update
+        };
+
+        let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
+    }
+
     fn drop_connection(&mut self) {
         self.transport = None;
         if let Some(t) = self.connect_task.take() {
             t.abort();
         }
+    }
+}
+
+/// Convert an UPDATE with treat-as-withdraw errors into a withdrawal-only UPDATE.
+///
+/// All announced IPv4 NLRIs are moved into `withdrawn`. Any `MP_REACH_NLRI`
+/// attributes are converted to `MP_UNREACH_NLRI` so that non-IPv4 prefixes are
+/// also withdrawn. All other attributes are dropped.
+fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
+    let mut withdrawn = update.withdrawn;
+    withdrawn.extend(update.announced);
+
+    // Convert any decoded MP_REACH_NLRI → MP_UNREACH_NLRI.
+    let mp_unreaches: Vec<PathAttribute> = update
+        .attributes
+        .into_iter()
+        .filter_map(|attr| {
+            if let PathAttribute::MpReachNlri(mp) = attr {
+                Some(PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                    afi_safi: mp.afi_safi,
+                    prefixes: mp.prefixes,
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    UpdateMessage {
+        withdrawn,
+        attributes: mp_unreaches,
+        announced: vec![],
     }
 }
 

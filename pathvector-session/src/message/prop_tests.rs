@@ -206,6 +206,13 @@ proptest! {
         attributes  in prop::collection::vec(arb_path_attribute(), 0..5),
         announced   in prop::collection::vec(arb_nlri_v4(), 0..5),
     ) {
+        // Deduplicate by type code — RFC 7606 §7.3 treats duplicate attributes
+        // as errors, so the roundtrip only holds for well-formed messages.
+        let mut seen = std::collections::HashSet::new();
+        let attributes: Vec<_> = attributes
+            .into_iter()
+            .filter(|a| seen.insert(a.type_code()))
+            .collect();
         let msg = BgpMessage::Update(UpdateMessage { withdrawn, attributes, announced });
         prop_assert_eq!(BgpMessage::decode(&msg.encode()).unwrap(), msg);
     }

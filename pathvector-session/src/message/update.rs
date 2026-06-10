@@ -9,6 +9,76 @@ use super::error::CodecError;
 use super::header::{MessageType, encode_header};
 use super::{Cursor, Writer};
 
+// ── RFC 7606 error policy types ──────────────────────────────────────────────
+
+/// RFC 7606 §2 error handling policy for a malformed path attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeErrorPolicy {
+    /// The session must be reset (NOTIFICATION + teardown).
+    /// Reserved for structural errors; attribute-level errors never produce this.
+    SessionReset,
+    /// The NLRIs in this UPDATE are treated as withdrawn; the session stays up.
+    TreatAsWithdraw,
+    /// The malformed attribute is silently dropped; the session and UPDATE are
+    /// otherwise processed normally.
+    AttributeDiscard,
+}
+
+/// A per-attribute decode error with its RFC 7606 handling policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeDecodeError {
+    /// BGP path attribute type code (1 = `ORIGIN`, 2 = `AS_PATH`, …).
+    pub type_code: u8,
+    /// RFC 7606 handling policy for this attribute type.
+    pub policy: AttributeErrorPolicy,
+    /// Human-readable reason the attribute was rejected.
+    pub detail: &'static str,
+}
+
+/// Outcome of decoding a BGP UPDATE message.
+///
+/// Structural errors (truncated withdrawn-routes block, truncated attribute
+/// header) still return `Err(CodecError)` and require a session reset.
+/// Per-attribute decode errors produce a `Partial` outcome instead.
+pub(super) enum UpdateDecodeOutcome {
+    /// All attributes decoded without error.
+    Clean(UpdateMessage),
+    /// One or more attributes were malformed.
+    Partial {
+        /// UPDATE with bad attributes removed.
+        update: UpdateMessage,
+        /// Per-attribute errors with their RFC 7606 policies.
+        errors: Vec<AttributeDecodeError>,
+        /// `true` if any error has `TreatAsWithdraw` policy — the caller must
+        /// treat all announced NLRIs in this UPDATE as withdrawn.
+        treat_as_withdraw: bool,
+    },
+}
+
+/// RFC 7606 §5 per-attribute error policy table.
+fn rfc7606_policy(type_code: u8) -> AttributeErrorPolicy {
+    match type_code {
+        // Well-known: ORIGIN, AS_PATH, NEXT_HOP, LOCAL_PREF → treat as withdraw
+        ATTR_ORIGIN | ATTR_AS_PATH | ATTR_NEXT_HOP | ATTR_LOCAL_PREF => {
+            AttributeErrorPolicy::TreatAsWithdraw
+        }
+        // MP_REACH_NLRI → treat as withdraw for the affected AFI/SAFI
+        ATTR_MP_REACH_NLRI => AttributeErrorPolicy::TreatAsWithdraw,
+        // Everything else (optional): attribute discard
+        _ => AttributeErrorPolicy::AttributeDiscard,
+    }
+}
+
+fn error_detail(e: &CodecError) -> &'static str {
+    match e {
+        CodecError::InvalidOrigin(_) => "invalid ORIGIN value",
+        CodecError::UnknownAsPathSegmentType(_) => "unknown AS_PATH segment type",
+        CodecError::InvalidAttribute { detail, .. } => detail,
+        CodecError::Truncated { .. } => "attribute value truncated",
+        _ => "malformed attribute",
+    }
+}
+
 // ── Path attribute flag bits ─────────────────────────────────────────────────
 
 const FLAG_OPTIONAL: u8 = 0x80;
@@ -69,25 +139,39 @@ pub struct UpdateMessage {
 }
 
 impl UpdateMessage {
-    pub(super) fn decode(cur: &mut Cursor<'_>) -> Result<Self, CodecError> {
-        // Withdrawn routes.
+    pub(super) fn decode(cur: &mut Cursor<'_>) -> Result<UpdateDecodeOutcome, CodecError> {
+        // Withdrawn routes — structural error → session reset.
         let withdrawn_len = cur.read_u16()? as usize;
         let mut wd_cur = cur.fork(withdrawn_len)?;
         let withdrawn = decode_nlri_list_v4(&mut wd_cur)?;
 
-        // Path attributes.
+        // Path attributes — structural errors → session reset;
+        // per-attribute errors collected for RFC 7606 handling.
         let attrs_len = cur.read_u16()? as usize;
         let mut attrs_cur = cur.fork(attrs_len)?;
-        let attributes = decode_path_attributes(&mut attrs_cur)?;
+        let (attributes, attr_errors) = decode_path_attributes(&mut attrs_cur)?;
 
-        // Announced NLRIs (remainder of the message).
+        // Announced NLRIs — structural error → session reset.
         let announced = decode_nlri_list_v4(cur)?;
 
-        Ok(Self {
+        let update = Self {
             withdrawn,
             attributes,
             announced,
-        })
+        };
+
+        if attr_errors.is_empty() {
+            Ok(UpdateDecodeOutcome::Clean(update))
+        } else {
+            let treat_as_withdraw = attr_errors
+                .iter()
+                .any(|e| e.policy == AttributeErrorPolicy::TreatAsWithdraw);
+            Ok(UpdateDecodeOutcome::Partial {
+                update,
+                errors: attr_errors,
+                treat_as_withdraw,
+            })
+        }
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
@@ -186,24 +270,58 @@ fn encode_nlri_list_v4(nlris: &[Nlri<Ipv4Addr>]) -> Vec<u8> {
 
 // ── Path attribute decode ────────────────────────────────────────────────────
 
-fn decode_path_attributes(cur: &mut Cursor<'_>) -> Result<Vec<PathAttribute>, CodecError> {
-    let mut out = Vec::new();
-    while cur.remaining() > 0 {
-        out.push(decode_one_path_attr(cur)?);
-    }
-    Ok(out)
-}
+/// Decode all path attributes from `cur`.
+///
+/// Structural errors (truncated header, can't advance past attribute bytes)
+/// return `Err(CodecError)` and require a session reset. Per-attribute value
+/// errors are recorded in the returned `Vec<AttributeDecodeError>` per
+/// RFC 7606 §5 — the bad attribute is skipped and parsing continues.
+///
+/// Duplicate type codes are also detected: RFC 7606 §7.3 requires that a
+/// duplicate well-known mandatory attribute be treated as a withdraw.
+fn decode_path_attributes(
+    cur: &mut Cursor<'_>,
+) -> Result<(Vec<PathAttribute>, Vec<AttributeDecodeError>), CodecError> {
+    let mut attrs = Vec::new();
+    let mut errors: Vec<AttributeDecodeError> = Vec::new();
+    let mut seen = [false; 256];
 
-fn decode_one_path_attr(cur: &mut Cursor<'_>) -> Result<PathAttribute, CodecError> {
-    let flags = cur.read_u8()?;
-    let type_code = cur.read_u8()?;
-    let len = if (flags & FLAG_EXT_LEN) != 0 {
-        cur.read_u16()? as usize
-    } else {
-        cur.read_u8()? as usize
-    };
-    let mut val = cur.fork(len)?;
-    decode_attr_value(flags, type_code, &mut val)
+    while cur.remaining() > 0 {
+        // Structural reads — any failure here means the attribute block is
+        // unsalvageable; propagate as session reset.
+        let flags = cur.read_u8()?;
+        let type_code = cur.read_u8()?;
+        let len = if (flags & FLAG_EXT_LEN) != 0 {
+            cur.read_u16()? as usize
+        } else {
+            cur.read_u8()? as usize
+        };
+        // fork advances the outer cursor past this attribute's bytes
+        // unconditionally, so inner decode errors don't corrupt the stream.
+        let mut val = cur.fork(len)?;
+
+        // Duplicate attribute detection (RFC 7606 §7.3).
+        if seen[type_code as usize] {
+            errors.push(AttributeDecodeError {
+                type_code,
+                policy: AttributeErrorPolicy::TreatAsWithdraw,
+                detail: "duplicate attribute type code",
+            });
+            continue;
+        }
+        seen[type_code as usize] = true;
+
+        match decode_attr_value(flags, type_code, &mut val) {
+            Ok(attr) => attrs.push(attr),
+            Err(e) => errors.push(AttributeDecodeError {
+                type_code,
+                policy: rfc7606_policy(type_code),
+                detail: error_detail(&e),
+            }),
+        }
+    }
+
+    Ok((attrs, errors))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -682,6 +800,30 @@ pub enum PathAttribute {
     },
 }
 
+impl PathAttribute {
+    /// Returns the BGP type code for this attribute (used for duplicate detection).
+    #[must_use]
+    pub fn type_code(&self) -> u8 {
+        match self {
+            Self::Origin(_) => ATTR_ORIGIN,
+            Self::AsPath(_) => ATTR_AS_PATH,
+            Self::NextHop(_) => ATTR_NEXT_HOP,
+            Self::Med(_) => ATTR_MED,
+            Self::LocalPref(_) => ATTR_LOCAL_PREF,
+            Self::AtomicAggregate => ATTR_ATOMIC_AGGREGATE,
+            Self::Aggregator(_) => ATTR_AGGREGATOR,
+            Self::Communities(_) => ATTR_COMMUNITY,
+            Self::MpReachNlri(_) => ATTR_MP_REACH_NLRI,
+            Self::MpUnreachNlri(_) => ATTR_MP_UNREACH_NLRI,
+            Self::ExtendedCommunities(_) => ATTR_EXTENDED_COMMUNITIES,
+            Self::As4Path(_) => ATTR_AS4_PATH,
+            Self::As4Aggregator { .. } => ATTR_AS4_AGGREGATOR,
+            Self::LargeCommunities(_) => ATTR_LARGE_COMMUNITY,
+            Self::Unknown { type_code, .. } => *type_code,
+        }
+    }
+}
+
 /// Reachable prefixes for a specific AFI/SAFI, carried in `MP_REACH_NLRI`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MpReachNlri {
@@ -713,7 +855,12 @@ mod tests {
     fn roundtrip(msg: &UpdateMessage) -> UpdateMessage {
         let encoded = msg.encode();
         let mut cur = Cursor::new(&encoded[19..]);
-        UpdateMessage::decode(&mut cur).unwrap()
+        match UpdateMessage::decode(&mut cur).unwrap() {
+            UpdateDecodeOutcome::Clean(u) => u,
+            UpdateDecodeOutcome::Partial { errors, .. } => {
+                panic!("roundtrip produced attribute errors: {errors:?}")
+            }
+        }
     }
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
@@ -938,13 +1085,14 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_origin_rejected() {
+    fn test_invalid_origin_is_treat_as_withdraw() {
+        // RFC 7606 §5: malformed ORIGIN → treat as withdraw, not session reset.
         let body: &[u8] = &[0x00, 0x00, 0x00, 0x04, FLAGS_WKM, ATTR_ORIGIN, 0x01, 99];
-        let mut cur = Cursor::new(body);
-        assert!(matches!(
-            UpdateMessage::decode(&mut cur),
-            Err(CodecError::InvalidOrigin(99))
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].type_code, ATTR_ORIGIN);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     // ── Missing roundtrip coverage ────────────────────────────────────────────
@@ -1057,9 +1205,34 @@ mod tests {
 
     // ── Raw-byte decode helpers ───────────────────────────────────────────────
 
-    fn decode_update(body: &[u8]) -> Result<UpdateMessage, CodecError> {
+    fn decode_raw(body: &[u8]) -> Result<UpdateDecodeOutcome, CodecError> {
         let mut cur = Cursor::new(body);
         UpdateMessage::decode(&mut cur)
+    }
+
+    /// Decode and assert the result is a clean (no attribute errors) UPDATE.
+    fn decode_update(body: &[u8]) -> UpdateMessage {
+        match decode_raw(body).expect("structural decode error") {
+            UpdateDecodeOutcome::Clean(u) => u,
+            UpdateDecodeOutcome::Partial { errors, .. } => {
+                panic!("expected clean decode, got attribute errors: {errors:?}")
+            }
+        }
+    }
+
+    /// Decode and assert the result is a `Partial` outcome with at least one
+    /// attribute error. Returns the errors and the treat-as-withdraw flag.
+    fn decode_partial(body: &[u8]) -> (Vec<AttributeDecodeError>, bool) {
+        match decode_raw(body).expect("structural decode error") {
+            UpdateDecodeOutcome::Partial {
+                errors,
+                treat_as_withdraw,
+                ..
+            } => (errors, treat_as_withdraw),
+            UpdateDecodeOutcome::Clean(_) => {
+                panic!("expected Partial outcome but got Clean")
+            }
+        }
     }
 
     /// Build an UPDATE body: no withdrawn routes, one path attribute (short len).
@@ -1090,23 +1263,26 @@ mod tests {
 
     #[test]
     fn test_invalid_ipv4_nlri_prefix_too_long() {
-        // withdrawn prefix_len = 33 (> 32 for IPv4).
+        // withdrawn prefix_len = 33 (> 32 for IPv4) — structural error in the
+        // withdrawn-routes block → session reset (not an attribute error).
         let body: &[u8] = &[0x00, 0x02, 33, 0x00, 0x00, 0x00];
         assert!(matches!(
-            decode_update(body),
+            decode_raw(body),
             Err(CodecError::InvalidNlri { prefix_len: 33 })
         ));
     }
 
     #[test]
-    fn test_invalid_ipv6_nlri_prefix_too_long() {
+    fn test_invalid_ipv6_nlri_prefix_too_long_is_attribute_discard() {
         // MP_UNREACH NLRI with IPv6 prefix_len = 129 (> 128).
+        // This is inside an MP_UNREACH_NLRI attribute value (type 15), so
+        // RFC 7606 applies: attribute discard, not session reset.
         let mp_body: &[u8] = &[0x00, 0x02, 0x01, 129, 0x00]; // AFI=2 IPv6, SAFI=1, pfx_len=129
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, mp_body);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidNlri { prefix_len: 129 })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_MP_UNREACH_NLRI);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
     }
 
     // ── Extended-length attribute ─────────────────────────────────────────────
@@ -1114,137 +1290,205 @@ mod tests {
     #[test]
     fn test_extended_length_origin_attribute() {
         let body = update_with_ext_attr(FLAGS_WKM, ATTR_ORIGIN, &[0u8]); // ORIGIN=IGP
-        let update = decode_update(&body).unwrap();
+        let update = decode_update(&body);
         assert!(matches!(update.attributes[0], PathAttribute::Origin(_)));
     }
 
-    // ── Path attribute error paths ────────────────────────────────────────────
+    // ── RFC 7606 per-attribute error policy tests ─────────────────────────────
+    //
+    // Each test verifies the RFC 7606 §5 policy for a malformed attribute:
+    //   TreatAsWithdraw — well-known mandatory attributes
+    //   AttributeDiscard — optional attributes
 
     #[test]
-    fn test_origin_too_short_is_error() {
+    fn test_origin_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_ORIGIN, &[]);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 1, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_ORIGIN);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     #[test]
-    fn test_next_hop_too_short_is_error() {
+    fn test_next_hop_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_NEXT_HOP, &[10, 0, 0]); // 3 bytes, needs 4
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 3, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_NEXT_HOP);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     #[test]
-    fn test_med_too_short_is_error() {
-        let body = update_with_attr(FLAGS_ONT, ATTR_MED, &[0u8; 3]);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 4, .. })
-        ));
-    }
-
-    #[test]
-    fn test_local_pref_too_short_is_error() {
+    fn test_local_pref_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_LOCAL_PREF, &[0u8; 3]);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 5, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_LOCAL_PREF);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     #[test]
-    fn test_aggregator_too_short_is_error() {
-        let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &[0u8; 7]); // needs 8
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 7, .. })
-        ));
-    }
-
-    #[test]
-    fn test_community_bad_length_is_error() {
-        let body = update_with_attr(FLAGS_OT, ATTR_COMMUNITY, &[0u8; 3]); // not multiple of 4
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 8, .. })
-        ));
-    }
-
-    #[test]
-    fn test_mp_reach_nlri_too_short_is_error() {
+    fn test_mp_reach_nlri_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, &[0x00, 0x01]); // only 2 bytes
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 14, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_MP_REACH_NLRI);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     #[test]
-    fn test_mp_unreach_nlri_too_short_is_error() {
+    fn test_as_path_unknown_segment_is_treat_as_withdraw() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[9, 0]); // unknown seg type
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+    }
+
+    #[test]
+    fn test_med_too_short_is_attribute_discard() {
+        let body = update_with_attr(FLAGS_ONT, ATTR_MED, &[0u8; 3]);
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_MED);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+    }
+
+    #[test]
+    fn test_aggregator_too_short_is_attribute_discard() {
+        let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &[0u8; 7]); // needs 8
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_AGGREGATOR);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+    }
+
+    #[test]
+    fn test_community_bad_length_is_attribute_discard() {
+        let body = update_with_attr(FLAGS_OT, ATTR_COMMUNITY, &[0u8; 3]); // not multiple of 4
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_COMMUNITY);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+    }
+
+    #[test]
+    fn test_mp_unreach_nlri_too_short_is_attribute_discard() {
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, &[0x00]); // only 1 byte
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 15, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_MP_UNREACH_NLRI);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
     }
 
     #[test]
-    fn test_extended_communities_bad_length_is_error() {
+    fn test_extended_communities_bad_length_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_EXTENDED_COMMUNITIES, &[0u8; 7]); // not multiple of 8
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 16, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_EXTENDED_COMMUNITIES);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
     }
 
     #[test]
-    fn test_as4_aggregator_too_short_is_error() {
+    fn test_as4_aggregator_too_short_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_AS4_AGGREGATOR, &[0u8; 7]); // needs 8
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 18, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_AS4_AGGREGATOR);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
     }
 
     #[test]
-    fn test_large_community_bad_length_is_error() {
+    fn test_large_community_bad_length_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_LARGE_COMMUNITY, &[0u8; 11]); // not multiple of 12
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 32, .. })
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(!treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_LARGE_COMMUNITY);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+    }
+
+    // ── RFC 7606 §7.3 — duplicate attribute → treat as withdraw ──────────────
+
+    #[test]
+    fn test_duplicate_attribute_is_treat_as_withdraw() {
+        // Two ORIGIN attributes in the same UPDATE.
+        let mut body = vec![0x00, 0x00]; // no withdrawn
+        let attr = |v: u8| [FLAGS_WKM, ATTR_ORIGIN, 0x01, v];
+        let attrs: Vec<u8> = attr(0).iter().chain(attr(1).iter()).copied().collect();
+        body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&attrs);
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert!(errors.iter().any(
+            |e| e.type_code == ATTR_ORIGIN && e.policy == AttributeErrorPolicy::TreatAsWithdraw
         ));
+    }
+
+    // ── RFC 7606: good attributes survive alongside bad ones ──────────────────
+
+    #[test]
+    fn test_attribute_discard_preserves_other_attrs() {
+        // MED is malformed (3 bytes) but ORIGIN is fine.
+        // The result should be Partial with only ORIGIN in the decoded attrs.
+        let mut body = vec![0x00, 0x00]; // no withdrawn
+        let origin_attr = [FLAGS_WKM, ATTR_ORIGIN, 0x01, 0x00u8]; // ORIGIN=IGP
+        let bad_med = [FLAGS_ONT, ATTR_MED, 0x03, 0x00, 0x00, 0x00u8]; // MED, 3 bytes (needs 4)
+        let mut attrs = Vec::new();
+        attrs.extend_from_slice(&origin_attr);
+        attrs.extend_from_slice(&bad_med);
+        body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&attrs);
+
+        let (attrs_decoded, errors, treat_as_withdraw) =
+            match decode_raw(&body).expect("structural error") {
+                UpdateDecodeOutcome::Partial {
+                    update,
+                    errors,
+                    treat_as_withdraw,
+                } => (update.attributes, errors, treat_as_withdraw),
+                UpdateDecodeOutcome::Clean(_) => panic!("expected Partial"),
+            };
+
+        assert!(
+            !treat_as_withdraw,
+            "MED discard should not trigger treat-as-withdraw"
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].type_code, ATTR_MED);
+        // ORIGIN survived
+        assert!(
+            attrs_decoded
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Origin(_)))
+        );
     }
 
     // ── AS_PATH error and edge cases ──────────────────────────────────────────
 
     #[test]
-    fn test_unknown_as_path_segment_type_is_error() {
+    fn test_unknown_as_path_segment_type_is_treat_as_withdraw() {
         // seg_type=9 (unknown), count=0
         let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[9, 0]);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::UnknownAsPathSegmentType(9))
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     #[test]
-    fn test_truncated_asn_in_as_path_is_error() {
+    fn test_truncated_asn_in_as_path_is_treat_as_withdraw() {
         // SEG_SEQUENCE, count=2, but only 4 bytes (enough for 1 ASN, not 2).
         let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[2, 2, 0, 0, 0x00, 0x01]);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 2, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
     }
 
     // ── MP_REACH next-hop error paths ─────────────────────────────────────────
 
     #[test]
-    fn test_mp_reach_invalid_next_hop_length_is_error() {
+    fn test_mp_reach_invalid_next_hop_length_is_treat_as_withdraw() {
         // AFI=IPv4, SAFI=1, nh_len=3 (not 4 → decode_next_hop fails).
         let mp_body: &[u8] = &[
             0x00, 0x01, // AFI = IPv4
@@ -1254,10 +1498,10 @@ mod tests {
             0x00, // SNPA
         ];
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, mp_body);
-        assert!(matches!(
-            decode_update(&body),
-            Err(CodecError::InvalidAttribute { type_code: 14, .. })
-        ));
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_MP_REACH_NLRI);
+        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
     }
 
     // ── Unknown AFI in MP_UNREACH → decode_mp_nlri else branch ───────────────
@@ -1267,7 +1511,7 @@ mod tests {
         // AFI=9 (unknown), no further NLRI bytes.
         let mp_body: &[u8] = &[0x00, 0x09, 0x01]; // AFI=9, SAFI=1
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, mp_body);
-        let update = decode_update(&body).unwrap();
+        let update = decode_update(&body);
         assert!(matches!(
             &update.attributes[0],
             PathAttribute::MpUnreachNlri(mp) if mp.prefixes.is_empty()

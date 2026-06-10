@@ -30,13 +30,18 @@ Exposed as `SetImportDefault` / `SetExportDefault` gRPC RPCs in the new
 
 ### Tier 2 — Medium scope, architectural or user-facing value
 
-**3. RFC 7606 revised UPDATE error handling** (`pathvector-session`, `pathvectord`)
-Currently every malformed attribute resets the session. RFC 7606 requires
-per-attribute error policies (session reset / treat-as-withdraw / attribute
-discard). This is architectural — it touches the codec, transport layer, and
-daemon event loop — and gets harder to retrofit as the codebase grows. Doing
-it now means every future attribute decode arm gets the correct error policy
-for free. See the dedicated section below.
+**3. RFC 7606 revised UPDATE error handling** (`pathvector-session`, `pathvectord`) — **Done (2026-06-10)**
+`UpdateDecodeOutcome::Partial` replaces the flat `Err(CodecError)` path for
+per-attribute errors. `BgpMessage::MalformedUpdate` carries the cleaned UPDATE
+plus per-attribute `AttributeDecodeError` entries. The transport layer applies
+the RFC 7606 §5 policy table: treat-as-withdraw (ORIGIN, AS_PATH, NEXT_HOP,
+LOCAL_PREF, MP_REACH_NLRI) or attribute-discard (all optional non-mandatory
+attributes). Duplicate type codes in a single UPDATE are detected and treated as
+withdraw (RFC 7606 §7.3). Good attributes in the same UPDATE survive alongside a
+discarded attribute. `make_treat_as_withdraw` converts announced NLRIs and any
+decoded MP_REACH_NLRI prefixes into proper withdrawals. The session stays up in
+all cases; malformed-attribute events are `tracing::warn!`-logged with type code,
+detail, and RFC 7606 policy. See RFC_REQUIREMENTS.md §RFC 7606 for full coverage.
 
 **4. CLI tool (`pathvector`)** (new crate, uses `pathvector-client`) — **Done (2026-06-09)**
 Implemented as `pathvector/` workspace member. Subcommands: `peer list`,

@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc eb5b2e7629f9f206e1a2d66f7e869dbcd176698997799b106e99a9ad43ce0399 # shrinks to first = Keepalive, second = Notification(NotificationMessage { error: UpdateMessage(Unknown(1)), data: [] })
+cc afe0e7b97db453b78bac4bd494da3838b960adbe6250b76eebc7ba0ee210d177 # shrinks to first = Keepalive, second = Update(UpdateMessage { withdrawn: [], attributes: [AtomicAggregate, AtomicAggregate], announced: [] })
+cc a99de70c9f70121ab87c95800fda95c7a982d952247179245fb657e645f35001 # shrinks to msg = Update(UpdateMessage { withdrawn: [], attributes: [LargeCommunities([]), LargeCommunities([])], announced: [] })

@@ -15,9 +15,13 @@ pub use notification::{
 };
 pub use open::{Capability, GracefulRestartFamily, OpenMessage};
 pub use route_refresh::RouteRefreshMessage;
-pub use update::{MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage};
+pub use update::{
+    AttributeDecodeError, AttributeErrorPolicy, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
+    UpdateMessage,
+};
 
 use header::{MessageType as MsgType, decode_header, encode_header};
+use update::UpdateDecodeOutcome;
 
 // ── Shared codec primitives ───────────────────────────────────────────────────
 //
@@ -149,6 +153,22 @@ impl Writer {
 
 // ── BgpMessage ───────────────────────────────────────────────────────────────
 
+/// A BGP UPDATE whose attributes could not all be decoded cleanly.
+///
+/// Produced by [`BgpMessage::decode`] when one or more path attributes are
+/// malformed but the error policy (RFC 7606 §5) does not require a session
+/// reset. The transport layer inspects [`MalformedUpdate::treat_as_withdraw`]
+/// to decide whether to forward a synthetic withdrawal or the cleaned UPDATE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MalformedUpdate {
+    /// The UPDATE with bad attributes removed.
+    pub update: UpdateMessage,
+    /// Per-attribute errors with their RFC 7606 policies.
+    pub errors: Vec<AttributeDecodeError>,
+    /// `true` if any error has `TreatAsWithdraw` policy.
+    pub treat_as_withdraw: bool,
+}
+
 /// A decoded BGP message.
 ///
 /// This is the central type of the message codec. `decode` parses any of the
@@ -162,6 +182,11 @@ pub enum BgpMessage {
     /// KEEPALIVE has no body — it is just the 19-byte header.
     Keepalive,
     RouteRefresh(RouteRefreshMessage),
+    /// UPDATE with one or more malformed attributes handled per RFC 7606.
+    ///
+    /// The session is not reset. The transport layer applies the per-attribute
+    /// error policy: treat-as-withdraw or attribute-discard.
+    MalformedUpdate(MalformedUpdate),
 }
 
 impl BgpMessage {
@@ -186,7 +211,18 @@ impl BgpMessage {
         // cur is now positioned at the body (total_len - HEADER_LEN bytes remain).
         match msg_type {
             MsgType::Open => Ok(Self::Open(OpenMessage::decode(&mut cur)?)),
-            MsgType::Update => Ok(Self::Update(UpdateMessage::decode(&mut cur)?)),
+            MsgType::Update => match UpdateMessage::decode(&mut cur)? {
+                UpdateDecodeOutcome::Clean(u) => Ok(Self::Update(u)),
+                UpdateDecodeOutcome::Partial {
+                    update,
+                    errors,
+                    treat_as_withdraw,
+                } => Ok(Self::MalformedUpdate(MalformedUpdate {
+                    update,
+                    errors,
+                    treat_as_withdraw,
+                })),
+            },
             MsgType::Notification => Ok(Self::Notification(NotificationMessage::decode(&mut cur)?)),
             MsgType::Keepalive => {
                 if cur.remaining() != 0 {
@@ -211,6 +247,9 @@ impl BgpMessage {
                 w.finish()
             }
             Self::RouteRefresh(m) => m.encode(),
+            Self::MalformedUpdate(_) => {
+                unreachable!("MalformedUpdate is a decode-only variant and is never sent")
+            }
         }
     }
 }
