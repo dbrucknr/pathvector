@@ -28,7 +28,7 @@ async fn announced_route_appears_in_rib() {
         .expect("10.0.0.0/8 did not appear in RIB within 10 s");
 
     assert_eq!(route.prefix, "10.0.0.0/8");
-    assert_eq!(route.peer_address, h.peer);
+    assert_eq!(route.peer_address, Some(std::net::IpAddr::V4(h.peer)));
     assert_eq!(route.peer_type, PeerType::External);
     assert_eq!(route.origin, Origin::Igp);
 }

@@ -7,7 +7,7 @@
 //!
 //! ```rust
 //! use std::{future::Future, net::IpAddr};
-//! use pathvector_client::{DaemonClient, error::ClientError, types::{PeerState, Route}};
+//! use pathvector_client::{DaemonClient, error::ClientError, types::{OriginateRouteParams, PeerState, Route}};
 //!
 //! struct NullClient;
 //!
@@ -33,6 +33,21 @@
 //!     fn set_export_default(&mut self, _: &str, _: bool) -> impl Future<Output = Result<(), ClientError>> + Send {
 //!         async { Ok(()) }
 //!     }
+//!     fn originate_route(&mut self, _: OriginateRouteParams) -> impl Future<Output = Result<(), ClientError>> + Send {
+//!         async { Ok(()) }
+//!     }
+//!     fn originate_routes(&mut self, _: Vec<OriginateRouteParams>) -> impl Future<Output = Result<u32, ClientError>> + Send {
+//!         async { Ok(0) }
+//!     }
+//!     fn withdraw_originated_route(&mut self, _: &str) -> impl Future<Output = Result<(), ClientError>> + Send {
+//!         async { Ok(()) }
+//!     }
+//!     fn withdraw_originated_routes(&mut self, _: Vec<String>) -> impl Future<Output = Result<u32, ClientError>> + Send {
+//!         async { Ok(0) }
+//!     }
+//!     fn list_originated_routes(&mut self) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send {
+//!         async { Ok(vec![]) }
+//!     }
 //! }
 //! ```
 
@@ -42,10 +57,12 @@ use crate::{
     PathvectorClient,
     error::ClientError,
     proto::{
-        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListPeersRequest,
-        ListRoutesRequest, PolicyAction, SetExportDefaultRequest, SetImportDefaultRequest,
+        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListOriginatedRoutesRequest,
+        ListPeersRequest, ListRoutesRequest, OriginateRouteRequest, OriginateRoutesRequest,
+        PolicyAction, SetExportDefaultRequest, SetImportDefaultRequest,
+        WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
     },
-    types::{PeerState, Route},
+    types::{OriginateRouteParams, PeerState, Route},
 };
 
 /// Abstracts the seven gRPC calls used to manage a running `pathvectord` daemon.
@@ -107,6 +124,38 @@ pub trait DaemonClient {
         peer: &str,
         accept: bool,
     ) -> impl Future<Output = Result<(), ClientError>> + Send;
+
+    /// Inject a single locally originated route into the daemon's Loc-RIB.
+    fn originate_route(
+        &mut self,
+        params: OriginateRouteParams,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+
+    /// Batch-inject routes into the daemon's Loc-RIB.  Returns the number of
+    /// routes accepted.
+    fn originate_routes(
+        &mut self,
+        routes: Vec<OriginateRouteParams>,
+    ) -> impl Future<Output = Result<u32, ClientError>> + Send;
+
+    /// Withdraw a single locally originated route.  No-op if not previously
+    /// originated.
+    fn withdraw_originated_route(
+        &mut self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+
+    /// Batch-withdraw locally originated routes.  Returns the number of
+    /// prefixes withdrawn.
+    fn withdraw_originated_routes(
+        &mut self,
+        prefixes: Vec<String>,
+    ) -> impl Future<Output = Result<u32, ClientError>> + Send;
+
+    /// Return all currently originated routes.
+    fn list_originated_routes(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send;
 }
 
 // ── Implementation for the real client ───────────────────────────────────────
@@ -284,6 +333,69 @@ impl DaemonClient for PathvectorClient {
             .await?;
         Ok(())
     }
+
+    async fn originate_route(
+        &mut self,
+        params: OriginateRouteParams,
+    ) -> Result<(), ClientError> {
+        self.origination
+            .originate_route(OriginateRouteRequest::from(params))
+            .await?;
+        Ok(())
+    }
+
+    async fn originate_routes(
+        &mut self,
+        routes: Vec<OriginateRouteParams>,
+    ) -> Result<u32, ClientError> {
+        let resp = self
+            .origination
+            .originate_routes(OriginateRoutesRequest {
+                routes: routes
+                    .into_iter()
+                    .map(OriginateRouteRequest::from)
+                    .collect(),
+            })
+            .await?
+            .into_inner();
+        Ok(resp.count)
+    }
+
+    async fn withdraw_originated_route(
+        &mut self,
+        prefix: &str,
+    ) -> Result<(), ClientError> {
+        self.origination
+            .withdraw_originated_route(WithdrawOriginatedRouteRequest {
+                prefix: prefix.into(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn withdraw_originated_routes(
+        &mut self,
+        prefixes: Vec<String>,
+    ) -> Result<u32, ClientError> {
+        let resp = self
+            .origination
+            .withdraw_originated_routes(WithdrawOriginatedRoutesRequest { prefixes })
+            .await?
+            .into_inner();
+        Ok(resp.count)
+    }
+
+    async fn list_originated_routes(&mut self) -> Result<Vec<Route>, ClientError> {
+        let resp = self
+            .origination
+            .list_originated_routes(ListOriginatedRoutesRequest {})
+            .await?
+            .into_inner();
+        resp.routes
+            .into_iter()
+            .map(|r| Route::try_from(r).map_err(ClientError::from))
+            .collect()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -333,6 +445,47 @@ mod tests {
         ) -> Result<(), ClientError> {
             Ok(())
         }
+
+        async fn originate_route(&mut self, _: OriginateRouteParams) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn originate_routes(
+            &mut self,
+            routes: Vec<OriginateRouteParams>,
+        ) -> Result<u32, ClientError> {
+            Ok(routes.len() as u32)
+        }
+
+        async fn withdraw_originated_route(&mut self, _: &str) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn withdraw_originated_routes(
+            &mut self,
+            prefixes: Vec<String>,
+        ) -> Result<u32, ClientError> {
+            Ok(prefixes.len() as u32)
+        }
+
+        async fn list_originated_routes(&mut self) -> Result<Vec<Route>, ClientError> {
+            Ok(vec![])
+        }
+    }
+
+    use crate::types::{LargeCommunity, Origin, OriginateRouteParams};
+
+    fn make_params() -> OriginateRouteParams {
+        OriginateRouteParams {
+            prefix: "1.2.3.4/32".into(),
+            next_hop: "10.0.0.1".into(),
+            origin: Origin::Igp,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        }
     }
 
     /// Each method of `StubClient` returns the correct value as documented.
@@ -352,6 +505,16 @@ mod tests {
         assert_eq!(c.list_candidates("10.0.0.0/8").await.unwrap(), vec![]);
         assert!(c.set_import_default("10.0.0.1", true).await.is_ok());
         assert!(c.set_export_default("10.0.0.1", false).await.is_ok());
+        assert!(c.originate_route(make_params()).await.is_ok());
+        assert_eq!(c.originate_routes(vec![make_params(), make_params()]).await.unwrap(), 2);
+        assert!(c.withdraw_originated_route("1.2.3.4/32").await.is_ok());
+        assert_eq!(
+            c.withdraw_originated_routes(vec!["1.2.3.4/32".into(), "5.6.7.8/32".into()])
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(c.list_originated_routes().await.unwrap(), vec![]);
 
         let err = c
             .get_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
@@ -406,6 +569,26 @@ mod tests {
         ));
         assert!(matches!(
             c.set_export_default("10.0.0.1", false).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.originate_route(make_params()).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.originate_routes(vec![make_params()]).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.withdraw_originated_route("1.2.3.4/32").await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.withdraw_originated_routes(vec!["1.2.3.4/32".into()]).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.list_originated_routes().await,
             Err(ClientError::Rpc(_))
         ));
     }

@@ -147,7 +147,7 @@ pub fn print_route_table(routes: &[Route]) {
         println!(
             "{:<20} {:<16} {:<16} {:<20} {:<6}  {}",
             r.prefix,
-            r.peer_address.to_string(),
+            r.peer_address.map_or_else(|| "local".to_owned(), |a| a.to_string()),
             next_hop,
             format_as_path(&r.as_path),
             format_origin(r.origin),
@@ -163,7 +163,8 @@ pub fn print_route_detail(route: &Route) {
         .map_or_else(|| "\u{2014}".to_owned(), |ip| ip.to_string());
 
     println!("Prefix:     {}", route.prefix);
-    println!("Peer:       {} ({})", route.peer_address, {
+    let peer_addr_str = route.peer_address.map_or_else(|| "local".to_owned(), |a| a.to_string());
+    println!("Peer:       {} ({})", peer_addr_str, {
         match route.peer_type {
             pathvector_client::types::PeerType::External => "eBGP",
             pathvector_client::types::PeerType::Internal => "iBGP",
@@ -372,7 +373,7 @@ mod tests {
     fn make_route_minimal() -> Route {
         Route {
             prefix: "192.0.2.0/24".to_owned(),
-            peer_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            peer_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
             peer_type: PeerType::External,
             next_hop: None,
             as_path: vec![],
@@ -390,7 +391,7 @@ mod tests {
     fn make_route_full() -> Route {
         Route {
             prefix: "10.0.0.0/8".to_owned(),
-            peer_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
             peer_type: PeerType::Internal,
             next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
             as_path: vec![AsSegment {

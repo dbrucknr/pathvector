@@ -6,7 +6,8 @@ use crate::{
     error::ConvertError,
     proto,
     types::{
-        Aggregator, AsSegment, AsSegmentType, LargeCommunity, Origin, PeerState, PeerType, Route,
+        Aggregator, AsSegment, AsSegmentType, LargeCommunity, Origin, OriginateRouteParams,
+        PeerEvent, PeerEventType, PeerState, PeerType, Route, RouteEvent, RouteEventType,
         SessionState,
     },
 };
@@ -25,6 +26,16 @@ fn parse_addr_opt(s: &str) -> Result<Option<IpAddr>, ConvertError> {
         s.parse()
             .map(Some)
             .map_err(|_| ConvertError::InvalidAddress(s.to_owned()))
+    }
+}
+
+/// Parse a route peer address: "local" → None (locally originated route),
+/// any other string → Some(IpAddr) or an error.
+fn parse_route_peer(s: &str) -> Result<Option<IpAddr>, ConvertError> {
+    if s == "local" {
+        Ok(None)
+    } else {
+        parse_addr(s).map(Some)
     }
 }
 
@@ -168,7 +179,7 @@ impl TryFrom<proto::Route> for Route {
 
         Ok(Self {
             prefix: p.prefix,
-            peer_address: parse_addr(&p.peer_address)?,
+            peer_address: parse_route_peer(&p.peer_address)?,
             peer_type: PeerType::try_from(p.peer_type)?,
             next_hop: parse_addr_opt(&p.next_hop)?,
             as_path,
@@ -201,6 +212,97 @@ impl TryFrom<proto::PeerState> for PeerState {
             prefixes_received: p.prefixes_received,
             prefixes_accepted: p.prefixes_accepted,
             prefixes_advertised: p.prefixes_advertised,
+        })
+    }
+}
+
+// ── OriginateRouteParams → proto ──────────────────────────────────────────────
+
+impl From<OriginateRouteParams> for proto::OriginateRouteRequest {
+    fn from(p: OriginateRouteParams) -> Self {
+        Self {
+            prefix: p.prefix,
+            next_hop: p.next_hop,
+            origin: match p.origin {
+                Origin::Igp => 0,
+                Origin::Egp => 1,
+                Origin::Incomplete => 2,
+            },
+            communities: p.communities,
+            large_communities: p
+                .large_communities
+                .into_iter()
+                .map(|lc| proto::LargeCommunity {
+                    global_admin: lc.global_admin,
+                    local_data1: lc.local_data1,
+                    local_data2: lc.local_data2,
+                })
+                .collect(),
+            extended_communities: p
+                .extended_communities
+                .into_iter()
+                .map(|arr| arr.to_vec())
+                .collect(),
+            local_pref: p.local_pref,
+            med: p.med,
+        }
+    }
+}
+
+// ── RouteEventType ────────────────────────────────────────────────────────────
+
+impl TryFrom<i32> for RouteEventType {
+    type Error = ConvertError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Current),
+            2 => Ok(Self::EndInitial),
+            3 => Ok(Self::Announced),
+            4 => Ok(Self::Withdrawn),
+            other => Err(ConvertError::UnknownEnumValue("RouteEventType", other)),
+        }
+    }
+}
+
+// ── RouteEvent ────────────────────────────────────────────────────────────────
+
+impl TryFrom<proto::RouteEvent> for RouteEvent {
+    type Error = ConvertError;
+
+    fn try_from(p: proto::RouteEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            event_type: RouteEventType::try_from(p.r#type)?,
+            route: p.route.map(Route::try_from).transpose()?,
+            withdrawn_prefix: p.withdrawn_prefix,
+        })
+    }
+}
+
+// ── PeerEventType ─────────────────────────────────────────────────────────────
+
+impl TryFrom<i32> for PeerEventType {
+    type Error = ConvertError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Current),
+            2 => Ok(Self::EndInitial),
+            3 => Ok(Self::Changed),
+            other => Err(ConvertError::UnknownEnumValue("PeerEventType", other)),
+        }
+    }
+}
+
+// ── PeerEvent ─────────────────────────────────────────────────────────────────
+
+impl TryFrom<proto::PeerEvent> for PeerEvent {
+    type Error = ConvertError;
+
+    fn try_from(p: proto::PeerEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            event_type: PeerEventType::try_from(p.r#type)?,
+            peer: p.peer.map(PeerState::try_from).transpose()?,
         })
     }
 }
@@ -601,7 +703,7 @@ mod tests {
     fn route_minimal_valid() {
         let r = Route::try_from(minimal_proto_route()).unwrap();
         assert_eq!(r.prefix, "10.0.0.0/8");
-        assert_eq!(r.peer_address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(r.peer_address, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
         assert_eq!(r.peer_type, PeerType::External);
         assert_eq!(r.next_hop, None);
         assert!(r.as_path.is_empty());
@@ -705,6 +807,14 @@ mod tests {
             Route::try_from(p),
             Err(ConvertError::InvalidAddress(_))
         ));
+    }
+
+    #[test]
+    fn route_local_peer_address_maps_to_none() {
+        let mut p = minimal_proto_route();
+        p.peer_address = "local".into();
+        let r = Route::try_from(p).unwrap();
+        assert_eq!(r.peer_address, None);
     }
 
     #[test]

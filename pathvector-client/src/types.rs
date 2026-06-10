@@ -129,8 +129,9 @@ pub struct PeerState {
 pub struct Route {
     /// Advertised prefix in CIDR notation, e.g. `"10.0.0.0/8"`.
     pub prefix: String,
-    /// IP address of the peer that sent this route.
-    pub peer_address: IpAddr,
+    /// IP address of the peer that sent this route, or [`None`] for locally
+    /// originated routes (injected via [`OriginationService`]).
+    pub peer_address: Option<IpAddr>,
     /// Whether the peer is iBGP or eBGP.
     pub peer_type: PeerType,
     /// Forwarding next-hop; [`None`] if the attribute was absent.
@@ -155,4 +156,92 @@ pub struct Route {
     pub atomic_aggregate: bool,
     /// AGGREGATOR attribute (RFC 4271 §5.1.7); absent if not set.
     pub aggregator: Option<Aggregator>,
+}
+
+// ── Origination ───────────────────────────────────────────────────────────────
+
+/// Parameters for a single locally originated route.
+///
+/// Pass to [`PathvectorClient::originate_route`] or collect into a `Vec` for
+/// [`PathvectorClient::originate_routes`].
+///
+/// [`PathvectorClient::originate_route`]: crate::PathvectorClient::originate_route
+/// [`PathvectorClient::originate_routes`]: crate::PathvectorClient::originate_routes
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct OriginateRouteParams {
+    /// Prefix in CIDR notation, e.g. `"1.2.3.4/32"`.
+    pub prefix: String,
+    /// Forwarding next-hop in dotted-decimal notation.
+    pub next_hop: String,
+    /// ORIGIN attribute.
+    pub origin: Origin,
+    /// Standard BGP communities (RFC 1997) as raw `u32` values.
+    pub communities: Vec<u32>,
+    /// Large communities (RFC 8092).
+    pub large_communities: Vec<LargeCommunity>,
+    /// Extended communities (RFC 4360), each exactly 8 bytes.
+    pub extended_communities: Vec<[u8; 8]>,
+    /// `LOCAL_PREF`; absent means unset (not advertised to eBGP peers).
+    pub local_pref: Option<u32>,
+    /// `MULTI_EXIT_DISC`; absent means unset.
+    pub med: Option<u32>,
+}
+
+// ── Streaming watch events ────────────────────────────────────────────────────
+
+/// Discriminant for events on the [`WatchRoutes`] stream.
+///
+/// [`WatchRoutes`]: crate::PathvectorClient::watch_routes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum RouteEventType {
+    /// Snapshot phase: the current best route for one prefix.
+    Current,
+    /// Snapshot complete; live deltas follow.
+    EndInitial,
+    /// A prefix was announced or its best-path changed.
+    Announced,
+    /// A prefix was withdrawn from the Loc-RIB.
+    Withdrawn,
+}
+
+/// A single event on the [`WatchRoutes`] stream.
+///
+/// [`WatchRoutes`]: crate::PathvectorClient::watch_routes
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RouteEvent {
+    pub event_type: RouteEventType,
+    /// Present for [`RouteEventType::Current`] and [`RouteEventType::Announced`].
+    pub route: Option<Route>,
+    /// Present for [`RouteEventType::Withdrawn`].
+    pub withdrawn_prefix: Option<String>,
+}
+
+/// Discriminant for events on the [`WatchPeers`] stream.
+///
+/// [`WatchPeers`]: crate::PathvectorClient::watch_peers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum PeerEventType {
+    /// Snapshot phase: the current state of one peer.
+    Current,
+    /// Snapshot complete; live deltas follow.
+    EndInitial,
+    /// A peer's session state changed.
+    Changed,
+}
+
+/// A single event on the [`WatchPeers`] stream.
+///
+/// [`WatchPeers`]: crate::PathvectorClient::watch_peers
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PeerEvent {
+    pub event_type: PeerEventType,
+    /// Present for [`PeerEventType::Current`] and [`PeerEventType::Changed`].
+    pub peer: Option<PeerState>,
 }

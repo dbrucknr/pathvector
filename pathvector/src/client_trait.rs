@@ -125,4 +125,43 @@ impl DaemonClient for MockDaemonClient {
         self.export_calls.push((peer.to_owned(), accept));
         Ok(())
     }
+
+    async fn originate_route(
+        &mut self,
+        _params: pathvector_client::types::OriginateRouteParams,
+    ) -> Result<(), pathvector_client::error::ClientError> {
+        if let Some(e) = self.check_error() { return Err(e); }
+        Ok(())
+    }
+
+    async fn originate_routes(
+        &mut self,
+        routes: Vec<pathvector_client::types::OriginateRouteParams>,
+    ) -> Result<u32, pathvector_client::error::ClientError> {
+        if let Some(e) = self.check_error() { return Err(e); }
+        Ok(routes.len() as u32)
+    }
+
+    async fn withdraw_originated_route(
+        &mut self,
+        _prefix: &str,
+    ) -> Result<(), pathvector_client::error::ClientError> {
+        if let Some(e) = self.check_error() { return Err(e); }
+        Ok(())
+    }
+
+    async fn withdraw_originated_routes(
+        &mut self,
+        prefixes: Vec<String>,
+    ) -> Result<u32, pathvector_client::error::ClientError> {
+        if let Some(e) = self.check_error() { return Err(e); }
+        Ok(prefixes.len() as u32)
+    }
+
+    async fn list_originated_routes(
+        &mut self,
+    ) -> Result<Vec<pathvector_client::types::Route>, pathvector_client::error::ClientError> {
+        if let Some(e) = self.check_error() { return Err(e); }
+        Ok(vec![])
+    }
 }

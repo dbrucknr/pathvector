@@ -487,9 +487,19 @@ types are defined independently in `src/types.rs`.
   `InvalidAddress`, `UnknownEnumValue`, `BadExtendedCommunityLen`
 - Three error types: `ConnectError`, `ClientError`, `ConvertError` — all with
   `Display`, `Error::source`, and `From` impls; no `thiserror`
-- 83 unit tests (including 10 proptest properties) + 12 integration tests driven
-  by an in-process mock gRPC server; all pass under `just ci` (MSRV 1.88)
 - Optional `serde` feature flag on all domain types
+- **Route origination API (2026-06-10):** `originate_route`, `originate_routes`,
+  `withdraw_originated_route`, `withdraw_originated_routes`, `list_originated_routes`
+  added to `DaemonClient` trait and implemented on `PathvectorClient`.
+  `OriginateRouteParams` domain type in `types.rs`; `From` impl in `convert.rs`.
+- **Streaming watch RPCs (2026-06-10):** `watch_routes(peer: Option<&str>)` and
+  `watch_peers()` as inherent methods on `PathvectorClient`; return
+  `impl Stream<Item = Result<RouteEvent/PeerEvent, ClientError>>`.  Not included
+  in `DaemonClient` trait (stream types are too complex to mock generically).
+  `RouteEvent`, `RouteEventType`, `PeerEvent`, `PeerEventType` domain types added.
+- **`Route.peer_address: Option<IpAddr>` (2026-06-10):** Changed from `IpAddr`
+  to `Option<IpAddr>`; `None` means locally originated route.  `convert.rs` maps
+  proto `"local"` string → `None`; output rendering shows `"local"` for CLI/dashboard.
 
 ### Remaining
 
@@ -498,72 +508,35 @@ types are defined independently in `src/types.rs`.
 - Policy introspection RPC (`ListTerms`, `EvalRoute`) — blocked on
   `reapply_import_policy` being wired to export propagation in `pathvectord`
 
-### gRPC streaming watch RPCs
+### Route origination API + gRPC streaming watch RPCs — **Done (2026-06-10)**
 
-The current management API is purely request/response — operators and tests must poll to
-observe changes. Adding server-side streaming RPCs would make the API event-driven:
+`OriginationService` is live on `pathvectord` with five RPCs: `OriginateRoute`,
+`OriginateRoutes` (batch), `WithdrawOriginatedRoute`, `WithdrawOriginatedRoutes` (batch),
+and `ListOriginatedRoutes`.  Routes are injected directly into `LocRib` under the synthetic
+`LOCAL_ORIGIN_PEER` (`0.0.0.0`) key, bypassing import policy; export policy still applies
+per peer.  A single `propagate_to_all_peers` call after the batch completes means N routes
+produce ~2 BGP UPDATE messages per peer regardless of N.
 
-```protobuf
-rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteEvent);
-rpc WatchPeers(WatchPeersRequest)  returns (stream PeerEvent);
-```
+`WatchRoutes` and `WatchPeers` streaming RPCs are live on `RibService` and `PeerService`.
+Snapshot-then-stream: subscribe to broadcast channel first (no race), send current state as
+`CURRENT` events, send `END_INITIAL` sentinel, then stream live deltas.  `broadcast::channel`
+capacity 1024; slow subscribers receive `RecvError::Lagged` and must reconnect.
 
-**Design: snapshot-then-stream** (same model as BGP itself and RFC 7854 BMP)
-
-When a client subscribes, the server:
-1. Sends all current best routes as `RouteEvent { type: CURRENT, route: ... }` messages
-2. Sends a `RouteEvent { type: END_OF_INITIAL }` sentinel
-3. Streams live deltas (`ANNOUNCED` / `WITHDRAWN`) as the RIB changes
-
-This is correct by construction: no race between "get current state" and "subscribe to
-changes." A client that reconnects re-subscribes and receives the full snapshot again,
-so no gap handling is required. This mirrors the BMP initial table dump + route monitoring
-pattern from RFC 7854 §5.
-
-`WatchPeers` follows the same model: current peer states first, then session transitions.
-
-**Proto sketch:**
-```protobuf
-enum RouteEventType { CURRENT = 0; END_OF_INITIAL = 1; ANNOUNCED = 2; WITHDRAWN = 3; }
-message RouteEvent {
-  RouteEventType type = 1;
-  optional Route route = 2;          // set for CURRENT and ANNOUNCED
-  optional string withdrawn_prefix = 3; // set for WITHDRAWN
-}
-message WatchRoutesRequest {
-  optional string peer_address = 1;  // filter by peer; omit for all peers
-}
-
-enum PeerEventType { CURRENT = 0; END_OF_INITIAL = 1; CHANGED = 2; }
-message PeerEvent {
-  PeerEventType type = 1;
-  PeerState peer = 2;
-}
-```
-
-**Benefits:**
-- **e2e tests** — replace `wait_for_route` 200ms polling loops with event-driven subscriptions;
-  no arbitrary sleep timeouts, tests complete as soon as the event fires
-- **CLI** — `pathvector watch routes` / `pathvector watch peers` become natural commands
-- **Dashboard** — replace the 200ms refresh ticker with a `WatchRoutes` stream
-- **Operators** — live monitoring without external polling scripts
-
-**Daemon-side implementation:**
-- `tokio::sync::broadcast::channel` per event type (`route_tx`, `peer_tx`) in `DaemonState`
-- `on_route_update` and `on_established`/`on_terminated` publish events on the respective channel
-- Each gRPC stream handler: grab a snapshot of current state under read lock, subscribe to
-  broadcast channel, send snapshot events, then forward live events — all without blocking
-  the main write-lock loop
-- Backpressure: `broadcast::channel` drops the oldest message on overflow for a slow subscriber;
-  the client must handle `RecvError::Lagged` by reconnecting to get a fresh snapshot
-
-**Client library:**
-```rust
-async fn watch_routes(&mut self, peer: Option<Ipv4Addr>)
-    -> Result<impl Stream<Item = Result<RouteEvent, ClientError>>, ClientError>;
-async fn watch_peers(&mut self)
-    -> Result<impl Stream<Item = Result<PeerEvent, ClientError>>, ClientError>;
-```
+**Remaining (client + CLI):**
+- `pathvector-client`: add `originate_route`, `originate_routes`, `withdraw_originated_route`,
+  `withdraw_originated_routes`, `list_originated_routes` to `DaemonClient` trait and impl;
+  add `watch_routes` / `watch_peers` as inherent methods on `PathvectorClient` (streams are
+  not included in the trait — too complex to mock generically); add `OriginateRouteParams`,
+  `RouteEvent`, `PeerEvent` domain types in `types.rs`; add `OriginationServiceClient` field
+  to `PathvectorClient`; add `convert.rs` helpers
+- CLI: `pathvector route originate <PREFIX> --next-hop <IP> [--community N]...`,
+  `pathvector route withdraw <PREFIX>`, `pathvector watch routes [--peer IP]`,
+  `pathvector watch peers`
+- **RouteEvent payload** — `route_tx.send()` in `originate_routes`/`withdraw_originated_routes`
+  currently sends `route: None`.  For `WatchRoutes` subscribers to receive complete route
+  data, the events should carry the full `proto::Route`.  Requires constructing the proto
+  Route in the daemon (move or expose `route_to_proto` logic).
+- Dashboard: replace 200ms polling ticker with `WatchRoutes` stream (separate follow-up)
 
 ---
 

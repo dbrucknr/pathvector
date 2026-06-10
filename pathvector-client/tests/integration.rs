@@ -6,6 +6,8 @@
 
 use std::{net::SocketAddr, time::Duration};
 
+use futures::StreamExt as _;
+
 use pathvector_client::{
     DaemonClient, PathvectorClient,
     error::{ClientError, ConnectError},
@@ -25,8 +27,11 @@ mod proto {
 }
 
 use proto::{
-    ListPeersResponse, ListRoutesResponse, PeerState as ProtoPeerState, Route as ProtoRoute,
-    RouteResponse,
+    ListOriginatedRoutesResponse, ListPeersResponse, ListRoutesResponse,
+    OriginateRouteResponse, OriginateRoutesResponse, PeerEvent, PeerState as ProtoPeerState,
+    Route as ProtoRoute, RouteEvent, RouteResponse, WithdrawOriginatedRouteResponse,
+    WithdrawOriginatedRoutesResponse,
+    origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
     rib_service_server::{RibService, RibServiceServer},
 };
@@ -92,6 +97,17 @@ impl PeerService for MockPeer {
             _ => Err(Status::not_found(format!("peer {addr} not found"))),
         }
     }
+
+    type WatchPeersStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
+
+    async fn watch_peers(
+        &self,
+        _req: Request<proto::WatchPeersRequest>,
+    ) -> Result<Response<Self::WatchPeersStream>, Status> {
+        let stream = futures::stream::empty();
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 #[tonic::async_trait]
@@ -134,6 +150,59 @@ impl RibService for MockRib {
             routes: vec![proto_route("10.0.0.0/8")],
         }))
     }
+
+    type WatchRoutesStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<RouteEvent, Status>> + Send>>;
+
+    async fn watch_routes(
+        &self,
+        _req: Request<proto::WatchRoutesRequest>,
+    ) -> Result<Response<Self::WatchRoutesStream>, Status> {
+        let stream = futures::stream::empty();
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+struct MockOrigination;
+
+#[tonic::async_trait]
+impl OriginationService for MockOrigination {
+    async fn originate_route(
+        &self,
+        _req: Request<proto::OriginateRouteRequest>,
+    ) -> Result<Response<OriginateRouteResponse>, Status> {
+        Ok(Response::new(OriginateRouteResponse {}))
+    }
+
+    async fn originate_routes(
+        &self,
+        req: Request<proto::OriginateRoutesRequest>,
+    ) -> Result<Response<OriginateRoutesResponse>, Status> {
+        let count = req.into_inner().routes.len() as u32;
+        Ok(Response::new(OriginateRoutesResponse { count }))
+    }
+
+    async fn withdraw_originated_route(
+        &self,
+        _req: Request<proto::WithdrawOriginatedRouteRequest>,
+    ) -> Result<Response<WithdrawOriginatedRouteResponse>, Status> {
+        Ok(Response::new(WithdrawOriginatedRouteResponse {}))
+    }
+
+    async fn withdraw_originated_routes(
+        &self,
+        req: Request<proto::WithdrawOriginatedRoutesRequest>,
+    ) -> Result<Response<WithdrawOriginatedRoutesResponse>, Status> {
+        let count = req.into_inner().prefixes.len() as u32;
+        Ok(Response::new(WithdrawOriginatedRoutesResponse { count }))
+    }
+
+    async fn list_originated_routes(
+        &self,
+        _req: Request<proto::ListOriginatedRoutesRequest>,
+    ) -> Result<Response<ListOriginatedRoutesResponse>, Status> {
+        Ok(Response::new(ListOriginatedRoutesResponse { routes: vec![] }))
+    }
 }
 
 // ── Server fixture ────────────────────────────────────────────────────────────
@@ -149,6 +218,7 @@ async fn start_server() -> SocketAddr {
         tonic::transport::Server::builder()
             .add_service(PeerServiceServer::new(MockPeer))
             .add_service(RibServiceServer::new(MockRib))
+            .add_service(OriginationServiceServer::new(MockOrigination))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
 
@@ -338,5 +408,8 @@ async fn list_candidates_returns_candidates() {
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].prefix, "10.0.0.0/8");
-    assert_eq!(candidates[0].peer_address.to_string(), "192.0.2.1");
+    assert_eq!(
+        candidates[0].peer_address.map(|a| a.to_string()),
+        Some("192.0.2.1".to_owned())
+    );
 }

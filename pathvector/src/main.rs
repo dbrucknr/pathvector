@@ -177,7 +177,7 @@ mod tests {
     fn make_route() -> Route {
         Route {
             prefix: "192.0.2.0/24".to_owned(),
-            peer_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            peer_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
             peer_type: PeerType::External,
             next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
             as_path: vec![AsSegment {

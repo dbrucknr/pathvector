@@ -12,20 +12,21 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
-bytes       = { workspace = true }
-prost       = { workspace = true }
-prost-types = { workspace = true }
-tonic       = { workspace = true }
-tonic-prost = { workspace = true }
-tokio       = { workspace = true }
-serde       = { version = "1", features = ["derive"], optional = true }
+bytes        = { workspace = true }
+futures      = { workspace = true }
+prost        = { workspace = true }
+prost-types  = { workspace = true }
+tonic        = { workspace = true }
+tonic-prost  = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+serde        = { version = "1", features = ["derive"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-proptest     = { workspace = true }
-tokio-stream = "0.1"
+proptest = { workspace = true }
 
 [features]
 serde = ["dep:serde"]
