@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use pathvector_client::types::{PeerType, SessionState};
+use pathvector_client::{DaemonClient, types::{PeerType, SessionState}};
 use pathvector_e2e::{Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn};
 
 /// RFC 4271 §8 — verify the FSM reaches Established and the management API

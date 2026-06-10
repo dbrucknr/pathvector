@@ -49,6 +49,7 @@
 
 use std::time::Duration;
 
+use pathvector_client::DaemonClient;
 use pathvector_e2e::{Harness, TwoPeerHarness, wait_for_gobgp_rib_entry, wait_for_route};
 
 // ── Import policy ─────────────────────────────────────────────────────────────
