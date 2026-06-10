@@ -11,7 +11,10 @@ use std::{
 use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
-    message::{Capability, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage},
+    message::{
+        Capability, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage,
+        encode_attributes, nlri_encoded_len, MAX_LEN, MAX_LEN_EXTENDED,
+    },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
@@ -99,73 +102,56 @@ fn prepare_outbound(
     route
 }
 
-/// Serialises a post-policy, post-transform route into a BGP UPDATE message
-/// with a single announced NLRI.
-fn route_to_update(route: Route<Ipv4Addr>) -> UpdateMessage {
-    let mut attributes = vec![
+/// Builds the path-attribute list for an outbound route.
+fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute> {
+    let mut attrs = vec![
         PathAttribute::Origin(route.origin),
-        PathAttribute::AsPath(route.as_path),
+        PathAttribute::AsPath(route.as_path.clone()),
     ];
     if let Some(NextHop::V4(nh)) = route.next_hop {
-        attributes.push(PathAttribute::NextHop(nh));
+        attrs.push(PathAttribute::NextHop(nh));
     }
     if let Some(lp) = route.local_pref {
-        attributes.push(PathAttribute::LocalPref(lp.as_u32()));
+        attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
     if let Some(m) = route.med {
-        attributes.push(PathAttribute::Med(m.as_u32()));
+        attrs.push(PathAttribute::Med(m.as_u32()));
     }
     if !route.communities.is_empty() {
-        attributes.push(PathAttribute::Communities(route.communities));
+        attrs.push(PathAttribute::Communities(route.communities.clone()));
     }
     if !route.large_communities.is_empty() {
-        attributes.push(PathAttribute::LargeCommunities(route.large_communities));
+        attrs.push(PathAttribute::LargeCommunities(
+            route.large_communities.clone(),
+        ));
     }
     if !route.extended_communities.is_empty() {
-        attributes.push(PathAttribute::ExtendedCommunities(
-            route.extended_communities,
+        attrs.push(PathAttribute::ExtendedCommunities(
+            route.extended_communities.clone(),
         ));
     }
     if route.atomic_aggregate {
-        attributes.push(PathAttribute::AtomicAggregate);
+        attrs.push(PathAttribute::AtomicAggregate);
     }
     if let Some(agg) = route.aggregator {
-        attributes.push(PathAttribute::Aggregator(agg));
+        attrs.push(PathAttribute::Aggregator(agg));
     }
-    UpdateMessage {
-        withdrawn: vec![],
-        attributes,
-        announced: vec![route.nlri],
-    }
+    attrs
 }
 
-fn withdraw_msg(nlri: Nlri<Ipv4Addr>) -> UpdateMessage {
-    UpdateMessage {
-        withdrawn: vec![nlri],
-        attributes: vec![],
-        announced: vec![],
-    }
+/// The outbound decision for a single prefix after AdjRibOut processing.
+enum PrefixDecision {
+    Announce(Route<Ipv4Addr>),
+    Withdraw(Nlri<Ipv4Addr>),
+    NoChange,
 }
 
-/// Propagates the current best route for `nlri` to one peer's outbound table.
+/// Determines the outbound decision for `nlri` for one peer.
 ///
 /// Reads the current best from `loc_rib`, applies export policy, runs eBGP
-/// attribute transforms via `prepare_outbound`, and calls `AdjRibOut::insert`.
-/// Sends an UPDATE or WITHDRAW only when the advertised state actually changes,
-/// so this function is safe to call even if the best route did not change.
-///
-/// Only call this for established peers; `update_tx` for non-established peers
-/// is not drained until they come up, which can produce stale advertisements.
-#[allow(clippy::too_many_arguments)]
-/// Propagate the current best route for `nlri` to a single peer.
-///
-/// Returns `true` if all outbound channel sends succeeded, or `false` if any
-/// [`try_send`] returned `Err` (the channel was full).  A `false` return means
-/// the peer's view of the RIB has diverged and the session must be closed and
-/// re-established to restore consistency — BGP has no partial-update recovery.
-/// Callers are responsible for scheduling the session close via [`SessionCommand::Stop`].
-///
-/// [`try_send`]: tokio::sync::mpsc::Sender::try_send
+/// attribute transforms, and calls `AdjRibOut::insert` to record the change.
+/// Returns what should be sent without transmitting anything — callers batch
+/// decisions and flush via [`flush_updates`].
 fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &LocRib<Ipv4Addr>,
@@ -174,71 +160,159 @@ fn propagate_prefix(
     peer_type: PeerType,
     local_as: u32,
     local_bgp_id: Ipv4Addr,
-    update_tx: &mpsc::Sender<UpdateMessage>,
-) -> bool {
+) -> PrefixDecision {
     match loc_rib.best(&nlri) {
         Some(best) => {
             let mut route = prepare_outbound(best.clone(), peer_type, local_as, local_bgp_id);
             match export_policy.evaluate(&mut route) {
-                Decision::Accept => {
-                    match adj_rib_out.insert(route.clone()) {
-                        InsertOutcome::Accepted(prev) => {
-                            if prev.as_ref() != Some(&route)
-                                && update_tx.try_send(route_to_update(route)).is_err()
-                            {
-                                tracing::error!(
-                                    peer = %adj_rib_out.peer(),
-                                    prefix = %nlri,
-                                    "outbound UPDATE channel full — session will be closed \
-                                     to restore consistent peer view"
-                                );
-                                return false;
-                            }
+                Decision::Accept => match adj_rib_out.insert(route.clone()) {
+                    InsertOutcome::Accepted(prev) => {
+                        if prev.as_ref() == Some(&route) {
+                            PrefixDecision::NoChange
+                        } else {
+                            PrefixDecision::Announce(route)
                         }
-                        InsertOutcome::Filtered(Some(_)) => {
-                            // iBGP split-horizon evicted a previously stored route.
-                            if update_tx.try_send(withdraw_msg(nlri)).is_err() {
-                                tracing::error!(
-                                    peer = %adj_rib_out.peer(),
-                                    prefix = %nlri,
-                                    "outbound WITHDRAW channel full — session will be closed \
-                                     to restore consistent peer view"
-                                );
-                                return false;
-                            }
-                        }
-                        InsertOutcome::Filtered(None) => {}
                     }
-                }
+                    InsertOutcome::Filtered(Some(_)) => PrefixDecision::Withdraw(nlri),
+                    InsertOutcome::Filtered(None) => PrefixDecision::NoChange,
+                },
                 Decision::Reject | Decision::Next => {
-                    if adj_rib_out.withdraw(&nlri).is_some()
-                        && update_tx.try_send(withdraw_msg(nlri)).is_err()
-                    {
-                        tracing::error!(
-                            peer = %adj_rib_out.peer(),
-                            prefix = %nlri,
-                            "outbound WITHDRAW channel full — session will be closed \
-                             to restore consistent peer view"
-                        );
-                        return false;
+                    if adj_rib_out.withdraw(&nlri).is_some() {
+                        PrefixDecision::Withdraw(nlri)
+                    } else {
+                        PrefixDecision::NoChange
                     }
                 }
             }
         }
         None => {
-            if adj_rib_out.withdraw(&nlri).is_some()
-                && update_tx.try_send(withdraw_msg(nlri)).is_err()
-            {
-                tracing::error!(
-                    peer = %adj_rib_out.peer(),
-                    prefix = %nlri,
-                    "outbound WITHDRAW channel full — session will be closed \
-                     to restore consistent peer view"
-                );
-                return false;
+            if adj_rib_out.withdraw(&nlri).is_some() {
+                PrefixDecision::Withdraw(nlri)
+            } else {
+                PrefixDecision::NoChange
             }
         }
     }
+}
+
+/// BGP UPDATE wire overhead: 19-byte header + 2-byte withdrawn-len + 2-byte
+/// attr-len field.
+const UPDATE_FIXED_OVERHEAD: usize = 19 + 2 + 2;
+
+/// Sends batched BGP UPDATE messages for a collected set of prefix decisions.
+///
+/// Announcements are grouped by identical path attributes; each group is packed
+/// into the fewest UPDATE messages that fit within `max_len`. Withdrawals are
+/// similarly batched into withdraw-only UPDATEs. Withdrawals are sent before
+/// announcements (conventional BGP practice).
+///
+/// Returns `true` if all sends succeeded. Returns `false` on the first channel-full
+/// error — the caller must schedule a session reset to restore a consistent peer view.
+// (encoded-attribute-bytes, attribute-list, nlris-to-announce)
+type AnnounceGroup = (Vec<u8>, Vec<PathAttribute>, Vec<Nlri<Ipv4Addr>>);
+
+fn flush_updates(
+    decisions: Vec<PrefixDecision>,
+    max_len: usize,
+    update_tx: &mpsc::Sender<UpdateMessage>,
+) -> bool {
+    let mut withdrawals: Vec<Nlri<Ipv4Addr>> = Vec::new();
+    let mut announce_groups: Vec<AnnounceGroup> = Vec::new();
+
+    for decision in decisions {
+        match decision {
+            PrefixDecision::Withdraw(nlri) => withdrawals.push(nlri),
+            PrefixDecision::Announce(route) => {
+                let attrs = route_to_attributes(&route);
+                let attr_bytes = encode_attributes(&attrs);
+                // Linear scan — typically 1-3 distinct attribute groups per batch.
+                if let Some((_, _, nlris)) = announce_groups
+                    .iter_mut()
+                    .find(|(key, _, _)| *key == attr_bytes)
+                {
+                    nlris.push(route.nlri);
+                } else {
+                    announce_groups.push((attr_bytes, attrs, vec![route.nlri]));
+                }
+            }
+            PrefixDecision::NoChange => {}
+        }
+    }
+
+    // ── Send withdrawals ──────────────────────────────────────────────────────
+    // Wire: header(19) + withdrawn_len(2) + nlris + attr_len(2)
+    let withdraw_overhead = UPDATE_FIXED_OVERHEAD; // attr block is empty (0 bytes)
+    let mut batch: Vec<Nlri<Ipv4Addr>> = Vec::new();
+    let mut batch_bytes = withdraw_overhead;
+
+    for nlri in withdrawals {
+        let nlen = nlri_encoded_len(&nlri);
+        if !batch.is_empty() && batch_bytes + nlen > max_len {
+            if update_tx
+                .try_send(UpdateMessage {
+                    withdrawn: std::mem::take(&mut batch),
+                    attributes: vec![],
+                    announced: vec![],
+                })
+                .is_err()
+            {
+                return false;
+            }
+            batch_bytes = withdraw_overhead;
+        }
+        batch.push(nlri);
+        batch_bytes += nlen;
+    }
+    if !batch.is_empty()
+        && update_tx
+            .try_send(UpdateMessage {
+                withdrawn: batch,
+                attributes: vec![],
+                announced: vec![],
+            })
+            .is_err()
+    {
+        return false;
+    }
+
+    // ── Send announcements ────────────────────────────────────────────────────
+    for (attr_bytes, attrs, nlris) in announce_groups {
+        // base cost for this attribute group: fixed overhead + attribute block
+        let base = UPDATE_FIXED_OVERHEAD + attr_bytes.len();
+        let mut batch: Vec<Nlri<Ipv4Addr>> = Vec::new();
+        let mut batch_bytes = base;
+
+        for nlri in nlris {
+            let nlen = nlri_encoded_len(&nlri);
+            if !batch.is_empty() && batch_bytes + nlen > max_len {
+                if update_tx
+                    .try_send(UpdateMessage {
+                        withdrawn: vec![],
+                        attributes: attrs.clone(),
+                        announced: std::mem::take(&mut batch),
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                batch_bytes = base;
+            }
+            batch.push(nlri);
+            batch_bytes += nlen;
+        }
+        if !batch.is_empty()
+            && update_tx
+                .try_send(UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: attrs,
+                    announced: batch,
+                })
+                .is_err()
+        {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -266,6 +340,15 @@ struct DaemonState {
     pub(crate) established_at: HashMap<Ipv4Addr, std::time::Instant>,
     /// Negotiated hold-timer value per established peer.
     pub(crate) hold_times: HashMap<Ipv4Addr, u16>,
+    /// Local capabilities advertised in OPEN messages; used to determine the
+    /// negotiated message size limit after `Established`.
+    pub(crate) config_capabilities: Vec<Capability>,
+    /// Negotiated maximum BGP message size per established peer.
+    ///
+    /// Set to [`MAX_LEN_EXTENDED`] (65535) when both sides negotiated
+    /// `Capability::ExtendedMessage`; otherwise [`MAX_LEN`] (4096).
+    /// Removed when the peer transitions out of Established.
+    pub(crate) negotiated_max_len: HashMap<Ipv4Addr, usize>,
     /// Peers whose outbound UPDATE channel overflowed during the current event.
     ///
     /// The event loop drains this list after each event via [`take_stalled_peers`]
@@ -282,6 +365,7 @@ impl DaemonState {
         local_bgp_id: Ipv4Addr,
         peers: &[config::PeerConfig],
         update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+        config_capabilities: Vec<Capability>,
     ) -> Self {
         let import_policies = peers
             .iter()
@@ -339,6 +423,8 @@ impl DaemonState {
             peer_remote_as,
             established_at: HashMap::new(),
             hold_times: HashMap::new(),
+            config_capabilities,
+            negotiated_max_len: HashMap::new(),
             stalled_peers: Vec::new(),
         }
     }
@@ -365,12 +451,25 @@ impl DaemonState {
         peer_type: PeerType,
         peer_as: u32,
         hold_time: u16,
+        peer_capabilities: &[Capability],
     ) {
         let peer_id = PeerId::from(peer_ip);
         self.peer_types.insert(peer_ip, peer_type);
         self.established_at
             .insert(peer_ip, std::time::Instant::now());
         self.hold_times.insert(peer_ip, hold_time);
+
+        // Record negotiated message size limit for NLRI batching.
+        let max_len = if peer_capabilities.contains(&Capability::ExtendedMessage)
+            && self
+                .config_capabilities
+                .contains(&Capability::ExtendedMessage)
+        {
+            MAX_LEN_EXTENDED
+        } else {
+            MAX_LEN
+        };
+        self.negotiated_max_len.insert(peer_ip, max_len);
 
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = AdjRibOut::new(peer_id, peer_type);
@@ -392,23 +491,22 @@ impl DaemonState {
             return;
         };
 
-        let mut stalled = false;
-        for nlri in all_nlris {
-            if !propagate_prefix(
-                nlri,
-                &self.loc_rib,
-                adj_rib_out,
-                export_policy,
-                peer_type,
-                self.local_as,
-                self.local_bgp_id,
-                update_tx,
-            ) {
-                stalled = true;
-                break;
-            }
-        }
-        if stalled {
+        let decisions: Vec<PrefixDecision> = all_nlris
+            .into_iter()
+            .map(|nlri| {
+                propagate_prefix(
+                    nlri,
+                    &self.loc_rib,
+                    adj_rib_out,
+                    export_policy,
+                    peer_type,
+                    self.local_as,
+                    self.local_bgp_id,
+                )
+            })
+            .collect();
+
+        if !flush_updates(decisions, max_len, update_tx) {
             self.stalled_peers.push(peer_ip);
         }
 
@@ -433,6 +531,7 @@ impl DaemonState {
         self.peer_types.remove(&peer_ip);
         self.established_at.remove(&peer_ip);
         self.hold_times.remove(&peer_ip);
+        self.negotiated_max_len.remove(&peer_ip);
 
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
@@ -470,6 +569,11 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
                 continue;
@@ -483,23 +587,21 @@ impl DaemonState {
                 continue;
             };
 
-            let mut stalled = false;
-            for &nlri in &prev_prefixes {
-                if !propagate_prefix(
-                    nlri,
-                    &self.loc_rib,
-                    adj_rib_out,
-                    export_policy,
-                    other_type,
-                    self.local_as,
-                    self.local_bgp_id,
-                    update_tx,
-                ) {
-                    stalled = true;
-                    break;
-                }
-            }
-            if stalled {
+            let decisions: Vec<PrefixDecision> = prev_prefixes
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        other_type,
+                        self.local_as,
+                        self.local_bgp_id,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx) {
                 self.stalled_peers.push(other_ip);
             }
         }
@@ -591,6 +693,11 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on RouteUpdate");
                 continue;
@@ -604,23 +711,21 @@ impl DaemonState {
                 continue;
             };
 
-            let mut stalled = false;
-            for &nlri in &affected {
-                if !propagate_prefix(
-                    nlri,
-                    &self.loc_rib,
-                    adj_rib_out,
-                    export_policy,
-                    other_type,
-                    self.local_as,
-                    self.local_bgp_id,
-                    update_tx,
-                ) {
-                    stalled = true;
-                    break;
-                }
-            }
-            if stalled {
+            let decisions: Vec<PrefixDecision> = affected
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        other_type,
+                        self.local_as,
+                        self.local_bgp_id,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx) {
                 self.stalled_peers.push(other_ip);
             }
         }
@@ -667,6 +772,11 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation in set_import_default");
                 continue;
@@ -680,23 +790,21 @@ impl DaemonState {
                 continue;
             };
 
-            let mut stalled = false;
-            for &nlri in &nlris {
-                if !propagate_prefix(
-                    nlri,
-                    &self.loc_rib,
-                    adj_rib_out,
-                    export_policy,
-                    other_type,
-                    self.local_as,
-                    self.local_bgp_id,
-                    update_tx,
-                ) {
-                    stalled = true;
-                    break;
-                }
-            }
-            if stalled {
+            let decisions: Vec<PrefixDecision> = nlris
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        other_type,
+                        self.local_as,
+                        self.local_bgp_id,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx) {
                 self.stalled_peers.push(other_ip);
             }
         }
@@ -732,6 +840,11 @@ impl DaemonState {
         // Collect all Loc-RIB NLRIs; the borrow is dropped after the collect.
         let nlris: Vec<Nlri<Ipv4Addr>> = self.loc_rib.best_routes().map(|(n, _)| n).collect();
 
+        let max_len = self
+            .negotiated_max_len
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(MAX_LEN);
         let Some(export_policy) = self.export_policies.get(&peer_ip) else {
             return;
         };
@@ -742,23 +855,21 @@ impl DaemonState {
             return;
         };
 
-        let mut stalled = false;
-        for nlri in nlris {
-            if !propagate_prefix(
-                nlri,
-                &self.loc_rib,
-                adj_rib_out,
-                export_policy,
-                peer_type,
-                self.local_as,
-                self.local_bgp_id,
-                update_tx,
-            ) {
-                stalled = true;
-                break;
-            }
-        }
-        if stalled {
+        let decisions: Vec<PrefixDecision> = nlris
+            .into_iter()
+            .map(|nlri| {
+                propagate_prefix(
+                    nlri,
+                    &self.loc_rib,
+                    adj_rib_out,
+                    export_policy,
+                    peer_type,
+                    self.local_as,
+                    self.local_bgp_id,
+                )
+            })
+            .collect();
+        if !flush_updates(decisions, max_len, update_tx) {
             self.stalled_peers.push(peer_ip);
         }
     }
@@ -827,16 +938,18 @@ where
     // into the per-peer forwarding task, so this is the only retained handle.
     let mut stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
 
+    let local_capabilities = vec![
+        Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+        Capability::FourByteAsn(local_as),
+        Capability::ExtendedMessage,
+    ];
+
     for peer in &cfg.peers {
         let session_cfg = SessionConfig {
             local_as,
             local_bgp_id,
             hold_time: cfg.daemon.hold_time,
-            capabilities: vec![
-                Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
-                Capability::FourByteAsn(local_as),
-                Capability::ExtendedMessage,
-            ],
+            capabilities: local_capabilities.clone(),
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
@@ -866,6 +979,7 @@ where
         local_bgp_id,
         &cfg.peers,
         update_senders,
+        local_capabilities,
     )));
 
     (state, event_rx, stop_senders)
@@ -889,7 +1003,13 @@ pub(crate) async fn run_event_loop(
         let mut s = state.write().await;
         match event {
             SessionEvent::Established(info) => {
-                s.on_established(peer_ip, info.peer_type, info.peer_as, info.hold_time);
+                s.on_established(
+                    peer_ip,
+                    info.peer_type,
+                    info.peer_as,
+                    info.hold_time,
+                    &info.peer_capabilities,
+                );
             }
             SessionEvent::Terminated => {
                 s.on_terminated(peer_ip);
@@ -1201,7 +1321,7 @@ mod tests {
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
-        let state = DaemonState::new(local_as, local_bgp_id, &peer_configs, senders);
+        let state = DaemonState::new(local_as, local_bgp_id, &peer_configs, senders, vec![]);
         (state, receivers)
     }
 
@@ -1314,7 +1434,7 @@ mod tests {
             let mut m = HashMap::new();
             m.insert(peer_ip, tx);
             m
-        });
+        }, vec![]);
         // Import policy with Reject default means routes are dropped unless a
         // term accepts them. Verify by running a route through it.
         let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
@@ -1334,7 +1454,7 @@ mod tests {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         assert!(!state.peer_types.contains_key(&peer_ip));
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         assert_eq!(state.peer_types[&peer_ip], PeerType::External);
     }
 
@@ -1342,7 +1462,7 @@ mod tests {
     fn test_on_established_empty_rib_sends_nothing() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         assert!(
             receivers.get_mut(&peer_ip).unwrap().try_recv().is_err(),
             "empty RIB should produce no messages on establish"
@@ -1366,7 +1486,7 @@ mod tests {
         .build();
         state.loc_rib.insert(src, route);
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         let msg = receivers
             .get_mut(&peer_ip)
@@ -1391,7 +1511,7 @@ mod tests {
             let mut m = HashMap::new();
             m.insert(peer_ip, tx);
             m
-        });
+        }, vec![]);
 
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
         state.loc_rib.insert(
@@ -1401,7 +1521,7 @@ mod tests {
                 .build(),
         );
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         // Export policy rejects everything — no UPDATE should be queued.
         // (We can't assert on the receiver here since we dropped _rx, but the
         // important invariant is that no panic or error occurs, and the RIB is
@@ -1415,7 +1535,7 @@ mod tests {
     fn test_on_terminated_removes_peer_type() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         state.on_terminated(peer_ip);
         assert!(!state.peer_types.contains_key(&peer_ip));
     }
@@ -1424,7 +1544,7 @@ mod tests {
     fn test_on_terminated_withdraws_peer_routes_from_rib() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         state.loc_rib.insert(
             PeerId::from(peer_ip),
@@ -1448,8 +1568,8 @@ mod tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
 
         // Announce a route from peer_a so it reaches peer_b's AdjRibOut.
         state.on_route_update(
@@ -1486,7 +1606,7 @@ mod tests {
     fn test_on_route_update_inserts_route_into_rib() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         state.on_route_update(
             peer_ip,
@@ -1510,8 +1630,8 @@ mod tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
 
         state.on_route_update(
             peer_a,
@@ -1538,7 +1658,7 @@ mod tests {
     fn test_on_route_update_withdraw_removes_route_from_rib() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         state.on_route_update(
             peer_ip,
@@ -1972,8 +2092,8 @@ mod tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
 
         // Peer A announces 10.0.0.0/8 via traditional field.
         state.on_route_update(
@@ -2479,7 +2599,12 @@ mod tests {
         assert_eq!(out.next_hop, route.next_hop);
     }
 
-    // ── route_to_update ───────────────────────────────────────────────────────
+    // ── route_to_attributes ───────────────────────────────────────────────────
+
+    fn route_to_update_for_test(route: Route<Ipv4Addr>) -> UpdateMessage {
+        let nlri = route.nlri;
+        UpdateMessage { withdrawn: vec![], attributes: route_to_attributes(&route), announced: vec![nlri] }
+    }
 
     #[test]
     fn test_route_to_update_contains_mandatory_attributes() {
@@ -2491,7 +2616,7 @@ mod tests {
         .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
         .build();
 
-        let msg = route_to_update(route);
+        let msg = route_to_update_for_test(route);
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
         assert!(
@@ -2514,7 +2639,7 @@ mod tests {
     #[test]
     fn test_route_to_update_omits_absent_optional_attributes() {
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
-        let msg = route_to_update(route);
+        let msg = route_to_update_for_test(route);
         assert!(
             !msg.attributes
                 .iter()
@@ -2544,7 +2669,7 @@ mod tests {
         .aggregator(Aggregator::new(Asn::new(65001), Ipv4Addr::new(1, 1, 1, 1)))
         .build();
 
-        let msg = route_to_update(route);
+        let msg = route_to_update_for_test(route);
         assert!(
             msg.attributes
                 .iter()
@@ -2582,7 +2707,24 @@ mod tests {
         );
     }
 
-    // ── propagate_prefix ──────────────────────────────────────────────────────
+    // ── propagate_prefix / flush_updates ─────────────────────────────────────
+
+    /// Test helper: propagate a single prefix and flush decisions to `tx`.
+    /// Returns whether the flush succeeded (channel not full).
+    #[allow(clippy::too_many_arguments)]
+    fn propagate_and_flush(
+        nlri: Nlri<Ipv4Addr>,
+        rib: &LocRib<Ipv4Addr>,
+        aro: &mut AdjRibOut<Ipv4Addr>,
+        policy: &Policy<Route<Ipv4Addr>>,
+        peer_type: PeerType,
+        local_as: u32,
+        bgp_id: Ipv4Addr,
+        tx: &mpsc::Sender<UpdateMessage>,
+    ) -> bool {
+        let decision = propagate_prefix(nlri, rib, aro, policy, peer_type, local_as, bgp_id);
+        flush_updates(vec![decision], MAX_LEN, tx)
+    }
 
     fn ebgp_out_peer() -> (PeerId, AdjRibOut<Ipv4Addr>) {
         let p = PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
@@ -2601,7 +2743,7 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2624,7 +2766,7 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2636,7 +2778,7 @@ mod tests {
         );
         let _ = rx.try_recv();
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2659,7 +2801,7 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2673,7 +2815,7 @@ mod tests {
 
         rib.withdraw(&peer(), &nlri("10.0.0.0/8"));
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2696,7 +2838,7 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2708,7 +2850,7 @@ mod tests {
         );
         let _ = rx.try_recv();
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2729,7 +2871,7 @@ mod tests {
         let rib = LocRib::<Ipv4Addr>::new();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2752,7 +2894,7 @@ mod tests {
         let (_, mut aro) = ibgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2776,7 +2918,7 @@ mod tests {
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2819,7 +2961,7 @@ mod tests {
         // Phase 1: best path is eBGP — stored in the iBGP peer's AdjRibOut.
         let mut rib = LocRib::new();
         rib.insert(src, ebgp_route_with_lp("10.0.0.0/8"));
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2835,7 +2977,7 @@ mod tests {
         // eBGP entry and the peer must receive a WITHDRAW.
         let mut rib2 = LocRib::new();
         rib2.insert(src, ibgp_route("10.0.0.0/8"));
-        propagate_prefix(
+        propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib2,
             &mut aro,
@@ -2871,7 +3013,7 @@ mod tests {
         })
         .unwrap();
 
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2894,7 +3036,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         // Advertise the route so it is stored in AdjRibOut.
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2916,7 +3058,7 @@ mod tests {
         .unwrap();
 
         // Export policy now rejects — triggers WITHDRAW try_send on a full channel.
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2939,7 +3081,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         // Store the route in AdjRibOut.
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2963,7 +3105,7 @@ mod tests {
         })
         .unwrap();
 
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
             &mut aro,
@@ -2986,7 +3128,7 @@ mod tests {
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
 
         let unknown: Ipv4Addr = "10.0.0.99".parse().unwrap();
-        state.on_established(unknown, PeerType::External, 65099, 90);
+        state.on_established(unknown, PeerType::External, 65099, 90, &[]);
         // Invariant: no state changes (the unknown IP is absent from maps).
         assert!(!state.peer_types.contains_key(&peer_ip));
     }
@@ -3001,7 +3143,7 @@ mod tests {
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.adj_ribs_out.remove(&peer_ip);
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         // peer_type is inserted before the guard, so it should be present.
         assert!(state.peer_types.contains_key(&peer_ip));
@@ -3015,7 +3157,7 @@ mod tests {
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.update_senders.remove(&peer_ip);
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         assert!(state.peer_types.contains_key(&peer_ip));
     }
@@ -3029,8 +3171,8 @@ mod tests {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
         state.adj_ribs_out.remove(&peer_b);
 
         state.on_terminated(peer_a);
@@ -3046,8 +3188,8 @@ mod tests {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
         state.update_senders.remove(&peer_b);
 
         state.on_terminated(peer_a);
@@ -3087,8 +3229,8 @@ mod tests {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
         state.adj_ribs_out.remove(&peer_b);
 
         state.on_route_update(
@@ -3114,8 +3256,8 @@ mod tests {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
         state.update_senders.remove(&peer_b);
 
         state.on_route_update(
@@ -3163,7 +3305,7 @@ mod tests {
         let mut aro = AdjRibOut::new(out_peer, PeerType::External);
 
         let (tx, _rx) = full_channel();
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             n,
             &loc_rib,
             &mut aro,
@@ -3203,7 +3345,7 @@ mod tests {
         );
 
         let (tx, _rx) = full_channel();
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             n,
             &loc_rib,
             &mut aro,
@@ -3237,7 +3379,7 @@ mod tests {
         aro.insert(RouteBuilder::new(n, Origin::Igp, AsPath::new()).build());
 
         let (tx, _rx) = full_channel();
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             n,
             &loc_rib,
             &mut aro,
@@ -3266,7 +3408,7 @@ mod tests {
         aro.insert(RouteBuilder::new(n, Origin::Igp, AsPath::new()).build());
 
         let (tx, _rx) = full_channel();
-        let ok = propagate_prefix(
+        let ok = propagate_and_flush(
             n,
             &loc_rib,
             &mut aro,
@@ -3288,11 +3430,11 @@ mod tests {
     fn test_on_terminated_ghost_established_peer_does_not_panic() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_a, 65002)]);
-        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
 
         // Inject a ghost peer into peer_types (never registered in config maps).
         let ghost: Ipv4Addr = "10.0.0.99".parse().unwrap();
-        state.on_established(ghost, PeerType::External, 65099, 90);
+        state.on_established(ghost, PeerType::External, 65099, 90, &[]);
 
         // Terminating peer_a iterates established peers; ghost has no policy /
         // rib entries — the error branch logs and continues without panicking.
@@ -3326,10 +3468,10 @@ mod tests {
     fn test_on_route_update_ghost_established_peer_does_not_panic() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_a, 65002)]);
-        state.on_established(peer_a, PeerType::External, 65002, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
 
         let ghost: Ipv4Addr = "10.0.0.99".parse().unwrap();
-        state.on_established(ghost, PeerType::External, 65099, 90);
+        state.on_established(ghost, PeerType::External, 65099, 90, &[]);
 
         state.on_route_update(
             peer_a,
@@ -3406,7 +3548,7 @@ mod stall_tests {
                 export_default: Some(config::ExportDefault::Accept),
             })
             .collect();
-        let state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders);
+        let state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![]);
         (state, receivers)
     }
 
@@ -3457,7 +3599,7 @@ mod stall_tests {
         // Saturate the channel; propagate_prefix's try_send will fail.
         fill_channel(&state, peer_ip);
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         assert!(
             !state.take_stalled_peers().is_empty(),
             "peer must be stalled when outbound channel is full during table dump"
@@ -3492,10 +3634,10 @@ mod stall_tests {
         let mut senders = HashMap::new();
         senders.insert(peer_a, tx_a);
         senders.insert(peer_b, tx_b.clone());
-        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders);
+        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![]);
 
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
 
         // Announce a route from peer_a → it ends up in Loc-RIB.
         state.on_route_update(
@@ -3534,8 +3676,8 @@ mod stall_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut receivers) = make_capped(&[(peer_a, 65002), (peer_b, 65003)], 64);
 
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
 
         // Announce a route from peer_a via on_route_update so that it is
         // properly recorded in Adj-RIB-In, Loc-RIB, AND peer_b's Adj-RIB-Out.
@@ -3594,10 +3736,10 @@ mod stall_tests {
         let mut senders = HashMap::new();
         senders.insert(peer_a, tx_a);
         senders.insert(peer_b, tx_b);
-        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders);
+        let mut state = DaemonState::new(65001, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![]);
 
-        state.on_established(peer_a, PeerType::External, 65002, 90);
-        state.on_established(peer_b, PeerType::External, 65003, 90);
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
 
         // Announce via on_route_update so adj_rib_out[peer_b] has the route.
         // The UPDATE fills peer_b's channel (capacity 1).
@@ -3643,7 +3785,7 @@ mod stall_tests {
             ),
         );
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         // Drain the table-dump UPDATE so the receiver is clean.
         receivers.get_mut(&peer_ip).unwrap().try_recv().ok();
 
@@ -3698,7 +3840,7 @@ mod stall_tests {
         );
 
         // on_established table-dumps the route → fills the cap-1 channel.
-        state.on_established(peer_ip, PeerType::External, 65002, 90);
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         // Do NOT drain the channel — it is now full.
 
         // Reject forces a WITHDRAW for the route already in adj_rib_out.
@@ -3709,6 +3851,171 @@ mod stall_tests {
             !state.take_stalled_peers().is_empty(),
             "peer must be stalled when channel is full during set_export_default propagation"
         );
+    }
+}
+
+// ── flush_updates tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod flush_updates_tests {
+    use std::net::Ipv4Addr;
+
+    use pathvector_rib::{AdjRibOut, PeerId, Route, RouteBuilder};
+    use pathvector_session::message::{PathAttribute, UpdateMessage, MAX_LEN};
+    use pathvector_types::{AsPath, IpAddress, Nlri, Origin, PeerType};
+    use tokio::sync::mpsc;
+
+    use super::{PrefixDecision, flush_updates, route_to_attributes};
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn base_route(prefix: &str) -> Route<Ipv4Addr> {
+        RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::new()).build()
+    }
+
+    /// A single announcement is sent as one UPDATE with that NLRI.
+    #[test]
+    fn test_flush_single_announce() {
+        let route = base_route("10.0.0.0/8");
+        let decisions = vec![PrefixDecision::Announce(route)];
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        let msg = rx.try_recv().expect("one UPDATE expected");
+        assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
+        assert!(msg.withdrawn.is_empty());
+        assert!(rx.try_recv().is_err(), "no extra messages");
+    }
+
+    /// Multiple NLRIs with identical path attributes are packed into one UPDATE.
+    #[test]
+    fn test_flush_same_attrs_batched_into_one_message() {
+        let prefixes = ["10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"];
+        let decisions: Vec<PrefixDecision> = prefixes
+            .iter()
+            .map(|p| PrefixDecision::Announce(base_route(p)))
+            .collect();
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        let msg = rx.try_recv().expect("one batched UPDATE expected");
+        assert_eq!(msg.announced.len(), 3);
+        assert!(rx.try_recv().is_err(), "all NLRIs in a single UPDATE");
+    }
+
+    /// Two routes with different attributes produce two separate UPDATEs.
+    #[test]
+    fn test_flush_different_attrs_two_messages() {
+        use pathvector_types::{LocalPref, NextHop};
+
+        let r1 = base_route("10.0.0.0/8");
+        // r2 has a NEXT_HOP, r1 does not — different attribute set.
+        let r2 = RouteBuilder::new(nlri("192.168.0.0/16"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .build();
+        let decisions = vec![
+            PrefixDecision::Announce(r1),
+            PrefixDecision::Announce(r2),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        let first = rx.try_recv().expect("first UPDATE");
+        let second = rx.try_recv().expect("second UPDATE");
+        assert_eq!(first.announced.len(), 1);
+        assert_eq!(second.announced.len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A batch too large for MAX_LEN is split across multiple UPDATEs.
+    #[test]
+    fn test_flush_splits_when_exceeding_max_len() {
+        // Each /24 encodes as 4 bytes of NLRI. With default MAX_LEN=4096:
+        // fixed overhead = 23 bytes; attr bytes ~4 bytes (Origin+AsPath minimal).
+        // 1000 NLRIs × 4 bytes = 4000 bytes of NLRIs, plus overhead > 4096.
+        let decisions: Vec<PrefixDecision> = (0u32..1000)
+            .map(|i| {
+                let a = (i / 256) as u8;
+                let b = (i % 256) as u8;
+                let route = RouteBuilder::new(
+                    Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap(),
+                    Origin::Igp,
+                    AsPath::new(),
+                )
+                .build();
+                PrefixDecision::Announce(route)
+            })
+            .collect();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+
+        // Drain all messages and verify: total announced == 1000, each message ≤ MAX_LEN.
+        let mut total = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            use pathvector_session::message::BgpMessage;
+            let wire_len = BgpMessage::Update(msg.clone()).encode().len();
+            assert!(
+                wire_len <= MAX_LEN,
+                "encoded message {wire_len} bytes exceeds MAX_LEN"
+            );
+            total += msg.announced.len();
+        }
+        assert_eq!(total, 1000, "all NLRIs must be sent");
+    }
+
+    /// Withdrawals are batched into a single withdraw-only UPDATE.
+    #[test]
+    fn test_flush_withdrawals_batched() {
+        let decisions: Vec<PrefixDecision> = ["10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
+            .iter()
+            .map(|p| PrefixDecision::Withdraw(nlri(p)))
+            .collect();
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        let msg = rx.try_recv().expect("one withdraw UPDATE expected");
+        assert_eq!(msg.withdrawn.len(), 3);
+        assert!(msg.announced.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Withdrawals are sent before announcements.
+    #[test]
+    fn test_flush_withdrawals_before_announces() {
+        let decisions = vec![
+            PrefixDecision::Announce(base_route("10.0.0.0/8")),
+            PrefixDecision::Withdraw(nlri("192.168.0.0/16")),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        let first = rx.try_recv().expect("first message");
+        assert!(!first.withdrawn.is_empty(), "withdraw must come first");
+        let second = rx.try_recv().expect("second message");
+        assert!(!second.announced.is_empty(), "announce comes second");
+    }
+
+    /// NoChange decisions produce no messages.
+    #[test]
+    fn test_flush_no_change_produces_nothing() {
+        let decisions = vec![PrefixDecision::NoChange, PrefixDecision::NoChange];
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(rx.try_recv().is_err(), "no messages for NoChange");
+    }
+
+    /// Returns false when the channel is full.
+    #[test]
+    fn test_flush_returns_false_on_full_channel() {
+        let (tx, _rx) = mpsc::channel(1);
+        // Pre-fill the channel.
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+
+        let decisions = vec![PrefixDecision::Withdraw(nlri("10.0.0.0/8"))];
+        assert!(!flush_updates(decisions, MAX_LEN, &tx));
     }
 }
 
@@ -3786,6 +4093,7 @@ mod event_loop_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &peer_configs,
             update_senders,
+            vec![],
         )));
 
         (state, update_receivers, stop_senders)
@@ -3824,7 +4132,7 @@ mod event_loop_tests {
         // Establish first so there is state to tear down.
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65002, 90);
+            s.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         }
 
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -3852,7 +4160,7 @@ mod event_loop_tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65002, 90);
+            s.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         }
 
         let update = UpdateMessage {
@@ -3919,6 +4227,7 @@ mod event_loop_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             &peer_configs,
             update_senders,
+            vec![],
         )));
         let mut stop_senders = HashMap::new();
         stop_senders.insert(peer_a, sess_stop_a);
@@ -3927,8 +4236,8 @@ mod event_loop_tests {
         // Establish both peers.
         {
             let mut s = state.write().await;
-            s.on_established(peer_a, PeerType::External, 65002, 90);
-            s.on_established(peer_b, PeerType::External, 65003, 90);
+            s.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+            s.on_established(peer_b, PeerType::External, 65003, 90, &[]);
         }
 
         // Pre-fill peer_b's cap-1 UPDATE channel so the propagation try_send fails.
@@ -4063,15 +4372,15 @@ mod prop_tests {
             ])
         ) {
             let n: Nlri<Ipv4Addr> = prefix.parse().unwrap();
-            let msg = withdraw_msg(n);
+            let msg = UpdateMessage { withdrawn: vec![n], attributes: vec![], announced: vec![] };
             prop_assert_eq!(msg.withdrawn.len(), 1);
             prop_assert_eq!(msg.withdrawn[0], n);
             prop_assert!(msg.announced.is_empty());
             prop_assert!(msg.attributes.is_empty());
         }
 
-        /// `route_to_update` always announces exactly the route's NLRI, never
-        /// withdraws anything, and always includes Origin and AsPath attributes.
+        /// `route_to_attributes` always produces Origin and AsPath attributes,
+        /// and the NLRI is the route's nlri.
         #[test]
         fn prop_route_to_update_structure(
             prefix in prop::sample::select(vec![
@@ -4081,7 +4390,8 @@ mod prop_tests {
             use pathvector_session::message::PathAttribute;
             let route = base_route(prefix);
             let nlri_val: Nlri<Ipv4Addr> = prefix.parse().unwrap();
-            let msg = route_to_update(route);
+            let attrs = route_to_attributes(&route);
+            let msg = UpdateMessage { withdrawn: vec![], attributes: attrs, announced: vec![nlri_val] };
 
             prop_assert_eq!(msg.announced, vec![nlri_val]);
             prop_assert!(msg.withdrawn.is_empty());

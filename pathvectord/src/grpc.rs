@@ -510,7 +510,7 @@ mod tests {
                 export_default: Some(ExportDefault::Accept),
             })
             .collect();
-        DaemonState::new(local_as, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders)
+        DaemonState::new(local_as, Ipv4Addr::new(10, 0, 0, 1), &peer_configs, senders, vec![])
     }
 
     fn nlri(s: &str) -> pathvector_types::Nlri<Ipv4Addr> {
@@ -567,7 +567,7 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, PeerType::External, 65002, 90);
+        s.on_established(addr, PeerType::External, 65002, 90, &[]);
 
         let ps = build_peer_state(&s, addr).unwrap();
         assert_eq!(ps.session_state, proto::SessionState::Established as i32);
@@ -583,7 +583,7 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, PeerType::External, 65002, 90);
+        s.on_established(addr, PeerType::External, 65002, 90, &[]);
 
         // Insert a route so the counts are non-zero.
         let n = nlri("10.0.0.0/8");
@@ -762,7 +762,7 @@ mod tests {
         state
             .write()
             .await
-            .on_established(addr, PeerType::External, 65002, 90);
+            .on_established(addr, PeerType::External, 65002, 90, &[]);
 
         let svc = PeerServiceImpl { state };
         let resp = svc
@@ -850,7 +850,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, PeerType::External, 65002, 90);
+            s.on_established(addr, PeerType::External, 65002, 90, &[]);
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
@@ -908,8 +908,8 @@ mod tests {
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         {
             let mut s = state.write().await;
-            s.on_established(a1, PeerType::External, 65002, 90);
-            s.on_established(a2, PeerType::External, 65003, 90);
+            s.on_established(a1, PeerType::External, 65002, 90, &[]);
+            s.on_established(a2, PeerType::External, 65003, 90, &[]);
 
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
@@ -939,8 +939,8 @@ mod tests {
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         {
             let mut s = state.write().await;
-            s.on_established(a1, PeerType::External, 65002, 90);
-            s.on_established(a2, PeerType::External, 65003, 90);
+            s.on_established(a1, PeerType::External, 65002, 90, &[]);
+            s.on_established(a2, PeerType::External, 65003, 90, &[]);
 
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
@@ -1001,7 +1001,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, PeerType::External, 65002, 90);
+            s.on_established(addr, PeerType::External, 65002, 90, &[]);
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());

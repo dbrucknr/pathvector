@@ -577,6 +577,26 @@ fn decode_mp_nlri(afi: Afi, cur: &mut Cursor<'_>) -> Result<Vec<Prefix>, CodecEr
     }
 }
 
+// ── Public encoding helpers ──────────────────────────────────────────────────
+
+/// Returns the number of bytes an IPv4 NLRI occupies on the wire.
+///
+/// Wire format: 1-byte prefix length + `ceil(prefix_len / 8)` address bytes.
+#[must_use]
+pub fn nlri_encoded_len(nlri: &Nlri<Ipv4Addr>) -> usize {
+    1 + (nlri.prefix_len() as usize).div_ceil(8)
+}
+
+/// Encodes a slice of path attributes to their wire representation.
+///
+/// The returned bytes are the raw attribute TLVs with no length prefix —
+/// suitable for use as a grouping key or for computing the attribute portion
+/// of a BGP UPDATE's wire size.
+#[must_use]
+pub fn encode_attributes(attrs: &[PathAttribute]) -> Vec<u8> {
+    encode_path_attributes(attrs)
+}
+
 // ── Path attribute encode ────────────────────────────────────────────────────
 
 fn encode_path_attributes(attrs: &[PathAttribute]) -> Vec<u8> {
