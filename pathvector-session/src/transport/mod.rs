@@ -557,6 +557,12 @@ fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
     }
 }
 
+/// Test-only re-export so `update::prop_tests` can exercise the conversion.
+#[cfg(test)]
+pub(crate) fn make_treat_as_withdraw_test(update: UpdateMessage) -> UpdateMessage {
+    make_treat_as_withdraw(update)
+}
+
 // ── Free async helpers ────────────────────────────────────────────────────────
 
 /// Resolves at `deadline`, or never if `None`.
