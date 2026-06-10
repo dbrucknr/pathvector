@@ -36,8 +36,7 @@ use std::{
 };
 
 use pathvector_client::{
-    DaemonClient,
-    PathvectorClient,
+    DaemonClient, PathvectorClient,
     types::{Route, SessionState},
 };
 use tempfile::NamedTempFile;

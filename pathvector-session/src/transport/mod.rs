@@ -835,10 +835,8 @@ mod tests {
         // Build a MalformedUpdate: ORIGIN was bad (treat-as-withdraw), two
         // announced prefixes.  The decoder would produce this when it encounters
         // a malformed ORIGIN attribute alongside valid NLRI in an UPDATE.
-        let prefix_a: Nlri<StdIpv4Addr> =
-            Nlri::new(StdIpv4Addr::new(10, 1, 0, 0), 24).unwrap();
-        let prefix_b: Nlri<StdIpv4Addr> =
-            Nlri::new(StdIpv4Addr::new(10, 2, 0, 0), 24).unwrap();
+        let prefix_a: Nlri<StdIpv4Addr> = Nlri::new(StdIpv4Addr::new(10, 1, 0, 0), 24).unwrap();
+        let prefix_b: Nlri<StdIpv4Addr> = Nlri::new(StdIpv4Addr::new(10, 2, 0, 0), 24).unwrap();
 
         let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
             update: UpdateMessage {
@@ -885,8 +883,7 @@ mod tests {
         // Confirm the session is still alive: send a KEEPALIVE and verify the
         // session does NOT emit Terminated within a short window.
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
-        let result =
-            tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
         assert!(
             result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
             "session must not terminate after a treat-as-withdraw malformed UPDATE"
@@ -907,8 +904,7 @@ mod tests {
 
         // MED was malformed (attribute-discard).  The decoder strips it and
         // keeps ORIGIN.  The cleaned update still announces a prefix.
-        let prefix: Nlri<StdIpv4Addr> =
-            Nlri::new(StdIpv4Addr::new(192, 168, 1, 0), 24).unwrap();
+        let prefix: Nlri<StdIpv4Addr> = Nlri::new(StdIpv4Addr::new(192, 168, 1, 0), 24).unwrap();
 
         let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
             update: UpdateMessage {
@@ -953,8 +949,7 @@ mod tests {
 
         // Confirm session is still alive.
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
-        let result =
-            tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
         assert!(
             result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
             "session must not terminate after an attribute-discard malformed UPDATE"

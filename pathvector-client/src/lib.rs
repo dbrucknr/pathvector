@@ -66,5 +66,4 @@ impl PathvectorClient {
             policy: PolicyServiceClient::new(channel),
         })
     }
-
 }

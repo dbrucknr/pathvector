@@ -306,10 +306,7 @@ mod tests {
             Err(ClientError::Rpc(tonic::Status::not_found("no peer")))
         }
 
-        async fn list_routes(
-            &mut self,
-            _peer: Option<IpAddr>,
-        ) -> Result<Vec<Route>, ClientError> {
+        async fn list_routes(&mut self, _peer: Option<IpAddr>) -> Result<Vec<Route>, ClientError> {
             Ok(vec![])
         }
 
@@ -391,7 +388,10 @@ mod tests {
             c.get_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))).await,
             Err(ClientError::Rpc(_))
         ));
-        assert!(matches!(c.list_routes(None).await, Err(ClientError::Rpc(_))));
+        assert!(matches!(
+            c.list_routes(None).await,
+            Err(ClientError::Rpc(_))
+        ));
         assert!(matches!(
             c.get_best_route("10.0.0.0/8").await,
             Err(ClientError::Rpc(_))

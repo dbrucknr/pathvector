@@ -10,7 +10,10 @@
 
 use std::time::Duration;
 
-use pathvector_client::{DaemonClient, types::{Origin, PeerType}};
+use pathvector_client::{
+    DaemonClient,
+    types::{Origin, PeerType},
+};
 use pathvector_e2e::{Harness, wait_for_route, wait_for_route_withdrawn};
 
 /// RFC 4271 §9.2 — a route announced by GoBGP must appear in the Loc-RIB and
