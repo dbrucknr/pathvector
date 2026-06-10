@@ -119,6 +119,9 @@ pub struct SessionConfig {
     pub hold_time: u16,
     /// Capabilities advertised in the OPEN message.
     pub capabilities: Vec<Capability>,
+    /// Capabilities the peer MUST advertise. If absent, the session is rejected
+    /// with NOTIFICATION code 2 subcode 7 (RFC 5492). Empty by default.
+    pub required_capabilities: Vec<Capability>,
     /// Expected peer AS. `None` accepts any AS.
     pub peer_as: Option<u32>,
     /// Address (IP + port) of the remote BGP peer.
@@ -215,6 +218,7 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         local_bgp_id: config.local_bgp_id,
         hold_time: config.hold_time,
         capabilities: config.capabilities.clone(),
+        required_capabilities: config.required_capabilities.clone(),
         peer_as: config.peer_as,
     };
 
@@ -264,6 +268,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         local_bgp_id: config.local_bgp_id,
         hold_time: config.hold_time,
         capabilities: config.capabilities.clone(),
+        required_capabilities: config.required_capabilities.clone(),
         peer_as: config.peer_as,
     };
 
@@ -678,6 +683,7 @@ mod tests {
             local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
             hold_time: 90,
             capabilities: vec![Capability::FourByteAsn(65001)],
+            required_capabilities: vec![],
             peer_as: Some(65002),
             // peer_addr is unused when a transport is injected via spawn_with.
             peer_addr: "127.0.0.1:0".parse().unwrap(),

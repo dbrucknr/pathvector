@@ -836,6 +836,7 @@ where
                 Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
                 Capability::FourByteAsn(local_as),
             ],
+            required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
         };
@@ -1094,6 +1095,17 @@ fn handle_update(
         }
 
         let raw = builder.build();
+
+        // RFC 7999: silently discard routes tagged with the BLACKHOLE community.
+        // Store in AdjRibIn so soft-reconfig can see the raw route, but never
+        // install into LocRib or advertise outbound.
+        if raw.communities.iter().any(|c| c.is_blackhole()) {
+            adj_rib_in.insert(raw.clone());
+            tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged route (RFC 7999)");
+            rejected += 1;
+            continue;
+        }
+
         // Store the pre-policy route for soft reconfiguration.
         adj_rib_in.insert(raw.clone());
 
@@ -1670,6 +1682,81 @@ mod tests {
                         type_code: 255,
                         value: vec![1, 2, 3],
                     },
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib.len(), 1);
+    }
+
+    // ── RFC 7999 — BLACKHOLE community discard ───────────────────────────────
+
+    #[test]
+    fn test_handle_update_blackhole_route_not_installed() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::Communities(vec![Community::BLACKHOLE]),
+                ],
+                announced: vec![nlri("192.0.2.0/24")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        // BLACKHOLE-tagged route must not enter LocRib even with accept-all policy.
+        assert_eq!(rib.len(), 0, "BLACKHOLE route must not be installed");
+    }
+
+    #[test]
+    fn test_handle_update_blackhole_route_stored_in_adj_rib_in() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        let prefix = nlri("192.0.2.0/24");
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::Communities(vec![Community::BLACKHOLE]),
+                ],
+                announced: vec![prefix],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        // Pre-policy route stored in AdjRibIn for soft-reconfig visibility.
+        assert!(ari.get(&prefix).is_some(), "BLACKHOLE route must be in AdjRibIn");
+    }
+
+    #[test]
+    fn test_handle_update_non_blackhole_route_installed_normally() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    // Regular community, not BLACKHOLE.
+                    PathAttribute::Communities(vec![Community::NO_EXPORT]),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },

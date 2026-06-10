@@ -11,6 +11,7 @@ fn arb_config() -> impl Strategy<Value = SessionConfig> {
             local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
             hold_time,
             capabilities: vec![],
+            required_capabilities: vec![],
             peer_as: if has_peer_as { Some(65002) } else { None },
             peer_addr: "127.0.0.1:0".parse().unwrap(),
         },
@@ -49,6 +50,7 @@ proptest! {
                 local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
                 hold_time: 90,
                 capabilities: vec![],
+                required_capabilities: vec![],
                 peer_as: None,
                 peer_addr: "127.0.0.1:0".parse().unwrap(),
             });

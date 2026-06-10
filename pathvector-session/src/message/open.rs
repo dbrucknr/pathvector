@@ -246,7 +246,7 @@ pub enum Capability {
 }
 
 impl Capability {
-    fn code(&self) -> u8 {
+    pub(crate) fn code(&self) -> u8 {
         match self {
             Self::MultiProtocol(_) => 1,
             Self::RouteRefresh => 2,

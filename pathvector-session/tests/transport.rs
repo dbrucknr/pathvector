@@ -36,6 +36,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
         hold_time: 90,
         capabilities: vec![Capability::FourByteAsn(65001)],
+        required_capabilities: vec![],
         peer_as: Some(65002),
         peer_addr,
     }
@@ -227,6 +228,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
         hold_time: 3,
         capabilities: vec![Capability::FourByteAsn(65001)],
+        required_capabilities: vec![],
         peer_as: Some(65002),
         peer_addr,
     }

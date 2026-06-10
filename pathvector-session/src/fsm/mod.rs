@@ -38,6 +38,10 @@ pub struct FsmConfig {
     /// Capabilities advertised in the OPEN message. Include
     /// [`Capability::FourByteAsn`] when `local_as > 65535`.
     pub capabilities: Vec<Capability>,
+    /// Capabilities that the peer MUST advertise. If the peer's OPEN is missing
+    /// any of these, the session is rejected with NOTIFICATION code 2 subcode 7
+    /// (Unsupported Capability) per RFC 5492 §3. Empty by default.
+    pub required_capabilities: Vec<Capability>,
     /// Expected peer AS. `None` skips AS validation.
     pub peer_as: Option<u32>,
 }
@@ -146,6 +150,7 @@ pub enum State {
 ///     local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
 ///     hold_time: 90,
 ///     capabilities: vec![],
+///     required_capabilities: vec![],
 ///     peer_as: Some(65002),
 /// });
 /// assert_eq!(fsm.state(), State::Idle);
@@ -248,12 +253,12 @@ impl Fsm {
                         push_timer_actions(&mut out, negotiated);
                         out
                     }
-                    Err(err) => {
+                    Err((err, data)) => {
                         self.state = State::Idle;
                         vec![
                             FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
                                 error: err,
-                                data: vec![],
+                                data,
                             })),
                             FsmOutput::StopHoldTimer,
                             FsmOutput::CloseTcpConnection,
@@ -540,29 +545,54 @@ impl Fsm {
     }
 
     /// Validate a received OPEN, returning the negotiated hold time on success.
-    fn validate_open(&self, peer: &OpenMessage) -> Result<u16, NotificationError> {
+    /// Validates the peer's OPEN message. Returns the negotiated hold time on
+    /// success, or `(error, data)` where `data` is the NOTIFICATION payload.
+    fn validate_open(&self, peer: &OpenMessage) -> Result<u16, (NotificationError, Vec<u8>)> {
         if peer.version != 4 {
-            return Err(NotificationError::OpenMessage(
-                OpenMsgError::UnsupportedVersionNumber,
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::UnsupportedVersionNumber),
+                vec![],
             ));
         }
 
         if peer.bgp_id == Ipv4Addr::UNSPECIFIED {
-            return Err(NotificationError::OpenMessage(
-                OpenMsgError::BadBgpIdentifier,
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
+                vec![],
             ));
         }
 
         if let Some(expected) = self.config.peer_as
             && resolve_as(peer) != expected
         {
-            return Err(NotificationError::OpenMessage(OpenMsgError::BadPeerAs));
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::BadPeerAs),
+                vec![],
+            ));
         }
 
         // RFC 4271 §6.2: hold time values 1 and 2 are unacceptable.
         if peer.hold_time == 1 || peer.hold_time == 2 {
-            return Err(NotificationError::OpenMessage(
-                OpenMsgError::UnacceptableHoldTime,
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::UnacceptableHoldTime),
+                vec![],
+            ));
+        }
+
+        // RFC 5492 §3: if we require a capability the peer did not advertise,
+        // send NOTIFICATION code 2 subcode 7 with the unsupported codes listed
+        // in the data field as capability TLVs.
+        let unsupported: Vec<&Capability> = self
+            .config
+            .required_capabilities
+            .iter()
+            .filter(|req| !peer.capabilities.iter().any(|c| c.code() == req.code()))
+            .collect();
+        if !unsupported.is_empty() {
+            let data = encode_unsupported_capabilities(&unsupported);
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability),
+                data,
             ));
         }
 
@@ -596,6 +626,17 @@ impl Fsm {
 }
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
+
+/// Encode a list of capabilities as NOTIFICATION data for Unsupported Capability
+/// (RFC 5492 §3). Each entry is a capability TLV: code(1) + length(1) + value.
+fn encode_unsupported_capabilities(caps: &[&Capability]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for cap in caps {
+        data.push(cap.code());
+        data.push(0); // length 0 — we only need the code to identify the capability
+    }
+    data
+}
 
 /// Extract the effective AS number from an OPEN message.
 ///
@@ -658,6 +699,7 @@ mod tests {
             local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
             hold_time: 90,
             capabilities: vec![Capability::FourByteAsn(65001)],
+            required_capabilities: vec![],
             peer_as: Some(65002),
         }
     }
@@ -1202,6 +1244,7 @@ mod tests {
             local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
             hold_time: 90,
             capabilities: vec![Capability::FourByteAsn(131_072)],
+            required_capabilities: vec![],
             peer_as: Some(131_073),
         };
         let mut fsm = Fsm::new(config);
@@ -1698,5 +1741,87 @@ mod tests {
             info.peer_as, 65002,
             "peer_as must come from my_as when no FourByteAsn cap"
         );
+    }
+
+    // ── RFC 5492 — Unsupported Capability ─────────────────────────────────────
+
+    #[test]
+    fn test_required_capability_missing_sends_unsupported_capability_notification() {
+        let config = FsmConfig {
+            required_capabilities: vec![Capability::RouteRefresh],
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        // Peer OPEN has no RouteRefresh capability.
+        let peer_open_no_rr = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(peer_open_no_rr));
+
+        assert_eq!(fsm.state(), State::Idle);
+        let notif = find_send(&out).expect("expected NOTIFICATION");
+        assert!(
+            matches!(
+                notif,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability),
+                    ..
+                })
+            ),
+            "expected UnsupportedCapability NOTIFICATION, got {notif:?}"
+        );
+        // Data field must list the RouteRefresh capability code (2).
+        if let BgpMessage::Notification(n) = notif {
+            assert!(
+                n.data.contains(&2),
+                "NOTIFICATION data must contain capability code 2 (RouteRefresh)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_required_capability_present_allows_session() {
+        let config = FsmConfig {
+            required_capabilities: vec![Capability::RouteRefresh],
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        // Peer OPEN includes RouteRefresh.
+        let peer_open_with_rr = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::FourByteAsn(65002), Capability::RouteRefresh],
+        });
+        fsm.process(FsmInput::MessageReceived(peer_open_with_rr));
+        assert_eq!(fsm.state(), State::OpenConfirm, "session should proceed to OpenConfirm");
+    }
+
+    #[test]
+    fn test_empty_required_capabilities_never_rejects() {
+        // Default config has required_capabilities: vec![] — any peer OPEN is accepted.
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let peer_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![],
+        });
+        fsm.process(FsmInput::MessageReceived(peer_open));
+        assert_eq!(fsm.state(), State::OpenConfirm);
     }
 }

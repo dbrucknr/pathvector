@@ -14,6 +14,7 @@ fn default_config() -> FsmConfig {
         local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
         hold_time: 90,
         capabilities: vec![],
+        required_capabilities: vec![],
         peer_as: None,
     }
 }

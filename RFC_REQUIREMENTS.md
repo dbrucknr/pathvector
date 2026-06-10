@@ -233,9 +233,9 @@ retry without them.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| NOTIFICATION code 2 subcode 7 (Unsupported Capability) sent when peer requires an unsupported capability | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
-| Unsupported Capability NOTIFICATION data field contains the list of unsupported capability codes | `pathvector-session/src/message/notification.rs` | ❌ | — |
-| On receiving Unsupported Capability NOTIFICATION, MAY retry OPEN without the offending capabilities | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| NOTIFICATION code 2 subcode 7 (Unsupported Capability) sent when peer requires an unsupported capability | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_required_capability_missing_sends_unsupported_capability_notification`, `test_required_capabilities_present_allows_session`, `test_empty_required_capabilities_never_rejects` |
+| Unsupported Capability NOTIFICATION data field contains the list of unsupported capability codes | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_required_capability_missing_sends_unsupported_capability_notification` (asserts `data.contains(&code)`) |
+| On receiving Unsupported Capability NOTIFICATION, MAY retry OPEN without the offending capabilities | `pathvector-session/src/fsm/mod.rs` | ❌ | — (retry-without-capability path not implemented; session goes Idle as per RFC 4271 §8.2.2 event 25) |
 
 ---
 
@@ -373,7 +373,7 @@ which state the unexpected message arrived in.
 |---|---|---|---|
 | BLACKHOLE community value 0xFFFF029A defined as a named constant | `pathvector-types/src/community.rs` | ✅ | `test_community_blackhole` |
 | `is_blackhole()` predicate returns true only for 0xFFFF029A | `pathvector-types/src/community.rs` | ✅ | `test_community_blackhole` |
-| Routes carrying BLACKHOLE result in a discard/null-route action | `pathvector-policy` / `pathvectord` | ❌ | — |
+| Routes carrying BLACKHOLE result in a discard/null-route action | `pathvectord/src/main.rs` | ✅ | `test_handle_update_blackhole_route_not_installed`, `test_handle_update_blackhole_route_stored_in_adj_rib_in`, `test_handle_update_non_blackhole_route_installed_normally` |
 
 ---
 
@@ -526,18 +526,18 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 | RFC | Subject | Overall Status |
 |---|---|---|
 | RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process e2e-verified (announce, withdraw, export policy, attribute transforms); LOCAL_PREF stripping unit-tested but not directly observable e2e; session lifecycle and route announce/withdraw validated e2e against GoBGP |
-| RFC 2918 | Route Refresh | ⚠️ Message and capability implemented; send-guard not enforced |
+| RFC 2918 | Route Refresh | ✅ Message, capability, and receive-guard (negotiation check) implemented |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ Wire format + IPv4 daemon processing; IPv6 daemon support deferred (see TODO) |
-| RFC 5492 | Capability Advertisement (supersedes RFC 3392) | ⚠️ Wire format inherited; Unsupported Capability NOTIFICATION and retry not implemented |
+| RFC 5492 | Capability Advertisement (supersedes RFC 3392) | ⚠️ Wire format + UnsupportedCapability NOTIFICATION (send + data encoding) implemented; retry-without-capability on receive not implemented |
 | RFC 6793 | 4-Byte ASN | ✅ |
 | RFC 4724 | Graceful Restart | ⚠️ Capability parsed; FSM restart behaviour not implemented |
 | RFC 4486 | Cease NOTIFICATION Subcodes | ✅ |
-| RFC 6608 | FSM Error Subcodes | ⚠️ Subcode 0 (Unspecified) implemented; subcodes 1–3 not sent |
+| RFC 6608 | FSM Error Subcodes | ✅ All subcodes 0–3 implemented and tested |
 | RFC 1997 | BGP Communities | ✅ |
 | RFC 4360 | Extended Communities | ✅ |
 | RFC 8092 | Large Communities | ✅ |
-| RFC 7999 | BLACKHOLE Community | ⚠️ Value and predicate defined; discard action not wired |
+| RFC 7999 | BLACKHOLE Community | ✅ Value, predicate, and discard action in `handle_update` all implemented |
 | RFC 1930 | Private ASN (2-byte) | ✅ |
 | RFC 6996 | Private ASN (4-byte) | ✅ |
 | RFC 5065 | BGP Confederations | ✅ |
