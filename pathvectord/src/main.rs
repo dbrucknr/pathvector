@@ -18,7 +18,7 @@ use pathvector_session::{
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 #[tokio::main]
 async fn main() {
@@ -195,6 +195,12 @@ fn propagate_prefix(
     }
 }
 
+/// Synthetic `PeerId` used as the source for locally originated routes.
+///
+/// Must not collide with any real peer address. `0.0.0.0` is unassignable as
+/// a BGP peer, so it is safe as a sentinel here.
+const LOCAL_ORIGIN_PEER: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+
 /// BGP UPDATE wire overhead: 19-byte header + 2-byte withdrawn-len + 2-byte
 /// attr-len field.
 const UPDATE_FIXED_OVERHEAD: usize = 19 + 2 + 2;
@@ -357,6 +363,21 @@ struct DaemonState {
     ///
     /// [`take_stalled_peers`]: DaemonState::take_stalled_peers
     stalled_peers: Vec<Ipv4Addr>,
+    /// Locally originated routes, keyed by NLRI.
+    ///
+    /// Injected via `OriginationService` gRPC RPCs. Routes are ephemeral —
+    /// not persisted across restarts. Callers are responsible for re-injecting
+    /// after a restart (same pattern as GoBGP `TABLE_TYPE_GLOBAL`).
+    pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
+    /// Broadcast channel for Loc-RIB events (announced / withdrawn).
+    ///
+    /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
+    /// receive `RecvError::Lagged` and must reconnect for a fresh snapshot.
+    pub(crate) route_tx: broadcast::Sender<proto::RouteEvent>,
+    /// Broadcast channel for peer session state changes.
+    ///
+    /// `WatchPeers` gRPC handlers subscribe at call time.
+    pub(crate) peer_tx: broadcast::Sender<proto::PeerEvent>,
 }
 
 impl DaemonState {
@@ -409,6 +430,9 @@ impl DaemonState {
 
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
+        let (route_tx, _) = broadcast::channel(1024);
+        let (peer_tx, _) = broadcast::channel(1024);
+
         Self {
             local_as,
             local_bgp_id,
@@ -426,6 +450,9 @@ impl DaemonState {
             config_capabilities,
             negotiated_max_len: HashMap::new(),
             stalled_peers: Vec::new(),
+            originated_routes: HashMap::new(),
+            route_tx,
+            peer_tx,
         }
     }
 
@@ -509,6 +536,11 @@ impl DaemonState {
         if !flush_updates(decisions, max_len, update_tx) {
             self.stalled_peers.push(peer_ip);
         }
+
+        let _ = self.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None, // gRPC handler builds PeerState from DaemonState fields
+        });
 
         tracing::info!(
             peer = %peer_ip,
@@ -606,6 +638,11 @@ impl DaemonState {
             }
         }
 
+        let _ = self.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None, // gRPC handler builds PeerState from DaemonState fields
+        });
+
         tracing::info!(
             peer = %peer_ip,
             rib_size = self.loc_rib.len(),
@@ -685,33 +722,41 @@ impl DaemonState {
 
         // Propagate best-path changes for affected prefixes to all established
         // peers (iBGP split-horizon is enforced by AdjRibOut).
-        let established_peers: Vec<Ipv4Addr> = self.peer_types.keys().copied().collect();
+        self.propagate_to_all_peers(&affected);
+    }
 
-        for other_ip in established_peers {
-            let other_type = self
+    /// Propagates best-path decisions for `nlris` to every currently established
+    /// peer and flushes the resulting BGP UPDATE messages.
+    ///
+    /// Extracted to eliminate the identical loop body duplicated across
+    /// `on_route_update`, `set_import_default`, `set_export_default`, and the
+    /// origination methods.
+    fn propagate_to_all_peers(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
+        let established_peers: Vec<Ipv4Addr> = self.peer_types.keys().copied().collect();
+        for peer_ip in established_peers {
+            let peer_type = self
                 .peer_types
-                .get(&other_ip)
+                .get(&peer_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
             let max_len = self
                 .negotiated_max_len
-                .get(&other_ip)
+                .get(&peer_ip)
                 .copied()
                 .unwrap_or(MAX_LEN);
-            let Some(export_policy) = self.export_policies.get(&other_ip) else {
-                tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on RouteUpdate");
+            let Some(export_policy) = self.export_policies.get(&peer_ip) else {
+                tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping propagation");
                 continue;
             };
-            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
-                tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on RouteUpdate");
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
+                tracing::error!(peer = %peer_ip, "adj_ribs_out missing peer — skipping propagation");
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
-                tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on RouteUpdate");
+            let Some(update_tx) = self.update_senders.get(&peer_ip) else {
+                tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping propagation");
                 continue;
             };
-
-            let decisions: Vec<PrefixDecision> = affected
+            let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
                     propagate_prefix(
@@ -719,16 +764,70 @@ impl DaemonState {
                         &self.loc_rib,
                         adj_rib_out,
                         export_policy,
-                        other_type,
+                        peer_type,
                         self.local_as,
                         self.local_bgp_id,
                     )
                 })
                 .collect();
             if !flush_updates(decisions, max_len, update_tx) {
-                self.stalled_peers.push(other_ip);
+                self.stalled_peers.push(peer_ip);
             }
         }
+    }
+
+    /// Injects a single route into the Loc-RIB and advertises it to all
+    /// established peers. Delegates to [`originate_routes`].
+    ///
+    /// [`originate_routes`]: DaemonState::originate_routes
+    pub(crate) fn originate_route(&mut self, route: Route<Ipv4Addr>) {
+        self.originate_routes(vec![route]);
+    }
+
+    /// Injects a batch of routes into the Loc-RIB and advertises all of them
+    /// to established peers in a single propagation pass.
+    ///
+    /// All routes are inserted before propagation begins — one `propagate_to_all_peers`
+    /// call regardless of batch size. This matches GoBGP `AddPathStream` semantics.
+    ///
+    /// Originated routes bypass import policy; they go directly into Loc-RIB.
+    /// Export policy still applies on the outbound side.
+    pub(crate) fn originate_routes(&mut self, routes: Vec<Route<Ipv4Addr>>) {
+        let mut nlris = Vec::with_capacity(routes.len());
+        for route in routes {
+            let nlri = route.nlri;
+            self.originated_routes.insert(nlri, route.clone());
+            self.loc_rib.insert(PeerId::from(LOCAL_ORIGIN_PEER), route);
+            nlris.push(nlri);
+            let _ = self.route_tx.send(proto::RouteEvent {
+                r#type: proto::RouteEventType::Announced as i32,
+                route: None, // filled by gRPC handler from loc_rib snapshot
+                withdrawn_prefix: None,
+            });
+        }
+        self.propagate_to_all_peers(&nlris);
+    }
+
+    /// Withdraws a single locally originated route.
+    ///
+    /// No-op if the prefix was not previously originated.
+    pub(crate) fn withdraw_originated_route(&mut self, nlri: Nlri<Ipv4Addr>) {
+        self.withdraw_originated_routes(&[nlri]);
+    }
+
+    /// Withdraws a batch of locally originated routes in a single propagation
+    /// pass.
+    pub(crate) fn withdraw_originated_routes(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
+        for nlri in nlris {
+            self.originated_routes.remove(nlri);
+            self.loc_rib.withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            let _ = self.route_tx.send(proto::RouteEvent {
+                r#type: proto::RouteEventType::Withdrawn as i32,
+                route: None,
+                withdrawn_prefix: Some(nlri.to_string()),
+            });
+        }
+        self.propagate_to_all_peers(nlris);
     }
 
     /// Replaces the import-policy default for `peer_ip` and re-evaluates the
@@ -763,51 +862,7 @@ impl DaemonState {
             &self.import_policies[&peer_ip],
         );
 
-        // Propagate updated Loc-RIB state for every affected NLRI to all
-        // established peers.
-        let established: Vec<Ipv4Addr> = self.peer_types.keys().copied().collect();
-        for other_ip in established {
-            let other_type = self
-                .peer_types
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
-            let Some(export_policy) = self.export_policies.get(&other_ip) else {
-                tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation in set_import_default");
-                continue;
-            };
-            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
-                tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation in set_import_default");
-                continue;
-            };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
-                tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation in set_import_default");
-                continue;
-            };
-
-            let decisions: Vec<PrefixDecision> = nlris
-                .iter()
-                .map(|&nlri| {
-                    propagate_prefix(
-                        nlri,
-                        &self.loc_rib,
-                        adj_rib_out,
-                        export_policy,
-                        other_type,
-                        self.local_as,
-                        self.local_bgp_id,
-                    )
-                })
-                .collect();
-            if !flush_updates(decisions, max_len, update_tx) {
-                self.stalled_peers.push(other_ip);
-            }
-        }
+        self.propagate_to_all_peers(&nlris);
     }
 
     /// Replaces the export-policy default for `peer_ip` and re-evaluates the

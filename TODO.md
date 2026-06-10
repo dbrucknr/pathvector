@@ -508,21 +508,62 @@ rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteEvent);
 rpc WatchPeers(WatchPeersRequest)  returns (stream PeerEvent);
 ```
 
-Where `RouteEvent` carries `oneof { Route announced = 1; string withdrawn_prefix = 2; }`
-and `PeerEvent` carries the updated `PeerState`.
+**Design: snapshot-then-stream** (same model as BGP itself and RFC 7854 BMP)
 
-Benefits:
-- **e2e tests** — replace `wait_for_route` polling loops with an event-driven subscription;
-  tests become faster and have no arbitrary sleep timeouts
+When a client subscribes, the server:
+1. Sends all current best routes as `RouteEvent { type: CURRENT, route: ... }` messages
+2. Sends a `RouteEvent { type: END_OF_INITIAL }` sentinel
+3. Streams live deltas (`ANNOUNCED` / `WITHDRAWN`) as the RIB changes
+
+This is correct by construction: no race between "get current state" and "subscribe to
+changes." A client that reconnects re-subscribes and receives the full snapshot again,
+so no gap handling is required. This mirrors the BMP initial table dump + route monitoring
+pattern from RFC 7854 §5.
+
+`WatchPeers` follows the same model: current peer states first, then session transitions.
+
+**Proto sketch:**
+```protobuf
+enum RouteEventType { CURRENT = 0; END_OF_INITIAL = 1; ANNOUNCED = 2; WITHDRAWN = 3; }
+message RouteEvent {
+  RouteEventType type = 1;
+  optional Route route = 2;          // set for CURRENT and ANNOUNCED
+  optional string withdrawn_prefix = 3; // set for WITHDRAWN
+}
+message WatchRoutesRequest {
+  optional string peer_address = 1;  // filter by peer; omit for all peers
+}
+
+enum PeerEventType { CURRENT = 0; END_OF_INITIAL = 1; CHANGED = 2; }
+message PeerEvent {
+  PeerEventType type = 1;
+  PeerState peer = 2;
+}
+```
+
+**Benefits:**
+- **e2e tests** — replace `wait_for_route` 200ms polling loops with event-driven subscriptions;
+  no arbitrary sleep timeouts, tests complete as soon as the event fires
 - **CLI** — `pathvector watch routes` / `pathvector watch peers` become natural commands
+- **Dashboard** — replace the 200ms refresh ticker with a `WatchRoutes` stream
 - **Operators** — live monitoring without external polling scripts
 
-Implementation touches: proto schema, daemon event fan-out (the session event channel
-already carries all the information — each watch stream registers as a receiver), and the
-client library (`watch_routes() -> impl Stream<Item = RouteEvent>`). The daemon side
-requires careful backpressure handling: a slow watch client must not block the main loop.
-Consider a bounded broadcast channel per watch stream with the oldest entry dropped on
-overflow (same pattern as Tokio's `broadcast::channel`).
+**Daemon-side implementation:**
+- `tokio::sync::broadcast::channel` per event type (`route_tx`, `peer_tx`) in `DaemonState`
+- `on_route_update` and `on_established`/`on_terminated` publish events on the respective channel
+- Each gRPC stream handler: grab a snapshot of current state under read lock, subscribe to
+  broadcast channel, send snapshot events, then forward live events — all without blocking
+  the main write-lock loop
+- Backpressure: `broadcast::channel` drops the oldest message on overflow for a slow subscriber;
+  the client must handle `RecvError::Lagged` by reconnecting to get a fresh snapshot
+
+**Client library:**
+```rust
+async fn watch_routes(&mut self, peer: Option<Ipv4Addr>)
+    -> Result<impl Stream<Item = Result<RouteEvent, ClientError>>, ClientError>;
+async fn watch_peers(&mut self)
+    -> Result<impl Stream<Item = Result<PeerEvent, ClientError>>, ClientError>;
+```
 
 ---
 

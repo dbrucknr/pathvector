@@ -32,13 +32,22 @@ use crate::DaemonState;
 // code without affecting the rest of this module.  Inner attributes cannot
 // appear inside an `include!` expansion in an inline `mod { }` block.
 
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt as _;
+
 use crate::proto;
 
 use proto::{
     Aggregator, AsSegment, GetBestRouteRequest, GetPeerRequest, LargeCommunity,
-    ListCandidatesRequest, ListPeersRequest, ListPeersResponse, ListRoutesRequest,
-    ListRoutesResponse, PeerState, PolicyAction, Route, RouteResponse, SetExportDefaultRequest,
-    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse,
+    ListCandidatesRequest, ListOriginatedRoutesRequest, ListOriginatedRoutesResponse,
+    ListPeersRequest, ListPeersResponse, ListRoutesRequest, ListRoutesResponse,
+    OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest, OriginateRoutesResponse,
+    PeerEvent, PeerEventType, PeerState, PolicyAction, Route, RouteEvent, RouteEventType,
+    RouteResponse, SetExportDefaultRequest, SetExportDefaultResponse, SetImportDefaultRequest,
+    SetImportDefaultResponse, WatchPeersRequest, WatchRoutesRequest,
+    WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse, WithdrawOriginatedRoutesRequest,
+    WithdrawOriginatedRoutesResponse,
+    origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
     policy_service_server::{PolicyService, PolicyServiceServer},
     rib_service_server::{RibService, RibServiceServer},
@@ -218,8 +227,13 @@ fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
     })
 }
 
+type PeerEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
+type RouteEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<RouteEvent, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl PeerService for PeerServiceImpl {
+    type WatchPeersStream = PeerEventStream;
+
     async fn list_peers(
         &self,
         _request: Request<ListPeersRequest>,
@@ -251,6 +265,56 @@ impl PeerService for PeerServiceImpl {
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("peer {addr} is not configured")))
     }
+
+    async fn watch_peers(
+        &self,
+        _request: Request<WatchPeersRequest>,
+    ) -> Result<Response<Self::WatchPeersStream>, Status> {
+        // Subscribe BEFORE snapshot to avoid a race between snapshot and first delta.
+        let rx = self.state.read().await.peer_tx.subscribe();
+
+        // Snapshot: current state of all configured peers under read lock.
+        let snapshot: Vec<PeerEvent> = {
+            let s = self.state.read().await;
+            let mut events: Vec<PeerEvent> = s
+                .peer_remote_as
+                .keys()
+                .copied()
+                .filter_map(|addr| build_peer_state(&s, addr))
+                .map(|ps| PeerEvent {
+                    r#type: PeerEventType::Current as i32,
+                    peer: Some(ps),
+                })
+                .collect();
+            events.sort_by_key(|e| e.peer.as_ref().map_or(String::new(), |p| p.address.clone()));
+            events.push(PeerEvent {
+                r#type: PeerEventType::EndInitial as i32,
+                peer: None,
+            });
+            events
+        };
+
+        let stream = async_stream::stream! {
+            for event in snapshot {
+                yield Ok(event);
+            }
+            // Forward live deltas; reconnect on lag.
+            let mut live = BroadcastStream::new(rx);
+            while let Some(item) = live.next().await {
+                match item {
+                    Ok(event) => yield Ok(event),
+                    Err(_lagged) => {
+                        yield Err(Status::data_loss(
+                            "watch stream fell behind; reconnect to receive a fresh snapshot",
+                        ));
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 // ── RibService ────────────────────────────────────────────────────────────────
@@ -266,6 +330,8 @@ fn parse_nlri(s: &str) -> Result<pathvector_types::Nlri<Ipv4Addr>, Status> {
 
 #[tonic::async_trait]
 impl RibService for RibServiceImpl {
+    type WatchRoutesStream = RouteEventStream;
+
     async fn get_best_route(
         &self,
         request: Request<GetBestRouteRequest>,
@@ -324,6 +390,77 @@ impl RibService for RibServiceImpl {
             .collect();
 
         Ok(Response::new(ListRoutesResponse { routes }))
+    }
+
+    async fn watch_routes(
+        &self,
+        request: Request<WatchRoutesRequest>,
+    ) -> Result<Response<Self::WatchRoutesStream>, Status> {
+        let peer_filter_str = request.into_inner().peer_address;
+
+        // Resolve optional peer filter; "local" maps to LOCAL_ORIGIN_PEER.
+        let peer_filter: Option<PeerId> = if peer_filter_str.is_empty() {
+            None
+        } else if peer_filter_str == "local" {
+            Some(PeerId::from(crate::LOCAL_ORIGIN_PEER))
+        } else {
+            let addr: Ipv4Addr = peer_filter_str.parse().map_err(|_| {
+                Status::invalid_argument(
+                    "peer_address must be a valid IPv4 address or \"local\"",
+                )
+            })?;
+            Some(PeerId::from(addr))
+        };
+
+        // Subscribe BEFORE snapshot to avoid gap between snapshot and first delta.
+        let rx = self.state.read().await.route_tx.subscribe();
+
+        // Snapshot: all current best routes (filtered if requested).
+        let snapshot: Vec<RouteEvent> = {
+            let s = self.state.read().await;
+            let mut events: Vec<RouteEvent> = s
+                .loc_rib
+                .best_routes()
+                .filter_map(|(nlri, route)| {
+                    let peer_id = s.loc_rib.best_peer(&nlri)?;
+                    if peer_filter.is_none_or(|f| f == peer_id) {
+                        Some(RouteEvent {
+                            r#type: RouteEventType::Current as i32,
+                            route: Some(route_to_proto(peer_id, nlri, route)),
+                            withdrawn_prefix: None,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            events.push(RouteEvent {
+                r#type: RouteEventType::EndInitial as i32,
+                route: None,
+                withdrawn_prefix: None,
+            });
+            events
+        };
+
+        let stream = async_stream::stream! {
+            for event in snapshot {
+                yield Ok(event);
+            }
+            let mut live = BroadcastStream::new(rx);
+            while let Some(item) = live.next().await {
+                match item {
+                    Ok(event) => yield Ok(event),
+                    Err(_lagged) => {
+                        yield Err(Status::data_loss(
+                            "watch stream fell behind; reconnect to receive a fresh snapshot",
+                        ));
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn list_candidates(
@@ -424,6 +561,158 @@ impl PolicyService for PolicyServiceImpl {
     }
 }
 
+// ── OriginationService ────────────────────────────────────────────────────────
+
+struct OriginationServiceImpl {
+    state: Arc<tokio::sync::RwLock<DaemonState>>,
+}
+
+/// Parse an `OriginateRouteRequest` into a `Route<Ipv4Addr>`.
+fn parse_originate_request(req: OriginateRouteRequest) -> Result<pathvector_rib::Route<Ipv4Addr>, Status> {
+    use pathvector_rib::RouteBuilder;
+    use pathvector_types::{
+        Community, ExtendedCommunity, LargeCommunity as TypesLargeCommunity, Nlri, Origin,
+        PeerType,
+    };
+
+    let nlri: Nlri<Ipv4Addr> = req
+        .prefix
+        .parse()
+        .map_err(|_| Status::invalid_argument(format!("'{}' is not valid CIDR notation", req.prefix)))?;
+
+    let next_hop_ip: Ipv4Addr = req
+        .next_hop
+        .parse()
+        .map_err(|_| Status::invalid_argument(format!("'{}' is not a valid IPv4 next-hop", req.next_hop)))?;
+
+    let origin = match proto::Origin::try_from(req.origin) {
+        Ok(proto::Origin::Igp) => Origin::Igp,
+        Ok(proto::Origin::Egp) => Origin::Egp,
+        _ => Origin::Incomplete,
+    };
+
+    let communities: Vec<Community> = req.communities.into_iter().map(Community::from).collect();
+
+    let large_communities: Vec<TypesLargeCommunity> = req
+        .large_communities
+        .into_iter()
+        .map(|lc| TypesLargeCommunity {
+            global_administrator: lc.global_admin,
+            local_data_1: lc.local_data1,
+            local_data_2: lc.local_data2,
+        })
+        .collect();
+
+    let extended_communities: Vec<ExtendedCommunity> = req
+        .extended_communities
+        .into_iter()
+        .map(|bytes| {
+            let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument("each extended_community must be exactly 8 bytes")
+            })?;
+            Ok::<ExtendedCommunity, Status>(ExtendedCommunity::from_bytes(arr))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut builder = RouteBuilder::new(
+        nlri,
+        origin,
+        pathvector_types::AsPath::new(),
+    )
+    .next_hop(pathvector_types::NextHop::V4(next_hop_ip))
+    .peer_type(PeerType::Internal);
+
+    for c in communities {
+        builder = builder.community(c);
+    }
+    for lc in large_communities {
+        builder = builder.large_community(lc);
+    }
+    for ec in extended_communities {
+        builder = builder.extended_community(ec);
+    }
+    if let Some(lp) = req.local_pref {
+        builder = builder.local_pref(pathvector_types::LocalPref::new(lp));
+    }
+    if let Some(med) = req.med {
+        builder = builder.med(pathvector_types::Med::new(med));
+    }
+
+    Ok(builder.build())
+}
+
+#[tonic::async_trait]
+impl OriginationService for OriginationServiceImpl {
+    async fn originate_route(
+        &self,
+        request: Request<OriginateRouteRequest>,
+    ) -> Result<Response<OriginateRouteResponse>, Status> {
+        let route = parse_originate_request(request.into_inner())?;
+        tracing::info!(prefix = %route.nlri, "OriginateRoute");
+        self.state.write().await.originate_route(route);
+        Ok(Response::new(OriginateRouteResponse {}))
+    }
+
+    async fn originate_routes(
+        &self,
+        request: Request<OriginateRoutesRequest>,
+    ) -> Result<Response<OriginateRoutesResponse>, Status> {
+        let routes_req = request.into_inner().routes;
+        let count = u32::try_from(routes_req.len()).unwrap_or(u32::MAX);
+        let routes: Vec<pathvector_rib::Route<Ipv4Addr>> = routes_req
+            .into_iter()
+            .map(parse_originate_request)
+            .collect::<Result<_, _>>()?;
+        tracing::info!(count, "OriginateRoutes (batch)");
+        self.state.write().await.originate_routes(routes);
+        Ok(Response::new(OriginateRoutesResponse { count }))
+    }
+
+    async fn withdraw_originated_route(
+        &self,
+        request: Request<WithdrawOriginatedRouteRequest>,
+    ) -> Result<Response<WithdrawOriginatedRouteResponse>, Status> {
+        let prefix = request.into_inner().prefix;
+        let nlri: pathvector_types::Nlri<Ipv4Addr> = parse_nlri(&prefix)?;
+        tracing::info!(%prefix, "WithdrawOriginatedRoute");
+        self.state.write().await.withdraw_originated_route(nlri);
+        Ok(Response::new(WithdrawOriginatedRouteResponse {}))
+    }
+
+    async fn withdraw_originated_routes(
+        &self,
+        request: Request<WithdrawOriginatedRoutesRequest>,
+    ) -> Result<Response<WithdrawOriginatedRoutesResponse>, Status> {
+        let prefixes = request.into_inner().prefixes;
+        let count = u32::try_from(prefixes.len()).unwrap_or(u32::MAX);
+        let nlris: Vec<pathvector_types::Nlri<Ipv4Addr>> = prefixes
+            .iter()
+            .map(|p| parse_nlri(p))
+            .collect::<Result<_, _>>()?;
+        tracing::info!(count, "WithdrawOriginatedRoutes (batch)");
+        self.state.write().await.withdraw_originated_routes(&nlris);
+        Ok(Response::new(WithdrawOriginatedRoutesResponse { count }))
+    }
+
+    async fn list_originated_routes(
+        &self,
+        _request: Request<ListOriginatedRoutesRequest>,
+    ) -> Result<Response<ListOriginatedRoutesResponse>, Status> {
+        let s = self.state.read().await;
+        let local_peer = PeerId::from(crate::LOCAL_ORIGIN_PEER);
+        let routes: Vec<Route> = s
+            .originated_routes
+            .iter()
+            .map(|(&nlri, route)| {
+                let mut r = route_to_proto(local_peer, nlri, route);
+                r.peer_address = "local".to_string();
+                r
+            })
+            .collect();
+        Ok(Response::new(ListOriginatedRoutesResponse { routes }))
+    }
+}
+
 // ── Server entrypoint ─────────────────────────────────────────────────────────
 
 /// Start the gRPC management server on `0.0.0.0:<port>`.
@@ -444,7 +733,12 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
     let rib_svc = RibServiceServer::new(RibServiceImpl {
         state: Arc::clone(&state),
     });
-    let policy_svc = PolicyServiceServer::new(PolicyServiceImpl { state });
+    let policy_svc = PolicyServiceServer::new(PolicyServiceImpl {
+        state: Arc::clone(&state),
+    });
+    let origination_svc = OriginationServiceServer::new(OriginationServiceImpl {
+        state: Arc::clone(&state),
+    });
     let reflection_svc = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build_v1()
@@ -454,6 +748,7 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
         .add_service(peer_svc)
         .add_service(rib_svc)
         .add_service(policy_svc)
+        .add_service(origination_svc)
         .add_service(reflection_svc)
         .serve(addr)
         .await
