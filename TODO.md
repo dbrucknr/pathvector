@@ -539,10 +539,6 @@ CLI subcommands `route originate`, `route withdraw`, `route list-originated`, `w
 [--peer]`, and `watch peers` all wired and tested (2026-06-10).
 
 **Remaining:**
-- **RouteEvent payload** — `route_tx.send()` in `originate_routes`/`withdraw_originated_routes`
-  currently sends `route: None`.  For `WatchRoutes` subscribers to receive complete route
-  data, the events should carry the full `proto::Route`.  Requires constructing the proto
-  Route in the daemon (move or expose `route_to_proto` logic).
 - Dashboard: replace 200ms polling ticker with `WatchRoutes` stream (separate follow-up)
 
 ---
