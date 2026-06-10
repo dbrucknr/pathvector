@@ -66,24 +66,25 @@ tables to `DaemonState` and routing `AfiSafi::IPV6_UNICAST` events to them.
 The RIB library is already generic. The outbound half (constructing MP_REACH_NLRI
 UPDATE messages with a valid IPv6 next-hop) is harder and can follow separately.
 
-**10. ROUTE-REFRESH send-guard** (`pathvector-session`) — correctness bug
-The `ROUTE-REFRESH` capability is correctly parsed and stored during OPEN
-negotiation, but `FsmOutput::SendRouteRefresh` is emitted without checking
-whether the peer advertised the capability. RFC 2918 §3 requires the sender
-to suppress ROUTE-REFRESH messages to peers that did not negotiate it; sending
-one anyway would trigger a NOTIFICATION and session reset on a strict peer.
-Fix: gate `FsmOutput::SendRouteRefresh` emission on
-`SessionInfo::peer_capabilities.contains(RouteRefresh)`. Small scope, one FSM
-guard + one unit test confirming the guard fires.
+**10. ROUTE-REFRESH receive guard** (`pathvector-session`) — **Done (2026-06-10)**
+ROUTE-REFRESH received in `Established` is now gated on capability negotiation.
+If both sides advertised `RouteRefresh` during OPEN, the message is accepted
+(session stays up; full re-advertisement is deferred as a future item).
+If not negotiated, the FSM sends FSM Error subcode 3 and tears down the
+session. The send direction is a no-op because pathvector never initiates
+ROUTE-REFRESH today.
+Tests: `test_route_refresh_with_capability_is_accepted`,
+`test_route_refresh_without_capability_sends_fsm_error_subcode_3`.
 
-**11. FSM error subcodes 1/2/3** (`pathvector-session`) — correctness gap
-RFC 4271 §6.5 defines three FSM Error subcodes:
-- Subcode 1: Receive Unexpected Message in OpenSent State
-- Subcode 2: Receive Unexpected Message in OpenConfirm State
-- Subcode 3: Receive Unexpected Message in Established State
-Currently the FSM sends subcode 0 (Unspecific) in all three cases. Each case
-is a small match arm change; combined with one unit test per subcode this
-closes three `❌` rows in RFC_REQUIREMENTS.md.
+**11. FSM error subcodes 1/2/3** (`pathvector-session`) — **Done (2026-06-10)**
+Added `FsmErrorOpenSent`, `FsmErrorOpenConfirm`, `FsmErrorEstablished` variants
+to `NotificationError` (wire: code 5, subcodes 1/2/3). The three `_ => vec![]`
+wildcards in `on_open_sent`, `on_open_confirm`, and `on_established` now each
+send the correct NOTIFICATION and tear down the session when an unexpected
+message type arrives. Closes three `❌` rows in RFC_REQUIREMENTS.md.
+Tests: `test_unexpected_message_in_open_sent_sends_fsm_error_subcode_1`,
+`test_unexpected_message_in_open_confirm_sends_fsm_error_subcode_2`,
+`test_unexpected_message_in_established_sends_fsm_error_subcode_3`.
 
 ### Tier 3 — Larger scope, important but not blocking
 

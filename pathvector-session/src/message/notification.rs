@@ -56,8 +56,17 @@ pub enum NotificationError {
     UpdateMessage(UpdateMsgError),
     /// Error code 4 — no KEEPALIVE or UPDATE received within the hold time.
     HoldTimerExpired,
-    /// Error code 5 — a message was received in an unexpected FSM state.
+    /// Error code 5 subcode 0 — FSM error, unspecified.
     FsmError,
+    /// Error code 5 subcode 1 — unexpected message received in `OpenSent`
+    /// state (RFC 4271 §6.5).
+    FsmErrorOpenSent,
+    /// Error code 5 subcode 2 — unexpected message received in `OpenConfirm`
+    /// state (RFC 4271 §6.5).
+    FsmErrorOpenConfirm,
+    /// Error code 5 subcode 3 — unexpected message received in `Established`
+    /// state (RFC 4271 §6.5).
+    FsmErrorEstablished,
     /// Error code 6 — operator-initiated or policy-driven session teardown
     /// (RFC 4486).
     Cease(CeaseError),
@@ -72,7 +81,12 @@ impl NotificationError {
             2 => Self::OpenMessage(OpenMsgError::from_u8(subcode)),
             3 => Self::UpdateMessage(UpdateMsgError::from_u8(subcode)),
             4 => Self::HoldTimerExpired,
-            5 => Self::FsmError,
+            5 => match subcode {
+                1 => Self::FsmErrorOpenSent,
+                2 => Self::FsmErrorOpenConfirm,
+                3 => Self::FsmErrorEstablished,
+                _ => Self::FsmError,
+            },
             6 => Self::Cease(CeaseError::from_u8(subcode)),
             _ => Self::Unknown { code, subcode },
         }
@@ -85,6 +99,9 @@ impl NotificationError {
             Self::UpdateMessage(s) => (3, s.as_u8()),
             Self::HoldTimerExpired => (4, 0),
             Self::FsmError => (5, 0),
+            Self::FsmErrorOpenSent => (5, 1),
+            Self::FsmErrorOpenConfirm => (5, 2),
+            Self::FsmErrorEstablished => (5, 3),
             Self::Cease(s) => (6, s.as_u8()),
             Self::Unknown { code, subcode } => (*code, *subcode),
         }
@@ -378,6 +395,20 @@ mod tests {
             data: vec![],
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_fsm_error_subcodes_roundtrip() {
+        let cases = [
+            NotificationError::FsmError,
+            NotificationError::FsmErrorOpenSent,
+            NotificationError::FsmErrorOpenConfirm,
+            NotificationError::FsmErrorEstablished,
+        ];
+        for error in cases {
+            let msg = NotificationMessage { error, data: vec![] };
+            assert_eq!(roundtrip(&msg), msg);
+        }
     }
 
     // ── UpdateMessage subcodes ────────────────────────────────────────────────

@@ -205,7 +205,7 @@ session reset — the more lenient policies are not yet applied.
 | RouteRefresh capability (code 2) advertised and decoded in OPEN | `pathvector-session/src/message/open.rs` | ✅ | `test_open_with_capabilities_roundtrip` |
 | ROUTE-REFRESH message (type 5): AFI (2) + reserved (1) + SAFI (1) | `pathvector-session/src/message/route_refresh.rs` | ✅ | `test_ipv4_unicast_roundtrip`, `test_ipv6_unicast_roundtrip`, `test_evpn_roundtrip`, `test_known_wire_bytes`, `proptest: prop_route_refresh_roundtrip`, `proptest: prop_encode_decode_roundtrip` |
 | ROUTE-REFRESH encoded length is 23 bytes | `pathvector-session/src/message/route_refresh.rs` | ✅ | `test_encoded_length` |
-| ROUTE-REFRESH only sent/honoured when capability was negotiated | `pathvector-session/src/fsm/mod.rs` | ⚠️ | — (capability is parsed; send-guard not enforced — see TODO) |
+| ROUTE-REFRESH only sent/honoured when capability was negotiated | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_route_refresh_with_capability_is_accepted`, `test_route_refresh_without_capability_sends_fsm_error_subcode_3` |
 
 ---
 
@@ -320,9 +320,9 @@ which state the unexpected message arrived in.
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
 | FSM error subcode 0 — Unspecified Error | `pathvector-session/src/message/notification.rs` | ✅ | `test_fsm_error_roundtrip` |
-| FSM error subcode 1 — Receive Unexpected Message in OpenSent State | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
-| FSM error subcode 2 — Receive Unexpected Message in OpenConfirm State | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
-| FSM error subcode 3 — Receive Unexpected Message in Established State | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| FSM error subcode 1 — Receive Unexpected Message in OpenSent State | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unexpected_message_in_open_sent_sends_fsm_error_subcode_1`, `proptest: prop_notification_roundtrip` |
+| FSM error subcode 2 — Receive Unexpected Message in OpenConfirm State | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unexpected_message_in_open_confirm_sends_fsm_error_subcode_2`, `proptest: prop_notification_roundtrip` |
+| FSM error subcode 3 — Receive Unexpected Message in Established State | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unexpected_message_in_established_sends_fsm_error_subcode_3`, `test_route_refresh_without_capability_sends_fsm_error_subcode_3`, `proptest: prop_notification_roundtrip` |
 
 ---
 

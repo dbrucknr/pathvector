@@ -294,6 +294,18 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
+            // Any other message type in OpenSent is unexpected (RFC 4271 §6.5 subcode 1).
+            FsmInput::MessageReceived(_) => {
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                        error: NotificationError::FsmErrorOpenSent,
+                        data: vec![],
+                    })),
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::CloseTcpConnection,
+                ]
+            }
             _ => vec![],
         }
     }
@@ -364,6 +376,19 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
+            // Any other message type in OpenConfirm is unexpected (RFC 4271 §6.5 subcode 2).
+            FsmInput::MessageReceived(_) => {
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                        error: NotificationError::FsmErrorOpenConfirm,
+                        data: vec![],
+                    })),
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
+                    FsmOutput::CloseTcpConnection,
+                ]
+            }
             _ => vec![],
         }
     }
@@ -415,6 +440,45 @@ impl Fsm {
                         error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
                         data: vec![],
                     })),
+                    FsmOutput::CloseTcpConnection,
+                    FsmOutput::SessionTerminated,
+                ]
+            }
+            // ROUTE-REFRESH: honoured only when both sides negotiated RFC 2918.
+            // Full re-advertisement (FsmOutput::RouteRefreshRequested) is deferred;
+            // for now we accept it silently when negotiated and reject it when not.
+            FsmInput::MessageReceived(BgpMessage::RouteRefresh(_)) => {
+                let negotiated = self
+                    .peer_open
+                    .as_ref()
+                    .is_some_and(|o| o.capabilities.contains(&Capability::RouteRefresh))
+                    && self.config.capabilities.contains(&Capability::RouteRefresh);
+                if negotiated {
+                    vec![]
+                } else {
+                    self.state = State::Idle;
+                    vec![
+                        FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                            error: NotificationError::FsmErrorEstablished,
+                            data: vec![],
+                        })),
+                        FsmOutput::StopHoldTimer,
+                        FsmOutput::StopKeepaliveTimer,
+                        FsmOutput::CloseTcpConnection,
+                        FsmOutput::SessionTerminated,
+                    ]
+                }
+            }
+            // Any other unexpected message type in Established (RFC 4271 §6.5 subcode 3).
+            FsmInput::MessageReceived(_) => {
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                        error: NotificationError::FsmErrorEstablished,
+                        data: vec![],
+                    })),
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
                     FsmOutput::SessionTerminated,
                 ]
@@ -1252,6 +1316,28 @@ mod tests {
     // ── OpenSent gaps ─────────────────────────────────────────────────────────
 
     #[test]
+    fn test_unexpected_message_in_open_sent_sends_fsm_error_subcode_1() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        assert_eq!(fsm.state(), State::OpenSent);
+
+        // KEEPALIVE is not valid in OpenSent — expect FSM Error subcode 1.
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::FsmErrorOpenSent,
+                ..
+            }))
+        ));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+    }
+
+    #[test]
     fn test_tcp_failed_in_open_sent_enters_active() {
         let mut fsm = Fsm::new(default_config());
         fsm.process(FsmInput::ManualStart);
@@ -1282,6 +1368,34 @@ mod tests {
     }
 
     // ── OpenConfirm gaps ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_unexpected_message_in_open_confirm_sends_fsm_error_subcode_2() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
+        assert_eq!(fsm.state(), State::OpenConfirm);
+
+        // UPDATE is not valid in OpenConfirm — expect FSM Error subcode 2.
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Update(
+            UpdateMessage { withdrawn: vec![], attributes: vec![], announced: vec![] },
+        )));
+
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::FsmErrorOpenConfirm,
+                ..
+            }))
+        ));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+        // Session never reached Established, so no SessionTerminated.
+        assert!(!has_output(&out, |o| *o == FsmOutput::SessionTerminated));
+    }
 
     fn enter_open_confirm() -> Fsm {
         let mut fsm = Fsm::new(default_config());
@@ -1370,6 +1484,88 @@ mod tests {
     }
 
     // ── Established gaps ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_unexpected_message_in_established_sends_fsm_error_subcode_3() {
+        let (mut fsm, _) = establish(default_config());
+
+        // OPEN is never valid in Established — expect FSM Error subcode 3.
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Open(
+            OpenMessage {
+                version: 4,
+                my_as: 65002,
+                hold_time: 90,
+                bgp_id: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                capabilities: vec![],
+            },
+        )));
+
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::FsmErrorEstablished,
+                ..
+            }))
+        ));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopHoldTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+        assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+        assert!(has_output(&out, |o| *o == FsmOutput::SessionTerminated));
+    }
+
+    #[test]
+    fn test_route_refresh_without_capability_sends_fsm_error_subcode_3() {
+        // Neither side advertised RouteRefresh — receiving one is unexpected.
+        let (mut fsm, _) = establish(default_config());
+
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::RouteRefresh(
+            crate::message::RouteRefreshMessage {
+                afi_safi: pathvector_types::AfiSafi::IPV4_UNICAST,
+            },
+        )));
+
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::FsmErrorEstablished,
+                ..
+            }))
+        ));
+        assert!(has_output(&out, |o| *o == FsmOutput::SessionTerminated));
+    }
+
+    #[test]
+    fn test_route_refresh_with_capability_is_accepted() {
+        // Both sides negotiate RouteRefresh — receiving it must not reset the session.
+        let config = FsmConfig {
+            capabilities: vec![Capability::RouteRefresh],
+            ..default_config()
+        };
+        let peer_open_msg = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: std::net::Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::RouteRefresh],
+        });
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        fsm.process(FsmInput::MessageReceived(peer_open_msg));
+        fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        assert_eq!(fsm.state(), State::Established);
+
+        let out = fsm.process(FsmInput::MessageReceived(BgpMessage::RouteRefresh(
+            crate::message::RouteRefreshMessage {
+                afi_safi: pathvector_types::AfiSafi::IPV4_UNICAST,
+            },
+        )));
+
+        assert_eq!(fsm.state(), State::Established, "session must stay up");
+        assert!(out.is_empty(), "no outputs expected until re-advert is wired");
+    }
 
     #[test]
     fn test_keepalive_message_in_established_resets_hold_timer() {

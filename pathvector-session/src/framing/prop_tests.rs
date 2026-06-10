@@ -124,6 +124,9 @@ fn arb_notification_error() -> impl Strategy<Value = NotificationError> {
     prop_oneof![
         Just(NotificationError::HoldTimerExpired),
         Just(NotificationError::FsmError),
+        Just(NotificationError::FsmErrorOpenSent),
+        Just(NotificationError::FsmErrorOpenConfirm),
+        Just(NotificationError::FsmErrorEstablished),
         prop_oneof![
             Just(MsgHeaderError::ConnectionNotSynchronized),
             Just(MsgHeaderError::BadMessageLength),
