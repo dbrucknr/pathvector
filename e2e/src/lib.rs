@@ -36,6 +36,7 @@ use std::{
 };
 
 use pathvector_client::{
+    DaemonClient,
     PathvectorClient,
     types::{Route, SessionState},
 };

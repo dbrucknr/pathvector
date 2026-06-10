@@ -7,6 +7,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use pathvector_client::{
+    DaemonClient,
     PathvectorClient,
     error::{ClientError, ConnectError},
     types::{Origin, PeerType, SessionState},
