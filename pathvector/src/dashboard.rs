@@ -11,19 +11,21 @@
 //! │ PREFIX           PEER       NEXT-HOP  AS-PATH   ORIGIN  MED    │
 //! │ 192.168.1.0/24   10.0.0.1   10.0.0.1  65001     IGP     —     │
 //! └─────────────────────────────────────────────────────────────────┘
-//!  Daemon: http://127.0.0.1:50051 | Refreshed: 00:00:01 | q: quit
+//!  Daemon: http://127.0.0.1:50051 | ● Live | q: quit
 //! ```
 //!
-//! The daemon is polled every [`POLL_INTERVAL`] seconds.  Press `q` or
-//! `Ctrl-C` to exit and restore the terminal.
+//! The dashboard subscribes to the daemon's `WatchPeers` and `WatchRoutes`
+//! streaming RPCs and updates the TUI as events arrive — no polling.
+//! Press `q` or `Ctrl-C` to exit and restore the terminal.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt as _;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -32,10 +34,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
+use tokio::sync::mpsc;
 
 use pathvector_client::{
     PathvectorClient,
-    types::{PeerState, Route, SessionState},
+    error::ClientError,
+    types::{PeerEvent, PeerEventType, PeerState, Route, RouteEvent, RouteEventType, SessionState},
 };
 
 use crate::{
@@ -44,12 +48,8 @@ use crate::{
     output::{format_as_path, format_opt_u32, format_uptime},
 };
 
-/// Polling interval between daemon queries.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Crossterm event polling timeout.  Shorter than `POLL_INTERVAL` so keypresses
-/// feel responsive.
-const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Crossterm keyboard polling interval inside the blocking thread.
+const KEY_POLL: Duration = Duration::from_millis(50);
 
 // ── Terminal guard ────────────────────────────────────────────────────────────
 
@@ -67,7 +67,6 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort; ignore errors during teardown.
         let _ = disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     }
@@ -75,40 +74,75 @@ impl Drop for TerminalGuard {
 
 // ── Dashboard state ───────────────────────────────────────────────────────────
 
-struct DashboardState {
-    peers: Vec<PeerState>,
-    routes: Vec<Route>,
-    last_refresh: Instant,
-    /// Error message shown in the status bar when the last poll failed.
-    last_error: Option<String>,
+pub(crate) struct DashboardState {
+    pub(crate) peers: Vec<PeerState>,
+    pub(crate) routes: Vec<Route>,
+    /// Set when the last stream event was an error.
+    pub(crate) last_error: Option<String>,
 }
 
 impl DashboardState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             peers: Vec::new(),
             routes: Vec::new(),
-            last_refresh: Instant::now(),
             last_error: None,
         }
     }
 
-    pub(crate) async fn refresh(&mut self, client: &mut impl DaemonClient) {
-        // Clear any stale error from the previous poll so that a recovery is
-        // reflected immediately rather than leaving the status bar stuck in the
-        // error state indefinitely.
-        self.last_error = None;
+    /// Apply a single event from the `WatchPeers` stream.
+    ///
+    /// - `Current` / `Changed` — upsert the peer by address.
+    /// - `EndInitial` — no-op; the snapshot phase is complete.
+    /// - `Err` — record the error message in `last_error`.
+    pub(crate) fn apply_peer_event(&mut self, event: Result<PeerEvent, ClientError>) {
+        match event {
+            Err(e) => self.last_error = Some(e.to_string()),
+            Ok(PeerEvent {
+                event_type: PeerEventType::Current | PeerEventType::Changed,
+                peer: Some(p),
+            }) => {
+                if let Some(slot) = self.peers.iter_mut().find(|x| x.address == p.address) {
+                    *slot = p;
+                } else {
+                    self.peers.push(p);
+                }
+                self.last_error = None;
+            }
+            Ok(_) => {}
+        }
+    }
 
-        match client.list_peers().await {
-            Ok(peers) => self.peers = peers,
+    /// Apply a single event from the `WatchRoutes` stream.
+    ///
+    /// - `Current` / `Announced` — upsert the route by prefix.
+    /// - `Withdrawn` — remove the route with the matching prefix.
+    /// - `EndInitial` — no-op; the snapshot phase is complete.
+    /// - `Err` — record the error message in `last_error`.
+    pub(crate) fn apply_route_event(&mut self, event: Result<RouteEvent, ClientError>) {
+        match event {
             Err(e) => self.last_error = Some(e.to_string()),
-        }
-        match client.list_routes(None).await {
-            Ok(routes) => self.routes = routes,
-            Err(e) => self.last_error = Some(e.to_string()),
-        }
-        if self.last_error.is_none() {
-            self.last_refresh = Instant::now();
+            Ok(RouteEvent {
+                event_type: RouteEventType::Current | RouteEventType::Announced,
+                route: Some(r),
+                ..
+            }) => {
+                if let Some(slot) = self.routes.iter_mut().find(|x| x.prefix == r.prefix) {
+                    *slot = r;
+                } else {
+                    self.routes.push(r);
+                }
+                self.last_error = None;
+            }
+            Ok(RouteEvent {
+                event_type: RouteEventType::Withdrawn,
+                withdrawn_prefix: Some(prefix),
+                ..
+            }) => {
+                self.routes.retain(|r| r.prefix != prefix);
+                self.last_error = None;
+            }
+            Ok(_) => {}
         }
     }
 }
@@ -116,36 +150,47 @@ impl DashboardState {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Run the live dashboard.  Returns when the user presses `q` or `Ctrl-C`.
+///
+/// Subscribes to `WatchPeers` and `WatchRoutes` before entering raw terminal
+/// mode so that connection errors surface in the normal terminal rather than
+/// corrupting the display.
 pub async fn run_dashboard(addr: String) -> Result<(), CliError> {
     let mut client = PathvectorClient::connect(&addr)?;
+
+    // Subscribe before raw mode — errors are visible in the normal terminal.
+    let mut peer_stream = client.watch_peers().await?;
+    let mut route_stream = client.watch_routes(None).await?;
+
     let mut state = DashboardState::new();
 
-    // Initial data fetch before entering raw mode so errors surface cleanly.
-    state.refresh(&mut client).await;
+    // Keyboard events arrive from a dedicated blocking thread via a channel.
+    let (key_tx, mut key_rx) = mpsc::channel::<event::KeyEvent>(16);
+    tokio::task::spawn_blocking(move || loop {
+        if event::poll(KEY_POLL).is_ok_and(|ready| ready)
+            && let Ok(Event::Key(k)) = event::read()
+            && key_tx.blocking_send(k).is_err()
+        {
+            break;
+        }
+    });
 
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut next_poll = Instant::now() + POLL_INTERVAL;
-
     loop {
         terminal.draw(|f| render(f, &state, &addr))?;
 
-        // Poll for keyboard events with a short timeout so we can re-render
-        // after `POLL_INTERVAL` without blocking indefinitely.
-        if event::poll(EVENT_TIMEOUT)?
-            && let Event::Key(key) = event::read()?
-        {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                _ => {}
+        tokio::select! {
+            Some(key) = key_rx.recv() => {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('q'), _)
+                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                    _ => {}
+                }
             }
-        }
-
-        if Instant::now() >= next_poll {
-            state.refresh(&mut client).await;
-            next_poll = Instant::now() + POLL_INTERVAL;
+            Some(event) = peer_stream.next() => state.apply_peer_event(event),
+            Some(event) = route_stream.next() => state.apply_route_event(event),
         }
     }
 
@@ -157,7 +202,6 @@ pub async fn run_dashboard(addr: String) -> Result<(), CliError> {
 fn render(f: &mut Frame, state: &DashboardState, addr: &str) {
     let area = f.area();
 
-    // Vertical split: peers (~30%), routes (~65%), status bar (1 line).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -289,8 +333,7 @@ fn render_status_bar(
     addr: &str,
     area: ratatui::layout::Rect,
 ) {
-    let elapsed_secs = state.last_refresh.elapsed().as_secs();
-    let text = build_status_bar_line(addr, elapsed_secs, state.last_error.as_deref());
+    let text = build_status_bar_line(addr, state.last_error.as_deref());
     let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(paragraph, area);
 }
@@ -300,13 +343,8 @@ fn render_status_bar(
 /// Build the status-bar [`Line`] from pure inputs.
 ///
 /// Extracted from `render_status_bar` so the render path can be tested without
-/// a live [`Instant`].  Pass `elapsed_secs = 0` in tests; the live path calls
-/// `state.last_refresh.elapsed().as_secs()`.
-pub(crate) fn build_status_bar_line(
-    addr: &str,
-    elapsed_secs: u64,
-    error: Option<&str>,
-) -> Line<'static> {
+/// terminal I/O.
+pub(crate) fn build_status_bar_line(addr: &str, error: Option<&str>) -> Line<'static> {
     if let Some(err) = error {
         Line::from(vec![
             Span::styled(" error: ", Style::default().fg(Color::Red)),
@@ -314,9 +352,10 @@ pub(crate) fn build_status_bar_line(
             Span::raw(" | q: quit"),
         ])
     } else {
-        let elapsed_str = format_uptime(elapsed_secs);
         Line::from(vec![
-            Span::raw(format!(" Daemon: {addr} | Refreshed: {elapsed_str} ago | ")),
+            Span::raw(format!(" Daemon: {addr} | ")),
+            Span::styled("● Live", Style::default().fg(Color::Green)),
+            Span::raw(" | "),
             Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(": quit"),
         ])
@@ -327,7 +366,7 @@ fn peer_type_str(p: &PeerState) -> &'static str {
     match p.peer_type {
         Some(pathvector_client::types::PeerType::External) => "eBGP",
         Some(pathvector_client::types::PeerType::Internal) => "iBGP",
-        _ => "—",
+        _ => "\u{2014}",
     }
 }
 
@@ -353,12 +392,18 @@ fn format_origin(origin: pathvector_client::types::Origin) -> &'static str {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::*;
-    use pathvector_client::types::{Origin, PeerState, PeerType, SessionState};
+    use pathvector_client::types::{
+        AsSegment, AsSegmentType, Origin, PeerEvent, PeerEventType, PeerState, PeerType,
+        RouteEvent, RouteEventType, SessionState,
+    };
 
-    fn make_peer(session_state: SessionState, peer_type: Option<PeerType>) -> PeerState {
+    use super::*;
+
+    // ── Fixture helpers ───────────────────────────────────────────────────────
+
+    fn make_peer(address: Ipv4Addr, session_state: SessionState, peer_type: Option<PeerType>) -> PeerState {
         PeerState {
-            address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            address: IpAddr::V4(address),
             remote_as: 65001,
             local_as: 65002,
             session_state,
@@ -371,68 +416,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn peer_type_str_external() {
-        let p = make_peer(SessionState::Established, Some(PeerType::External));
-        assert_eq!(peer_type_str(&p), "eBGP");
-    }
-
-    #[test]
-    fn peer_type_str_internal() {
-        let p = make_peer(SessionState::Established, Some(PeerType::Internal));
-        assert_eq!(peer_type_str(&p), "iBGP");
-    }
-
-    #[test]
-    fn peer_type_str_none() {
-        let p = make_peer(SessionState::Idle, None);
-        assert_eq!(peer_type_str(&p), "\u{2014}");
-    }
-
-    #[test]
-    fn session_state_str_established() {
-        let p = make_peer(SessionState::Established, None);
-        assert_eq!(session_state_str(&p), "Established");
-    }
-
-    #[test]
-    fn session_state_str_idle() {
-        let p = make_peer(SessionState::Idle, None);
-        assert_eq!(session_state_str(&p), "Idle");
-    }
-
-    #[test]
-    fn format_origin_variants() {
-        assert_eq!(format_origin(Origin::Igp), "IGP");
-        assert_eq!(format_origin(Origin::Egp), "EGP");
-        assert_eq!(format_origin(Origin::Incomplete), "?");
-    }
-
-    #[test]
-    fn dashboard_state_new_is_empty() {
-        let s = DashboardState::new();
-        assert!(s.peers.is_empty());
-        assert!(s.routes.is_empty());
-        assert!(s.last_error.is_none());
-    }
-
-    // ── DashboardState::refresh ───────────────────────────────────────────────
-
-    use crate::client_trait::MockDaemonClient;
-    use pathvector_client::types::{AsSegment, AsSegmentType, Route};
-    use std::net::Ipv4Addr as V4;
-
-    fn make_route() -> Route {
+    fn make_route(prefix: &str, peer: Ipv4Addr) -> Route {
         Route {
-            prefix: "192.0.2.0/24".to_owned(),
-            peer_address: Some(IpAddr::V4(V4::new(10, 0, 0, 1))),
+            prefix: prefix.to_owned(),
+            peer_address: Some(IpAddr::V4(peer)),
             peer_type: PeerType::External,
             next_hop: None,
             as_path: vec![AsSegment {
                 kind: AsSegmentType::Sequence,
                 asns: vec![65001],
             }],
-            origin: pathvector_client::types::Origin::Igp,
+            origin: Origin::Igp,
             local_pref: None,
             med: None,
             communities: vec![],
@@ -443,146 +437,278 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn refresh_populates_peers_and_routes() {
+    // These helpers return Result<_, ClientError> to match the apply_* method
+    // signatures exactly — the Ok wrapping is intentional.
+    #[allow(clippy::unnecessary_wraps)]
+    fn peer_event(kind: PeerEventType, peer: PeerState) -> Result<PeerEvent, ClientError> {
+        Ok(PeerEvent { event_type: kind, peer: Some(peer) })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn end_initial_peer() -> Result<PeerEvent, ClientError> {
+        Ok(PeerEvent { event_type: PeerEventType::EndInitial, peer: None })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn route_announced(r: Route) -> Result<RouteEvent, ClientError> {
+        Ok(RouteEvent { event_type: RouteEventType::Announced, route: Some(r), withdrawn_prefix: None })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn route_current(r: Route) -> Result<RouteEvent, ClientError> {
+        Ok(RouteEvent { event_type: RouteEventType::Current, route: Some(r), withdrawn_prefix: None })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn route_withdrawn(prefix: &str) -> Result<RouteEvent, ClientError> {
+        Ok(RouteEvent { event_type: RouteEventType::Withdrawn, route: None, withdrawn_prefix: Some(prefix.to_owned()) })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn end_initial_route() -> Result<RouteEvent, ClientError> {
+        Ok(RouteEvent { event_type: RouteEventType::EndInitial, route: None, withdrawn_prefix: None })
+    }
+
+    fn rpc_error() -> ClientError {
+        ClientError::Rpc(tonic::Status::unavailable("daemon down"))
+    }
+
+    // ── DashboardState::new ───────────────────────────────────────────────────
+
+    #[test]
+    fn dashboard_state_new_is_empty() {
+        let s = DashboardState::new();
+        assert!(s.peers.is_empty());
+        assert!(s.routes.is_empty());
+        assert!(s.last_error.is_none());
+    }
+
+    // ── apply_peer_event ─────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_peer_current_inserts_new_peer() {
         let mut state = DashboardState::new();
-        let mut mock = MockDaemonClient::new();
-        mock.peers = vec![make_peer(
-            SessionState::Established,
-            Some(PeerType::External),
-        )];
-        mock.routes = vec![make_route()];
-
-        state.refresh(&mut mock).await;
-
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p));
         assert_eq!(state.peers.len(), 1);
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn apply_peer_changed_updates_existing_peer() {
+        let mut state = DashboardState::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let p1 = make_peer(addr, SessionState::Idle, None);
+        state.apply_peer_event(peer_event(PeerEventType::Current, p1));
+        assert_eq!(state.peers[0].session_state, SessionState::Idle);
+
+        let p2 = make_peer(addr, SessionState::Established, Some(PeerType::External));
+        state.apply_peer_event(peer_event(PeerEventType::Changed, p2));
+        // Same peer, not a second entry.
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.peers[0].session_state, SessionState::Established);
+    }
+
+    #[test]
+    fn apply_peer_changed_different_address_inserts() {
+        let mut state = DashboardState::new();
+        let p1 = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        let p2 = make_peer(Ipv4Addr::new(10, 0, 0, 2), SessionState::Established, Some(PeerType::Internal));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p1));
+        state.apply_peer_event(peer_event(PeerEventType::Changed, p2));
+        assert_eq!(state.peers.len(), 2);
+    }
+
+    #[test]
+    fn apply_peer_end_initial_is_noop() {
+        let mut state = DashboardState::new();
+        state.apply_peer_event(end_initial_peer());
+        assert!(state.peers.is_empty());
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn apply_peer_error_sets_last_error() {
+        let mut state = DashboardState::new();
+        state.apply_peer_event(Err(rpc_error()));
+        assert!(state.last_error.is_some());
+        assert!(state.last_error.as_deref().unwrap().contains("daemon down"));
+    }
+
+    #[test]
+    fn apply_peer_success_clears_last_error() {
+        let mut state = DashboardState::new();
+        state.apply_peer_event(Err(rpc_error()));
+        assert!(state.last_error.is_some());
+
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p));
+        assert!(state.last_error.is_none());
+    }
+
+    // ── apply_route_event ────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_route_current_inserts_new_route() {
+        let mut state = DashboardState::new();
+        let r = make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1));
+        state.apply_route_event(route_current(r));
         assert_eq!(state.routes.len(), 1);
         assert!(state.last_error.is_none());
     }
 
-    #[tokio::test]
-    async fn refresh_sets_last_error_on_peer_failure() {
+    #[test]
+    fn apply_route_announced_inserts_new_route() {
         let mut state = DashboardState::new();
-        let mut mock = MockDaemonClient::new();
-        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
-            tonic::Status::unavailable("daemon down"),
-        ));
-
-        state.refresh(&mut mock).await;
-
-        assert!(
-            state.last_error.is_some(),
-            "last_error must be set on RPC failure"
-        );
+        let r = make_route("192.0.2.0/24", Ipv4Addr::new(10, 0, 0, 1));
+        state.apply_route_event(route_announced(r));
+        assert_eq!(state.routes.len(), 1);
     }
 
-    /// After a failed poll, a subsequent successful poll must clear `last_error`.
-    /// Without the `self.last_error = None` reset at the top of `refresh`, the
-    /// error message would remain in the status bar indefinitely after recovery.
-    #[tokio::test]
-    async fn refresh_clears_error_on_recovery() {
+    #[test]
+    fn apply_route_announced_updates_existing_prefix() {
         let mut state = DashboardState::new();
-        let mut failing = MockDaemonClient::new();
-        failing.force_error = Some(pathvector_client::error::ClientError::Rpc(
-            tonic::Status::unavailable("daemon down"),
-        ));
+        let prefix = "10.0.0.0/8";
+        let r1 = make_route(prefix, Ipv4Addr::new(10, 0, 0, 1));
+        state.apply_route_event(route_announced(r1));
 
-        // First poll — daemon is down.
-        state.refresh(&mut failing).await;
-        assert!(
-            state.last_error.is_some(),
-            "error must be set after failure"
-        );
+        let mut r2 = make_route(prefix, Ipv4Addr::new(10, 0, 0, 2));
+        r2.med = Some(100);
+        state.apply_route_event(route_announced(r2));
 
-        // Second poll — daemon has recovered.
-        let mut recovered = MockDaemonClient::new();
-        state.refresh(&mut recovered).await;
-        assert!(
-            state.last_error.is_none(),
-            "error must be cleared after recovery"
-        );
+        // Same prefix — updated in place, not duplicated.
+        assert_eq!(state.routes.len(), 1);
+        assert_eq!(state.routes[0].med, Some(100));
     }
 
-    #[tokio::test]
-    async fn refresh_clears_stale_data_on_successive_success() {
+    #[test]
+    fn apply_route_withdrawn_removes_route() {
         let mut state = DashboardState::new();
-        let mut mock = MockDaemonClient::new();
-        mock.peers = vec![make_peer(
-            SessionState::Established,
-            Some(PeerType::External),
-        )];
+        let prefix = "10.0.0.0/8";
+        state.apply_route_event(route_announced(make_route(prefix, Ipv4Addr::new(10, 0, 0, 1))));
+        assert_eq!(state.routes.len(), 1);
 
-        // First refresh — populates peers.
-        state.refresh(&mut mock).await;
-        assert_eq!(state.peers.len(), 1);
-
-        // Second refresh with empty mock — peers list clears.
-        let mut empty = MockDaemonClient::new();
-        state.refresh(&mut empty).await;
-        assert_eq!(state.peers.len(), 0);
+        state.apply_route_event(route_withdrawn(prefix));
+        assert!(state.routes.is_empty());
         assert!(state.last_error.is_none());
     }
 
-    // ── build_status_bar_line unit tests ──────────────────────────────────────
-
     #[test]
-    fn status_bar_ok_zero_elapsed() {
-        let line = build_status_bar_line("http://localhost:50051", 0, None);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("Daemon: http://localhost:50051"),
-            "addr present: {text}"
-        );
-        // 0 secs → format_uptime returns em-dash
-        assert!(
-            text.contains('\u{2014}'),
-            "0 secs renders as em-dash: {text}"
-        );
-        assert!(text.contains('q'), "quit hint present: {text}");
+    fn apply_route_withdrawn_unknown_prefix_is_noop() {
+        let mut state = DashboardState::new();
+        state.apply_route_event(route_announced(make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_withdrawn("192.0.2.0/24")); // not present
+        assert_eq!(state.routes.len(), 1); // original route untouched
     }
 
     #[test]
-    fn status_bar_ok_nonzero_elapsed() {
-        let line = build_status_bar_line("http://127.0.0.1:50051", 65, None);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("00:01:05"),
-            "65 s renders as 00:01:05: {text}"
-        );
+    fn apply_route_withdrawn_only_removes_matching_prefix() {
+        let mut state = DashboardState::new();
+        state.apply_route_event(route_announced(make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_announced(make_route("172.16.0.0/12", Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_withdrawn("10.0.0.0/8"));
+        assert_eq!(state.routes.len(), 1);
+        assert_eq!(state.routes[0].prefix, "172.16.0.0/12");
     }
 
     #[test]
-    fn status_bar_error_state() {
-        let line = build_status_bar_line("http://localhost:50051", 0, Some("connection refused"));
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("error:"), "error label present: {text}");
-        assert!(
-            text.contains("connection refused"),
-            "error message present: {text}"
-        );
+    fn apply_route_end_initial_is_noop() {
+        let mut state = DashboardState::new();
+        state.apply_route_event(end_initial_route());
+        assert!(state.routes.is_empty());
+        assert!(state.last_error.is_none());
     }
 
     #[test]
-    fn status_bar_error_style_first_span_is_red() {
-        let line = build_status_bar_line("http://localhost:50051", 0, Some("oops"));
-        assert_eq!(
-            line.spans[0].style.fg,
-            Some(Color::Red),
-            "first span must carry red style"
-        );
+    fn apply_route_error_sets_last_error() {
+        let mut state = DashboardState::new();
+        state.apply_route_event(Err(rpc_error()));
+        assert!(state.last_error.is_some());
+    }
+
+    #[test]
+    fn apply_route_success_clears_last_error() {
+        let mut state = DashboardState::new();
+        state.apply_route_event(Err(rpc_error()));
+        state.apply_route_event(route_announced(make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(state.last_error.is_none());
+    }
+
+    // ── Helper functions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn peer_type_str_external() {
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        assert_eq!(peer_type_str(&p), "eBGP");
+    }
+
+    #[test]
+    fn peer_type_str_internal() {
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::Internal));
+        assert_eq!(peer_type_str(&p), "iBGP");
+    }
+
+    #[test]
+    fn peer_type_str_none() {
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Idle, None);
+        assert_eq!(peer_type_str(&p), "\u{2014}");
+    }
+
+    #[test]
+    fn session_state_str_established() {
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, None);
+        assert_eq!(session_state_str(&p), "Established");
+    }
+
+    #[test]
+    fn session_state_str_idle() {
+        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Idle, None);
+        assert_eq!(session_state_str(&p), "Idle");
+    }
+
+    #[test]
+    fn format_origin_variants() {
+        assert_eq!(format_origin(Origin::Igp), "IGP");
+        assert_eq!(format_origin(Origin::Egp), "EGP");
+        assert_eq!(format_origin(Origin::Incomplete), "?");
+    }
+
+    // ── build_status_bar_line ────────────────────────────────────────────────
+
+    #[test]
+    fn status_bar_live_contains_addr_and_live_indicator() {
+        let line = build_status_bar_line("http://localhost:50051", None);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Daemon: http://localhost:50051"), "addr: {text}");
+        assert!(text.contains("Live"), "live indicator: {text}");
+        assert!(text.contains('q'), "quit hint: {text}");
+    }
+
+    #[test]
+    fn status_bar_live_indicator_is_green() {
+        let line = build_status_bar_line("http://127.0.0.1:50051", None);
+        let live_span = line.spans.iter().find(|s| s.content.contains("Live")).unwrap();
+        assert_eq!(live_span.style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn status_bar_error_shows_message() {
+        let line = build_status_bar_line("http://localhost:50051", Some("connection refused"));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("error:"), "error label: {text}");
+        assert!(text.contains("connection refused"), "error message: {text}");
+    }
+
+    #[test]
+    fn status_bar_error_first_span_is_red() {
+        let line = build_status_bar_line("http://localhost:50051", Some("oops"));
+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
     }
 
     // ── Snapshot tests (ratatui TestBackend) ─────────────────────────────────
-    //
-    // Each test renders a private widget function into a fixed-size in-memory
-    // terminal buffer and snapshots the text output.  On first run the snapshot
-    // files are created in `src/snapshots/`; after that, any change to the
-    // rendered output fails the test until `cargo insta review` accepts it.
 
     use ratatui::backend::TestBackend;
 
-    /// Render `draw` into a `width × height` test buffer and return the
-    /// rendered text as a string suitable for snapshot testing.
     fn render_to_string(width: u16, height: u16, draw: impl FnOnce(&mut ratatui::Frame)) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -590,14 +716,11 @@ mod tests {
         terminal.backend().to_string()
     }
 
-    // --- render_peers ---
-
     #[test]
     fn snapshot_render_peers_empty() {
         let state = DashboardState::new();
         let output = render_to_string(80, 6, |f| {
-            let area = f.area();
-            render_peers(f, &state, area);
+            render_peers(f, &state, f.area());
         });
         insta::assert_snapshot!(output);
     }
@@ -605,15 +728,14 @@ mod tests {
     #[test]
     fn snapshot_render_peers_established() {
         let mut state = DashboardState::new();
-        let mut peer = make_peer(SessionState::Established, Some(PeerType::External));
+        let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
         peer.uptime_seconds = 3661;
         peer.prefixes_received = 5;
         peer.prefixes_accepted = 4;
         peer.prefixes_advertised = 3;
         state.peers = vec![peer];
         let output = render_to_string(80, 6, |f| {
-            let area = f.area();
-            render_peers(f, &state, area);
+            render_peers(f, &state, f.area());
         });
         insta::assert_snapshot!(output);
     }
@@ -621,22 +743,18 @@ mod tests {
     #[test]
     fn snapshot_render_peers_idle() {
         let mut state = DashboardState::new();
-        state.peers = vec![make_peer(SessionState::Idle, Some(PeerType::Internal))];
+        state.peers = vec![make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Idle, Some(PeerType::Internal))];
         let output = render_to_string(80, 6, |f| {
-            let area = f.area();
-            render_peers(f, &state, area);
+            render_peers(f, &state, f.area());
         });
         insta::assert_snapshot!(output);
     }
-
-    // --- render_routes ---
 
     #[test]
     fn snapshot_render_routes_empty() {
         let state = DashboardState::new();
         let output = render_to_string(90, 6, |f| {
-            let area = f.area();
-            render_routes(f, &state, area);
+            render_routes(f, &state, f.area());
         });
         insta::assert_snapshot!(output);
     }
@@ -644,26 +762,18 @@ mod tests {
     #[test]
     fn snapshot_render_routes_with_route() {
         let mut state = DashboardState::new();
-        state.routes = vec![make_route()];
+        state.routes = vec![make_route("192.0.2.0/24", Ipv4Addr::new(10, 0, 0, 1))];
         let output = render_to_string(90, 6, |f| {
-            let area = f.area();
-            render_routes(f, &state, area);
+            render_routes(f, &state, f.area());
         });
         insta::assert_snapshot!(output);
     }
 
-    // --- render_status_bar ---
-    //
-    // `render_status_bar` calls `state.last_refresh.elapsed().as_secs()`.
-    // `DashboardState::new()` sets `last_refresh = Instant::now()`, so elapsed
-    // is 0 for any synchronous test — the snapshot reliably shows "—".
-
     #[test]
-    fn snapshot_render_status_bar_ok() {
+    fn snapshot_render_status_bar_live() {
         let state = DashboardState::new();
         let output = render_to_string(80, 1, |f| {
-            let area = f.area();
-            render_status_bar(f, &state, "http://127.0.0.1:50051", area);
+            render_status_bar(f, &state, "http://127.0.0.1:50051", f.area());
         });
         insta::assert_snapshot!(output);
     }
@@ -673,29 +783,21 @@ mod tests {
         let mut state = DashboardState::new();
         state.last_error = Some("connection refused".to_owned());
         let output = render_to_string(80, 1, |f| {
-            let area = f.area();
-            render_status_bar(f, &state, "http://127.0.0.1:50051", area);
+            render_status_bar(f, &state, "http://127.0.0.1:50051", f.area());
         });
         insta::assert_snapshot!(output);
     }
 
-    // --- render (full layout) ---
-    //
-    // Exercises the top-level `render` dispatcher which composes all three panes
-    // via a `Layout` split.  This is the only test that calls `render()` directly
-    // and therefore the one that covers the layout code path.
-
     #[test]
     fn snapshot_render_full_populated() {
         let mut state = DashboardState::new();
-        let mut peer = make_peer(SessionState::Established, Some(PeerType::External));
-        peer.uptime_seconds = 7322; // 02:02:02
+        let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        peer.uptime_seconds = 7322;
         peer.prefixes_received = 10;
         peer.prefixes_accepted = 8;
         peer.prefixes_advertised = 6;
         state.peers = vec![peer];
-        state.routes = vec![make_route()];
-
+        state.routes = vec![make_route("192.0.2.0/24", Ipv4Addr::new(10, 0, 0, 1))];
         let output = render_to_string(80, 20, |f| {
             render(f, &state, "http://127.0.0.1:50051");
         });

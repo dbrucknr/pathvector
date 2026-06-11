@@ -1,6 +1,5 @@
 ---
 source: pathvector/src/dashboard.rs
-assertion_line: 676
 expression: output
 ---
 "┌ Peers ───────────────────────────────────────────────────────────────────────┐"
@@ -22,4 +21,4 @@ expression: output
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" Daemon: http://127.0.0.1:50051 | Refreshed: — ago | q: quit                    "
+" Daemon: http://127.0.0.1:50051 | ● Live | q: quit                              "

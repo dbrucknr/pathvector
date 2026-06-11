@@ -1,6 +1,5 @@
 ---
 source: pathvector/src/dashboard.rs
-assertion_line: 618
 expression: output
 ---
 "┌ Routes ────────────────────────────────────────────────────────────────────────────────┐"

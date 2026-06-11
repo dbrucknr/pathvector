@@ -1,0 +1,5 @@
+---
+source: pathvector/src/dashboard.rs
+expression: output
+---
+" Daemon: http://127.0.0.1:50051 | ● Live | q: quit                              "

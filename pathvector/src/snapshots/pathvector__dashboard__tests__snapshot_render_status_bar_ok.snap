@@ -1,6 +1,0 @@
----
-source: pathvector/src/dashboard.rs
-assertion_line: 633
-expression: output
----
-" Daemon: http://127.0.0.1:50051 | Refreshed: — ago | q: quit                    "
