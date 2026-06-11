@@ -23,8 +23,9 @@ pub mod types;
 
 pub use client_trait::DaemonClient;
 
+use std::pin::Pin;
+
 use futures::Stream;
-use tokio_stream::StreamExt as _;
 use tonic::transport::Channel;
 
 use error::{ClientError, ConnectError};
@@ -32,13 +33,20 @@ use proto::{
     origination_service_client::OriginationServiceClient, peer_service_client::PeerServiceClient,
     policy_service_client::PolicyServiceClient, rib_service_client::RibServiceClient,
 };
-use types::{OriginateRouteParams, PeerEvent, RouteEvent};
+use types::OriginateRouteParams;
+
+/// A heap-allocated, `Send` stream of fallible items.
+///
+/// The return type of [`DaemonClient::watch_peers`] and
+/// [`DaemonClient::watch_routes`].  Use this type when you need to name the
+/// stream in a variable binding, struct field, or `dyn` context.
+pub type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, ClientError>> + Send>>;
 
 /// A connected client to a running `pathvectord` daemon.
 ///
-/// Construct one via [`PathvectorClient::connect`], then call the async methods
-/// to query peers and RIB state.  The client is cheap to clone — it shares the
-/// underlying gRPC channel.
+/// Construct one via [`PathvectorClient::connect`], then call methods from the
+/// [`DaemonClient`] trait to query and control the daemon.  The client is cheap
+/// to clone — it shares the underlying gRPC channel.
 #[derive(Clone)]
 pub struct PathvectorClient {
     peers: PeerServiceClient<Channel>,
@@ -171,78 +179,5 @@ impl PathvectorClient {
             .into_iter()
             .map(|r| types::Route::try_from(r).map_err(ClientError::from))
             .collect()
-    }
-
-    /// Subscribe to live Loc-RIB changes.
-    ///
-    /// Returns a stream that first delivers the current best routes as
-    /// [`RouteEventType::Current`] events, then a single
-    /// [`RouteEventType::EndInitial`] sentinel, then live
-    /// [`RouteEventType::Announced`] / [`RouteEventType::Withdrawn`] deltas.
-    ///
-    /// Pass `peer` to filter the initial snapshot to routes from a specific
-    /// peer; pass `Some("local")` for locally originated routes.  Live deltas
-    /// are always delivered regardless of the filter.
-    ///
-    /// If the daemon's broadcast channel overflows (slow consumer), the stream
-    /// will end with [`ClientError::Rpc`] — reconnect to get a fresh snapshot.
-    ///
-    /// [`RouteEventType::Current`]: types::RouteEventType::Current
-    /// [`RouteEventType::EndInitial`]: types::RouteEventType::EndInitial
-    /// [`RouteEventType::Announced`]: types::RouteEventType::Announced
-    /// [`RouteEventType::Withdrawn`]: types::RouteEventType::Withdrawn
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError::Rpc`] if the initial gRPC call fails.  Individual
-    /// stream items return [`ClientError::Rpc`] on stream failure or
-    /// [`ClientError::Convert`] if the daemon sends malformed event data.
-    pub async fn watch_routes(
-        &mut self,
-        peer: Option<&str>,
-    ) -> Result<impl Stream<Item = Result<RouteEvent, ClientError>>, ClientError> {
-        let stream = self
-            .rib
-            .watch_routes(proto::WatchRoutesRequest {
-                peer_address: peer.unwrap_or("").to_owned(),
-            })
-            .await?
-            .into_inner();
-
-        Ok(stream.map(|msg| {
-            let event = msg?;
-            RouteEvent::try_from(event).map_err(ClientError::from)
-        }))
-    }
-
-    /// Subscribe to live peer session changes.
-    ///
-    /// Returns a stream that first delivers the current state of every
-    /// configured peer as [`PeerEventType::Current`] events, then a single
-    /// [`PeerEventType::EndInitial`] sentinel, then live
-    /// [`PeerEventType::Changed`] events as sessions transition.
-    ///
-    /// [`PeerEventType::Current`]: types::PeerEventType::Current
-    /// [`PeerEventType::EndInitial`]: types::PeerEventType::EndInitial
-    /// [`PeerEventType::Changed`]: types::PeerEventType::Changed
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError::Rpc`] if the initial gRPC call fails.  Individual
-    /// stream items return [`ClientError::Rpc`] on stream failure or
-    /// [`ClientError::Convert`] if the daemon sends malformed event data.
-    pub async fn watch_peers(
-        &mut self,
-    ) -> Result<impl Stream<Item = Result<PeerEvent, ClientError>>, ClientError> {
-        let stream = self
-            .peers
-            .watch_peers(proto::WatchPeersRequest {})
-            .await?
-            .into_inner();
-
-        Ok(stream.map(|msg| {
-            let event = msg?;
-            PeerEvent::try_from(event).map_err(ClientError::from)
-        }))
     }
 }

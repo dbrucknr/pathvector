@@ -48,21 +48,29 @@
 //!     fn list_originated_routes(&mut self) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send {
 //!         async { Ok(vec![]) }
 //!     }
+//!     fn watch_routes(&mut self, _: Option<&str>) -> impl Future<Output = Result<pathvector_client::BoxStream<pathvector_client::types::RouteEvent>, ClientError>> + Send {
+//!         async { Ok(Box::pin(futures::stream::empty()) as pathvector_client::BoxStream<_>) }
+//!     }
+//!     fn watch_peers(&mut self) -> impl Future<Output = Result<pathvector_client::BoxStream<pathvector_client::types::PeerEvent>, ClientError>> + Send {
+//!         async { Ok(Box::pin(futures::stream::empty()) as pathvector_client::BoxStream<_>) }
+//!     }
 //! }
 //! ```
 
 use std::{future::Future, net::IpAddr};
 
+use tokio_stream::StreamExt as _;
+
 use crate::{
-    PathvectorClient,
+    BoxStream, PathvectorClient,
     error::ClientError,
     proto::{
         GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListOriginatedRoutesRequest,
         ListPeersRequest, ListRoutesRequest, OriginateRouteRequest, OriginateRoutesRequest,
-        PolicyAction, SetExportDefaultRequest, SetImportDefaultRequest,
-        WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
+        PolicyAction, SetExportDefaultRequest, SetImportDefaultRequest, WatchPeersRequest,
+        WatchRoutesRequest, WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
     },
-    types::{OriginateRouteParams, PeerState, Route},
+    types::{OriginateRouteParams, PeerEvent, PeerState, Route, RouteEvent},
 };
 
 /// Abstracts the seven gRPC calls used to manage a running `pathvectord` daemon.
@@ -156,6 +164,38 @@ pub trait DaemonClient {
     fn list_originated_routes(
         &mut self,
     ) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send;
+
+    /// Subscribe to live Loc-RIB changes.
+    ///
+    /// The returned stream first delivers the current best routes as
+    /// [`RouteEventType::Current`] events, then a single
+    /// [`RouteEventType::EndInitial`] sentinel, then live
+    /// [`RouteEventType::Announced`] / [`RouteEventType::Withdrawn`] deltas.
+    ///
+    /// Pass `peer` to filter the initial snapshot to routes from a specific peer.
+    ///
+    /// [`RouteEventType::Current`]: crate::types::RouteEventType::Current
+    /// [`RouteEventType::EndInitial`]: crate::types::RouteEventType::EndInitial
+    /// [`RouteEventType::Announced`]: crate::types::RouteEventType::Announced
+    /// [`RouteEventType::Withdrawn`]: crate::types::RouteEventType::Withdrawn
+    fn watch_routes(
+        &mut self,
+        peer: Option<&str>,
+    ) -> impl Future<Output = Result<BoxStream<RouteEvent>, ClientError>> + Send;
+
+    /// Subscribe to live peer session changes.
+    ///
+    /// The returned stream first delivers the current state of every configured
+    /// peer as [`PeerEventType::Current`] events, then a single
+    /// [`PeerEventType::EndInitial`] sentinel, then live
+    /// [`PeerEventType::Changed`] events as sessions transition.
+    ///
+    /// [`PeerEventType::Current`]: crate::types::PeerEventType::Current
+    /// [`PeerEventType::EndInitial`]: crate::types::PeerEventType::EndInitial
+    /// [`PeerEventType::Changed`]: crate::types::PeerEventType::Changed
+    fn watch_peers(
+        &mut self,
+    ) -> impl Future<Output = Result<BoxStream<PeerEvent>, ClientError>> + Send;
 }
 
 // ── Implementation for the real client ───────────────────────────────────────
@@ -390,6 +430,37 @@ impl DaemonClient for PathvectorClient {
             .map(|r| Route::try_from(r).map_err(ClientError::from))
             .collect()
     }
+
+    async fn watch_routes(
+        &mut self,
+        peer: Option<&str>,
+    ) -> Result<BoxStream<RouteEvent>, ClientError> {
+        let stream = self
+            .rib
+            .watch_routes(WatchRoutesRequest {
+                peer_address: peer.unwrap_or("").to_owned(),
+            })
+            .await?
+            .into_inner();
+
+        Ok(Box::pin(stream.map(|msg| {
+            let event = msg?;
+            RouteEvent::try_from(event).map_err(ClientError::from)
+        })))
+    }
+
+    async fn watch_peers(&mut self) -> Result<BoxStream<PeerEvent>, ClientError> {
+        let stream = self
+            .peers
+            .watch_peers(WatchPeersRequest {})
+            .await?
+            .into_inner();
+
+        Ok(Box::pin(stream.map(|msg| {
+            let event = msg?;
+            PeerEvent::try_from(event).map_err(ClientError::from)
+        })))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -464,6 +535,17 @@ mod tests {
 
         async fn list_originated_routes(&mut self) -> Result<Vec<Route>, ClientError> {
             Ok(vec![])
+        }
+
+        async fn watch_routes(
+            &mut self,
+            _peer: Option<&str>,
+        ) -> Result<BoxStream<RouteEvent>, ClientError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn watch_peers(&mut self) -> Result<BoxStream<PeerEvent>, ClientError> {
+            Ok(Box::pin(futures::stream::empty()))
         }
     }
 

@@ -174,4 +174,23 @@ impl DaemonClient for MockDaemonClient {
         }
         Ok(vec![])
     }
+
+    async fn watch_routes(
+        &mut self,
+        _peer: Option<&str>,
+    ) -> Result<
+        pathvector_client::BoxStream<pathvector_client::types::RouteEvent>,
+        pathvector_client::error::ClientError,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn watch_peers(
+        &mut self,
+    ) -> Result<
+        pathvector_client::BoxStream<pathvector_client::types::PeerEvent>,
+        pathvector_client::error::ClientError,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
 }
