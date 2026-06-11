@@ -182,7 +182,6 @@ impl<A: IpAddress> Default for LocRib<A> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
