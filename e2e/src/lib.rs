@@ -454,8 +454,9 @@ pub struct Harness {
     _gobgpd: ContainerAsync<GenericImage>,
     _pathvectord: ContainerAsync<GenericImage>,
     /// Container ID of gobgpd — used by `gobgp_announce` / `gobgp_withdraw`
-    /// to run `docker exec gobgp ...` against the container.
-    gobgpd_id: String,
+    /// and by `wait_for_gobgp_rib_entry` / `wait_for_gobgp_rib_withdrawn` in
+    /// origination tests that inject routes from the pathvectord side.
+    pub gobgpd_id: String,
     // Keep config files alive until the containers stop.
     _gobgpd_config: NamedTempFile,
     _pathvectord_config: NamedTempFile,
