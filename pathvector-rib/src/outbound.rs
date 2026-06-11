@@ -13,6 +13,7 @@ use crate::Route;
 ///
 /// iBGP peers receive the route unmodified; confederation segment stripping
 /// for eBGP is handled separately by `AdjRibOut::insert`.
+#[must_use]
 pub fn prepare_outbound(
     mut route: Route<Ipv4Addr>,
     peer_type: PeerType,

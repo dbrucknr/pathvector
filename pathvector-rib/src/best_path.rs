@@ -738,7 +738,7 @@ mod tests {
                 .peer_type(PeerType::External)
                 .build();
             // Backdate received_at to simulate an older route.
-            r.received_at = Instant::now() - Duration::from_secs(60);
+            r.received_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
             r
         };
         let newer = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
@@ -763,7 +763,9 @@ mod tests {
             let mut r = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
                 .peer_type(PeerType::Internal)
                 .build();
-            r.received_at = Instant::now() - Duration::from_secs(3600);
+            r.received_at = Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap();
             r
         };
         let new_ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())

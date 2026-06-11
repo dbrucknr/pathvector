@@ -13,14 +13,16 @@ fn peer(n: u8) -> PeerId {
 }
 
 fn nlri_for(prefix_idx: usize) -> Nlri<Ipv4Addr> {
+    #[allow(clippy::cast_possible_truncation)]
     let b = (prefix_idx / 256) as u8;
+    #[allow(clippy::cast_possible_truncation)]
     let c = (prefix_idx % 256) as u8;
     format!("10.{b}.{c}.0/24").parse().unwrap()
 }
 
 fn make_route(prefix_idx: usize, lp: u32, path_len: usize, pt: PeerType) -> Route<Ipv4Addr> {
     let asns = (0..path_len)
-        .map(|i| Asn::new(65000 + i as u32))
+        .map(|i| Asn::new(65000 + u32::try_from(i).unwrap_or(u32::MAX)))
         .collect::<Vec<_>>();
     RouteBuilder::new(
         nlri_for(prefix_idx),
@@ -57,9 +59,11 @@ fn bench_loc_rib_insert(c: &mut Criterion) {
                 // Alternate local_pref so best-path changes on every other
                 // iteration, keeping select_best fully exercised throughout.
                 let start = Instant::now();
+                #[allow(clippy::cast_possible_truncation)]
                 for i in 0..(iters as usize) {
                     let lp = if i % 2 == 0 { 300u32 } else { 50u32 };
-                    black_box(rib.insert(peer(3), make_route(0, lp, 1, PeerType::External)));
+                    rib.insert(peer(3), make_route(0, lp, 1, PeerType::External));
+                    black_box(());
                 }
                 let elapsed = start.elapsed();
 

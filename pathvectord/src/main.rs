@@ -20,7 +20,7 @@ use pathvector_session::{
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
-use pathvector_types::{AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
+use pathvector_types::{AfiSafi, AsPath, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 #[tokio::main]
@@ -81,7 +81,6 @@ fn config_peer_type(local_as: u32, remote_as: u32) -> PeerType {
         PeerType::External
     }
 }
-
 
 /// Builds the path-attribute list for an outbound route.
 fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute> {

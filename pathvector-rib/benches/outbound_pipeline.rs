@@ -35,9 +35,7 @@ fn dense_route() -> Route<Ipv4Addr> {
     RouteBuilder::new(
         "10.1.0.0/24".parse::<Nlri<Ipv4Addr>>().unwrap(),
         Origin::Igp,
-        AsPath::from_sequence(
-            (0..15).map(|i| Asn::new(65002 + i)).collect(),
-        ),
+        AsPath::from_sequence((0..15).map(|i| Asn::new(65002 + i)).collect()),
     )
     .local_pref(LocalPref::new(150))
     .med(Med::new(100))
@@ -62,12 +60,13 @@ fn build_peers(n: usize) -> Vec<AdjRibOut<Ipv4Addr>> {
             } else {
                 PeerType::Internal
             };
+            #[allow(clippy::cast_possible_truncation)]
             AdjRibOut::new(peer(i as u8 + 1), pt)
         })
         .collect()
 }
 
-fn run_pipeline(route: &Route<Ipv4Addr>, peers: &mut Vec<AdjRibOut<Ipv4Addr>>) {
+fn run_pipeline(route: &Route<Ipv4Addr>, peers: &mut [AdjRibOut<Ipv4Addr>]) {
     for adj in peers.iter_mut() {
         let outbound = prepare_outbound(route.clone(), adj.peer_type(), LOCAL_AS, LOCAL_BGP_ID);
         adj.insert(outbound);
@@ -78,29 +77,21 @@ fn bench_outbound_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbound_pipeline");
 
     for n in [1usize, 10, 50] {
-        group.bench_with_input(
-            BenchmarkId::new("minimal", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || (minimal_route(), build_peers(n)),
-                    |(route, mut peers)| run_pipeline(&route, &mut peers),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("minimal", n), &n, |b, &n| {
+            b.iter_batched(
+                || (minimal_route(), build_peers(n)),
+                |(route, mut peers)| run_pipeline(&route, &mut peers),
+                BatchSize::SmallInput,
+            );
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("dense", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || (dense_route(), build_peers(n)),
-                    |(route, mut peers)| run_pipeline(&route, &mut peers),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("dense", n), &n, |b, &n| {
+            b.iter_batched(
+                || (dense_route(), build_peers(n)),
+                |(route, mut peers)| run_pipeline(&route, &mut peers),
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();

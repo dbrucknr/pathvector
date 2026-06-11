@@ -22,6 +22,7 @@ fn make_route(
     pt: PeerType,
     med: Option<u32>,
 ) -> Route<Ipv4Addr> {
+    #[allow(clippy::cast_possible_truncation)] // path_len <= 5; i never exceeds u32
     let asns = (0..path_len)
         .map(|i| Asn::new(65000 + i as u32))
         .collect::<Vec<_>>();
@@ -38,18 +39,23 @@ fn make_route(
 /// Build a candidate map with `n` routes that differ across all relevant
 /// best-path attributes so that `select_best` exercises multiple steps.
 fn build_candidates(n: usize) -> HashMap<PeerId, Route<Ipv4Addr>> {
+    #[allow(clippy::cast_possible_truncation)] // n <= 100 in bench sizes
     (0..n)
         .map(|i| {
-            let i = i as u8;
-            let lp = 100u32.saturating_add(i as u32 * 10);
-            let path_len = (i as usize % 5) + 1;
-            let pt = if i % 3 == 0 {
+            let idx = i as u8;
+            let lp = 100u32.saturating_add(u32::from(idx) * 10);
+            let path_len = (usize::from(idx) % 5) + 1;
+            let pt = if idx.is_multiple_of(3) {
                 PeerType::External
             } else {
                 PeerType::Internal
             };
-            let med = if i % 2 == 0 { Some(i as u32 * 100) } else { None };
-            (peer(i + 1), make_route(i, lp, path_len, pt, med))
+            let med = if idx.is_multiple_of(2) {
+                Some(u32::from(idx) * 100)
+            } else {
+                None
+            };
+            (peer(idx + 1), make_route(idx, lp, path_len, pt, med))
         })
         .collect()
 }

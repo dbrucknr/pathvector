@@ -1,10 +1,8 @@
 use std::net::Ipv4Addr;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pathvector_session::message::{
-    BgpMessage, PathAttribute, UpdateMessage,
-};
-use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin};
+use pathvector_session::message::{BgpMessage, PathAttribute, UpdateMessage};
+use pathvector_types::{AsPath, Asn, Nlri, Origin};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -26,6 +24,7 @@ fn base_attrs() -> Vec<PathAttribute> {
 
 /// Build an UPDATE message announcing `n` IPv4 /24 prefixes.
 fn build_update(n: usize) -> UpdateMessage {
+    #[allow(clippy::cast_possible_truncation)]
     UpdateMessage {
         withdrawn: vec![],
         attributes: base_attrs(),
@@ -35,7 +34,7 @@ fn build_update(n: usize) -> UpdateMessage {
     }
 }
 
-/// Encode an UpdateMessage to a complete wire frame (19-byte header + body).
+/// Encode an `UpdateMessage` to a complete wire frame (19-byte header + body).
 fn encode_update(msg: &UpdateMessage) -> Vec<u8> {
     BgpMessage::Update(msg.clone()).encode()
 }
@@ -76,6 +75,7 @@ fn bench_encode_withdraw(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_withdraw");
 
     for n in [1usize, 100, 1000] {
+        #[allow(clippy::cast_possible_truncation)]
         let msg = UpdateMessage {
             withdrawn: (0..n)
                 .map(|i| nlri((i / 256) as u8, (i % 256) as u8))
@@ -91,5 +91,10 @@ fn bench_encode_withdraw(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_encode_update, bench_decode_update, bench_encode_withdraw);
+criterion_group!(
+    benches,
+    bench_encode_update,
+    bench_decode_update,
+    bench_encode_withdraw
+);
 criterion_main!(benches);
