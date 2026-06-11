@@ -768,3 +768,167 @@ async fn test_collision_peer_wins_keeps_outbound() {
     outbound_peer.abort();
     discard_peer.abort();
 }
+
+/// An inbound connection arriving while the session is in Active (outbound
+/// connect attempt was refused; waiting for the retry timer) is accepted
+/// directly — no collision, the session proceeds through the normal handshake
+/// and reaches Established over the incoming connection.
+#[tokio::test]
+async fn test_incoming_connection_in_active_accepted() {
+    // Point the session at a port with nothing listening so the outbound
+    // connect is refused immediately and the FSM transitions to Active.
+    let (nowhere_listener, nowhere_addr) = loopback_listener().await;
+    drop(nowhere_listener); // nothing listens; connect is refused → Active
+
+    let config = SessionConfig {
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        peer_as: Some(65002),
+        ..local_config(nowhere_addr)
+    };
+    let mut handle = spawn(config);
+    handle.start().await;
+
+    // Wait briefly for the TCP refused → session reaches Active.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Simulate the daemon delivering an inbound connection from the peer.
+    let (incoming_listener, incoming_addr) = loopback_listener().await;
+    let incoming_tx = handle.incoming_sender();
+
+    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+    let peer = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(incoming_addr).await.unwrap();
+        peer_handshake_on_stream(stream, 65002, peer_bgp_id).await
+    });
+
+    let (stream, _) = incoming_listener.accept().await.unwrap();
+    incoming_tx
+        .send(SessionCommand::IncomingConnection(stream))
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
+        .await
+        .expect("timed out waiting for Established")
+        .expect("session channel closed");
+    assert!(
+        matches!(event, SessionEvent::Established(_)),
+        "expected Established over incoming connection, got {event:?}"
+    );
+
+    peer.abort();
+}
+
+/// An inbound connection arriving while the session is already Established must
+/// be silently rejected — the stream is dropped and the existing session is
+/// undisturbed.
+#[tokio::test]
+async fn test_incoming_connection_while_established_is_rejected() {
+    let (outbound_listener, outbound_addr) = loopback_listener().await;
+    let mut handle = spawn(local_config(outbound_addr));
+    handle.start().await;
+
+    // Complete the outbound handshake to reach Established.
+    let outbound_peer = tokio::spawn(async move {
+        let (_r, _w) = accept_and_handshake(outbound_listener).await;
+        std::future::pending::<()>().await
+    });
+
+    let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    // Deliver a spurious inbound connection while Established.
+    let (discard_listener, discard_addr) = loopback_listener().await;
+    let incoming_tx = handle.incoming_sender();
+
+    let discard_peer = tokio::spawn(async move {
+        let _stream = tokio::net::TcpStream::connect(discard_addr).await.unwrap();
+        // Stream dropped server-side immediately; just wait a moment.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let (stream, _) = discard_listener.accept().await.unwrap();
+    incoming_tx
+        .send(SessionCommand::IncomingConnection(stream))
+        .await
+        .unwrap();
+
+    // No new session event — the existing Established session is unaffected.
+    let result =
+        tokio::time::timeout(Duration::from_millis(300), handle.next_event()).await;
+    assert!(
+        result.is_err(),
+        "expected no event after rejected incoming on Established session"
+    );
+
+    outbound_peer.abort();
+    discard_peer.abort();
+}
+
+/// An inbound connection arriving in OpenSent *before* the peer's OPEN has been
+/// received (peer_bgp_id is unknown) is accepted conservatively — the outbound
+/// connection is closed and the session restarts over the incoming one.
+#[tokio::test]
+async fn test_incoming_connection_unknown_peer_id_adopts_conservatively() {
+    // Outbound listener: accepts the connect but withholds its OPEN so the
+    // session stays in OpenSent with peer_bgp_id == None.
+    let (outbound_listener, outbound_addr) = loopback_listener().await;
+
+    let config = SessionConfig {
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        peer_as: Some(65002),
+        ..local_config(outbound_addr)
+    };
+    let mut handle = spawn(config);
+    handle.start().await;
+
+    // Accept the outbound connect and read the OPEN, but send nothing back.
+    // The session is now in OpenSent with peer_bgp_id = None.
+    let outbound_peer = tokio::spawn(async move {
+        let (stream, _) = outbound_listener.accept().await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = FramedRead::new(r, BgpCodec::new());
+        let writer = FramedWrite::new(w, BgpCodec::new());
+        let msg = reader.next().await.unwrap().unwrap();
+        assert!(matches!(msg, BgpMessage::Open(_)));
+        // Hold the connection open without sending our OPEN.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop((reader, writer));
+    });
+
+    // Give the session time to send its OPEN and enter OpenSent.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Now deliver an incoming connection — peer_bgp_id is still None, so the
+    // session should conservatively adopt the incoming connection.
+    let (incoming_listener, incoming_addr) = loopback_listener().await;
+    let incoming_tx = handle.incoming_sender();
+
+    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+    let incoming_peer = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(incoming_addr).await.unwrap();
+        peer_handshake_on_stream(stream, 65002, peer_bgp_id).await
+    });
+
+    let (stream, _) = incoming_listener.accept().await.unwrap();
+    incoming_tx
+        .send(SessionCommand::IncomingConnection(stream))
+        .await
+        .unwrap();
+
+    // Session should reach Established over the new incoming connection.
+    let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
+        .await
+        .expect("timed out waiting for Established")
+        .expect("session channel closed");
+    assert!(
+        matches!(event, SessionEvent::Established(_)),
+        "expected Established after conservative adopt, got {event:?}"
+    );
+
+    outbound_peer.abort();
+    incoming_peer.abort();
+}
