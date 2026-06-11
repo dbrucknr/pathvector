@@ -60,13 +60,26 @@ change: attribute transform (`prepare_outbound`) followed by `AdjRibOut::insert`
 each peer. Peers alternate eBGP/iBGP to exercise both the transform path and the
 iBGP split-horizon filter.
 
-| Peers | Time | Takeaway |
-|---|---|---|
-| 1 | 240 ns | Single peer; dominated by `Route::clone` |
-| 10 | 1.7 µs | Typical small deployment; ~170 ns per peer |
-| 50 | 8.7 µs | Large deployment; linear scaling confirmed |
+Two route fixtures are compared to isolate the `Route::clone` cost from attribute density:
 
-Scaling is linear (50 peers is ~36× a single peer). No hidden quadratic behaviour.
+- **minimal** — 2-hop AS path, no communities (baseline)
+- **dense** — 15-hop AS path, 5 standard communities, 2 large communities, 1 extended
+  community (route-target), MED set; representative of an IXP-learned prefix with
+  policy markings
+
+| Peers | Minimal | Dense | Ratio |
+|---|---|---|---|
+| 1 | 239 ns | 376 ns | 1.57× |
+| 10 | 1.6 µs | 2.6 µs | 1.62× |
+| 50 | 8.4 µs | 13.4 µs | 1.59× |
+
+The 1.57–1.59× ratio is flat across all peer counts — the overhead is purely the five
+additional heap allocations per `Route::clone` (AS path segments + community Vecs), not
+any interaction with the pipeline logic. Dense adds ~137 ns per clone.
+
+Scaling is linear in both cases (50 peers ≈ 35× single peer). `Arc<Route>` would
+eliminate the clone overhead but require copy-on-write for the outbound attribute
+transforms; not warranted at these costs.
 
 ---
 
