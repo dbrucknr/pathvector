@@ -66,6 +66,7 @@ pub enum InsertOutcome<A: IpAddress> {
 /// assert!(matches!(outcome, InsertOutcome::Accepted(None)));
 /// assert_eq!(rib.len(), 1);
 /// ```
+#[derive(Clone)]
 pub struct AdjRibOut<A: IpAddress> {
     peer: PeerId,
     peer_type: PeerType,

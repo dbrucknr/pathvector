@@ -322,30 +322,54 @@ fn flush_updates(
     true
 }
 
+/// Immutable-ish snapshot of the read-heavy routing state.
+///
+/// Stored inside `DaemonState` as an `Arc<RibSnapshot>`. The event loop
+/// mutates it via [`Arc::make_mut`] (zero-cost when no readers hold a clone;
+/// copy-on-write when a gRPC call is in flight). gRPC handlers clone the `Arc`
+/// in O(1) and release the outer `RwLock` immediately, so reads never block
+/// BGP event processing.
+#[derive(Clone)]
+pub(crate) struct RibSnapshot {
+    pub(crate) loc_rib: LocRib<Ipv4Addr>,
+    /// Locally originated routes (bypassed import policy; export policy applies).
+    pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
+    /// Immutable after startup.
+    pub(crate) local_as: u32,
+    /// Immutable after startup.
+    pub(crate) local_bgp_id: Ipv4Addr,
+    /// Remote AS number for each configured peer; immutable after startup.
+    pub(crate) peer_remote_as: HashMap<Ipv4Addr, u32>,
+    /// Live session state: present while a peer is Established.
+    pub(crate) peer_types: HashMap<Ipv4Addr, PeerType>,
+    /// Wall-clock instant at which each peer last reached Established.
+    pub(crate) established_at: HashMap<Ipv4Addr, std::time::Instant>,
+    /// Negotiated hold-timer value per established peer.
+    pub(crate) hold_times: HashMap<Ipv4Addr, u16>,
+    /// Derived from `adj_ribs_in[peer].len()`; synced after each mutation.
+    pub(crate) prefixes_received: HashMap<Ipv4Addr, usize>,
+    /// Derived from `adj_ribs_out[peer].len()`; synced after each propagation.
+    pub(crate) prefixes_advertised: HashMap<Ipv4Addr, usize>,
+}
+
 /// Holds all per-peer routing state and applies BGP event semantics.
 ///
 /// Constructed once at startup from config; `run()` feeds it `SessionEvent`s.
 /// The struct owns no I/O — callers hold the session handles and event channel,
 /// making the routing logic fully unit-testable without real TCP connections.
+///
+/// Read-heavy fields live in `Arc<RibSnapshot>`; gRPC handlers clone the `Arc`
+/// and release the lock immediately so reads never contend with BGP writes.
 struct DaemonState {
-    pub(crate) local_as: u32,
-    pub(crate) local_bgp_id: Ipv4Addr,
-    pub(crate) loc_rib: LocRib<Ipv4Addr>,
+    /// Read-heavy routing state; cloned cheaply by gRPC handlers.
+    pub(crate) rib: Arc<RibSnapshot>,
     pub(crate) import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
     pub(crate) export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
     pub(crate) adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
     pub(crate) adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
     /// Static peer type derived from config; used to reset `AdjRibOut` on reconnect.
     pub(crate) peer_config_types: HashMap<Ipv4Addr, PeerType>,
-    /// Live session state: present while a peer is Established, absent otherwise.
-    pub(crate) peer_types: HashMap<Ipv4Addr, PeerType>,
     pub(crate) update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
-    /// Remote AS number for each configured peer (immutable after startup).
-    pub(crate) peer_remote_as: HashMap<Ipv4Addr, u32>,
-    /// Wall-clock instant at which each peer last reached Established.
-    pub(crate) established_at: HashMap<Ipv4Addr, std::time::Instant>,
-    /// Negotiated hold-timer value per established peer.
-    pub(crate) hold_times: HashMap<Ipv4Addr, u16>,
     /// Local capabilities advertised in OPEN messages; used to determine the
     /// negotiated message size limit after `Established`.
     pub(crate) config_capabilities: Vec<Capability>,
@@ -363,12 +387,6 @@ struct DaemonState {
     ///
     /// [`take_stalled_peers`]: DaemonState::take_stalled_peers
     stalled_peers: Vec<Ipv4Addr>,
-    /// Locally originated routes, keyed by NLRI.
-    ///
-    /// Injected via `OriginationService` gRPC RPCs. Routes are ephemeral —
-    /// not persisted across restarts. Callers are responsible for re-injecting
-    /// after a restart (same pattern as GoBGP `TABLE_TYPE_GLOBAL`).
-    pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
     /// Broadcast channel for Loc-RIB events (announced / withdrawn).
     ///
     /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
@@ -433,27 +451,65 @@ impl DaemonState {
         let (route_tx, _) = broadcast::channel(1024);
         let (peer_tx, _) = broadcast::channel(1024);
 
-        Self {
+        let rib = Arc::new(RibSnapshot {
+            loc_rib: LocRib::new(),
+            originated_routes: HashMap::new(),
             local_as,
             local_bgp_id,
-            loc_rib: LocRib::new(),
+            peer_remote_as,
+            peer_types: HashMap::new(),
+            established_at: HashMap::new(),
+            hold_times: HashMap::new(),
+            prefixes_received: HashMap::new(),
+            prefixes_advertised: HashMap::new(),
+        });
+
+        Self {
+            rib,
             import_policies,
             export_policies,
             adj_ribs_in,
             adj_ribs_out,
             peer_config_types,
-            peer_types: HashMap::new(),
             update_senders,
-            peer_remote_as,
-            established_at: HashMap::new(),
-            hold_times: HashMap::new(),
             config_capabilities,
             negotiated_max_len: HashMap::new(),
             stalled_peers: Vec::new(),
-            originated_routes: HashMap::new(),
             route_tx,
             peer_tx,
         }
+    }
+
+    /// Returns a cheap clone of the snapshot Arc for lock-free gRPC reads.
+    ///
+    /// gRPC handlers call this while holding the outer `RwLock` read guard,
+    /// then immediately release the lock. All subsequent work runs against
+    /// the cloned Arc without holding any lock.
+    pub(crate) fn snapshot(&self) -> Arc<RibSnapshot> {
+        Arc::clone(&self.rib)
+    }
+
+    /// Returns a mutable reference to the snapshot.
+    ///
+    /// Uses copy-on-write semantics: free when no readers hold a clone (the
+    /// common case during BGP convergence); allocates a fresh `RibSnapshot`
+    /// only when a concurrent gRPC read is in flight.
+    fn rib_mut(&mut self) -> &mut RibSnapshot {
+        Arc::make_mut(&mut self.rib)
+    }
+
+    /// Syncs the derived `prefixes_received` count for `peer_ip` from the
+    /// current `adj_ribs_in` length.
+    fn sync_received(&mut self, peer_ip: Ipv4Addr) {
+        let count = self.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
+        self.rib_mut().prefixes_received.insert(peer_ip, count);
+    }
+
+    /// Syncs the derived `prefixes_advertised` count for `peer_ip` from the
+    /// current `adj_ribs_out` length.
+    fn sync_advertised(&mut self, peer_ip: Ipv4Addr) {
+        let count = self.adj_ribs_out.get(&peer_ip).map_or(0, AdjRibOut::len);
+        self.rib_mut().prefixes_advertised.insert(peer_ip, count);
     }
 
     /// Drains and returns the list of peers whose outbound UPDATE channel
@@ -481,10 +537,15 @@ impl DaemonState {
         peer_capabilities: &[Capability],
     ) {
         let peer_id = PeerId::from(peer_ip);
-        self.peer_types.insert(peer_ip, peer_type);
-        self.established_at
-            .insert(peer_ip, std::time::Instant::now());
-        self.hold_times.insert(peer_ip, hold_time);
+
+        // Update snapshot fields.
+        {
+            let rib = self.rib_mut();
+            rib.peer_types.insert(peer_ip, peer_type);
+            rib.established_at
+                .insert(peer_ip, std::time::Instant::now());
+            rib.hold_times.insert(peer_ip, hold_time);
+        }
 
         // Record negotiated message size limit for NLRI batching.
         let max_len = if peer_capabilities.contains(&Capability::ExtendedMessage)
@@ -502,7 +563,8 @@ impl DaemonState {
             *aro = AdjRibOut::new(peer_id, peer_type);
         }
 
-        let all_nlris: Vec<Nlri<Ipv4Addr>> = self.loc_rib.best_routes().map(|(n, _)| n).collect();
+        let all_nlris: Vec<Nlri<Ipv4Addr>> =
+            self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
         let rib_prefixes = all_nlris.len();
 
         let Some(export_policy) = self.export_policies.get(&peer_ip) else {
@@ -518,17 +580,19 @@ impl DaemonState {
             return;
         };
 
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
         let decisions: Vec<PrefixDecision> = all_nlris
             .into_iter()
             .map(|nlri| {
                 propagate_prefix(
                     nlri,
-                    &self.loc_rib,
+                    &self.rib.loc_rib,
                     adj_rib_out,
                     export_policy,
                     peer_type,
-                    self.local_as,
-                    self.local_bgp_id,
+                    local_as,
+                    local_bgp_id,
                 )
             })
             .collect();
@@ -537,9 +601,11 @@ impl DaemonState {
             self.stalled_peers.push(peer_ip);
         }
 
+        self.sync_advertised(peer_ip);
+
         let _ = self.peer_tx.send(proto::PeerEvent {
             r#type: proto::PeerEventType::Changed as i32,
-            peer: None, // gRPC handler builds PeerState from DaemonState fields
+            peer: None, // gRPC handler builds PeerState from snapshot
         });
 
         tracing::info!(
@@ -560,9 +626,16 @@ impl DaemonState {
     #[allow(clippy::similar_names)]
     fn on_terminated(&mut self, peer_ip: Ipv4Addr) {
         let peer_id = PeerId::from(peer_ip);
-        self.peer_types.remove(&peer_ip);
-        self.established_at.remove(&peer_ip);
-        self.hold_times.remove(&peer_ip);
+
+        // Remove live session state from snapshot.
+        {
+            let rib = self.rib_mut();
+            rib.peer_types.remove(&peer_ip);
+            rib.established_at.remove(&peer_ip);
+            rib.hold_times.remove(&peer_ip);
+            rib.prefixes_received.remove(&peer_ip);
+            rib.prefixes_advertised.remove(&peer_ip);
+        }
         self.negotiated_max_len.remove(&peer_ip);
 
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
@@ -572,9 +645,9 @@ impl DaemonState {
         // Snapshot affected prefixes before withdrawal so we can propagate the
         // changes to other established peers below.
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
-            self.loc_rib.best_routes().map(|(n, _)| n).collect();
+            self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
-        self.loc_rib.withdraw_peer(&peer_id);
+        self.rib_mut().loc_rib.withdraw_peer(&peer_id);
 
         // Reset this peer's outbound state for a clean reconnect.
         let cfg_pt = self
@@ -589,14 +662,18 @@ impl DaemonState {
         // Tell all other established peers about the best-path changes caused
         // by this teardown.
         let other_peers: Vec<Ipv4Addr> = self
+            .rib
             .peer_types
             .keys()
             .copied()
             .filter(|&ip| ip != peer_ip)
             .collect();
 
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
         for other_ip in other_peers {
             let other_type = self
+                .rib
                 .peer_types
                 .get(&other_ip)
                 .copied()
@@ -624,28 +701,29 @@ impl DaemonState {
                 .map(|&nlri| {
                     propagate_prefix(
                         nlri,
-                        &self.loc_rib,
+                        &self.rib.loc_rib,
                         adj_rib_out,
                         export_policy,
                         other_type,
-                        self.local_as,
-                        self.local_bgp_id,
+                        local_as,
+                        local_bgp_id,
                     )
                 })
                 .collect();
             if !flush_updates(decisions, max_len, update_tx) {
                 self.stalled_peers.push(other_ip);
             }
+            self.sync_advertised(other_ip);
         }
 
         let _ = self.peer_tx.send(proto::PeerEvent {
             r#type: proto::PeerEventType::Changed as i32,
-            peer: None, // gRPC handler builds PeerState from DaemonState fields
+            peer: None, // gRPC handler builds PeerState from snapshot
         });
 
         tracing::info!(
             peer = %peer_ip,
-            rib_size = self.loc_rib.len(),
+            rib_size = self.rib.loc_rib.len(),
             "session terminated"
         );
     }
@@ -658,6 +736,7 @@ impl DaemonState {
     fn on_route_update(&mut self, peer_ip: Ipv4Addr, msg: UpdateMessage) {
         let peer_id = PeerId::from(peer_ip);
         let peer_type = self
+            .rib
             .peer_types
             .get(&peer_ip)
             .copied()
@@ -711,14 +790,12 @@ impl DaemonState {
             return;
         };
 
-        handle_update(
-            peer_id,
-            msg,
-            adj_rib_in,
-            &mut self.loc_rib,
-            policy,
-            peer_type,
-        );
+        // Split mutable borrows across distinct struct fields explicitly so the
+        // borrow checker can verify they don't alias.
+        let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
+        handle_update(peer_id, msg, adj_rib_in, loc_rib, policy, peer_type);
+
+        self.sync_received(peer_ip);
 
         // Propagate best-path changes for affected prefixes to all established
         // peers (iBGP split-horizon is enforced by AdjRibOut).
@@ -732,9 +809,12 @@ impl DaemonState {
     /// `on_route_update`, `set_import_default`, `set_export_default`, and the
     /// origination methods.
     fn propagate_to_all_peers(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
-        let established_peers: Vec<Ipv4Addr> = self.peer_types.keys().copied().collect();
+        let established_peers: Vec<Ipv4Addr> = self.rib.peer_types.keys().copied().collect();
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
         for peer_ip in established_peers {
             let peer_type = self
+                .rib
                 .peer_types
                 .get(&peer_ip)
                 .copied()
@@ -761,18 +841,23 @@ impl DaemonState {
                 .map(|&nlri| {
                     propagate_prefix(
                         nlri,
-                        &self.loc_rib,
+                        &self.rib.loc_rib,
                         adj_rib_out,
                         export_policy,
                         peer_type,
-                        self.local_as,
-                        self.local_bgp_id,
+                        local_as,
+                        local_bgp_id,
                     )
                 })
                 .collect();
             if !flush_updates(decisions, max_len, update_tx) {
                 self.stalled_peers.push(peer_ip);
             }
+        }
+        // Sync advertised counts after all propagation is complete.
+        let peers: Vec<Ipv4Addr> = self.adj_ribs_out.keys().copied().collect();
+        for peer_ip in peers {
+            self.sync_advertised(peer_ip);
         }
     }
 
@@ -796,8 +881,9 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            self.originated_routes.insert(nlri, route.clone());
-            self.loc_rib
+            let rib = self.rib_mut();
+            rib.originated_routes.insert(nlri, route.clone());
+            rib.loc_rib
                 .insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
@@ -824,9 +910,9 @@ impl DaemonState {
     /// pass.
     pub(crate) fn withdraw_originated_routes(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
         for nlri in nlris {
-            self.originated_routes.remove(nlri);
-            self.loc_rib
-                .withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            let rib = self.rib_mut();
+            rib.originated_routes.remove(nlri);
+            rib.loc_rib.withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Withdrawn as i32,
                 route: None,
@@ -859,12 +945,13 @@ impl DaemonState {
             .unwrap_or_default();
 
         // Re-evaluate the peer's Adj-RIB-In against the new policy.
-        // `adj_ribs_in`, `import_policies`, and `loc_rib` are separate struct
-        // fields; Rust allows simultaneous (im)mutable borrows of distinct fields.
+        // Split the borrows explicitly: rib_mut() needs &mut self.rib, while
+        // adj_ribs_in and import_policies are separate fields.
+        let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
         reapply_import_policy(
             PeerId::from(peer_ip),
             &self.adj_ribs_in[&peer_ip],
-            &mut self.loc_rib,
+            loc_rib,
             &self.import_policies[&peer_ip],
         );
 
@@ -884,7 +971,7 @@ impl DaemonState {
         }
         self.export_policies.insert(peer_ip, Policy::new(action));
 
-        if !self.peer_types.contains_key(&peer_ip) {
+        if !self.rib.peer_types.contains_key(&peer_ip) {
             tracing::debug!(
                 peer = %peer_ip,
                 "set_export_default: peer not established — new policy applies on reconnect"
@@ -893,19 +980,22 @@ impl DaemonState {
         }
 
         let peer_type = self
+            .rib
             .peer_types
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
 
         // Collect all Loc-RIB NLRIs; the borrow is dropped after the collect.
-        let nlris: Vec<Nlri<Ipv4Addr>> = self.loc_rib.best_routes().map(|(n, _)| n).collect();
+        let nlris: Vec<Nlri<Ipv4Addr>> = self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
         let max_len = self
             .negotiated_max_len
             .get(&peer_ip)
             .copied()
             .unwrap_or(MAX_LEN);
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
         let Some(export_policy) = self.export_policies.get(&peer_ip) else {
             return;
         };
@@ -921,18 +1011,19 @@ impl DaemonState {
             .map(|nlri| {
                 propagate_prefix(
                     nlri,
-                    &self.loc_rib,
+                    &self.rib.loc_rib,
                     adj_rib_out,
                     export_policy,
                     peer_type,
-                    self.local_as,
-                    self.local_bgp_id,
+                    local_as,
+                    local_bgp_id,
                 )
             })
             .collect();
         if !flush_updates(decisions, max_len, update_tx) {
             self.stalled_peers.push(peer_ip);
         }
+        self.sync_advertised(peer_ip);
     }
 }
 
@@ -1574,9 +1665,9 @@ mod tests {
     fn test_on_established_records_peer_type() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        assert!(!state.peer_types.contains_key(&peer_ip));
+        assert!(!state.rib.peer_types.contains_key(&peer_ip));
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
-        assert_eq!(state.peer_types[&peer_ip], PeerType::External);
+        assert_eq!(state.rib.peer_types[&peer_ip], PeerType::External);
     }
 
     #[test]
@@ -1605,7 +1696,7 @@ mod tests {
         .next_hop(NextHop::V4("10.0.0.9".parse().unwrap()))
         .peer_type(PeerType::External)
         .build();
-        state.loc_rib.insert(src, route);
+        state.rib_mut().loc_rib.insert(src, route);
 
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
@@ -1641,7 +1732,7 @@ mod tests {
         );
 
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
-        state.loc_rib.insert(
+        state.rib_mut().loc_rib.insert(
             src,
             RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
                 .peer_type(PeerType::External)
@@ -1653,7 +1744,7 @@ mod tests {
         // (We can't assert on the receiver here since we dropped _rx, but the
         // important invariant is that no panic or error occurs, and the RIB is
         // not modified.)
-        assert_eq!(state.loc_rib.len(), 1, "RIB must be unchanged");
+        assert_eq!(state.rib.loc_rib.len(), 1, "RIB must be unchanged");
     }
 
     // ── DaemonState::on_terminated ────────────────────────────────────────────
@@ -1664,7 +1755,7 @@ mod tests {
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
         state.on_terminated(peer_ip);
-        assert!(!state.peer_types.contains_key(&peer_ip));
+        assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
 
     #[test]
@@ -1673,7 +1764,7 @@ mod tests {
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
-        state.loc_rib.insert(
+        state.rib_mut().loc_rib.insert(
             PeerId::from(peer_ip),
             RouteBuilder::new(
                 nlri("10.0.0.0/8"),
@@ -1683,10 +1774,10 @@ mod tests {
             .peer_type(PeerType::External)
             .build(),
         );
-        assert_eq!(state.loc_rib.len(), 1);
+        assert_eq!(state.rib.loc_rib.len(), 1);
 
         state.on_terminated(peer_ip);
-        assert_eq!(state.loc_rib.len(), 0);
+        assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
     #[test]
@@ -1747,8 +1838,8 @@ mod tests {
             },
         );
 
-        assert_eq!(state.loc_rib.len(), 1);
-        assert!(state.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+        assert_eq!(state.rib.loc_rib.len(), 1);
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
     }
 
     #[test]
@@ -1798,7 +1889,7 @@ mod tests {
                 announced: vec![nlri("10.0.0.0/8")],
             },
         );
-        assert_eq!(state.loc_rib.len(), 1);
+        assert_eq!(state.rib.loc_rib.len(), 1);
 
         state.on_route_update(
             peer_ip,
@@ -1808,7 +1899,7 @@ mod tests {
                 announced: vec![],
             },
         );
-        assert_eq!(state.loc_rib.len(), 0);
+        assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
     // ── basic handle_update behaviour ─────────────────────────────────────────
@@ -2251,7 +2342,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.loc_rib.len(),
+            state.rib.loc_rib.len(),
             0,
             "LocRib must be empty after MP_UNREACH_NLRI"
         );
@@ -3260,7 +3351,7 @@ mod tests {
         let unknown: Ipv4Addr = "10.0.0.99".parse().unwrap();
         state.on_established(unknown, PeerType::External, 65099, 90, &[]);
         // Invariant: no state changes (the unknown IP is absent from maps).
-        assert!(!state.peer_types.contains_key(&peer_ip));
+        assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
 
     // ── on_established error paths ────────────────────────────────────────────
@@ -3276,7 +3367,7 @@ mod tests {
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
         // peer_type is inserted before the guard, so it should be present.
-        assert!(state.peer_types.contains_key(&peer_ip));
+        assert!(state.rib.peer_types.contains_key(&peer_ip));
     }
 
     #[test]
@@ -3289,7 +3380,7 @@ mod tests {
 
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
 
-        assert!(state.peer_types.contains_key(&peer_ip));
+        assert!(state.rib.peer_types.contains_key(&peer_ip));
     }
 
     // ── on_terminated propagation error paths ────────────────────────────────
@@ -3307,8 +3398,8 @@ mod tests {
 
         state.on_terminated(peer_a);
 
-        assert!(!state.peer_types.contains_key(&peer_a));
-        assert!(state.peer_types.contains_key(&peer_b));
+        assert!(!state.rib.peer_types.contains_key(&peer_a));
+        assert!(state.rib.peer_types.contains_key(&peer_b));
     }
 
     #[test]
@@ -3324,7 +3415,7 @@ mod tests {
 
         state.on_terminated(peer_a);
 
-        assert!(!state.peer_types.contains_key(&peer_a));
+        assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
 
     // ── on_route_update error paths ───────────────────────────────────────────
@@ -3349,7 +3440,7 @@ mod tests {
             },
         );
 
-        assert_eq!(state.loc_rib.len(), 0);
+        assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
     #[test]
@@ -3376,7 +3467,7 @@ mod tests {
         );
 
         // Route lands in the RIB; missing peer B did not cause a panic.
-        assert_eq!(state.loc_rib.len(), 1);
+        assert_eq!(state.rib.loc_rib.len(), 1);
     }
 
     #[test]
@@ -3402,7 +3493,7 @@ mod tests {
             },
         );
 
-        assert_eq!(state.loc_rib.len(), 1);
+        assert_eq!(state.rib.loc_rib.len(), 1);
     }
 
     // ── propagate_prefix channel-full stall paths ────────────────────────────
@@ -3569,7 +3660,7 @@ mod tests {
         // Terminating peer_a iterates established peers; ghost has no policy /
         // rib entries — the error branch logs and continues without panicking.
         state.on_terminated(peer_a);
-        assert!(!state.peer_types.contains_key(&peer_a));
+        assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
 
     /// Calling `on_route_update` with an unknown peer IP logs an error and
@@ -3588,7 +3679,7 @@ mod tests {
                 announced: vec![],
             },
         );
-        assert_eq!(state.loc_rib.len(), 0);
+        assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
     /// When `on_route_update` propagates to established peers, a ghost peer
@@ -3614,7 +3705,7 @@ mod tests {
                 announced: vec![nlri("10.0.0.0/8")],
             },
         );
-        assert_eq!(state.loc_rib.len(), 1);
+        assert_eq!(state.rib.loc_rib.len(), 1);
     }
 }
 
@@ -3723,7 +3814,7 @@ mod stall_tests {
         // Pre-populate the Loc-RIB from a third-party peer so that on_established
         // has something to propagate.
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.loc_rib.insert(
+        state.rib_mut().loc_rib.insert(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -3924,7 +4015,7 @@ mod stall_tests {
         // Populate Loc-RIB BEFORE establishing so the table dump sends the
         // route to peer_ip's Adj-RIB-Out.
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.loc_rib.insert(
+        state.rib_mut().loc_rib.insert(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -3955,7 +4046,7 @@ mod stall_tests {
         // Peer is configured but never established — set_export_default must
         // return early without sending anything to the channel.
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.loc_rib.insert(
+        state.rib_mut().loc_rib.insert(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -3978,7 +4069,7 @@ mod stall_tests {
 
         // Pre-populate Loc-RIB so the table dump fills the channel (cap 1).
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.loc_rib.insert(
+        state.rib_mut().loc_rib.insert(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -4264,7 +4355,7 @@ mod event_loop_tests {
 
         let s = state.read().await;
         assert!(
-            s.peer_types.contains_key(&peer_ip),
+            s.rib.peer_types.contains_key(&peer_ip),
             "Established event must register peer type in DaemonState"
         );
     }
@@ -4293,7 +4384,7 @@ mod event_loop_tests {
 
         let s = state.read().await;
         assert!(
-            !s.peer_types.contains_key(&peer_ip),
+            !s.rib.peer_types.contains_key(&peer_ip),
             "Terminated event must remove peer type from DaemonState"
         );
     }
@@ -4331,7 +4422,7 @@ mod event_loop_tests {
 
         let s = state.read().await;
         assert_eq!(
-            s.loc_rib.len(),
+            s.rib.loc_rib.len(),
             1,
             "RouteUpdate must insert route into Loc-RIB"
         );

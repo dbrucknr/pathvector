@@ -37,6 +37,7 @@ use crate::{peer::PeerId, route::Route};
 /// rib.withdraw(&nlri);
 /// assert!(rib.is_empty());
 /// ```
+#[derive(Clone)]
 pub struct AdjRibIn<A: IpAddress> {
     peer: PeerId,
     routes: HashMap<Nlri<A>, Route<A>>,

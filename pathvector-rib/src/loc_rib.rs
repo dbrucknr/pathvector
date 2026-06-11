@@ -48,6 +48,7 @@ use crate::{best_path::select_best, peer::PeerId, route::Route};
 /// assert_eq!(rib.best_peer(&nlri), Some(peer_a));
 /// assert_eq!(rib.best(&nlri).unwrap().local_pref, Some(LocalPref::new(200)));
 /// ```
+#[derive(Clone)]
 pub struct LocRib<A: IpAddress> {
     candidates: HashMap<Nlri<A>, HashMap<PeerId, Route<A>>>,
     best: RouteMap<A, (PeerId, Route<A>)>,
@@ -180,6 +181,7 @@ impl<A: IpAddress> Default for LocRib<A> {
         Self::new()
     }
 }
+
 
 #[cfg(test)]
 mod tests {

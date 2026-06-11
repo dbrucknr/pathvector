@@ -23,7 +23,7 @@ use pathvector_policy::DefaultAction;
 use pathvector_rib::PeerId;
 use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType};
 
-use crate::DaemonState;
+use crate::{DaemonState, RibSnapshot};
 
 // ── Generated protobuf/gRPC code ─────────────────────────────────────────────
 //
@@ -104,7 +104,11 @@ pub(crate) fn route_to_proto(
     nlri: pathvector_types::Nlri<Ipv4Addr>,
     route: &pathvector_rib::Route<Ipv4Addr>,
 ) -> Route {
-    let peer_address = peer_id.ip().to_string();
+    let peer_address = if peer_id.ip() == std::net::IpAddr::V4(crate::LOCAL_ORIGIN_PEER) {
+        "local".to_string()
+    } else {
+        peer_id.ip().to_string()
+    };
 
     let next_hop = match route.next_hop {
         Some(NextHop::V4(ip)) => ip.to_string(),
@@ -169,17 +173,17 @@ struct PeerServiceImpl {
 /// Build a `PeerState` proto message from daemon state for `addr`.
 ///
 /// Returns `None` if `addr` is not in `peer_remote_as` (i.e. not configured).
-fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
-    let remote_as = *s.peer_remote_as.get(&addr)?;
+fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
+    let remote_as = *snap.peer_remote_as.get(&addr)?;
     let peer_id = PeerId::from(addr);
 
     let (session_state, peer_type, hold_time, uptime_seconds) =
-        if let Some(&pt) = s.peer_types.get(&addr) {
-            let uptime = s
+        if let Some(&pt) = snap.peer_types.get(&addr) {
+            let uptime = snap
                 .established_at
                 .get(&addr)
                 .map_or(0, |t| t.elapsed().as_secs());
-            let ht = s.hold_times.get(&addr).copied().unwrap_or(0);
+            let ht = snap.hold_times.get(&addr).copied().unwrap_or(0);
             (
                 proto::SessionState::Established as i32,
                 proto_peer_type(pt),
@@ -195,28 +199,30 @@ fn build_peer_state(s: &DaemonState, addr: Ipv4Addr) -> Option<PeerState> {
             )
         };
 
-    let prefixes_received = s
-        .adj_ribs_in
+    let prefixes_received = snap
+        .prefixes_received
         .get(&addr)
-        .map_or(0, |ari| u32::try_from(ari.len()).unwrap_or(u32::MAX));
+        .copied()
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
     // Count best-path wins: routes in the Loc-RIB whose winner is this peer.
-    let prefixes_accepted = s
+    let prefixes_accepted = snap
         .loc_rib
         .best_routes()
-        .filter(|(nlri, _)| s.loc_rib.best_peer(nlri) == Some(peer_id))
+        .filter(|(nlri, _)| snap.loc_rib.best_peer(nlri) == Some(peer_id))
         .count();
     let prefixes_accepted = u32::try_from(prefixes_accepted).unwrap_or(u32::MAX);
 
-    let prefixes_advertised = s
-        .adj_ribs_out
+    let prefixes_advertised = snap
+        .prefixes_advertised
         .get(&addr)
-        .map_or(0, |aro| u32::try_from(aro.len()).unwrap_or(u32::MAX));
+        .copied()
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
     Some(PeerState {
         address: addr.to_string(),
         remote_as,
-        local_as: s.local_as,
+        local_as: snap.local_as,
         session_state,
         peer_type,
         hold_time,
@@ -240,12 +246,12 @@ impl PeerService for PeerServiceImpl {
         &self,
         _request: Request<ListPeersRequest>,
     ) -> Result<Response<ListPeersResponse>, Status> {
-        let s = self.state.read().await;
-        let mut peers: Vec<PeerState> = s
+        let snap = self.state.read().await.snapshot();
+        let mut peers: Vec<PeerState> = snap
             .peer_remote_as
             .keys()
             .copied()
-            .filter_map(|addr| build_peer_state(&s, addr))
+            .filter_map(|addr| build_peer_state(&snap, addr))
             .collect();
         // Stable ordering by address for predictable CLI output.
         peers.sort_by_key(|p| p.address.clone());
@@ -262,8 +268,8 @@ impl PeerService for PeerServiceImpl {
             .parse()
             .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
 
-        let s = self.state.read().await;
-        build_peer_state(&s, addr)
+        let snap = self.state.read().await.snapshot();
+        build_peer_state(&snap, addr)
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("peer {addr} is not configured")))
     }
@@ -275,26 +281,24 @@ impl PeerService for PeerServiceImpl {
         // Subscribe BEFORE snapshot to avoid a race between snapshot and first delta.
         let rx = self.state.read().await.peer_tx.subscribe();
 
-        // Snapshot: current state of all configured peers under read lock.
-        let snapshot: Vec<PeerEvent> = {
-            let s = self.state.read().await;
-            let mut events: Vec<PeerEvent> = s
-                .peer_remote_as
-                .keys()
-                .copied()
-                .filter_map(|addr| build_peer_state(&s, addr))
-                .map(|ps| PeerEvent {
-                    r#type: PeerEventType::Current as i32,
-                    peer: Some(ps),
-                })
-                .collect();
-            events.sort_by_key(|e| e.peer.as_ref().map_or(String::new(), |p| p.address.clone()));
-            events.push(PeerEvent {
-                r#type: PeerEventType::EndInitial as i32,
-                peer: None,
-            });
-            events
-        };
+        // Snapshot: clone Arc once, release lock, iterate without holding it.
+        let snap = self.state.read().await.snapshot();
+        let mut events: Vec<PeerEvent> = snap
+            .peer_remote_as
+            .keys()
+            .copied()
+            .filter_map(|addr| build_peer_state(&snap, addr))
+            .map(|ps| PeerEvent {
+                r#type: PeerEventType::Current as i32,
+                peer: Some(ps),
+            })
+            .collect();
+        events.sort_by_key(|e| e.peer.as_ref().map_or(String::new(), |p| p.address.clone()));
+        events.push(PeerEvent {
+            r#type: PeerEventType::EndInitial as i32,
+            peer: None,
+        });
+        let snapshot = events;
 
         let stream = async_stream::stream! {
             for event in snapshot {
@@ -341,10 +345,10 @@ impl RibService for RibServiceImpl {
         let prefix = request.into_inner().prefix;
         let nlri = parse_nlri(&prefix)?;
 
-        let s = self.state.read().await;
-        let resp = match s.loc_rib.best(&nlri) {
+        let snap = self.state.read().await.snapshot();
+        let resp = match snap.loc_rib.best(&nlri) {
             Some(route) => {
-                let peer_id = s
+                let peer_id = snap
                     .loc_rib
                     .best_peer(&nlri)
                     .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
@@ -377,12 +381,13 @@ impl RibService for RibServiceImpl {
             Some(PeerId::from(addr))
         };
 
-        let s = self.state.read().await;
-        let routes: Vec<Route> = s
+        // Clone the Arc, release the lock, iterate without holding it.
+        let snap = self.state.read().await.snapshot();
+        let routes: Vec<Route> = snap
             .loc_rib
             .best_routes()
             .filter_map(|(nlri, route)| {
-                let peer_id = s.loc_rib.best_peer(&nlri)?;
+                let peer_id = snap.loc_rib.best_peer(&nlri)?;
                 if peer_filter.is_none_or(|f| f == peer_id) {
                     Some(route_to_proto(peer_id, nlri, route))
                 } else {
@@ -415,32 +420,30 @@ impl RibService for RibServiceImpl {
         // Subscribe BEFORE snapshot to avoid gap between snapshot and first delta.
         let rx = self.state.read().await.route_tx.subscribe();
 
-        // Snapshot: all current best routes (filtered if requested).
-        let snapshot: Vec<RouteEvent> = {
-            let s = self.state.read().await;
-            let mut events: Vec<RouteEvent> = s
-                .loc_rib
-                .best_routes()
-                .filter_map(|(nlri, route)| {
-                    let peer_id = s.loc_rib.best_peer(&nlri)?;
-                    if peer_filter.is_none_or(|f| f == peer_id) {
-                        Some(RouteEvent {
-                            r#type: RouteEventType::Current as i32,
-                            route: Some(route_to_proto(peer_id, nlri, route)),
-                            withdrawn_prefix: None,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            events.push(RouteEvent {
-                r#type: RouteEventType::EndInitial as i32,
-                route: None,
-                withdrawn_prefix: None,
-            });
-            events
-        };
+        // Clone the Arc, release the lock, build snapshot without holding it.
+        let snap = self.state.read().await.snapshot();
+        let mut events: Vec<RouteEvent> = snap
+            .loc_rib
+            .best_routes()
+            .filter_map(|(nlri, route)| {
+                let peer_id = snap.loc_rib.best_peer(&nlri)?;
+                if peer_filter.is_none_or(|f| f == peer_id) {
+                    Some(RouteEvent {
+                        r#type: RouteEventType::Current as i32,
+                        route: Some(route_to_proto(peer_id, nlri, route)),
+                        withdrawn_prefix: None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        events.push(RouteEvent {
+            r#type: RouteEventType::EndInitial as i32,
+            route: None,
+            withdrawn_prefix: None,
+        });
+        let snapshot = events;
 
         let stream = async_stream::stream! {
             for event in snapshot {
@@ -470,8 +473,8 @@ impl RibService for RibServiceImpl {
         let prefix = request.into_inner().prefix;
         let nlri = parse_nlri(&prefix)?;
 
-        let s = self.state.read().await;
-        let routes: Vec<Route> = s
+        let snap = self.state.read().await.snapshot();
+        let routes: Vec<Route> = snap
             .loc_rib
             .candidates(&nlri)
             .map(|map| {
@@ -693,16 +696,12 @@ impl OriginationService for OriginationServiceImpl {
         &self,
         _request: Request<ListOriginatedRoutesRequest>,
     ) -> Result<Response<ListOriginatedRoutesResponse>, Status> {
-        let s = self.state.read().await;
+        let snap = self.state.read().await.snapshot();
         let local_peer = PeerId::from(crate::LOCAL_ORIGIN_PEER);
-        let routes: Vec<Route> = s
+        let routes: Vec<Route> = snap
             .originated_routes
             .iter()
-            .map(|(&nlri, route)| {
-                let mut r = route_to_proto(local_peer, nlri, route);
-                r.peer_address = "local".to_string();
-                r
-            })
+            .map(|(&nlri, route)| route_to_proto(local_peer, nlri, route))
             .collect();
         Ok(Response::new(ListOriginatedRoutesResponse { routes }))
     }
@@ -840,14 +839,14 @@ mod tests {
     #[test]
     fn test_build_peer_state_unknown_address_returns_none() {
         let s = make_state(65001, &[]);
-        assert!(build_peer_state(&s, "10.0.0.99".parse().unwrap()).is_none());
+        assert!(build_peer_state(&s.rib, "10.0.0.99".parse().unwrap()).is_none());
     }
 
     #[test]
     fn test_build_peer_state_idle_peer() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let s = make_state(65001, &[(addr, 65002)]);
-        let ps = build_peer_state(&s, addr).unwrap();
+        let ps = build_peer_state(&s.rib, addr).unwrap();
 
         assert_eq!(ps.address, "10.0.0.2");
         assert_eq!(ps.remote_as, 65002);
@@ -869,7 +868,7 @@ mod tests {
         let mut s = make_state(65001, &[(addr, 65002)]);
         s.on_established(addr, PeerType::External, 65002, 90, &[]);
 
-        let ps = build_peer_state(&s, addr).unwrap();
+        let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.session_state, proto::SessionState::Established as i32);
         assert_eq!(ps.peer_type, proto::PeerType::External as i32);
         assert_eq!(ps.hold_time, 90);
@@ -891,9 +890,10 @@ mod tests {
             .peer_type(PeerType::External)
             .build();
         s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
-        s.loc_rib.insert(peer("10.0.0.2"), route);
+        s.rib_mut().loc_rib.insert(peer("10.0.0.2"), route);
+        s.sync_received(addr);
 
-        let ps = build_peer_state(&s, addr).unwrap();
+        let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.prefixes_received, 1);
         assert_eq!(ps.prefixes_accepted, 1);
     }
@@ -1154,7 +1154,7 @@ mod tests {
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
-            s.loc_rib.insert(peer("10.0.0.2"), route);
+            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), route);
         }
 
         let svc = RibServiceImpl { state };
@@ -1214,12 +1214,12 @@ mod tests {
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
             s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
-            s.loc_rib.insert(peer("10.0.0.2"), r1);
+            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), r1);
 
             let n2 = nlri("192.168.0.0/24");
             let r2 = route_igp(n2, PeerType::External);
             s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
-            s.loc_rib.insert(peer("10.0.0.3"), r2);
+            s.rib_mut().loc_rib.insert(peer("10.0.0.3"), r2);
         }
 
         let svc = RibServiceImpl { state };
@@ -1245,12 +1245,12 @@ mod tests {
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
             s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
-            s.loc_rib.insert(peer("10.0.0.2"), r1);
+            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), r1);
 
             let n2 = nlri("192.168.0.0/24");
             let r2 = route_igp(n2, PeerType::External);
             s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
-            s.loc_rib.insert(peer("10.0.0.3"), r2);
+            s.rib_mut().loc_rib.insert(peer("10.0.0.3"), r2);
         }
 
         let svc = RibServiceImpl { state };
@@ -1305,7 +1305,7 @@ mod tests {
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
-            s.loc_rib.insert(peer("10.0.0.2"), route);
+            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), route);
         }
 
         let svc = RibServiceImpl { state };
@@ -1684,7 +1684,7 @@ mod tests {
 
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
-        assert!(s.originated_routes.contains_key(&nlri));
+        assert!(s.rib.originated_routes.contains_key(&nlri));
     }
 
     #[tokio::test]
@@ -1712,7 +1712,7 @@ mod tests {
             .route
             .expect("Announced event must carry route payload");
         assert_eq!(route.prefix, "192.0.2.0/24");
-        assert_eq!(route.peer_address, "0.0.0.0"); // LOCAL_ORIGIN_PEER
+        assert_eq!(route.peer_address, "local"); // LOCAL_ORIGIN_PEER sentinel
         assert_eq!(route.next_hop, "10.0.0.1");
     }
 
@@ -1752,7 +1752,7 @@ mod tests {
 
         assert_eq!(resp.count, 2);
         let s = state.read().await;
-        assert_eq!(s.originated_routes.len(), 2);
+        assert_eq!(s.rib.originated_routes.len(), 2);
     }
 
     #[tokio::test]
@@ -1789,7 +1789,7 @@ mod tests {
 
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
-        assert!(!s.originated_routes.contains_key(&nlri));
+        assert!(!s.rib.originated_routes.contains_key(&nlri));
     }
 
     #[tokio::test]
@@ -1836,7 +1836,7 @@ mod tests {
             .into_inner();
 
         assert_eq!(resp.count, 2);
-        assert!(state.read().await.originated_routes.is_empty());
+        assert!(state.read().await.rib.originated_routes.is_empty());
     }
 
     #[tokio::test]
@@ -1980,7 +1980,7 @@ mod tests {
         let mut s = make_state(65001, &[(addr, 65002)]);
         s.on_established(addr, pathvector_types::PeerType::External, 65002, 90, &[]);
         let n = nlri("192.0.2.0/24");
-        s.loc_rib.insert(
+        s.rib_mut().loc_rib.insert(
             peer(addr.to_string().as_str()),
             route_igp(n, PeerType::External),
         );
