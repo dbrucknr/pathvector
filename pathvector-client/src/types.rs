@@ -25,15 +25,17 @@ pub enum SessionState {
     Established,
 }
 
-/// Whether a peer is iBGP (same AS) or eBGP (different AS).
+/// Source classification of a BGP route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub enum PeerType {
-    /// eBGP — peer is in a different autonomous system.
+    /// eBGP — route learned from a peer in a different autonomous system.
     External,
-    /// iBGP — peer is in the same autonomous system.
+    /// iBGP — route learned from a peer in the same autonomous system.
     Internal,
+    /// Locally originated — injected via the origination API.
+    Local,
 }
 
 /// BGP ORIGIN path attribute (RFC 4271 §4.3).

@@ -283,7 +283,7 @@ misconfiguration rather than a normal connection collision.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| BGP Identifier MUST be unique within the local AS | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| BGP Identifier MUST be unique within the local AS | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_duplicate_ibgp_bgp_id_sends_bad_bgp_identifier` (RFC 6286) |
 | iBGP peer with identical BGP ID treated as routing loop, not a normal collision | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_duplicate_ibgp_bgp_id_sends_bad_bgp_identifier` (RFC 6286) |
 
 ---
@@ -466,8 +466,8 @@ which state the unexpected message arrived in.
 
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
-| Extended Message capability (code 6) decoded in OPEN | `pathvector-session/src/message/open.rs` | ❌ | — |
-| When negotiated, allow UPDATE messages up to 65535 bytes | `pathvector-session/src/message/header.rs` | ❌ | — |
+| Extended Message capability (code 6) decoded in OPEN | `pathvector-session/src/message/open.rs` | ✅ | `test_extended_message_not_negotiated_when_local_lacks_capability`; proptest framing round-trip |
+| When negotiated, allow UPDATE messages up to 65535 bytes | `pathvector-session/src/message/header.rs` | ✅ | `test_extended_message_not_negotiated_when_local_lacks_capability`; `MAX_LEN_EXTENDED = 65535` |
 
 ---
 
@@ -525,7 +525,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 outstanding; collision detection done (2026-06-11); Update-Send Process e2e-verified (announce, withdraw, export policy, attribute transforms); LOCAL_PREF stripping unit-tested but not directly observable e2e; session lifecycle and route announce/withdraw validated e2e against GoBGP |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1 and 8 outstanding (IGP/FIB integration required); steps 3 and 9 done (2026-06-11); Update-Send Process e2e-verified (announce, withdraw, export policy, attribute transforms); LOCAL_PREF stripping unit-tested but not directly observable e2e; session lifecycle and route announce/withdraw validated e2e against GoBGP |
 | RFC 2918 | Route Refresh | ✅ Message, capability, and receive-guard (negotiation check) implemented |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ Wire format + IPv4 daemon processing; IPv6 daemon support deferred (see TODO) |
@@ -542,7 +542,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 | RFC 6996 | Private ASN (4-byte) | ✅ |
 | RFC 5065 | BGP Confederations | ✅ |
 | RFC 4456 | Route Reflectors | ❌ |
-| RFC 6286 | AS-Wide Unique BGP Identifier | ❌ |
+| RFC 6286 | AS-Wide Unique BGP Identifier | ✅ Duplicate iBGP BGP ID rejected with `BadBgpIdentifier` NOTIFICATION |
 | RFC 7606 | Revised UPDATE Error Handling | ✅ Per-attribute error policies implemented: treat-as-withdraw (ORIGIN, AS_PATH, NEXT_HOP, LOCAL_PREF, MP_REACH_NLRI) and attribute-discard (optional attributes); duplicate attribute detection; session stays up |
 | RFC 8212 | Default EBGP Route Propagation | ✅ eBGP peers default to Reject when policy is omitted; iBGP peers default to Accept; explicit config overrides; both import and export directions verified e2e |
 | RFC 3107 | MPLS Labeled Unicast | ⚠️ SAFI defined; label encoding not implemented |
@@ -550,7 +550,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 | RFC 4761 | VPLS | ⚠️ SAFI/AFI defined; NLRI not implemented |
 | RFC 7432 | EVPN | ⚠️ SAFI/AFI defined; route types not implemented |
 | RFC 5575 | FlowSpec | ⚠️ SAFI defined; component encoding not implemented |
-| RFC 8654 | Extended Message | ❌ |
+| RFC 8654 | Extended Message | ✅ Capability decoded in OPEN; codec raises limit to 65535 bytes when negotiated |
 | RFC 7854 | BGP Monitoring Protocol (BMP) | ❌ |
 | RFC 2385 | TCP MD5 Authentication | ❌ |
 | RFC 8205 | BGPsec | ❌ |

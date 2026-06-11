@@ -67,6 +67,7 @@ fn proto_peer_type(pt: PeerType) -> i32 {
     match pt {
         PeerType::External => proto::PeerType::External as i32,
         PeerType::Internal => proto::PeerType::Internal as i32,
+        PeerType::Local => proto::PeerType::Unspecified as i32,
     }
 }
 
@@ -104,7 +105,7 @@ pub(crate) fn route_to_proto(
     nlri: pathvector_types::Nlri<Ipv4Addr>,
     route: &pathvector_rib::Route<Ipv4Addr>,
 ) -> Route {
-    let peer_address = if peer_id.ip() == std::net::IpAddr::V4(crate::LOCAL_ORIGIN_PEER) {
+    let peer_address = if route.peer_type == PeerType::Local {
         "local".to_string()
     } else {
         peer_id.ip().to_string()
@@ -618,7 +619,7 @@ fn parse_originate_request(
 
     let mut builder = RouteBuilder::new(nlri, origin, pathvector_types::AsPath::new())
         .next_hop(pathvector_types::NextHop::V4(next_hop_ip))
-        .peer_type(PeerType::Internal);
+        .peer_type(PeerType::Local);
 
     for c in communities {
         builder = builder.community(c);

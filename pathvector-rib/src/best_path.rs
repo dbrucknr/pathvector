@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use ipnetx::interfaces::IpAddress;
-use pathvector_types::LocalPref;
+use pathvector_types::{LocalPref, PeerType};
 
 use crate::{peer::PeerId, route::Route};
 
@@ -15,13 +15,15 @@ use crate::{peer::PeerId, route::Route};
 /// | Step | Criterion | Winner |
 /// |---|---|---|
 /// | 2 | `LOCAL_PREF` | higher (missing → 100) |
+/// | 3/7 | Source type | `Local` > `External` > `Internal` |
 /// | 4 | AS path length | shorter |
 /// | 5 | `ORIGIN` | lower (`IGP=0` best) |
 /// | 6 | `MED` | lower (missing → `0`) |
+/// | 9 | Route age (eBGP only) | older |
 /// | 10 | Peer IP address | lower |
 ///
-/// Steps 1, 3, 7, 8, and 9 require information not available at the RIB
-/// layer (IGP reachability, session type, route age). See `TODO.md`.
+/// Steps 1 and 8 require IGP reachability information not available at the
+/// RIB layer. See `TODO.md`.
 ///
 /// # Examples
 ///
@@ -106,13 +108,25 @@ fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Rout
         return med; // reverse: lower MED → Greater → preferred
     }
 
-    // Step 7: Prefer eBGP over iBGP (RFC 4271 §9.1 step 7).
-    // A route learned from an external peer is always preferred over one
-    // learned from an internal peer when all higher-priority criteria tie.
-    // PeerType::External (1) > PeerType::Internal (0).
+    // Step 3/7: Prefer locally originated routes, then eBGP over iBGP
+    // (RFC 4271 §9.1 steps 3 and 7).
+    // PeerType discriminants encode the preference order:
+    // Local (2) > External (1) > Internal (0).
     let session = a.peer_type.cmp(&b.peer_type);
     if session != Ordering::Equal {
-        return session; // External > Internal → preferred
+        return session;
+    }
+
+    // Step 9: Oldest eBGP route (RFC 4271 §9.1 step 9).
+    // Only applies when both routes are eBGP — iBGP and local routes were
+    // resolved at step 3/7. Prefer the older, more stable route to reduce
+    // churn when all policy-relevant attributes are equal.
+    // Step 8 (IGP metric) is skipped — requires FIB integration.
+    if a.peer_type == PeerType::External {
+        let age = b.received_at.cmp(&a.received_at); // older (smaller Instant) → Greater
+        if age != Ordering::Equal {
+            return age;
+        }
     }
 
     // Step 10: Lowest peer IP address (final tie-breaker).
@@ -423,6 +437,34 @@ mod prop_tests {
                 "peer ...{} should beat ...{}", ip_a, ip_b);
         }
     }
+
+    // ── Step 3: locally originated beats peer-learned (RFC 4271 §9.1) ────────
+
+    proptest! {
+        #[test]
+        fn prop_select_best_locally_originated_beats_peer_learned(
+            lp  in 0u32..=300u32,
+            len in 0usize..=5usize,
+            origin in arb_origin(),
+        ) {
+            let local = RouteBuilder::new(nlri(), origin, make_path(len))
+                .local_pref(LocalPref::new(lp))
+                .peer_type(PeerType::Local)
+                .build();
+            let ebgp = RouteBuilder::new(nlri(), origin, make_path(len))
+                .local_pref(LocalPref::new(lp))
+                .peer_type(PeerType::External)
+                .build();
+
+            // eBGP gets the lower peer IP — step 3 must override step 10.
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(1), ebgp);   // lower IP, eBGP
+            candidates.insert(peer(2), local);  // higher IP, Local
+
+            let (winner, _) = select_best(&candidates).unwrap();
+            prop_assert_eq!(winner, peer(2), "Local must beat eBGP regardless of peer IP");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,5 +670,110 @@ mod tests {
         candidates.insert(peer(2), route);
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(1)); // step 10: lower peer IP
+    }
+
+    // ── Step 3: locally originated (RFC 4271 §9.1 step 3) ───────────────────
+
+    #[test]
+    fn test_locally_originated_beats_ebgp() {
+        let local = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::Local)
+            .build();
+        let ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::External)
+            .build();
+        // eBGP gets the lower peer IP — step 3 must override step 10.
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), ebgp);
+        candidates.insert(peer(2), local);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // Local beats eBGP
+    }
+
+    #[test]
+    fn test_locally_originated_beats_ibgp() {
+        let local = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::Local)
+            .build();
+        let ibgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::Internal)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), ibgp);
+        candidates.insert(peer(2), local);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // Local beats iBGP
+    }
+
+    #[test]
+    fn test_local_pref_still_overrides_local_origin() {
+        // LOCAL_PREF (step 2) is evaluated before source type (step 3).
+        // An iBGP route with a very high LOCAL_PREF beats a locally
+        // originated route with a low LOCAL_PREF.
+        let local = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(50))
+            .peer_type(PeerType::Local)
+            .build();
+        let ibgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(200))
+            .peer_type(PeerType::Internal)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), ibgp);
+        candidates.insert(peer(2), local);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(1)); // higher LOCAL_PREF wins over Local origin
+    }
+
+    // ── Step 9: oldest eBGP route (RFC 4271 §9.1 step 9) ────────────────────
+
+    #[test]
+    fn test_select_best_prefers_older_ebgp_route() {
+        use std::time::{Duration, Instant};
+
+        let older = {
+            let mut r = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .peer_type(PeerType::External)
+                .build();
+            // Backdate received_at to simulate an older route.
+            r.received_at = Instant::now() - Duration::from_secs(60);
+            r
+        };
+        let newer = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build();
+
+        // newer gets the lower peer IP — step 9 must override step 10.
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), newer);
+        candidates.insert(peer(2), older);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // older route preferred
+    }
+
+    #[test]
+    fn test_step9_only_applies_to_ebgp() {
+        use std::time::{Duration, Instant};
+
+        // iBGP route that is very old — should NOT win over a newer eBGP route
+        // because step 3/7 resolves in favour of eBGP first.
+        let old_ibgp = {
+            let mut r = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .peer_type(PeerType::Internal)
+                .build();
+            r.received_at = Instant::now() - Duration::from_secs(3600);
+            r
+        };
+        let new_ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build();
+
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), old_ibgp);
+        candidates.insert(peer(2), new_ebgp);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // eBGP wins at step 3/7 before step 9 fires
     }
 }

@@ -63,12 +63,19 @@ pub struct Route<A: IpAddress> {
     pub atomic_aggregate: bool,
     /// The router that performed aggregation, if known.
     pub aggregator: Option<Aggregator>,
-    /// Whether this route was learned from an iBGP or eBGP peer.
+    /// Whether this route was learned from an iBGP peer, eBGP peer, or
+    /// locally originated.
     ///
-    /// Used in best-path selection (RFC 4271 §9.1 step 7) and iBGP split
-    /// horizon enforcement. Defaults to [`PeerType::External`] when built
-    /// with [`RouteBuilder`] without an explicit call to `.peer_type()`.
+    /// Used in best-path selection (RFC 4271 §9.1 steps 3 and 7) and iBGP
+    /// split horizon enforcement. Defaults to [`PeerType::External`] when
+    /// built with [`RouteBuilder`] without an explicit call to `.peer_type()`.
     pub peer_type: PeerType,
+    /// When this route was first received or created.
+    ///
+    /// Used for best-path step 9 (RFC 4271 §9.1): when two eBGP routes are
+    /// otherwise equal, prefer the one received first (oldest). Set
+    /// automatically to `Instant::now()` by [`RouteBuilder::build`].
+    pub received_at: std::time::Instant,
 }
 
 impl<A: IpAddress> BgpRoute for Route<A> {
@@ -167,6 +174,7 @@ pub struct RouteBuilder<A: IpAddress> {
     atomic_aggregate: bool,
     aggregator: Option<Aggregator>,
     peer_type: PeerType,
+    received_at: std::time::Instant,
 }
 
 impl<A: IpAddress> RouteBuilder<A> {
@@ -190,6 +198,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             atomic_aggregate: false,
             aggregator: None,
             peer_type: PeerType::External,
+            received_at: std::time::Instant::now(),
         }
     }
 
@@ -275,6 +284,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             atomic_aggregate: self.atomic_aggregate,
             aggregator: self.aggregator,
             peer_type: self.peer_type,
+            received_at: self.received_at,
         }
     }
 }

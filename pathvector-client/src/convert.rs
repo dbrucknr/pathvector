@@ -70,7 +70,12 @@ impl TryFrom<i32> for PeerType {
     type Error = ConvertError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        peer_type_from_i32(value).ok_or(ConvertError::UnknownEnumValue("PeerType", value))
+        match value {
+            0 => Ok(PeerType::Local), // Unspecified proto value = locally originated route
+            1 => Ok(PeerType::External),
+            2 => Ok(PeerType::Internal),
+            _ => Err(ConvertError::UnknownEnumValue("PeerType", value)),
+        }
     }
 }
 
@@ -461,15 +466,12 @@ mod tests {
         assert_eq!(PeerType::try_from(2).unwrap(), PeerType::Internal);
     }
 
-    /// Discriminant 0 is PEER_TYPE_UNSPECIFIED. Routes must have a concrete
-    /// type, so this is an error via `TryFrom` — unlike `PeerState` where
-    /// `peer_type_from_i32` returns `None` for unspecified.
+    /// Discriminant 0 is PEER_TYPE_UNSPECIFIED. For routes, this maps to
+    /// `PeerType::Local` (locally originated). For `PeerState`, the
+    /// `peer_type_from_i32` helper still returns `None` for unspecified.
     #[test]
-    fn peer_type_unspecified_is_error_via_try_from() {
-        assert!(matches!(
-            PeerType::try_from(0),
-            Err(ConvertError::UnknownEnumValue("PeerType", 0))
-        ));
+    fn peer_type_unspecified_maps_to_local_via_try_from() {
+        assert_eq!(PeerType::try_from(0).unwrap(), PeerType::Local);
     }
 
     #[test]
@@ -831,14 +833,13 @@ mod tests {
     }
 
     #[test]
-    fn route_unspecified_peer_type_is_error() {
-        // Routes must have a concrete peer type. PeerType::try_from(0) is Err.
+    fn route_unspecified_peer_type_maps_to_local() {
+        // Proto PeerType::Unspecified (0) is emitted for locally originated
+        // routes. It maps to PeerType::Local on the client side.
         let mut p = minimal_proto_route();
         p.peer_type = 0;
-        assert!(matches!(
-            Route::try_from(p),
-            Err(ConvertError::UnknownEnumValue("PeerType", 0))
-        ));
+        let route = Route::try_from(p).unwrap();
+        assert_eq!(route.peer_type, PeerType::Local);
     }
 
     #[test]
