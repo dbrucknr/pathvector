@@ -48,6 +48,21 @@ use crate::{best_path::select_best, peer::PeerId, route::Route};
 /// assert_eq!(rib.best_peer(&nlri), Some(peer_a));
 /// assert_eq!(rib.best(&nlri).unwrap().local_pref, Some(LocalPref::new(200)));
 /// ```
+/// Read-only view into the Loc-RIB needed by the outbound advertisement path.
+///
+/// Abstracting over this boundary lets the Update-Send Process (`propagate_prefix`)
+/// be tested without constructing a full [`LocRib`] with real route data.
+pub trait RibView<A: IpAddress> {
+    /// Returns the current best route for `nlri`, or `None` if no route exists.
+    fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>>;
+}
+
+impl<A: IpAddress> RibView<A> for LocRib<A> {
+    fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
+        self.best.get(nlri.prefix()).map(|pair| &pair.1)
+    }
+}
+
 #[derive(Clone)]
 pub struct LocRib<A: IpAddress> {
     candidates: HashMap<Nlri<A>, HashMap<PeerId, Route<A>>>,

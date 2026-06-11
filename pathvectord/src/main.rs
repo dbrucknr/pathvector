@@ -10,7 +10,7 @@ use std::{
 
 use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{
-    AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, Route, RouteBuilder,
+    AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, RibView, Route, RouteBuilder,
     outbound::prepare_outbound,
 };
 use pathvector_session::{
@@ -134,7 +134,7 @@ enum PrefixDecision {
 /// decisions and flush via [`flush_updates`].
 fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
-    loc_rib: &LocRib<Ipv4Addr>,
+    loc_rib: &impl RibView<Ipv4Addr>,
     adj_rib_out: &mut AdjRibOut<Ipv4Addr>,
     export_policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
@@ -2915,7 +2915,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn propagate_and_flush(
         nlri: Nlri<Ipv4Addr>,
-        rib: &LocRib<Ipv4Addr>,
+        rib: &impl RibView<Ipv4Addr>,
         aro: &mut AdjRibOut<Ipv4Addr>,
         policy: &Policy<Route<Ipv4Addr>>,
         peer_type: PeerType,
@@ -3191,6 +3191,96 @@ mod tests {
         let msg = rx
             .try_recv()
             .expect("split-horizon eviction must send WITHDRAW");
+        assert!(!msg.withdrawn.is_empty());
+        assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
+    }
+
+    // ── propagate_prefix — StubRibView (dependency-inversion tests) ─────────────
+
+    /// Minimal `RibView` implementation for unit tests that want to inject a
+    /// specific best route without constructing a full `LocRib`.
+    struct StubRibView(Option<Route<Ipv4Addr>>);
+
+    impl RibView<Ipv4Addr> for StubRibView {
+        fn best(&self, _nlri: &Nlri<Ipv4Addr>) -> Option<&Route<Ipv4Addr>> {
+            self.0.as_ref()
+        }
+    }
+
+    #[test]
+    fn test_propagate_prefix_stub_rib_announces_when_route_present() {
+        let rib = StubRibView(Some(ebgp_route_with_lp("10.0.0.0/8")));
+        let (_, mut aro) = ebgp_out_peer();
+        let (tx, mut rx) = mpsc::channel(16);
+        propagate_and_flush(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let msg = rx.try_recv().expect("should announce when best route present");
+        assert!(!msg.announced.is_empty());
+        assert_eq!(msg.announced[0], nlri("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn test_propagate_prefix_stub_rib_no_message_when_no_route() {
+        let rib = StubRibView(None);
+        let (_, mut aro) = ebgp_out_peer();
+        let (tx, mut rx) = mpsc::channel(16);
+        propagate_and_flush(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &reject_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no message when RIB has no best route and prefix was never advertised"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_stub_rib_withdraw_when_route_gone() {
+        // First advertise via a real LocRib, then call again with empty StubRibView
+        // to verify a WITHDRAW is produced even without constructing a second LocRib.
+        let mut rib = LocRib::new();
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        let (_, mut aro) = ebgp_out_peer();
+        let (tx, mut rx) = mpsc::channel(16);
+        propagate_and_flush(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let _ = rx.try_recv(); // consume announcement
+
+        // Now inject an empty view — simulates route having been withdrawn
+        let empty_rib = StubRibView(None);
+        propagate_and_flush(
+            nlri("10.0.0.0/8"),
+            &empty_rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        let msg = rx.try_recv().expect("should WITHDRAW when best route disappears");
         assert!(!msg.withdrawn.is_empty());
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
     }

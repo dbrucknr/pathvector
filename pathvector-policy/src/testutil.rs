@@ -27,6 +27,7 @@ impl TestRoute {
     ///
     /// Defaults: ORIGIN IGP, no `LOCAL_PREF`, no MED, empty AS path,
     /// no communities, no `NEXT_HOP`.
+    #[must_use]
     pub fn new(prefix: &str) -> Self {
         Self {
             nlri: prefix.parse().expect("invalid test prefix"),
@@ -45,6 +46,7 @@ impl TestRoute {
     ///
     /// Used to verify that conditions correctly call `.masked()` before
     /// comparing network addresses.
+    #[must_use]
     pub fn with_nlri_ip(prefix: &str) -> Self {
         Self::new(prefix)
     }

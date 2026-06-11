@@ -10,6 +10,10 @@ pub(crate) use pathvector_client::DaemonClient;
 /// Each field holds the value that the corresponding method will return.
 /// Methods that do not return data (`set_import_default`, `set_export_default`)
 /// return `Ok(())` unconditionally unless `force_error` is set.
+///
+/// For streaming methods (`watch_peers`, `watch_routes`), provide event sequences
+/// via `peer_events` and `route_events`. Each call drains the next batch from the
+/// front of the queue. An empty queue returns an empty stream.
 #[cfg(test)]
 pub(crate) struct MockDaemonClient {
     pub peers: Vec<pathvector_client::types::PeerState>,
@@ -22,6 +26,10 @@ pub(crate) struct MockDaemonClient {
     pub import_calls: Vec<(String, bool)>,
     /// Recorded calls to `set_export_default` — `(peer, accept)`.
     pub export_calls: Vec<(String, bool)>,
+    /// Queued batches for `watch_peers`. Each `watch_peers` call drains one batch.
+    pub peer_events: std::collections::VecDeque<Vec<Result<pathvector_client::types::PeerEvent, pathvector_client::error::ClientError>>>,
+    /// Queued batches for `watch_routes`. Each `watch_routes` call drains one batch.
+    pub route_events: std::collections::VecDeque<Vec<Result<pathvector_client::types::RouteEvent, pathvector_client::error::ClientError>>>,
 }
 
 #[cfg(test)]
@@ -35,6 +43,8 @@ impl MockDaemonClient {
             force_error: None,
             import_calls: Vec::new(),
             export_calls: Vec::new(),
+            peer_events: std::collections::VecDeque::new(),
+            route_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -182,7 +192,8 @@ impl DaemonClient for MockDaemonClient {
         pathvector_client::BoxStream<pathvector_client::types::RouteEvent>,
         pathvector_client::error::ClientError,
     > {
-        Ok(Box::pin(futures::stream::empty()))
+        let events = self.route_events.pop_front().unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 
     async fn watch_peers(
@@ -191,6 +202,7 @@ impl DaemonClient for MockDaemonClient {
         pathvector_client::BoxStream<pathvector_client::types::PeerEvent>,
         pathvector_client::error::ClientError,
     > {
-        Ok(Box::pin(futures::stream::empty()))
+        let events = self.peer_events.pop_front().unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 }

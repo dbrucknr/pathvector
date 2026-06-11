@@ -66,13 +66,12 @@ impl<R: BgpRoute> Action<R> for Next {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// // ActionSequence<R> requires a concrete BgpRoute type R to compile;
-/// // see the unit tests in this module for a runnable example.
+/// ```
 /// use pathvector_policy::{ActionSequence, Accept, SetLocalPref};
+/// use pathvector_policy::testutil::TestRoute;
 /// use pathvector_types::LocalPref;
 ///
-/// let action: ActionSequence<MyRoute> = ActionSequence::new()
+/// let action: ActionSequence<TestRoute> = ActionSequence::new()
 ///     .then(SetLocalPref::new(LocalPref::new(200)))
 ///     .then(Accept);
 /// ```
@@ -351,13 +350,12 @@ impl<R: BgpRoute> Action<R> for RemoveLargeCommunity {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// // ActionSequence<R> requires a concrete BgpRoute type R to compile;
-/// // see the unit tests in this module for a runnable example.
+/// ```
 /// use pathvector_policy::{Accept, ActionSequence, AddCommunity, SetLocalPref};
+/// use pathvector_policy::testutil::TestRoute;
 /// use pathvector_types::{Community, LocalPref};
 ///
-/// let action: ActionSequence<MyRoute> = ActionSequence::new()
+/// let action: ActionSequence<TestRoute> = ActionSequence::new()
 ///     .then(SetLocalPref::new(LocalPref::new(200)))
 ///     .then(AddCommunity::new(Community::from_parts(65000, 200)))
 ///     .then(Accept);

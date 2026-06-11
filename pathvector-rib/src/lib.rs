@@ -14,6 +14,6 @@ mod prop_tests;
 
 pub use adj_rib_in::AdjRibIn;
 pub use adj_rib_out::{AdjRibOut, InsertOutcome};
-pub use loc_rib::LocRib;
+pub use loc_rib::{LocRib, RibView};
 pub use peer::PeerId;
 pub use route::{Route, RouteBuilder};

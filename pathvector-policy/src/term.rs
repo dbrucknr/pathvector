@@ -82,16 +82,15 @@ where
 ///
 /// # Examples
 ///
-/// ```ignore
-/// // Policy<R> requires a concrete BgpRoute type R;
-/// // see the unit tests in this module for runnable examples.
+/// ```
 /// use pathvector_policy::{
 ///     Accept, ActionSequence, AnyCondition, CommunityCondition, DefaultAction,
 ///     Policy, Reject, SetLocalPref, Term,
 /// };
+/// use pathvector_policy::testutil::TestRoute;
 /// use pathvector_types::{Community, LocalPref};
 ///
-/// let mut policy: Policy<MyRoute> = Policy::new(DefaultAction::Reject);
+/// let mut policy: Policy<TestRoute> = Policy::new(DefaultAction::Reject);
 ///
 /// // Term 1: preferred routes get LOCAL_PREF 200
 /// policy.add_term(Term::new(
@@ -168,16 +167,15 @@ impl<R: BgpRoute> Policy<R> {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// // PolicyBuilder<R> requires a concrete BgpRoute type R;
-/// // see the unit tests in this module for runnable examples.
+/// ```
 /// use pathvector_policy::{
 ///     Accept, AnyCondition, CommunityCondition, DefaultAction,
 ///     PolicyBuilder, Reject,
 /// };
+/// use pathvector_policy::testutil::TestRoute;
 /// use pathvector_types::Community;
 ///
-/// let policy = PolicyBuilder::<MyRoute>::new(DefaultAction::Reject)
+/// let policy = PolicyBuilder::<TestRoute>::new(DefaultAction::Reject)
 ///     .term(
 ///         CommunityCondition::new(Community::NO_EXPORT),
 ///         Reject,

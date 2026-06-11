@@ -52,15 +52,23 @@ Implemented as `pathvector/` workspace member. Subcommands: `peer list`,
 the daemon endpoint. `watch routes` and `watch peers` stream events to stdout until
 Ctrl-C using `tokio::select!` on the stream and `tokio::signal::ctrl_c()`.
 
-**5. Dashboard: surface all refresh errors, not just the last one** (`pathvector`)
-`DashboardState::refresh` makes two sequential calls (`list_peers`, then
-`list_routes`).  If both fail, only the `list_routes` error is shown in the
-status bar — the `list_peers` error is silently overwritten.  In practice
-both failing at the same time means "daemon is down" and either message is
-equally useful.  The right fix is to collect all errors into a `Vec<String>`
-and render them as a multi-line status area, or join them with `"; "` in the
-single-line bar.  Deferred because the single-error case is the overwhelmingly
-common one and the fix requires a UI layout decision.
+**5. Dashboard: replace polling with streaming** (`pathvector`) — **Done (2026-06-11)**
+`run_dashboard` now subscribes to `WatchPeers` and `WatchRoutes` streaming RPCs before
+entering raw mode. A `spawn_blocking` thread bridges crossterm's blocking keyboard poll
+into the async `tokio::select!` loop alongside `peer_stream.next()` and
+`route_stream.next()`. `DashboardState::apply_peer_event` and `apply_route_event` are
+pure state-mutation methods that upsert / remove entries in-place. The status bar shows
+`● Live` (green) instead of a stale timestamp; connection errors replace the live
+indicator with the error string. `MockDaemonClient` grows `watch_routes`/`watch_peers`
+impls returning empty streams. 15 unit tests cover all event variants and error paths.
+`BoxStream<T>` type alias exported from `pathvector-client` allows naming the stream type
+in bindings, struct fields, and `dyn` contexts. `DaemonClient` trait extended with
+`watch_routes` and `watch_peers`.
+
+**Remaining dashboard gap:** `last_error` is a single `Option<String>` so two simultaneous
+failures (one from each stream) overwrites the first error. In practice both streams fail
+together ("daemon down") so the second message is equally informative. Fix requires UI
+layout decision; deferred.
 
 **6. IPv6 RIB — inbound half** (`pathvectord`)
 After item 1 (MultiProtocol capability) is done, advertising IPv6 capability
@@ -114,6 +122,63 @@ the natural way to verify it. Before RFC 7606 there is less to test.
 ~~Check whether or not the each module currently meets these requirements.~~
 **Done** — `RFC_REQUIREMENTS.md` tracks every implemented RFC, its requirements, owning module,
 implementation status, and verified-by test citations.
+
+### Testing strategy — overall picture (2026-06-11)
+
+The project uses four complementary testing layers. The goal is near-complete coverage;
+some paths (terminal I/O, async streams, long-running timers) are tested through
+integration rather than direct unit tests.
+
+**Layer 1 — Unit tests** (pure functions, no I/O)
+- `pathvector-types`: all type constructors, well-known constants, encode/decode round-trips.
+- `pathvector-policy`: term evaluation, action application, all condition variants.
+- `pathvector-rib`: `select_best` steps, `LocRib`/`AdjRibIn`/`AdjRibOut` mutation and consistency.
+- `pathvectord::propagate_prefix`, `flush_updates`, `prepare_outbound`: all pure functions;
+  testable with `StubRibView` (no `DaemonState` construction needed).
+- `pathvector/src/dashboard`: `apply_peer_event` / `apply_route_event` — pure state-mutation;
+  15 tests cover all event variants, error paths, and upsert semantics.
+
+**Layer 2 — Property tests (proptests)**
+- `pathvector-session`: codec round-trips for all BGP message types + capabilities.
+- `pathvector-rib`: all 8 best-path decision-step invariants + structural RIB invariants.
+- `pathvector-policy`: determinism + first-match-wins + 8 action invariants.
+- _Gap_: `pathvectord` event-loop transitions don't have proptests yet. The `DaemonState`
+  update/withdraw/originate methods are good candidates — adding property tests for the
+  consistency invariant "every prefix in `AdjRibOut` is also in `LocRib`" would close this.
+
+**Layer 3 — Integration / session tests**
+- `pathvectord` unit tests (200+ in `main.rs`) drive the full `run_event_loop` via
+  `MockSessionHandle` — verify FSM transitions, import/export policy, route propagation,
+  origination, stall detection, BLACKHOLE handling, RFC 8212 defaults, and more.
+- `pathvector-session` FSM proptests drive the session state machine with random event
+  sequences, verifying no unexpected state is reachable.
+
+**Layer 4 — End-to-end tests** (Docker, GoBGP)
+- 35 tests across `e2e/tests/` covering: session establishment, route import/export,
+  policy enforcement, origination, withdrawal, and multi-peer topologies.
+- Tests use the full stack: `pathvectord` binary inside a container, GoBGP as the peer,
+  `PathvectorClient` gRPC API for assertions.
+- _Gap_: BIRD interoperability (stricter RFC compliance than GoBGP). See Tier 3, item 7.
+
+**Dependency inversion progress**
+
+| Seam | Abstraction | Status |
+|------|-------------|--------|
+| Session transport | `SessionHandle` trait | ✅ `MockSessionHandle` in use |
+| RIB best-route lookup | `RibView<A>` trait | ✅ Done (2026-06-11) |
+| Full RIB store | `impl RibStore` | ❌ Deferred |
+| Policy engine | `impl PolicyEngine` | ❌ Deferred |
+| Streaming mock clients | `MockDaemonClient::peer/route_events` queues | ✅ Done (2026-06-11) |
+
+**Known coverage gaps**
+
+- `run_dashboard` terminal I/O path — not unit-testable; covered by the stream unit tests
+  plus e2e visual inspection.
+- `pathvectord` clock/timer behaviour (hold timer, connect-retry timer) — no `Clock` trait
+  injection yet. Deferred until MRAI or dampening requires it.
+- `pathvector-client` conversion layer fuzz target — deferred until proto types stabilise.
+
+---
 
 ### Property testing and fuzz coverage (ordered)
 
@@ -260,16 +325,18 @@ they require information the RIB layer does not yet have.
 
 ### Trait-based RIB and policy seams
 
-`pathvectord` currently depends concretely on `LocRib<Ipv4Addr>`, `AdjRibIn`,
-`AdjRibOut`, and `Policy<Route<Ipv4Addr>>`. The library-first promise — that
-someone embedding `pathvector-session` can bring their own RIB — is not fully
-delivered until these are abstracted behind traits (`impl RibStore`,
-`impl PolicyEngine`). This would also make the daemon itself unit-testable at
-the RIB boundary without constructing full `DaemonState` instances.
+**`RibView` seam — Done (2026-06-11).** `pathvector-rib` now exports a `RibView<A>` trait
+with a single `best(&self, nlri) -> Option<&Route<A>>` method. `LocRib<A>` implements it.
+`propagate_prefix` in `pathvectord` is now generic over `impl RibView<Ipv4Addr>` instead
+of taking `&LocRib<Ipv4Addr>` directly. A `StubRibView(Option<Route<Ipv4Addr>>)` test
+double in `pathvectord`'s test module (3 tests) demonstrates that the Update-Send Process
+can be driven with injected best routes — no RIB construction or peer setup required.
 
-Prerequisites: decide whether the trait lives in `pathvector-rib` (risking
-an upward dependency) or in a new thin `pathvector-core` crate that both the
-RIB and the daemon depend on.
+**Remaining seams** — `pathvectord` still depends concretely on `AdjRibIn`, `AdjRibOut`,
+and `Policy<Route<Ipv4Addr>>` at the `DaemonState` level. Full inversion (allowing
+third-party RIB or policy implementations) would require `impl RibStore` + `impl PolicyEngine`
+traits in a new thin `pathvector-core` crate, or accepting upward dependency in
+`pathvector-rib`/`pathvector-policy`. Deferred until the embedding use-case becomes concrete.
 
 ### Longest-prefix-match queries
 
@@ -530,10 +597,12 @@ Snapshot-then-stream: subscribe to broadcast channel first (no race), send curre
 `CURRENT` events, send `END_INITIAL` sentinel, then stream live deltas.  `broadcast::channel`
 capacity 1024; slow subscribers receive `RecvError::Lagged` and must reconnect.
 
-`pathvector-client` exposes the full origination surface on `DaemonClient` trait and
-`PathvectorClient` impl. `watch_routes` and `watch_peers` are inherent methods returning
-`impl Stream`. `OriginateRouteParams`, `RouteEvent`, `PeerEvent`, `RouteEventType`,
-`PeerEventType` domain types added to `types.rs`; `From`/`TryFrom` impls in `convert.rs`.
+`pathvector-client` exposes the full origination and watch surface on `DaemonClient` trait
+and `PathvectorClient` impl. `watch_routes` and `watch_peers` are methods on the
+`DaemonClient` trait returning `BoxStream<T>` — a `Pin<Box<dyn Stream<...> + Send>>` type
+alias that is nameable in struct fields, variable bindings, and `dyn` contexts.
+`OriginateRouteParams`, `RouteEvent`, `PeerEvent`, `RouteEventType`, `PeerEventType` domain
+types added to `types.rs`; `From`/`TryFrom` impls in `convert.rs`.
 
 CLI subcommands `route originate`, `route withdraw`, `route list-originated`, `watch routes
 [--peer]`, and `watch peers` all wired and tested (2026-06-10).
@@ -543,8 +612,7 @@ originated route propagation to GoBGP, batch origination, withdrawal, idempotent
 re-origination, attribute preservation (communities, local_pref, med), blackhole community
 (RFC 7999), coexistence with peer-learned routes, and no-op withdrawal of unknown prefix.
 
-**Remaining:**
-- Dashboard: replace 200ms polling ticker with `WatchRoutes` stream (separate follow-up)
+**Dashboard streaming done** — see Tier 2, item 5 above.
 
 ---
 

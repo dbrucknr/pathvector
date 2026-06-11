@@ -72,14 +72,18 @@ impl From<CodecError> for FramingError {
 ///
 /// Wrap a [`tokio::net::TcpStream`] to get an async stream of decoded messages:
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use tokio_util::codec::FramedRead;
 /// use pathvector_session::framing::BgpCodec;
+/// use futures::StreamExt as _;
 ///
-/// let (reader, writer) = tcp_stream.into_split();
-/// let mut framed = FramedRead::new(reader, BgpCodec::new());
-/// while let Some(msg) = framed.next().await.transpose()? {
-///     // msg: BgpMessage
+/// async fn example(tcp_stream: tokio::net::TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+///     let (reader, _writer) = tcp_stream.into_split();
+///     let mut framed = FramedRead::new(reader, BgpCodec::new());
+///     while let Some(msg) = framed.next().await.transpose()? {
+///         let _ = msg; // msg: BgpMessage
+///     }
+///     Ok(())
 /// }
 /// ```
 pub struct BgpCodec {

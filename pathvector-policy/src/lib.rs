@@ -9,8 +9,9 @@ pub mod term;
 
 #[cfg(test)]
 mod prop_tests;
-#[cfg(test)]
-pub(crate) mod testutil;
+/// Minimal test double — public so doctests can use it; not part of the stable API.
+#[doc(hidden)]
+pub mod testutil;
 
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
