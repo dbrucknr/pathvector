@@ -711,16 +711,29 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    both the BGP event loop and all concurrent gRPC reads. Fix: generate the dump
    asynchronously, releasing the lock between batches.
 
-5. **`RibSnapshot` split — eliminate gRPC/event-loop read contention** — `ListRoutes`,
-   `GetBestRoute`, `ListCandidates`, and `WatchRoutes` snapshot calls currently hold the
-   `Arc<RwLock<DaemonState>>` read lock for the full duration of RIB iteration. This
-   contends with the event loop's write lock on every incoming UPDATE. Fix: separate the
-   read-heavy data (`LocRib`, `originated_routes`, peer states) into an `Arc<RibSnapshot>`
-   that is replaced atomically on each write. gRPC reads clone the `Arc` (near-zero cost)
-   and release the outer lock immediately; the event loop mutates at its own pace. Tradeoff:
-   one extra `Arc` clone per write path and slightly more complex update logic. Correct
-   approach at any scale; this is the most impactful single structural change before
-   adding more peers or running internet-table workloads.
+5. ~~**`RibSnapshot` split — eliminate gRPC/event-loop read contention**~~ — **Done (2026-06-11).**
+   `DaemonState` now holds `rib: Arc<RibSnapshot>`. gRPC handlers call `snapshot()` to clone
+   the `Arc` (O(1) atomic increment) and release the outer lock before iterating. The event
+   loop mutates via `Arc::make_mut` — zero-cost when refcount is 1, copy-on-write only when
+   a gRPC call is in-flight. See `DECISIONS.md` for full rationale.
+
+   **Known concern — CoW under long-lived gRPC streams**: `Arc::make_mut` is zero-cost
+   when refcount == 1 (no management-plane reader in flight — the common case). The O(N)
+   clone only fires when a snapshot `Arc` is held *while* the event loop mutates state.
+   Point-in-time calls (`ListRoutes`, `GetBestRoute`) release the snapshot immediately so
+   contention is microsecond-scale. The risk is a future long-lived streaming handler
+   (e.g. `WatchRoutes`) retaining a snapshot Arc across yield points — that would make
+   every UPDATE during the stream's lifetime a full RIB clone.
+
+   **Why `arc-swap` is not the right fix**: `arc-swap` requires cloning the full snapshot
+   on *every* write (clone → mutate → swap), making BGP UPDATE processing always O(N).
+   `Arc::make_mut` is O(1) in the common case and only pays the clone cost on actual
+   contention — strictly better for a write-heavy event loop with rare management reads.
+
+   **Correct mitigation**: ensure streaming handlers never hold a snapshot `Arc` across
+   `await` points. Each streamed event should carry its own data (already the case for
+   watch handlers via the broadcast channel). Audit any new streaming RPC before merging
+   to confirm it drops the snapshot before its first yield.
 
 #### Per-crate criterion benchmarks
 
