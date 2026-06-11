@@ -550,6 +550,35 @@ re-origination, attribute preservation (communities, local_pref, med), blackhole
 
 ## Cross-cutting
 
+### Design patterns / dependency-inversion improvements
+
+Three targeted changes that improve testability or robustness without over-engineering.
+Priority order matches the payoff-to-cost ratio.
+
+1. **`RibSnapshot` split** — see Performance item 5 above; listed there because it is
+   primarily a performance fix, but it also decouples gRPC reads from the event loop entirely,
+   which is an architectural improvement in its own right.
+
+2. **`Clock` trait for timer injection** (`pathvector-session`) — the `ConnectRetry` and
+   `HoldTimer` timers are currently wired to `tokio::time` directly. A two-impl trait
+   (`RealClock` / `MockClock`) would make timer-sensitive tests deterministic without
+   relying on `tokio::time::pause()` (global state). Low urgency now; becomes important
+   before adding route dampening (RFC 2439) or MRAI (RFC 4271 §9.2.1.1), both of which
+   have complex timing logic that is difficult to test reliably with real timers.
+
+   ```rust
+   pub trait Clock: Send + Sync + 'static {
+       fn now(&self) -> Instant;
+       fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+   }
+   ```
+
+3. **`RibView` trait for `propagate_prefix`** (`pathvectord`) — `propagate_prefix` currently
+   takes `&LocRib<Ipv4Addr>` directly. A narrow `RibView` trait (just `best(&Nlri) ->
+   Option<&Route>`) would make the function unit-testable with a trivial stub instead of
+   requiring a fully populated `LocRib`. Useful before best-path selection grows more
+   complex (ECMP, route reflector client preference, etc.). Defer until then.
+
 ### Architecture overview document
 
 **Done (2026-06-09).** `ARCHITECTURE.md` at the workspace root covers:
@@ -681,6 +710,17 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    releasing the write lock. At ~950k routes this is a multi-millisecond stall that blocks
    both the BGP event loop and all concurrent gRPC reads. Fix: generate the dump
    asynchronously, releasing the lock between batches.
+
+5. **`RibSnapshot` split — eliminate gRPC/event-loop read contention** — `ListRoutes`,
+   `GetBestRoute`, `ListCandidates`, and `WatchRoutes` snapshot calls currently hold the
+   `Arc<RwLock<DaemonState>>` read lock for the full duration of RIB iteration. This
+   contends with the event loop's write lock on every incoming UPDATE. Fix: separate the
+   read-heavy data (`LocRib`, `originated_routes`, peer states) into an `Arc<RibSnapshot>`
+   that is replaced atomically on each write. gRPC reads clone the `Arc` (near-zero cost)
+   and release the outer lock immediately; the event loop mutates at its own pace. Tradeoff:
+   one extra `Arc` clone per write path and slightly more complex update logic. Correct
+   approach at any scale; this is the most impactful single structural change before
+   adding more peers or running internet-table workloads.
 
 #### Per-crate criterion benchmarks
 
