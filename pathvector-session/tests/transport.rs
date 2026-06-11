@@ -857,8 +857,7 @@ async fn test_incoming_connection_while_established_is_rejected() {
         .unwrap();
 
     // No new session event — the existing Established session is unaffected.
-    let result =
-        tokio::time::timeout(Duration::from_millis(300), handle.next_event()).await;
+    let result = tokio::time::timeout(Duration::from_millis(300), handle.next_event()).await;
     assert!(
         result.is_err(),
         "expected no event after rejected incoming on Established session"
