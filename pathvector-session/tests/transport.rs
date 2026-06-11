@@ -831,7 +831,7 @@ async fn test_incoming_connection_while_established_is_rejected() {
     // Complete the outbound handshake to reach Established.
     let outbound_peer = tokio::spawn(async move {
         let (_r, _w) = accept_and_handshake(outbound_listener).await;
-        std::future::pending::<()>().await
+        std::future::pending::<()>().await;
     });
 
     let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
@@ -867,8 +867,8 @@ async fn test_incoming_connection_while_established_is_rejected() {
     discard_peer.abort();
 }
 
-/// An inbound connection arriving in OpenSent *before* the peer's OPEN has been
-/// received (peer_bgp_id is unknown) is accepted conservatively — the outbound
+/// An inbound connection arriving in `OpenSent` *before* the peer's OPEN has been
+/// received (`peer_bgp_id` is unknown) is accepted conservatively — the outbound
 /// connection is closed and the session restarts over the incoming one.
 #[tokio::test]
 async fn test_incoming_connection_unknown_peer_id_adopts_conservatively() {
