@@ -538,6 +538,11 @@ capacity 1024; slow subscribers receive `RecvError::Lagged` and must reconnect.
 CLI subcommands `route originate`, `route withdraw`, `route list-originated`, `watch routes
 [--peer]`, and `watch peers` all wired and tested (2026-06-10).
 
+e2e test suite added (2026-06-11): 12 tests in `e2e/tests/origination.rs` covering
+originated route propagation to GoBGP, batch origination, withdrawal, idempotent
+re-origination, attribute preservation (communities, local_pref, med), blackhole community
+(RFC 7999), coexistence with peer-learned routes, and no-op withdrawal of unknown prefix.
+
 **Remaining:**
 - Dashboard: replace 200ms polling ticker with `WatchRoutes` stream (separate follow-up)
 
