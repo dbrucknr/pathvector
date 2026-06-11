@@ -36,19 +36,20 @@ The decision process is not on the critical latency path even at 100 candidates.
 
 Measures `LocRib::insert` on a RIB pre-populated with N prefixes (2 competing peers
 each). Each iteration inserts a third peer's route into an existing prefix, triggering
-a best-path recompute on the updated candidate set.
+a best-path recompute on the 3-candidate set. The RIB is built once outside the clock
+and dropped after timing stops (`iter_custom`), so only the insert is measured.
 
 | RIB size | Time | Takeaway |
 |---|---|---|
-| 10k prefixes | 2.2 ms | Well below full table; insert is trie + HashMap |
-| 100k prefixes | 34.7 ms | ~⅒ of a full internet table |
-| 500k prefixes | 30.4 ms | ~½ of a full internet table |
+| 10k prefixes | 296 ns | HashMap + trie lookup; ~same as 100k |
+| 100k prefixes | 288 ns | Insert cost is nearly RIB-size-independent up to 100k |
+| 500k prefixes | 1.1 µs | Trie pressure starts showing at ~½ internet table |
 
-> **Note:** The 500k case appears faster than 100k because `BatchSize::LargeInput`
-> amortises the RIB rebuild cost differently at larger sizes — Criterion reconstructs
-> the RIB once per sample rather than once per iteration. The insert operation itself
-> is consistent; the variance is in setup overhead. The 100k measurement is the most
-> representative single-insert cost.
+At 10k and 100k entries the insert cost is effectively constant — the per-prefix
+HashMap lookup and 3-candidate `select_best` run in nanoseconds regardless of total
+RIB size. At 500k the prefix trie (RouteMap) begins to show memory-access pressure,
+pushing the cost to ~1 µs. Still well within convergence budget for a control-plane
+event loop.
 
 ---
 

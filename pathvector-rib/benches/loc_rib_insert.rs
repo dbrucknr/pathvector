@@ -1,6 +1,10 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    hint::black_box,
+    net::{IpAddr, Ipv4Addr},
+    time::Instant,
+};
 
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pathvector_rib::{LocRib, PeerId, Route, RouteBuilder};
 use pathvector_types::{AsPath, Asn, LocalPref, NextHop, Nlri, Origin, PeerType};
 
@@ -44,15 +48,24 @@ fn bench_loc_rib_insert(c: &mut Criterion) {
 
     for n in [10_000usize, 100_000, 500_000] {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            b.iter_batched(
-                || build_rib(n),
-                |mut rib| {
-                    // Insert a third peer's route for prefix 0 — triggers best-path
-                    // recompute on a prefix that already has two candidates.
-                    rib.insert(peer(3), make_route(0, 300, 1, PeerType::External));
-                },
-                BatchSize::LargeInput,
-            );
+            // iter_custom lets us build the RIB once outside the clock and drop
+            // it after the clock stops — iter_batched includes drop time in the
+            // measurement, which dominates at large N and swamps the insert cost.
+            b.iter_custom(|iters| {
+                let mut rib = build_rib(n);
+
+                // Alternate local_pref so best-path changes on every other
+                // iteration, keeping select_best fully exercised throughout.
+                let start = Instant::now();
+                for i in 0..(iters as usize) {
+                    let lp = if i % 2 == 0 { 300u32 } else { 50u32 };
+                    black_box(rib.insert(peer(3), make_route(0, lp, 1, PeerType::External)));
+                }
+                let elapsed = start.elapsed();
+
+                drop(rib); // outside the clock
+                elapsed
+            });
         });
     }
 
