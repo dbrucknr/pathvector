@@ -18,7 +18,20 @@ ipnetx            = { workspace = true }
 routemap          = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+criterion = { workspace = true }
+proptest  = { workspace = true }
+
+[[bench]]
+name    = "select_best"
+harness = false
+
+[[bench]]
+name    = "loc_rib_insert"
+harness = false
+
+[[bench]]
+name    = "outbound_pipeline"
+harness = false
 
 [lints]
 workspace = true

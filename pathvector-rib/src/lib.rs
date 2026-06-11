@@ -4,6 +4,7 @@ pub mod adj_rib_in;
 pub mod adj_rib_out;
 pub mod best_path;
 pub mod loc_rib;
+pub mod outbound;
 
 mod peer;
 mod route;
