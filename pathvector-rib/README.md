@@ -65,13 +65,15 @@ RFC 4271 §9.1. The steps implemented in this crate:
 | Step | Criterion | Winner |
 |---|---|---|
 | 2 | `LOCAL_PREF` | higher (missing → treated as 100) |
-| 4 | AS path length | shorter |
+| 3/7 | Route source | locally originated > eBGP > iBGP |
+| 4 | AS path length | shorter (confederation segments count as 0) |
 | 5 | `ORIGIN` | lower (IGP=0 best, then EGP=1, then INCOMPLETE=2) |
 | 6 | `MED` | lower (missing → treated as 0) |
+| 9 | Route age | oldest eBGP route (only when both candidates are eBGP) |
 | 10 | Peer IP address | lower (final tie-breaker) |
 
-Steps 1, 3, 7, 8, and 9 require information not available at the RIB layer
-(IGP reachability, peer session type, route age). See `TODO.md` for details.
+Steps 1 (next-hop reachability) and 8 (IGP metric to next-hop) require IGP/FIB
+integration and are deferred. See `TODO.md` for details.
 
 ---
 
@@ -85,6 +87,43 @@ Steps 1, 3, 7, 8, and 9 require information not available at the RIB layer
 | [`AdjRibIn<A>`] | Per-peer inbound routing table (pre-policy) |
 | [`LocRib<A>`] | Local routing table with best-path selection |
 | [`AdjRibOut<A>`] | Per-peer outbound routing table (post-policy) |
+
+---
+
+## Benchmarks
+
+Three Criterion benchmark groups measure the control-plane hot paths. Run them with:
+
+```bash
+cargo bench -p pathvector-rib
+```
+
+To run a single group:
+
+```bash
+cargo bench -p pathvector-rib -- select_best
+cargo bench -p pathvector-rib -- loc_rib_insert
+cargo bench -p pathvector-rib -- outbound_pipeline
+```
+
+HTML reports are written to `target/criterion/` when gnuplot or the plotters backend
+is available. To compare two runs (e.g. before and after a change):
+
+```bash
+cargo bench -p pathvector-rib -- --save-baseline before
+# make your change
+cargo bench -p pathvector-rib -- --baseline before
+```
+
+### Groups
+
+| Group | Sizes | What it measures |
+|---|---|---|
+| `select_best` | 2 / 10 / 100 candidates | RFC 4271 §9.1 10-step comparison loop across competing routes for one prefix |
+| `loc_rib_insert` | 10k / 100k / 500k prefixes | `LocRib::insert` + best-path recompute; simulates a RIB of increasing size up to ~½ a full internet table |
+| `outbound_pipeline` | 1 / 10 / 50 peers | `prepare_outbound` + `AdjRibOut::insert` per peer; simulates the Update-Send Process for one prefix change |
+
+All benchmarks are deterministic (no random input) and sized for M2 Max hardware.
 
 ---
 

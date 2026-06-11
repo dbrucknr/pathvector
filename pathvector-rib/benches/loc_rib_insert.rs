@@ -42,7 +42,7 @@ fn build_rib(n: usize) -> LocRib<Ipv4Addr> {
 fn bench_loc_rib_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("loc_rib_insert");
 
-    for n in [1_000usize, 10_000, 100_000] {
+    for n in [10_000usize, 100_000, 500_000] {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || build_rib(n),

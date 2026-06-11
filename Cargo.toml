@@ -41,7 +41,7 @@ routemap   = "0.1.3"
 tokio      = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 proptest   = "1"
-criterion  = { version = "0.5", features = ["html_reports"] }
+criterion  = { version = "0.8.2", features = ["html_reports"] }
 tonic            = { version = "0.14", features = ["transport"] }
 tonic-prost      = "0.14"
 tonic-reflection = "0.14"
