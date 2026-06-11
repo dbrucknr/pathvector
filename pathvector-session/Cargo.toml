@@ -20,8 +20,13 @@ tokio-util       = { workspace = true }
 tracing          = "0.1"
 
 [dev-dependencies]
-proptest = { workspace = true }
-tokio    = { version = "1", features = ["net", "io-util", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
+criterion = { workspace = true }
+proptest  = { workspace = true }
+tokio     = { version = "1", features = ["net", "io-util", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
+
+[[bench]]
+name    = "codec"
+harness = false
 
 [lints]
 workspace = true
