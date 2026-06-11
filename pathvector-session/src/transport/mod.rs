@@ -113,6 +113,10 @@ pub trait SessionHandle: Send + 'static {
     /// Clone the stop-command sender so the event loop can close a session
     /// whose outbound UPDATE channel overflowed.
     fn stop_sender(&self) -> mpsc::Sender<SessionCommand>;
+
+    /// Clone the command sender for delivering an accepted inbound TCP
+    /// connection to this session (RFC 4271 §6.8 collision detection).
+    fn incoming_sender(&self) -> mpsc::Sender<SessionCommand>;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -142,6 +146,10 @@ pub enum SessionCommand {
     Start,
     /// Send CEASE NOTIFICATION and drop the connection.
     Stop,
+    /// An inbound TCP connection from this peer was accepted by the daemon's
+    /// BGP listener.  The session applies RFC 4271 §6.8 collision detection
+    /// and either adopts the incoming connection or discards it.
+    IncomingConnection(TcpStream),
 }
 
 /// Events emitted by a session to its caller.
@@ -206,6 +214,10 @@ impl SessionHandle for SpawnedSessionHandle {
     /// consistent peer view is to close the session and let it re-establish
     /// (which triggers a full-table dump from a clean `AdjRibOut`).
     fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+        self.cmd_tx.clone()
+    }
+
+    fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
         self.cmd_tx.clone()
     }
 }
@@ -369,10 +381,16 @@ impl<T: BgpTransport> Session<T> {
             tokio::select! {
                 biased;
 
-                cmd = self.cmd_rx.recv() => return match cmd {
-                    Some(SessionCommand::Start) => FsmInput::ManualStart,
+                cmd = self.cmd_rx.recv() => match cmd {
+                    Some(SessionCommand::Start) => return FsmInput::ManualStart,
                     // None = handle dropped → treat as operator stop.
-                    Some(SessionCommand::Stop) | None => FsmInput::ManualStop,
+                    Some(SessionCommand::Stop) | None => return FsmInput::ManualStop,
+                    Some(SessionCommand::IncomingConnection(stream)) => {
+                        if let Some(input) = self.handle_incoming_connection(stream).await {
+                            return input;
+                        }
+                        // Won the collision: incoming rejected, outbound continues.
+                    }
                 },
 
                 result = recv_connect(&mut self.connect_task) => {
@@ -432,6 +450,70 @@ impl<T: BgpTransport> Session<T> {
                     }
                     // Not yet Established, or send succeeded — loop.
                 }
+            }
+        }
+    }
+
+    /// RFC 4271 §6.8 connection collision detection.
+    ///
+    /// Called when the daemon's listener accepts an inbound TCP connection from
+    /// this peer.  Returns `Some(FsmInput)` when the session should adopt the
+    /// incoming connection (the FSM will process the input normally), or `None`
+    /// when the incoming connection was rejected and the outbound connection
+    /// should continue undisturbed.
+    async fn handle_incoming_connection(&mut self, stream: TcpStream) -> Option<FsmInput> {
+        use crate::fsm::State;
+        match self.fsm.state() {
+            // No active outbound attempt — accept the incoming connection directly.
+            State::Idle | State::Connect | State::Active => {
+                if let Some(factory) = &self.connect_factory {
+                    self.transport = Some(factory(stream));
+                }
+                Some(FsmInput::TcpConnected)
+            }
+
+            // Collision: compare BGP identifiers (RFC 4271 §6.8).
+            // local > peer  →  close outbound, adopt incoming (CollisionDetected)
+            // local < peer  →  keep outbound, discard incoming (return None)
+            // unknown peer  →  conservative: adopt incoming
+            State::OpenSent | State::OpenConfirm => {
+                let should_close_outbound = self
+                    .fsm
+                    .peer_bgp_id()
+                    .is_none_or(|peer_id| self.config.local_bgp_id > peer_id);
+
+                if should_close_outbound {
+                    tracing::info!(
+                        peer = %self.config.peer_addr,
+                        local_bgp_id = %self.config.local_bgp_id,
+                        "BGP collision: local BGP ID higher, closing outbound and adopting incoming"
+                    );
+                    let outputs = self.fsm.process(FsmInput::CollisionDetected);
+                    self.execute(outputs).await;
+                    if let Some(factory) = &self.connect_factory {
+                        self.transport = Some(factory(stream));
+                    }
+                    Some(FsmInput::TcpConnected)
+                } else {
+                    tracing::info!(
+                        peer = %self.config.peer_addr,
+                        local_bgp_id = %self.config.local_bgp_id,
+                        peer_bgp_id = %self.fsm.peer_bgp_id().unwrap(),
+                        "BGP collision: peer BGP ID higher, keeping outbound and rejecting incoming"
+                    );
+                    drop(stream);
+                    None
+                }
+            }
+
+            // Already established — reject the incoming connection.
+            State::Established => {
+                tracing::warn!(
+                    peer = %self.config.peer_addr,
+                    "BGP collision: already established, rejecting duplicate incoming connection"
+                );
+                drop(stream);
+                None
             }
         }
     }

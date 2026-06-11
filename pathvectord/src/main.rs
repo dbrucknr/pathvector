@@ -951,12 +951,18 @@ where
     F: Fn(SessionConfig) -> H,
 {
     let grpc_port = cfg.daemon.grpc_port;
-    let (state, event_rx, stop_senders) = build_daemon(&cfg, spawn_fn).await;
+    let bgp_port = cfg.daemon.bgp_port;
+    let (state, event_rx, stop_senders, incoming_senders) = build_daemon(&cfg, spawn_fn).await;
 
     // Spawn the gRPC management API server alongside the BGP event loop.
     let grpc_state = Arc::clone(&state);
     tokio::spawn(async move {
         grpc::serve(grpc_state, grpc_port).await;
+    });
+
+    // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
+    tokio::spawn(async move {
+        run_bgp_listener(bgp_port, incoming_senders).await;
     });
 
     run_event_loop(event_rx, state, stop_senders).await;
@@ -984,6 +990,7 @@ pub(crate) async fn build_daemon<H, F>(
     Arc<RwLock<DaemonState>>,
     mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
     HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
+    HashMap<IpAddr, mpsc::Sender<SessionCommand>>,
 )
 where
     H: SessionHandle,
@@ -998,6 +1005,8 @@ where
     // outbound UPDATE channel overflowed.  The session handle itself is moved
     // into the per-peer forwarding task, so this is the only retained handle.
     let mut stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
+    // Incoming senders: keyed by IpAddr for O(1) lookup in the BGP listener.
+    let mut incoming_senders: HashMap<IpAddr, mpsc::Sender<SessionCommand>> = HashMap::new();
 
     let local_capabilities = vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
@@ -1021,6 +1030,7 @@ where
 
         update_senders.insert(peer.address, handle.update_sender());
         stop_senders.insert(peer.address, handle.stop_sender());
+        incoming_senders.insert(IpAddr::V4(peer.address), handle.incoming_sender());
 
         let peer_addr = peer.address;
         let tx = event_tx.clone();
@@ -1043,7 +1053,51 @@ where
         local_capabilities,
     )));
 
-    (state, event_rx, stop_senders)
+    (state, event_rx, stop_senders, incoming_senders)
+}
+
+/// BGP TCP listener for inbound connections (RFC 4271 §6.8).
+///
+/// Binds on `0.0.0.0:<bgp_port>` and forwards each accepted connection to the
+/// session task for the corresponding peer.  Unknown peers (not in
+/// `incoming_senders`) have their connection dropped immediately — the TCP RST
+/// tells the remote peer to back off.
+///
+/// The listener runs for the lifetime of the daemon.  If `bind()` fails (e.g.,
+/// port 179 without `CAP_NET_BIND_SERVICE`), the error is logged and the
+/// listener exits; the daemon continues operating in dial-only mode.
+async fn run_bgp_listener(
+    bgp_port: u16,
+    incoming_senders: HashMap<IpAddr, mpsc::Sender<SessionCommand>>,
+) {
+    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], bgp_port));
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => {
+            tracing::info!(port = bgp_port, "BGP listener started");
+            l
+        }
+        Err(e) => {
+            tracing::error!(port = bgp_port, error = %e, "BGP listener failed to bind; operating in dial-only mode");
+            return;
+        }
+    };
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer_addr)) => {
+                if let Some(tx) = incoming_senders.get(&peer_addr.ip()) {
+                    tracing::debug!(peer = %peer_addr, "accepted inbound BGP connection");
+                    let _ = tx.send(SessionCommand::IncomingConnection(stream)).await;
+                } else {
+                    tracing::debug!(peer = %peer_addr, "rejected inbound BGP connection from unknown peer");
+                    // stream dropped here → TCP RST
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "BGP listener accept error");
+            }
+        }
+    }
 }
 
 /// Core BGP event loop.
@@ -4592,6 +4646,10 @@ mod run_with_tests {
         fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
             self.stop_tx.clone()
         }
+
+        fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+            self.stop_tx.clone()
+        }
     }
 
     /// Test-side view of a spawned mock session.
@@ -4636,6 +4694,7 @@ mod run_with_tests {
                 bgp_id: Ipv4Addr::new(10, 0, 0, 1),
                 hold_time: 90,
                 grpc_port: 0,
+                bgp_port: 0, // 0 = OS assigns; listener will fail to bind but tests don't need it
             },
             peers: peer_ips
                 .iter()
@@ -4685,7 +4744,7 @@ mod run_with_tests {
         let peer_b = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
-        let (_state, _rx, stop_senders) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, stop_senders, _) = build_daemon(&cfg, spawn_fn).await;
         assert!(stop_senders.contains_key(&peer_a));
         assert!(stop_senders.contains_key(&peer_b));
     }
@@ -4697,7 +4756,7 @@ mod run_with_tests {
         let peer_a = Ipv4Addr::new(10, 0, 0, 1);
         let (spawn_fn, peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_a, 65002)]);
-        let (_state, mut event_rx, _stop) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, mut event_rx, _stop, _) = build_daemon(&cfg, spawn_fn).await;
 
         let event_tx = peers.lock().unwrap()[0].event_tx.clone();
         event_tx.send(SessionEvent::Terminated).await.unwrap();
@@ -4715,7 +4774,7 @@ mod run_with_tests {
         let peer_b = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
-        let (state, _rx, _stop) = build_daemon(&cfg, spawn_fn).await;
+        let (state, _rx, _stop, _) = build_daemon(&cfg, spawn_fn).await;
         let s = state.read().await;
         assert!(s.update_senders.contains_key(&peer_a));
         assert!(s.update_senders.contains_key(&peer_b));
@@ -4727,7 +4786,7 @@ mod run_with_tests {
     async fn build_daemon_no_peers_closes_event_channel() {
         let (spawn_fn, peers) = make_mock_spawn();
         let cfg = make_config(&[]);
-        let (_state, mut event_rx, _stop) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, mut event_rx, _stop, _) = build_daemon(&cfg, spawn_fn).await;
         assert_eq!(peers.lock().unwrap().len(), 0);
         // No senders remain; recv() returns None immediately.
         assert!(event_rx.recv().await.is_none());

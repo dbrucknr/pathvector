@@ -16,7 +16,9 @@ use pathvector_session::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
     UpdateMessage,
 };
-use pathvector_session::transport::{SessionConfig, SessionEvent, SessionHandle, spawn};
+use pathvector_session::transport::{
+    SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -554,4 +556,215 @@ async fn test_open_with_wrong_peer_as_does_not_establish() {
     }
 
     peer.await.expect("peer task panicked");
+}
+
+// ── RFC 4271 §6.8 collision detection ─────────────────────────────────────────
+
+/// Helper: complete the BGP open/keepalive handshake *from the peer side* over
+/// an already-connected `TcpStream` (as opposed to `accept_and_handshake` which
+/// waits for a listener accept first).
+async fn peer_handshake_on_stream(
+    stream: tokio::net::TcpStream,
+    peer_as: u32,
+    peer_bgp_id: Ipv4Addr,
+) -> (
+    FramedRead<tokio::net::tcp::OwnedReadHalf, BgpCodec>,
+    FramedWrite<tokio::net::tcp::OwnedWriteHalf, BgpCodec>,
+) {
+    let (r, w) = stream.into_split();
+    let mut reader = FramedRead::new(r, BgpCodec::new());
+    let mut writer = FramedWrite::new(w, BgpCodec::new());
+
+    // Receive OPEN from the session under test.
+    let msg = reader.next().await.unwrap().unwrap();
+    assert!(matches!(msg, BgpMessage::Open(_)), "expected OPEN");
+
+    // Respond with our OPEN.
+    writer
+        .send(BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: u16::try_from(peer_as).unwrap_or(23456),
+            hold_time: 90,
+            bgp_id: peer_bgp_id,
+            capabilities: vec![Capability::FourByteAsn(peer_as)],
+        }))
+        .await
+        .unwrap();
+
+    // Receive KEEPALIVE sent by the session.
+    let msg = reader.next().await.unwrap().unwrap();
+    assert!(matches!(msg, BgpMessage::Keepalive), "expected KEEPALIVE");
+
+    // Send our KEEPALIVE to complete Established.
+    writer.send(BgpMessage::Keepalive).await.unwrap();
+
+    (reader, writer)
+}
+
+/// Collision where `local_bgp_id > peer_bgp_id`: the session must close its
+/// outbound connection, adopt the incoming one, and still reach Established.
+#[tokio::test]
+async fn test_collision_local_wins_adopts_incoming() {
+    // Session config: local BGP ID 10.0.0.2 (higher than peer 10.0.0.1).
+    let (outbound_listener, outbound_addr) = loopback_listener().await;
+    let config = SessionConfig {
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+        peer_as: Some(65002),
+        ..local_config(outbound_addr)
+    };
+    let mut handle = spawn(config);
+    handle.start().await;
+
+    // Simulate the outbound connection being accepted by the peer — drive it
+    // far enough that the session reaches OpenConfirm (peer OPEN received).
+    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 1); // lower than local
+    let outbound_peer = tokio::spawn(async move {
+        let (stream, _) = outbound_listener.accept().await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = FramedRead::new(r, BgpCodec::new());
+        let mut writer = FramedWrite::new(w, BgpCodec::new());
+
+        // Receive the OPEN the session sends.
+        let msg = reader.next().await.unwrap().unwrap();
+        assert!(matches!(msg, BgpMessage::Open(_)));
+
+        // Send our OPEN — session enters OpenConfirm and stores peer_bgp_id.
+        writer
+            .send(BgpMessage::Open(OpenMessage {
+                version: 4,
+                my_as: 65002,
+                hold_time: 90,
+                bgp_id: peer_bgp_id,
+                capabilities: vec![Capability::FourByteAsn(65002)],
+            }))
+            .await
+            .unwrap();
+
+        // Hold the connection open until the test tears it down.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop((reader, writer));
+    });
+
+    // Wait until Established would normally happen OR give the session time
+    // to reach OpenConfirm (peer OPEN received → peer_bgp_id is set).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Now simulate the daemon delivering an inbound TCP connection from the peer.
+    // This triggers collision detection: local (10.0.0.2) > peer (10.0.0.1),
+    // so the session should close the outbound and adopt this incoming stream.
+    let (incoming_listener, incoming_addr) = loopback_listener().await;
+    let incoming_tx = handle.incoming_sender();
+
+    // Simulate the peer dialling US: connect to a listener we control.
+    let incoming_peer = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(incoming_addr).await.unwrap();
+        // Complete the handshake on this new connection.
+        peer_handshake_on_stream(stream, 65002, peer_bgp_id).await
+    });
+
+    // Accept the "incoming from peer" stream and deliver it to the session.
+    let (incoming_stream, _) = incoming_listener.accept().await.unwrap();
+    incoming_tx
+        .send(SessionCommand::IncomingConnection(incoming_stream))
+        .await
+        .unwrap();
+
+    // The session must reach Established (over the new connection).
+    let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
+        .await
+        .expect("timed out waiting for Established")
+        .expect("session channel closed");
+    assert!(
+        matches!(event, SessionEvent::Established(_)),
+        "expected Established, got {event:?}"
+    );
+
+    outbound_peer.abort();
+    incoming_peer.abort();
+}
+
+/// Collision where `local_bgp_id < peer_bgp_id`: the session must keep its
+/// outbound connection and discard the incoming one, then reach Established
+/// normally over the outbound.
+#[tokio::test]
+async fn test_collision_peer_wins_keeps_outbound() {
+    // Session config: local BGP ID 10.0.0.1 (lower than peer 10.0.0.2).
+    let (outbound_listener, outbound_addr) = loopback_listener().await;
+    let config = SessionConfig {
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        peer_as: Some(65002),
+        ..local_config(outbound_addr)
+    };
+    let mut handle = spawn(config);
+    handle.start().await;
+
+    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2); // higher than local
+
+    // Accept the outbound connection and drive through full handshake.
+    let outbound_peer = tokio::spawn(async move {
+        let (stream, _) = outbound_listener.accept().await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = FramedRead::new(r, BgpCodec::new());
+        let mut writer = FramedWrite::new(w, BgpCodec::new());
+
+        // Receive OPEN.
+        let msg = reader.next().await.unwrap().unwrap();
+        assert!(matches!(msg, BgpMessage::Open(_)));
+
+        // Send our OPEN (higher BGP ID — session should keep this connection).
+        writer
+            .send(BgpMessage::Open(OpenMessage {
+                version: 4,
+                my_as: 65002,
+                hold_time: 90,
+                bgp_id: peer_bgp_id,
+                capabilities: vec![Capability::FourByteAsn(65002)],
+            }))
+            .await
+            .unwrap();
+
+        // Receive KEEPALIVE.
+        let msg = reader.next().await.unwrap().unwrap();
+        assert!(matches!(msg, BgpMessage::Keepalive));
+
+        // Complete handshake.
+        writer.send(BgpMessage::Keepalive).await.unwrap();
+
+        // Hold the connection open.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop((reader, writer));
+    });
+
+    // Give the session time to receive the peer OPEN (enter OpenConfirm).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Deliver a spurious inbound connection — should be silently discarded.
+    let (discard_listener, discard_addr) = loopback_listener().await;
+    let incoming_tx = handle.incoming_sender();
+
+    // "Peer" tries to open a second connection to us.
+    let discard_peer = tokio::spawn(async move {
+        // Just connect — the stream will be dropped by the session immediately.
+        let _stream = tokio::net::TcpStream::connect(discard_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    let (incoming_stream, _) = discard_listener.accept().await.unwrap();
+    incoming_tx
+        .send(SessionCommand::IncomingConnection(incoming_stream))
+        .await
+        .unwrap();
+
+    // Session must still reach Established over the original outbound connection.
+    let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
+        .await
+        .expect("timed out waiting for Established")
+        .expect("session channel closed");
+    assert!(
+        matches!(event, SessionEvent::Established(_)),
+        "expected Established, got {event:?}"
+    );
+
+    outbound_peer.abort();
+    discard_peer.abort();
 }

@@ -65,6 +65,12 @@ pub enum FsmInput {
     TcpConnected,
     /// TCP connection attempt failed or was refused.
     TcpFailed,
+    /// An inbound TCP connection arrived while an outbound connection is in
+    /// progress and the local BGP ID is higher than the peer's.  RFC 4271 §6.8:
+    /// close the outbound connection and restart over the incoming one.  Unlike
+    /// `TcpFailed`, this does NOT emit [`FsmOutput::SessionTerminated`] —
+    /// the collision is a physical-layer event, not a session teardown.
+    CollisionDetected,
     /// A complete BGP message was received from the peer.
     MessageReceived(BgpMessage),
 }
@@ -180,6 +186,16 @@ impl Fsm {
     #[must_use]
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// BGP Identifier received in the peer's OPEN message.
+    ///
+    /// `None` until the peer's OPEN has been validated (i.e., before
+    /// [`State::OpenConfirm`]).  Used by the transport layer to resolve RFC
+    /// 4271 §6.8 connection collisions.
+    #[must_use]
+    pub fn peer_bgp_id(&self) -> Option<Ipv4Addr> {
+        self.peer_open.as_ref().map(|o| o.bgp_id)
     }
 
     /// Feed one input event, advance the FSM, and return the ordered list of
@@ -299,6 +315,13 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
+            // RFC 4271 §6.8: collision — close outbound, restart over incoming.
+            // Transition to Active so the next TcpConnected is valid.
+            FsmInput::CollisionDetected => {
+                self.peer_open = None;
+                self.state = State::Active;
+                vec![FsmOutput::StopHoldTimer, FsmOutput::CloseTcpConnection]
+            }
             // Any other message type in OpenSent is unexpected (RFC 4271 §6.5 subcode 1).
             FsmInput::MessageReceived(_) => {
                 self.state = State::Idle;
@@ -378,6 +401,17 @@ impl Fsm {
                         error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
                         data: vec![],
                     })),
+                    FsmOutput::CloseTcpConnection,
+                ]
+            }
+            // RFC 4271 §6.8: collision — close outbound, restart over incoming.
+            FsmInput::CollisionDetected => {
+                self.peer_open = None;
+                self.negotiated_hold_time = 0;
+                self.state = State::Active;
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
                 ]
             }
@@ -1883,6 +1917,83 @@ mod tests {
             fsm.state(),
             State::OpenConfirm,
             "session should proceed to OpenConfirm"
+        );
+    }
+
+    // ── RFC 4271 §6.8 collision detection ─────────────────────────────────────
+
+    fn open_sent_fsm(local_bgp_id: Ipv4Addr) -> Fsm {
+        let mut fsm = Fsm::new(FsmConfig {
+            local_bgp_id,
+            ..default_config()
+        });
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        assert_eq!(fsm.state(), State::OpenSent);
+        fsm
+    }
+
+    fn open_confirm_fsm(local_bgp_id: Ipv4Addr, peer_bgp_id: Ipv4Addr) -> Fsm {
+        let mut fsm = open_sent_fsm(local_bgp_id);
+        fsm.process(FsmInput::MessageReceived(BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: peer_bgp_id,
+            capabilities: vec![],
+        })));
+        assert_eq!(fsm.state(), State::OpenConfirm);
+        fsm
+    }
+
+    #[test]
+    fn test_peer_bgp_id_none_before_open_received() {
+        let fsm = open_sent_fsm(Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(fsm.peer_bgp_id(), None);
+    }
+
+    #[test]
+    fn test_peer_bgp_id_set_after_open_received() {
+        let fsm = open_confirm_fsm(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(fsm.peer_bgp_id(), Some(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    #[test]
+    fn test_collision_detected_in_open_sent_resets_to_active() {
+        let mut fsm = open_sent_fsm(Ipv4Addr::new(10, 0, 0, 2));
+        let outputs = fsm.process(FsmInput::CollisionDetected);
+        assert_eq!(fsm.state(), State::Active);
+        assert!(fsm.peer_bgp_id().is_none());
+        // Must stop hold timer and close connection — must NOT emit SessionTerminated.
+        assert!(outputs.contains(&FsmOutput::StopHoldTimer));
+        assert!(outputs.contains(&FsmOutput::CloseTcpConnection));
+        assert!(!outputs.contains(&FsmOutput::SessionTerminated));
+    }
+
+    #[test]
+    fn test_collision_detected_in_open_confirm_resets_to_active() {
+        let mut fsm = open_confirm_fsm(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1));
+        let outputs = fsm.process(FsmInput::CollisionDetected);
+        assert_eq!(fsm.state(), State::Active);
+        assert!(fsm.peer_bgp_id().is_none());
+        assert!(outputs.contains(&FsmOutput::StopHoldTimer));
+        assert!(outputs.contains(&FsmOutput::StopKeepaliveTimer));
+        assert!(outputs.contains(&FsmOutput::CloseTcpConnection));
+        assert!(!outputs.contains(&FsmOutput::SessionTerminated));
+    }
+
+    #[test]
+    fn test_collision_detected_followed_by_tcp_connected_reaches_open_sent() {
+        // After CollisionDetected → Active, TcpConnected must be valid and send OPEN.
+        let mut fsm = open_confirm_fsm(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1));
+        fsm.process(FsmInput::CollisionDetected);
+        assert_eq!(fsm.state(), State::Active);
+        let outputs = fsm.process(FsmInput::TcpConnected);
+        assert_eq!(fsm.state(), State::OpenSent);
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, FsmOutput::SendMessage(BgpMessage::Open(_))))
         );
     }
 

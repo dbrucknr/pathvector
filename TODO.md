@@ -324,18 +324,18 @@ offer:
 
 - MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-- Connection collision detection — when both peers dial simultaneously, the router with the higher BGP ID keeps its outbound connection; FSM has the `bgp_id` field but no collision logic
+- ~~Connection collision detection~~ — **Done (2026-06-11).** `FsmInput::CollisionDetected` resets the FSM to Active without emitting `SessionTerminated` (no RIB churn). The transport layer compares `local_bgp_id` vs `peer_bgp_id` (from the stored peer OPEN) and either adopts the incoming stream or drops it. `pathvectord` spawns a `TcpListener` on `bgp_port` (default 179, configurable) and routes accepted connections to per-peer sessions via `SessionCommand::IncomingConnection`. Tests: `test_collision_detected_in_open_sent/open_confirm_resets_to_active`, `test_collision_local_wins_adopts_incoming`, `test_collision_peer_wins_keeps_outbound`.
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 
-### Hold timer expiry — active FSM enforcement
+### Hold timer expiry — active FSM enforcement — **Done**
 
-The FSM tracks hold time but does not currently fire a `HoldTimerExpired`
-event when the timer elapses without a KEEPALIVE or UPDATE arriving. RFC 4271
-§8.5.3 requires sending `NOTIFICATION(Hold Timer Expired)` and transitioning
-to Idle. Without this, a peer that silently stops sending KEEPALIVEs is never
-detected as dead — the session stays open indefinitely. Implement as a
-`tokio::time::sleep` arm in `wait_for_input` alongside the existing keepalive
-interval arm.
+The hold timer is fully implemented and wired. `wait_for_input` fires
+`HoldTimerExpired` when `hold_deadline` elapses; `on_established` sends
+`NOTIFICATION(HoldTimerExpired)`, stops timers, closes TCP, and emits
+`SessionTerminated`. KEEPALIVE and UPDATE receipt call `reset_hold_if_active()`
+to restart the deadline. Covered by `test_hold_timer_expired_in_established`,
+`test_keepalive_message_in_established_resets_hold_timer`, and the interop test
+`test_hold_timer_fires_terminates_session` over real TCP.
 
 ### RFC 7606 — Revised UPDATE error handling
 

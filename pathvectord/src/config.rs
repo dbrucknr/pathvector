@@ -11,6 +11,7 @@ use serde::Deserialize;
 /// bgp_id    = "127.0.0.2"
 /// hold_time = 90          # optional, default 90 s
 /// grpc_port = 50051       # optional, default 50051
+/// bgp_port  = 179         # optional, default 179 (use 1179+ without CAP_NET_BIND_SERVICE)
 ///
 /// [[peers]]
 /// address   = "127.0.0.1"
@@ -37,6 +38,13 @@ pub struct DaemonConfig {
     /// starts when the daemon runs).
     #[serde(default = "default_grpc_port")]
     pub grpc_port: u16,
+    /// TCP port on which pathvectord listens for inbound BGP connections.
+    ///
+    /// Peers that also dial out will trigger RFC 4271 §6.8 collision detection.
+    /// Defaults to `179`.  Set to a non-privileged port (e.g. `1179`) for
+    /// development or testing without `CAP_NET_BIND_SERVICE`.
+    #[serde(default = "default_bgp_listen_port")]
+    pub bgp_port: u16,
 }
 
 fn default_hold_time() -> u16 {
@@ -45,6 +53,10 @@ fn default_hold_time() -> u16 {
 
 fn default_grpc_port() -> u16 {
     50051
+}
+
+fn default_bgp_listen_port() -> u16 {
+    179
 }
 
 /// TOML representation of the import policy default action for a peer.

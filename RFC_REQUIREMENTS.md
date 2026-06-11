@@ -119,7 +119,7 @@ The core protocol. Every crate is shaped by it.
 | Unhandled inputs in non-Established states are no-ops | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_unhandled_input_in_connect_is_noop`, `test_unhandled_input_in_active_is_noop`, `test_unhandled_input_in_open_sent_is_noop`, `test_unhandled_input_in_open_confirm_is_noop` |
 | Open hold timer (240 s) while awaiting peer OPEN in OpenSent | `pathvector-session/src/fsm/mod.rs` | ⚠️ | `test_hold_timer_expired_in_open_sent` (no interop/e2e; 240 s timer impractical to hold in integration tests) |
 | Peer AS validation skipped when peer_as is unconfigured | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_open_accepted_when_peer_as_unconfigured` |
-| Connection collision detection (higher BGP ID keeps outbound connection) | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| Connection collision detection (higher BGP ID keeps outbound connection) | `pathvector-session/src/fsm/mod.rs`, `pathvector-session/src/transport/mod.rs`, `pathvectord/src/main.rs` | ✅ | `test_collision_detected_in_open_sent_resets_to_active`, `test_collision_detected_in_open_confirm_resets_to_active`, `test_collision_detected_followed_by_tcp_connected_reaches_open_sent`, `interop: test_collision_local_wins_adopts_incoming`, `interop: test_collision_peer_wins_keeps_outbound` |
 | Full session lifecycle over real TCP sockets | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_session_reaches_established`, `e2e: session_reaches_established` |
 | Hold timer fires over real TCP → session terminated | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_hold_timer_fires_terminates_session` |
 | Peer disconnect detected and emits SessionTerminated | `pathvector-session/tests/transport.rs` | ✅ | `interop: test_peer_disconnect_emits_terminated` |
@@ -284,7 +284,7 @@ misconfiguration rather than a normal connection collision.
 | Requirement | Module | Status | Verified by |
 |---|---|---|---|
 | BGP Identifier MUST be unique within the local AS | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
-| iBGP peer with identical BGP ID treated as routing loop, not a normal collision | `pathvector-session/src/fsm/mod.rs` | ❌ | — |
+| iBGP peer with identical BGP ID treated as routing loop, not a normal collision | `pathvector-session/src/fsm/mod.rs` | ✅ | `test_duplicate_ibgp_bgp_id_sends_bad_bgp_identifier` (RFC 6286) |
 
 ---
 
@@ -525,7 +525,7 @@ the field is omitted; iBGP peers default to `Accept`. An explicit TOML value alw
 
 | RFC | Subject | Overall Status |
 |---|---|---|
-| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 and collision detection outstanding; Update-Send Process e2e-verified (announce, withdraw, export policy, attribute transforms); LOCAL_PREF stripping unit-tested but not directly observable e2e; session lifecycle and route announce/withdraw validated e2e against GoBGP |
+| RFC 4271 | BGP-4 core protocol | ⚠️ Best-path steps 1/3/8/9 outstanding; collision detection done (2026-06-11); Update-Send Process e2e-verified (announce, withdraw, export policy, attribute transforms); LOCAL_PREF stripping unit-tested but not directly observable e2e; session lifecycle and route announce/withdraw validated e2e against GoBGP |
 | RFC 2918 | Route Refresh | ✅ Message, capability, and receive-guard (negotiation check) implemented |
 | RFC 3392 | Capability Advertisement | ✅ Superseded by RFC 5492 — wire format fully implemented |
 | RFC 4760 | Multiprotocol Extensions | ✅ Wire format + IPv4 daemon processing; IPv6 daemon support deferred (see TODO) |
