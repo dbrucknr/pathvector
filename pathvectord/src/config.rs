@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use pathvector_policy::DefaultAction;
 use serde::Deserialize;
@@ -45,6 +45,21 @@ pub struct DaemonConfig {
     /// development or testing without `CAP_NET_BIND_SERVICE`.
     #[serde(default = "default_bgp_listen_port")]
     pub bgp_port: u16,
+    /// Local IPv6 address used as `NEXT_HOP` when advertising IPv6 routes to
+    /// eBGP peers (RFC 4760 §4.3).
+    ///
+    /// When absent, IPv6 routes are still received and stored in the local RIB
+    /// but are only propagated to iBGP peers (where NEXT_HOP is passed through
+    /// unchanged). Set this to enable full dual-stack eBGP.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as   = 65001
+    /// bgp_id     = "10.0.0.1"
+    /// local_ipv6 = "2001:db8::1"
+    /// ```
+    #[serde(default)]
+    pub local_ipv6: Option<Ipv6Addr>,
 }
 
 fn default_hold_time() -> u16 {

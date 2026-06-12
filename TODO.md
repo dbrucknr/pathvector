@@ -70,20 +70,24 @@ failures (one from each stream) overwrites the first error. In practice both str
 together ("daemon down") so the second message is equally informative. Fix requires UI
 layout decision; deferred.
 
-**6. IPv6 RIB — inbound half** (`pathvectord`) — **Done (2026-06-12)**
-Parallel `LocRib<Ipv6Addr>` / `AdjRibIn<Ipv6Addr>` tables added to `DaemonState`
-and `RibSnapshot`. `handle_update` routes `AfiSafi::IPV6_UNICAST` MP_REACH_NLRI
-and MP_UNREACH_NLRI events to them. `sync_received` counts both v4 and v6.
-`on_established` resets the v6 AdjRibIn for reconnected peers. `on_terminated`
-withdraws v6 routes for departed peers. `build_daemon` advertises
-`MultiProtocol(IPV6_UNICAST)` capability. gRPC `list_routes` and `watch_routes`
-include v6 routes in their responses. IPv6 import policy is accept-all until
-per-AFI policy configuration is added.
-Tests: 4 new unit tests in `pathvectord::tests` covering MP_REACH_NLRI v6
-announce, AdjRibIn v6 storage, MP_UNREACH_NLRI v6 withdrawal, and mixed v4+v6
-UPDATE.
-Outbound half (constructing MP_REACH_NLRI UPDATE messages with a valid IPv6
-next-hop) is deferred — requires new UPDATE construction logic.
+**6. IPv6 RIB — dual-stack** (`pathvectord`) — **Done (2026-06-12)**
+Full dual-stack BGP. Inbound: parallel `LocRib<Ipv6Addr>` / `AdjRibIn<Ipv6Addr>`
+tables in `DaemonState`; `handle_update` routes `AfiSafi::IPV6_UNICAST`
+MP_REACH_NLRI and MP_UNREACH_NLRI to them; `sync_received` counts both AFIs;
+`on_established` resets v6 AdjRibIn; `on_terminated` withdraws v6 routes.
+Outbound: parallel `AdjRibOut<Ipv6Addr>` per peer; `propagate_prefix_v6` applies
+`prepare_outbound_v6` (AS_PATH prepend + NEXT_HOP rewrite for eBGP);
+`flush_updates_v6` packs MP_UNREACH_NLRI and MP_REACH_NLRI UPDATE messages;
+`propagate_to_all_peers_v6` wires the full pipeline; `on_established` sends a
+v6 full-table dump; `on_route_update` propagates affected v6 NLRIs.
+Config: `local_ipv6: Option<Ipv6Addr>` in `DaemonConfig` — required for eBGP
+next-hop rewrite (iBGP is pass-through and works without it).
+Capability: `MultiProtocol(IPV6_UNICAST)` advertised in OPEN.
+gRPC: `list_routes` and `watch_routes` include v6 routes via `route_v6_to_proto`.
+IPv6 import policy is accept-all; per-AFI policy config is deferred.
+Tests: 10 new unit tests covering announce, withdraw, AdjRibIn storage, mixed
+v4+v6 UPDATE, eBGP next-hop rewrite, eBGP suppression without `local_ipv6`,
+withdraw-on-disappear, full-table dump on Established, end-to-end propagation.
 
 **10. ROUTE-REFRESH receive guard** (`pathvector-session`) — **Done (2026-06-10)**
 ROUTE-REFRESH received in `Established` is now gated on capability negotiation.

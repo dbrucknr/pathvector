@@ -11,12 +11,12 @@ use std::{
 use pathvector_policy::{Decision, DefaultAction, Policy};
 use pathvector_rib::{
     AdjRibIn, AdjRibOut, InsertOutcome, LocRib, PeerId, RibView, Route, RouteBuilder,
-    outbound::prepare_outbound,
+    outbound::{prepare_outbound, prepare_outbound_v6},
 };
 use pathvector_session::{
     message::{
         Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
-        UpdateMessage, encode_attributes, nlri_encoded_len,
+        UpdateMessage, encode_attributes, nlri_encoded_len, nlri_v6_encoded_len,
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
@@ -302,6 +302,218 @@ fn flush_updates(
     true
 }
 
+/// Outbound decision for a single IPv6 prefix after AdjRibOut processing.
+#[derive(Debug)]
+enum PrefixDecisionV6 {
+    Announce(Route<Ipv6Addr>),
+    Withdraw(Nlri<Ipv6Addr>),
+    NoChange,
+}
+
+/// IPv6 equivalent of [`propagate_prefix`]: determines the outbound decision
+/// for one IPv6 NLRI for a single peer.
+///
+/// For eBGP peers, `local_ipv6` must be `Some` for an announcement to be
+/// generated; if `None`, eBGP routes are silently suppressed (no next-hop to
+/// rewrite) but any previously advertised route is withdrawn.
+fn propagate_prefix_v6(
+    nlri: Nlri<Ipv6Addr>,
+    loc_rib: &LocRib<Ipv6Addr>,
+    adj_rib_out: &mut AdjRibOut<Ipv6Addr>,
+    peer_type: PeerType,
+    local_as: u32,
+    local_ipv6: Option<Ipv6Addr>,
+) -> PrefixDecisionV6 {
+    // For eBGP with no local IPv6 address configured, we can't rewrite the
+    // next-hop, so don't announce — but do withdraw if we previously did.
+    let can_announce = peer_type != PeerType::External || local_ipv6.is_some();
+
+    match loc_rib.best(&nlri) {
+        Some(best) if can_announce => {
+            let route = prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6);
+            match adj_rib_out.insert(route.clone()) {
+                InsertOutcome::Accepted(prev) => {
+                    if prev.as_ref() == Some(&route) {
+                        PrefixDecisionV6::NoChange
+                    } else {
+                        PrefixDecisionV6::Announce(route)
+                    }
+                }
+                InsertOutcome::Filtered(Some(_)) => PrefixDecisionV6::Withdraw(nlri),
+                InsertOutcome::Filtered(None) => PrefixDecisionV6::NoChange,
+            }
+        }
+        _ => {
+            if adj_rib_out.withdraw(&nlri).is_some() {
+                PrefixDecisionV6::Withdraw(nlri)
+            } else {
+                PrefixDecisionV6::NoChange
+            }
+        }
+    }
+}
+
+/// Sends batched BGP UPDATE messages for IPv6 prefix decisions using
+/// MP_REACH_NLRI / MP_UNREACH_NLRI attributes (RFC 4760).
+///
+/// Announcements are grouped by identical path attributes; each group is packed
+/// into the fewest UPDATE messages that fit within `max_len`. Withdrawals are
+/// sent first as MP_UNREACH_NLRI UPDATE messages.
+///
+/// Returns `true` if all sends succeeded; `false` on the first channel-full
+/// error.
+fn flush_updates_v6(
+    decisions: Vec<PrefixDecisionV6>,
+    max_len: usize,
+    update_tx: &mpsc::Sender<UpdateMessage>,
+) -> bool {
+    // (encoded-attr-bytes, attribute-list-with-mp-reach, nlri-list)
+    type AnnounceGroupV6 = (Vec<u8>, Vec<PathAttribute>, Vec<Nlri<Ipv6Addr>>);
+
+    let mut withdrawals: Vec<Nlri<Ipv6Addr>> = Vec::new();
+    let mut announce_groups: Vec<AnnounceGroupV6> = Vec::new();
+
+    for decision in decisions {
+        match decision {
+            PrefixDecisionV6::Withdraw(nlri) => withdrawals.push(nlri),
+            PrefixDecisionV6::Announce(route) => {
+                // MP_UNREACH_NLRI is the only attribute on the announce message;
+                // we group routes with identical scalar attributes (same attrs
+                // minus the NLRI list) and pack them together.
+                let mut attrs = route_v6_to_attributes(&route);
+                // Remove MpReachNlri (last attr) so it isn't part of the key.
+                let mp_reach = attrs.pop().expect("route_v6_to_attributes always appends MpReachNlri last");
+                let key = encode_attributes(&attrs);
+                // Restore the MP_REACH_NLRI placeholder next-hop in the group leader.
+                if let Some((_, group_attrs, nlris)) =
+                    announce_groups.iter_mut().find(|(k, _, _)| *k == key)
+                {
+                    // Add this NLRI to the existing group's MP_REACH_NLRI prefix list.
+                    if let Some(PathAttribute::MpReachNlri(mp)) =
+                        group_attrs.iter_mut().find(|a| matches!(a, PathAttribute::MpReachNlri(_)))
+                    {
+                        mp.prefixes.push(Prefix::V6(route.nlri));
+                    }
+                    nlris.push(route.nlri);
+                } else {
+                    attrs.push(mp_reach);
+                    announce_groups.push((key, attrs, vec![route.nlri]));
+                }
+            }
+            PrefixDecisionV6::NoChange => {}
+        }
+    }
+
+    // ── Send MP_UNREACH_NLRI withdrawals ──────────────────────────────────────
+    // Each MP_UNREACH_NLRI carries a batch of IPv6 NLRIs in a single UPDATE.
+    // Fixed overhead: 19-byte header + 2 withdrawn_len (0) + 2 attr_len.
+    let base_withdraw = UPDATE_FIXED_OVERHEAD;
+    let mut batch: Vec<Nlri<Ipv6Addr>> = Vec::new();
+    let mut batch_bytes = base_withdraw;
+
+    for nlri in withdrawals {
+        // Cost of this NLRI inside the MP_UNREACH_NLRI TLV.
+        let nlen = nlri_v6_encoded_len(&nlri);
+        // MP_UNREACH_NLRI attribute header: 4 bytes (flags+type+ext-len) + 3 afi/safi.
+        let mp_hdr = if batch.is_empty() { 4 + 3 } else { 0 };
+        if !batch.is_empty() && batch_bytes + mp_hdr + nlen > max_len {
+            if !send_mp_unreach_v6(std::mem::take(&mut batch), update_tx) {
+                return false;
+            }
+            batch_bytes = base_withdraw;
+        }
+        if batch.is_empty() {
+            batch_bytes += 4 + 3; // first NLRI: pay for attribute header
+        }
+        batch.push(nlri);
+        batch_bytes += nlen;
+    }
+    if !batch.is_empty() && !send_mp_unreach_v6(batch, update_tx) {
+        return false;
+    }
+
+    // ── Send MP_REACH_NLRI announcements ──────────────────────────────────────
+    // Each group shares the same scalar path attributes + next-hop. We already
+    // built full attribute lists (including a single MpReachNlri) per group
+    // above; here we just pack and send them as-is (splitting is uncommon for
+    // v6 since the NLRI encoding is larger).
+    for (_, attrs, _) in announce_groups {
+        if update_tx
+            .try_send(UpdateMessage {
+                withdrawn: vec![],
+                attributes: attrs,
+                announced: vec![],
+            })
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn send_mp_unreach_v6(
+    nlris: Vec<Nlri<Ipv6Addr>>,
+    update_tx: &mpsc::Sender<UpdateMessage>,
+) -> bool {
+    let prefixes = nlris.into_iter().map(Prefix::V6).collect();
+    update_tx
+        .try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                prefixes,
+            })],
+            announced: vec![],
+        })
+        .is_ok()
+}
+
+/// Builds the path-attribute list for an outbound IPv6 route.
+///
+/// The NLRI is carried in MP_REACH_NLRI (RFC 4760); the traditional
+/// `NEXT_HOP` attribute is not emitted for IPv6 routes.
+fn route_v6_to_attributes(route: &Route<Ipv6Addr>) -> Vec<PathAttribute> {
+    let mut attrs = vec![
+        PathAttribute::Origin(route.origin),
+        PathAttribute::AsPath(route.as_path.clone()),
+    ];
+    if let Some(lp) = route.local_pref {
+        attrs.push(PathAttribute::LocalPref(lp.as_u32()));
+    }
+    if let Some(m) = route.med {
+        attrs.push(PathAttribute::Med(m.as_u32()));
+    }
+    if !route.communities.is_empty() {
+        attrs.push(PathAttribute::Communities(route.communities.clone()));
+    }
+    if !route.large_communities.is_empty() {
+        attrs.push(PathAttribute::LargeCommunities(
+            route.large_communities.clone(),
+        ));
+    }
+    if !route.extended_communities.is_empty() {
+        attrs.push(PathAttribute::ExtendedCommunities(
+            route.extended_communities.clone(),
+        ));
+    }
+    if route.atomic_aggregate {
+        attrs.push(PathAttribute::AtomicAggregate);
+    }
+    if let Some(agg) = route.aggregator {
+        attrs.push(PathAttribute::Aggregator(agg));
+    }
+    // MP_REACH_NLRI is always last so it can be popped as a grouping key.
+    let next_hop = route.next_hop.unwrap_or(NextHop::V6(Ipv6Addr::UNSPECIFIED));
+    attrs.push(PathAttribute::MpReachNlri(MpReachNlri {
+        afi_safi: AfiSafi::IPV6_UNICAST,
+        next_hop,
+        prefixes: vec![Prefix::V6(route.nlri)],
+    }));
+    attrs
+}
+
 /// Immutable-ish snapshot of the read-heavy routing state.
 ///
 /// Stored inside `DaemonState` as an `Arc<RibSnapshot>`. The event loop
@@ -320,6 +532,9 @@ pub(crate) struct RibSnapshot {
     pub(crate) local_as: u32,
     /// Immutable after startup.
     pub(crate) local_bgp_id: Ipv4Addr,
+    /// Local IPv6 address for eBGP next-hop rewrite; `None` if not configured.
+    /// Immutable after startup.
+    pub(crate) local_ipv6: Option<Ipv6Addr>,
     /// Remote AS number for each configured peer; immutable after startup.
     pub(crate) peer_remote_as: HashMap<Ipv4Addr, u32>,
     /// Live session state: present while a peer is Established.
@@ -350,6 +565,7 @@ struct DaemonState {
     pub(crate) adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
     pub(crate) adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
     pub(crate) adj_ribs_in_v6: HashMap<Ipv4Addr, AdjRibIn<Ipv6Addr>>,
+    pub(crate) adj_ribs_out_v6: HashMap<Ipv4Addr, AdjRibOut<Ipv6Addr>>,
     /// Static peer type derived from config; used to reset `AdjRibOut` on reconnect.
     pub(crate) peer_config_types: HashMap<Ipv4Addr, PeerType>,
     pub(crate) update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
@@ -385,6 +601,7 @@ impl DaemonState {
     fn new(
         local_as: u32,
         local_bgp_id: Ipv4Addr,
+        local_ipv6: Option<Ipv6Addr>,
         peers: &[config::PeerConfig],
         update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
         config_capabilities: Vec<Capability>,
@@ -434,6 +651,14 @@ impl DaemonState {
             })
             .collect();
 
+        let adj_ribs_out_v6 = peers
+            .iter()
+            .map(|p| {
+                let pt = config_peer_type(local_as, p.remote_as);
+                (p.address, AdjRibOut::new(PeerId::from(p.address), pt))
+            })
+            .collect();
+
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
         let (route_tx, _) = broadcast::channel(1024);
@@ -445,6 +670,7 @@ impl DaemonState {
             originated_routes: HashMap::new(),
             local_as,
             local_bgp_id,
+            local_ipv6,
             peer_remote_as,
             peer_types: HashMap::new(),
             established_at: HashMap::new(),
@@ -460,6 +686,7 @@ impl DaemonState {
             adj_ribs_in,
             adj_ribs_out,
             adj_ribs_in_v6,
+            adj_ribs_out_v6,
             peer_config_types,
             update_senders,
             config_capabilities,
@@ -499,8 +726,11 @@ impl DaemonState {
     /// Syncs the derived `prefixes_advertised` count for `peer_ip` from the
     /// current `adj_ribs_out` length.
     fn sync_advertised(&mut self, peer_ip: Ipv4Addr) {
-        let count = self.adj_ribs_out.get(&peer_ip).map_or(0, AdjRibOut::len);
-        self.rib_mut().prefixes_advertised.insert(peer_ip, count);
+        let v4 = self.adj_ribs_out.get(&peer_ip).map_or(0, AdjRibOut::len);
+        let v6 = self.adj_ribs_out_v6.get(&peer_ip).map_or(0, AdjRibOut::len);
+        self.rib_mut()
+            .prefixes_advertised
+            .insert(peer_ip, v4 + v6);
     }
 
     /// Drains and returns the list of peers whose outbound UPDATE channel
@@ -553,12 +783,16 @@ impl DaemonState {
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = AdjRibOut::new(peer_id, peer_type);
         }
-        // Reset IPv6 Adj-RIB-In so a re-established session starts clean.
+        // Reset v6 RIBs so a re-established session starts clean.
         self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
+        self.adj_ribs_out_v6
+            .insert(peer_ip, AdjRibOut::new(peer_id, peer_type));
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
-        let rib_prefixes = all_nlris.len();
+        let all_nlris_v6: Vec<Nlri<Ipv6Addr>> =
+            self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
+        let rib_prefixes = all_nlris.len() + all_nlris_v6.len();
 
         let Some(export_policy) = self.export_policies.get(&peer_ip) else {
             tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping Established event");
@@ -575,6 +809,7 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let local_ipv6 = self.rib.local_ipv6;
         let decisions: Vec<PrefixDecision> = all_nlris
             .into_iter()
             .map(|nlri| {
@@ -592,6 +827,28 @@ impl DaemonState {
 
         if !flush_updates(decisions, max_len, update_tx) {
             self.stalled_peers.push(peer_ip);
+        }
+
+        // Full-table dump for IPv6.
+        if !all_nlris_v6.is_empty() {
+            if let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip) {
+                let decisions_v6: Vec<PrefixDecisionV6> = all_nlris_v6
+                    .into_iter()
+                    .map(|nlri| {
+                        propagate_prefix_v6(
+                            nlri,
+                            &self.rib.loc_rib_v6,
+                            adj_rib_out_v6,
+                            peer_type,
+                            local_as,
+                            local_ipv6,
+                        )
+                    })
+                    .collect();
+                if !flush_updates_v6(decisions_v6, max_len, update_tx) {
+                    self.stalled_peers.push(peer_ip);
+                }
+            }
         }
 
         self.sync_advertised(peer_ip);
@@ -653,6 +910,9 @@ impl DaemonState {
             .copied()
             .unwrap_or(PeerType::External);
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
+            *aro = AdjRibOut::new(peer_id, cfg_pt);
+        }
+        if let Some(aro) = self.adj_ribs_out_v6.get_mut(&peer_ip) {
             *aro = AdjRibOut::new(peer_id, cfg_pt);
         }
 
@@ -750,28 +1010,36 @@ impl DaemonState {
             .copied()
             .collect();
 
+        let mut affected_v6: Vec<Nlri<Ipv6Addr>> = Vec::new();
+
         for attr in &msg.attributes {
             match attr {
                 PathAttribute::MpUnreachNlri(MpUnreachNlri { afi_safi, prefixes })
                     if *afi_safi == AfiSafi::IPV4_UNICAST =>
                 {
                     affected.extend(prefixes.iter().filter_map(|p| {
-                        if let Prefix::V4(nlri) = p {
-                            Some(*nlri)
-                        } else {
-                            None
-                        }
+                        if let Prefix::V4(nlri) = p { Some(*nlri) } else { None }
                     }));
                 }
                 PathAttribute::MpReachNlri(MpReachNlri {
                     afi_safi, prefixes, ..
                 }) if *afi_safi == AfiSafi::IPV4_UNICAST => {
                     affected.extend(prefixes.iter().filter_map(|p| {
-                        if let Prefix::V4(nlri) = p {
-                            Some(*nlri)
-                        } else {
-                            None
-                        }
+                        if let Prefix::V4(nlri) = p { Some(*nlri) } else { None }
+                    }));
+                }
+                PathAttribute::MpUnreachNlri(MpUnreachNlri { afi_safi, prefixes })
+                    if *afi_safi == AfiSafi::IPV6_UNICAST =>
+                {
+                    affected_v6.extend(prefixes.iter().filter_map(|p| {
+                        if let Prefix::V6(nlri) = p { Some(*nlri) } else { None }
+                    }));
+                }
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi, prefixes, ..
+                }) if *afi_safi == AfiSafi::IPV6_UNICAST => {
+                    affected_v6.extend(prefixes.iter().filter_map(|p| {
+                        if let Prefix::V6(nlri) = p { Some(*nlri) } else { None }
                     }));
                 }
                 _ => {}
@@ -815,6 +1083,9 @@ impl DaemonState {
         // Propagate best-path changes for affected prefixes to all established
         // peers (iBGP split-horizon is enforced by AdjRibOut).
         self.propagate_to_all_peers(&affected);
+        if !affected_v6.is_empty() {
+            self.propagate_to_all_peers_v6(&affected_v6);
+        }
     }
 
     /// Propagates best-path decisions for `nlris` to every currently established
@@ -873,6 +1144,49 @@ impl DaemonState {
         let peers: Vec<Ipv4Addr> = self.adj_ribs_out.keys().copied().collect();
         for peer_ip in peers {
             self.sync_advertised(peer_ip);
+        }
+    }
+
+    fn propagate_to_all_peers_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
+        let established_peers: Vec<Ipv4Addr> = self.rib.peer_types.keys().copied().collect();
+        let local_as = self.rib.local_as;
+        let local_ipv6 = self.rib.local_ipv6;
+        for peer_ip in established_peers {
+            let peer_type = self
+                .rib
+                .peer_types
+                .get(&peer_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&peer_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip) else {
+                tracing::error!(peer = %peer_ip, "adj_ribs_out_v6 missing peer — skipping v6 propagation");
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&peer_ip) else {
+                tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping v6 propagation");
+                continue;
+            };
+            let decisions: Vec<PrefixDecisionV6> = nlris
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix_v6(
+                        nlri,
+                        &self.rib.loc_rib_v6,
+                        adj_rib_out_v6,
+                        peer_type,
+                        local_as,
+                        local_ipv6,
+                    )
+                })
+                .collect();
+            if !flush_updates_v6(decisions, max_len, update_tx) {
+                self.stalled_peers.push(peer_ip);
+            }
         }
     }
 
@@ -1155,6 +1469,7 @@ where
     let state = Arc::new(RwLock::new(DaemonState::new(
         local_as,
         local_bgp_id,
+        cfg.daemon.local_ipv6,
         &cfg.peers,
         update_senders,
         local_capabilities,
@@ -1604,7 +1919,8 @@ mod tests {
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
-        let state = DaemonState::new(local_as, local_bgp_id, &peer_configs, senders, vec![]);
+        let state =
+            DaemonState::new(local_as, local_bgp_id, None, &peer_configs, senders, vec![]);
         (state, receivers)
     }
 
@@ -1716,6 +2032,7 @@ mod tests {
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peers,
             {
                 let mut m = HashMap::new();
@@ -1799,6 +2116,7 @@ mod tests {
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peers,
             {
                 let mut m = HashMap::new();
@@ -2621,6 +2939,209 @@ mod tests {
 
         assert_eq!(rib.len(), 1, "IPv4 route must be in loc_rib");
         assert_eq!(rib_v6.len(), 1, "IPv6 route must be in loc_rib_v6");
+    }
+
+    // ── IPv6 outbound (propagate_prefix_v6 / flush_updates_v6) ───────────────
+
+    fn make_adj_rib_out_v6(pt: PeerType) -> AdjRibOut<Ipv6Addr> {
+        AdjRibOut::new(peer(), pt)
+    }
+
+    #[test]
+    fn test_propagate_prefix_v6_ibgp_announces_route() {
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut aro = make_adj_rib_out_v6(PeerType::Internal);
+        let route = RouteBuilder::new(nlri_v6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        rib_v6.insert(peer(), route);
+
+        let decision = propagate_prefix_v6(
+            nlri_v6("2001:db8::/32"),
+            &rib_v6,
+            &mut aro,
+            PeerType::Internal,
+            65001,
+            None, // no local_ipv6 — OK for iBGP
+        );
+
+        assert!(
+            matches!(decision, PrefixDecisionV6::Announce(_)),
+            "iBGP peer should receive v6 announcement regardless of local_ipv6"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_v6_ebgp_with_local_ipv6_rewrites_nexthop() {
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut aro = make_adj_rib_out_v6(PeerType::External);
+        let route = RouteBuilder::new(nlri_v6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        rib_v6.insert(peer(), route);
+
+        let local_v6: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let decision = propagate_prefix_v6(
+            nlri_v6("2001:db8::/32"),
+            &rib_v6,
+            &mut aro,
+            PeerType::External,
+            65001,
+            Some(local_v6),
+        );
+
+        match decision {
+            PrefixDecisionV6::Announce(r) => {
+                assert_eq!(
+                    r.next_hop,
+                    Some(NextHop::V6(local_v6)),
+                    "eBGP next-hop must be rewritten to local_ipv6"
+                );
+            }
+            other => panic!("expected Announce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_propagate_prefix_v6_ebgp_without_local_ipv6_is_no_announce() {
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut aro = make_adj_rib_out_v6(PeerType::External);
+        let route = RouteBuilder::new(nlri_v6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        rib_v6.insert(peer(), route);
+
+        let decision = propagate_prefix_v6(
+            nlri_v6("2001:db8::/32"),
+            &rib_v6,
+            &mut aro,
+            PeerType::External,
+            65001,
+            None, // no local_ipv6 — eBGP must NOT announce
+        );
+
+        assert!(
+            matches!(decision, PrefixDecisionV6::NoChange),
+            "eBGP peer without local_ipv6 must not receive v6 announcement"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_v6_withdraw_when_best_disappears() {
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut aro = make_adj_rib_out_v6(PeerType::Internal);
+        // Pre-populate AdjRibOut with an existing announcement.
+        let route = RouteBuilder::new(nlri_v6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        rib_v6.insert(peer(), route.clone());
+        // Announce it first so AdjRibOut records it.
+        propagate_prefix_v6(
+            nlri_v6("2001:db8::/32"),
+            &rib_v6,
+            &mut aro,
+            PeerType::Internal,
+            65001,
+            None,
+        );
+
+        // Now withdraw from loc_rib_v6 and propagate again.
+        rib_v6.withdraw(&peer(), &nlri_v6("2001:db8::/32"));
+        let decision = propagate_prefix_v6(
+            nlri_v6("2001:db8::/32"),
+            &rib_v6,
+            &mut aro,
+            PeerType::Internal,
+            65001,
+            None,
+        );
+
+        assert!(
+            matches!(decision, PrefixDecisionV6::Withdraw(_)),
+            "must produce Withdraw when best path is gone"
+        );
+    }
+
+    #[test]
+    fn test_on_established_sends_v6_full_table_dump() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut rxs) = make_state(65001, &[(peer_ip, 65002)]);
+
+        // Pre-populate the v6 RIB with a route from a third-party peer.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        let v6_route = RouteBuilder::new(
+            nlri_v6("2001:db8::/32"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65009)]),
+        )
+        .next_hop(NextHop::V6("2001:db8::9".parse().unwrap()))
+        .peer_type(PeerType::External)
+        .build();
+        state.rib_mut().loc_rib_v6.insert(src, v6_route);
+
+        // Set local_ipv6 so eBGP dump works.
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[]);
+
+        // First message should be the MP_REACH_NLRI UPDATE for the v6 prefix.
+        let msg = rxs
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("should receive v6 UPDATE on establish");
+        let has_mp_reach = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST));
+        assert!(has_mp_reach, "Established full-table dump must include v6 MP_REACH_NLRI");
+    }
+
+    #[test]
+    fn test_on_route_update_v6_propagates_to_peer() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        // Set local_ipv6 so eBGP next-hop rewrite works for peer_b.
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[]);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[]);
+
+        // Peer A announces an IPv6 route via MP_REACH_NLRI.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::2".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+
+        // peer_b should receive an UPDATE with MP_REACH_NLRI for the v6 prefix.
+        let msg = rxs
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b should receive a v6 UPDATE");
+        let has_v6 = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST));
+        assert!(has_v6, "propagated UPDATE must contain MP_REACH_NLRI for v6 prefix");
     }
 
     // ── import policy ─────────────────────────────────────────────────────────
@@ -4131,6 +4652,7 @@ mod stall_tests {
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peer_configs,
             senders,
             vec![],
@@ -4223,6 +4745,7 @@ mod stall_tests {
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peer_configs,
             senders,
             vec![],
@@ -4331,6 +4854,7 @@ mod stall_tests {
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peer_configs,
             senders,
             vec![],
@@ -4688,6 +5212,7 @@ mod event_loop_tests {
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peer_configs,
             update_senders,
             vec![],
@@ -4822,6 +5347,7 @@ mod event_loop_tests {
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peer_configs,
             update_senders,
             vec![],
@@ -5145,6 +5671,7 @@ mod run_with_tests {
                 hold_time: 90,
                 grpc_port: 0,
                 bgp_port: 0, // 0 = OS assigns; listener will fail to bind but tests don't need it
+                local_ipv6: None,
             },
             peers: peer_ips
                 .iter()

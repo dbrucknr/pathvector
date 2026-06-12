@@ -17,7 +17,7 @@ pub use open::{Capability, GracefulRestartFamily, OpenMessage};
 pub use route_refresh::RouteRefreshMessage;
 pub use update::{
     AttributeDecodeError, AttributeErrorPolicy, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
-    UpdateMessage, encode_attributes, nlri_encoded_len,
+    UpdateMessage, encode_attributes, nlri_encoded_len, nlri_v6_encoded_len,
 };
 
 use header::{MessageType as MsgType, decode_header, encode_header};

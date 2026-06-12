@@ -882,6 +882,7 @@ mod tests {
         DaemonState::new(
             local_as,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             &peer_configs,
             senders,
             vec![],

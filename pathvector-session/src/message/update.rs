@@ -588,6 +588,15 @@ pub fn nlri_encoded_len(nlri: &Nlri<Ipv4Addr>) -> usize {
     1 + (nlri.prefix_len() as usize).div_ceil(8)
 }
 
+/// Returns the number of bytes an IPv6 NLRI occupies on the wire.
+///
+/// Wire format: 1-byte prefix length + `ceil(prefix_len / 8)` address bytes
+/// (same encoding as IPv4, just wider — up to 16 address bytes).
+#[must_use]
+pub fn nlri_v6_encoded_len(nlri: &Nlri<Ipv6Addr>) -> usize {
+    1 + (nlri.prefix_len() as usize).div_ceil(8)
+}
+
 /// Encodes a slice of path attributes to their wire representation.
 ///
 /// The returned bytes are the raw attribute TLVs with no length prefix —
