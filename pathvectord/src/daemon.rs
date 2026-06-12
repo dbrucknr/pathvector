@@ -10,13 +10,11 @@ use std::{
 };
 
 use pathvector_policy::{Decision, DefaultAction, Policy};
-use pathvector_rib::{
-    AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder,
-};
+use pathvector_rib::{AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
     message::{
-        Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute,
-        Prefix, UpdateMessage,
+        Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
+        UpdateMessage,
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
@@ -292,9 +290,7 @@ impl DaemonState {
     fn sync_advertised(&mut self, peer_ip: Ipv4Addr) {
         let v4 = self.adj_ribs_out.get(&peer_ip).map_or(0, AdjRibOut::len);
         let v6 = self.adj_ribs_out_v6.get(&peer_ip).map_or(0, AdjRibOut::len);
-        self.rib_mut()
-            .prefixes_advertised
-            .insert(peer_ip, v4 + v6);
+        self.rib_mut().prefixes_advertised.insert(peer_ip, v4 + v6);
     }
 
     /// Drains and returns the list of peers whose outbound UPDATE channel
@@ -582,28 +578,44 @@ impl DaemonState {
                     if *afi_safi == AfiSafi::IPV4_UNICAST =>
                 {
                     affected.extend(prefixes.iter().filter_map(|p| {
-                        if let Prefix::V4(nlri) = p { Some(*nlri) } else { None }
+                        if let Prefix::V4(nlri) = p {
+                            Some(*nlri)
+                        } else {
+                            None
+                        }
                     }));
                 }
                 PathAttribute::MpReachNlri(MpReachNlri {
                     afi_safi, prefixes, ..
                 }) if *afi_safi == AfiSafi::IPV4_UNICAST => {
                     affected.extend(prefixes.iter().filter_map(|p| {
-                        if let Prefix::V4(nlri) = p { Some(*nlri) } else { None }
+                        if let Prefix::V4(nlri) = p {
+                            Some(*nlri)
+                        } else {
+                            None
+                        }
                     }));
                 }
                 PathAttribute::MpUnreachNlri(MpUnreachNlri { afi_safi, prefixes })
                     if *afi_safi == AfiSafi::IPV6_UNICAST =>
                 {
                     affected_v6.extend(prefixes.iter().filter_map(|p| {
-                        if let Prefix::V6(nlri) = p { Some(*nlri) } else { None }
+                        if let Prefix::V6(nlri) = p {
+                            Some(*nlri)
+                        } else {
+                            None
+                        }
                     }));
                 }
                 PathAttribute::MpReachNlri(MpReachNlri {
                     afi_safi, prefixes, ..
                 }) if *afi_safi == AfiSafi::IPV6_UNICAST => {
                     affected_v6.extend(prefixes.iter().filter_map(|p| {
-                        if let Prefix::V6(nlri) = p { Some(*nlri) } else { None }
+                        if let Prefix::V6(nlri) = p {
+                            Some(*nlri)
+                        } else {
+                            None
+                        }
                     }));
                 }
                 _ => {}
@@ -809,7 +821,8 @@ impl DaemonState {
         for route in routes {
             let nlri = route.nlri;
             let rib = self.rib_mut();
-            rib.loc_rib_v6.insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
+            rib.loc_rib_v6
+                .insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Announced as i32,
@@ -1481,7 +1494,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::outbound::{propagate_prefix, propagate_prefix_v6, route_to_attributes, route_v6_to_attributes};
+    use crate::outbound::{propagate_prefix, propagate_prefix_v6, route_to_attributes};
     use pathvector_rib::{RibView, outbound::prepare_outbound};
 
     // ── test helpers ──────────────────────────────────────────────────────────
@@ -1541,8 +1554,7 @@ mod tests {
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
-        let state =
-            DaemonState::new(local_as, local_bgp_id, None, &peer_configs, senders, vec![]);
+        let state = DaemonState::new(local_as, local_bgp_id, None, &peer_configs, senders, vec![]);
         (state, receivers)
     }
 
@@ -1933,7 +1945,17 @@ mod tests {
         let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
         let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
         let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(DefaultAction::Accept);
-        handle_update(p, msg, ari, rib, &mut ari_v6, &mut rib_v6, policy, &policy_v6, pt);
+        handle_update(
+            p,
+            msg,
+            ari,
+            rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            policy,
+            &policy_v6,
+            pt,
+        );
     }
 
     fn nlri_v6(s: &str) -> Nlri<Ipv6Addr> {
@@ -2768,11 +2790,13 @@ mod tests {
             .unwrap()
             .try_recv()
             .expect("should receive v6 UPDATE on establish");
-        let has_mp_reach = msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST));
-        assert!(has_mp_reach, "Established full-table dump must include v6 MP_REACH_NLRI");
+        let has_mp_reach = msg.attributes.iter().any(
+            |a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST),
+        );
+        assert!(
+            has_mp_reach,
+            "Established full-table dump must include v6 MP_REACH_NLRI"
+        );
     }
 
     #[test]
@@ -2811,11 +2835,13 @@ mod tests {
             .unwrap()
             .try_recv()
             .expect("peer_b should receive a v6 UPDATE");
-        let has_v6 = msg
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST));
-        assert!(has_v6, "propagated UPDATE must contain MP_REACH_NLRI for v6 prefix");
+        let has_v6 = msg.attributes.iter().any(
+            |a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST),
+        );
+        assert!(
+            has_v6,
+            "propagated UPDATE must contain MP_REACH_NLRI for v6 prefix"
+        );
     }
 
     // ── import policy ─────────────────────────────────────────────────────────

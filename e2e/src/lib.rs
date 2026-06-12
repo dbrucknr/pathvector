@@ -687,7 +687,10 @@ impl Harness {
             .args(["gobgp", "global", "rib", "del", prefix, "-a", "ipv6"])
             .status()
             .expect("docker exec gobgp withdraw ipv6");
-        assert!(status.success(), "gobgp withdraw_v6 {prefix} failed: {status}");
+        assert!(
+            status.success(),
+            "gobgp withdraw_v6 {prefix} failed: {status}"
+        );
     }
 
     /// Announce an IPv6 prefix into GoBGP's RIB (AFI/SAFI = ipv6-unicast).
@@ -699,14 +702,15 @@ impl Harness {
         let status = Command::new("docker")
             .args(["exec", &self.gobgpd_id])
             .args([
-                "gobgp", "global", "rib", "add", prefix,
-                "nexthop", nexthop,
-                "origin", "igp",
-                "-a", "ipv6",
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp", "-a",
+                "ipv6",
             ])
             .status()
             .expect("docker exec gobgp announce ipv6");
-        assert!(status.success(), "gobgp announce_v6 {prefix} failed: {status}");
+        assert!(
+            status.success(),
+            "gobgp announce_v6 {prefix} failed: {status}"
+        );
     }
 }
 
