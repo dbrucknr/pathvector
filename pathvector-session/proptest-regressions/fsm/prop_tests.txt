@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5c36bfb3554d5120d7cc28ccaa8f7df046e3f170ceb5af4334e5c81cf14da42d # shrinks to input = ConnectRetryTimerExpired
