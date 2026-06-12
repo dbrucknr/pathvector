@@ -27,9 +27,13 @@ pub(crate) struct MockDaemonClient {
     /// Recorded calls to `set_export_default` — `(peer, accept)`.
     pub export_calls: Vec<(String, bool)>,
     /// Queued batches for `watch_peers`. Each `watch_peers` call drains one batch.
-    pub peer_events: std::collections::VecDeque<Vec<Result<pathvector_client::types::PeerEvent, pathvector_client::error::ClientError>>>,
+    pub peer_events: std::collections::VecDeque<
+        Vec<Result<pathvector_client::types::PeerEvent, pathvector_client::error::ClientError>>,
+    >,
     /// Queued batches for `watch_routes`. Each `watch_routes` call drains one batch.
-    pub route_events: std::collections::VecDeque<Vec<Result<pathvector_client::types::RouteEvent, pathvector_client::error::ClientError>>>,
+    pub route_events: std::collections::VecDeque<
+        Vec<Result<pathvector_client::types::RouteEvent, pathvector_client::error::ClientError>>,
+    >,
 }
 
 #[cfg(test)]

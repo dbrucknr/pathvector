@@ -165,12 +165,14 @@ pub async fn run_dashboard(addr: String) -> Result<(), CliError> {
 
     // Keyboard events arrive from a dedicated blocking thread via a channel.
     let (key_tx, mut key_rx) = mpsc::channel::<event::KeyEvent>(16);
-    tokio::task::spawn_blocking(move || loop {
-        if event::poll(KEY_POLL).is_ok_and(|ready| ready)
-            && let Ok(Event::Key(k)) = event::read()
-            && key_tx.blocking_send(k).is_err()
-        {
-            break;
+    tokio::task::spawn_blocking(move || {
+        loop {
+            if event::poll(KEY_POLL).is_ok_and(|ready| ready)
+                && let Ok(Event::Key(k)) = event::read()
+                && key_tx.blocking_send(k).is_err()
+            {
+                break;
+            }
         }
     });
 
@@ -401,7 +403,11 @@ mod tests {
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
-    fn make_peer(address: Ipv4Addr, session_state: SessionState, peer_type: Option<PeerType>) -> PeerState {
+    fn make_peer(
+        address: Ipv4Addr,
+        session_state: SessionState,
+        peer_type: Option<PeerType>,
+    ) -> PeerState {
         PeerState {
             address: IpAddr::V4(address),
             remote_as: 65001,
@@ -441,32 +447,54 @@ mod tests {
     // signatures exactly — the Ok wrapping is intentional.
     #[allow(clippy::unnecessary_wraps)]
     fn peer_event(kind: PeerEventType, peer: PeerState) -> Result<PeerEvent, ClientError> {
-        Ok(PeerEvent { event_type: kind, peer: Some(peer) })
+        Ok(PeerEvent {
+            event_type: kind,
+            peer: Some(peer),
+        })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn end_initial_peer() -> Result<PeerEvent, ClientError> {
-        Ok(PeerEvent { event_type: PeerEventType::EndInitial, peer: None })
+        Ok(PeerEvent {
+            event_type: PeerEventType::EndInitial,
+            peer: None,
+        })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn route_announced(r: Route) -> Result<RouteEvent, ClientError> {
-        Ok(RouteEvent { event_type: RouteEventType::Announced, route: Some(r), withdrawn_prefix: None })
+        Ok(RouteEvent {
+            event_type: RouteEventType::Announced,
+            route: Some(r),
+            withdrawn_prefix: None,
+        })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn route_current(r: Route) -> Result<RouteEvent, ClientError> {
-        Ok(RouteEvent { event_type: RouteEventType::Current, route: Some(r), withdrawn_prefix: None })
+        Ok(RouteEvent {
+            event_type: RouteEventType::Current,
+            route: Some(r),
+            withdrawn_prefix: None,
+        })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn route_withdrawn(prefix: &str) -> Result<RouteEvent, ClientError> {
-        Ok(RouteEvent { event_type: RouteEventType::Withdrawn, route: None, withdrawn_prefix: Some(prefix.to_owned()) })
+        Ok(RouteEvent {
+            event_type: RouteEventType::Withdrawn,
+            route: None,
+            withdrawn_prefix: Some(prefix.to_owned()),
+        })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn end_initial_route() -> Result<RouteEvent, ClientError> {
-        Ok(RouteEvent { event_type: RouteEventType::EndInitial, route: None, withdrawn_prefix: None })
+        Ok(RouteEvent {
+            event_type: RouteEventType::EndInitial,
+            route: None,
+            withdrawn_prefix: None,
+        })
     }
 
     fn rpc_error() -> ClientError {
@@ -488,7 +516,11 @@ mod tests {
     #[test]
     fn apply_peer_current_inserts_new_peer() {
         let mut state = DashboardState::new();
-        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        let p = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::External),
+        );
         state.apply_peer_event(peer_event(PeerEventType::Current, p));
         assert_eq!(state.peers.len(), 1);
         assert!(state.last_error.is_none());
@@ -512,8 +544,16 @@ mod tests {
     #[test]
     fn apply_peer_changed_different_address_inserts() {
         let mut state = DashboardState::new();
-        let p1 = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
-        let p2 = make_peer(Ipv4Addr::new(10, 0, 0, 2), SessionState::Established, Some(PeerType::Internal));
+        let p1 = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::External),
+        );
+        let p2 = make_peer(
+            Ipv4Addr::new(10, 0, 0, 2),
+            SessionState::Established,
+            Some(PeerType::Internal),
+        );
         state.apply_peer_event(peer_event(PeerEventType::Current, p1));
         state.apply_peer_event(peer_event(PeerEventType::Changed, p2));
         assert_eq!(state.peers.len(), 2);
@@ -541,7 +581,11 @@ mod tests {
         state.apply_peer_event(Err(rpc_error()));
         assert!(state.last_error.is_some());
 
-        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        let p = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::External),
+        );
         state.apply_peer_event(peer_event(PeerEventType::Current, p));
         assert!(state.last_error.is_none());
     }
@@ -585,7 +629,10 @@ mod tests {
     fn apply_route_withdrawn_removes_route() {
         let mut state = DashboardState::new();
         let prefix = "10.0.0.0/8";
-        state.apply_route_event(route_announced(make_route(prefix, Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_announced(make_route(
+            prefix,
+            Ipv4Addr::new(10, 0, 0, 1),
+        )));
         assert_eq!(state.routes.len(), 1);
 
         state.apply_route_event(route_withdrawn(prefix));
@@ -596,7 +643,10 @@ mod tests {
     #[test]
     fn apply_route_withdrawn_unknown_prefix_is_noop() {
         let mut state = DashboardState::new();
-        state.apply_route_event(route_announced(make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_announced(make_route(
+            "10.0.0.0/8",
+            Ipv4Addr::new(10, 0, 0, 1),
+        )));
         state.apply_route_event(route_withdrawn("192.0.2.0/24")); // not present
         assert_eq!(state.routes.len(), 1); // original route untouched
     }
@@ -604,8 +654,14 @@ mod tests {
     #[test]
     fn apply_route_withdrawn_only_removes_matching_prefix() {
         let mut state = DashboardState::new();
-        state.apply_route_event(route_announced(make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1))));
-        state.apply_route_event(route_announced(make_route("172.16.0.0/12", Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_announced(make_route(
+            "10.0.0.0/8",
+            Ipv4Addr::new(10, 0, 0, 1),
+        )));
+        state.apply_route_event(route_announced(make_route(
+            "172.16.0.0/12",
+            Ipv4Addr::new(10, 0, 0, 1),
+        )));
         state.apply_route_event(route_withdrawn("10.0.0.0/8"));
         assert_eq!(state.routes.len(), 1);
         assert_eq!(state.routes[0].prefix, "172.16.0.0/12");
@@ -630,7 +686,10 @@ mod tests {
     fn apply_route_success_clears_last_error() {
         let mut state = DashboardState::new();
         state.apply_route_event(Err(rpc_error()));
-        state.apply_route_event(route_announced(make_route("10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 1))));
+        state.apply_route_event(route_announced(make_route(
+            "10.0.0.0/8",
+            Ipv4Addr::new(10, 0, 0, 1),
+        )));
         assert!(state.last_error.is_none());
     }
 
@@ -638,13 +697,21 @@ mod tests {
 
     #[test]
     fn peer_type_str_external() {
-        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        let p = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::External),
+        );
         assert_eq!(peer_type_str(&p), "eBGP");
     }
 
     #[test]
     fn peer_type_str_internal() {
-        let p = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::Internal));
+        let p = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::Internal),
+        );
         assert_eq!(peer_type_str(&p), "iBGP");
     }
 
@@ -679,7 +746,10 @@ mod tests {
     fn status_bar_live_contains_addr_and_live_indicator() {
         let line = build_status_bar_line("http://localhost:50051", None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("Daemon: http://localhost:50051"), "addr: {text}");
+        assert!(
+            text.contains("Daemon: http://localhost:50051"),
+            "addr: {text}"
+        );
         assert!(text.contains("Live"), "live indicator: {text}");
         assert!(text.contains('q'), "quit hint: {text}");
     }
@@ -687,7 +757,11 @@ mod tests {
     #[test]
     fn status_bar_live_indicator_is_green() {
         let line = build_status_bar_line("http://127.0.0.1:50051", None);
-        let live_span = line.spans.iter().find(|s| s.content.contains("Live")).unwrap();
+        let live_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Live"))
+            .unwrap();
         assert_eq!(live_span.style.fg, Some(Color::Green));
     }
 
@@ -728,7 +802,11 @@ mod tests {
     #[test]
     fn snapshot_render_peers_established() {
         let mut state = DashboardState::new();
-        let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        let mut peer = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::External),
+        );
         peer.uptime_seconds = 3661;
         peer.prefixes_received = 5;
         peer.prefixes_accepted = 4;
@@ -743,7 +821,11 @@ mod tests {
     #[test]
     fn snapshot_render_peers_idle() {
         let mut state = DashboardState::new();
-        state.peers = vec![make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Idle, Some(PeerType::Internal))];
+        state.peers = vec![make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Idle,
+            Some(PeerType::Internal),
+        )];
         let output = render_to_string(80, 6, |f| {
             render_peers(f, &state, f.area());
         });
@@ -791,7 +873,11 @@ mod tests {
     #[test]
     fn snapshot_render_full_populated() {
         let mut state = DashboardState::new();
-        let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 1), SessionState::Established, Some(PeerType::External));
+        let mut peer = make_peer(
+            Ipv4Addr::new(10, 0, 0, 1),
+            SessionState::Established,
+            Some(PeerType::External),
+        );
         peer.uptime_seconds = 7322;
         peer.prefixes_received = 10;
         peer.prefixes_accepted = 8;

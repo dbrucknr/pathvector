@@ -3222,7 +3222,9 @@ mod tests {
             bgp_id(),
             &tx,
         );
-        let msg = rx.try_recv().expect("should announce when best route present");
+        let msg = rx
+            .try_recv()
+            .expect("should announce when best route present");
         assert!(!msg.announced.is_empty());
         assert_eq!(msg.announced[0], nlri("10.0.0.0/8"));
     }
@@ -3280,7 +3282,9 @@ mod tests {
             bgp_id(),
             &tx,
         );
-        let msg = rx.try_recv().expect("should WITHDRAW when best route disappears");
+        let msg = rx
+            .try_recv()
+            .expect("should WITHDRAW when best route disappears");
         assert!(!msg.withdrawn.is_empty());
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
     }
