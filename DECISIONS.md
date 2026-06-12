@@ -179,9 +179,12 @@ objects in the BGP event loop.
 
 ### Rationale
 
-The implementation is IPv4-only at this stage. Introducing generics now would add
-complexity without benefit. When IPv6 support is added, the correct abstraction boundary
-will be clearer. Premature generics often create the wrong abstraction.
+The implementation is dual-stack (IPv4 and IPv6). Generics were introduced when IPv6 support
+was added — `LocRib<A>`, `AdjRibIn<A>`, `AdjRibOut<A>` are all generic over `IpAddress`.
+The outbound pipeline has parallel `propagate_prefix` / `propagate_prefix_v6` functions in
+`pathvectord/src/outbound.rs` rather than a single generic function, because the wire format
+differs substantially (MP_REACH_NLRI vs traditional NLRI fields) and the additional
+abstraction would obscure the protocol differences without simplifying the code.
 
 The only `dyn` usage in the data-adjacent path is:
 - `Pin<Box<dyn Stream<...>>>` in tonic streaming handlers — required by tonic's trait
@@ -191,5 +194,4 @@ The only `dyn` usage in the data-adjacent path is:
 ### Consequences
 
 - Zero vtable overhead in the BGP event loop.
-- IPv6 support will require either duplicating or genericizing these functions. The
-  concrete types make the required changes obvious.
+- The concrete types made the required IPv6 changes obvious when they were added.

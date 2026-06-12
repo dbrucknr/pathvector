@@ -547,6 +547,6 @@ sudo birdc configure
 
 | Feature | Notes |
 |---|---|
-| IPv6 RIB | Session layer parses IPv6 MP_REACH/UNREACH; daemon tables are IPv4-only |
+| IPv6 origination via CLI | `route originate` only accepts IPv4 prefixes in the CLI today; IPv6 origination works via gRPC directly |
 | RFC 7606 revised UPDATE error handling | Treat malformed path attributes as withdrawals rather than session resets |
 | Production Docker image | The test image (`e2e/Dockerfile.pathvectord`) exists; a standalone published image does not yet |
