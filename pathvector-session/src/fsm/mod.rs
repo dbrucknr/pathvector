@@ -215,7 +215,7 @@ impl Fsm {
 
     fn on_idle(&mut self, input: &FsmInput) -> Vec<FsmOutput> {
         match input {
-            FsmInput::ManualStart => {
+            FsmInput::ManualStart | FsmInput::ConnectRetryTimerExpired => {
                 self.state = State::Connect;
                 vec![
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
@@ -285,7 +285,11 @@ impl Fsm {
             // NOTIFICATION in OpenSent: clean up and go Idle (RFC 4271 §8.2.2 event 25).
             FsmInput::MessageReceived(BgpMessage::Notification(_)) => {
                 self.state = State::Idle;
-                vec![FsmOutput::StopHoldTimer, FsmOutput::CloseTcpConnection]
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::CloseTcpConnection,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
+                ]
             }
             FsmInput::TcpFailed => {
                 self.state = State::Active;
@@ -364,12 +368,15 @@ impl Fsm {
                 out
             }
             FsmInput::MessageReceived(BgpMessage::Notification(_)) | FsmInput::TcpFailed => {
+                self.peer_open = None;
+                self.negotiated_hold_time = 0;
                 self.state = State::Idle;
                 vec![
                     FsmOutput::StopHoldTimer,
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
                     FsmOutput::SessionTerminated,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             FsmInput::KeepaliveTimerExpired => {
@@ -441,12 +448,15 @@ impl Fsm {
                 out
             }
             FsmInput::MessageReceived(BgpMessage::Notification(_)) | FsmInput::TcpFailed => {
+                self.peer_open = None;
+                self.negotiated_hold_time = 0;
                 self.state = State::Idle;
                 vec![
                     FsmOutput::StopHoldTimer,
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
                     FsmOutput::SessionTerminated,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             FsmInput::KeepaliveTimerExpired => {
@@ -2014,5 +2024,63 @@ mod tests {
         });
         fsm.process(FsmInput::MessageReceived(peer_open));
         assert_eq!(fsm.state(), State::OpenConfirm);
+    }
+
+    // ── Automatic reconnect after session termination ─────────────────────────
+
+    fn reach_established(fsm: &mut Fsm) {
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
+        fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        assert_eq!(fsm.state(), State::Established);
+    }
+
+    #[test]
+    fn test_established_tcp_failed_schedules_reconnect() {
+        let mut fsm = Fsm::new(default_config());
+        reach_established(&mut fsm);
+
+        let out = fsm.process(FsmInput::TcpFailed);
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(
+            out.contains(&FsmOutput::SessionTerminated),
+            "must emit SessionTerminated"
+        );
+        assert!(
+            out.iter().any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            "must schedule ConnectRetryTimer for automatic reconnect"
+        );
+    }
+
+    #[test]
+    fn test_established_notification_schedules_reconnect() {
+        let mut fsm = Fsm::new(default_config());
+        reach_established(&mut fsm);
+
+        let notif = BgpMessage::Notification(NotificationMessage {
+            error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+            data: vec![],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(notif));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(
+            out.iter().any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            "must schedule ConnectRetryTimer for automatic reconnect"
+        );
+    }
+
+    #[test]
+    fn test_idle_connect_retry_timer_restarts_connect() {
+        let mut fsm = Fsm::new(default_config());
+        reach_established(&mut fsm);
+        fsm.process(FsmInput::TcpFailed); // → Idle with ConnectRetryTimer
+
+        let out = fsm.process(FsmInput::ConnectRetryTimerExpired);
+        assert_eq!(fsm.state(), State::Connect);
+        assert!(
+            out.contains(&FsmOutput::InitiateTcpConnect),
+            "must re-initiate TCP connect on timer expiry"
+        );
     }
 }

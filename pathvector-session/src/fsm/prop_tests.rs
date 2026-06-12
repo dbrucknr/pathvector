@@ -61,7 +61,8 @@ fn arb_non_start_input() -> impl Strategy<Value = FsmInput> {
         Just(FsmInput::ManualStop),
         Just(FsmInput::TcpConnected),
         Just(FsmInput::TcpFailed),
-        Just(FsmInput::ConnectRetryTimerExpired),
+        // ConnectRetryTimerExpired is intentionally excluded: it now triggers
+        // automatic reconnect from Idle (same as ManualStart).
         Just(FsmInput::HoldTimerExpired),
         Just(FsmInput::KeepaliveTimerExpired),
         arb_bgp_message().prop_map(FsmInput::MessageReceived),
