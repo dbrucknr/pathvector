@@ -1,6 +1,7 @@
 [global.config]
 as = 65001
 router-id = "1.0.0.1"
+port = 1179
 
 [[neighbors]]
 [neighbors.config]

@@ -1,9 +1,12 @@
 [daemon]
 local_as = 65002
 bgp_id   = "10.0.0.2"
+bgp_port  = 1180
+grpc_port = 50052
 
 [[peers]]
 address        = "127.0.0.1"
+port           = 1179
 remote_as      = 65001
 # RFC 8212: eBGP peers default to reject. Explicit accept for GoBGP interop testing.
 import_default = "accept"

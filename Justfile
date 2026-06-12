@@ -16,6 +16,30 @@ cargo-fuzz-bin := `which cargo-fuzz`
 default:
     @just --list
 
+# ── Local interop (GoBGP + pathvectord, no Docker) ────────────────────────────
+
+# Start GoBGP for local interop testing (non-privileged ports, no sudo).
+# Reads gobgp.toml from the workspace root.
+gobgp-up:
+    gobgpd -f gobgp.toml
+
+# Start pathvectord against the local interop config (config.toml).
+dev:
+    cargo run -p pathvectord -- config.toml
+
+# Open the live TUI dashboard pointed at the local dev daemon.
+dashboard:
+    cargo run -p pathvector -- --address http://127.0.0.1:50052 dashboard
+
+# Run any pathvector CLI command against the local dev daemon.
+# Usage: just pv route list   |   just pv peer list   |   just pv watch routes
+pv *args:
+    cargo run -q -p pathvector -- --address http://127.0.0.1:50052 {{args}}
+
+# Run the simulated BGP exchange (gobgp-up + dev must already be running).
+exchange:
+    ./scripts/exchange.sh
+
 # ── Standard suite ────────────────────────────────────────────────────────────
 
 # Run every check that CI runs, in the same order.  Green here = green on push.
