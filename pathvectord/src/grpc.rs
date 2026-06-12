@@ -2655,7 +2655,9 @@ mod tests {
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for _ in 0..announced.len() {
-            let ev = route_rx.try_recv().expect("RouteEvent must be emitted for each announced prefix");
+            let ev = route_rx
+                .try_recv()
+                .expect("RouteEvent must be emitted for each announced prefix");
             assert_eq!(
                 ev.r#type,
                 proto::RouteEventType::Announced as i32,
@@ -2665,7 +2667,10 @@ mod tests {
             seen.insert(route.prefix);
         }
         assert!(seen.contains("10.0.0.0/8"), "10/8 RouteEvent missing");
-        assert!(seen.contains("172.16.0.0/12"), "172.16/12 RouteEvent missing");
+        assert!(
+            seen.contains("172.16.0.0/12"),
+            "172.16/12 RouteEvent missing"
+        );
     }
 
     /// on_route_update must emit a Withdrawn RouteEvent when a peer withdraws
@@ -2712,7 +2717,9 @@ mod tests {
             );
         }
 
-        let ev = route_rx.try_recv().expect("Withdrawn RouteEvent must be emitted");
+        let ev = route_rx
+            .try_recv()
+            .expect("Withdrawn RouteEvent must be emitted");
         assert_eq!(ev.r#type, proto::RouteEventType::Withdrawn as i32);
         assert_eq!(
             ev.withdrawn_prefix.as_deref(),
@@ -2758,7 +2765,9 @@ mod tests {
 
         // At least one PeerEvent::Changed must arrive so the RCV counter
         // refreshes on the dashboard.
-        let ev = peer_rx.try_recv().expect("PeerEvent::Changed must be emitted after on_route_update");
+        let ev = peer_rx
+            .try_recv()
+            .expect("PeerEvent::Changed must be emitted after on_route_update");
         assert_eq!(ev.r#type, proto::PeerEventType::Changed as i32);
     }
 
@@ -2804,7 +2813,9 @@ mod tests {
         .await
         .expect("set_import_default reject");
 
-        let ev = route_rx.try_recv().expect("Withdrawn RouteEvent must be emitted on reject-import");
+        let ev = route_rx
+            .try_recv()
+            .expect("Withdrawn RouteEvent must be emitted on reject-import");
         assert_eq!(ev.r#type, proto::RouteEventType::Withdrawn as i32);
         assert_eq!(ev.withdrawn_prefix.as_deref(), Some("192.168.0.0/16"));
 
@@ -2816,7 +2827,9 @@ mod tests {
         .await
         .expect("set_import_default accept");
 
-        let ev = route_rx.try_recv().expect("Announced RouteEvent must be emitted on accept-import");
+        let ev = route_rx
+            .try_recv()
+            .expect("Announced RouteEvent must be emitted on accept-import");
         assert_eq!(ev.r#type, proto::RouteEventType::Announced as i32);
         let route = ev.route.expect("Announced event must carry route payload");
         assert_eq!(route.prefix, "192.168.0.0/16");
