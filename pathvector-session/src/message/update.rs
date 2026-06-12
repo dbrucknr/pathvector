@@ -876,7 +876,10 @@ mod tests {
     fn roundtrip(msg: UpdateMessage) {
         let encoded = msg.encode();
         let mut cur = Cursor::new(&encoded[19..]);
-        assert_eq!(UpdateMessage::decode(&mut cur).unwrap(), UpdateDecodeOutcome::Clean(msg));
+        assert_eq!(
+            UpdateMessage::decode(&mut cur).unwrap(),
+            UpdateDecodeOutcome::Clean(msg)
+        );
     }
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
@@ -1105,11 +1108,22 @@ mod tests {
     fn test_invalid_origin_is_treat_as_withdraw() {
         // RFC 7606 §5: malformed ORIGIN → treat as withdraw, not session reset.
         let body: &[u8] = &[0x00, 0x00, 0x00, 0x04, FLAGS_WKM, ATTR_ORIGIN, 0x01, 99];
-        let (errors, treat_as_withdraw) = decode_partial(body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].type_code, ATTR_ORIGIN);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_ORIGIN,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "invalid ORIGIN value",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     // ── Missing roundtrip coverage ────────────────────────────────────────────
@@ -1227,36 +1241,6 @@ mod tests {
         UpdateMessage::decode(&mut cur)
     }
 
-    /// Decode and assert the result is a clean (no attribute errors) UPDATE.
-    fn decode_update(body: &[u8]) -> UpdateMessage {
-        let UpdateDecodeOutcome::Clean(u) = decode_raw(body).expect("structural decode error") else {
-            panic!("expected clean decode, got attribute errors")
-        };
-        u
-    }
-
-    /// Decode and assert the result is a `Partial` outcome with at least one
-    /// attribute error. Returns the errors and the treat-as-withdraw flag.
-    fn decode_partial(body: &[u8]) -> (Vec<AttributeDecodeError>, bool) {
-        let UpdateDecodeOutcome::Partial { errors, treat_as_withdraw, .. } =
-            decode_raw(body).expect("structural decode error")
-        else {
-            panic!("expected Partial outcome but got Clean")
-        };
-        (errors, treat_as_withdraw)
-    }
-
-    /// Decode and assert a `Partial` outcome, returning the update message,
-    /// errors, and treat-as-withdraw flag together.
-    fn decode_partial_update(body: &[u8]) -> (UpdateMessage, Vec<AttributeDecodeError>, bool) {
-        let UpdateDecodeOutcome::Partial { update, errors, treat_as_withdraw } =
-            decode_raw(body).expect("structural decode error")
-        else {
-            panic!("expected Partial outcome but got Clean")
-        };
-        (update, errors, treat_as_withdraw)
-    }
-
     /// Build an UPDATE body: no withdrawn routes, one path attribute (short len).
     fn update_with_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
         let attr_total = 3 + value.len(); // flags + type + 1-byte len + value
@@ -1281,30 +1265,6 @@ mod tests {
         body
     }
 
-    // ── Helper panic branches (should_panic tests cover the else arms) ────────
-
-    #[test]
-    #[should_panic(expected = "expected clean decode, got attribute errors")]
-    fn test_decode_update_panics_on_partial_outcome() {
-        // Malformed ORIGIN (value 99 is invalid) → Partial outcome.
-        let body: &[u8] = &[0x00, 0x00, 0x00, 0x04, FLAGS_WKM, ATTR_ORIGIN, 0x01, 99];
-        decode_update(body);
-    }
-
-    #[test]
-    #[should_panic(expected = "expected Partial outcome but got Clean")]
-    fn test_decode_partial_panics_on_clean_outcome() {
-        // Empty UPDATE always decodes as Clean.
-        decode_partial(&[0x00, 0x00, 0x00, 0x00]);
-    }
-
-    #[test]
-    #[should_panic(expected = "expected Partial outcome but got Clean")]
-    fn test_decode_partial_update_panics_on_clean_outcome() {
-        // Empty UPDATE always decodes as Clean.
-        decode_partial_update(&[0x00, 0x00, 0x00, 0x00]);
-    }
-
     // ── NLRI error paths ──────────────────────────────────────────────────────
 
     #[test]
@@ -1325,10 +1285,22 @@ mod tests {
         // RFC 7606 applies: attribute discard, not session reset.
         let mp_body: &[u8] = &[0x00, 0x02, 0x01, 129, 0x00]; // AFI=2 IPv6, SAFI=1, pfx_len=129
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, mp_body);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_MP_UNREACH_NLRI);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_MP_UNREACH_NLRI,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "malformed attribute",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     // ── Extended-length attribute ─────────────────────────────────────────────
@@ -1336,8 +1308,14 @@ mod tests {
     #[test]
     fn test_extended_length_origin_attribute() {
         let body = update_with_ext_attr(FLAGS_WKM, ATTR_ORIGIN, &[0u8]); // ORIGIN=IGP
-        let update = decode_update(&body);
-        assert!(matches!(update.attributes[0], PathAttribute::Origin(_)));
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Clean(UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                announced: vec![],
+            })
+        );
     }
 
     // ── RFC 7606 per-attribute error policy tests ─────────────────────────────
@@ -1349,109 +1327,253 @@ mod tests {
     #[test]
     fn test_origin_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_ORIGIN, &[]);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_ORIGIN);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_ORIGIN,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "ORIGIN must be 1 byte",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     #[test]
     fn test_next_hop_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_NEXT_HOP, &[10, 0, 0]); // 3 bytes, needs 4
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_NEXT_HOP);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_NEXT_HOP,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "NEXT_HOP must be 4 bytes",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     #[test]
     fn test_local_pref_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_LOCAL_PREF, &[0u8; 3]);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_LOCAL_PREF);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_LOCAL_PREF,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "LOCAL_PREF must be 4 bytes",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     #[test]
     fn test_mp_reach_nlri_too_short_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, &[0x00, 0x01]); // only 2 bytes
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_MP_REACH_NLRI);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_MP_REACH_NLRI,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "MP_REACH_NLRI too short",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     #[test]
     fn test_as_path_unknown_segment_is_treat_as_withdraw() {
         let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[9, 0]); // unknown seg type
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AS_PATH,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "unknown AS_PATH segment type",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     #[test]
     fn test_med_too_short_is_attribute_discard() {
         let body = update_with_attr(FLAGS_ONT, ATTR_MED, &[0u8; 3]);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_MED);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_MED,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "MED must be 4 bytes",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     #[test]
     fn test_aggregator_too_short_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &[0u8; 7]); // needs 8
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_AGGREGATOR);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AGGREGATOR,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "AGGREGATOR must be 8 bytes (4-byte ASN mode)",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     #[test]
     fn test_community_bad_length_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_COMMUNITY, &[0u8; 3]); // not multiple of 4
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_COMMUNITY);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_COMMUNITY,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "COMMUNITY length must be a multiple of 4",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     #[test]
     fn test_mp_unreach_nlri_too_short_is_attribute_discard() {
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, &[0x00]); // only 1 byte
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_MP_UNREACH_NLRI);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_MP_UNREACH_NLRI,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "MP_UNREACH_NLRI too short",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     #[test]
     fn test_extended_communities_bad_length_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_EXTENDED_COMMUNITIES, &[0u8; 7]); // not multiple of 8
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_EXTENDED_COMMUNITIES);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_EXTENDED_COMMUNITIES,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "EXTENDED_COMMUNITIES length must be a multiple of 8",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     #[test]
     fn test_as4_aggregator_too_short_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_AS4_AGGREGATOR, &[0u8; 7]); // needs 8
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_AS4_AGGREGATOR);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AS4_AGGREGATOR,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "AS4_AGGREGATOR must be 8 bytes",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     #[test]
     fn test_large_community_bad_length_is_attribute_discard() {
         let body = update_with_attr(FLAGS_OT, ATTR_LARGE_COMMUNITY, &[0u8; 11]); // not multiple of 12
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(!treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_LARGE_COMMUNITY);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::AttributeDiscard);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_LARGE_COMMUNITY,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "LARGE_COMMUNITY length must be a multiple of 12",
+                }],
+                treat_as_withdraw: false,
+            }
+        );
     }
 
     // ── RFC 7606 §7.3 — duplicate attribute → treat as withdraw ──────────────
@@ -1464,11 +1586,22 @@ mod tests {
         let attrs: Vec<u8> = attr(0).iter().chain(attr(1).iter()).copied().collect();
         body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
         body.extend_from_slice(&attrs);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert!(errors.iter().any(
-            |e| e.type_code == ATTR_ORIGIN && e.policy == AttributeErrorPolicy::TreatAsWithdraw
-        ));
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                    announced: vec![],
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_ORIGIN,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "duplicate attribute type code",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     // ── RFC 7606: good attributes survive alongside bad ones ──────────────────
@@ -1486,20 +1619,21 @@ mod tests {
         body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
         body.extend_from_slice(&attrs);
 
-        let (update, errors, treat_as_withdraw) = decode_partial_update(&body);
-        let attrs_decoded = update.attributes;
-
-        assert!(
-            !treat_as_withdraw,
-            "MED discard should not trigger treat-as-withdraw"
-        );
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].type_code, ATTR_MED);
-        // ORIGIN survived
-        assert!(
-            attrs_decoded
-                .iter()
-                .any(|a| matches!(a, PathAttribute::Origin(_)))
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                    announced: vec![],
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_MED,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "MED must be 4 bytes",
+                }],
+                treat_as_withdraw: false,
+            }
         );
     }
 
@@ -1509,19 +1643,44 @@ mod tests {
     fn test_unknown_as_path_segment_type_is_treat_as_withdraw() {
         // seg_type=9 (unknown), count=0
         let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[9, 0]);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AS_PATH,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "unknown AS_PATH segment type",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     #[test]
     fn test_truncated_asn_in_as_path_is_treat_as_withdraw() {
         // SEG_SEQUENCE, count=2, but only 4 bytes (enough for 1 ASN, not 2).
         let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[2, 2, 0, 0, 0x00, 0x01]);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AS_PATH,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "truncated ASN in AS_PATH segment",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     // ── MP_REACH next-hop error paths ─────────────────────────────────────────
@@ -1537,10 +1696,22 @@ mod tests {
             0x00, // SNPA
         ];
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_REACH_NLRI, mp_body);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_MP_REACH_NLRI);
-        assert_eq!(errors[0].policy, AttributeErrorPolicy::TreatAsWithdraw);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_MP_REACH_NLRI,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "unexpected next-hop length for AFI",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     // ── Unknown AFI in MP_UNREACH → decode_mp_nlri else branch ───────────────
@@ -1550,11 +1721,17 @@ mod tests {
         // AFI=9 (unknown), no further NLRI bytes.
         let mp_body: &[u8] = &[0x00, 0x09, 0x01]; // AFI=9, SAFI=1
         let body = update_with_attr(FLAGS_ONT, ATTR_MP_UNREACH_NLRI, mp_body);
-        let update = decode_update(&body);
-        assert!(matches!(
-            &update.attributes[0],
-            PathAttribute::MpUnreachNlri(mp) if mp.prefixes.is_empty()
-        ));
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Clean(UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                    afi_safi: AfiSafi::new(Afi::new(9), Safi::new(1)),
+                    prefixes: vec![],
+                })],
+                announced: vec![],
+            })
+        );
     }
 
     // ── error_detail Truncated path ───────────────────────────────────────────
@@ -1565,18 +1742,30 @@ mod tests {
         // CodecError::Truncated from read_u8(), exercising the Truncated arm of
         // error_detail().
         let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[0x02]);
-        let (errors, treat_as_withdraw) = decode_partial(&body);
-        assert!(treat_as_withdraw);
-        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
-        assert_eq!(errors[0].detail, "attribute value truncated");
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AS_PATH,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "attribute value truncated",
+                }],
+                treat_as_withdraw: true,
+            }
+        );
     }
 
     // ── Public encoding helpers ───────────────────────────────────────────────
 
     #[test]
     fn test_nlri_encoded_len_values() {
-        assert_eq!(nlri_encoded_len(&nlri4("0.0.0.0/0")), 1);   // 1 + 0
-        assert_eq!(nlri_encoded_len(&nlri4("10.0.0.0/8")), 2);  // 1 + 1
+        assert_eq!(nlri_encoded_len(&nlri4("0.0.0.0/0")), 1); // 1 + 0
+        assert_eq!(nlri_encoded_len(&nlri4("10.0.0.0/8")), 2); // 1 + 1
         assert_eq!(nlri_encoded_len(&nlri4("10.0.0.0/24")), 4); // 1 + 3
         assert_eq!(nlri_encoded_len(&nlri4("10.0.0.1/32")), 5); // 1 + 4
     }

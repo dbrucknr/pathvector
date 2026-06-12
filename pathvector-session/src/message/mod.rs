@@ -450,10 +450,10 @@ mod tests {
         let body: &[u8] = &[
             0x00, 0x00, // withdrawn routes length
             0x00, 0x04, // total path attribute length
-            0x40,       // flags: well-known mandatory
-            0x01,       // type: ORIGIN
-            0x01,       // length: 1
-            0x05,       // value: 5 (invalid — only 0/1/2 are defined)
+            0x40, // flags: well-known mandatory
+            0x01, // type: ORIGIN
+            0x01, // length: 1
+            0x05, // value: 5 (invalid — only 0/1/2 are defined)
         ];
         let raw = make_raw_message(2, body);
         let msg = BgpMessage::decode(&raw).unwrap();

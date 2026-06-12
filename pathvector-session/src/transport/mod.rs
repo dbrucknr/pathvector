@@ -1236,7 +1236,7 @@ mod tests {
         );
     }
 
-    /// When an incoming connection arrives while the session is in OpenConfirm
+    /// When an incoming connection arrives while the session is in `OpenConfirm`
     /// AND the peer's BGP ID (from the received OPEN) is higher than the local
     /// BGP ID, the session must keep the outbound connection and silently drop
     /// the incoming one (RFC 4271 §6.8, "peer wins" case — exercises L498-505).
