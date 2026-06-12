@@ -2620,6 +2620,208 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    // ── Event emission: on_route_update ───────────────────────────────────────
+
+    /// on_route_update must emit an Announced RouteEvent for each accepted
+    /// prefix so the dashboard's watch_routes stream reflects peer-received
+    /// routes without requiring a full reconnect/snapshot.
+    #[tokio::test]
+    async fn test_on_route_update_emits_announced_route_events() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        let mut route_rx = state.read().await.route_tx.subscribe();
+
+        let mut s = state.write().await;
+        s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+
+        let announced = vec![nlri("10.0.0.0/8"), nlri("172.16.0.0/12")];
+        s.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(pathvector_types::Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                    PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                ],
+                announced: announced.clone(),
+            },
+        );
+        drop(s);
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..announced.len() {
+            let ev = route_rx.try_recv().expect("RouteEvent must be emitted for each announced prefix");
+            assert_eq!(
+                ev.r#type,
+                proto::RouteEventType::Announced as i32,
+                "event type must be Announced"
+            );
+            let route = ev.route.expect("Announced event must carry route payload");
+            seen.insert(route.prefix);
+        }
+        assert!(seen.contains("10.0.0.0/8"), "10/8 RouteEvent missing");
+        assert!(seen.contains("172.16.0.0/12"), "172.16/12 RouteEvent missing");
+    }
+
+    /// on_route_update must emit a Withdrawn RouteEvent when a peer withdraws
+    /// a prefix that was previously accepted into the Loc-RIB.
+    #[tokio::test]
+    async fn test_on_route_update_emits_withdrawn_route_event() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(pathvector_types::Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                        PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                    ],
+                    announced: vec![nlri("10.0.0.0/8")],
+                },
+            );
+        } // write lock released before subscribe
+
+        // Subscribe after the announce so the channel only sees the withdraw.
+        // No tasks are running between the drop above and here, so no events
+        // can be lost.
+        let mut route_rx = state.read().await.route_tx.subscribe();
+
+        {
+            let mut s = state.write().await;
+            s.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![nlri("10.0.0.0/8")],
+                    attributes: vec![],
+                    announced: vec![],
+                },
+            );
+        }
+
+        let ev = route_rx.try_recv().expect("Withdrawn RouteEvent must be emitted");
+        assert_eq!(ev.r#type, proto::RouteEventType::Withdrawn as i32);
+        assert_eq!(
+            ev.withdrawn_prefix.as_deref(),
+            Some("10.0.0.0/8"),
+            "withdrawn_prefix must name the removed NLRI"
+        );
+    }
+
+    /// on_route_update must emit a PeerEvent::Changed after processing so the
+    /// dashboard's RCV counter (and ADV from propagation) refreshes without
+    /// waiting for a session reconnect.
+    #[tokio::test]
+    async fn test_on_route_update_emits_peer_changed_event() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        let mut s = state.write().await;
+        s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+
+        // Drain the PeerEvent fired by on_established.
+        drop(s);
+        while peer_rx.try_recv().is_ok() {}
+        let mut s = state.write().await;
+
+        s.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(pathvector_types::Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                    PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        drop(s);
+
+        // At least one PeerEvent::Changed must arrive so the RCV counter
+        // refreshes on the dashboard.
+        let ev = peer_rx.try_recv().expect("PeerEvent::Changed must be emitted after on_route_update");
+        assert_eq!(ev.r#type, proto::PeerEventType::Changed as i32);
+    }
+
+    /// set_import_default must emit RouteEvents for all affected NLRIs so the
+    /// dashboard reflects policy-driven adds and removes without a reconnect.
+    #[tokio::test]
+    async fn test_set_import_default_emits_route_events() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(pathvector_types::Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                        PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                    ],
+                    announced: vec![nlri("192.168.0.0/16")],
+                },
+            );
+        }
+
+        // Subscribe after the initial announce so we only see the policy events.
+        let mut route_rx = state.read().await.route_tx.subscribe();
+
+        let svc = PolicyServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        // Flip to reject — 192.168/16 should be withdrawn from the dashboard.
+        svc.set_import_default(Request::new(SetImportDefaultRequest {
+            peer_address: peer_ip.to_string(),
+            action: proto::PolicyAction::Reject as i32,
+        }))
+        .await
+        .expect("set_import_default reject");
+
+        let ev = route_rx.try_recv().expect("Withdrawn RouteEvent must be emitted on reject-import");
+        assert_eq!(ev.r#type, proto::RouteEventType::Withdrawn as i32);
+        assert_eq!(ev.withdrawn_prefix.as_deref(), Some("192.168.0.0/16"));
+
+        // Flip back to accept — 192.168/16 should reappear on the dashboard.
+        svc.set_import_default(Request::new(SetImportDefaultRequest {
+            peer_address: peer_ip.to_string(),
+            action: proto::PolicyAction::Accept as i32,
+        }))
+        .await
+        .expect("set_import_default accept");
+
+        let ev = route_rx.try_recv().expect("Announced RouteEvent must be emitted on accept-import");
+        assert_eq!(ev.r#type, proto::RouteEventType::Announced as i32);
+        let route = ev.route.expect("Announced event must carry route payload");
+        assert_eq!(route.prefix, "192.168.0.0/16");
+    }
+
     // ── In-process integration test: real tonic server + PathvectorClient ─────
     //
     // Starts a real tonic gRPC server on a random port and calls it via
