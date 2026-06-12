@@ -143,7 +143,9 @@ impl Decoder for BgpCodec {
 }
 
 impl Encoder<BgpMessage> for BgpCodec {
-    type Error = FramingError;
+    // Encoding is infallible — we only return io::Error so that FramedWrite's
+    // Sink impl doesn't require a FramingError::Codec arm that can never fire.
+    type Error = io::Error;
 
     fn encode(&mut self, msg: BgpMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
         dst.put_slice(&msg.encode());
@@ -359,5 +361,13 @@ mod tests {
         codec.encode(original.clone(), &mut buf).unwrap();
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_bgpcodec_default_same_as_new() {
+        let mut codec = BgpCodec::default();
+        let mut buf = BytesMut::from(BgpMessage::Keepalive.encode().as_slice());
+        let msg = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, BgpMessage::Keepalive);
     }
 }

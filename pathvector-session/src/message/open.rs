@@ -445,4 +445,16 @@ mod tests {
             Err(CodecError::InvalidCapability { code: 64 })
         ));
     }
+
+    #[test]
+    fn test_extended_message_capability_roundtrip() {
+        // cap_code=6 (ExtendedMessage), cap_len=0
+        let params = [OPT_PARAM_CAPABILITIES, 2, 6, 0];
+        let body = open_with_raw_opt_params(&params);
+        let open = decode_open_body(&body).unwrap();
+        assert_eq!(open.capabilities, vec![Capability::ExtendedMessage]);
+        // Verify that encoding back produces the correct capability code.
+        let roundtripped = roundtrip(&open);
+        assert_eq!(roundtripped.capabilities, vec![Capability::ExtendedMessage]);
+    }
 }

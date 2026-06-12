@@ -442,4 +442,39 @@ mod tests {
             Err(CodecError::InvalidLength(20))
         ));
     }
+
+    #[test]
+    fn test_malformed_update_decode_produces_malformed_update_variant() {
+        // UPDATE with an invalid ORIGIN value (5) → Partial decode → MalformedUpdate.
+        // Wire: 2-byte withdrawn-len=0, 2-byte attr-len=4, ORIGIN attr with value 5.
+        let body: &[u8] = &[
+            0x00, 0x00, // withdrawn routes length
+            0x00, 0x04, // total path attribute length
+            0x40,       // flags: well-known mandatory
+            0x01,       // type: ORIGIN
+            0x01,       // length: 1
+            0x05,       // value: 5 (invalid — only 0/1/2 are defined)
+        ];
+        let raw = make_raw_message(2, body);
+        let msg = BgpMessage::decode(&raw).unwrap();
+        assert!(
+            matches!(msg, BgpMessage::MalformedUpdate(_)),
+            "expected MalformedUpdate, got {msg:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MalformedUpdate is a decode-only variant")]
+    fn test_malformed_update_encode_panics() {
+        let msg = BgpMessage::MalformedUpdate(MalformedUpdate {
+            update: UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![],
+                announced: vec![],
+            },
+            errors: vec![],
+            treat_as_withdraw: false,
+        });
+        let _ = msg.encode();
+    }
 }

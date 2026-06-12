@@ -70,12 +70,8 @@ impl FramedBgpTransport {
 
 impl BgpTransport for FramedBgpTransport {
     async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
-        self.writer.send(msg).await.map_err(|e| match e {
-            FramingError::Io(io_err) => io_err,
-            FramingError::Codec(_) => {
-                io::Error::new(io::ErrorKind::InvalidData, "BGP encode error")
-            }
-        })
+        self.writer.send(msg).await?;
+        Ok(())
     }
 
     async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
@@ -495,10 +491,11 @@ impl<T: BgpTransport> Session<T> {
                     }
                     Some(FsmInput::TcpConnected)
                 } else {
+                    let peer_bgp_id = self.fsm.peer_bgp_id().unwrap();
                     tracing::info!(
                         peer = %self.config.peer_addr,
                         local_bgp_id = %self.config.local_bgp_id,
-                        peer_bgp_id = %self.fsm.peer_bgp_id().unwrap(),
+                        peer_bgp_id = %peer_bgp_id,
                         "BGP collision: peer BGP ID higher, keeping outbound and rejecting incoming"
                     );
                     drop(stream);
@@ -715,7 +712,8 @@ mod tests {
     use std::net::Ipv4Addr as StdIpv4Addr;
 
     use super::{
-        BgpTransport, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, spawn_with,
+        BgpTransport, FramedBgpTransport, SessionCommand, SessionConfig, SessionEvent,
+        SessionHandle, SpawnedSessionHandle, spawn_with,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
@@ -837,6 +835,21 @@ mod tests {
             matches!(event, SessionEvent::Established(_)),
             "expected Established, got {event:?}"
         );
+    }
+
+    /// Extract the inner `UpdateMessage` from a `RouteUpdate` event.
+    /// Panics with a clear message if the event is a different variant.
+    fn expect_route_update(event: SessionEvent) -> UpdateMessage {
+        let SessionEvent::RouteUpdate(u) = event else {
+            panic!("expected RouteUpdate, got {event:?}")
+        };
+        u
+    }
+
+    #[test]
+    #[should_panic(expected = "expected RouteUpdate")]
+    fn test_expect_route_update_panics_on_wrong_variant() {
+        expect_route_update(SessionEvent::Terminated);
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -966,26 +979,22 @@ mod tests {
             .expect("timed out waiting for RouteUpdate after malformed UPDATE")
             .expect("session exited unexpectedly");
 
-        match event {
-            SessionEvent::RouteUpdate(u) => {
-                // treat-as-withdraw: announced list must be empty.
-                assert!(
-                    u.announced.is_empty(),
-                    "treat-as-withdraw must clear announced, got {:?}",
-                    u.announced
-                );
-                // Both prefixes must appear in withdrawn.
-                assert!(
-                    u.withdrawn.contains(&prefix_a),
-                    "withdrawn must contain {prefix_a:?}"
-                );
-                assert!(
-                    u.withdrawn.contains(&prefix_b),
-                    "withdrawn must contain {prefix_b:?}"
-                );
-            }
-            other => panic!("expected RouteUpdate, got {other:?}"),
-        }
+        let u = expect_route_update(event);
+        // treat-as-withdraw: announced list must be empty.
+        assert!(
+            u.announced.is_empty(),
+            "treat-as-withdraw must clear announced, got {:?}",
+            u.announced
+        );
+        // Both prefixes must appear in withdrawn.
+        assert!(
+            u.withdrawn.contains(&prefix_a),
+            "withdrawn must contain {prefix_a:?}"
+        );
+        assert!(
+            u.withdrawn.contains(&prefix_b),
+            "withdrawn must contain {prefix_b:?}"
+        );
 
         // Confirm the session is still alive: send a KEEPALIVE and verify the
         // session does NOT emit Terminated within a short window.
@@ -1037,22 +1046,18 @@ mod tests {
             .expect("timed out waiting for RouteUpdate after attribute-discard UPDATE")
             .expect("session exited unexpectedly");
 
-        match event {
-            SessionEvent::RouteUpdate(u) => {
-                // attribute-discard: announcement must be preserved.
-                assert!(
-                    u.announced.contains(&prefix),
-                    "announced must contain {prefix:?} after attribute-discard"
-                );
-                // No spurious withdrawals.
-                assert!(
-                    u.withdrawn.is_empty(),
-                    "withdrawn must be empty after attribute-discard, got {:?}",
-                    u.withdrawn
-                );
-            }
-            other => panic!("expected RouteUpdate, got {other:?}"),
-        }
+        let u = expect_route_update(event);
+        // attribute-discard: announcement must be preserved.
+        assert!(
+            u.announced.contains(&prefix),
+            "announced must contain {prefix:?} after attribute-discard"
+        );
+        // No spurious withdrawals.
+        assert!(
+            u.withdrawn.is_empty(),
+            "withdrawn must be empty after attribute-discard, got {:?}",
+            u.withdrawn
+        );
 
         // Confirm session is still alive.
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
@@ -1188,17 +1193,100 @@ mod tests {
             .expect("timed out waiting for RouteUpdate")
             .expect("session exited");
 
-        match event {
-            SessionEvent::RouteUpdate(u) => {
-                let has_unreach = u.attributes.iter().any(|a| {
-                    matches!(a, PathAttribute::MpUnreachNlri(m) if m.afi_safi == AfiSafi::IPV6_UNICAST)
-                });
-                assert!(
-                    has_unreach,
-                    "expected MpUnreachNlri in treat-as-withdraw result"
-                );
+        let u = expect_route_update(event);
+        let has_unreach = u.attributes.iter().any(
+            |a| matches!(a, PathAttribute::MpUnreachNlri(m) if m.afi_safi == AfiSafi::IPV6_UNICAST),
+        );
+        assert!(
+            has_unreach,
+            "expected MpUnreachNlri in treat-as-withdraw result"
+        );
+    }
+
+    /// `FramedBgpTransport::send` maps `FramingError::Io` to the underlying
+    /// `io::Error` when the TCP write half has been closed.
+    #[tokio::test]
+    async fn test_framed_transport_send_io_error_is_forwarded() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client_stream, server_accept) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let client_stream = client_stream.unwrap();
+        let (server_stream, _addr) = server_accept.unwrap();
+
+        // Close the server side so that writing to the client eventually fails.
+        drop(server_stream);
+
+        let mut transport = FramedBgpTransport::from_stream(client_stream);
+
+        // Keep sending until we get an io::Error (a closed peer may buffer briefly).
+        let mut result = Ok(());
+        for _ in 0..20 {
+            result = transport.send(BgpMessage::Keepalive).await;
+            if result.is_err() {
+                break;
             }
-            other => panic!("expected RouteUpdate, got {other:?}"),
+            tokio::task::yield_now().await;
         }
+        assert!(
+            result.is_err(),
+            "expected FramedBgpTransport::send to fail after peer closed"
+        );
+    }
+
+    /// When an incoming connection arrives while the session is in OpenConfirm
+    /// AND the peer's BGP ID (from the received OPEN) is higher than the local
+    /// BGP ID, the session must keep the outbound connection and silently drop
+    /// the incoming one (RFC 4271 §6.8, "peer wins" case — exercises L498-505).
+    #[tokio::test]
+    async fn test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming() {
+        use tokio::net::TcpListener;
+
+        // local_bgp_id = 10.0.0.1, peer_open uses bgp_id = 10.0.0.2 (higher).
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+        handle.start().await;
+
+        // Receive the OPEN the session sent.
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("channel closed before OPEN");
+
+        // Inject peer OPEN with higher BGP ID (10.0.0.2 > 10.0.0.1).
+        peer.recv_tx.send(Ok(peer_open())).unwrap();
+
+        // Wait for the session's KEEPALIVE — confirms it is now in OpenConfirm
+        // and has recorded the peer's BGP ID.
+        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("channel closed before KEEPALIVE");
+
+        // Create a real TcpStream to inject as an incoming connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (incoming, _) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let incoming = incoming.unwrap();
+
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        // Complete the handshake — session keeps the outbound and reaches Established.
+        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "expected Established after peer-wins collision, got {event:?}"
+        );
     }
 }

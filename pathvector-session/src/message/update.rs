@@ -40,6 +40,7 @@ pub struct AttributeDecodeError {
 /// Structural errors (truncated withdrawn-routes block, truncated attribute
 /// header) still return `Err(CodecError)` and require a session reset.
 /// Per-attribute decode errors produce a `Partial` outcome instead.
+#[derive(Debug, PartialEq)]
 pub(super) enum UpdateDecodeOutcome {
     /// All attributes decoded without error.
     Clean(UpdateMessage),
@@ -872,15 +873,10 @@ mod tests {
 
     use super::*;
 
-    fn roundtrip(msg: &UpdateMessage) -> UpdateMessage {
+    fn roundtrip(msg: UpdateMessage) {
         let encoded = msg.encode();
         let mut cur = Cursor::new(&encoded[19..]);
-        match UpdateMessage::decode(&mut cur).unwrap() {
-            UpdateDecodeOutcome::Clean(u) => u,
-            UpdateDecodeOutcome::Partial { errors, .. } => {
-                panic!("roundtrip produced attribute errors: {errors:?}")
-            }
-        }
+        assert_eq!(UpdateMessage::decode(&mut cur).unwrap(), UpdateDecodeOutcome::Clean(msg));
     }
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
@@ -898,7 +894,7 @@ mod tests {
             attributes: vec![],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -908,7 +904,7 @@ mod tests {
             attributes: vec![],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -927,7 +923,7 @@ mod tests {
             ],
             announced: vec![nlri4("10.0.0.0/8")],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -943,7 +939,7 @@ mod tests {
             ],
             announced: vec![nlri4("172.16.0.0/12")],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -959,7 +955,7 @@ mod tests {
             ],
             announced: vec![nlri4("192.0.2.0/24")],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -976,7 +972,7 @@ mod tests {
             ],
             announced: vec![nlri4("10.0.0.0/8")],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -990,7 +986,7 @@ mod tests {
             })],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1003,7 +999,7 @@ mod tests {
             })],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1019,7 +1015,7 @@ mod tests {
             }],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1036,12 +1032,19 @@ mod tests {
             }],
             announced: vec![],
         };
-        let decoded = roundtrip(&msg);
-        let PathAttribute::Unknown { flags, .. } = &decoded.attributes[0] else {
-            panic!("expected Unknown attribute");
-        };
-        assert!(
-            flags & FLAG_PARTIAL != 0,
+        let encoded = msg.encode();
+        let mut cur = Cursor::new(&encoded[19..]);
+        assert_eq!(
+            UpdateMessage::decode(&mut cur).unwrap(),
+            UpdateDecodeOutcome::Clean(UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::Unknown {
+                    flags: FLAGS_OT | FLAG_PARTIAL,
+                    type_code: 200,
+                    value: vec![1, 2, 3],
+                }],
+                announced: vec![],
+            }),
             "Partial bit must be set on re-encode of unrecognised optional transitive attribute (RFC 4271 §5)"
         );
     }
@@ -1059,14 +1062,8 @@ mod tests {
             }],
             announced: vec![],
         };
-        let decoded = roundtrip(&msg);
-        let PathAttribute::Unknown { flags, .. } = &decoded.attributes[0] else {
-            panic!("expected Unknown attribute");
-        };
-        assert!(
-            flags & FLAG_PARTIAL == 0,
-            "Partial bit must NOT be set for optional non-transitive attribute"
-        );
+        // roundtrip asserts full equality — unchanged flags proves Partial bit was not added
+        roundtrip(msg);
     }
 
     #[test]
@@ -1084,7 +1081,7 @@ mod tests {
             ],
             announced: vec![nlri4("10.0.0.0/8")],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1101,7 +1098,7 @@ mod tests {
             attributes: vec![],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1126,7 +1123,7 @@ mod tests {
             ])],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1137,7 +1134,7 @@ mod tests {
             attributes: vec![PathAttribute::As4Path(path)],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1150,7 +1147,7 @@ mod tests {
             }],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1164,7 +1161,7 @@ mod tests {
             })],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1181,7 +1178,7 @@ mod tests {
             })],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1194,7 +1191,7 @@ mod tests {
             })],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1208,7 +1205,7 @@ mod tests {
             attributes: vec![PathAttribute::AsPath(path)],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     #[test]
@@ -1220,7 +1217,7 @@ mod tests {
             attributes: vec![PathAttribute::Communities(communities)],
             announced: vec![],
         };
-        assert_eq!(roundtrip(&msg), msg);
+        roundtrip(msg);
     }
 
     // ── Raw-byte decode helpers ───────────────────────────────────────────────
@@ -1232,27 +1229,32 @@ mod tests {
 
     /// Decode and assert the result is a clean (no attribute errors) UPDATE.
     fn decode_update(body: &[u8]) -> UpdateMessage {
-        match decode_raw(body).expect("structural decode error") {
-            UpdateDecodeOutcome::Clean(u) => u,
-            UpdateDecodeOutcome::Partial { errors, .. } => {
-                panic!("expected clean decode, got attribute errors: {errors:?}")
-            }
-        }
+        let UpdateDecodeOutcome::Clean(u) = decode_raw(body).expect("structural decode error") else {
+            panic!("expected clean decode, got attribute errors")
+        };
+        u
     }
 
     /// Decode and assert the result is a `Partial` outcome with at least one
     /// attribute error. Returns the errors and the treat-as-withdraw flag.
     fn decode_partial(body: &[u8]) -> (Vec<AttributeDecodeError>, bool) {
-        match decode_raw(body).expect("structural decode error") {
-            UpdateDecodeOutcome::Partial {
-                errors,
-                treat_as_withdraw,
-                ..
-            } => (errors, treat_as_withdraw),
-            UpdateDecodeOutcome::Clean(_) => {
-                panic!("expected Partial outcome but got Clean")
-            }
-        }
+        let UpdateDecodeOutcome::Partial { errors, treat_as_withdraw, .. } =
+            decode_raw(body).expect("structural decode error")
+        else {
+            panic!("expected Partial outcome but got Clean")
+        };
+        (errors, treat_as_withdraw)
+    }
+
+    /// Decode and assert a `Partial` outcome, returning the update message,
+    /// errors, and treat-as-withdraw flag together.
+    fn decode_partial_update(body: &[u8]) -> (UpdateMessage, Vec<AttributeDecodeError>, bool) {
+        let UpdateDecodeOutcome::Partial { update, errors, treat_as_withdraw } =
+            decode_raw(body).expect("structural decode error")
+        else {
+            panic!("expected Partial outcome but got Clean")
+        };
+        (update, errors, treat_as_withdraw)
     }
 
     /// Build an UPDATE body: no withdrawn routes, one path attribute (short len).
@@ -1277,6 +1279,30 @@ mod tests {
         body.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
         body.extend_from_slice(value);
         body
+    }
+
+    // ── Helper panic branches (should_panic tests cover the else arms) ────────
+
+    #[test]
+    #[should_panic(expected = "expected clean decode, got attribute errors")]
+    fn test_decode_update_panics_on_partial_outcome() {
+        // Malformed ORIGIN (value 99 is invalid) → Partial outcome.
+        let body: &[u8] = &[0x00, 0x00, 0x00, 0x04, FLAGS_WKM, ATTR_ORIGIN, 0x01, 99];
+        decode_update(body);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected Partial outcome but got Clean")]
+    fn test_decode_partial_panics_on_clean_outcome() {
+        // Empty UPDATE always decodes as Clean.
+        decode_partial(&[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected Partial outcome but got Clean")]
+    fn test_decode_partial_update_panics_on_clean_outcome() {
+        // Empty UPDATE always decodes as Clean.
+        decode_partial_update(&[0x00, 0x00, 0x00, 0x00]);
     }
 
     // ── NLRI error paths ──────────────────────────────────────────────────────
@@ -1460,15 +1486,8 @@ mod tests {
         body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
         body.extend_from_slice(&attrs);
 
-        let (attrs_decoded, errors, treat_as_withdraw) =
-            match decode_raw(&body).expect("structural error") {
-                UpdateDecodeOutcome::Partial {
-                    update,
-                    errors,
-                    treat_as_withdraw,
-                } => (update.attributes, errors, treat_as_withdraw),
-                UpdateDecodeOutcome::Clean(_) => panic!("expected Partial"),
-            };
+        let (update, errors, treat_as_withdraw) = decode_partial_update(&body);
+        let attrs_decoded = update.attributes;
 
         assert!(
             !treat_as_withdraw,
@@ -1536,6 +1555,78 @@ mod tests {
             &update.attributes[0],
             PathAttribute::MpUnreachNlri(mp) if mp.prefixes.is_empty()
         ));
+    }
+
+    // ── error_detail Truncated path ───────────────────────────────────────────
+
+    #[test]
+    fn test_as_path_truncated_mid_segment_is_treat_as_withdraw() {
+        // AS_PATH with one byte (segment-type only, count byte missing) triggers
+        // CodecError::Truncated from read_u8(), exercising the Truncated arm of
+        // error_detail().
+        let body = update_with_attr(FLAGS_WKM, ATTR_AS_PATH, &[0x02]);
+        let (errors, treat_as_withdraw) = decode_partial(&body);
+        assert!(treat_as_withdraw);
+        assert_eq!(errors[0].type_code, ATTR_AS_PATH);
+        assert_eq!(errors[0].detail, "attribute value truncated");
+    }
+
+    // ── Public encoding helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn test_nlri_encoded_len_values() {
+        assert_eq!(nlri_encoded_len(&nlri4("0.0.0.0/0")), 1);   // 1 + 0
+        assert_eq!(nlri_encoded_len(&nlri4("10.0.0.0/8")), 2);  // 1 + 1
+        assert_eq!(nlri_encoded_len(&nlri4("10.0.0.0/24")), 4); // 1 + 3
+        assert_eq!(nlri_encoded_len(&nlri4("10.0.0.1/32")), 5); // 1 + 4
+    }
+
+    #[test]
+    fn test_encode_attributes_non_empty() {
+        let attrs = vec![PathAttribute::Origin(Origin::Igp)];
+        let bytes = encode_attributes(&attrs);
+        // ORIGIN attr: flags(1) + type(1) + len(1) + value(1) = 4 bytes
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes[1], ATTR_ORIGIN);
+    }
+
+    // ── PathAttribute::type_code for remaining variants ───────────────────────
+
+    #[test]
+    fn test_type_code_for_uncovered_path_attribute_variants() {
+        assert_eq!(
+            PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: pathvector_types::AfiSafi::IPV4_UNICAST,
+                prefixes: vec![],
+            })
+            .type_code(),
+            ATTR_MP_UNREACH_NLRI
+        );
+        assert_eq!(
+            PathAttribute::ExtendedCommunities(vec![]).type_code(),
+            ATTR_EXTENDED_COMMUNITIES
+        );
+        assert_eq!(
+            PathAttribute::As4Path(AsPath::from_segments(vec![])).type_code(),
+            ATTR_AS4_PATH
+        );
+        assert_eq!(
+            PathAttribute::As4Aggregator {
+                asn: 65001,
+                bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+            }
+            .type_code(),
+            ATTR_AS4_AGGREGATOR
+        );
+        assert_eq!(
+            PathAttribute::Unknown {
+                type_code: 200,
+                flags: 0,
+                value: vec![],
+            }
+            .type_code(),
+            200
+        );
     }
 }
 

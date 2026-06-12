@@ -773,6 +773,22 @@ mod tests {
         })
     }
 
+    fn find_notification(outputs: &[FsmOutput]) -> Option<&NotificationMessage> {
+        outputs.iter().find_map(|o| {
+            if let FsmOutput::SendMessage(BgpMessage::Notification(n)) = o {
+                Some(n)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn test_find_notification_returns_none_when_no_notification_in_outputs() {
+        let outputs = vec![FsmOutput::StopHoldTimer, FsmOutput::InitiateTcpConnect];
+        assert!(find_notification(&outputs).is_none());
+    }
+
     /// Drive the FSM through the happy path up to Established and return it.
     fn establish(config: FsmConfig) -> (Fsm, SessionInfo) {
         let mut fsm = Fsm::new(config);
@@ -780,15 +796,8 @@ mod tests {
         fsm.process(FsmInput::TcpConnected);
         fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
-        let info = outputs
-            .iter()
-            .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o {
-                    Some(i.clone())
-                } else {
-                    None
-                }
-            })
+        let info = outputs.iter()
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
             .expect("SessionEstablished in outputs");
         (fsm, info)
     }
@@ -824,9 +833,7 @@ mod tests {
         let mut fsm = Fsm::new(default_config());
         fsm.process(FsmInput::ManualStart);
         let out = fsm.process(FsmInput::TcpConnected);
-        let Some(BgpMessage::Open(open)) = find_send(&out) else {
-            panic!("expected OPEN message");
-        };
+        let Some(BgpMessage::Open(open)) = find_send(&out) else { panic!("expected OPEN message") };
         assert_eq!(open.my_as, 65001);
         assert_eq!(open.bgp_id, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(open.hold_time, 90);
@@ -883,13 +890,7 @@ mod tests {
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = outputs
             .iter()
-            .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o {
-                    Some(i.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
             .expect("SessionEstablished");
 
         assert!(
@@ -925,13 +926,7 @@ mod tests {
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = outputs
             .iter()
-            .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o {
-                    Some(i.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
             .expect("SessionEstablished");
         assert_eq!(info.peer_type, pathvector_types::PeerType::Internal);
     }
@@ -962,13 +957,7 @@ mod tests {
         let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
         let info = outputs
             .iter()
-            .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o {
-                    Some(i.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
             .expect("SessionEstablished");
 
         let gr = info.peer_capabilities.iter().find_map(|c| {
@@ -1296,20 +1285,13 @@ mod tests {
         fsm.process(FsmInput::ManualStart);
         // Verify we send AS_TRANS in the my_as field.
         let out = fsm.process(FsmInput::TcpConnected);
-        let Some(BgpMessage::Open(open)) = find_send(&out) else {
-            panic!("expected OPEN");
-        };
+        let Some(BgpMessage::Open(open)) = find_send(&out) else { panic!("expected OPEN") };
         assert_eq!(open.my_as, AS_TRANS);
         // Verify we accept a peer with 4-byte ASN via capability.
         fsm.process(FsmInput::MessageReceived(peer_open(131_073, 90)));
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
-        let info = out.iter().find_map(|o| {
-            if let FsmOutput::SessionEstablished(i) = o {
-                Some(i.clone())
-            } else {
-                None
-            }
-        });
+        let info = out.iter()
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None });
         assert_eq!(info.unwrap().peer_as, 131_073);
     }
 
@@ -1336,13 +1318,7 @@ mod tests {
 
         let info = outputs
             .iter()
-            .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o {
-                    Some(i.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
             .expect("SessionEstablished");
 
         // peer_as should be the 2-byte my_as value since there is no FourByteAsn cap.
@@ -1779,13 +1755,7 @@ mod tests {
 
         let info = out
             .iter()
-            .find_map(|o| {
-                if let FsmOutput::SessionEstablished(i) = o {
-                    Some(i.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(|o| if let FsmOutput::SessionEstablished(i) = o { Some(i.clone()) } else { None })
             .expect("SessionEstablished");
         assert_eq!(
             info.peer_as, 65002,
@@ -1817,16 +1787,8 @@ mod tests {
         let out = fsm.process(FsmInput::MessageReceived(duplicate_id_open));
 
         assert_eq!(fsm.state(), State::Idle);
-        assert!(
-            matches!(
-                find_send(&out),
-                Some(BgpMessage::Notification(NotificationMessage {
-                    error: NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
-                    ..
-                }))
-            ),
-            "expected BadBgpIdentifier NOTIFICATION"
-        );
+        let n = find_notification(&out).expect("expected BadBgpIdentifier NOTIFICATION");
+        assert_eq!(n.error, NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier));
     }
 
     #[test]
@@ -1874,24 +1836,9 @@ mod tests {
         let out = fsm.process(FsmInput::MessageReceived(peer_open_no_rr));
 
         assert_eq!(fsm.state(), State::Idle);
-        let notif = find_send(&out).expect("expected NOTIFICATION");
-        assert!(
-            matches!(
-                notif,
-                BgpMessage::Notification(NotificationMessage {
-                    error: NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability),
-                    ..
-                })
-            ),
-            "expected UnsupportedCapability NOTIFICATION, got {notif:?}"
-        );
-        // Data field must list the RouteRefresh capability code (2).
-        if let BgpMessage::Notification(n) = notif {
-            assert!(
-                n.data.contains(&2),
-                "NOTIFICATION data must contain capability code 2 (RouteRefresh)"
-            );
-        }
+        let n = find_notification(&out).expect("expected UnsupportedCapability NOTIFICATION");
+        assert_eq!(n.error, NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability));
+        assert!(n.data.contains(&2), "NOTIFICATION data must contain capability code 2 (RouteRefresh)");
     }
 
     #[test]
