@@ -138,14 +138,14 @@ where
                     let peers = client.list_peers().await?;
                     output::print_peer_table(&peers);
                 }
-                PeerCommands::Get { address } => {
-                    let ip: IpAddr = address.parse().map_err(|_| {
+                PeerCommands::Get { peer } => {
+                    let ip: IpAddr = peer.parse().map_err(|_| {
                         pathvector_client::error::ClientError::Rpc(tonic::Status::invalid_argument(
-                            format!("'{address}' is not a valid IP address"),
+                            format!("'{peer}' is not a valid IP address"),
                         ))
                     })?;
-                    let peer = client.get_peer(ip).await?;
-                    output::print_peer_detail(&peer);
+                    let peer_state = client.get_peer(ip).await?;
+                    output::print_peer_detail(&peer_state);
                 }
             }
         }
@@ -218,14 +218,14 @@ where
         Commands::Policy { command } => {
             let mut client = connect(addr)?;
             match command {
-                PolicyCommands::SetImport { address, decision } => {
+                PolicyCommands::SetImport { peer, decision } => {
                     client
-                        .set_import_default(&address, decision.as_bool())
+                        .set_import_default(&peer, decision.as_bool())
                         .await?;
                 }
-                PolicyCommands::SetExport { address, decision } => {
+                PolicyCommands::SetExport { peer, decision } => {
                     client
-                        .set_export_default(&address, decision.as_bool())
+                        .set_export_default(&peer, decision.as_bool())
                         .await?;
                 }
             }

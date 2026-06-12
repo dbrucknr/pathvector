@@ -82,7 +82,8 @@ pub enum PeerCommands {
     /// Show detailed state for a single peer.
     Get {
         /// Peer IP address in dotted-decimal notation.
-        address: String,
+        #[arg(value_name = "ADDRESS")]
+        peer: String,
     },
 }
 
@@ -185,7 +186,8 @@ pub enum PolicyCommands {
     /// any Loc-RIB changes to all established peers — no session reset required.
     SetImport {
         /// Peer IP address in dotted-decimal notation.
-        address: String,
+        #[arg(value_name = "ADDRESS")]
+        peer: String,
         /// New default action.
         decision: Decision,
     },
@@ -197,7 +199,8 @@ pub enum PolicyCommands {
     /// ones — no session reset required.
     SetExport {
         /// Peer IP address in dotted-decimal notation.
-        address: String,
+        #[arg(value_name = "ADDRESS")]
+        peer: String,
         /// New default action.
         decision: Decision,
     },

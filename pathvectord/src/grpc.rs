@@ -630,17 +630,7 @@ impl PolicyService for PolicyServiceImpl {
             )));
         }
 
-        tracing::info!(
-            peer = %peer_ip,
-            ?action,
-            "SetImportDefault: acquiring write lock — replacing import policy"
-        );
         s.set_import_default(peer_ip, action);
-        tracing::info!(
-            peer = %peer_ip,
-            ?action,
-            "SetImportDefault: complete"
-        );
         Ok(Response::new(SetImportDefaultResponse {}))
     }
 
@@ -2557,5 +2547,71 @@ mod tests {
         let end = stream.next().await.unwrap().unwrap();
         assert_eq!(end.r#type, proto::RouteEventType::EndInitial as i32);
         assert!(stream.next().await.is_none());
+    }
+
+    // ── In-process integration test: real tonic server + PathvectorClient ─────
+    //
+    // Starts a real tonic gRPC server on a random port and calls it via
+    // PathvectorClient over an actual H2C connection to catch routing or
+    // transport-level bugs that direct handler-call tests cannot detect.
+
+    async fn start_grpc_server_for_integration(
+        state: Arc<tokio::sync::RwLock<DaemonState>>,
+    ) -> std::net::SocketAddr {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let policy_svc =
+            proto::policy_service_server::PolicyServiceServer::new(PolicyServiceImpl {
+                state: Arc::clone(&state),
+            });
+        let peer_svc = proto::peer_service_server::PeerServiceServer::new(PeerServiceImpl {
+            state: Arc::clone(&state),
+        });
+        let origination_svc =
+            proto::origination_service_server::OriginationServiceServer::new(
+                OriginationServiceImpl {
+                    state: Arc::clone(&state),
+                },
+            );
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(peer_svc)
+                .add_service(policy_svc)
+                .add_service(origination_svc)
+                .serve_with_incoming(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                )
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_policy_service_over_real_h2c_connection() {
+        use pathvector_client::{DaemonClient, PathvectorClient};
+
+        let peer_ip: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let state = arc_state(65001, &[(peer_ip, 65002)]);
+        let addr = start_grpc_server_for_integration(Arc::clone(&state)).await;
+
+        let mut client =
+            PathvectorClient::connect(format!("http://{addr}")).expect("connect");
+
+        client
+            .set_import_default(&peer_ip.to_string(), false)
+            .await
+            .expect("set_import_default reject via H2C failed");
+
+        client
+            .set_import_default(&peer_ip.to_string(), true)
+            .await
+            .expect("set_import_default accept via H2C failed");
     }
 }

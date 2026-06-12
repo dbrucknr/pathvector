@@ -34,7 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest          = { workspace = true }
+pathvector-client = { workspace = true }
 
 # pathvectord generates code via tonic_prost_build.  The generated file
 # triggers four pedantic lints (doc_markdown, trivially_copy_pass_by_ref,

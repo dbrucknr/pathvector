@@ -3,14 +3,16 @@
 How to run pathvectord and GoBGP side-by-side on a single machine, observe a
 live session, and drive routing events manually or via a scripted exchange.
 
+[gobgp source](https://github.com/osrg/gobgp)
+
 ---
 
 ## Prerequisites
 
 ```bash
 # GoBGP (installs gobgpd + gobgp CLI)
-go install github.com/osrg/gobgp/v3/cmd/gobgpd@v3.6.0
-go install github.com/osrg/gobgp/v3/cmd/gobgp@v3.6.0
+go install github.com/osrg/gobgp/v4/cmd/gobgpd@v4.6.0
+go install github.com/osrg/gobgp/v4/cmd/gobgp@v4.6.0
 
 # Confirm both are on PATH
 gobgpd --version
