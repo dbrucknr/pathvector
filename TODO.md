@@ -70,12 +70,20 @@ failures (one from each stream) overwrites the first error. In practice both str
 together ("daemon down") so the second message is equally informative. Fix requires UI
 layout decision; deferred.
 
-**6. IPv6 RIB — inbound half** (`pathvectord`)
-After item 1 (MultiProtocol capability) is done, advertising IPv6 capability
-becomes a matter of adding parallel `LocRib<Ipv6Addr>` / `AdjRibIn<Ipv6Addr>`
-tables to `DaemonState` and routing `AfiSafi::IPV6_UNICAST` events to them.
-The RIB library is already generic. The outbound half (constructing MP_REACH_NLRI
-UPDATE messages with a valid IPv6 next-hop) is harder and can follow separately.
+**6. IPv6 RIB — inbound half** (`pathvectord`) — **Done (2026-06-12)**
+Parallel `LocRib<Ipv6Addr>` / `AdjRibIn<Ipv6Addr>` tables added to `DaemonState`
+and `RibSnapshot`. `handle_update` routes `AfiSafi::IPV6_UNICAST` MP_REACH_NLRI
+and MP_UNREACH_NLRI events to them. `sync_received` counts both v4 and v6.
+`on_established` resets the v6 AdjRibIn for reconnected peers. `on_terminated`
+withdraws v6 routes for departed peers. `build_daemon` advertises
+`MultiProtocol(IPV6_UNICAST)` capability. gRPC `list_routes` and `watch_routes`
+include v6 routes in their responses. IPv6 import policy is accept-all until
+per-AFI policy configuration is added.
+Tests: 4 new unit tests in `pathvectord::tests` covering MP_REACH_NLRI v6
+announce, AdjRibIn v6 storage, MP_UNREACH_NLRI v6 withdrawal, and mixed v4+v6
+UPDATE.
+Outbound half (constructing MP_REACH_NLRI UPDATE messages with a valid IPv6
+next-hop) is deferred — requires new UPDATE construction logic.
 
 **10. ROUTE-REFRESH receive guard** (`pathvector-session`) — **Done (2026-06-10)**
 ROUTE-REFRESH received in `Established` is now gated on capability negotiation.

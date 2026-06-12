@@ -4,7 +4,7 @@ mod proto;
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -312,6 +312,8 @@ fn flush_updates(
 #[derive(Clone)]
 pub(crate) struct RibSnapshot {
     pub(crate) loc_rib: LocRib<Ipv4Addr>,
+    /// IPv6 Loc-RIB — best IPv6 routes, post-import-policy.
+    pub(crate) loc_rib_v6: LocRib<Ipv6Addr>,
     /// Locally originated routes (bypassed import policy; export policy applies).
     pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
     /// Immutable after startup.
@@ -347,6 +349,7 @@ struct DaemonState {
     pub(crate) export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
     pub(crate) adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
     pub(crate) adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
+    pub(crate) adj_ribs_in_v6: HashMap<Ipv4Addr, AdjRibIn<Ipv6Addr>>,
     /// Static peer type derived from config; used to reset `AdjRibOut` on reconnect.
     pub(crate) peer_config_types: HashMap<Ipv4Addr, PeerType>,
     pub(crate) update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
@@ -413,6 +416,11 @@ impl DaemonState {
             .map(|p| (p.address, AdjRibIn::new(PeerId::from(p.address))))
             .collect();
 
+        let adj_ribs_in_v6 = peers
+            .iter()
+            .map(|p| (p.address, AdjRibIn::new(PeerId::from(p.address))))
+            .collect();
+
         let peer_config_types = peers
             .iter()
             .map(|p| (p.address, config_peer_type(local_as, p.remote_as)))
@@ -433,6 +441,7 @@ impl DaemonState {
 
         let rib = Arc::new(RibSnapshot {
             loc_rib: LocRib::new(),
+            loc_rib_v6: LocRib::new(),
             originated_routes: HashMap::new(),
             local_as,
             local_bgp_id,
@@ -450,6 +459,7 @@ impl DaemonState {
             export_policies,
             adj_ribs_in,
             adj_ribs_out,
+            adj_ribs_in_v6,
             peer_config_types,
             update_senders,
             config_capabilities,
@@ -481,8 +491,9 @@ impl DaemonState {
     /// Syncs the derived `prefixes_received` count for `peer_ip` from the
     /// current `adj_ribs_in` length.
     fn sync_received(&mut self, peer_ip: Ipv4Addr) {
-        let count = self.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
-        self.rib_mut().prefixes_received.insert(peer_ip, count);
+        let v4 = self.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
+        let v6 = self.adj_ribs_in_v6.get(&peer_ip).map_or(0, AdjRibIn::len);
+        self.rib_mut().prefixes_received.insert(peer_ip, v4 + v6);
     }
 
     /// Syncs the derived `prefixes_advertised` count for `peer_ip` from the
@@ -542,6 +553,8 @@ impl DaemonState {
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = AdjRibOut::new(peer_id, peer_type);
         }
+        // Reset IPv6 Adj-RIB-In so a re-established session starts clean.
+        self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
@@ -621,6 +634,9 @@ impl DaemonState {
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
         }
+        if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
+            ari.clear();
+        }
 
         // Snapshot affected prefixes before withdrawal so we can propagate the
         // changes to other established peers below.
@@ -628,6 +644,7 @@ impl DaemonState {
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
         self.rib_mut().loc_rib.withdraw_peer(&peer_id);
+        self.rib_mut().loc_rib_v6.withdraw_peer(&peer_id);
 
         // Reset this peer's outbound state for a clean reconnect.
         let cfg_pt = self
@@ -770,10 +787,28 @@ impl DaemonState {
             return;
         };
 
+        // IPv6 AdjRibIn may not exist for all peers (e.g. if capability was not
+        // advertised); use a temporary empty table in that case so handle_update
+        // can take ownership without a conditional.
+        let mut scratch_v6 = AdjRibIn::new(peer_id);
+        let adj_rib_in_v6 = self
+            .adj_ribs_in_v6
+            .get_mut(&peer_ip)
+            .unwrap_or(&mut scratch_v6);
+
         // Split mutable borrows across distinct struct fields explicitly so the
         // borrow checker can verify they don't alias.
-        let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
-        handle_update(peer_id, msg, adj_rib_in, loc_rib, policy, peer_type);
+        let rib = Arc::make_mut(&mut self.rib);
+        handle_update(
+            peer_id,
+            msg,
+            adj_rib_in,
+            &mut rib.loc_rib,
+            adj_rib_in_v6,
+            &mut rib.loc_rib_v6,
+            policy,
+            peer_type,
+        );
 
         self.sync_received(peer_ip);
 
@@ -1081,6 +1116,7 @@ where
 
     let local_capabilities = vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+        Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         Capability::FourByteAsn(local_as),
         Capability::ExtendedMessage,
     ];
@@ -1268,12 +1304,14 @@ pub fn reapply_import_policy(
 // UPDATE processing dispatches across all path attribute types in one pass.
 // Splitting this function further would produce artificial helpers with no
 // independent utility.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn handle_update(
     peer: PeerId,
     msg: UpdateMessage,
     adj_rib_in: &mut AdjRibIn<Ipv4Addr>,
     loc_rib: &mut LocRib<Ipv4Addr>,
+    adj_rib_in_v6: &mut AdjRibIn<Ipv6Addr>,
+    loc_rib_v6: &mut LocRib<Ipv6Addr>,
     policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
 ) {
@@ -1302,6 +1340,8 @@ fn handle_update(
     // (nlri, next_hop) pairs from MP_REACH_NLRI; next_hop is mandatory there.
     let mut mp_v4_announced: Vec<(Nlri<Ipv4Addr>, NextHop)> = Vec::new();
     let mut mp_v4_withdrawn: Vec<Nlri<Ipv4Addr>> = Vec::new();
+    let mut mp_v6_announced: Vec<(Nlri<Ipv6Addr>, NextHop)> = Vec::new();
+    let mut mp_v6_withdrawn: Vec<Nlri<Ipv6Addr>> = Vec::new();
 
     for attr in &msg.attributes {
         match attr {
@@ -1322,6 +1362,12 @@ fn handle_update(
                             mp_v4_announced.push((*nlri, mp.next_hop));
                         }
                     }
+                } else if mp.afi_safi == AfiSafi::IPV6_UNICAST {
+                    for prefix in &mp.prefixes {
+                        if let Prefix::V6(nlri) = prefix {
+                            mp_v6_announced.push((*nlri, mp.next_hop));
+                        }
+                    }
                 } else {
                     tracing::debug!(
                         peer = %peer,
@@ -1335,6 +1381,12 @@ fn handle_update(
                     for prefix in &mp.prefixes {
                         if let Prefix::V4(nlri) = prefix {
                             mp_v4_withdrawn.push(*nlri);
+                        }
+                    }
+                } else if mp.afi_safi == AfiSafi::IPV6_UNICAST {
+                    for prefix in &mp.prefixes {
+                        if let Prefix::V6(nlri) = prefix {
+                            mp_v6_withdrawn.push(*nlri);
                         }
                     }
                 } else {
@@ -1429,13 +1481,58 @@ fn handle_update(
         }
     }
 
+    // ── MP_UNREACH_NLRI IPv6 withdrawals (RFC 4760) ──────────────────────────
+    let mp_v6_withdrawn_count = mp_v6_withdrawn.len();
+    for nlri in &mp_v6_withdrawn {
+        adj_rib_in_v6.withdraw(nlri);
+        loc_rib_v6.withdraw(&peer, nlri);
+    }
+
+    // ── IPv6 announcements from MP_REACH_NLRI ─────────────────────────────
+    // No import policy for IPv6 yet — accept all. Policy support will be added
+    // when per-AFI policy configuration is introduced.
+    let mut accepted_v6 = 0usize;
+    for (nlri, nh) in mp_v6_announced {
+        let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+        builder = builder.next_hop(nh);
+        if let Some(lp) = local_pref {
+            builder = builder.local_pref(lp);
+        }
+        if let Some(m) = med {
+            builder = builder.med(m);
+        }
+        for &c in &communities {
+            builder = builder.community(c);
+        }
+        for &lc in &large_communities {
+            builder = builder.large_community(lc);
+        }
+        for &ec in &extended_communities {
+            builder = builder.extended_community(ec);
+        }
+        if atomic_aggregate {
+            builder = builder.atomic_aggregate();
+        }
+        if let Some(agg) = aggregator {
+            builder = builder.aggregator(agg);
+        }
+
+        let route = builder.build();
+        adj_rib_in_v6.insert(route.clone());
+        loc_rib_v6.insert(peer, route);
+        accepted_v6 += 1;
+    }
+
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
         mp_withdrawn = mp_withdrawn_count,
+        mp_v6_withdrawn = mp_v6_withdrawn_count,
         accepted,
         rejected,
+        accepted_v6,
         rib_size = loc_rib.len(),
+        rib_v6_size = loc_rib_v6.len(),
         "processed UPDATE"
     );
 }
@@ -1882,6 +1979,26 @@ mod tests {
         assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
+    // ── test wrappers ─────────────────────────────────────────────────────────
+
+    /// Wrapper for IPv4-only `handle_update` calls — passes fresh v6 stubs.
+    fn handle_update_v4(
+        p: PeerId,
+        msg: UpdateMessage,
+        ari: &mut AdjRibIn<Ipv4Addr>,
+        rib: &mut LocRib<Ipv4Addr>,
+        policy: &Policy<Route<Ipv4Addr>>,
+        pt: PeerType,
+    ) {
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(p, msg, ari, rib, &mut ari_v6, &mut rib_v6, policy, pt);
+    }
+
+    fn nlri_v6(s: &str) -> Nlri<Ipv6Addr> {
+        s.parse().unwrap()
+    }
+
     // ── basic handle_update behaviour ─────────────────────────────────────────
 
     #[test]
@@ -1909,7 +2026,7 @@ mod tests {
             ],
             announced: vec![nlri("192.168.0.0/16")],
         };
-        handle_update(
+        handle_update_v4(
             peer(),
             msg,
             &mut ari,
@@ -1933,7 +2050,7 @@ mod tests {
     fn test_handle_update_withdraw_removes_route() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -1950,7 +2067,7 @@ mod tests {
         );
         assert_eq!(rib.len(), 1);
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![nlri("10.0.0.0/8")],
@@ -1970,7 +2087,7 @@ mod tests {
     fn test_handle_update_empty_announced_is_noop() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -1990,7 +2107,7 @@ mod tests {
     fn test_handle_update_unknown_attribute_is_skipped() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2018,7 +2135,7 @@ mod tests {
     fn test_handle_update_blackhole_route_not_installed() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2043,7 +2160,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
         let prefix = nlri("192.0.2.0/24");
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2070,7 +2187,7 @@ mod tests {
     fn test_handle_update_non_blackhole_route_installed_normally() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2100,7 +2217,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2117,7 +2234,7 @@ mod tests {
         );
         assert_eq!(rib.len(), 1);
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2146,7 +2263,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2188,7 +2305,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2230,7 +2347,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2256,7 +2373,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2338,13 +2455,181 @@ mod tests {
         );
     }
 
+    // ── IPv6 inbound (MP_REACH_NLRI / MP_UNREACH_NLRI) ───────────────────────
+
+    fn fresh_ari_v6() -> AdjRibIn<Ipv6Addr> {
+        AdjRibIn::new(peer())
+    }
+
+    #[test]
+    fn test_handle_update_mp_reach_ipv6_inserts_into_loc_rib_v6() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert_eq!(rib_v6.len(), 1, "IPv6 route must enter loc_rib_v6");
+        assert!(rib.is_empty(), "IPv4 LocRib must remain empty");
+        let route = rib_v6.best(&nlri_v6("2001:db8::/32")).unwrap();
+        assert_eq!(route.origin, Origin::Igp);
+    }
+
+    #[test]
+    fn test_handle_update_mp_reach_ipv6_stored_in_adj_rib_in_v6() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("fe80::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("fd00::/16"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert_eq!(ari_v6.len(), 1, "pre-policy route must be in adj_rib_in_v6");
+    }
+
+    #[test]
+    fn test_handle_update_mp_unreach_ipv6_withdraws_route() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+
+        // Announce first.
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib_v6.len(), 1);
+
+        // Then withdraw.
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                })],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert!(
+            rib_v6.is_empty(),
+            "loc_rib_v6 must be empty after withdrawal"
+        );
+        assert!(rib.is_empty(), "IPv4 LocRib must be unaffected");
+    }
+
+    #[test]
+    fn test_handle_update_ipv4_and_ipv6_in_same_update() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        assert_eq!(rib.len(), 1, "IPv4 route must be in loc_rib");
+        assert_eq!(rib_v6.len(), 1, "IPv6 route must be in loc_rib_v6");
+    }
+
     // ── import policy ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_reject_all_policy_blocks_all_routes() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2366,7 +2651,7 @@ mod tests {
     fn test_accept_all_policy_passes_all_routes() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2396,7 +2681,7 @@ mod tests {
 
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2425,7 +2710,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2442,7 +2727,7 @@ mod tests {
             PeerType::External,
         );
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2472,7 +2757,7 @@ mod tests {
     fn test_peer_type_tagged_on_route() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2497,7 +2782,7 @@ mod tests {
     fn test_adj_rib_in_stores_raw_route_even_when_rejected() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2529,7 +2814,7 @@ mod tests {
 
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2556,7 +2841,7 @@ mod tests {
     fn test_adj_rib_in_withdraw_clears_both_tables() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2574,7 +2859,7 @@ mod tests {
         assert_eq!(ari.len(), 1);
         assert_eq!(rib.len(), 1);
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![nlri("10.0.0.0/8")],
@@ -2596,7 +2881,7 @@ mod tests {
     fn test_reapply_accepts_previously_rejected_route() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2621,7 +2906,7 @@ mod tests {
     fn test_reapply_rejects_previously_accepted_route() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2646,7 +2931,7 @@ mod tests {
     fn test_reapply_applies_new_policy_modifications() {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2685,7 +2970,7 @@ mod tests {
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
 
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],
@@ -2701,7 +2986,7 @@ mod tests {
             &accept_all(),
             PeerType::External,
         );
-        handle_update(
+        handle_update_v4(
             peer(),
             UpdateMessage {
                 withdrawn: vec![],

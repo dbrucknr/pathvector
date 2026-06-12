@@ -165,6 +165,67 @@ pub(crate) fn route_to_proto(
     }
 }
 
+fn route_v6_to_proto(
+    peer_id: PeerId,
+    nlri: pathvector_types::Nlri<std::net::Ipv6Addr>,
+    route: &pathvector_rib::Route<std::net::Ipv6Addr>,
+) -> Route {
+    let peer_address = peer_id.ip().to_string();
+
+    let next_hop = match route.next_hop {
+        Some(NextHop::V4(ip)) => ip.to_string(),
+        Some(NextHop::V6(ip)) => ip.to_string(),
+        Some(NextHop::V6WithLinkLocal { global, .. }) => global.to_string(),
+        None => String::new(),
+    };
+
+    let as_path: Vec<AsSegment> = route
+        .as_path
+        .segments()
+        .iter()
+        .map(proto_as_segment)
+        .collect();
+
+    let communities: Vec<u32> = route.communities.iter().map(|c| c.as_u32()).collect();
+
+    let large_communities: Vec<LargeCommunity> = route
+        .large_communities
+        .iter()
+        .map(|lc| LargeCommunity {
+            global_admin: lc.global_administrator,
+            local_data1: lc.local_data_1,
+            local_data2: lc.local_data_2,
+        })
+        .collect();
+
+    let extended_communities: Vec<Vec<u8>> = route
+        .extended_communities
+        .iter()
+        .map(|ec| ec.as_bytes().to_vec())
+        .collect();
+
+    let aggregator = route.aggregator.map(|agg| Aggregator {
+        asn: agg.asn.as_u32(),
+        address: agg.ip.to_string(),
+    });
+
+    Route {
+        prefix: nlri.to_string(),
+        peer_address,
+        peer_type: proto_peer_type(route.peer_type),
+        next_hop,
+        as_path,
+        origin: proto_origin(route.origin),
+        local_pref: route.local_pref.map(LocalPref::as_u32),
+        med: route.med.map(Med::as_u32),
+        communities,
+        large_communities,
+        extended_communities,
+        atomic_aggregate: route.atomic_aggregate,
+        aggregator,
+    }
+}
+
 // ── PeerService ───────────────────────────────────────────────────────────────
 
 struct PeerServiceImpl {
@@ -384,18 +445,23 @@ impl RibService for RibServiceImpl {
 
         // Clone the Arc, release the lock, iterate without holding it.
         let snap = self.state.read().await.snapshot();
-        let routes: Vec<Route> = snap
-            .loc_rib
-            .best_routes()
-            .filter_map(|(nlri, route)| {
-                let peer_id = snap.loc_rib.best_peer(&nlri)?;
-                if peer_filter.is_none_or(|f| f == peer_id) {
-                    Some(route_to_proto(peer_id, nlri, route))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let v4_routes = snap.loc_rib.best_routes().filter_map(|(nlri, route)| {
+            let peer_id = snap.loc_rib.best_peer(&nlri)?;
+            if peer_filter.is_none_or(|f| f == peer_id) {
+                Some(route_to_proto(peer_id, nlri, route))
+            } else {
+                None
+            }
+        });
+        let v6_routes = snap.loc_rib_v6.best_routes().filter_map(|(nlri, route)| {
+            let peer_id = snap.loc_rib_v6.best_peer(&nlri)?;
+            if peer_filter.is_none_or(|f| f == peer_id) {
+                Some(route_v6_to_proto(peer_id, nlri, route))
+            } else {
+                None
+            }
+        });
+        let routes: Vec<Route> = v4_routes.chain(v6_routes).collect();
 
         Ok(Response::new(ListRoutesResponse { routes }))
     }
@@ -423,22 +489,31 @@ impl RibService for RibServiceImpl {
 
         // Clone the Arc, release the lock, build snapshot without holding it.
         let snap = self.state.read().await.snapshot();
-        let mut events: Vec<RouteEvent> = snap
-            .loc_rib
-            .best_routes()
-            .filter_map(|(nlri, route)| {
-                let peer_id = snap.loc_rib.best_peer(&nlri)?;
-                if peer_filter.is_none_or(|f| f == peer_id) {
-                    Some(RouteEvent {
-                        r#type: RouteEventType::Current as i32,
-                        route: Some(route_to_proto(peer_id, nlri, route)),
-                        withdrawn_prefix: None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let v4_events = snap.loc_rib.best_routes().filter_map(|(nlri, route)| {
+            let peer_id = snap.loc_rib.best_peer(&nlri)?;
+            if peer_filter.is_none_or(|f| f == peer_id) {
+                Some(RouteEvent {
+                    r#type: RouteEventType::Current as i32,
+                    route: Some(route_to_proto(peer_id, nlri, route)),
+                    withdrawn_prefix: None,
+                })
+            } else {
+                None
+            }
+        });
+        let v6_events = snap.loc_rib_v6.best_routes().filter_map(|(nlri, route)| {
+            let peer_id = snap.loc_rib_v6.best_peer(&nlri)?;
+            if peer_filter.is_none_or(|f| f == peer_id) {
+                Some(RouteEvent {
+                    r#type: RouteEventType::Current as i32,
+                    route: Some(route_v6_to_proto(peer_id, nlri, route)),
+                    withdrawn_prefix: None,
+                })
+            } else {
+                None
+            }
+        });
+        let mut events: Vec<RouteEvent> = v4_events.chain(v6_events).collect();
         events.push(RouteEvent {
             r#type: RouteEventType::EndInitial as i32,
             route: None,

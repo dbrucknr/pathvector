@@ -41,9 +41,9 @@ registry lives in `pathvector-types`.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| IPv4 unicast (AFI 1, SAFI 1): insert/withdraw prefix into Loc-RIB | `src/session_handler.rs` | ✅ | `test_ipv4_unicast_update_processed`, interop:gobgp |
-| IPv6 unicast (AFI 2, SAFI 1) via MP_REACH_NLRI: insert/withdraw prefix into Loc-RIB | `src/session_handler.rs` | ✅ | `test_ipv6_unicast_update_processed` |
-| Unknown AFI/SAFI: silently ignored (no session reset) | `src/session_handler.rs` | ✅ | `test_unknown_afisafi_ignored` |
+| IPv4 unicast (AFI 1, SAFI 1): insert/withdraw prefix into Loc-RIB | `src/main.rs` | ✅ | `test_handle_update_mp_reach_announces_ipv4_route`, `test_handle_update_mp_unreach_withdraws_ipv4_route`, interop:gobgp |
+| IPv6 unicast (AFI 2, SAFI 1) via MP_REACH_NLRI: insert/withdraw into LocRib_v6 | `src/main.rs` | ✅ | `test_handle_update_mp_reach_ipv6_inserts_into_loc_rib_v6`, `test_handle_update_mp_unreach_ipv6_withdraws_route` |
+| Unknown AFI/SAFI: silently ignored (no session reset) | `src/main.rs` | ✅ | `test_handle_update_mp_unreach_non_ipv4_is_skipped` |
 
 ---
 
