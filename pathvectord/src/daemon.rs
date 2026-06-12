@@ -2639,8 +2639,15 @@ mod tests {
 
     // ── IPv6 outbound (propagate_prefix_v6 / flush_updates_v6) ───────────────
 
+    fn peer_b() -> PeerId {
+        peer_id("10.0.0.2")
+    }
+
     fn make_adj_rib_out_v6(pt: PeerType) -> AdjRibOut<Ipv6Addr> {
-        AdjRibOut::new(peer(), pt)
+        // Use a distinct peer ID from `peer()` (the typical route source) so
+        // that the source-peer split-horizon check in propagate_prefix_v6 does
+        // not suppress the announcement in these unit tests.
+        AdjRibOut::new(peer_b(), pt)
     }
 
     #[test]
@@ -3592,6 +3599,34 @@ mod tests {
             rx.try_recv().is_err(),
             "no message expected for a route that was never advertised"
         );
+    }
+
+    #[test]
+    fn test_propagate_prefix_ebgp_source_peer_not_readvertised() {
+        // A route learned from an eBGP peer must never be re-advertised back
+        // to that same peer.  This mirrors the GoBGP "No matching path for
+        // withdraw found" warning: routes were ending up in AdjRibOut for the
+        // source peer and producing spurious WITHDRAWs.
+        let (src_peer, mut aro) = ebgp_out_peer(); // same peer as source AND target
+        let mut rib = LocRib::new();
+        rib.insert(src_peer, ebgp_route_with_lp("10.0.0.0/8"));
+        let (tx, mut rx) = mpsc::channel(16);
+
+        propagate_and_flush(
+            nlri("10.0.0.0/8"),
+            &rib,
+            &mut aro,
+            &accept_all(),
+            PeerType::External,
+            65001,
+            bgp_id(),
+            &tx,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "source-peer split horizon must suppress eBGP re-advertisement"
+        );
+        assert!(aro.is_empty(), "AdjRibOut must not store route for source peer");
     }
 
     #[test]

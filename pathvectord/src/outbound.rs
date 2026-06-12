@@ -83,6 +83,18 @@ pub(crate) fn propagate_prefix(
 ) -> PrefixDecision {
     match loc_rib.best(&nlri) {
         Some(best) => {
+            // Never re-advertise a route back to the peer it was learned from.
+            // This covers both eBGP and iBGP source-peer split horizon; the
+            // iBGP case is also enforced by AdjRibOut::insert, but catching it
+            // here avoids unnecessary prepare_outbound work and keeps eviction
+            // logic consistent.
+            if loc_rib.best_peer(&nlri) == Some(adj_rib_out.peer()) {
+                return if adj_rib_out.withdraw(&nlri).is_some() {
+                    PrefixDecision::Withdraw(nlri)
+                } else {
+                    PrefixDecision::NoChange
+                };
+            }
             let mut route = prepare_outbound(best.clone(), peer_type, local_as, local_bgp_id);
             match export_policy.evaluate(&mut route) {
                 Decision::Accept => match adj_rib_out.insert(route.clone()) {
@@ -260,6 +272,14 @@ pub(crate) fn propagate_prefix_v6(
 
     match loc_rib.best(&nlri) {
         Some(best) if can_announce => {
+            // Never re-advertise a route back to the peer it was learned from.
+            if loc_rib.best_peer(&nlri) == Some(adj_rib_out.peer()) {
+                return if adj_rib_out.withdraw(&nlri).is_some() {
+                    PrefixDecisionV6::Withdraw(nlri)
+                } else {
+                    PrefixDecisionV6::NoChange
+                };
+            }
             let route = prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6);
             match adj_rib_out.insert(route.clone()) {
                 InsertOutcome::Accepted(prev) => {
