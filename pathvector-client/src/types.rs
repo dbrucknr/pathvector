@@ -194,7 +194,7 @@ pub struct OriginateRouteParams {
 
 /// Discriminant for events on the [`WatchRoutes`] stream.
 ///
-/// [`WatchRoutes`]: crate::PathvectorClient::watch_routes
+/// [`WatchRoutes`]: crate::DaemonClient::watch_routes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
@@ -211,7 +211,7 @@ pub enum RouteEventType {
 
 /// A single event on the [`WatchRoutes`] stream.
 ///
-/// [`WatchRoutes`]: crate::PathvectorClient::watch_routes
+/// [`WatchRoutes`]: crate::DaemonClient::watch_routes
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RouteEvent {
@@ -224,7 +224,7 @@ pub struct RouteEvent {
 
 /// Discriminant for events on the [`WatchPeers`] stream.
 ///
-/// [`WatchPeers`]: crate::PathvectorClient::watch_peers
+/// [`WatchPeers`]: crate::DaemonClient::watch_peers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
@@ -239,7 +239,7 @@ pub enum PeerEventType {
 
 /// A single event on the [`WatchPeers`] stream.
 ///
-/// [`WatchPeers`]: crate::PathvectorClient::watch_peers
+/// [`WatchPeers`]: crate::DaemonClient::watch_peers
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PeerEvent {
