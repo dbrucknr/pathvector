@@ -264,12 +264,20 @@ exchange:
 Then the full workflow becomes:
 
 ```
-just gobgp-up          # terminal 1
-just dev               # terminal 2
+just gobgp-up          # terminal 1  ← start first
+just dev               # terminal 2  ← start second
 just dashboard         # terminal 3
 just pv route list     # terminal 4
 just exchange          # terminal 4 (after both daemons are up)
 ```
+
+> **Start order matters.** Always start `just gobgp-up` before `just dev`.
+> pathvectord is the active side: it dials GoBGP immediately on startup.
+> If GoBGP is not yet listening, the TCP connect fails and the BGP FSM starts
+> a 120-second ConnectRetry timer (RFC 4271 §8) before trying again.  During
+> that window the dashboard will show the peer stuck in Idle/Active even though
+> GoBGP is now up.  The session will reach Established automatically once the
+> timer fires — you just have to wait up to two minutes.
 
 ---
 
@@ -280,5 +288,6 @@ just exchange          # terminal 4 (after both daemons are up)
 | `Address already in use` on port 1179/1180 | Stale daemon process | `lsof -i :1179 -i :1180` then `kill <pid>` |
 | `unknown service pathvector.v1.PeerService` | CLI hitting GoBGP's gRPC port (50051) | Pass `--address http://127.0.0.1:50052` or use `just pv` |
 | Session never reaches Established | `bgp_id` is not a real interface address | Run `ifconfig \| grep "inet "` and set a real address in `config.toml` |
+| Peer stuck in Idle/Active after starting `just dev` | `just dev` was started before `just gobgp-up`; RFC 4271 ConnectRetry timer is 120 s | Wait up to 2 minutes — the session will come up automatically. Next time start `just gobgp-up` first |
 | GoBGP shows no routes from pathvectord | Export policy is rejecting | Check `import_default`/`export_default` in `config.toml` are both `"accept"` |
 | Dashboard shows no peers | Wrong gRPC address | Use `--address http://127.0.0.1:50052` |
