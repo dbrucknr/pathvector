@@ -398,6 +398,17 @@ mod tests {
     }
 
     #[test]
+    fn test_rib_view_best_via_trait_object() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        rib.insert(peer(1), route("10.0.0.0/8"));
+
+        let view: &dyn RibView<Ipv4Addr> = &rib;
+        assert!(view.best(&n).is_some());
+        assert!(view.best(&nlri("192.168.0.0/16")).is_none());
+    }
+
+    #[test]
     fn test_loc_rib_same_peer_update_replaces_candidate() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
