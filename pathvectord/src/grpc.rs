@@ -362,6 +362,10 @@ impl PeerService for PeerServiceImpl {
         });
         let snapshot = events;
 
+        // Hold a Weak so that dropping the last strong Arc (i.e. daemon
+        // shutdown) closes peer_tx and naturally terminates the stream, while
+        // still allowing snapshot reads for state-change signals.
+        let state_weak = Arc::downgrade(&self.state);
         let stream = async_stream::stream! {
             for event in snapshot {
                 yield Ok(event);
@@ -370,6 +374,30 @@ impl PeerService for PeerServiceImpl {
             let mut live = BroadcastStream::new(rx);
             while let Some(item) = live.next().await {
                 match item {
+                    Ok(PeerEvent { peer: None, .. }) => {
+                        // on_terminated / on_established broadcast a signal
+                        // without the peer payload. Upgrade to read the current
+                        // snapshot and emit one Changed event per configured
+                        // peer so every subscriber gets a consistent view.
+                        let Some(state) = state_weak.upgrade() else { break };
+                        let snap = state.read().await.snapshot();
+                        let mut changed: Vec<PeerEvent> = snap
+                            .peer_remote_as
+                            .keys()
+                            .copied()
+                            .filter_map(|addr| build_peer_state(&snap, addr))
+                            .map(|ps| PeerEvent {
+                                r#type: PeerEventType::Changed as i32,
+                                peer: Some(ps),
+                            })
+                            .collect();
+                        changed.sort_by_key(|e| {
+                            e.peer.as_ref().map_or(String::new(), |p| p.address.clone())
+                        });
+                        for e in changed {
+                            yield Ok(e);
+                        }
+                    }
                     Ok(event) => yield Ok(event),
                     Err(_lagged) => {
                         yield Err(Status::data_loss(
@@ -2465,6 +2493,47 @@ mod tests {
         let end = stream.next().await.unwrap().unwrap();
         assert_eq!(end.r#type, proto::PeerEventType::EndInitial as i32);
 
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_watch_peers_peer_none_broadcast_emits_changed_with_state() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PeerServiceImpl {
+            state: Arc::clone(&state),
+        };
+        let resp = svc
+            .watch_peers(Request::new(WatchPeersRequest {}))
+            .await
+            .expect("watch_peers");
+        let mut stream = resp.into_inner();
+
+        // Drain the snapshot (Current + EndInitial).
+        while let Some(Ok(ev)) = stream.next().await {
+            if ev.r#type == proto::PeerEventType::EndInitial as i32 {
+                break;
+            }
+        }
+
+        // Simulate on_terminated / on_established broadcasting peer: None.
+        let _ = state.read().await.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None,
+        });
+
+        // The stream should enrich the signal and emit one Changed event with
+        // the current peer state (Idle, since peer_types has no entry).
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.r#type, proto::PeerEventType::Changed as i32);
+        let ps = ev.peer.expect("peer payload must be present after enrichment");
+        assert_eq!(ps.address, "10.0.0.2");
+        assert_eq!(ps.remote_as, 65002);
+        assert_eq!(ps.session_state, proto::SessionState::Idle as i32);
+
+        // Close the sender so the stream terminates.
+        drop(state);
+        drop(svc);
         assert!(stream.next().await.is_none());
     }
 

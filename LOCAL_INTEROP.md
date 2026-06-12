@@ -5,6 +5,10 @@ live session, and drive routing events manually or via a scripted exchange.
 
 [gobgp source](https://github.com/osrg/gobgp)
 
+- Quick Tip - If you'd like to use a simulated workflow (There's a just recipes annotated below in this file):
+  - You'll need 4 separate terminals
+  - Run `just gobgp-up` in one, `just dev` in another, `just dashboard` in a third, and `just exchange` in the fourth
+
 ---
 
 ## Prerequisites
