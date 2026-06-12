@@ -667,6 +667,15 @@ impl DaemonState {
         if !affected_v6.is_empty() {
             self.propagate_to_all_peers_v6(&affected_v6);
         }
+
+        // Notify watchers so the dashboard reflects the updated Loc-RIB and
+        // RCV/ADV counters.  `propagate_to_all_peers` already called
+        // `sync_advertised`; the PeerEvent flushes that to the dashboard.
+        self.emit_route_events(&affected);
+        let _ = self.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None,
+        });
     }
 
     /// Propagates best-path decisions for `nlris` to every currently established
@@ -725,6 +734,38 @@ impl DaemonState {
         let peers: Vec<Ipv4Addr> = self.adj_ribs_out.keys().copied().collect();
         for peer_ip in peers {
             self.sync_advertised(peer_ip);
+        }
+        let _ = self.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None,
+        });
+    }
+
+    /// Emits a `RouteEvent` for each NLRI in `affected` based on the current
+    /// Loc-RIB state: `Announced` when a best route exists, `Withdrawn` when
+    /// the prefix has been removed.
+    fn emit_route_events(&self, affected: &[Nlri<Ipv4Addr>]) {
+        for &nlri in affected {
+            let event = match self.rib.loc_rib.best(&nlri) {
+                Some(route) => {
+                    let peer_id = self
+                        .rib
+                        .loc_rib
+                        .best_peer(&nlri)
+                        .unwrap_or_else(|| PeerId::from(Ipv4Addr::UNSPECIFIED));
+                    proto::RouteEvent {
+                        r#type: proto::RouteEventType::Announced as i32,
+                        route: Some(grpc::route_to_proto(peer_id, nlri, route)),
+                        withdrawn_prefix: None,
+                    }
+                }
+                None => proto::RouteEvent {
+                    r#type: proto::RouteEventType::Withdrawn as i32,
+                    route: None,
+                    withdrawn_prefix: Some(nlri.to_string()),
+                },
+            };
+            let _ = self.route_tx.send(event);
         }
     }
 
@@ -894,6 +935,9 @@ impl DaemonState {
         );
 
         self.propagate_to_all_peers(&nlris);
+        // propagate_to_all_peers fires PeerEvent::Changed (ADV); fire route
+        // events too so the dashboard reflects the Loc-RIB change.
+        self.emit_route_events(&nlris);
     }
 
     /// Replaces the export-policy default for `peer_ip` and re-evaluates the
