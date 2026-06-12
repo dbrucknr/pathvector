@@ -633,9 +633,14 @@ impl PolicyService for PolicyServiceImpl {
         tracing::info!(
             peer = %peer_ip,
             ?action,
-            "SetImportDefault: replacing import policy and reapplying to Adj-RIB-In"
+            "SetImportDefault: acquiring write lock — replacing import policy"
         );
         s.set_import_default(peer_ip, action);
+        tracing::info!(
+            peer = %peer_ip,
+            ?action,
+            "SetImportDefault: complete"
+        );
         Ok(Response::new(SetImportDefaultResponse {}))
     }
 
@@ -1689,6 +1694,122 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── PolicyService with established peer + routes (exchange scenario) ────────
+    //
+    // All previous policy tests use empty state (no established peers, no routes)
+    // so propagate_to_all_peers is never exercised.  These tests mirror the
+    // scripts/exchange.sh phase 3 scenario exactly.
+
+    #[tokio::test]
+    async fn test_set_import_default_reject_with_established_peer_and_routes() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn, Nlri};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        // Simulate BGP session reaching Established (GoBGP peer).
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+        }
+
+        // Simulate GoBGP sending 3 routes (like exchange script phase 1).
+        let routes: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+        for prefix in routes {
+            let nlri: Nlri<Ipv4Addr> = prefix.parse().unwrap();
+            let mut s = state.write().await;
+            s.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(pathvector_types::Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                        PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                    ],
+                    announced: vec![nlri],
+                },
+            );
+        }
+
+        // Verify routes are in loc_rib before the policy change.
+        {
+            let s = state.read().await;
+            assert_eq!(s.rib.loc_rib.len(), 3, "3 GoBGP routes must be in loc_rib");
+        }
+
+        // Phase 3: flip to reject-import — mirrors `pv policy set-import 127.0.0.1 reject`.
+        let svc = PolicyServiceImpl {
+            state: Arc::clone(&state),
+        };
+        svc.set_import_default(Request::new(SetImportDefaultRequest {
+            peer_address: "127.0.0.1".into(),
+            action: proto::PolicyAction::Reject as i32,
+        }))
+        .await
+        .expect("set_import_default reject must succeed with populated rib");
+
+        // All 3 routes should now be gone from loc_rib.
+        {
+            let s = state.read().await;
+            assert_eq!(
+                s.rib.loc_rib.len(),
+                0,
+                "loc_rib must be empty after reject-import policy"
+            );
+        }
+
+        // Restore: flip back to accept-import.
+        svc.set_import_default(Request::new(SetImportDefaultRequest {
+            peer_address: "127.0.0.1".into(),
+            action: proto::PolicyAction::Accept as i32,
+        }))
+        .await
+        .expect("set_import_default accept must succeed");
+    }
+
+    #[tokio::test]
+    async fn test_set_export_default_reject_with_established_peer_and_routes() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn, Nlri};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+        }
+
+        // Inject a route into loc_rib via origination (simulates phase 2).
+        {
+            let mut s = state.write().await;
+            s.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(pathvector_types::Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                        PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                    ],
+                    announced: vec!["10.0.0.0/8".parse::<Nlri<Ipv4Addr>>().unwrap()],
+                },
+            );
+        }
+
+        let svc = PolicyServiceImpl {
+            state: Arc::clone(&state),
+        };
+        svc.set_export_default(Request::new(SetExportDefaultRequest {
+            peer_address: "127.0.0.1".into(),
+            action: proto::PolicyAction::Reject as i32,
+        }))
+        .await
+        .expect("set_export_default reject must succeed with populated rib");
     }
 
     // ── PolicyService::set_export_default ─────────────────────────────────────
