@@ -210,3 +210,75 @@ impl DaemonClient for MockDaemonClient {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 }
+
+// ── MockDaemonClient unit tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt as _;
+    use pathvector_client::error::ClientError;
+
+    use super::{DaemonClient, MockDaemonClient};
+
+    fn rpc_err() -> ClientError {
+        ClientError::Rpc(tonic::Status::unavailable("no daemon"))
+    }
+
+    /// `list_routes` returns `Err` when `force_error` is set.
+    #[tokio::test]
+    async fn list_routes_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(rpc_err());
+        let result = mock.list_routes(None).await;
+        assert!(result.is_err());
+    }
+
+    /// `watch_routes` returns the queued event batch and drains it.
+    #[tokio::test]
+    async fn watch_routes_yields_queued_events() {
+        use pathvector_client::types::{RouteEvent, RouteEventType};
+        let mut mock = MockDaemonClient::new();
+        let event = RouteEvent {
+            event_type: RouteEventType::EndInitial,
+            route: None,
+            withdrawn_prefix: None,
+        };
+        mock.route_events.push_back(vec![Ok(event)]);
+
+        let mut stream = mock.watch_routes(None).await.unwrap();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// `watch_routes` with an empty queue returns an empty stream.
+    #[tokio::test]
+    async fn watch_routes_empty_queue_returns_empty_stream() {
+        let mut mock = MockDaemonClient::new();
+        let mut stream = mock.watch_routes(None).await.unwrap();
+        assert!(stream.next().await.is_none());
+    }
+
+    /// `watch_peers` returns the queued event batch and drains it.
+    #[tokio::test]
+    async fn watch_peers_yields_queued_events() {
+        use pathvector_client::types::{PeerEvent, PeerEventType};
+        let mut mock = MockDaemonClient::new();
+        let event = PeerEvent {
+            event_type: PeerEventType::EndInitial,
+            peer: None,
+        };
+        mock.peer_events.push_back(vec![Ok(event)]);
+
+        let mut stream = mock.watch_peers().await.unwrap();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// `watch_peers` with an empty queue returns an empty stream.
+    #[tokio::test]
+    async fn watch_peers_empty_queue_returns_empty_stream() {
+        let mut mock = MockDaemonClient::new();
+        let mut stream = mock.watch_peers().await.unwrap();
+        assert!(stream.next().await.is_none());
+    }
+}

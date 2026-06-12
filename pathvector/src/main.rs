@@ -438,6 +438,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_list_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(run_cmd(&["pv", "route", "list"], mock).await.is_err());
+    }
+
+    #[tokio::test]
     async fn route_list_peer_filter() {
         let mut mock = MockDaemonClient::new();
         mock.routes = vec![make_route()];
