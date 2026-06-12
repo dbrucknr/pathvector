@@ -3626,7 +3626,123 @@ mod tests {
             rx.try_recv().is_err(),
             "source-peer split horizon must suppress eBGP re-advertisement"
         );
-        assert!(aro.is_empty(), "AdjRibOut must not store route for source peer");
+        assert!(
+            aro.is_empty(),
+            "AdjRibOut must not store route for source peer"
+        );
+    }
+
+    /// Full exchange lifecycle regression test.
+    ///
+    /// Simulates the scripts/exchange.sh scenario entirely in-process:
+    /// 1. Peer (GoBGP) establishes and announces three prefixes.
+    /// 2. Daemon originates two local prefixes → peer receives ANNOUNCEs.
+    /// 3. Import policy flipped to reject → peer routes drop from LocRib.
+    /// 4. Import policy restored to accept → peer routes return to LocRib.
+    /// 5. Peer withdraws two of its three routes.
+    /// 6. Daemon withdraws its local routes → peer receives WITHDRAWs.
+    ///
+    /// Final invariant: only the one surviving peer route remains in LocRib.
+    #[test]
+    fn test_exchange_lifecycle_final_rib_has_only_surviving_peer_route() {
+        let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let (mut state, mut rx_map) = make_state(65002, &[(gobgp, 65001)]);
+
+        // ── 1. Session establishes; GoBGP announces {10, 172, 192} ───────────
+        state.on_established(gobgp, PeerType::External, 65001, 90, &[]);
+
+        let gobgp_announces = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Egp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+            ],
+            announced: vec![
+                nlri("10.0.0.0/8"),
+                nlri("172.16.0.0/12"),
+                nlri("192.168.0.0/16"),
+            ],
+        };
+        state.on_route_update(gobgp, gobgp_announces);
+        // Drain the table-dump messages generated during on_established + propagation
+        // (source-peer check suppresses re-advertisement back to GoBGP).
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        assert_eq!(state.rib.loc_rib.len(), 3, "phase 1: all three GoBGP routes in LocRib");
+
+        // ── 2. Originate {203, 198}; GoBGP should receive ANNOUNCEs ──────────
+        let route_203 = RouteBuilder::new(nlri("203.0.113.0/24"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4("10.0.0.2".parse().unwrap()))
+            .build();
+        let route_198 = RouteBuilder::new(nlri("198.51.100.0/24"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4("10.0.0.2".parse().unwrap()))
+            .build();
+        state.originate_routes(vec![route_203, route_198]);
+
+        let mut announced_to_gobgp: Vec<Nlri<Ipv4Addr>> = Vec::new();
+        while let Ok(msg) = rx_map.get_mut(&gobgp).unwrap().try_recv() {
+            announced_to_gobgp.extend(msg.announced);
+        }
+        assert!(
+            announced_to_gobgp.contains(&nlri("203.0.113.0/24")),
+            "phase 2: GoBGP must receive ANNOUNCE for 203.0.113.0/24"
+        );
+        assert!(
+            announced_to_gobgp.contains(&nlri("198.51.100.0/24")),
+            "phase 2: GoBGP must receive ANNOUNCE for 198.51.100.0/24"
+        );
+        assert_eq!(state.rib.loc_rib.len(), 5, "phase 2: 3 GoBGP + 2 local routes in LocRib");
+
+        // ── 3. Import policy → reject; GoBGP routes leave LocRib ─────────────
+        state.set_import_default(gobgp, DefaultAction::Reject);
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        assert_eq!(
+            state.rib.loc_rib.len(), 2,
+            "phase 3 reject: only local originated routes remain"
+        );
+
+        // ── 4. Import policy → accept; GoBGP routes return ───────────────────
+        state.set_import_default(gobgp, DefaultAction::Accept);
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        assert_eq!(state.rib.loc_rib.len(), 5, "phase 4 restore: all 5 routes back in LocRib");
+
+        // ── 5. GoBGP withdraws {10, 172} ──────────────────────────────────────
+        let gobgp_withdraws = UpdateMessage {
+            withdrawn: vec![nlri("10.0.0.0/8"), nlri("172.16.0.0/12")],
+            attributes: vec![],
+            announced: vec![],
+        };
+        state.on_route_update(gobgp, gobgp_withdraws);
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        assert_eq!(
+            state.rib.loc_rib.len(), 3,
+            "phase 5: 192 from GoBGP + 2 local routes remain"
+        );
+
+        // ── 6. Daemon withdraws {203, 198}; GoBGP must receive WITHDRAWs ─────
+        state.withdraw_originated_routes(&[nlri("203.0.113.0/24"), nlri("198.51.100.0/24")]);
+        let mut withdrawn_to_gobgp: Vec<Nlri<Ipv4Addr>> = Vec::new();
+        while let Ok(msg) = rx_map.get_mut(&gobgp).unwrap().try_recv() {
+            withdrawn_to_gobgp.extend(msg.withdrawn);
+        }
+        assert!(
+            withdrawn_to_gobgp.contains(&nlri("203.0.113.0/24")),
+            "phase 6: GoBGP must receive WITHDRAW for 203.0.113.0/24"
+        );
+        assert!(
+            withdrawn_to_gobgp.contains(&nlri("198.51.100.0/24")),
+            "phase 6: GoBGP must receive WITHDRAW for 198.51.100.0/24"
+        );
+
+        // ── Final: only 192.168.0.0/16 (from GoBGP) survives in LocRib ───────
+        assert_eq!(
+            state.rib.loc_rib.len(), 1,
+            "final: only 192.168.0.0/16 must remain in LocRib"
+        );
+        assert!(
+            state.rib.loc_rib.best(&nlri("192.168.0.0/16")).is_some(),
+            "final: 192.168.0.0/16 must be the surviving route"
+        );
     }
 
     #[test]

@@ -14,6 +14,28 @@ GOBGP="gobgp"
 
 log() { echo "[$(date +%T)] $*"; }
 
+# ── Wait for BGP session to reach Established ────────────────────────────────
+# The exchange requires an established session; polling avoids race conditions
+# when just dev (cargo compile + startup) finishes after just exchange starts.
+wait_established() {
+    local timeout=60
+    local elapsed=0
+    log "Waiting for BGP session to reach Established (timeout: ${timeout}s)..."
+    while true; do
+        if $PV peer list 2>/dev/null | grep -q "Established"; then
+            log "Session is Established."
+            return 0
+        fi
+        if [ "$elapsed" -ge "$timeout" ]; then
+            log "ERROR: session did not reach Established within ${timeout}s — is pathvectord running?"
+            exit 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+wait_established
+
 # ── Phase 1: GoBGP injects a prefix table ────────────────────────────────────
 
 log "GoBGP: announcing prefix table..."
