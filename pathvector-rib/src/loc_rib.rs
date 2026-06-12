@@ -60,7 +60,7 @@ pub trait RibView<A: IpAddress> {
     ///
     /// Implementations that cannot track the source peer (e.g. test stubs)
     /// return `None`, which disables the source-peer split-horizon check in
-    /// [`propagate_prefix`](crate::outbound::propagate_prefix).
+    /// [`propagate_prefix`].
     fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
         let _ = nlri;
         None

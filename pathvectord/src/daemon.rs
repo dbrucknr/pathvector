@@ -3668,7 +3668,11 @@ mod tests {
         // Drain the table-dump messages generated during on_established + propagation
         // (source-peer check suppresses re-advertisement back to GoBGP).
         while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
-        assert_eq!(state.rib.loc_rib.len(), 3, "phase 1: all three GoBGP routes in LocRib");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            3,
+            "phase 1: all three GoBGP routes in LocRib"
+        );
 
         // ── 2. Originate {203, 198}; GoBGP should receive ANNOUNCEs ──────────
         let route_203 = RouteBuilder::new(nlri("203.0.113.0/24"), Origin::Igp, AsPath::new())
@@ -3691,20 +3695,29 @@ mod tests {
             announced_to_gobgp.contains(&nlri("198.51.100.0/24")),
             "phase 2: GoBGP must receive ANNOUNCE for 198.51.100.0/24"
         );
-        assert_eq!(state.rib.loc_rib.len(), 5, "phase 2: 3 GoBGP + 2 local routes in LocRib");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            5,
+            "phase 2: 3 GoBGP + 2 local routes in LocRib"
+        );
 
         // ── 3. Import policy → reject; GoBGP routes leave LocRib ─────────────
         state.set_import_default(gobgp, DefaultAction::Reject);
         while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
         assert_eq!(
-            state.rib.loc_rib.len(), 2,
+            state.rib.loc_rib.len(),
+            2,
             "phase 3 reject: only local originated routes remain"
         );
 
         // ── 4. Import policy → accept; GoBGP routes return ───────────────────
         state.set_import_default(gobgp, DefaultAction::Accept);
         while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
-        assert_eq!(state.rib.loc_rib.len(), 5, "phase 4 restore: all 5 routes back in LocRib");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            5,
+            "phase 4 restore: all 5 routes back in LocRib"
+        );
 
         // ── 5. GoBGP withdraws {10, 172} ──────────────────────────────────────
         let gobgp_withdraws = UpdateMessage {
@@ -3715,7 +3728,8 @@ mod tests {
         state.on_route_update(gobgp, gobgp_withdraws);
         while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
         assert_eq!(
-            state.rib.loc_rib.len(), 3,
+            state.rib.loc_rib.len(),
+            3,
             "phase 5: 192 from GoBGP + 2 local routes remain"
         );
 
@@ -3736,7 +3750,8 @@ mod tests {
 
         // ── Final: only 192.168.0.0/16 (from GoBGP) survives in LocRib ───────
         assert_eq!(
-            state.rib.loc_rib.len(), 1,
+            state.rib.loc_rib.len(),
+            1,
             "final: only 192.168.0.0/16 must remain in LocRib"
         );
         assert!(

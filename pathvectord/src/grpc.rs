@@ -2526,7 +2526,9 @@ mod tests {
         // the current peer state (Idle, since peer_types has no entry).
         let ev = stream.next().await.unwrap().unwrap();
         assert_eq!(ev.r#type, proto::PeerEventType::Changed as i32);
-        let ps = ev.peer.expect("peer payload must be present after enrichment");
+        let ps = ev
+            .peer
+            .expect("peer payload must be present after enrichment");
         assert_eq!(ps.address, "10.0.0.2");
         assert_eq!(ps.remote_as, 65002);
         assert_eq!(ps.session_state, proto::SessionState::Idle as i32);
@@ -2639,21 +2641,18 @@ mod tests {
         let peer_svc = proto::peer_service_server::PeerServiceServer::new(PeerServiceImpl {
             state: Arc::clone(&state),
         });
-        let origination_svc =
-            proto::origination_service_server::OriginationServiceServer::new(
-                OriginationServiceImpl {
-                    state: Arc::clone(&state),
-                },
-            );
+        let origination_svc = proto::origination_service_server::OriginationServiceServer::new(
+            OriginationServiceImpl {
+                state: Arc::clone(&state),
+            },
+        );
 
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(peer_svc)
                 .add_service(policy_svc)
                 .add_service(origination_svc)
-                .serve_with_incoming(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
@@ -2670,8 +2669,7 @@ mod tests {
         let state = arc_state(65001, &[(peer_ip, 65002)]);
         let addr = start_grpc_server_for_integration(Arc::clone(&state)).await;
 
-        let mut client =
-            PathvectorClient::connect(format!("http://{addr}")).expect("connect");
+        let mut client = PathvectorClient::connect(format!("http://{addr}")).expect("connect");
 
         client
             .set_import_default(&peer_ip.to_string(), false)

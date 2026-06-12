@@ -2048,7 +2048,8 @@ mod tests {
             "must emit SessionTerminated"
         );
         assert!(
-            out.iter().any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            out.iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
             "must schedule ConnectRetryTimer for automatic reconnect"
         );
     }
@@ -2065,7 +2066,8 @@ mod tests {
         let out = fsm.process(FsmInput::MessageReceived(notif));
         assert_eq!(fsm.state(), State::Idle);
         assert!(
-            out.iter().any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            out.iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
             "must schedule ConnectRetryTimer for automatic reconnect"
         );
     }

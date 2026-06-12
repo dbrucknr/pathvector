@@ -219,14 +219,10 @@ where
             let mut client = connect(addr)?;
             match command {
                 PolicyCommands::SetImport { peer, decision } => {
-                    client
-                        .set_import_default(&peer, decision.as_bool())
-                        .await?;
+                    client.set_import_default(&peer, decision.as_bool()).await?;
                 }
                 PolicyCommands::SetExport { peer, decision } => {
-                    client
-                        .set_export_default(&peer, decision.as_bool())
-                        .await?;
+                    client.set_export_default(&peer, decision.as_bool()).await?;
                 }
             }
         }
