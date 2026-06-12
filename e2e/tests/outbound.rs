@@ -80,3 +80,37 @@ async fn source_route_visible_in_pathvectord_rib() {
         .await
         .expect("198.51.100.0/24 did not appear in pathvectord's RIB within 10 s");
 }
+
+// ── IPv6 outbound ─────────────────────────────────────────────────────────────
+
+use pathvector_client::types::OriginateRouteParams;
+use pathvector_e2e::{Harness, wait_for_gobgp_rib_entry_v6};
+
+/// RFC 4760 — pathvectord originates an IPv6 prefix and advertises it to a
+/// GoBGP eBGP peer via MP_REACH_NLRI.  GoBGP must install it in its IPv6 RIB.
+///
+/// pathvectord rewrites the NEXT_HOP to `local_ipv6` (2001:db8::2) before
+/// sending — confirmed by GoBGP showing the prefix in `gobgp global rib -a ipv6`.
+#[tokio::test]
+async fn originated_v6_route_propagates_to_gobgp() {
+    let mut h = Harness::new_v6().await;
+
+    use pathvector_client::types::Origin;
+    h.client
+        .originate_route(OriginateRouteParams {
+            prefix: "2001:db8:1::/48".to_owned(),
+            next_hop: "::".parse().unwrap(),
+            origin: Origin::Igp,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        })
+        .await
+        .expect("originate_route RPC failed");
+
+    wait_for_gobgp_rib_entry_v6(&h.gobgpd_id, "2001:db8:1::", Duration::from_secs(15))
+        .await
+        .expect("originated IPv6 route did not appear in GoBGP RIB within 15 s");
+}

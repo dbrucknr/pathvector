@@ -157,6 +157,10 @@ integration rather than direct unit tests.
 - _Gap_: `pathvectord` event-loop transitions don't have proptests yet. The `DaemonState`
   update/withdraw/originate methods are good candidates — adding property tests for the
   consistency invariant "every prefix in `AdjRibOut` is also in `LocRib`" would close this.
+- _Gap (closed 2026-06-12)_: outbound batching now has property coverage in
+  `outbound::prop_tests`. Four proptests covering `flush_updates` (IPv4) and `flush_updates_v6`
+  (IPv6): `prop_flush_updates_no_message_exceeds_max_len`, `prop_flush_updates_all_announces_sent`,
+  `prop_flush_updates_all_withdrawals_sent`, `prop_flush_updates_v6_no_message_exceeds_max_len`.
 
 **Layer 3 — Integration / session tests**
 - `pathvectord` unit tests (200+ in `main.rs`) drive the full `run_event_loop` via
@@ -313,6 +317,18 @@ Remaining e2e work:
   cache hit on repeat runs. `test` and `msrv` jobs now pass `--exclude pathvector-e2e`
   so the crate is not exercised without its required images. A `.githooks/pre-push` hook
   (installed via `just install-hooks`) runs `just e2e` locally before each push.
+- **IPv6 interoperability (GoBGP)** — **Done (2026-06-12).** Three new e2e tests confirm the
+  full IPv6 wire path against GoBGP 4.6.0:
+  - `routes.rs::announced_v6_route_appears_in_rib` — GoBGP announces `2001:db8::/32` via
+    MP_REACH_NLRI; pathvectord installs it; `get_best_route` returns it with correct attributes
+  - `routes.rs::withdrawn_v6_route_removed_from_rib` — GoBGP withdraws via MP_UNREACH_NLRI;
+    pathvectord removes it from LocRib_v6
+  - `outbound.rs::originated_v6_route_propagates_to_gobgp` — pathvectord originates
+    `2001:db8:1::/48`; GoBGP receives it via MP_REACH_NLRI with NEXT_HOP = `2001:db8::2`
+    (eBGP rewrite from `local_ipv6`)
+  Also fixed: `get_best_route` gRPC handler now queries `loc_rib_v6` for IPv6 prefixes;
+  `originate_route`/`originate_routes` dispatch to `originate_route_v6` for IPv6 prefixes.
+
 - **BIRD interoperability** — add a second peer implementation. BIRD is stricter about RFC
   compliance than GoBGP (it's the reference implementation for many IXP route servers) and
   will catch things GoBGP tolerates. A `e2e/Dockerfile.bird` wrapping the official BIRD
@@ -507,6 +523,22 @@ Not yet started. Key work items:
   - Idempotent: `propagate_prefix` compares new route against what is already in `AdjRibOut` and sends UPDATE/WITHDRAW only when the advertised state actually changes
 
 ### Remaining
+
+- **Split `pathvectord/src/main.rs`** — **Done (2026-06-12).** The 5865-line file was split
+  into three modules:
+  - `src/main.rs` (31 lines) — binary entry point only
+  - `src/daemon.rs` (5240 lines) — `DaemonState`, `RibSnapshot`, `handle_update`,
+    `reapply_import_policy`, `run`, `run_bgp_listener`, and all daemon/event/prop tests
+  - `src/outbound.rs` (605 lines) — all outbound pipeline functions (`propagate_prefix*`,
+    `flush_updates*`, `route_*_to_attributes*`) + their unit and property tests
+  All 214 unit tests pass; `cargo clippy -D warnings` is clean.
+
+- **IPv6 import policy (RFC 8212 parity)** — **Done (2026-06-12).** `import_policies_v6:
+  HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>` added to `DaemonState`, initialized with the
+  same `DefaultAction` as `import_policies` (Reject for eBGP, Accept for iBGP per RFC 8212).
+  `handle_update` applies BLACKHOLE check + `policy_v6.evaluate()` to all IPv6 announcements.
+  Test: `test_rfc8212_ebgp_ipv6_reject_without_policy` verifies eBGP routes are rejected and
+  stored in AdjRibIn for soft-reconfig.
 
 - **Panic safety in main event loop — Done.** All `expect()` calls in `run()` replaced with
   `let...else` + `tracing::error!` + `continue`. Unknown peer IPs now log an error and skip

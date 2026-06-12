@@ -132,3 +132,56 @@ async fn unknown_prefix_returns_none() {
         "no route should exist for a never-announced prefix"
     );
 }
+
+// ── IPv6 inbound ─────────────────────────────────────────────────────────────
+
+use pathvector_e2e::wait_for_gobgp_rib_entry_v6;
+
+/// RFC 4760 — GoBGP announces an IPv6 prefix via MP_REACH_NLRI; pathvectord
+/// must install it in LocRib_v6 and surface it through list_routes.
+#[tokio::test]
+async fn announced_v6_route_appears_in_rib() {
+    let h = Harness::new_v6().await;
+
+    // GoBGP injects the prefix into its own RIB and advertises it to pathvectord
+    // via MP_REACH_NLRI (IPv6 unicast).  GoBGP uses its own loopback as next-hop.
+    h.gobgp_announce_v6("2001:db8::/32", "::1");
+
+    wait_for_route(&mut h.client.clone(), "2001:db8::/32", Duration::from_secs(15))
+        .await
+        .expect("IPv6 route did not appear in pathvectord LocRib within 15 s");
+
+    let route = h
+        .client
+        .clone()
+        .get_best_route("2001:db8::/32")
+        .await
+        .unwrap()
+        .expect("best route must be present");
+
+    assert_eq!(route.prefix, "2001:db8::/32");
+    assert_eq!(route.origin, Origin::Igp);
+    assert_eq!(route.peer_type, PeerType::External);
+}
+
+/// RFC 4760 — an IPv6 route withdrawn by GoBGP (MP_UNREACH_NLRI) must be
+/// removed from pathvectord's LocRib_v6.
+#[tokio::test]
+async fn withdrawn_v6_route_removed_from_rib() {
+    let h = Harness::new_v6().await;
+
+    h.gobgp_announce_v6("2001:db8::/32", "::1");
+    wait_for_route(&mut h.client.clone(), "2001:db8::/32", Duration::from_secs(15))
+        .await
+        .expect("IPv6 route did not appear before withdrawal test");
+
+    h.gobgp_withdraw_v6("2001:db8::/32");
+
+    wait_for_route_withdrawn(
+        &mut h.client.clone(),
+        "2001:db8::/32",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("IPv6 route was not withdrawn from pathvectord LocRib within 15 s");
+}

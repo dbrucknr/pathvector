@@ -195,6 +195,14 @@ fn write_gobgp_config() -> NamedTempFile {
   [peer-groups.transport.config]
     passive-mode = true
 
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
 [[dynamic-neighbors]]
   [dynamic-neighbors.config]
     prefix     = "0.0.0.0/0"
@@ -255,6 +263,40 @@ local_as  = 65002
 bgp_id    = "10.0.0.2"
 hold_time = 9
 grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `local_ipv6` set for eBGP IPv6 next-hop
+/// rewrite.  All other settings are identical to [`write_daemon_config`].
+fn write_daemon_config_v6(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as   = 65002
+bgp_id     = "10.0.0.2"
+local_ipv6 = "2001:db8::2"
+hold_time  = 9
+grpc_port  = {PATHVECTORD_GRPC_PORT}
 "#
     )
     .expect("write pathvectord config header");
@@ -482,6 +524,18 @@ impl Harness {
         Self::new_inner(write_daemon_config).await
     }
 
+    /// Same as [`Self::new`] but with `local_ipv6 = "2001:db8::2"` configured.
+    ///
+    /// Use this harness for IPv6 tests that require pathvectord to rewrite the
+    /// NEXT_HOP in outbound MP_REACH_NLRI when advertising to an eBGP peer.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_v6() -> Self {
+        Self::new_inner(write_daemon_config_v6).await
+    }
+
     /// Same as [`Self::new`] but with **no** import or export policy on the peer.
     ///
     /// For an eBGP peer this activates RFC 8212 defaults: both import and
@@ -621,6 +675,39 @@ impl Harness {
             .expect("docker exec gobgp withdraw");
         assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
     }
+
+    /// Withdraw an IPv6 prefix from GoBGP's RIB (AFI/SAFI = ipv6-unicast).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn gobgp_withdraw_v6(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args(["gobgp", "global", "rib", "del", prefix, "-a", "ipv6"])
+            .status()
+            .expect("docker exec gobgp withdraw ipv6");
+        assert!(status.success(), "gobgp withdraw_v6 {prefix} failed: {status}");
+    }
+
+    /// Announce an IPv6 prefix into GoBGP's RIB (AFI/SAFI = ipv6-unicast).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn gobgp_announce_v6(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix,
+                "nexthop", nexthop,
+                "origin", "igp",
+                "-a", "ipv6",
+            ])
+            .status()
+            .expect("docker exec gobgp announce ipv6");
+        assert!(status.success(), "gobgp announce_v6 {prefix} failed: {status}");
+    }
 }
 
 // ── Outbound advertisement helpers ────────────────────────────────────────────
@@ -648,6 +735,38 @@ pub async fn wait_for_gobgp_rib_entry(
         }
         let out = Command::new("docker")
             .args(["exec", container_id, "gobgp", "global", "rib"])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains(prefix) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Polls `gobgp global rib -a ipv6` inside `container_id` until `prefix` appears.
+///
+/// IPv6-specific variant of [`wait_for_gobgp_rib_entry`].
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix appears.
+pub async fn wait_for_gobgp_rib_entry_v6(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for IPv6 prefix {prefix} to appear in GoBGP global RIB"
+            ));
+        }
+        let out = Command::new("docker")
+            .args(["exec", container_id, "gobgp", "global", "rib", "-a", "ipv6"])
             .output();
         if let Ok(out) = out {
             let text = String::from_utf8_lossy(&out.stdout);

@@ -14,7 +14,7 @@
 //! **write** lock because it mutates import/export policy maps and re-evaluates
 //! RIB state.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -165,7 +165,7 @@ pub(crate) fn route_to_proto(
     }
 }
 
-fn route_v6_to_proto(
+pub(crate) fn route_v6_to_proto(
     peer_id: PeerId,
     nlri: pathvector_types::Nlri<std::net::Ipv6Addr>,
     route: &pathvector_rib::Route<std::net::Ipv6Addr>,
@@ -405,26 +405,46 @@ impl RibService for RibServiceImpl {
         request: Request<GetBestRouteRequest>,
     ) -> Result<Response<RouteResponse>, Status> {
         let prefix = request.into_inner().prefix;
-        let nlri = parse_nlri(&prefix)?;
-
         let snap = self.state.read().await.snapshot();
-        let resp = match snap.loc_rib.best(&nlri) {
-            Some(route) => {
-                let peer_id = snap
-                    .loc_rib
-                    .best_peer(&nlri)
-                    .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
-                RouteResponse {
-                    found: true,
-                    route: Some(route_to_proto(peer_id, nlri, route)),
+
+        // Try IPv4 first; if parsing fails, try IPv6.
+        if let Ok(nlri) = prefix.parse::<pathvector_types::Nlri<Ipv4Addr>>() {
+            let resp = match snap.loc_rib.best(&nlri) {
+                Some(route) => {
+                    let peer_id = snap
+                        .loc_rib
+                        .best_peer(&nlri)
+                        .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+                    RouteResponse {
+                        found: true,
+                        route: Some(route_to_proto(peer_id, nlri, route)),
+                    }
                 }
-            }
-            None => RouteResponse {
-                found: false,
-                route: None,
-            },
-        };
-        Ok(Response::new(resp))
+                None => RouteResponse { found: false, route: None },
+            };
+            return Ok(Response::new(resp));
+        }
+
+        if let Ok(nlri) = prefix.parse::<pathvector_types::Nlri<Ipv6Addr>>() {
+            let resp = match snap.loc_rib_v6.best(&nlri) {
+                Some(route) => {
+                    let peer_id = snap
+                        .loc_rib_v6
+                        .best_peer(&nlri)
+                        .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+                    RouteResponse {
+                        found: true,
+                        route: Some(route_v6_to_proto(peer_id, nlri, route)),
+                    }
+                }
+                None => RouteResponse { found: false, route: None },
+            };
+            return Ok(Response::new(resp));
+        }
+
+        Err(Status::invalid_argument(format!(
+            "'{prefix}' is not valid CIDR notation"
+        )))
     }
 
     async fn list_routes(
@@ -715,15 +735,88 @@ fn parse_originate_request(
     Ok(builder.build())
 }
 
+/// Parse an `OriginateRouteRequest` whose prefix is IPv6 into a `Route<Ipv6Addr>`.
+fn parse_originate_request_v6(
+    req: OriginateRouteRequest,
+) -> Result<pathvector_rib::Route<Ipv6Addr>, Status> {
+    use pathvector_rib::RouteBuilder;
+    use pathvector_types::{
+        Community, ExtendedCommunity, LargeCommunity as TypesLargeCommunity, Nlri, Origin, PeerType,
+    };
+
+    let nlri: Nlri<Ipv6Addr> = req.prefix.parse().map_err(|_| {
+        Status::invalid_argument(format!("'{}' is not valid CIDR notation", req.prefix))
+    })?;
+
+    let origin = match proto::Origin::try_from(req.origin) {
+        Ok(proto::Origin::Igp) => Origin::Igp,
+        Ok(proto::Origin::Egp) => Origin::Egp,
+        _ => Origin::Incomplete,
+    };
+
+    let communities: Vec<Community> = req.communities.into_iter().map(Community::from).collect();
+    let large_communities: Vec<TypesLargeCommunity> = req
+        .large_communities
+        .into_iter()
+        .map(|lc| TypesLargeCommunity {
+            global_administrator: lc.global_admin,
+            local_data_1: lc.local_data1,
+            local_data_2: lc.local_data2,
+        })
+        .collect();
+    let extended_communities: Vec<ExtendedCommunity> = req
+        .extended_communities
+        .into_iter()
+        .map(|bytes| {
+            let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument("each extended_community must be exactly 8 bytes")
+            })?;
+            Ok::<ExtendedCommunity, Status>(ExtendedCommunity::from_bytes(arr))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut builder = RouteBuilder::new(nlri, origin, pathvector_types::AsPath::new())
+        .peer_type(PeerType::Local);
+    for c in communities {
+        builder = builder.community(c);
+    }
+    for lc in large_communities {
+        builder = builder.large_community(lc);
+    }
+    for ec in extended_communities {
+        builder = builder.extended_community(ec);
+    }
+    if let Some(lp) = req.local_pref {
+        builder = builder.local_pref(pathvector_types::LocalPref::new(lp));
+    }
+    if let Some(med) = req.med {
+        builder = builder.med(pathvector_types::Med::new(med));
+    }
+
+    Ok(builder.build())
+}
+
+/// Returns true if `prefix` parses as an IPv6 CIDR (contains ':').
+fn is_ipv6_prefix(prefix: &str) -> bool {
+    prefix.contains(':')
+}
+
 #[tonic::async_trait]
 impl OriginationService for OriginationServiceImpl {
     async fn originate_route(
         &self,
         request: Request<OriginateRouteRequest>,
     ) -> Result<Response<OriginateRouteResponse>, Status> {
-        let route = parse_originate_request(request.into_inner())?;
-        tracing::info!(prefix = %route.nlri, "OriginateRoute");
-        self.state.write().await.originate_route(route);
+        let req = request.into_inner();
+        if is_ipv6_prefix(&req.prefix) {
+            let route = parse_originate_request_v6(req)?;
+            tracing::info!(prefix = %route.nlri, "OriginateRoute (IPv6)");
+            self.state.write().await.originate_route_v6(route);
+        } else {
+            let route = parse_originate_request(req)?;
+            tracing::info!(prefix = %route.nlri, "OriginateRoute");
+            self.state.write().await.originate_route(route);
+        }
         Ok(Response::new(OriginateRouteResponse {}))
     }
 
@@ -733,12 +826,24 @@ impl OriginationService for OriginationServiceImpl {
     ) -> Result<Response<OriginateRoutesResponse>, Status> {
         let routes_req = request.into_inner().routes;
         let count = u32::try_from(routes_req.len()).unwrap_or(u32::MAX);
-        let routes: Vec<pathvector_rib::Route<Ipv4Addr>> = routes_req
-            .into_iter()
-            .map(parse_originate_request)
-            .collect::<Result<_, _>>()?;
+        // Split into v4 and v6 batches; process each with its own originate call.
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for req in routes_req {
+            if is_ipv6_prefix(&req.prefix) {
+                v6.push(parse_originate_request_v6(req)?);
+            } else {
+                v4.push(parse_originate_request(req)?);
+            }
+        }
         tracing::info!(count, "OriginateRoutes (batch)");
-        self.state.write().await.originate_routes(routes);
+        let mut state = self.state.write().await;
+        if !v4.is_empty() {
+            state.originate_routes(v4);
+        }
+        if !v6.is_empty() {
+            state.originate_routes_v6(v6);
+        }
         Ok(Response::new(OriginateRoutesResponse { count }))
     }
 

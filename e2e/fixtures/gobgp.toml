@@ -25,6 +25,14 @@
   [peer-groups.transport.config]
     passive-mode = true
 
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
 [[dynamic-neighbors]]
   [dynamic-neighbors.config]
     prefix     = "0.0.0.0/0"
