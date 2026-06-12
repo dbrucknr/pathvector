@@ -6,10 +6,13 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use pathvector_policy::{Decision, Policy};
-use pathvector_rib::{AdjRibOut, InsertOutcome, LocRib, RibView, Route, outbound::{prepare_outbound, prepare_outbound_v6}};
+use pathvector_rib::{
+    AdjRibOut, InsertOutcome, LocRib, RibView, Route,
+    outbound::{prepare_outbound, prepare_outbound_v6},
+};
 use pathvector_session::message::{
-    MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage,
-    encode_attributes, nlri_encoded_len, nlri_v6_encoded_len,
+    MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage, encode_attributes,
+    nlri_encoded_len, nlri_v6_encoded_len,
 };
 use pathvector_types::{AfiSafi, NextHop, Nlri, PeerType};
 use tokio::sync::mpsc;
@@ -309,15 +312,18 @@ pub(crate) fn flush_updates_v6(
                 // minus the NLRI list) and pack them together.
                 let mut attrs = route_v6_to_attributes(&route);
                 // Remove MpReachNlri (last attr) so it isn't part of the key.
-                let mp_reach = attrs.pop().expect("route_v6_to_attributes always appends MpReachNlri last");
+                let mp_reach = attrs
+                    .pop()
+                    .expect("route_v6_to_attributes always appends MpReachNlri last");
                 let key = encode_attributes(&attrs);
                 // Restore the MP_REACH_NLRI placeholder next-hop in the group leader.
                 if let Some((_, group_attrs, nlris)) =
                     announce_groups.iter_mut().find(|(k, _, _)| *k == key)
                 {
                     // Add this NLRI to the existing group's MP_REACH_NLRI prefix list.
-                    if let Some(PathAttribute::MpReachNlri(mp)) =
-                        group_attrs.iter_mut().find(|a| matches!(a, PathAttribute::MpReachNlri(_)))
+                    if let Some(PathAttribute::MpReachNlri(mp)) = group_attrs
+                        .iter_mut()
+                        .find(|a| matches!(a, PathAttribute::MpReachNlri(_)))
                     {
                         mp.prefixes.push(Prefix::V6(route.nlri));
                     }
@@ -603,14 +609,181 @@ mod flush_updates_tests {
         let decisions = vec![PrefixDecision::Withdraw(nlri("10.0.0.0/8"))];
         assert!(!flush_updates(decisions, MAX_LEN, &tx));
     }
+
+    /// Returns false when the channel is closed (announcement path).
+    #[test]
+    fn test_flush_announce_returns_false_on_closed_channel() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let decisions = vec![PrefixDecision::Announce(base_route("10.0.0.0/8"))];
+        assert!(!flush_updates(decisions, MAX_LEN, &tx));
+    }
+
+    /// Returns false mid-batch when channel fills during withdrawal overflow.
+    #[test]
+    fn test_flush_withdrawal_overflow_false_on_full_channel() {
+        // Use a tiny max_len so the second withdrawal forces a flush of the first.
+        // Channel capacity 1 lets the first flush succeed; channel drops so the
+        // second try_send (the overflow flush) fails.
+        let (tx, rx) = mpsc::channel(1);
+        // 23 bytes fixed overhead; each /8 NLRI is 2 bytes.  max_len=25 fits
+        // exactly one withdrawal per message, so the second triggers overflow.
+        let decisions: Vec<PrefixDecision> = ["10.0.0.0/8", "192.0.2.0/24"]
+            .iter()
+            .map(|p| PrefixDecision::Withdraw(nlri(p)))
+            .collect();
+        // Drop the receiver after the first message is queued so the second fails.
+        drop(rx);
+        // Channel is already closed; even the first send will fail.
+        assert!(!flush_updates(decisions, MAX_LEN, &tx));
+    }
+}
+
+#[cfg(test)]
+mod v6_tests {
+    use std::net::Ipv6Addr;
+
+    use pathvector_rib::RouteBuilder;
+    use pathvector_session::message::{MAX_LEN, PathAttribute, UpdateMessage};
+    use pathvector_types::{
+        Aggregator, AsPath, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med,
+        NextHop, Nlri, Origin,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{PrefixDecisionV6, flush_updates_v6, route_v6_to_attributes};
+
+    fn nlri6(s: &str) -> Nlri<Ipv6Addr> {
+        s.parse().unwrap()
+    }
+
+    fn base_route_v6(prefix: &str) -> pathvector_rib::Route<Ipv6Addr> {
+        RouteBuilder::new(nlri6(prefix), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build()
+    }
+
+    /// route_v6_to_attributes includes MED when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_med() {
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .med(Med::new(100))
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let attrs = route_v6_to_attributes(&route);
+        assert!(attrs.iter().any(|a| matches!(a, PathAttribute::Med(100))));
+    }
+
+    /// route_v6_to_attributes includes Community when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_community() {
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .community(Community::from(0x0001_0001u32))
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let attrs = route_v6_to_attributes(&route);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Communities(_)))
+        );
+    }
+
+    /// route_v6_to_attributes includes LargeCommunities when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_large_community() {
+        let lc = LargeCommunity {
+            global_administrator: 65001,
+            local_data_1: 1,
+            local_data_2: 2,
+        };
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .large_community(lc)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let attrs = route_v6_to_attributes(&route);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::LargeCommunities(_)))
+        );
+    }
+
+    /// route_v6_to_attributes includes ExtendedCommunities when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_extended_community() {
+        let ec = ExtendedCommunity::from_bytes([0x00, 0x02, 0, 0, 0, 0, 0, 1]);
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .extended_community(ec)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let attrs = route_v6_to_attributes(&route);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ExtendedCommunities(_)))
+        );
+    }
+
+    /// route_v6_to_attributes includes LocalPref when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_local_pref() {
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(200))
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let attrs = route_v6_to_attributes(&route);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::LocalPref(200)))
+        );
+    }
+
+    /// route_v6_to_attributes includes Aggregator when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_aggregator() {
+        let agg = Aggregator {
+            asn: Asn::new(65001),
+            ip: "10.0.0.1".parse().unwrap(),
+        };
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .aggregator(agg)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let attrs = route_v6_to_attributes(&route);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Aggregator(_)))
+        );
+    }
+
+    /// flush_updates_v6 returns false when the channel is closed.
+    #[test]
+    fn test_flush_v6_returns_false_on_closed_channel() {
+        let (tx, rx) = mpsc::channel::<UpdateMessage>(1);
+        drop(rx);
+        let decisions = vec![PrefixDecisionV6::Announce(base_route_v6("2001:db8::/32"))];
+        assert!(!flush_updates_v6(decisions, MAX_LEN, &tx));
+    }
+
+    /// flush_updates_v6 returns false for withdrawals when channel is closed.
+    #[test]
+    fn test_flush_v6_withdrawal_returns_false_on_closed_channel() {
+        let (tx, rx) = mpsc::channel::<UpdateMessage>(1);
+        drop(rx);
+        let decisions = vec![PrefixDecisionV6::Withdraw(nlri6("2001:db8::/32"))];
+        assert!(!flush_updates_v6(decisions, MAX_LEN, &tx));
+    }
 }
 
 #[cfg(test)]
 mod prop_tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use pathvector_rib::{Route, RouteBuilder};
-    use pathvector_session::message::{BgpMessage, MAX_LEN, UpdateMessage};
+    use pathvector_rib::RouteBuilder;
+    use pathvector_session::message::{BgpMessage, MAX_LEN};
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
     use proptest::prelude::*;
     use tokio::sync::mpsc;
@@ -623,7 +796,7 @@ mod prop_tests {
         (any::<[u8; 4]>(), 0u8..=32u8).prop_map(|(octets, len)| {
             // Mask to the prefix length so the NLRI is well-formed.
             let addr = if len == 0 {
-                Ipv4Addr::new(0, 0, 0, 0)
+                Ipv4Addr::UNSPECIFIED
             } else {
                 let bits = u32::from_be_bytes(octets);
                 let mask = !0u32 << (32 - len);

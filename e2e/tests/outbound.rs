@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use pathvector_client::types::Origin;
 use pathvector_e2e::{TwoPeerHarness, wait_for_gobgp_rib_entry, wait_for_gobgp_rib_withdrawn};
 
 /// A route announced at the source must propagate through pathvectord and
@@ -95,7 +96,6 @@ use pathvector_e2e::{Harness, wait_for_gobgp_rib_entry_v6};
 async fn originated_v6_route_propagates_to_gobgp() {
     let mut h = Harness::new_v6().await;
 
-    use pathvector_client::types::Origin;
     h.client
         .originate_route(OriginateRouteParams {
             prefix: "2001:db8:1::/48".to_owned(),

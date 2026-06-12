@@ -411,16 +411,18 @@ impl RibService for RibServiceImpl {
         if let Ok(nlri) = prefix.parse::<pathvector_types::Nlri<Ipv4Addr>>() {
             let resp = match snap.loc_rib.best(&nlri) {
                 Some(route) => {
-                    let peer_id = snap
-                        .loc_rib
-                        .best_peer(&nlri)
-                        .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+                    let peer_id = snap.loc_rib.best_peer(&nlri).unwrap_or_else(|| {
+                        PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                    });
                     RouteResponse {
                         found: true,
                         route: Some(route_to_proto(peer_id, nlri, route)),
                     }
                 }
-                None => RouteResponse { found: false, route: None },
+                None => RouteResponse {
+                    found: false,
+                    route: None,
+                },
             };
             return Ok(Response::new(resp));
         }
@@ -428,16 +430,18 @@ impl RibService for RibServiceImpl {
         if let Ok(nlri) = prefix.parse::<pathvector_types::Nlri<Ipv6Addr>>() {
             let resp = match snap.loc_rib_v6.best(&nlri) {
                 Some(route) => {
-                    let peer_id = snap
-                        .loc_rib_v6
-                        .best_peer(&nlri)
-                        .unwrap_or_else(|| PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+                    let peer_id = snap.loc_rib_v6.best_peer(&nlri).unwrap_or_else(|| {
+                        PeerId::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                    });
                     RouteResponse {
                         found: true,
                         route: Some(route_v6_to_proto(peer_id, nlri, route)),
                     }
                 }
-                None => RouteResponse { found: false, route: None },
+                None => RouteResponse {
+                    found: false,
+                    route: None,
+                },
             };
             return Ok(Response::new(resp));
         }
@@ -775,8 +779,8 @@ fn parse_originate_request_v6(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut builder = RouteBuilder::new(nlri, origin, pathvector_types::AsPath::new())
-        .peer_type(PeerType::Local);
+    let mut builder =
+        RouteBuilder::new(nlri, origin, pathvector_types::AsPath::new()).peer_type(PeerType::Local);
     for c in communities {
         builder = builder.community(c);
     }
@@ -937,7 +941,7 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
     use pathvector_rib::{PeerId, RouteBuilder};
@@ -952,6 +956,7 @@ mod tests {
         OriginationServiceImpl, PeerServiceImpl, PolicyServiceImpl, RibServiceImpl,
         build_peer_state, parse_nlri, parse_originate_request, parse_peer_address,
         parse_policy_action, proto, proto_as_segment, proto_origin, route_to_proto,
+        route_v6_to_proto,
     };
     use tokio_stream::StreamExt as _;
 
@@ -1543,7 +1548,6 @@ mod tests {
     #[test]
     fn test_route_to_proto_v6_nexthop() {
         use pathvector_types::{NextHop, PeerType};
-        use std::net::Ipv6Addr;
 
         let n = nlri("10.0.0.0/8");
         let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -1559,7 +1563,6 @@ mod tests {
     #[test]
     fn test_route_to_proto_v6_with_link_local_nexthop() {
         use pathvector_types::{NextHop, PeerType};
-        use std::net::Ipv6Addr;
 
         let n = nlri("10.0.0.0/8");
         let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -1849,6 +1852,254 @@ mod tests {
         req.origin = proto::Origin::Incomplete as i32;
         let route = parse_originate_request(req).unwrap();
         assert_eq!(route.origin, pathvector_types::Origin::Incomplete);
+    }
+
+    // ── parse_originate_request_v6 ────────────────────────────────────────────
+
+    fn minimal_originate_req_v6() -> OriginateRouteRequest {
+        OriginateRouteRequest {
+            prefix: "2001:db8::/32".to_owned(),
+            next_hop: "::".to_owned(),
+            origin: proto::Origin::Igp as i32,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_valid() {
+        use super::parse_originate_request_v6;
+        let route = parse_originate_request_v6(minimal_originate_req_v6()).unwrap();
+        assert_eq!(route.nlri.to_string(), "2001:db8::/32");
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_invalid_prefix() {
+        use super::parse_originate_request_v6;
+        let mut req = minimal_originate_req_v6();
+        req.prefix = "not-cidr".to_owned();
+        let err = parse_originate_request_v6(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_with_communities() {
+        use super::parse_originate_request_v6;
+        let mut req = minimal_originate_req_v6();
+        req.communities = vec![(65000_u32 << 16) | 1];
+        req.large_communities = vec![proto::LargeCommunity {
+            global_admin: 65000,
+            local_data1: 1,
+            local_data2: 2,
+        }];
+        req.extended_communities = vec![vec![0u8; 8]];
+        let route = parse_originate_request_v6(req).unwrap();
+        assert!(!route.communities.is_empty());
+        assert!(!route.large_communities.is_empty());
+        assert!(!route.extended_communities.is_empty());
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_with_local_pref_and_med() {
+        use super::parse_originate_request_v6;
+        let mut req = minimal_originate_req_v6();
+        req.local_pref = Some(100);
+        req.med = Some(50);
+        let route = parse_originate_request_v6(req).unwrap();
+        assert!(route.local_pref.is_some());
+        assert!(route.med.is_some());
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_invalid_ext_community_length() {
+        use super::parse_originate_request_v6;
+        let mut req = minimal_originate_req_v6();
+        req.extended_communities = vec![vec![0x00; 5]];
+        let err = parse_originate_request_v6(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_egp_origin() {
+        use super::parse_originate_request_v6;
+        let mut req = minimal_originate_req_v6();
+        req.origin = proto::Origin::Egp as i32;
+        let route = parse_originate_request_v6(req).unwrap();
+        assert_eq!(route.origin, pathvector_types::Origin::Egp);
+    }
+
+    // ── route_v6_to_proto ─────────────────────────────────────────────────────
+
+    fn nlri6(s: &str) -> pathvector_types::Nlri<std::net::Ipv6Addr> {
+        s.parse().unwrap()
+    }
+
+    fn peer6(ip: &str) -> PeerId {
+        PeerId::from(ip.parse::<Ipv4Addr>().unwrap())
+    }
+
+    fn route_v6_igp(
+        n: pathvector_types::Nlri<std::net::Ipv6Addr>,
+        pt: PeerType,
+    ) -> pathvector_rib::Route<std::net::Ipv6Addr> {
+        use pathvector_types::NextHop;
+        RouteBuilder::new(n, Origin::Igp, AsPath::from_sequence(vec![Asn::new(65002)]))
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .peer_type(pt)
+            .build()
+    }
+
+    #[test]
+    fn test_route_v6_to_proto_basic_fields() {
+        let n = nlri6("2001:db8::/32");
+        let route = route_v6_igp(n, PeerType::External);
+        let r = route_v6_to_proto(peer6("10.0.0.2"), n, &route);
+        assert_eq!(r.prefix, "2001:db8::/32");
+        assert_eq!(r.peer_address, "10.0.0.2");
+        assert_eq!(r.next_hop, "2001:db8::1");
+        assert_eq!(r.origin, proto_origin(pathvector_types::Origin::Igp));
+    }
+
+    #[test]
+    fn test_route_v6_to_proto_with_communities() {
+        use pathvector_types::{Community, ExtendedCommunity, LargeCommunity as TypesLC};
+        let n = nlri6("2001:db8::/32");
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .community(Community::from(0x0001_0001u32))
+            .large_community(TypesLC {
+                global_administrator: 1,
+                local_data_1: 2,
+                local_data_2: 3,
+            })
+            .extended_community(ExtendedCommunity::from_bytes([0u8; 8]))
+            .peer_type(PeerType::External)
+            .build();
+        let r = route_v6_to_proto(peer6("10.0.0.2"), n, &route);
+        assert_eq!(r.communities.len(), 1);
+        assert_eq!(r.large_communities.len(), 1);
+        assert_eq!(r.extended_communities.len(), 1);
+    }
+
+    // ── RibService::get_best_route (IPv6) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_best_route_v6_found() {
+        let state = arc_state(65001, &[]);
+        {
+            let mut s = state.write().await;
+            let n = nlri6("2001:db8::/32");
+            s.rib_mut().loc_rib_v6.insert(
+                PeerId::from(Ipv4Addr::new(10, 0, 0, 2)),
+                route_v6_igp(n, PeerType::External),
+            );
+        }
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .get_best_route(Request::new(GetBestRouteRequest {
+                prefix: "2001:db8::/32".into(),
+            }))
+            .await
+            .unwrap();
+        let rr = resp.into_inner();
+        assert!(rr.found);
+        let r = rr.route.unwrap();
+        assert_eq!(r.prefix, "2001:db8::/32");
+    }
+
+    #[tokio::test]
+    async fn test_get_best_route_v6_not_found() {
+        let state = arc_state(65001, &[]);
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .get_best_route(Request::new(GetBestRouteRequest {
+                prefix: "2001:db8::/32".into(),
+            }))
+            .await
+            .unwrap();
+        let rr = resp.into_inner();
+        assert!(!rr.found);
+    }
+
+    // ── RibService::list_routes (IPv6) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_routes_includes_v6_routes() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(addr, PeerType::External, 65002, 90, &[]);
+            let n = nlri6("2001:db8::/32");
+            s.rib_mut()
+                .loc_rib_v6
+                .insert(PeerId::from(addr), route_v6_igp(n, PeerType::External));
+        }
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .list_routes(Request::new(proto::ListRoutesRequest {
+                peer_address: String::new(),
+            }))
+            .await
+            .unwrap();
+        let routes = resp.into_inner().routes;
+        assert!(
+            routes.iter().any(|r| r.prefix == "2001:db8::/32"),
+            "IPv6 route must appear in list_routes"
+        );
+    }
+
+    // ── RibService::watch_routes (IPv6) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_watch_routes_includes_v6_current_events() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(addr, PeerType::External, 65002, 90, &[]);
+            let n = nlri6("2001:db8::/32");
+            s.rib_mut()
+                .loc_rib_v6
+                .insert(PeerId::from(addr), route_v6_igp(n, PeerType::External));
+        }
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .watch_routes(Request::new(WatchRoutesRequest {
+                peer_address: String::new(),
+            }))
+            .await
+            .unwrap();
+        drop(svc);
+        let mut stream = resp.into_inner();
+
+        let current = stream.next().await.unwrap().unwrap();
+        assert_eq!(current.r#type, proto::RouteEventType::Current as i32);
+        let r = current.route.unwrap();
+        assert_eq!(r.prefix, "2001:db8::/32");
+    }
+
+    // ── OriginationService: IPv6 dispatch ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_originate_route_v6_inserts_into_loc_rib_v6() {
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        svc.originate_route(Request::new(minimal_originate_req_v6()))
+            .await
+            .expect("originate_route v6");
+
+        let s = state.read().await;
+        let n: pathvector_types::Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        assert!(
+            s.rib.loc_rib_v6.best(&n).is_some(),
+            "v6 route must be in loc_rib_v6"
+        );
     }
 
     // ── OriginationService handlers ───────────────────────────────────────────
