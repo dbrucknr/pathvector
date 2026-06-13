@@ -49,18 +49,18 @@ use testcontainers::{
 // ── Docker image names ────────────────────────────────────────────────────────
 
 /// GoBGP image built by `just e2e` from `e2e/Dockerfile`.
-const GOBGPD_IMAGE: &str = "pathvector-gobgpd-test";
+pub const GOBGPD_IMAGE: &str = "pathvector-gobgpd-test";
 
 /// pathvectord image built by `just e2e` from `e2e/Dockerfile.pathvectord`.
-const PATHVECTORD_IMAGE: &str = "pathvector-e2e";
+pub const PATHVECTORD_IMAGE: &str = "pathvector-e2e";
 
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
-const GOBGPD_BGP_PORT: u16 = 179;
+pub const GOBGPD_BGP_PORT: u16 = 179;
 
 /// gRPC management port inside the pathvectord container.
-const PATHVECTORD_GRPC_PORT: u16 = 51_200;
+pub const PATHVECTORD_GRPC_PORT: u16 = 51_200;
 
 // ── Port / ID allocation ──────────────────────────────────────────────────────
 
@@ -71,11 +71,11 @@ static NEXT_TEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Host-side port base for pathvectord's gRPC mapping.
 static NEXT_GRPC_PORT: AtomicU16 = AtomicU16::new(51_200);
 
-fn alloc_test_id() -> u32 {
+pub fn alloc_test_id() -> u32 {
     NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn alloc_grpc_port() -> u16 {
+pub fn alloc_grpc_port() -> u16 {
     NEXT_GRPC_PORT.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -109,7 +109,7 @@ pub fn daemon_binary() -> PathBuf {
 ///
 /// Placed **last** in [`Harness`] so it is dropped after the containers that
 /// use it.
-struct DockerNetwork {
+pub struct DockerNetwork {
     name: String,
 }
 
@@ -119,7 +119,8 @@ impl DockerNetwork {
     /// # Panics
     ///
     /// Panics if `docker network create` fails.
-    fn create(name: String) -> Self {
+    #[must_use]
+    pub fn create(name: String) -> Self {
         let status = Command::new("docker")
             .args(["network", "create", &name])
             .stdout(Stdio::null())
@@ -131,6 +132,57 @@ impl DockerNetwork {
             "docker network create {name} failed: {status}"
         );
         Self { name }
+    }
+
+    /// Create a new Docker bridge network with a specific subnet.
+    ///
+    /// Useful when container IPs must be known before the containers start
+    /// (e.g. TCP MD5SIG tests where each side is pre-configured with the
+    /// other's IP).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network create` fails.
+    #[must_use]
+    pub fn create_with_subnet(name: String, subnet: &str) -> Self {
+        let status = Command::new("docker")
+            .args(["network", "create", "--subnet", subnet, &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("docker network create --subnet");
+        assert!(
+            status.success(),
+            "docker network create {name} --subnet {subnet} failed: {status}"
+        );
+        Self { name }
+    }
+
+    /// The network name — pass to `docker run --network`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Raw-CLI container guard ───────────────────────────────────────────────────
+
+/// RAII guard for a Docker container started via the CLI (not testcontainers).
+///
+/// The container is forcibly removed (`docker rm -f`) when this guard drops.
+/// Unlike [`ContainerAsync`], this supports options that testcontainers does
+/// not expose — in particular `--ip` (fixed IP assignment on a custom subnet)
+/// and `--cap-add` (Linux capability grants needed for `TCP_MD5SIG`).
+pub struct ContainerGuard(pub String);
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
     }
 }
 
@@ -155,7 +207,8 @@ impl Drop for DockerNetwork {
 /// # Panics
 ///
 /// Panics if `docker inspect` fails or the output is not a valid IPv4 address.
-fn container_network_ip(container_id: &str, network: &str) -> Ipv4Addr {
+#[must_use]
+pub fn container_network_ip(container_id: &str, network: &str) -> Ipv4Addr {
     let fmt = format!(r#"{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}"#);
     let output = Command::new("docker")
         .args(["inspect", container_id, "--format", &fmt])
@@ -176,7 +229,12 @@ fn container_network_ip(container_id: &str, network: &str) -> Ipv4Addr {
 ///
 /// The container uses port 179 (default; no `port =` key needed).
 /// gRPC defaults to `0.0.0.0:50051` which is accessible via `docker exec`.
-fn write_gobgp_config() -> NamedTempFile {
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config() -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp gobgp config");
     write!(
         f,
@@ -385,6 +443,299 @@ import_default = "accept"
         .expect("write pathvectord peer config");
     }
     f
+}
+
+/// Writes a GoBGP config with a **static neighbor** and TCP MD5 authentication.
+///
+/// Dynamic neighbors cannot be used with TCP MD5SIG: the Linux kernel requires
+/// the key to be pre-installed on the listener for a specific peer IP before
+/// the SYN arrives.  A static neighbor entry is the only correct approach.
+///
+/// The `pathvectord_ip` argument is the IP that pathvectord will dial from —
+/// GoBGP configures `TCP_MD5SIG` on its listener for that address.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_md5(pathvectord_ip: &str, key: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp md5 config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "{pathvectord_ip}"
+    peer-as          = 65002
+    auth-password    = "{key}"
+  [neighbors.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [neighbors.transport.config]
+    passive-mode = true
+
+  [[neighbors.afi-safis]]
+    [neighbors.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+"#
+    )
+    .expect("write gobgp md5 config");
+    f
+}
+
+/// Writes a pathvectord config with TCP MD5 authentication on every peer.
+///
+/// Identical to [`write_daemon_config`] but adds `md5_password = "<key>"`
+/// to each peer stanza so pathvectord's outbound socket is keyed before
+/// `connect()`.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_md5(peers: &[(Ipv4Addr, u32)], key: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord md5 config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord md5 config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+md5_password   = "{key}"
+"#
+        )
+        .expect("write pathvectord md5 peer config");
+    }
+    f
+}
+
+// ── Low-level container helpers (CLI-based) ───────────────────────────────────
+
+/// Start a Docker container via the CLI and return its container ID.
+///
+/// This is the escape hatch for features testcontainers does not expose:
+/// `--ip` for fixed IP assignment and `--cap-add` for Linux capabilities.
+/// Both are required for TCP MD5SIG tests.
+///
+/// # Panics
+///
+/// Panics if `docker run` exits non-zero.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn docker_start(
+    name: &str,
+    image: &str,
+    network: &str,
+    ip: Option<&str>,
+    cap_net_admin: bool,
+    volume_src: &str,
+    volume_dst: &str,
+    host_grpc_port: Option<u16>,
+    cmd: Option<&str>,
+) -> ContainerGuard {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--detach".into(),
+        format!("--name={name}"),
+        format!("--network={network}"),
+    ];
+    if let Some(fixed_ip) = ip {
+        args.push(format!("--ip={fixed_ip}"));
+    }
+    if cap_net_admin {
+        args.push("--cap-add=NET_ADMIN".into());
+    }
+    args.push(format!("--volume={volume_src}:{volume_dst}"));
+    if let Some(host_port) = host_grpc_port {
+        args.push(format!("--publish={host_port}:{PATHVECTORD_GRPC_PORT}"));
+    }
+    args.push(format!("{image}:latest"));
+    if let Some(c) = cmd {
+        args.push(c.into());
+    }
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .expect("docker run");
+    assert!(
+        output.status.success(),
+        "docker run {image} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let id = std::str::from_utf8(&output.stdout)
+        .expect("docker run output is UTF-8")
+        .trim()
+        .to_owned();
+    ContainerGuard(id)
+}
+
+/// Block (synchronously, with short sleeps) until the container's Docker
+/// HEALTHCHECK reports `healthy`, or panic if `timeout` expires.
+///
+/// This is a blocking poll — acceptable in tests where the startup path is
+/// already sequential and the wait is at most a few seconds.
+///
+/// # Panics
+///
+/// Panics if `docker inspect` fails or `timeout` expires before the container
+/// reports `healthy`.
+pub fn wait_container_healthy(container_id: &str, timeout: Duration) {
+    use std::time::Instant;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Health.Status}}",
+                container_id,
+            ])
+            .output()
+            .expect("docker inspect");
+        let status = std::str::from_utf8(&output.stdout)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if status == "healthy" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "container {container_id} did not become healthy within {timeout:?} (last status: {status:?})"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+// ── Md5Harness ────────────────────────────────────────────────────────────────
+
+/// Fixed container IPs for TCP MD5SIG tests.
+///
+/// A dedicated subnet is used so both IPs are known before either container
+/// starts — a prerequisite for pre-configuring `TCP_MD5SIG` on both sides.
+pub const MD5_TEST_SUBNET: &str = "172.31.42.0/24";
+pub const MD5_GOBGP_IP: &str = "172.31.42.10";
+pub const MD5_PATHVECTORD_IP: &str = "172.31.42.20";
+
+/// A test environment for RFC 2385 TCP MD5 authentication tests.
+///
+/// Uses a Docker subnet with **fixed container IPs** and grants `CAP_NET_ADMIN`
+/// to both containers so the Linux kernel accepts the `setsockopt(TCP_MD5SIG)`
+/// calls.  GoBGP is configured with a static neighbor (not dynamic) because
+/// `TCP_MD5SIG` requires knowing the peer IP before the SYN arrives.
+///
+/// # Panics
+///
+/// [`Md5Harness::new`] panics if Docker is not running, either image is
+/// missing, or the BGP session does not reach `Established` within 30 seconds.
+pub struct Md5Harness {
+    // Containers must drop before the network.
+    _gobgpd: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// The GoBGP container's IP on the shared network.
+    pub gobgp_ip: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl Md5Harness {
+    /// Stand up both containers with the same MD5 key and wait for the session.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new(key: &str) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-md5-test-{test_id}");
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), MD5_TEST_SUBNET);
+
+        // Both IPs are known before either container starts — write configs now.
+        let gobgpd_config = write_gobgp_config_md5(MD5_PATHVECTORD_IP, key);
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord_config =
+            write_daemon_config_md5(&[(MD5_GOBGP_IP.parse().unwrap(), 65001)], key);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        // Start GoBGP with a fixed IP and CAP_NET_ADMIN (needed for TCP_MD5SIG
+        // on the listener socket).
+        let gobgpd = docker_start(
+            &format!("gobgpd-md5-{test_id}"),
+            GOBGPD_IMAGE,
+            &network_name,
+            Some(MD5_GOBGP_IP),
+            true,
+            &gobgpd_config_path,
+            "/etc/gobgp/gobgpd.conf",
+            None,
+            None,
+        );
+
+        // Wait for GoBGP's HEALTHCHECK before starting pathvectord — the MD5
+        // key must be installed on the listener before pathvectord's SYN arrives.
+        wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
+
+        // Start pathvectord with a fixed IP and CAP_NET_ADMIN (needed for
+        // TCP_MD5SIG on the outbound socket before connect()).
+        let pathvectord = docker_start(
+            &format!("pathvectord-md5-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(MD5_PATHVECTORD_IP),
+            true,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client =
+            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+                .expect("connect PathvectorClient for Md5Harness");
+
+        wait_for_established(
+            &mut client,
+            MD5_GOBGP_IP.parse().unwrap(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("MD5-authenticated BGP session did not reach Established within 30 s");
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            gobgp_ip: MD5_GOBGP_IP.parse().unwrap(),
+            _network: network,
+        }
+    }
 }
 
 // ── Polling helpers ───────────────────────────────────────────────────────────

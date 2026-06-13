@@ -1629,6 +1629,7 @@ mod tests {
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                md5_password: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -1739,6 +1740,7 @@ mod tests {
             port: 179,
             remote_as: 65002,
             import_default: None,
+            md5_password: None,
             export_default: None,
         }];
         let state = DaemonState::new(
@@ -1822,6 +1824,7 @@ mod tests {
             address: peer_ip,
             port: 179,
             remote_as: 65002,
+            md5_password: None,
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
         }];
@@ -4582,6 +4585,7 @@ mod stall_tests {
             .map(|&(address, remote_as)| config::PeerConfig {
                 address,
                 port: 179,
+                md5_password: None,
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
@@ -4664,12 +4668,14 @@ mod stall_tests {
         let peer_configs = vec![
             config::PeerConfig {
                 address: peer_a,
+                md5_password: None,
                 port: 179,
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
             },
             config::PeerConfig {
+            md5_password: None,
                 address: peer_b,
                 port: 179,
                 remote_as: 65003,
@@ -4777,6 +4783,7 @@ mod stall_tests {
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                md5_password: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -4784,6 +4791,7 @@ mod stall_tests {
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                md5_password: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -4975,6 +4983,7 @@ mod event_loop_tests {
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                md5_password: None,
             })
             .collect();
 
@@ -5101,6 +5110,7 @@ mod event_loop_tests {
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                md5_password: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -5108,6 +5118,7 @@ mod event_loop_tests {
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                md5_password: None,
             },
         ];
         let mut update_senders = HashMap::new();

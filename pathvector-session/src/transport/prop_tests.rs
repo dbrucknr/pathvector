@@ -14,6 +14,7 @@ fn arb_config() -> impl Strategy<Value = SessionConfig> {
             required_capabilities: vec![],
             peer_as: if has_peer_as { Some(65002) } else { None },
             peer_addr: "127.0.0.1:0".parse().unwrap(),
+            md5_password: None,
         },
     )
 }
@@ -53,6 +54,7 @@ proptest! {
                 required_capabilities: vec![],
                 peer_as: None,
                 peer_addr: "127.0.0.1:0".parse().unwrap(),
+                md5_password: None,
             });
             handle.start().await;
             handle.stop().await;

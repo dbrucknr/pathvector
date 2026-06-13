@@ -41,6 +41,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         required_capabilities: vec![],
         peer_as: Some(65002),
         peer_addr,
+        md5_password: None,
     }
 }
 
@@ -233,6 +234,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         required_capabilities: vec![],
         peer_as: Some(65002),
         peer_addr,
+        md5_password: None,
     }
 }
 

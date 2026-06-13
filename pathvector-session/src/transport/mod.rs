@@ -833,6 +833,7 @@ mod tests {
             peer_as: Some(65002),
             // peer_addr is unused when a transport is injected via spawn_with.
             peer_addr: "127.0.0.1:0".parse().unwrap(),
+            md5_password: None,
         }
     }
 
