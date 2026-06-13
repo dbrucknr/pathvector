@@ -5447,6 +5447,7 @@ mod run_with_tests {
                     remote_as,
                     import_default: None,
                     export_default: None,
+                    md5_password: None,
                 })
                 .collect(),
         }
@@ -5533,5 +5534,100 @@ mod run_with_tests {
         assert_eq!(peers.lock().unwrap().len(), 0);
         // No senders remain; recv() returns None immediately.
         assert!(event_rx.recv().await.is_none());
+    }
+
+    // ── TCP MD5 wiring tests ──────────────────────────────────────────────────
+
+    /// A peer configured with `md5_password` must appear in the password map
+    /// returned by `build_daemon` so `run_bgp_listener` can apply the key to
+    /// the listener socket before any SYN arrives.
+    #[tokio::test]
+    async fn build_daemon_md5_password_present_in_map() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (spawn_fn, _peers) = make_mock_spawn();
+
+        let mut cfg = make_config(&[(peer_ip, 65002)]);
+        cfg.peers[0].md5_password = Some("s3cr3t".to_string());
+
+        let (_state, _rx, _stop, _incoming, md5_passwords) =
+            build_daemon(&cfg, spawn_fn).await;
+
+        assert_eq!(
+            md5_passwords.get(&IpAddr::V4(peer_ip)).map(String::as_str),
+            Some("s3cr3t"),
+            "MD5 password must be present in the listener key map"
+        );
+    }
+
+    /// A peer without `md5_password` must not appear in the password map.
+    #[tokio::test]
+    async fn build_daemon_no_md5_password_absent_from_map() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let cfg = make_config(&[(peer_ip, 65002)]); // md5_password = None
+
+        let (_state, _rx, _stop, _incoming, md5_passwords) =
+            build_daemon(&cfg, spawn_fn).await;
+
+        assert!(
+            md5_passwords.is_empty(),
+            "no MD5 passwords configured → map must be empty"
+        );
+    }
+
+    /// When multiple peers are configured, only the ones with a password appear
+    /// in the map; the others are absent.
+    #[tokio::test]
+    async fn build_daemon_md5_map_contains_only_configured_peers() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (spawn_fn, _peers) = make_mock_spawn();
+
+        let mut cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
+        cfg.peers[0].md5_password = Some("key-for-a".to_string());
+        // peer_b has no password
+
+        let (_state, _rx, _stop, _incoming, md5_passwords) =
+            build_daemon(&cfg, spawn_fn).await;
+
+        assert_eq!(
+            md5_passwords.get(&IpAddr::V4(peer_a)).map(String::as_str),
+            Some("key-for-a"),
+        );
+        assert!(
+            !md5_passwords.contains_key(&IpAddr::V4(peer_b)),
+            "peer_b has no MD5 password and must not be in the map"
+        );
+    }
+
+    /// `md5_password` is threaded into `SessionConfig` so the outbound connect
+    /// task can apply `TCP_MD5SIG` before dialling the peer. Verify the value
+    /// reaches the spawned session config.
+    #[tokio::test]
+    async fn build_daemon_md5_password_reaches_session_config() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+
+        // Capture the SessionConfig that build_daemon passes to spawn_fn.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<pathvector_session::transport::SessionConfig>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = std::sync::Arc::clone(&captured);
+
+        let (base_spawn, _peers) = make_mock_spawn();
+        let spawn_fn = move |cfg: pathvector_session::transport::SessionConfig| {
+            *captured_clone.lock().unwrap() = Some(cfg.clone());
+            base_spawn(cfg)
+        };
+
+        let mut config = make_config(&[(peer_ip, 65002)]);
+        config.peers[0].md5_password = Some("session-key".to_string());
+
+        build_daemon(&config, spawn_fn).await;
+
+        let session_cfg = captured.lock().unwrap().take().expect("spawn_fn must be called");
+        assert_eq!(
+            session_cfg.md5_password.as_deref(),
+            Some("session-key"),
+            "md5_password must be threaded into SessionConfig"
+        );
     }
 }

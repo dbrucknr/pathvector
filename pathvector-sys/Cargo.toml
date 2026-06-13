@@ -13,6 +13,9 @@ keywords.workspace = true
 [dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 # This crate's sole purpose is to encapsulate unsafe OS-level syscalls and
 # expose a safe public API. It deliberately does NOT inherit the workspace
 # `unsafe_code = "forbid"` lint — that rule applies to all other pathvector
