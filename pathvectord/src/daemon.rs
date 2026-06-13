@@ -533,6 +533,11 @@ impl DaemonState {
             self.sync_advertised(other_ip);
         }
 
+        // Emit Withdrawn RouteEvents for every NLRI that lost its best path
+        // (or Announced if another peer's route was promoted). Without this,
+        // the dashboard shows stale routes after a peer disconnects.
+        self.emit_route_events(&prev_prefixes);
+
         let _ = self.peer_tx.send(proto::PeerEvent {
             r#type: proto::PeerEventType::Changed as i32,
             peer: None, // gRPC handler builds PeerState from snapshot

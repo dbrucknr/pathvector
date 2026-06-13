@@ -2876,6 +2876,62 @@ mod tests {
         addr
     }
 
+    /// on_terminated must emit Withdrawn RouteEvents for every NLRI whose best
+    /// path was removed when the peer disconnected. Without this the dashboard
+    /// shows stale routes after a session drops.
+    #[tokio::test]
+    async fn test_on_terminated_emits_withdrawn_route_events() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+        use pathvector_types::{AsPath, Asn};
+
+        let peer_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let state = arc_state(65002, &[(peer_ip, 65001)]);
+
+        // Establish and announce two routes, then drop the lock so subscribe
+        // works without hitting the RwLock deadlock.
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(pathvector_types::Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65001)])),
+                        PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+                    ],
+                    announced: vec![nlri("10.0.0.0/8"), nlri("172.16.0.0/12")],
+                },
+            );
+        }
+
+        // Subscribe after the announce; the channel only sees the withdraw events.
+        let mut route_rx = state.read().await.route_tx.subscribe();
+
+        {
+            let mut s = state.write().await;
+            s.on_terminated(peer_ip);
+        }
+
+        let mut withdrawn: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Ok(ev) = route_rx.try_recv() {
+            if ev.r#type == proto::RouteEventType::Withdrawn as i32 {
+                if let Some(pfx) = ev.withdrawn_prefix {
+                    withdrawn.insert(pfx);
+                }
+            }
+        }
+        assert!(
+            withdrawn.contains("10.0.0.0/8"),
+            "Withdrawn RouteEvent for 10/8 must be emitted on peer termination"
+        );
+        assert!(
+            withdrawn.contains("172.16.0.0/12"),
+            "Withdrawn RouteEvent for 172.16/12 must be emitted on peer termination"
+        );
+    }
+
     #[tokio::test]
     async fn test_policy_service_over_real_h2c_connection() {
         use pathvector_client::{DaemonClient, PathvectorClient};

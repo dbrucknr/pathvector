@@ -524,6 +524,16 @@ Not yet started. Key work items:
 
 ### Remaining
 
+- **`on_terminated` missing RouteEvents** — when a peer session drops,
+  `loc_rib.withdraw_peer` removes the peer's routes but no `RouteEvent`s are
+  emitted to the broadcast channel. The dashboard therefore shows stale routes
+  after a peer disconnects until the next reconnect/snapshot. Same gap as the
+  `on_route_update` / `set_import_default` omission fixed 2026-06-13. Fix:
+  call `emit_route_events(&prev_prefixes)` after `withdraw_peer` (routes that
+  lost their only candidate emit Withdrawn; routes promoted to another peer's
+  candidate emit Announced with the new best). Tests: assert that
+  `route_tx` receives Withdrawn events for each route removed on termination.
+
 - **Split `pathvectord/src/main.rs`** — **Done (2026-06-12).** The 5865-line file was split
   into three modules:
   - `src/main.rs` (31 lines) — binary entry point only
