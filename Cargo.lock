@@ -1583,12 +1583,19 @@ dependencies = [
  "bytes",
  "criterion",
  "futures",
- "libc",
+ "pathvector-sys",
  "pathvector-types",
  "proptest",
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "pathvector-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

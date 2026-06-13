@@ -225,113 +225,12 @@ impl SessionHandle for SpawnedSessionHandle {
 
 // ── TCP MD5SIG helpers (RFC 2385) ─────────────────────────────────────────────
 
-/// Set the `TCP_MD5SIG` socket option on `fd` for the given peer address.
+/// Set the `TCP_MD5SIG` socket option on `fd` for the given peer IP address.
 ///
-/// This configures the Linux kernel to add (outbound) or verify (inbound) an
-/// HMAC-MD5 signature on every TCP segment exchanged with `peer_ip`. Both the
-/// listener socket and the outbound socket must have the key set for a session
-/// to establish.
-///
-/// No-op on non-Linux platforms with a warning; callers should still compile
-/// and run on macOS for development, just without MD5 enforcement.
-///
-/// # Errors
-///
-/// Returns `io::Error` if `setsockopt` fails (e.g., key too long, permission
-/// denied, or unsupported kernel).
-pub fn apply_tcp_md5sig(
-    fd: std::os::unix::io::RawFd,
-    peer_ip: std::net::IpAddr,
-    key: &str,
-) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        #[allow(unsafe_code)]
-        return apply_tcp_md5sig_linux(fd, peer_ip, key);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (fd, peer_ip, key);
-        tracing::warn!("TCP MD5SIG is only supported on Linux; MD5 will not be enforced");
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn apply_tcp_md5sig_linux(
-    fd: std::os::unix::io::RawFd,
-    peer_ip: std::net::IpAddr,
-    key: &str,
-) -> io::Result<()> {
-    use std::mem;
-    use std::net::IpAddr;
-
-    let key_bytes = key.as_bytes();
-    if key_bytes.len() > libc::TCP_MD5SIG_MAXKEYLEN as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "TCP MD5 key too long: {} bytes (max {})",
-                key_bytes.len(),
-                libc::TCP_MD5SIG_MAXKEYLEN
-            ),
-        ));
-    }
-
-    // SAFETY: zeroed tcp_md5sig is a valid initial state; all fields are
-    // plain integers or fixed-size byte arrays with no validity invariants.
-    let mut sig: libc::tcp_md5sig = unsafe { mem::zeroed() };
-
-    match peer_ip {
-        IpAddr::V4(v4) => {
-            // SAFETY: sockaddr_storage is a C union; we fill only the
-            // sockaddr_in-sized prefix. The remaining bytes stay zeroed.
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: 0, // port 0 = match all connections from/to this IP
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from(v4).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    std::ptr::addr_of!(sin).cast::<u8>(),
-                    std::ptr::addr_of_mut!(sig.tcpm_addr).cast::<u8>(),
-                    mem::size_of::<libc::sockaddr_in>(),
-                );
-            }
-        }
-        IpAddr::V6(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "TCP MD5SIG for IPv6 peers is not yet supported",
-            ));
-        }
-    }
-
-    sig.tcpm_keylen = key_bytes.len() as u16;
-    sig.tcpm_key[..key_bytes.len()].copy_from_slice(key_bytes);
-
-    // SAFETY: fd is a valid socket fd supplied by the caller; sig is fully
-    // initialised above; size matches the structure.
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_MD5SIG,
-            std::ptr::addr_of!(sig).cast::<libc::c_void>(),
-            mem::size_of::<libc::tcp_md5sig>() as libc::socklen_t,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
+/// Re-exported from [`pathvector_sys`], where all unsafe OS-level code lives.
+/// This crate and all other pathvector crates call this safe function without
+/// writing any `unsafe` themselves.
+pub use pathvector_sys::apply_tcp_md5sig;
 
 /// Spawn a BGP session task and return a handle to control it.
 ///

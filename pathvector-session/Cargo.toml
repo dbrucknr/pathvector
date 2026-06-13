@@ -14,7 +14,7 @@ keywords.workspace = true
 [dependencies]
 bytes            = { workspace = true }
 futures          = { workspace = true }
-libc             = { workspace = true }
+pathvector-sys   = { workspace = true }
 pathvector-types = { workspace = true }
 tokio            = { workspace = true }
 tokio-util       = { workspace = true }

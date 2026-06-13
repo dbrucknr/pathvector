@@ -9,6 +9,7 @@ members = [
     "pathvectord",
     "pathvector",
     "e2e",
+    "pathvector-sys",
 ]
 resolver = "2"
 
@@ -23,6 +24,7 @@ keywords = ["bgp", "routing", "networking"]
 
 [workspace.dependencies]
 # Internal crates
+pathvector-sys     = { path = "pathvector-sys",     version = "0.1.0" }
 pathvector-types   = { path = "pathvector-types",   version = "0.1.0" }
 pathvector-policy  = { path = "pathvector-policy",  version = "0.1.0" }
 pathvector-rib     = { path = "pathvector-rib",     version = "0.1.0" }
@@ -50,9 +52,7 @@ prost            = "0.14"
 prost-types      = "0.14"
 
 [workspace.lints.rust]
-# Deny rather than forbid so that pathvector-session can opt into a targeted
-# allow for the TCP_MD5SIG setsockopt call (the only intentional unsafe site).
-unsafe_code = "deny"
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
