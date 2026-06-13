@@ -77,7 +77,7 @@ lint-linux:
         -e CARGO_HOME=/workspace/.cargo-linux-cache \
         rust:latest \
         sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null \
-            && rustup component add clippy --quiet \
+            && rustup component add clippy \
             && cargo clippy --workspace --all-targets -- -D warnings"
 
 # Verify rustfmt formatting (does not modify files)
