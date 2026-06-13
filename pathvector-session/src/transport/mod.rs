@@ -690,12 +690,12 @@ pub(crate) fn make_treat_as_withdraw_test(update: UpdateMessage) -> UpdateMessag
 /// When `password` is `Some(key)`, a raw socket is created first, the MD5 key
 /// is installed via [`apply_tcp_md5sig`], and then the socket is connected.
 async fn tcp_connect(addr: SocketAddr, password: Option<&str>) -> io::Result<TcpStream> {
+    use std::os::unix::io::AsRawFd;
+    use tokio::net::TcpSocket;
+
     let Some(key) = password else {
         return TcpStream::connect(addr).await;
     };
-
-    use std::os::unix::io::AsRawFd;
-    use tokio::net::TcpSocket;
 
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?

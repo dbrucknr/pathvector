@@ -41,7 +41,7 @@ pub fn apply_tcp_md5sig(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()>
             ),
         ));
     }
-    if let IpAddr::V6(_) = peer_ip {
+    if peer_ip.is_ipv6() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "TCP MD5SIG for IPv6 peers is not yet supported",
@@ -78,12 +78,12 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     //   u8   tcpm_key[TCP_MD5SIG_MAXKEYLEN];         //  80 bytes
     #[repr(C)]
     struct TcpMd5Sig {
-        tcpm_addr:  libc::sockaddr_storage,
-        tcpm_pad1:  u16,
+        tcpm_addr: libc::sockaddr_storage,
+        tcpm_pad1: u16,
         tcpm_keylen: u8,
-        tcpm_pad2:  u8,
-        tcpm_pad3:  u32,
-        tcpm_key:   [u8; 80],
+        tcpm_pad2: u8,
+        tcpm_pad3: u32,
+        tcpm_key: [u8; 80],
     }
 
     // Input validation was already performed by the public apply_tcp_md5sig
@@ -147,7 +147,10 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     // kernel omits this feature; CI runs on native Linux where it is present.
     // Treat "not supported" as a non-fatal condition — log a warning and let
     // the BGP session continue without kernel-level authentication.
-    if matches!(err.raw_os_error(), Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)) {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+    ) {
         // No tracing subscriber available here (sys crate has none); the
         // session-layer and daemon callers log via their own tracing spans.
         return Ok(());

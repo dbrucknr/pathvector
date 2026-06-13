@@ -341,14 +341,17 @@ Remaining e2e work:
 ### Best-path selection — missing decision steps
 
 RFC 4271 §9.1 defines a 10-step decision process. The current implementation
-covers steps 2, 4, 5, 6, and 10. The remaining steps are deferred because
-they require information the RIB layer does not yet have.
+covers steps 2, 4, 5, 6, 7, and 10. The remaining steps are listed below.
+
+**Step 8 is unblocked and ready to implement.** It requires only a `PartialOrd`
+on peer IP address — no IGP or FIB dependency. A two-line comparison in
+`select_best` closes this gap immediately.
 
 | Step | Criterion | Blocked on |
 |---|---|---|
-| 1 | Prefer routes with a reachable next-hop | IGP integration — the RIB needs to know which next-hops are reachable via the interior routing protocol |
-| 3 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally (`network` statement) vs learned from a peer |
-| 8 | Prefer lowest IGP metric to next-hop | IGP integration — requires the router's own IGP topology view |
+| 1 | Prefer routes with a reachable next-hop | FIB integration — the RIB needs to know which next-hops are reachable |
+| 3 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally vs learned from a peer |
+| 8 | Prefer route from peer with lowest IP address | **Nothing** — `PartialOrd` on `IpAddr`; ready to implement today |
 | 9 | Prefer oldest eBGP route | Route age tracking — the RIB would need to record when each route was first received |
 
 ### Trait-based RIB and policy seams
@@ -389,6 +392,49 @@ Intra-cluster route reflection (RFC 4456) requires the RIB to track:
 
 Loop prevention in a route reflector topology uses these attributes instead
 of (or in addition to) the AS path.
+
+### FIB integration (Netlink / kernel route installation)
+
+Routes are correctly selected by `select_best` and stored in `LocRib`, but never
+installed into the kernel's forwarding table. pathvectord cannot actually forward
+packets — it is a BGP process, not yet a BGP router.
+
+FIB integration requires:
+- A `FibManager` component that subscribes to `LocRib` best-route changes
+  (via `RouteEvents`) and translates them into Netlink `RTM_NEWROUTE` /
+  `RTM_DELROUTE` messages
+- `rtnetlink` crate (or raw Netlink sockets) for kernel interaction
+- A configurable route table number and protocol ID (to avoid stomping on static
+  or OSPF routes)
+- Route ownership tracking: when pathvectord exits cleanly, withdraw all installed
+  routes; on crash, the kernel automatically removes routes with the daemon's
+  protocol ID if `NLM_F_CREATE` was used with a protocol tag
+
+This is the single most impactful gap between "BGP implementation" and "BGP router".
+It also unblocks best-path step 1 (next-hop reachability via IGP cost).
+
+FIB integration is Linux-specific. macOS and other platforms would require a
+`#[cfg]`-gated stub that logs installed/withdrawn routes without touching the kernel.
+
+### Maximum prefix limits
+
+No per-peer `max_prefixes` guard. A peer that sends more prefixes than expected
+should trigger a CEASE NOTIFICATION (RFC 4486 subcode 1 — Maximum Number of Prefixes
+Reached) and optionally restart after a configurable idle-hold timer.
+
+Config shape:
+```toml
+[[peers]]
+address     = "10.0.0.1"
+remote_as   = 65001
+max_prefixes = 100          # optional; no limit if absent
+max_prefixes_restart = 300  # idle-hold seconds before reconnect; 0 = no restart
+```
+
+Implementation: count `AdjRibIn` entries per peer on each `INSERT` event in
+`handle_update`; if the count exceeds the limit, send `CEASE/MaximumPrefixes` and
+move the FSM to Idle. Cover with an e2e test using a GoBGP peer configured to
+announce more prefixes than the limit.
 
 ### Configurable MED behaviour
 
