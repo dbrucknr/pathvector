@@ -163,6 +163,19 @@ failing cases to the smallest reproducing input automatically.
 | `AdjRibOut::insert` → `get` roundtrips exactly | Lossy insert sends a different UPDATE than export policy produced |
 | `AdjRibOut::withdraw` → `get` returns `None` | Stale entry suppresses the WITHDRAW the peer must receive |
 
+### `pathvector-sys`
+
+`pathvector-sys` is the sole crate in the workspace permitted to write `unsafe` code. All
+unsafe lives in one place — the `apply_tcp_md5sig` Linux path — making it easy to audit
+and reason about. The property tests focus on the validation boundary that fires before
+any syscall, keeping them cross-platform (they pass on macOS and Linux alike).
+
+| Invariant | Why it matters |
+|---|---|
+| Keys of 0–80 bytes never produce `InvalidInput` | All keys in the valid range must pass length guard; EBADF (fd=-1) or Ok(()) are acceptable |
+| Keys longer than 80 bytes always produce `InvalidInput` | RFC 2385 key length limit; must be enforced before the kernel call |
+| Any IPv6 address always returns `Unsupported` | IPv6 peer MD5 is not yet implemented; must not silently succeed |
+
 ---
 
 ## Fuzz testing
@@ -433,6 +446,11 @@ the `pathvectord` container. Routes are injected via `docker exec <id> gobgp glo
 Both are Linux/arm64 on Apple Silicon and Linux/amd64 on x86 CI runners. The GoBGP
 version is pinned in the `Justfile` (`gobgp-version := "4.6.0"`).
 
+> **After changing pathvectord source code, always rebuild the image before running
+> e2e tests.** The image embeds the compiled binary; `just e2e` does this automatically.
+> Running tests against a stale image is the most common source of confusing failures —
+> a `serde(default)` field added to config will be silently ignored by an old binary.
+
 ### Running the suite
 
 **Prerequisite: Docker must be running.**
@@ -459,18 +477,89 @@ just e2e-down  # stop and clean up
 
 ### Scenario coverage
 
-| Test | File | RFC | What it proves |
-|---|---|---|---|
-| `session_reaches_established` | session.rs | RFC 4271 §8 | OPEN + KEEPALIVE exchange succeeds end-to-end |
-| `peer_state_fields_correct_after_established` | session.rs | RFC 4271 §8 | AS numbers, peer type, hold-time populated correctly |
-| `list_peers_includes_gobgp_peer` | session.rs | RFC 4271 §8 | Management API reflects live session state |
-| `wait_for_established_respects_deadline` | session.rs | — | Test harness deadline fires correctly |
-| `announced_route_appears_in_rib` | routes.rs | RFC 4271 §9.2 | UPDATE received and installed in Loc-RIB with correct attributes |
-| `withdrawn_route_removed_from_rib` | routes.rs | RFC 4271 §9.3 | WITHDRAW removes route from Loc-RIB |
-| `multiple_routes_all_installed` | routes.rs | RFC 4271 §9.2 | Multiple prefixes handled correctly; `list_routes` returns all |
-| `partial_withdrawal_leaves_others_intact` | routes.rs | RFC 4271 §9.3 | Withdraw of one prefix does not disturb others |
-| `list_candidates_returns_peer_route` | routes.rs | RFC 4271 §9.1 | Candidate map populated; `list_candidates` API works |
-| `unknown_prefix_returns_none` | routes.rs | RFC 4271 §9.1 | `get_best_route` returns `None` for absent prefix |
+#### Session (`session.rs`)
+
+| Test | RFC | What it proves |
+|---|---|---|
+| `session_reaches_established` | RFC 4271 §8 | OPEN + KEEPALIVE exchange succeeds end-to-end |
+| `peer_state_fields_correct_after_established` | RFC 4271 §8 | AS numbers, peer type, hold-time populated correctly |
+| `list_peers_includes_gobgp_peer` | RFC 4271 §8 | Management API reflects live session state |
+| `wait_for_established_respects_deadline` | — | Test harness deadline fires correctly |
+| `wait_for_route_respects_deadline` | — | Route polling helper respects deadline |
+| `wait_for_route_withdrawn_respects_deadline` | — | Withdrawal polling helper respects deadline |
+
+#### Routes (`routes.rs`)
+
+| Test | RFC | What it proves |
+|---|---|---|
+| `announced_route_appears_in_rib` | RFC 4271 §9.2 | IPv4 UPDATE received and installed in Loc-RIB with correct attributes |
+| `withdrawn_route_removed_from_rib` | RFC 4271 §9.3 | IPv4 WITHDRAW removes route from Loc-RIB |
+| `multiple_routes_all_installed` | RFC 4271 §9.2 | Multiple prefixes handled correctly; `list_routes` returns all |
+| `partial_withdrawal_leaves_others_intact` | RFC 4271 §9.3 | Withdraw of one prefix does not disturb others |
+| `list_candidates_returns_peer_route` | RFC 4271 §9.1 | Candidate map populated; `list_candidates` API works |
+| `unknown_prefix_returns_none` | RFC 4271 §9.1 | `get_best_route` returns `None` for absent prefix |
+| `announced_v6_route_appears_in_rib` | RFC 4760 | IPv6 MP_REACH_NLRI UPDATE installed in `loc_rib_v6` |
+| `withdrawn_v6_route_removed_from_rib` | RFC 4760 | IPv6 MP_UNREACH_NLRI removes route from `loc_rib_v6` |
+
+#### Policy (`policy.rs`)
+
+| Test | RFC | What it proves |
+|---|---|---|
+| `no_import_policy_rejects_ebgp_prefix` | RFC 8212 §4 | eBGP default-reject: no import policy → route blocked |
+| `explicit_import_accept_installs_ebgp_prefix` | RFC 8212 | Positive control: explicit accept → route installed |
+| `no_export_policy_suppresses_advertisement_to_peer` | RFC 8212 §4 | eBGP default-reject: no export policy → route not forwarded |
+| `explicit_export_accept_propagates_to_sink` | RFC 8212 | Positive control: explicit accept → route forwarded to sink |
+| `soft_reconfig_import_accept_installs_route` | — | Runtime `SetImportDefault(Accept)` installs routes without session teardown |
+| `soft_reconfig_export_accept_propagates_to_sink` | — | Runtime `SetExportDefault(Accept)` propagates routes to sink without session teardown |
+| `import_default_v6_reject_blocks_ipv6_allows_ipv4` | — | `import_default_v6 = "reject"` blocks IPv6 while `import_default = "accept"` admits IPv4 from the same peer |
+
+#### Authentication (`auth.rs`)
+
+| Test | RFC | What it proves |
+|---|---|---|
+| `md5_matching_key_session_establishes` | RFC 2385 | Matching `md5_password` on both sides → BGP session reaches Established |
+| `md5_key_mismatch_session_never_establishes` | RFC 2385 | Mismatched keys → session cannot establish; **CI-only** (see note below) |
+
+> **CI-only gate on the negative MD5 test.** TCP MD5SIG is enforced at the Linux kernel
+> level. Docker Desktop on macOS runs inside a Linux VM whose kernel is built without
+> `CONFIG_TCP_MD5SIG`. On that host, `setsockopt(TCP_MD5SIG)` in the container succeeds
+> (the call is accepted by the kernel and silently ignored), so mismatched keys still
+> allow the TCP handshake through — the negative test would pass for the wrong reason.
+> GitHub Actions CI runners use native Linux Docker where `CONFIG_TCP_MD5SIG` is always
+> compiled in. `md5_key_mismatch_session_never_establishes` is gated on `CI=1` so it
+> only asserts on a host that can actually enforce the kernel-level check.
+>
+> The positive test (`md5_matching_key_session_establishes`) runs everywhere: even when
+> `setsockopt` is a no-op, both sides have TCP MD5SIG configured consistently and the
+> session reaches Established.
+
+#### Outbound propagation (`outbound.rs`)
+
+| Test | RFC | What it proves |
+|---|---|---|
+| `announced_route_propagates_to_sink` | RFC 4271 §9.2 | Route accepted from source → re-advertised to sink peer |
+| `multiple_routes_all_propagate_to_sink` | RFC 4271 §9.2 | Multiple prefixes each forwarded |
+| `withdrawn_route_removed_from_sink` | RFC 4271 §9.3 | Withdrawal from source → WITHDRAW sent to sink |
+| `source_route_visible_in_pathvectord_rib` | RFC 4271 §9.2 | Intermediate Loc-RIB correctly populated in two-peer topology |
+| `originated_v6_route_propagates_to_gobgp` | RFC 4760 | IPv6 origination → MP_REACH_NLRI forwarded to GoBGP |
+
+#### Origination (`origination.rs`)
+
+| Test | RFC | What it proves |
+|---|---|---|
+| `originated_route_appears_in_rib` | RFC 4271 §9.2 | Originated route injected via gRPC appears in Loc-RIB |
+| `originated_route_propagates_to_gobgp` | RFC 4271 §9.2 | Originated route forwarded to established eBGP peer |
+| `withdrawn_originated_route_removed_from_rib` | RFC 4271 §9.3 | Withdrawal removes originated route from Loc-RIB |
+| `withdrawn_originated_route_removed_from_gobgp` | RFC 4271 §9.3 | Withdrawal sends WITHDRAW to peer; GoBGP removes it |
+| `batch_originate_all_propagate` | RFC 4271 §9.2 | Batch origination: all prefixes forwarded in one or more UPDATEs |
+| `list_originated_routes_tracks_state` | — | `list_originated_routes` gRPC reflects current originated set |
+| `re_originate_same_prefix_replaces_route` | RFC 4271 §9.2 | Re-originating a prefix updates attributes and re-advertises |
+| `originated_route_has_correct_attributes` | RFC 4271 §5 | ORIGIN, NEXT_HOP, AS_PATH, LOCAL_PREF set correctly |
+| `withdraw_then_reoriginate_reappears_in_gobgp` | RFC 4271 §9.2 | Withdraw → re-originate sends a fresh UPDATE (not suppressed) |
+| `withdraw_nonexistent_is_noop` | — | Withdrawing an unknown prefix does not panic or corrupt state |
+| `batch_withdraw_removes_specified_prefixes` | RFC 4271 §9.3 | Batch withdrawal removes exactly the specified set |
+| `originated_route_with_blackhole_community_propagates` | RFC 7999 | BLACKHOLE-tagged route forwarded to peers that accept it |
+| `originated_and_peer_routes_coexist` | RFC 4271 §9.2 | Local originated routes and peer-received routes coexist correctly |
 
 ### Protocol validation notes
 
@@ -482,6 +571,57 @@ are worth recording even though the Docker suite now handles automated testing.
 | NOTIFICATION Code 2 Subcode 3 (Bad BGP Identifier) | `bgp_id` in `127.0.0.0/8` — GoBGP rejects loopback BGP IDs | Use a non-loopback address, e.g. `10.0.0.2` |
 | Session drops on first UPDATE | `FourByteAsn` capability omitted — GoBGP sends 2-byte AS_PATH, decoder reads 4 bytes per ASN | Added `Capability::FourByteAsn(local_as)` to `SessionConfig::capabilities` |
 | Repeated self-connection NOTIFICATIONs | GoBGP dials its own listener without `passive-mode` | Set `passive-mode = true` in GoBGP neighbor transport config |
+
+---
+
+## TCP MD5 authentication safety (`pathvector-sys`)
+
+RFC 2385 (TCP MD5) is a security feature. We hold it to a higher standard than ordinary
+protocol code: the same bug that accepts a wrong key would silently let a spoofed session
+through. This section documents every layer of assurance applied to `apply_tcp_md5sig`.
+
+### Isolation
+
+All `unsafe` code in the workspace lives in `pathvector-sys` and nowhere else. Every
+other crate, including `pathvectord`, inherits `unsafe_code = "forbid"` from the
+workspace `Cargo.toml`. `pathvector-sys` overrides this to `unsafe_code = "allow"` only
+for the one function that calls `setsockopt`. The isolation means a code reviewer can
+audit the entire unsafe surface by reading a single 60-line function.
+
+The kernel struct (`tcp_md5sig`) is defined locally in `pathvector-sys/src/tcp.rs` as
+`#[repr(C)] struct TcpMd5Sig` rather than using `libc::tcp_md5sig`. This is because
+`libc::tcp_md5sig` is not exposed on all Linux target architectures in all `libc`
+versions (notably absent on `aarch64` in `libc 0.2.x`). The local definition matches
+the kernel ABI exactly (`<linux/tcp.h>`), documented with field offsets and sizes.
+
+### Validation layers
+
+| Layer | What it checks | Test |
+|---|---|---|
+| Input validation (pre-syscall) | Key > 80 bytes → `InvalidInput` before any kernel call | `test_key_too_long_returns_error` |
+| Input validation (pre-syscall) | Key at exactly 80 bytes passes the guard | `test_key_at_exact_limit_passes_length_guard` |
+| Input validation (pre-syscall) | IPv6 address → `Unsupported` (not yet implemented) | `test_ipv6_returns_unsupported` |
+| Syscall success path (Linux) | Real `TcpListener` fd → `setsockopt` succeeds | `test_apply_succeeds_on_real_socket_linux` |
+| Syscall idempotence (Linux) | Calling twice on the same peer updates the key | `test_apply_twice_same_peer_succeeds_linux` |
+| Syscall error path (Linux) | Invalid fd → OS error, not panic or `InvalidInput` | `test_invalid_fd_returns_os_error_linux` |
+| Property: valid key range | All keys 0–80 bytes never produce `InvalidInput` | `prop_key_within_limit_never_rejected_for_length` |
+| Property: over-limit key | All keys > 80 bytes always produce `InvalidInput` | `prop_key_over_limit_always_rejected` |
+| Property: IPv6 | Any IPv6 address always returns `Unsupported` | `prop_ipv6_always_unsupported` |
+| E2E interop (positive) | Matching keys → BGP session reaches Established against real GoBGP | `md5_matching_key_session_establishes` |
+| E2E interop (negative, CI) | Mismatched keys → session never establishes on native Linux | `md5_key_mismatch_session_never_establishes` |
+
+### Platform behaviour
+
+| Platform | `setsockopt(TCP_MD5SIG)` | Enforcement | Notes |
+|---|---|---|---|
+| Linux (native) | Succeeds if `CAP_NET_ADMIN` held | Kernel enforces signature on every segment | CI and production |
+| Linux in Docker Desktop VM | Returns `ENOPROTOOPT` (no `CONFIG_TCP_MD5SIG`) | Not enforced | Handled: `ENOPROTOOPT`/`EOPNOTSUPP` → `Ok(())` with a warning; session continues |
+| macOS (native) | No-op; `#[cfg(not(target_os = "linux"))]` | Not enforced | Development-only; no kernel path taken |
+
+The graceful-degrade on `ENOPROTOOPT` is the reason the positive e2e test passes on
+macOS: both sides are configured consistently, the no-op call succeeds, and the session
+establishes without kernel-level authentication — which is the correct behaviour for a
+host that cannot enforce it.
 
 ---
 
@@ -508,6 +648,7 @@ cargo llvm-cov -p pathvector-policy --show-missing-lines
 | `pathvector-session` | ≈ 90% |
 | `pathvector-policy` | ≈ 95% |
 | `pathvector-rib` | ≈ 90% |
+| `pathvector-sys` | ≈ 85% |
 | `pathvector-client` | ≈ 75% |
 | `pathvector` (CLI) | ≈ 80% |
 
@@ -517,6 +658,8 @@ cargo llvm-cov -p pathvector-policy --show-missing-lines
 - `dashboard::run_dashboard` — requires a real crossterm terminal; covered indirectly
   by `DashboardState::refresh` and snapshot tests of the render functions.
 - Doc examples marked `ignore` — require a concrete route type not available in doc-test scope.
+- `apply_linux` on non-Linux — the Linux kernel path is `#[cfg(target_os = "linux")]`;
+  macOS coverage runs exclude it by definition.
 
 ---
 
@@ -529,8 +672,9 @@ cargo llvm-cov -p pathvector-policy --show-missing-lines
   expected.
 - **Sealed traits** (`IpAddress` in `ipnetx`, `EvaluateTerm` in `pathvector-policy`)
   prevent external code from implementing internal interfaces.
-- **No `unsafe` code** anywhere in the workspace, enforced by workspace-level lint:
-  `unsafe_code = "forbid"`.
+- **`unsafe_code = "forbid"`** is enforced at the workspace level. The single exception
+  is `pathvector-sys`, which overrides to `"allow"` and is the designated home for all
+  unsafe code in the workspace. No other crate may write `unsafe`.
 
 ### BGP protocol correctness
 

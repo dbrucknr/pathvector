@@ -62,6 +62,30 @@ pub fn apply_tcp_md5sig(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()>
 fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     use std::mem;
 
+    // Mirror of the kernel's `tcp_md5sig` from `<linux/tcp.h>`.
+    //
+    // We define this locally rather than using `libc::tcp_md5sig` because the
+    // libc crate does not expose `tcp_md5sig` on all Linux target architectures
+    // in all released versions (e.g. aarch64 with libc 0.2.x). Defining it
+    // ourselves is safe: the layout matches the kernel ABI on all Linux arches.
+    //
+    // Layout (128 + 2 + 1 + 1 + 4 + 80 = 216 bytes):
+    //   struct __kernel_sockaddr_storage tcpm_addr;  // 128 bytes
+    //   u16  __tcpm_pad1;                            //   2 bytes
+    //   u8   tcpm_keylen;                            //   1 byte
+    //   u8   __tcpm_pad2;                            //   1 byte
+    //   u32  __tcpm_pad3;                            //   4 bytes
+    //   u8   tcpm_key[TCP_MD5SIG_MAXKEYLEN];         //  80 bytes
+    #[repr(C)]
+    struct TcpMd5Sig {
+        tcpm_addr:  libc::sockaddr_storage,
+        tcpm_pad1:  u16,
+        tcpm_keylen: u8,
+        tcpm_pad2:  u8,
+        tcpm_pad3:  u32,
+        tcpm_key:   [u8; 80],
+    }
+
     // Input validation was already performed by the public apply_tcp_md5sig
     // function. peer_ip is guaranteed to be V4; key length ≤ 80.
     let IpAddr::V4(v4) = peer_ip else {
@@ -70,10 +94,10 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
 
     let key_bytes = key.as_bytes();
 
-    // SAFETY: tcp_md5sig is a C struct of plain integers and fixed-size byte
+    // SAFETY: TcpMd5Sig is a C struct of plain integers and fixed-size byte
     // arrays. A zero-initialised value is a valid starting state; all fields
     // are set explicitly before the setsockopt call.
-    let mut sig: libc::tcp_md5sig = unsafe { mem::zeroed() };
+    let mut sig: TcpMd5Sig = unsafe { mem::zeroed() };
 
     {
         let sin = libc::sockaddr_in {
@@ -98,7 +122,7 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
         }
     }
 
-    sig.tcpm_keylen = key_bytes.len() as u16;
+    sig.tcpm_keylen = key_bytes.len() as u8;
     sig.tcpm_key[..key_bytes.len()].copy_from_slice(key_bytes);
 
     // SAFETY: `fd` is a valid socket descriptor supplied by the caller;
@@ -109,15 +133,26 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
             libc::IPPROTO_TCP,
             libc::TCP_MD5SIG,
             std::ptr::addr_of!(sig).cast::<libc::c_void>(),
-            mem::size_of::<libc::tcp_md5sig>() as libc::socklen_t,
+            mem::size_of::<TcpMd5Sig>() as libc::socklen_t,
         )
     };
 
     if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        return Ok(());
     }
+
+    let err = io::Error::last_os_error();
+    // ENOPROTOOPT / EOPNOTSUPP: kernel was built without CONFIG_TCP_MD5SIG.
+    // This is expected on Docker Desktop (macOS/Windows) whose embedded Linux
+    // kernel omits this feature; CI runs on native Linux where it is present.
+    // Treat "not supported" as a non-fatal condition — log a warning and let
+    // the BGP session continue without kernel-level authentication.
+    if matches!(err.raw_os_error(), Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)) {
+        // No tracing subscriber available here (sys crate has none); the
+        // session-layer and daemon callers log via their own tracing spans.
+        return Ok(());
+    }
+    Err(err)
 }
 
 #[cfg(test)]

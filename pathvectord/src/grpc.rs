@@ -1010,6 +1010,7 @@ mod tests {
                 remote_as,
                 import_default: Some(ImportDefault::Accept),
                 export_default: Some(ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             })
             .collect();

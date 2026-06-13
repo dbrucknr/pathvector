@@ -171,9 +171,12 @@ impl DaemonState {
             .iter()
             .map(|p| {
                 let is_ebgp = p.remote_as != local_as;
+                // import_default_v6 takes precedence; falls back to import_default,
+                // then to the RFC 8212 default for the peer type.
+                let default_v6 = p.import_default_v6.or(p.import_default);
                 (
                     p.address,
-                    Policy::new(resolve_import_default(p.import_default, is_ebgp)),
+                    Policy::new(resolve_import_default(default_v6, is_ebgp)),
                 )
             })
             .collect();
@@ -1589,6 +1592,18 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn route_v4(prefix: &str) -> Route<Ipv4Addr> {
+        RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build()
+    }
+
+    fn route_v6(prefix: &str) -> Route<Ipv6Addr> {
+        RouteBuilder::new(nlri_v6(prefix), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build()
+    }
+
     fn accept_all() -> Policy<Route<Ipv4Addr>> {
         Policy::new(DefaultAction::Accept)
     }
@@ -1629,6 +1644,7 @@ mod tests {
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             })
             .collect();
@@ -1740,7 +1756,8 @@ mod tests {
             port: 179,
             remote_as: 65002,
             import_default: None,
-            md5_password: None,
+            import_default_v6: None,
+                md5_password: None,
             export_default: None,
         }];
         let state = DaemonState::new(
@@ -1824,7 +1841,8 @@ mod tests {
             address: peer_ip,
             port: 179,
             remote_as: 65002,
-            md5_password: None,
+            import_default_v6: None,
+                md5_password: None,
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
         }];
@@ -2619,6 +2637,97 @@ mod tests {
             ari_v6.len(),
             1,
             "rejected route must still be stored in AdjRibIn for soft-reconfig"
+        );
+    }
+
+    // ── import_default_v6 TOML wiring ────────────────────────────────────────
+
+    /// When `import_default_v6` is not set in config, the IPv6 import policy
+    /// falls back to `import_default`. This test verifies the fallback: an eBGP
+    /// peer with `import_default = "accept"` and no `import_default_v6` must
+    /// accept IPv6 routes.
+    #[test]
+    fn test_import_default_v6_falls_back_to_import_default() {
+        use std::collections::HashMap;
+
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let peers = vec![config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65002, // eBGP
+            import_default: Some(config::ImportDefault::Accept),
+            import_default_v6: None, // omitted → falls back to import_default
+            export_default: None,
+            md5_password: None,
+        }];
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            &peers,
+            {
+                let mut m = HashMap::new();
+                m.insert(peer_ip, tx);
+                m
+            },
+            vec![],
+        );
+
+        let policy_v6 = state.import_policies_v6.get(&peer_ip).unwrap();
+        let mut dummy = route_v6("2001:db8::/32");
+        assert_eq!(
+            policy_v6.evaluate(&mut dummy),
+            Decision::Accept,
+            "IPv6 policy must fall back to import_default (Accept) when import_default_v6 is None"
+        );
+    }
+
+    /// When `import_default_v6` is set it overrides `import_default` for the
+    /// IPv6 policy only. The IPv4 policy must remain unaffected.
+    #[test]
+    fn test_import_default_v6_overrides_import_default() {
+        use std::collections::HashMap;
+
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let peers = vec![config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65002, // eBGP
+            import_default: Some(config::ImportDefault::Accept),
+            import_default_v6: Some(config::ImportDefault::Reject),
+            export_default: None,
+            md5_password: None,
+        }];
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            &peers,
+            {
+                let mut m = HashMap::new();
+                m.insert(peer_ip, tx);
+                m
+            },
+            vec![],
+        );
+
+        let policy_v4 = state.import_policies.get(&peer_ip).unwrap();
+        let policy_v6 = state.import_policies_v6.get(&peer_ip).unwrap();
+
+        let mut dummy_v4 = route_v4("192.0.2.0/24");
+        let mut dummy_v6 = route_v6("2001:db8::/32");
+
+        assert_eq!(
+            policy_v4.evaluate(&mut dummy_v4),
+            Decision::Accept,
+            "IPv4 policy must remain Accept (import_default)"
+        );
+        assert_eq!(
+            policy_v6.evaluate(&mut dummy_v6),
+            Decision::Reject,
+            "IPv6 policy must be Reject (import_default_v6 overrides)"
         );
     }
 
@@ -4585,6 +4694,7 @@ mod stall_tests {
             .map(|&(address, remote_as)| config::PeerConfig {
                 address,
                 port: 179,
+                import_default_v6: None,
                 md5_password: None,
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
@@ -4668,6 +4778,7 @@ mod stall_tests {
         let peer_configs = vec![
             config::PeerConfig {
                 address: peer_a,
+                import_default_v6: None,
                 md5_password: None,
                 port: 179,
                 remote_as: 65002,
@@ -4675,7 +4786,8 @@ mod stall_tests {
                 export_default: Some(config::ExportDefault::Accept),
             },
             config::PeerConfig {
-            md5_password: None,
+            import_default_v6: None,
+                md5_password: None,
                 address: peer_b,
                 port: 179,
                 remote_as: 65003,
@@ -4783,6 +4895,7 @@ mod stall_tests {
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             },
             config::PeerConfig {
@@ -4791,6 +4904,7 @@ mod stall_tests {
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             },
         ];
@@ -4983,6 +5097,7 @@ mod event_loop_tests {
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             })
             .collect();
@@ -5110,6 +5225,7 @@ mod event_loop_tests {
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             },
             config::PeerConfig {
@@ -5118,6 +5234,7 @@ mod event_loop_tests {
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
                 md5_password: None,
             },
         ];
@@ -5458,7 +5575,8 @@ mod run_with_tests {
                     remote_as,
                     import_default: None,
                     export_default: None,
-                    md5_password: None,
+                    import_default_v6: None,
+                md5_password: None,
                 })
                 .collect(),
         }

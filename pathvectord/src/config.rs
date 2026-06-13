@@ -140,12 +140,27 @@ pub struct PeerConfig {
     #[serde(default = "default_bgp_port")]
     pub port: u16,
     pub remote_as: u32,
-    /// Default action when no import policy term matches.
+    /// Default action when no import policy term matches for IPv4 routes.
     ///
     /// When omitted: eBGP peers default to `"reject"` (RFC 8212 compliance);
     /// iBGP peers default to `"accept"`. Set explicitly to override.
     #[serde(default)]
     pub import_default: Option<ImportDefault>,
+    /// Default action when no import policy term matches for IPv6 routes.
+    ///
+    /// When omitted, falls back to [`import_default`]. This lets operators
+    /// accept IPv4 routes while still applying RFC 8212 reject semantics to
+    /// IPv6, or vice-versa.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address           = "198.51.100.1"
+    /// remote_as         = 64496
+    /// import_default    = "accept"    # accept IPv4
+    /// import_default_v6 = "reject"    # but reject IPv6 from this peer
+    /// ```
+    #[serde(default)]
+    pub import_default_v6: Option<ImportDefault>,
     /// Default action when no export policy term matches.
     ///
     /// When omitted: eBGP peers default to `"reject"` (RFC 8212 compliance);
@@ -392,6 +407,62 @@ md5_password = "s3cr3t"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.peers[0].md5_password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn test_config_import_default_v6_omitted_is_none() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+import_default = "accept"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.peers[0].import_default_v6.is_none());
+    }
+
+    #[test]
+    fn test_config_import_default_v6_accept() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+import_default    = "reject"
+import_default_v6 = "accept"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.peers[0].import_default_v6,
+            Some(ImportDefault::Accept)
+        ));
+    }
+
+    #[test]
+    fn test_config_import_default_v6_reject() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+import_default    = "accept"
+import_default_v6 = "reject"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.peers[0].import_default_v6,
+            Some(ImportDefault::Reject)
+        ));
     }
 
     #[test]

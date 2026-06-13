@@ -27,6 +27,7 @@ COPY pathvector-types/    pathvector-types/
 COPY pathvector-policy/   pathvector-policy/
 COPY pathvector-rib/      pathvector-rib/
 COPY pathvector-session/  pathvector-session/
+COPY pathvector-sys/      pathvector-sys/
 COPY pathvector-bmp/      pathvector-bmp/
 COPY pathvector-client/   pathvector-client/
 COPY pathvector/          pathvector/

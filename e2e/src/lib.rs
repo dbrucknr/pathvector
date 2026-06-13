@@ -445,6 +445,49 @@ import_default = "accept"
     f
 }
 
+/// Writes a pathvectord config where each peer accepts IPv4 but rejects IPv6.
+///
+/// `import_default = "accept"` / `import_default_v6 = "reject"` lets us test
+/// that the two per-AFI defaults are independent: IPv4 routes from GoBGP are
+/// installed while IPv6 routes are dropped at the import gate.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_ipv4_accept_ipv6_reject(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as   = 65002
+bgp_id     = "10.0.0.2"
+local_ipv6 = "2001:db8::2"
+hold_time  = 9
+grpc_port  = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address           = "{ip}"
+port              = {GOBGPD_BGP_PORT}
+remote_as         = {remote_as}
+import_default    = "accept"
+import_default_v6 = "reject"
+export_default    = "accept"
+"#
+        )
+        .expect("write pathvectord per-peer config");
+    }
+    f
+}
+
 /// Writes a GoBGP config with a **static neighbor** and TCP MD5 authentication.
 ///
 /// Dynamic neighbors cannot be used with TCP MD5SIG: the Linux kernel requires
@@ -850,6 +893,7 @@ pub struct Harness {
     /// and by `wait_for_gobgp_rib_entry` / `wait_for_gobgp_rib_withdrawn` in
     /// origination tests that inject routes from the pathvectord side.
     pub gobgpd_id: String,
+    pub pathvectord_id: String,
     // Keep config files alive until the containers stop.
     _gobgpd_config: NamedTempFile,
     _pathvectord_config: NamedTempFile,
@@ -885,6 +929,23 @@ impl Harness {
     /// See the struct-level documentation.
     pub async fn new_v6() -> Self {
         Self::new_inner(write_daemon_config_v6).await
+    }
+
+    /// Same as [`Self::new`] but with `import_default = "accept"` and
+    /// `import_default_v6 = "reject"` on the peer.
+    ///
+    /// Use this harness to verify that the two per-AFI import defaults are
+    /// independent: IPv4 routes from GoBGP are accepted into the Loc-RIB while
+    /// IPv6 routes from the same peer are blocked at the import gate.
+    ///
+    /// `local_ipv6 = "2001:db8::2"` is included so the MP_REACH_NLRI next-hop
+    /// rewrite works for outbound IPv6 advertisements (if any).
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_v6_reject_policy() -> Self {
+        Self::new_inner(write_daemon_config_ipv4_accept_ipv6_reject).await
     }
 
     /// Same as [`Self::new`] but with **no** import or export policy on the peer.
@@ -978,10 +1039,13 @@ impl Harness {
             .await
             .expect("BGP session did not reach Established within 30 s");
 
+        let pathvectord_container_id = pathvectord.id().to_owned();
+
         Self {
             _gobgpd: gobgpd,
             _pathvectord: pathvectord,
             gobgpd_id: gobgpd_container_id,
+            pathvectord_id: pathvectord_container_id,
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,

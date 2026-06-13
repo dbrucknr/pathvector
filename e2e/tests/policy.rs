@@ -203,6 +203,42 @@ async fn soft_reconfig_import_accept_installs_route() {
         );
 }
 
+// ── Per-AFI import policy (import_default_v6) ─────────────────────────────────
+
+/// `import_default_v6 = "reject"` must block IPv6 routes while
+/// `import_default = "accept"` continues to admit IPv4 routes from the same peer.
+///
+/// This verifies that the two per-AFI defaults are evaluated independently —
+/// the IPv4 path cannot "bleed" its Accept decision into the IPv6 path.
+#[tokio::test]
+async fn import_default_v6_reject_blocks_ipv6_allows_ipv4() {
+    let h = Harness::new_v6_reject_policy().await;
+
+    // Announce an IPv4 prefix — must be accepted (import_default = "accept").
+    h.gobgp_announce("192.0.2.0/24", "10.0.0.1");
+    wait_for_route(&mut h.client.clone(), "192.0.2.0/24", Duration::from_secs(15))
+        .await
+        .expect("IPv4 route must be installed when import_default = accept");
+
+    // Announce an IPv6 prefix — must be rejected (import_default_v6 = "reject").
+    h.gobgp_announce_v6("2001:db8::/32", "::1");
+
+    // Give pathvectord time to process the UPDATE before asserting absence.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let v6_route = h
+        .client
+        .clone()
+        .get_best_route("2001:db8::/32")
+        .await
+        .expect("get_best_route RPC must succeed");
+
+    assert!(
+        v6_route.is_none(),
+        "IPv6 route must NOT be installed when import_default_v6 = reject"
+    );
+}
+
 /// Runtime export-policy reload: start with RFC 8212 reject default (import
 /// accept, export reject), confirm the route reaches Loc-RIB but is NOT
 /// forwarded to the sink, then call `SetExportDefault(Accept)` via gRPC and

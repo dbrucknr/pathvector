@@ -418,6 +418,7 @@ offer:
 ### Remaining
 
 - ~~MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering~~ **Done (2026-06-13).** `md5_password: Option<String>` TOML field → `SessionConfig` → `apply_tcp_md5sig` (Linux `setsockopt TCP_MD5SIG`) on the outbound `TcpSocket` before `connect()` and on the BGP listener socket after `bind()`. No-op with `warn!` on non-Linux (macOS dev). IPv6 peer MD5 deferred.
+- Documentation: add MD5 interop recipe to `LOCAL_INTEROP.md` and refresh `TESTING.md` with MD5 safety section, `pathvector-sys` proptest table, and full 41-test e2e scenario table — **Done (2026-06-13).**
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - ~~Connection collision detection~~ — **Done (2026-06-11).** `FsmInput::CollisionDetected` resets the FSM to Active without emitting `SessionTerminated` (no RIB churn). The transport layer compares `local_bgp_id` vs `peer_bgp_id` (from the stored peer OPEN) and either adopts the incoming stream or drops it. `pathvectord` spawns a `TcpListener` on `bgp_port` (default 179, configurable) and routes accepted connections to per-peer sessions via `SessionCommand::IncomingConnection`. Tests: `test_collision_detected_in_open_sent/open_confirm_resets_to_active`, `test_collision_local_wins_adopts_incoming`, `test_collision_peer_wins_keeps_outbound`.
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
@@ -523,6 +524,22 @@ Not yet started. Key work items:
   - Idempotent: `propagate_prefix` compares new route against what is already in `AdjRibOut` and sends UPDATE/WITHDRAW only when the advertised state actually changes
 
 ### Remaining
+
+- **Dynamic peer reconfiguration (runtime config)** — the daemon reads its
+  configuration once at startup; adding, removing, or modifying a peer requires
+  a full restart. Real operators need to add/remove peers, change import/export
+  policy, and adjust timers without a restart (and without a BGP session reset
+  to unaffected peers). This is the primary operational gap separating pathvector
+  from a production-grade replacement for GoBGP or BIRD. Approaches to consider:
+  - **gRPC-driven live config**: extend `DaemonService` with `AddPeer` / `RemovePeer`
+    / `UpdatePeer` RPCs; `DaemonState` grows a mutable peer table; new sessions are
+    spawned on-the-fly, existing sessions receive a `Stop` if the peer is removed.
+  - **Config-file watch + partial reload**: inotify/kqueue watcher re-reads
+    `pathvectord.toml` on change and diffs against running state; only affected
+    sessions are touched.
+  Either approach requires the session spawn path to be callable at runtime, not
+  just during `build_daemon`. The gRPC approach is simpler to implement correctly
+  first; config-file reload can wrap it.
 
 - **`on_terminated` missing RouteEvents** — when a peer session drops,
   `loc_rib.withdraw_peer` removes the peer's routes but no `RouteEvent`s are

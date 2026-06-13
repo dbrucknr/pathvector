@@ -285,6 +285,105 @@ just exchange          # terminal 4 (after both daemons are up)
 
 ---
 
+## TCP MD5 authentication (RFC 2385)
+
+TCP MD5 authentication adds an HMAC-MD5 signature to every TCP segment. Both sides
+of a BGP session must be configured with the same password. A mismatch causes the TCP
+handshake to silently fail — no NOTIFICATION is sent because the TCP SYN itself is
+rejected by the kernel before BGP can even start.
+
+> **Platform note.** TCP MD5SIG is enforced at the Linux kernel level. On macOS,
+> `pathvectord` configures the socket option (it is a no-op on macOS), so the session
+> still establishes — just without kernel-level authentication. Use a Linux host or
+> Docker containers to test actual enforcement.
+
+### GoBGP config (`gobgp-md5.toml`)
+
+GoBGP requires `auth-password` under `[neighbors.config]` (not `transport.config`):
+
+```toml
+[global.config]
+as        = 65001
+router-id = "1.0.0.1"
+port      = 1179
+
+[[neighbors]]
+[neighbors.config]
+    neighbor-address = "127.0.0.1"
+    peer-as          = 65002
+    auth-password    = "shared-bgp-secret"
+[neighbors.transport.config]
+    passive-mode = true
+```
+
+### pathvectord config (`config-md5.toml`)
+
+```toml
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+bgp_port  = 1180
+grpc_port = 50052
+
+[[peers]]
+address        = "127.0.0.1"
+port           = 1179
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"
+md5_password   = "shared-bgp-secret"
+```
+
+### Positive case — matching keys → session establishes
+
+```bash
+# Terminal 1
+gobgpd -f gobgp-md5.toml
+
+# Terminal 2
+cargo run -p pathvectord -- config-md5.toml
+
+# Terminal 3 — confirm Established
+cargo run -p pathvector -- --address http://127.0.0.1:50052 peer get 127.0.0.1
+```
+
+Expected output includes `state: Established`.
+
+### Negative case — mismatched keys → session never establishes (Linux only)
+
+Change the pathvectord config to use a different password:
+
+```toml
+md5_password = "wrong-key"
+```
+
+On **Linux** (native Docker or bare metal):
+
+```bash
+# The TCP SYN from pathvectord is dropped by the kernel because the MD5 signature
+# does not match GoBGP's expected signature. The session stays in Active/Connect.
+cargo run -p pathvector -- --address http://127.0.0.1:50052 peer get 127.0.0.1
+# Expected: state: Active (never reaches Established)
+```
+
+On **macOS** (Docker Desktop), the `setsockopt(TCP_MD5SIG)` call returns `ENOPROTOOPT`
+because Docker Desktop's embedded Linux kernel is built without `CONFIG_TCP_MD5SIG`.
+`pathvectord` treats this as non-fatal and continues; both sides proceed without
+kernel-level authentication, so the session still establishes despite the key mismatch.
+This is expected behaviour in the development environment.
+
+### Requirements
+
+- `CAP_NET_ADMIN` is required on Linux for `setsockopt(TCP_MD5SIG)`. When running as
+  a non-root user, the listener socket call may fail with `EACCES`. In production, run
+  pathvectord as root or grant `CAP_NET_ADMIN` via `setcap`.
+- IPv6 peer MD5 authentication is not yet implemented. Configuring `md5_password` on
+  a peer with an IPv6 address returns `Unsupported` and the session will not start.
+- GoBGP requires knowing the peer's IP before the SYN arrives — it must be configured
+  as a static neighbor (`neighbor-address`), not discovered dynamically.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -295,3 +394,5 @@ just exchange          # terminal 4 (after both daemons are up)
 | Peer stuck in Idle/Active after starting `just dev` | `just dev` was started before `just gobgp-up`; RFC 4271 ConnectRetry timer is 120 s | Wait up to 2 minutes — the session will come up automatically. Next time start `just gobgp-up` first |
 | GoBGP shows no routes from pathvectord | Export policy is rejecting | Check `import_default`/`export_default` in `config.toml` are both `"accept"` |
 | Dashboard shows no peers | Wrong gRPC address | Use `--address http://127.0.0.1:50052` |
+| MD5 session stuck in Active (Linux) | Key mismatch — kernel drops SYN | Confirm `auth-password` in GoBGP matches `md5_password` in pathvectord |
+| MD5 session establishes despite wrong key (macOS) | Docker Desktop kernel lacks `CONFIG_TCP_MD5SIG`; `ENOPROTOOPT` is treated as non-fatal | Expected on macOS — test enforcement on native Linux |
