@@ -219,10 +219,18 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "pathvector-sys",
  "pathvector-types",
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "pathvector-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
