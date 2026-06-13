@@ -76,6 +76,9 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     //   u8   __tcpm_pad2;                            //   1 byte
     //   u32  __tcpm_pad3;                            //   4 bytes
     //   u8   tcpm_key[TCP_MD5SIG_MAXKEYLEN];         //  80 bytes
+    // Field names mirror the Linux kernel struct verbatim (`tcpm_*`) so the
+    // layout comment above stays readable. Renaming would break the mapping.
+    #[allow(clippy::struct_field_names)]
     #[repr(C)]
     struct TcpMd5Sig {
         tcpm_addr: libc::sockaddr_storage,
@@ -100,6 +103,8 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     let mut sig: TcpMd5Sig = unsafe { mem::zeroed() };
 
     {
+        // AF_INET is 2 and always fits in sa_family_t (u16).
+        #[allow(clippy::cast_possible_truncation)]
         let sin = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
             // Port 0 in tcpm_addr means "match all connections to/from
@@ -122,11 +127,14 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
         }
     }
 
-    sig.tcpm_keylen = key_bytes.len() as u8;
+    // key_bytes.len() ≤ 80 (validated above), so the cast to u8 is safe.
+    sig.tcpm_keylen = u8::try_from(key_bytes.len()).expect("key length ≤ 80 fits in u8");
     sig.tcpm_key[..key_bytes.len()].copy_from_slice(key_bytes);
 
     // SAFETY: `fd` is a valid socket descriptor supplied by the caller;
     // `sig` is fully initialised above; the size matches the struct.
+    // TcpMd5Sig is 216 bytes — always fits in socklen_t (u32).
+    #[allow(clippy::cast_possible_truncation)]
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -149,7 +157,7 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     // the BGP session continue without kernel-level authentication.
     if matches!(
         err.raw_os_error(),
-        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+        Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP)
     ) {
         // No tracing subscriber available here (sys crate has none); the
         // session-layer and daemon callers log via their own tracing spans.
