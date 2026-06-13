@@ -9,7 +9,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 |---|---|---|---|---|
 | RFC 1997 | BGP Communities Attribute | pathvector-types, pathvector-policy | ✅ | [types](pathvector-types/RFC.md#rfc-1997--bgp-communities-attribute) · [policy](pathvector-policy/RFC.md#rfc-1997--bgp-communities-attribute-policy-layer) |
 | RFC 1930 | AS Number Guidelines (2-byte private range) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-1930--as-number-guidelines-private-range-2-byte) |
-| RFC 2385 | BGP TCP MD5 Protection | pathvector-session | ❌ | [session](pathvector-session/RFC.md#rfc-2385--protection-of-bgp-sessions-via-md5-deferred) |
+| RFC 2385 | BGP TCP MD5 Protection | pathvector-sys, pathvector-session, pathvectord | ✅ | — |
 | RFC 2918 | Route Refresh Capability | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-2918--route-refresh-capability-for-bgp-4) |
 | RFC 3107 | MPLS Label in BGP (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 4271 §4 | BGP Message Formats | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-4--message-formats) |
@@ -42,3 +42,10 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 8212 | Default eBGP Route Propagation | pathvectord | ✅ | [daemon](pathvectord/RFC.md#rfc-8212--default-external-bgp-route-propagation-without-policy) |
 | RFC 8654 | Extended Message Support | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-8654--extended-message-support-for-bgp) |
 | RFC 6396 | MRT Routing Information Export Format | pathvectord | ❌ | — |
+| RFC 6810 | RPKI-to-Router Protocol v0 (RTR) | pathvectord | ❌ | — |
+| RFC 6811 | BGP Prefix Origin Validation (ROV) | pathvectord, pathvector-policy | ❌ | — |
+| RFC 7313 | Enhanced Route Refresh Capability | pathvector-session | ❌ | — |
+| RFC 8210 | RPKI-to-Router Protocol v1 (RTR) | pathvectord | ❌ | — |
+| RFC 8538 | NOTIFICATION Support for BGP Graceful Restart | pathvector-session | ❌ | — |
+| RFC 9003 | Extended BGP Administrative Shutdown Communication | pathvector-session | ❌ | — |
+| RFC 9234 | BGP Route Leak Prevention Using Roles | pathvector-session, pathvectord | ❌ | — |

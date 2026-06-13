@@ -507,6 +507,12 @@ offer:
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - ~~Connection collision detection~~ — **Done (2026-06-11).** `FsmInput::CollisionDetected` resets the FSM to Active without emitting `SessionTerminated` (no RIB churn). The transport layer compares `local_bgp_id` vs `peer_bgp_id` (from the stored peer OPEN) and either adopts the incoming stream or drops it. `pathvectord` spawns a `TcpListener` on `bgp_port` (default 179, configurable) and routes accepted connections to per-peer sessions via `SessionCommand::IncomingConnection`. Tests: `test_collision_detected_in_open_sent/open_confirm_resets_to_active`, `test_collision_local_wins_adopts_incoming`, `test_collision_peer_wins_keeps_outbound`.
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
+- NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during the GR window without tearing down the restart; extends RFC 4724; depends on Graceful Restart FSM
+- Enhanced Route Refresh (RFC 7313) — adds `ORF_BEGIN` / `ORF_END` markers so the receiver knows when a full re-advertisement is complete; extends RFC 2918; currently codec-only
+- Extended admin shutdown communication (RFC 9003) — extends CEASE NOTIFICATION (RFC 4486) with a UTF-8 freetext reason string (max 128 bytes); small addition on top of existing CEASE infrastructure
+- BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
+- Per-peer hold timer and keepalive interval — currently held in `SessionConfig` at a fixed value; should be configurable per peer in `PeerConfig` with a global fallback in `[daemon]`
+- Outbound ROUTE-REFRESH trigger — send a `ROUTE-REFRESH` message to a peer to request their full table re-advertisement (protocol-level inbound soft reset); currently soft reset is API-driven only; requires RFC 2918 capability negotiation guard (already present)
 
 ### Hold timer expiry — active FSM enforcement — **Done**
 
@@ -681,6 +687,41 @@ Not yet started. Key work items:
   withdrawals or announcements via the multiprotocol attributes instead of the
   traditional fields are handled correctly. Non-IPv4 AFI/SAFIs are logged at DEBUG
   and skipped. Full IPv6 RIB support still requires the dual-stack work above.
+
+- **IPv6 BGP transport** — TCP sessions over IPv6 (bind listener on `[::]:179`,
+  dial peers at IPv6 addresses). Distinct from IPv6 NLRI (MP_REACH_NLRI over IPv4
+  sessions), which already works. Requires `IpAddr::V6` support throughout
+  `PeerConfig`, `DaemonState`, and the TCP listener. MD5 auth for IPv6 peers is
+  also currently `Unsupported` in `pathvector-sys` and would need a separate ABI
+  path (`sockaddr_in6` in the `TcpMd5Sig` struct).
+
+- **Dynamic neighbors** — accept BGP sessions from peers not explicitly configured,
+  filtered by a source prefix range (e.g. `dynamic_peer_prefix = "10.0.0.0/24"`).
+  Common at IXPs where the peer list changes without operator intervention. Requires
+  the TCP listener to look up the peer by source IP or fall back to a dynamic
+  neighbor template rather than failing with "unknown peer".
+
+- **Peer groups** — a named config template applied to multiple peers; changing one
+  field on the group propagates to all members without restarting unaffected sessions.
+  Maps cleanly to a `[[peer_groups]]` TOML table and a `peer_group: Option<String>`
+  field on `PeerConfig`.
+
+- **Next-hop self** — force `NEXT_HOP` to the local router's address on iBGP
+  re-advertisements. Essential when a route reflector sits between iBGP clients that
+  cannot reach the original eBGP next-hop directly. Configurable per peer:
+  `next_hop_self = true` in `PeerConfig`; applied in `prepare_outbound`.
+
+- **AS path regex in policy** — match routes by AS path pattern
+  (`^65001 ` for routes originated by AS 65001, `_65002_` for transit through AS 65002).
+  Requires a regex condition in `pathvector-policy`; the `regex` crate is the natural
+  choice. Most production policy engines expose this as a first-class condition.
+
+- **RPKI / Route Origin Validation (RFC 6811)** — connect to an RTR validator
+  (RFC 6810 / RFC 8210), receive ROA payloads, mark routes as Valid / Invalid /
+  NotFound, and optionally filter Invalid routes in the import policy. Significant
+  security feature; GoBGP, BIRD, and FRR all support it. Likely warrants a new
+  `pathvector-rpki` crate owning the RTR client and validity cache, with a policy
+  condition (`RoaValidityCondition`) consuming it.
 
 - gRPC management API — **Done (2026-06-09).** `PeerService`, `RibService`, and `PolicyService` are live. Proto schema at `proto/pathvector/v1/management.proto`. See [DAEMON.md](DAEMON.md) for the full operational guide and `grpcurl` examples; see [CLI.md](CLI.md) for the `pathvector` CLI reference.
 - gRPC server reflection — **Done (2026-06-08).** `tonic-reflection` registered at startup. `grpcurl` now works without `--proto` flags; `grpcurl -plaintext localhost:50051 list` discovers all services at runtime.
