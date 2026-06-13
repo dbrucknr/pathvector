@@ -757,9 +757,8 @@ impl Md5Harness {
             Some("/etc/pathvectord.toml"),
         );
 
-        let mut client =
-            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
-                .expect("connect PathvectorClient for Md5Harness");
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for Md5Harness");
 
         wait_for_established(
             &mut client,

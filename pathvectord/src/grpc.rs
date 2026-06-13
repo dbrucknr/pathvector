@@ -2918,10 +2918,10 @@ mod tests {
 
         let mut withdrawn: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Ok(ev) = route_rx.try_recv() {
-            if ev.r#type == proto::RouteEventType::Withdrawn as i32 {
-                if let Some(pfx) = ev.withdrawn_prefix {
-                    withdrawn.insert(pfx);
-                }
+            if ev.r#type == proto::RouteEventType::Withdrawn as i32
+                && let Some(pfx) = ev.withdrawn_prefix
+            {
+                withdrawn.insert(pfx);
             }
         }
         assert!(

@@ -14,7 +14,7 @@ use std::{net::IpAddr, time::Duration};
 
 use pathvector_client::{DaemonClient, types::SessionState};
 use pathvector_e2e::{
-    DockerNetwork, Md5Harness, GOBGPD_IMAGE, PATHVECTORD_IMAGE, alloc_grpc_port, alloc_test_id,
+    DockerNetwork, GOBGPD_IMAGE, Md5Harness, PATHVECTORD_IMAGE, alloc_grpc_port, alloc_test_id,
     docker_start, wait_container_healthy, wait_for_established, write_daemon_config_md5,
     write_gobgp_config,
 };
@@ -77,7 +77,7 @@ async fn md5_key_mismatch_session_never_establishes() {
         &format!("gobgpd-mismatch-{test_id}"),
         GOBGPD_IMAGE,
         &network_name,
-        None, // No fixed IP — GoBGP uses dynamic neighbors, pathvectord's IP unknown at start.
+        None,  // No fixed IP — GoBGP uses dynamic neighbors, pathvectord's IP unknown at start.
         false, // GoBGP does not set TCP_MD5SIG — no CAP_NET_ADMIN needed.
         &gobgpd_config_path,
         "/etc/gobgp/gobgpd.conf",
@@ -88,9 +88,8 @@ async fn md5_key_mismatch_session_never_establishes() {
 
     // Discover GoBGP's actual IP so pathvectord can dial it.
     let gobgpd_ip: std::net::Ipv4Addr = {
-        let fmt = format!(
-            r#"{{{{(index .NetworkSettings.Networks "{network_name}").IPAddress}}}}"#
-        );
+        let fmt =
+            format!(r#"{{{{(index .NetworkSettings.Networks "{network_name}").IPAddress}}}}"#);
         let out = std::process::Command::new("docker")
             .args(["inspect", &gobgpd.0, "--format", &fmt])
             .output()
@@ -127,8 +126,7 @@ async fn md5_key_mismatch_session_never_establishes() {
     // Allow 15 s — longer than a normal TCP retry but short enough for the
     // test suite to complete quickly.  If the session DOES establish, that is a
     // bug: MD5 enforcement failed.
-    let result =
-        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(15)).await;
+    let result = wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(15)).await;
 
     assert!(
         result.is_err(),

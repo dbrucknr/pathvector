@@ -1145,7 +1145,13 @@ where
         local_capabilities,
     )));
 
-    (state, event_rx, stop_senders, incoming_senders, md5_passwords)
+    (
+        state,
+        event_rx,
+        stop_senders,
+        incoming_senders,
+        md5_passwords,
+    )
 }
 
 /// BGP TCP listener for inbound connections (RFC 4271 §6.8).
@@ -1757,7 +1763,7 @@ mod tests {
             remote_as: 65002,
             import_default: None,
             import_default_v6: None,
-                md5_password: None,
+            md5_password: None,
             export_default: None,
         }];
         let state = DaemonState::new(
@@ -1842,7 +1848,7 @@ mod tests {
             port: 179,
             remote_as: 65002,
             import_default_v6: None,
-                md5_password: None,
+            md5_password: None,
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
         }];
@@ -4786,7 +4792,7 @@ mod stall_tests {
                 export_default: Some(config::ExportDefault::Accept),
             },
             config::PeerConfig {
-            import_default_v6: None,
+                import_default_v6: None,
                 md5_password: None,
                 address: peer_b,
                 port: 179,
@@ -5576,7 +5582,7 @@ mod run_with_tests {
                     import_default: None,
                     export_default: None,
                     import_default_v6: None,
-                md5_password: None,
+                    md5_password: None,
                 })
                 .collect(),
         }
@@ -5678,8 +5684,7 @@ mod run_with_tests {
         let mut cfg = make_config(&[(peer_ip, 65002)]);
         cfg.peers[0].md5_password = Some("s3cr3t".to_string());
 
-        let (_state, _rx, _stop, _incoming, md5_passwords) =
-            build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, _stop, _incoming, md5_passwords) = build_daemon(&cfg, spawn_fn).await;
 
         assert_eq!(
             md5_passwords.get(&IpAddr::V4(peer_ip)).map(String::as_str),
@@ -5695,8 +5700,7 @@ mod run_with_tests {
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_ip, 65002)]); // md5_password = None
 
-        let (_state, _rx, _stop, _incoming, md5_passwords) =
-            build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, _stop, _incoming, md5_passwords) = build_daemon(&cfg, spawn_fn).await;
 
         assert!(
             md5_passwords.is_empty(),
@@ -5716,8 +5720,7 @@ mod run_with_tests {
         cfg.peers[0].md5_password = Some("key-for-a".to_string());
         // peer_b has no password
 
-        let (_state, _rx, _stop, _incoming, md5_passwords) =
-            build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, _stop, _incoming, md5_passwords) = build_daemon(&cfg, spawn_fn).await;
 
         assert_eq!(
             md5_passwords.get(&IpAddr::V4(peer_a)).map(String::as_str),
@@ -5737,8 +5740,9 @@ mod run_with_tests {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
 
         // Capture the SessionConfig that build_daemon passes to spawn_fn.
-        let captured: std::sync::Arc<std::sync::Mutex<Option<pathvector_session::transport::SessionConfig>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured: std::sync::Arc<
+            std::sync::Mutex<Option<pathvector_session::transport::SessionConfig>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_clone = std::sync::Arc::clone(&captured);
 
         let (base_spawn, _peers) = make_mock_spawn();
@@ -5752,7 +5756,11 @@ mod run_with_tests {
 
         build_daemon(&config, spawn_fn).await;
 
-        let session_cfg = captured.lock().unwrap().take().expect("spawn_fn must be called");
+        let session_cfg = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spawn_fn must be called");
         assert_eq!(
             session_cfg.md5_password.as_deref(),
             Some("session-key"),

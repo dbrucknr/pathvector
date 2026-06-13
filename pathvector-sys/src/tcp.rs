@@ -165,7 +165,7 @@ mod tests {
 
     // ── Boundary / error-path unit tests ─────────────────────────────────────
 
-    /// Keys longer than TCP_MD5SIG_MAXKEYLEN (80 bytes) must be rejected before
+    /// Keys longer than `TCP_MD5SIG_MAXKEYLEN` (80 bytes) must be rejected before
     /// the syscall is attempted. fd = -1 ensures we never reach the kernel.
     #[test]
     fn test_key_too_long_returns_error() {
@@ -177,7 +177,7 @@ mod tests {
     }
 
     /// A key at exactly the 80-byte limit must pass the length guard. On Linux
-    /// the syscall will fail with EBADF (fd = -1) but not InvalidInput.
+    /// the syscall will fail with EBADF (fd = -1) but not `InvalidInput`.
     /// On non-Linux this returns Ok(()) immediately.
     #[test]
     fn test_key_at_exact_limit_passes_length_guard() {

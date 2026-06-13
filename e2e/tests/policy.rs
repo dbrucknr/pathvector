@@ -216,9 +216,13 @@ async fn import_default_v6_reject_blocks_ipv6_allows_ipv4() {
 
     // Announce an IPv4 prefix — must be accepted (import_default = "accept").
     h.gobgp_announce("192.0.2.0/24", "10.0.0.1");
-    wait_for_route(&mut h.client.clone(), "192.0.2.0/24", Duration::from_secs(15))
-        .await
-        .expect("IPv4 route must be installed when import_default = accept");
+    wait_for_route(
+        &mut h.client.clone(),
+        "192.0.2.0/24",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("IPv4 route must be installed when import_default = accept");
 
     // Announce an IPv6 prefix — must be rejected (import_default_v6 = "reject").
     h.gobgp_announce_v6("2001:db8::/32", "::1");
