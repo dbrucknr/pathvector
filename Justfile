@@ -88,6 +88,14 @@ fmt-check:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+# Build the mdBook user guide (output in book/)
+docs-build:
+    mdbook build
+
+# Serve the mdBook guide with live reload at http://localhost:3000
+docs-serve:
+    mdbook serve --open
+
 # ── End-to-end ────────────────────────────────────────────────────────────────
 
 # GoBGP version embedded in the gobgpd Docker image.
