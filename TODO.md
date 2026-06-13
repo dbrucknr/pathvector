@@ -417,7 +417,7 @@ offer:
 
 ### Remaining
 
-- MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering
+- ~~MD5 authentication (RFC 2385) — TCP-MD5 socket option for eBGP peering~~ **Done (2026-06-13).** `md5_password: Option<String>` TOML field → `SessionConfig` → `apply_tcp_md5sig` (Linux `setsockopt TCP_MD5SIG`) on the outbound `TcpSocket` before `connect()` and on the BGP listener socket after `bind()`. No-op with `warn!` on non-Linux (macOS dev). IPv6 peer MD5 deferred.
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - ~~Connection collision detection~~ — **Done (2026-06-11).** `FsmInput::CollisionDetected` resets the FSM to Active without emitting `SessionTerminated` (no RIB churn). The transport layer compares `local_bgp_id` vs `peer_bgp_id` (from the stored peer OPEN) and either adopts the incoming stream or drops it. `pathvectord` spawns a `TcpListener` on `bgp_port` (default 179, configurable) and routes accepted connections to per-peer sessions via `SessionCommand::IncomingConnection`. Tests: `test_collision_detected_in_open_sent/open_confirm_resets_to_active`, `test_collision_local_wins_adopts_incoming`, `test_collision_peer_wins_keeps_outbound`.
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)

@@ -220,13 +220,16 @@ EOR) requires coordination with `pathvector-rib` and is deferred.
 
 ---
 
-## RFC 2385 — Protection of BGP Sessions via MD5 (Deferred)
+## RFC 2385 — Protection of BGP Sessions via MD5
 
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc2385
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| TCP MD5 socket option set on listener and outbound sockets when configured | — | ❌ | — |
+| `TCP_MD5SIG` socket option on outbound socket before `connect()` | `transport/mod.rs` `tcp_connect` | ✅ | — |
+| `TCP_MD5SIG` socket option on BGP listener socket per configured peer | `daemon.rs` `run_bgp_listener` | ✅ | — |
+| `md5_password` TOML field wired into `SessionConfig` and propagated | `config.rs`, `daemon.rs` | ✅ | `test_md5_password_explicit` |
 
-**Deferred:** Requires OS-level socket option (`TCP_MD5SIG`). Platform support and key
-management are deferred.
+**Platform note:** Linux only. `apply_tcp_md5sig` is a no-op with a `warn!` log on
+non-Linux platforms (macOS dev environment). Key rotation and per-AFI MD5 for IPv6
+peers are not yet supported.

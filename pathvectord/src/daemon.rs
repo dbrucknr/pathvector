@@ -1030,7 +1030,8 @@ where
 {
     let grpc_port = cfg.daemon.grpc_port;
     let bgp_port = cfg.daemon.bgp_port;
-    let (state, event_rx, stop_senders, incoming_senders) = build_daemon(&cfg, spawn_fn).await;
+    let (state, event_rx, stop_senders, incoming_senders, md5_passwords) =
+        build_daemon(&cfg, spawn_fn).await;
 
     // Spawn the gRPC management API server alongside the BGP event loop.
     let grpc_state = Arc::clone(&state);
@@ -1040,7 +1041,7 @@ where
 
     // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
     tokio::spawn(async move {
-        run_bgp_listener(bgp_port, incoming_senders).await;
+        run_bgp_listener(bgp_port, incoming_senders, md5_passwords).await;
     });
 
     run_event_loop(event_rx, state, stop_senders).await;
@@ -1069,6 +1070,7 @@ pub(crate) async fn build_daemon<H, F>(
     mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
     HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
     HashMap<IpAddr, mpsc::Sender<SessionCommand>>,
+    HashMap<IpAddr, String>, // RFC 2385 MD5 passwords keyed by peer IP
 )
 where
     H: SessionHandle,
@@ -1085,6 +1087,9 @@ where
     let mut stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
     // Incoming senders: keyed by IpAddr for O(1) lookup in the BGP listener.
     let mut incoming_senders: HashMap<IpAddr, mpsc::Sender<SessionCommand>> = HashMap::new();
+    // RFC 2385 MD5 passwords: passed to the listener so it can configure
+    // TCP_MD5SIG before any SYN arrives from an MD5-enabled peer.
+    let mut md5_passwords: HashMap<IpAddr, String> = HashMap::new();
 
     let local_capabilities = vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
@@ -1102,6 +1107,7 @@ where
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
+            md5_password: peer.md5_password.clone(),
         };
 
         let mut handle = spawn_fn(session_cfg);
@@ -1110,6 +1116,9 @@ where
         update_senders.insert(peer.address, handle.update_sender());
         stop_senders.insert(peer.address, handle.stop_sender());
         incoming_senders.insert(IpAddr::V4(peer.address), handle.incoming_sender());
+        if let Some(pw) = &peer.md5_password {
+            md5_passwords.insert(IpAddr::V4(peer.address), pw.clone());
+        }
 
         let peer_addr = peer.address;
         let tx = event_tx.clone();
@@ -1133,7 +1142,7 @@ where
         local_capabilities,
     )));
 
-    (state, event_rx, stop_senders, incoming_senders)
+    (state, event_rx, stop_senders, incoming_senders, md5_passwords)
 }
 
 /// BGP TCP listener for inbound connections (RFC 4271 §6.8).
@@ -1149,6 +1158,7 @@ where
 async fn run_bgp_listener(
     bgp_port: u16,
     incoming_senders: HashMap<IpAddr, mpsc::Sender<SessionCommand>>,
+    md5_passwords: HashMap<IpAddr, String>,
 ) {
     let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], bgp_port));
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -1161,6 +1171,25 @@ async fn run_bgp_listener(
             return;
         }
     };
+
+    // RFC 2385: install TCP MD5 keys on the listener socket before any SYN
+    // arrives. If a peer sends a SYN with MD5 and the listener has no key for
+    // that peer, the kernel silently drops the SYN.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        for (peer_ip, key) in &md5_passwords {
+            if let Err(e) =
+                pathvector_session::transport::apply_tcp_md5sig(listener.as_raw_fd(), *peer_ip, key)
+            {
+                tracing::error!(peer = %peer_ip, error = %e, "failed to set TCP MD5SIG on BGP listener");
+            } else {
+                tracing::info!(peer = %peer_ip, "TCP MD5SIG installed on BGP listener");
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = &md5_passwords;
 
     loop {
         match listener.accept().await {
@@ -5458,7 +5487,7 @@ mod run_with_tests {
         let peer_b = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
-        let (_state, _rx, stop_senders, _) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
         assert!(stop_senders.contains_key(&peer_a));
         assert!(stop_senders.contains_key(&peer_b));
     }
@@ -5470,7 +5499,7 @@ mod run_with_tests {
         let peer_a = Ipv4Addr::new(10, 0, 0, 1);
         let (spawn_fn, peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_a, 65002)]);
-        let (_state, mut event_rx, _stop, _) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, mut event_rx, _stop, _, _) = build_daemon(&cfg, spawn_fn).await;
 
         let event_tx = peers.lock().unwrap()[0].event_tx.clone();
         event_tx.send(SessionEvent::Terminated).await.unwrap();
@@ -5488,7 +5517,7 @@ mod run_with_tests {
         let peer_b = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
-        let (state, _rx, _stop, _) = build_daemon(&cfg, spawn_fn).await;
+        let (state, _rx, _stop, _, _) = build_daemon(&cfg, spawn_fn).await;
         let s = state.read().await;
         assert!(s.update_senders.contains_key(&peer_a));
         assert!(s.update_senders.contains_key(&peer_b));
@@ -5500,7 +5529,7 @@ mod run_with_tests {
     async fn build_daemon_no_peers_closes_event_channel() {
         let (spawn_fn, peers) = make_mock_spawn();
         let cfg = make_config(&[]);
-        let (_state, mut event_rx, _stop, _) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, mut event_rx, _stop, _, _) = build_daemon(&cfg, spawn_fn).await;
         assert_eq!(peers.lock().unwrap().len(), 0);
         // No senders remain; recv() returns None immediately.
         assert!(event_rx.recv().await.is_none());

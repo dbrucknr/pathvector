@@ -133,6 +133,11 @@ pub struct SessionConfig {
     pub peer_as: Option<u32>,
     /// Address (IP + port) of the remote BGP peer.
     pub peer_addr: SocketAddr,
+    /// RFC 2385 TCP MD5 authentication key for this peer. When set, the kernel
+    /// signs every TCP segment with HMAC-MD5 keyed by this value. The peer must
+    /// be configured with the same key or the session will not establish. Max 80
+    /// bytes (Linux kernel limit). `None` disables MD5 authentication.
+    pub md5_password: Option<String>,
 }
 
 /// Commands sent to a running session via [`SessionHandle`].
@@ -215,6 +220,116 @@ impl SessionHandle for SpawnedSessionHandle {
 
     fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
         self.cmd_tx.clone()
+    }
+}
+
+// ── TCP MD5SIG helpers (RFC 2385) ─────────────────────────────────────────────
+
+/// Set the `TCP_MD5SIG` socket option on `fd` for the given peer address.
+///
+/// This configures the Linux kernel to add (outbound) or verify (inbound) an
+/// HMAC-MD5 signature on every TCP segment exchanged with `peer_ip`. Both the
+/// listener socket and the outbound socket must have the key set for a session
+/// to establish.
+///
+/// No-op on non-Linux platforms with a warning; callers should still compile
+/// and run on macOS for development, just without MD5 enforcement.
+///
+/// # Errors
+///
+/// Returns `io::Error` if `setsockopt` fails (e.g., key too long, permission
+/// denied, or unsupported kernel).
+pub fn apply_tcp_md5sig(
+    fd: std::os::unix::io::RawFd,
+    peer_ip: std::net::IpAddr,
+    key: &str,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        #[allow(unsafe_code)]
+        return apply_tcp_md5sig_linux(fd, peer_ip, key);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, peer_ip, key);
+        tracing::warn!("TCP MD5SIG is only supported on Linux; MD5 will not be enforced");
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn apply_tcp_md5sig_linux(
+    fd: std::os::unix::io::RawFd,
+    peer_ip: std::net::IpAddr,
+    key: &str,
+) -> io::Result<()> {
+    use std::mem;
+    use std::net::IpAddr;
+
+    let key_bytes = key.as_bytes();
+    if key_bytes.len() > libc::TCP_MD5SIG_MAXKEYLEN as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "TCP MD5 key too long: {} bytes (max {})",
+                key_bytes.len(),
+                libc::TCP_MD5SIG_MAXKEYLEN
+            ),
+        ));
+    }
+
+    // SAFETY: zeroed tcp_md5sig is a valid initial state; all fields are
+    // plain integers or fixed-size byte arrays with no validity invariants.
+    let mut sig: libc::tcp_md5sig = unsafe { mem::zeroed() };
+
+    match peer_ip {
+        IpAddr::V4(v4) => {
+            // SAFETY: sockaddr_storage is a C union; we fill only the
+            // sockaddr_in-sized prefix. The remaining bytes stay zeroed.
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0, // port 0 = match all connections from/to this IP
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(v4).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    std::ptr::addr_of!(sin).cast::<u8>(),
+                    std::ptr::addr_of_mut!(sig.tcpm_addr).cast::<u8>(),
+                    mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+        }
+        IpAddr::V6(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TCP MD5SIG for IPv6 peers is not yet supported",
+            ));
+        }
+    }
+
+    sig.tcpm_keylen = key_bytes.len() as u16;
+    sig.tcpm_key[..key_bytes.len()].copy_from_slice(key_bytes);
+
+    // SAFETY: fd is a valid socket fd supplied by the caller; sig is fully
+    // initialised above; size matches the structure.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MD5SIG,
+            std::ptr::addr_of!(sig).cast::<libc::c_void>(),
+            mem::size_of::<libc::tcp_md5sig>() as libc::socklen_t,
+        )
+    };
+
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -529,8 +644,10 @@ impl<T: BgpTransport> Session<T> {
                         self.pending_input = Some(FsmInput::TcpConnected);
                     } else if self.connect_factory.is_some() {
                         let addr = self.config.peer_addr;
-                        self.connect_task =
-                            Some(tokio::spawn(async move { TcpStream::connect(addr).await }));
+                        let password = self.config.md5_password.clone();
+                        self.connect_task = Some(tokio::spawn(async move {
+                            tcp_connect(addr, password.as_deref()).await
+                        }));
                     } else {
                         // Injected-transport mode with no transport remaining — signal
                         // failure so the FSM can back off rather than hanging forever.
@@ -664,6 +781,37 @@ fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
 #[cfg(test)]
 pub(crate) fn make_treat_as_withdraw_test(update: UpdateMessage) -> UpdateMessage {
     make_treat_as_withdraw(update)
+}
+
+// ── TCP connect helper ────────────────────────────────────────────────────────
+
+/// Connect to `addr`, optionally setting `TCP_MD5SIG` before the handshake.
+///
+/// When `password` is `None` this is equivalent to `TcpStream::connect(addr)`.
+/// When `password` is `Some(key)`, a raw socket is created first, the MD5 key
+/// is installed via [`apply_tcp_md5sig`], and then the socket is connected.
+async fn tcp_connect(addr: SocketAddr, password: Option<&str>) -> io::Result<TcpStream> {
+    let Some(key) = password else {
+        return TcpStream::connect(addr).await;
+    };
+
+    use std::os::unix::io::AsRawFd;
+    use tokio::net::TcpSocket;
+
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+
+    apply_tcp_md5sig(socket.as_raw_fd(), addr.ip(), key).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("TCP MD5SIG setup failed for {}: {e}", addr.ip()),
+        )
+    })?;
+
+    socket.connect(addr).await
 }
 
 // ── Free async helpers ────────────────────────────────────────────────────────

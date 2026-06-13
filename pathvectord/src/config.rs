@@ -152,6 +152,20 @@ pub struct PeerConfig {
     /// iBGP peers default to `"accept"`. Set explicitly to override.
     #[serde(default)]
     pub export_default: Option<ExportDefault>,
+    /// RFC 2385 TCP MD5 authentication key shared with this peer.
+    ///
+    /// When set, the kernel signs and verifies every TCP segment for this BGP
+    /// session using HMAC-MD5. The peer must be configured with the same key.
+    /// Maximum 80 bytes (Linux kernel limit). Omit to disable MD5 (default).
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address      = "198.51.100.1"
+    /// remote_as    = 64496
+    /// md5_password = "secret"
+    /// ```
+    #[serde(default)]
+    pub md5_password: Option<String>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -347,6 +361,37 @@ export_default = "accept"
             cfg.peers[0].export_default,
             Some(ExportDefault::Accept)
         ));
+    }
+
+    #[test]
+    fn test_md5_password_omitted_is_none() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.peers[0].md5_password.is_none());
+    }
+
+    #[test]
+    fn test_md5_password_explicit() {
+        let toml = r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+md5_password = "s3cr3t"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.peers[0].md5_password.as_deref(), Some("s3cr3t"));
     }
 
     #[test]
