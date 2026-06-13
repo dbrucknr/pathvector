@@ -532,7 +532,7 @@ pub fn write_gobgp_config_md5(pathvectord_ip: &str, key: &str) -> NamedTempFile 
 
 /// Writes a pathvectord config with TCP MD5 authentication on every peer.
 ///
-/// Identical to [`write_daemon_config`] but adds `md5_password = "<key>"`
+/// Identical to `write_daemon_config` but adds `md5_password = "<key>"`
 /// to each peer stanza so pathvectord's outbound socket is keyed before
 /// `connect()`.
 ///

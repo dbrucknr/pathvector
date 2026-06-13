@@ -148,7 +148,7 @@ pub struct PeerConfig {
     pub import_default: Option<ImportDefault>,
     /// Default action when no import policy term matches for IPv6 routes.
     ///
-    /// When omitted, falls back to [`import_default`]. This lets operators
+    /// When omitted, falls back to `import_default`. This lets operators
     /// accept IPv4 routes while still applying RFC 8212 reject semantics to
     /// IPv6, or vice-versa.
     ///
