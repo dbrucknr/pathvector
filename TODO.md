@@ -111,17 +111,56 @@ Tests: `test_unexpected_message_in_open_sent_sends_fsm_error_subcode_1`,
 
 ### Tier 3 — Larger scope, important but not blocking
 
-**7. BIRD interoperability**
-BIRD is stricter than GoBGP about RFC compliance. Running the existing e2e suite
-against BIRD would surface any GoBGP-specific leniency the implementation
-currently relies on. Mostly infrastructure work (Dockerfile.bird, bird.conf).
+**7. BIRD 2 interoperability**
+BIRD is the most widely deployed open-source BGP implementation (IXPs, hosting
+providers, research networks) and is stricter than GoBGP about RFC compliance.
+Running the existing e2e suite against BIRD would surface any GoBGP-specific
+leniency the implementation currently relies on.
 
-**8. Criterion benchmark suite**
+Infrastructure needed:
+- `e2e/Dockerfile.bird` — Alpine image with `bird2` package; tiny, fast boot
+- `e2e/bird.conf.tmpl` — per-test config template (router id, AS, neighbor, filter)
+- `BirdHarness` in `e2e/src/lib.rs` or a `peer: PeerKind` enum on the existing `Harness`
+- CLI wrapper: `birdc show route` / `birdc show protocols all` for route/state queries
+
+The `Harness` abstraction generalises cleanly — the same session/route/policy/auth
+test scenarios should pass against BIRD unchanged if the protocol implementation is
+correct. Any test that passes GoBGP but fails BIRD is a real bug worth fixing.
+
+Distinct value: BIRD enforces UPDATE attribute ordering and rejects malformed
+attributes that GoBGP silently accepts. Most likely surface for hidden bugs.
+
+**8. FRR (FRRouting) interoperability**
+FRR is what Cloudflare, Facebook, and most modern network hardware runs for BGP.
+The official `frrouting/frr` Docker image is freely available. More complex than
+BIRD (needs `zebra` + `bgpd` daemons inside the container) but the most
+production-realistic peer available without licensing.
+
+Infrastructure needed:
+- `e2e/Dockerfile.frr` or use `frrouting/frr` image directly with a mounted config
+- `frr.conf` / `daemons` file template (enable `bgpd=yes`, disable others)
+- CLI wrapper: `vtysh -c "show bgp summary"` / `vtysh -c "show bgp ipv4 unicast"`
+
+Distinct value: FRR has the most complete RFC 7606 error-handling of any open-source
+implementation — it would immediately expose the current "any decode error resets
+the session" gap. Also exercises large-community handling and NEXT_HOP validation
+edge cases that GoBGP is lenient about.
+
+**9. Arista cEOS (commercial, later)**
+cEOS is Arista's containerized EOS, freely available with registration from the
+Arista portal. Runs as a proper OCI container. Most accessible commercial router OS
+for interop testing — no VM required.
+
+Add once BIRD and FRR are solid. Requires an Arista account; cannot be pulled
+anonymously in public CI. Gate behind a `CI_ARISTA_IMAGE` env var so it runs only
+when the image is available.
+
+**10. Criterion benchmark suite**
 Per-crate benchmarks with the three-size pattern (small/medium/large).
 Establishes the baseline before performance optimisations. Described in detail
 under Cross-cutting → Performance below.
 
-**9. Adversarial input / NOTIFICATION path testing**
+**11. Adversarial input / NOTIFICATION path testing**
 RFC 7606 (item 3) is the prerequisite — once the error handling architecture
 exists, injecting malformed UPDATEs and NOTIFICATIONs over real TCP becomes
 the natural way to verify it. Before RFC 7606 there is less to test.
@@ -174,7 +213,7 @@ integration rather than direct unit tests.
   policy enforcement, origination, withdrawal, and multi-peer topologies.
 - Tests use the full stack: `pathvectord` binary inside a container, GoBGP as the peer,
   `PathvectorClient` gRPC API for assertions.
-- _Gap_: BIRD interoperability (stricter RFC compliance than GoBGP). See Tier 3, item 7.
+- _Gap_: BIRD and FRR interoperability (stricter RFC compliance than GoBGP). See Tier 3, items 7 and 8.
 
 **Dependency inversion progress**
 
