@@ -65,16 +65,19 @@ install-hooks:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run clippy inside a Linux container — catches #[cfg(target_os = "linux")] warnings
-# invisible on macOS. Requires Docker. Use this before pushing if you touched any
-# Linux-gated code (pathvector-sys/src/tcp.rs, daemon.rs listener block, etc.).
+# Run clippy inside a Linux/amd64 container — matches CI exactly and catches
+# #[cfg(target_os = "linux")] warnings invisible on macOS. Requires Docker.
+# Use before pushing if you touched any Linux-gated code.
+# First run is slow (image pull + full compile); subsequent runs reuse the cache.
 lint-linux:
     docker run --rm \
+        --platform linux/amd64 \
         -v "{{justfile_directory()}}:/workspace" \
         -w /workspace \
         -e CARGO_HOME=/workspace/.cargo-linux-cache \
         rust:latest \
         sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null \
+            && rustup component add clippy --quiet \
             && cargo clippy --workspace --all-targets -- -D warnings"
 
 # Verify rustfmt formatting (does not modify files)
