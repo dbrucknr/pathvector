@@ -18,3 +18,4 @@ fuzz/coverage/
 
 # macOS
 .DS_Store
+.cargo-linux-cache/

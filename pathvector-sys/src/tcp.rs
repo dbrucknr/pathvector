@@ -211,7 +211,7 @@ mod tests {
 
     // ── Linux-only: real setsockopt call ─────────────────────────────────────
 
-    /// On Linux, calling apply_tcp_md5sig on a real TCP socket with a valid key
+    /// On Linux, calling `apply_tcp_md5sig` on a real TCP socket with a valid key
     /// must succeed. This is the only test that actually exercises the kernel
     /// path; all others stay on the safe side of the syscall boundary.
     ///
@@ -232,7 +232,7 @@ mod tests {
         );
     }
 
-    /// Calling apply_tcp_md5sig twice on the same socket with the same peer IP
+    /// Calling `apply_tcp_md5sig` twice on the same socket with the same peer IP
     /// (updating the key) must also succeed — the kernel replaces the entry.
     #[cfg(target_os = "linux")]
     #[test]
