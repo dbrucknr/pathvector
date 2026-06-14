@@ -1429,12 +1429,28 @@ impl TwoPeerHarness {
 /// BIRD 2 image built by `just e2e-images` from `e2e/Dockerfile.bird`.
 pub const BIRD_IMAGE: &str = "pathvector-bird-test";
 
-/// Fixed subnet for BIRD interop tests.
+/// Derives the per-test BIRD subnet and fixed IPs from `test_id`.
 ///
-/// Both IPs are known before either container starts — BIRD's config
-/// must name pathvectord's IP as the `neighbor` before BIRD launches.
-pub const BIRD_TEST_SUBNET: &str = "172.31.50.0/24";
-pub const BIRD_IP: &str = "172.31.50.10";
+/// Each test gets an isolated /24 in `172.31.{id}.0/24` so multiple
+/// BIRD tests can run concurrently without Docker rejecting duplicate
+/// subnets.  The low octet assignments (`.10` / `.20`) are arbitrary but
+/// must stay within the /24.
+pub fn bird_test_subnet(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.31.{third}.0/24")
+}
+
+pub fn bird_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.31.{third}.10")
+}
+
+pub fn bird_pathvectord_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.31.{third}.20")
+}
+
+/// Retained for any call-sites that still use the old constants.
 pub const BIRD_PATHVECTORD_IP: &str = "172.31.50.20";
 
 /// Writes the pathvectord config for the BIRD interop harness.
@@ -1485,7 +1501,7 @@ export_default = "accept"
 ///
 /// Panics if the temporary file cannot be created or written.
 #[must_use]
-pub fn write_bird_config(routes: &[&str]) -> NamedTempFile {
+pub fn write_bird_config(routes: &[&str], pathvectord_ip: &str) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp bird config");
     write!(
         f,
@@ -1501,7 +1517,7 @@ protocol device {{}}
 protocol bgp pathvectord {{
     description "pathvectord peer";
     local as 65001;
-    neighbor {BIRD_PATHVECTORD_IP} as 65002;
+    neighbor {pathvectord_ip} as 65002;
 
     # passive: wait for pathvectord to connect; do not dial out.
     # pathvectord is configured to dial BIRD's IP, so only one side initiates.
@@ -1642,6 +1658,10 @@ pub struct BirdHarness {
     pub bird_id: String,
     /// The BIRD container's IP on the shared network.
     pub bird_ip: Ipv4Addr,
+    /// The pathvectord container's IP on the shared network.
+    /// This is the eBGP session-local address and therefore the NEXT_HOP
+    /// pathvectord advertises to BIRD (RFC 4271 §5.1.3).
+    pub pathvectord_ip: Ipv4Addr,
     _network: DockerNetwork,
 }
 
@@ -1663,12 +1683,18 @@ impl BirdHarness {
         let grpc_host_port = alloc_grpc_port();
         let network_name = format!("pathvector-bird-test-{test_id}");
 
+        // Per-test IPs derived from test_id so concurrent tests get
+        // non-overlapping subnets (Docker rejects duplicate subnets).
+        let subnet = bird_test_subnet(test_id);
+        let bird_ip_str = bird_ip(test_id);
+        let pv_ip_str = bird_pathvectord_ip(test_id);
+
         let network =
-            DockerNetwork::create_with_subnet(network_name.clone(), BIRD_TEST_SUBNET);
+            DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
         // Write BIRD config — pathvectord's IP is known (fixed) before either
-        // container starts, so we can set `neighbor BIRD_PATHVECTORD_IP` now.
-        let bird_config = write_bird_config(routes);
+        // container starts, so we can set `neighbor <pv_ip>` now.
+        let bird_config = write_bird_config(routes, &pv_ip_str);
         let bird_config_path = bird_config.path().to_str().unwrap().to_owned();
 
         // Start BIRD with its fixed IP and the config mounted.
@@ -1676,7 +1702,7 @@ impl BirdHarness {
             &format!("bird-{test_id}"),
             BIRD_IMAGE,
             &network_name,
-            Some(BIRD_IP),
+            Some(&bird_ip_str),
             false,
             &bird_config_path,
             "/etc/bird/bird.conf",
@@ -1687,11 +1713,12 @@ impl BirdHarness {
         // Wait for BIRD's healthcheck (control socket live, `birdc show status` OK).
         wait_container_healthy(&bird.0, Duration::from_secs(30));
 
-        // Write pathvectord config referencing BIRD's fixed IP.
-        // Uses write_daemon_config_bird so bgp_id = BIRD_PATHVECTORD_IP,
-        // ensuring the eBGP NEXT_HOP is directly reachable from BIRD.
-        let pathvectord_config =
-            write_daemon_config_bird(&[(BIRD_IP.parse().unwrap(), 65001)]);
+        // Write pathvectord config referencing BIRD's per-test IP.
+        // bgp_id = pv_ip so the eBGP NEXT_HOP is directly reachable from BIRD.
+        let pathvectord_config = write_daemon_config_bird(&[(
+            bird_ip_str.parse().unwrap(),
+            65001,
+        )]);
         let pathvectord_config_path =
             pathvectord_config.path().to_str().unwrap().to_owned();
 
@@ -1700,7 +1727,7 @@ impl BirdHarness {
             &format!("pathvectord-bird-{test_id}"),
             PATHVECTORD_IMAGE,
             &network_name,
-            Some(BIRD_PATHVECTORD_IP),
+            Some(&pv_ip_str),
             false,
             &pathvectord_config_path,
             "/etc/pathvectord.toml",
@@ -1712,9 +1739,10 @@ impl BirdHarness {
             PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
                 .expect("PathvectorClient::connect for BirdHarness");
 
+        let bird_ip: Ipv4Addr = bird_ip_str.parse().unwrap();
         wait_for_established(
             &mut client,
-            BIRD_IP.parse().unwrap(),
+            bird_ip,
             Duration::from_secs(30),
         )
         .await
@@ -1728,7 +1756,8 @@ impl BirdHarness {
             _pathvectord_config: pathvectord_config,
             client,
             bird_id,
-            bird_ip: BIRD_IP.parse().unwrap(),
+            bird_ip,
+            pathvectord_ip: pv_ip_str.parse().unwrap(),
             _network: network,
         }
     }

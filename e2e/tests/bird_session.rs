@@ -12,7 +12,7 @@ use pathvector_client::{
     DaemonClient,
     types::{PeerType, SessionState},
 };
-use pathvector_e2e::{BirdHarness, BIRD_IP};
+use pathvector_e2e::BirdHarness;
 
 /// RFC 4271 §8 — FSM must reach Established with BIRD 2.
 ///
@@ -25,7 +25,7 @@ async fn bird_session_reaches_established() {
     let peer = h
         .client
         .clone()
-        .get_peer(BIRD_IP.parse().unwrap())
+        .get_peer(h.bird_ip.into())
         .await
         .unwrap();
 
@@ -43,7 +43,7 @@ async fn bird_peer_state_fields_correct() {
     let peer = h
         .client
         .clone()
-        .get_peer(BIRD_IP.parse().unwrap())
+        .get_peer(h.bird_ip.into())
         .await
         .unwrap();
 

@@ -437,6 +437,24 @@ enable (`maximum-paths` knob).
 - Split-horizon: client→client, client↔non-client reflect; non-client→non-client blocked
 - 6 new unit tests covering all split-horizon cases and attribute encoding
 
+**Known gaps (tracked for follow-up):**
+
+1. **ORIGINATOR_ID loop detection** — RFC 4456 §8 SHOULD: if received `ORIGINATOR_ID` equals
+   our own `bgp_id`, discard the UPDATE. Currently only `CLUSTER_LIST` loop detection is
+   implemented. Low priority (prevents mis-configured self-reflection).
+
+2. **CLUSTER_LIST loop detection scope** — The inbound loop check fires only for routes
+   from RR clients. Routes from non-client iBGP peers that carry a `CLUSTER_LIST` (i.e.,
+   already reflected by another RR) should also be loop-checked before entering our Loc-RIB.
+
+3. **eBGP routes not getting reflection attributes** — When an eBGP-learned route is
+   reflected to iBGP clients, it does not receive `ORIGINATOR_ID` / `CLUSTER_LIST`. RFC 4456
+   §8 requires these on all reflected routes, including those learned from eBGP peers.
+
+4. **IPv6 AdjRibOut not RR-aware** — `on_established` and `on_terminated` reset IPv6
+   `AdjRibOut` without calling `new_reflecting`. `propagate_to_all_peers_v6` has no
+   RR split-horizon logic. IPv6 reflection requires the same changes applied to IPv4.
+
 ### FIB integration (Netlink / kernel route installation)
 
 Routes are correctly selected by `select_best` and stored in `LocRib`, but never

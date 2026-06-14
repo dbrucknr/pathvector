@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use pathvector_client::types::{Origin, OriginateRouteParams};
 use pathvector_e2e::{
-    BIRD_PATHVECTORD_IP, BirdHarness, get_bird_next_hop, wait_for_bird_rib_entry, wait_for_route,
+    BirdHarness, get_bird_next_hop, wait_for_bird_rib_entry, wait_for_route,
 };
 
 /// A static route pre-announced by BIRD must appear in pathvectord's Loc-RIB.
@@ -104,7 +104,7 @@ async fn pathvectord_ebgp_next_hop_is_session_local_addr_not_router_id() {
     let next_hop = get_bird_next_hop(&h.bird_id, "203.0.114.0/24")
         .expect("BGP.next_hop not found in birdc show route all output");
 
-    let expected: std::net::Ipv4Addr = BIRD_PATHVECTORD_IP.parse().unwrap();
+    let expected = h.pathvectord_ip;
     assert_eq!(
         next_hop, expected,
         "eBGP NEXT_HOP must be the session local address ({expected}), not the router ID"
