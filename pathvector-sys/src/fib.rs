@@ -257,7 +257,7 @@ impl KernelFib {
 
     /// Returns a [`KernelOracle`] backed by this FIB's live snapshot.
     ///
-    /// Create all oracles before calling [`spawn`], since `spawn` consumes `self`.
+    /// Create all oracles before calling `spawn`, since `spawn` consumes `self`.
     #[must_use]
     pub fn oracle(&self) -> KernelOracle {
         KernelOracle {
@@ -333,7 +333,11 @@ impl FibWriter {
     pub fn new(table: u32, metric: u32) -> std::io::Result<Self> {
         let (conn, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(conn);
-        Ok(Self { handle, table, metric })
+        Ok(Self {
+            handle,
+            table,
+            metric,
+        })
     }
 
     /// Install (or replace) an IPv4 prefix route via `gateway`.
@@ -345,8 +349,15 @@ impl FibWriter {
         prefix_len: u8,
         gateway: Ipv4Addr,
     ) -> std::io::Result<()> {
-        linux::install_route_v4(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
-            .await
+        linux::install_route_v4(
+            &self.handle,
+            dst,
+            prefix_len,
+            gateway,
+            self.table,
+            self.metric,
+        )
+        .await
     }
 
     /// Remove an IPv4 prefix route from the kernel FIB.
@@ -361,8 +372,15 @@ impl FibWriter {
         prefix_len: u8,
         gateway: Ipv6Addr,
     ) -> std::io::Result<()> {
-        linux::install_route_v6(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
-            .await
+        linux::install_route_v6(
+            &self.handle,
+            dst,
+            prefix_len,
+            gateway,
+            self.table,
+            self.metric,
+        )
+        .await
     }
 
     /// Remove an IPv6 prefix route from the kernel FIB.
@@ -375,22 +393,52 @@ impl FibWriter {
 impl FibWriter {
     /// No-op on non-Linux platforms; accepts the same arguments so call sites
     /// need no `#[cfg]` gates.
+    ///
+    /// # Errors
+    ///
+    /// Never errors on non-Linux platforms.
     pub fn new(_table: u32, _metric: u32) -> std::io::Result<Self> {
         Ok(Self)
     }
 
-    pub async fn install_v4(&self, _dst: Ipv4Addr, _prefix_len: u8, _gateway: Ipv4Addr) -> std::io::Result<()> {
+    /// # Errors
+    ///
+    /// Never errors on non-Linux platforms.
+    #[allow(clippy::unused_async)]
+    pub async fn install_v4(
+        &self,
+        _dst: Ipv4Addr,
+        _prefix_len: u8,
+        _gateway: Ipv4Addr,
+    ) -> std::io::Result<()> {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Never errors on non-Linux platforms.
+    #[allow(clippy::unused_async)]
     pub async fn withdraw_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
         Ok(())
     }
 
-    pub async fn install_v6(&self, _dst: Ipv6Addr, _prefix_len: u8, _gateway: Ipv6Addr) -> std::io::Result<()> {
+    /// # Errors
+    ///
+    /// Never errors on non-Linux platforms.
+    #[allow(clippy::unused_async)]
+    pub async fn install_v6(
+        &self,
+        _dst: Ipv6Addr,
+        _prefix_len: u8,
+        _gateway: Ipv6Addr,
+    ) -> std::io::Result<()> {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Never errors on non-Linux platforms.
+    #[allow(clippy::unused_async)]
     pub async fn withdraw_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
         Ok(())
     }
@@ -409,13 +457,10 @@ mod linux {
     use futures::{StreamExt, TryStreamExt};
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_route::{
-        route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteType},
         AddressFamily, RouteNetlinkMessage,
+        route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteType},
     };
-    use rtnetlink::{
-        multicast::MulticastGroup,
-        IpVersion, RouteMessageBuilder,
-    };
+    use rtnetlink::{IpVersion, RouteMessageBuilder, multicast::MulticastGroup};
     use tokio::sync::watch;
 
     use super::{FibEntry4, FibEntry6, FibSnapshot};
@@ -469,11 +514,19 @@ mod linux {
         while let Some((msg, _addr)) = events.next().await {
             match msg.payload {
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
-                    apply_new(&mut snapshot.write().expect("FibSnapshot poisoned"), &route, table);
+                    apply_new(
+                        &mut snapshot.write().expect("FibSnapshot poisoned"),
+                        &route,
+                        table,
+                    );
                     let _ = change_tx.send(());
                 }
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route)) => {
-                    apply_del(&mut snapshot.write().expect("FibSnapshot poisoned"), &route, table);
+                    apply_del(
+                        &mut snapshot.write().expect("FibSnapshot poisoned"),
+                        &route,
+                        table,
+                    );
                     let _ = change_tx.send(());
                 }
                 _ => {}
@@ -534,7 +587,11 @@ mod linux {
 
         let metric = metric_of(msg);
 
-        Some(FibEntry4 { network, prefix_len, metric })
+        Some(FibEntry4 {
+            network,
+            prefix_len,
+            metric,
+        })
     }
 
     /// Parse an IPv6 unicast route.
@@ -562,7 +619,11 @@ mod linux {
 
         let metric = metric_of(msg);
 
-        Some(FibEntry6 { network, prefix_len, metric })
+        Some(FibEntry6 {
+            network,
+            prefix_len,
+            metric,
+        })
     }
 
     fn metric_of(msg: &RouteMessage) -> u32 {
@@ -830,24 +891,15 @@ mod tests {
             ("10.20.30.0".parse().unwrap(), 24, 50),
         ]);
         // Address in the /24 subnet → metric 50 (the more-specific route)
-        assert_eq!(
-            snap.igp_metric_v4("10.20.30.5".parse().unwrap()),
-            Some(50)
-        );
+        assert_eq!(snap.igp_metric_v4("10.20.30.5".parse().unwrap()), Some(50));
         // Address in /8 but outside /24 → metric 100
-        assert_eq!(
-            snap.igp_metric_v4("10.99.0.1".parse().unwrap()),
-            Some(100)
-        );
+        assert_eq!(snap.igp_metric_v4("10.99.0.1".parse().unwrap()), Some(100));
     }
 
     #[test]
     fn no_match_returns_none_metric() {
         let snap = snap_with_v4(&[("192.168.0.0".parse().unwrap(), 16, 10)]);
-        assert_eq!(
-            snap.igp_metric_v4("10.0.0.1".parse().unwrap()),
-            None
-        );
+        assert_eq!(snap.igp_metric_v4("10.0.0.1".parse().unwrap()), None);
     }
 
     #[test]
@@ -894,10 +946,7 @@ mod tests {
 
         // Oracle now sees the injected route
         assert!(oracle.is_v4_reachable("10.1.2.3".parse().unwrap()));
-        assert_eq!(
-            oracle.igp_metric_v4("10.1.2.3".parse().unwrap()),
-            Some(10)
-        );
+        assert_eq!(oracle.igp_metric_v4("10.1.2.3".parse().unwrap()), Some(10));
     }
 
     #[test]
