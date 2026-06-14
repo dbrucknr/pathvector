@@ -923,9 +923,7 @@ impl OriginationService for OriginationServiceImpl {
 /// returns (rather than panicking) if the server fails to bind or encounters a
 /// fatal transport error.
 pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u16) {
-    let addr: SocketAddr = format!("0.0.0.0:{port}")
-        .parse()
-        .expect("grpc bind address is always valid");
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!(%addr, "gRPC management API listening");
 
@@ -941,10 +939,16 @@ pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u1
     let origination_svc = OriginationServiceServer::new(OriginationServiceImpl {
         state: Arc::clone(&state),
     });
-    let reflection_svc = tonic_reflection::server::Builder::configure()
+    let reflection_svc = match tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build_v1()
-        .expect("file descriptor set is valid");
+    {
+        Ok(svc) => svc,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build gRPC reflection service");
+            return;
+        }
+    };
 
     if let Err(e) = tonic::transport::Server::builder()
         .add_service(peer_svc)

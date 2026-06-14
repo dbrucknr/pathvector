@@ -338,11 +338,7 @@ pub(crate) fn flush_updates_v6(
                 // MP_UNREACH_NLRI is the only attribute on the announce message;
                 // we group routes with identical scalar attributes (same attrs
                 // minus the NLRI list) and pack them together.
-                let mut attrs = route_v6_to_attributes(&route);
-                // Remove MpReachNlri (last attr) so it isn't part of the key.
-                let mp_reach = attrs
-                    .pop()
-                    .expect("route_v6_to_attributes always appends MpReachNlri last");
+                let (mut attrs, mp_reach) = route_v6_to_attributes(&route);
                 let key = encode_attributes(&attrs);
                 // Restore the MP_REACH_NLRI placeholder next-hop in the group leader.
                 if let Some((_, group_attrs, nlris)) =
@@ -357,7 +353,7 @@ pub(crate) fn flush_updates_v6(
                     }
                     nlris.push(route.nlri);
                 } else {
-                    attrs.push(mp_reach);
+                    attrs.push(PathAttribute::MpReachNlri(mp_reach));
                     announce_groups.push((key, attrs, vec![route.nlri]));
                 }
             }
@@ -435,7 +431,7 @@ pub(crate) fn send_mp_unreach_v6(
 ///
 /// The NLRI is carried in MP_REACH_NLRI (RFC 4760); the traditional
 /// `NEXT_HOP` attribute is not emitted for IPv6 routes.
-pub(crate) fn route_v6_to_attributes(route: &Route<Ipv6Addr>) -> Vec<PathAttribute> {
+pub(crate) fn route_v6_to_attributes(route: &Route<Ipv6Addr>) -> (Vec<PathAttribute>, MpReachNlri) {
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
         PathAttribute::AsPath(route.as_path.clone()),
@@ -465,14 +461,13 @@ pub(crate) fn route_v6_to_attributes(route: &Route<Ipv6Addr>) -> Vec<PathAttribu
     if let Some(agg) = route.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
-    // MP_REACH_NLRI is always last so it can be popped as a grouping key.
     let next_hop = route.next_hop.unwrap_or(NextHop::V6(Ipv6Addr::UNSPECIFIED));
-    attrs.push(PathAttribute::MpReachNlri(MpReachNlri {
+    let mp_reach = MpReachNlri {
         afi_safi: AfiSafi::IPV6_UNICAST,
         next_hop,
         prefixes: vec![Prefix::V6(route.nlri)],
-    }));
-    attrs
+    };
+    (attrs, mp_reach)
 }
 
 // ── flush_updates tests ───────────────────────────────────────────────────────
@@ -731,7 +726,7 @@ mod v6_tests {
             .med(Med::new(100))
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let attrs = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route);
         assert!(attrs.iter().any(|a| matches!(a, PathAttribute::Med(100))));
     }
 
@@ -742,7 +737,7 @@ mod v6_tests {
             .community(Community::from(0x0001_0001u32))
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let attrs = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route);
         assert!(
             attrs
                 .iter()
@@ -762,7 +757,7 @@ mod v6_tests {
             .large_community(lc)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let attrs = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route);
         assert!(
             attrs
                 .iter()
@@ -778,7 +773,7 @@ mod v6_tests {
             .extended_community(ec)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let attrs = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route);
         assert!(
             attrs
                 .iter()
@@ -793,7 +788,7 @@ mod v6_tests {
             .local_pref(LocalPref::new(200))
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let attrs = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route);
         assert!(
             attrs
                 .iter()
@@ -812,7 +807,7 @@ mod v6_tests {
             .aggregator(agg)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let attrs = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route);
         assert!(
             attrs
                 .iter()
