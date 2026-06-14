@@ -117,6 +117,26 @@ jobs:
           cache-from: type=gha,scope=pathvectord
           cache-to: type=gha,mode=max,scope=pathvectord
 
+      - name: Build BIRD image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/Dockerfile.bird
+          load: true
+          tags: pathvector-bird-test:latest
+          cache-from: type=gha,scope=bird
+          cache-to: type=gha,mode=max,scope=bird
+
+      - name: Build FRR image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/Dockerfile.frr
+          load: true
+          tags: pathvector-frr-test:latest
+          cache-from: type=gha,scope=frr
+          cache-to: type=gha,mode=max,scope=frr
+
       - name: Run e2e tests
         run: cargo test -p pathvector-e2e -- --test-threads=1
 

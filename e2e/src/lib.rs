@@ -22,8 +22,10 @@
 //!
 //! **Image names**
 //!
-//! `just e2e` builds two images before running the suite:
+//! `just e2e` builds four images before running the suite:
 //! - `pathvector-gobgpd-test:latest` — GoBGP from `e2e/Dockerfile`
+//! - `pathvector-bird-test:latest`   — BIRD from `e2e/Dockerfile.bird`
+//! - `pathvector-frr-test:latest`    — FRRRouting from `e2e/Dockerfile.frr`
 //! - `pathvector-e2e:latest`         — pathvectord from `e2e/Dockerfile.pathvectord`
 
 use std::{

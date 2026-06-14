@@ -6,6 +6,39 @@ use routemap::RouteMap;
 
 use crate::{best_path::select_best, peer::PeerId, route::Route};
 
+/// Describes how the best path for a prefix changed after a `LocRib` mutation.
+///
+/// Returned by [`LocRib::insert`], [`LocRib::withdraw`], and
+/// [`LocRib::withdraw_peer`] so callers can react without re-querying the RIB.
+///
+/// The common consumer is a `FibManager` that installs or removes kernel
+/// routes on best-path changes, and the outbound advertisement pipeline that
+/// sends UPDATE messages to peers.
+// `Announced` carries a full `Route<A>` so the FibManager can act on it
+// immediately without a second RIB lookup. `Route<A>` is large (~207 bytes),
+// but these values are consumed immediately at each call site — they are never
+// stored in a long-lived collection — so boxing would add allocation in the
+// common (Announced) case for no benefit.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BestPathChange<A: IpAddress> {
+    /// A new or replacement best path was selected for this prefix.
+    ///
+    /// The caller should install/update the route in the FIB and advertise
+    /// it to eligible peers.
+    Announced(Nlri<A>, Route<A>),
+    /// The best path was removed and no candidates remain for this prefix.
+    ///
+    /// The caller should withdraw the route from the FIB and send a BGP
+    /// WITHDRAW to all peers that were receiving it.
+    Withdrawn(Nlri<A>),
+    /// The best path is unchanged — the insert or withdraw touched a
+    /// non-winning candidate.
+    ///
+    /// No FIB update or BGP advertisement is required.
+    Unchanged,
+}
+
 /// The local routing table — best-path selected, post-import-policy.
 ///
 /// `LocRib` holds two parallel data structures per prefix:
@@ -99,10 +132,28 @@ impl<A: IpAddress> LocRib<A> {
     /// If this peer previously had a route for this prefix, it is replaced.
     /// Best-path selection runs after every insert, so `best()` always
     /// reflects the current winner.
-    pub fn insert(&mut self, peer: PeerId, route: Route<A>) {
+    ///
+    /// Returns a [`BestPathChange`] describing whether and how the best path
+    /// changed as a result of this insert.
+    pub fn insert(&mut self, peer: PeerId, route: Route<A>) -> BestPathChange<A> {
         let nlri = route.nlri;
+        let old = self
+            .best
+            .get(nlri.prefix())
+            .map(|(p, r)| (*p, r.clone()));
         self.candidates.entry(nlri).or_default().insert(peer, route);
         self.recompute_best(nlri);
+        match self.best.get(nlri.prefix()) {
+            None => BestPathChange::Unchanged,
+            Some((new_peer, new_route)) => match old {
+                Some((old_peer, ref old_route))
+                    if old_peer == *new_peer && old_route == new_route =>
+                {
+                    BestPathChange::Unchanged
+                }
+                _ => BestPathChange::Announced(nlri, new_route.clone()),
+            },
+        }
     }
 
     /// Removes a specific prefix from a peer's contribution and recomputes
@@ -110,16 +161,38 @@ impl<A: IpAddress> LocRib<A> {
     ///
     /// Called when a peer withdraws a specific route. If no candidates remain
     /// for the prefix, the prefix is removed from the `LocRib` entirely.
-    pub fn withdraw(&mut self, peer: &PeerId, nlri: &Nlri<A>) {
+    ///
+    /// Returns a [`BestPathChange`] describing whether and how the best path
+    /// changed as a result of this withdrawal.
+    pub fn withdraw(&mut self, peer: &PeerId, nlri: &Nlri<A>) -> BestPathChange<A> {
+        let old = self
+            .best
+            .get(nlri.prefix())
+            .map(|(p, r)| (*p, r.clone()));
         if let Some(peer_map) = self.candidates.get_mut(nlri) {
             peer_map.remove(peer);
             if peer_map.is_empty() {
                 self.candidates.remove(nlri);
                 self.best.remove(nlri.prefix());
+                if old.is_some() {
+                    return BestPathChange::Withdrawn(*nlri);
+                }
             } else {
                 self.recompute_best(*nlri);
+                return match self.best.get(nlri.prefix()) {
+                    None => BestPathChange::Withdrawn(*nlri),
+                    Some((new_peer, new_route)) => match old {
+                        Some((old_peer, ref old_route))
+                            if old_peer == *new_peer && old_route == new_route =>
+                        {
+                            BestPathChange::Unchanged
+                        }
+                        _ => BestPathChange::Announced(*nlri, new_route.clone()),
+                    },
+                };
             }
         }
+        BestPathChange::Unchanged
     }
 
     /// Removes all routes contributed by `peer` and recomputes best-path
@@ -127,7 +200,10 @@ impl<A: IpAddress> LocRib<A> {
     ///
     /// Called when a BGP session goes down. Any prefix for which this was the
     /// only candidate is removed from the `LocRib`.
-    pub fn withdraw_peer(&mut self, peer: &PeerId) {
+    ///
+    /// Returns one [`BestPathChange`] per prefix that had a candidate from
+    /// this peer. Prefixes unaffected by this peer are omitted.
+    pub fn withdraw_peer(&mut self, peer: &PeerId) -> Vec<BestPathChange<A>> {
         let affected: Vec<Nlri<A>> = self
             .candidates
             .iter()
@@ -135,9 +211,10 @@ impl<A: IpAddress> LocRib<A> {
             .map(|(n, _)| *n)
             .collect();
 
-        for nlri in affected {
-            self.withdraw(peer, &nlri);
-        }
+        affected
+            .into_iter()
+            .map(|nlri| self.withdraw(peer, &nlri))
+            .collect()
     }
 
     /// Returns the current best route for `nlri`, if any.
@@ -433,5 +510,105 @@ mod tests {
         let candidates = rib.candidates(&n).unwrap();
         assert_eq!(candidates.len(), 1); // still only one candidate for peer(1)
         assert_eq!(rib.best(&n).unwrap().local_pref, Some(LocalPref::new(200)));
+    }
+
+    // BestPathChange tests — verify the return-value contract that FibManager
+    // depends on for deciding when to install/remove kernel routes.
+
+    #[test]
+    fn test_insert_first_route_is_announced() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        let change = rib.insert(peer(1), route("10.0.0.0/8"));
+        assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
+    }
+
+    #[test]
+    fn test_insert_inferior_route_is_unchanged() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
+        // peer(2) loses best-path — best stays with peer(1)
+        let change = rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        assert_eq!(change, BestPathChange::Unchanged);
+    }
+
+    #[test]
+    fn test_insert_superior_route_is_announced() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100));
+        let n = nlri("10.0.0.0/8");
+        // peer(2) wins with higher LOCAL_PREF
+        let change = rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200));
+        assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
+    }
+
+    #[test]
+    fn test_withdraw_sole_candidate_is_withdrawn() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        rib.insert(peer(1), route("10.0.0.0/8"));
+        let change = rib.withdraw(&peer(1), &n);
+        assert_eq!(change, BestPathChange::Withdrawn(n));
+    }
+
+    #[test]
+    fn test_withdraw_losing_candidate_is_unchanged() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        // withdrawing the loser changes nothing
+        let change = rib.withdraw(&peer(2), &n);
+        assert_eq!(change, BestPathChange::Unchanged);
+    }
+
+    #[test]
+    fn test_withdraw_winning_candidate_announces_new_best() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        // withdrawing the winner promotes peer(2) → Announced
+        let change = rib.withdraw(&peer(1), &n);
+        assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
+    }
+
+    #[test]
+    fn test_withdraw_nonexistent_peer_is_unchanged() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        rib.insert(peer(1), route("10.0.0.0/8"));
+        let change = rib.withdraw(&peer(99), &n);
+        assert_eq!(change, BestPathChange::Unchanged);
+    }
+
+    #[test]
+    fn test_withdraw_nonexistent_prefix_is_unchanged() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let change = rib.withdraw(&peer(1), &nlri("10.0.0.0/8"));
+        assert_eq!(change, BestPathChange::Unchanged);
+    }
+
+    #[test]
+    fn test_withdraw_peer_returns_withdrawn_for_sole_owner() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(peer(1), route("10.0.0.0/8"));
+        rib.insert(peer(1), route("192.168.0.0/16"));
+        let changes = rib.withdraw_peer(&peer(1));
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .all(|c| matches!(c, BestPathChange::Withdrawn(_))));
+    }
+
+    #[test]
+    fn test_withdraw_peer_returns_announced_for_promoted_candidate() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        // removing peer(1) promotes peer(2)
+        let changes = rib.withdraw_peer(&peer(1));
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], BestPathChange::Announced(_, _)));
     }
 }
