@@ -128,21 +128,25 @@ address. BIRD rejected the routes; GoBGP silently accepted them. Fix: the TCP
 `local_addr()` is now threaded through `Session<T>` → `SessionInfo` → `on_established`
 → `RibSnapshot::local_addrs` and used as the NEXT_HOP in `prepare_outbound`.
 
-**8. FRR (FRRouting) interoperability**
-FRR is what Cloudflare, Facebook, and most modern network hardware runs for BGP.
-The official `frrouting/frr` Docker image is freely available. More complex than
-BIRD (needs `zebra` + `bgpd` daemons inside the container) but the most
-production-realistic peer available without licensing.
+**8. FRR (FRRouting) interoperability** ✅ Done (2026-06-14)
+FRR interoperability is fully implemented. 8 tests pass across `frr_session.rs` and
+`frr_routes.rs` (session, peer state, list_peers, route inbound, multiple routes,
+route outbound, NEXT_HOP §5.1.3, peer address attribution). FRR confirmed that
+pathvectord's NEXT_HOP rewrite is correct end-to-end with a second strict peer.
 
-Infrastructure needed:
-- `e2e/Dockerfile.frr` or use `frrouting/frr` image directly with a mounted config
-- `frr.conf` / `daemons` file template (enable `bgpd=yes`, disable others)
-- CLI wrapper: `vtysh -c "show bgp summary"` / `vtysh -c "show bgp ipv4 unicast"`
-
-Distinct value: FRR has the most complete RFC 7606 error-handling of any open-source
-implementation — it would immediately expose the current "any decode error resets
-the session" gap. Also exercises large-community handling and NEXT_HOP validation
-edge cases that GoBGP is lenient about.
+**FRR config gotchas (recorded for future test work):**
+- `no bgp network import-check`: FRR 8.x will not advertise `network` statements
+  unless the prefix is present in the kernel FIB. This flag bypasses that check,
+  which is required in a container where no kernel routes are installed.
+- `no bgp ebgp-requires-policy`: FRR 8.x enforces explicit import/export policy
+  on eBGP sessions by default (similar to RFC 8212). Must be disabled for simple
+  test configs that don't configure per-session policy.
+- `--privileged` Docker flag required: `bgpd` calls `cap_set_proc` for
+  `CAP_SYS_ADMIN` during startup for netlink access. `--cap-add=NET_ADMIN` alone
+  is insufficient on Docker Desktop (macOS); `--privileged` is needed.
+- `frrinit.sh start` exits immediately (starts daemons in background). The
+  container CMD must keep PID 1 alive (`|| sleep infinity`) to prevent Docker
+  from killing the daemons when the init script exits.
 
 **9. Arista cEOS (commercial, later)**
 cEOS is Arista's containerized EOS, freely available with registration from the
@@ -219,7 +223,7 @@ integration rather than direct unit tests.
   policy enforcement, origination, withdrawal, and multi-peer topologies.
 - Tests use the full stack: `pathvectord` binary inside a container, GoBGP as the peer,
   `PathvectorClient` gRPC API for assertions.
-- _Gap_: FRR interoperability (stricter RFC compliance than GoBGP). BIRD is done (Tier 3 item 7). See Tier 3 item 8 for FRR.
+- BIRD and FRR interoperability both done (2026-06-14). See Tier 3 items 7 and 8.
 
 **Dependency inversion progress**
 
