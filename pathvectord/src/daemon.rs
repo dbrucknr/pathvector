@@ -523,11 +523,14 @@ impl DaemonState {
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
         let fib_changes_v4 = self.rib_mut().loc_rib.withdraw_peer(&peer_id);
-        self.rib_mut().loc_rib_v6.withdraw_peer(&peer_id);
+        let fib_changes_v6 = self.rib_mut().loc_rib_v6.withdraw_peer(&peer_id);
 
         if let Some(fm) = &self.fib_manager {
             for change in fib_changes_v4 {
                 fm.apply_v4(change);
+            }
+            for change in fib_changes_v6 {
+                fm.apply_v6(change);
             }
         }
 
@@ -768,7 +771,7 @@ impl DaemonState {
         // Split mutable borrows across distinct struct fields explicitly so the
         // borrow checker can verify they don't alias.
         let rib = Arc::make_mut(&mut self.rib);
-        let fib_changes = handle_update(
+        let (fib_changes, fib_changes_v6) = handle_update(
             peer_id,
             msg,
             adj_rib_in,
@@ -783,6 +786,9 @@ impl DaemonState {
         if let Some(fm) = &self.fib_manager {
             for change in fib_changes {
                 fm.apply_v4(change);
+            }
+            for change in fib_changes_v6 {
+                fm.apply_v6(change);
             }
         }
 
@@ -1017,8 +1023,12 @@ impl DaemonState {
         for route in routes {
             let nlri = route.nlri;
             let rib = self.rib_mut();
-            rib.loc_rib_v6
+            let fib_change = rib
+                .loc_rib_v6
                 .insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
+            if let Some(fm) = &self.fib_manager {
+                fm.apply_v6(fib_change);
+            }
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Announced as i32,
@@ -1189,6 +1199,8 @@ where
 {
     let grpc_port = cfg.daemon.grpc_port;
     let bgp_port = cfg.daemon.bgp_port;
+    let fib_table = cfg.daemon.fib_table;
+    let fib_metric = cfg.daemon.fib_metric;
     let (state, event_rx, stop_senders, incoming_senders, md5_passwords) =
         build_daemon(&cfg, spawn_fn).await;
 
@@ -1199,11 +1211,11 @@ where
     // reachability queries.  FibWriter handles the write side (route install /
     // remove).  On non-Linux platforms both are no-ops.
     let kernel_fib = {
-        let (kfib, _change_rx) = pathvector_sys::KernelFib::new(pathvector_sys::RT_TABLE_MAIN);
+        let (kfib, _change_rx) = pathvector_sys::KernelFib::new(fib_table);
         kfib
     };
     let _daemon_oracle = fib::DaemonOracle(kernel_fib.oracle());
-    let fib_writer = match pathvector_sys::FibWriter::new(pathvector_sys::RT_TABLE_MAIN, 20) {
+    let fib_writer = match pathvector_sys::FibWriter::new(fib_table, fib_metric) {
         Ok(w) => {
             tokio::spawn(kernel_fib.spawn());
             Some(w)
@@ -1515,8 +1527,9 @@ fn handle_update(
     policy: &Policy<Route<Ipv4Addr>>,
     policy_v6: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
-) -> Vec<BestPathChange<Ipv4Addr>> {
+) -> (Vec<BestPathChange<Ipv4Addr>>, Vec<BestPathChange<Ipv6Addr>>) {
     let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
+    let mut fib_changes_v6: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
     let withdrawn_count = msg.withdrawn.len();
 
     // ── Traditional IPv4 withdrawals (RFC 4271 §4.3) ──────────────────────
@@ -1693,7 +1706,7 @@ fn handle_update(
     let mp_v6_withdrawn_count = mp_v6_withdrawn.len();
     for nlri in &mp_v6_withdrawn {
         adj_rib_in_v6.withdraw(nlri);
-        loc_rib_v6.withdraw(&peer, nlri);
+        fib_changes_v6.push(loc_rib_v6.withdraw(&peer, nlri));
     }
 
     // ── IPv6 announcements from MP_REACH_NLRI ─────────────────────────────
@@ -1740,7 +1753,7 @@ fn handle_update(
         let mut route = raw;
         match policy_v6.evaluate(&mut route) {
             Decision::Accept => {
-                loc_rib_v6.insert(peer, route);
+                fib_changes_v6.push(loc_rib_v6.insert(peer, route));
                 accepted_v6 += 1;
             }
             Decision::Reject | Decision::Next => {
@@ -1762,7 +1775,7 @@ fn handle_update(
         rib_v6_size = loc_rib_v6.len(),
         "processed UPDATE"
     );
-    fib_changes
+    (fib_changes, fib_changes_v6)
 }
 
 #[cfg(test)]
@@ -6159,6 +6172,8 @@ mod run_with_tests {
                 bgp_port: 0, // 0 = OS assigns; listener will fail to bind but tests don't need it
                 local_ipv6: None,
                 cluster_id: None,
+                fib_table: 254,
+                fib_metric: 20,
             },
             peers: peer_ips
                 .iter()

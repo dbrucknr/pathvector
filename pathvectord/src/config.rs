@@ -75,6 +75,40 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub cluster_id: Option<u32>,
+    /// Linux routing table into which BGP routes are installed (default: 254 = main).
+    ///
+    /// Set to a non-default value (e.g. 100) to keep BGP routes in a separate
+    /// table and use policy routing (`ip rule`) to select them.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as  = 65001
+    /// bgp_id    = "10.0.0.1"
+    /// fib_table = 100
+    /// ```
+    #[serde(default = "default_fib_table")]
+    pub fib_table: u32,
+    /// Metric assigned to installed BGP routes (default: 20).
+    ///
+    /// Lower values are preferred. Choose a value higher than connected and
+    /// static routes so BGP routes do not shadow them.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as   = 65001
+    /// bgp_id     = "10.0.0.1"
+    /// fib_metric = 200
+    /// ```
+    #[serde(default = "default_fib_metric")]
+    pub fib_metric: u32,
+}
+
+fn default_fib_table() -> u32 {
+    254
+}
+
+fn default_fib_metric() -> u32 {
+    20
 }
 
 fn default_hold_time() -> u16 {

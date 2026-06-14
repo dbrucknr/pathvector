@@ -459,28 +459,69 @@ enable (`maximum-paths` knob).
    `AdjRibOut` without calling `new_reflecting`. `propagate_to_all_peers_v6` has no
    RR split-horizon logic. IPv6 reflection requires the same changes applied to IPv4.
 
-### FIB integration (Netlink / kernel route installation)
+### FIB integration (Netlink / kernel route installation) — ⚠️ Partially done (2026-06-14)
 
-Routes are correctly selected by `select_best` and stored in `LocRib`, but never
-installed into the kernel's forwarding table. pathvectord cannot actually forward
-packets — it is a BGP process, not yet a BGP router.
+**Done:** `KernelFib` (passive FIB tracker), `KernelOracle`, `FibWriter`
+(`RTM_NEWROUTE` / `RTM_DELROUTE`), `DaemonOracle` (`NextHopOracle` impl),
+`FibManager` (async write queue). `BestPathChange<Ipv4Addr>` is dispatched from
+`on_route_update`, `set_import_default`, `on_terminated`, and
+`withdraw_originated_routes`. IPv4 routes are installed into the kernel FIB on
+best-path change.
 
-FIB integration requires:
-- A `FibManager` component that subscribes to `LocRib` best-route changes
-  (via `RouteEvents`) and translates them into Netlink `RTM_NEWROUTE` /
-  `RTM_DELROUTE` messages
-- `rtnetlink` crate (or raw Netlink sockets) for kernel interaction
-- A configurable route table number and protocol ID (to avoid stomping on static
-  or OSPF routes)
-- Route ownership tracking: when pathvectord exits cleanly, withdraw all installed
-  routes; on crash, the kernel automatically removes routes with the daemon's
-  protocol ID if `NLM_F_CREATE` was used with a protocol tag
+**Remaining gaps — ordered by impact:**
 
-This is the single most impactful gap between "BGP implementation" and "BGP router".
-It also unblocks best-path step 1 (next-hop reachability via IGP cost).
+**1. IPv6 FIB write path** (`pathvector-sys`, `pathvectord`) — `FibWriter` only has
+`install_v4` / `withdraw_v4`. `handle_update` and `withdraw_peer` for `loc_rib_v6`
+produce `BestPathChange<Ipv6Addr>` that is silently discarded. Fix: add
+`install_v6` / `withdraw_v6` to `FibWriter`, add `apply_v6` to `FibManager`,
+and collect/dispatch `BestPathChange<Ipv6Addr>` in `handle_update` and
+`on_terminated`.
 
-FIB integration is Linux-specific. macOS and other platforms would require a
-`#[cfg]`-gated stub that logs installed/withdrawn routes without touching the kernel.
+**2. `DaemonOracle` not wired into best-path selection** (`pathvector-rib`,
+`pathvectord`) — `LocRib::recompute_best` calls `select_best` (→ `AlwaysReachable`)
+rather than `select_best_with_oracle`. RFC 4271 §9.1 steps 1 and 8 remain dead
+code at runtime. Fix: add `oracle: &dyn NextHopOracle` to `LocRib` construction
+or to `recompute_best`; thread `DaemonOracle` in from `run_with`. This is the
+architecturally deepest gap.
+
+**3. No re-evaluation when FIB changes** (`pathvectord`) — The `KernelFib` watch
+channel (`change_rx`) is dropped immediately in `run_with`. When a next-hop
+becomes unreachable or recovers, best-path is never re-run. Fix: retain
+`change_rx` in the event loop; on each tick, re-run `recompute_best` for all
+prefixes whose next-hop changed (or do a full re-evaluate pass).
+
+**4. Stale routes on restart** (`pathvectord`) — If the daemon exits uncleanly,
+`RTPROT_BGP` routes remain in the kernel indefinitely. On clean restart they are
+overwritten (NLM_F_REPLACE), but stale prefixes not re-advertised by any peer
+remain. Fix: on startup, dump all routes with `RTPROT_BGP` in `RT_TABLE_MAIN`
+and delete any that are not in the current Loc-RIB after the first convergence
+cycle.
+
+**5. `RTM_DELROUTE` ESRCH not silenced** (`pathvectord`) — Removing a route that
+doesn't exist in the kernel returns errno `ESRCH` and logs a `WARN`. This fires
+on every clean shutdown (routes withdrawn from Loc-RIB before kernel is updated)
+and on daemon startup when a previous run already cleaned up. Fix: in
+`withdraw_route_v4` (and v6), treat `io::ErrorKind::Other` with underlying errno
+3 (`ESRCH`) as `Ok(())`.
+
+**6. `fib_table` and `fib_metric` not configurable** (`pathvectord`) — Hardcoded
+to 254 (main table) and metric 20. Fix: add optional `fib_table: u32` and
+`fib_metric: u32` to `DaemonConfig` with those defaults; pass through
+`build_daemon` → `run_with` → `FibWriter::new`.
+
+**7. `try_send` silently drops on channel full** (`pathvectord`) — `FibManager`
+uses `try_send` into a 4096-capacity channel. On full BGP table convergence
+(~900k prefixes), early installs may be dropped without any indication. Fix:
+track a `dropped_fib_updates` counter; log a periodic summary; or switch to a
+deduplicated map keyed by NLRI so only the latest state per prefix is queued.
+
+**Testing gaps:**
+
+- Unit tests for `FibManager::apply_v4`: verify correct `FibChange` variant
+  and fields for each `BestPathChange` input without running a background task.
+- E2e test: after session with GoBGP establishes and a prefix is learned,
+  assert `ip route show table 254` inside the container contains the prefix;
+  on teardown assert it is removed.
 
 ### Maximum prefix limits
 

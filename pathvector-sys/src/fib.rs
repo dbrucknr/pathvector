@@ -384,6 +384,48 @@ impl FibWriter {
             Ok(())
         }
     }
+
+    /// Install (or replace) an IPv6 prefix route via `gateway`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the netlink call fails (Linux only).
+    #[allow(clippy::unused_async)]
+    pub async fn install_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+        gateway: Ipv6Addr,
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::install_route_v6(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
+                .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dst, prefix_len, gateway);
+            Ok(())
+        }
+    }
+
+    /// Remove an IPv6 prefix route from the kernel FIB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the netlink call fails (Linux only).
+    #[allow(clippy::unused_async)]
+    pub async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::withdraw_route_v6(&self.handle, dst, prefix_len, self.table).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dst, prefix_len);
+            Ok(())
+        }
+    }
 }
 
 // ── Linux implementation ──────────────────────────────────────────────────────
@@ -668,7 +710,62 @@ mod linux {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
+    /// Install (or replace) an IPv6 route tagged RTPROT_BGP.
+    pub(super) async fn install_route_v6(
+        handle: &rtnetlink::Handle,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+        gateway: Ipv6Addr,
+        table: u32,
+        metric: u32,
+    ) -> io::Result<()> {
+        let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(dst, prefix_len)
+            .gateway(gateway)
+            .table_id(table)
+            .priority(metric)
+            .protocol(RouteProtocol::Bgp)
+            .build();
+        handle
+            .route()
+            .add(msg)
+            .replace()
+            .execute()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    /// Remove an IPv6 route from the kernel FIB.
+    ///
+    /// Returns `Ok(())` if the route was deleted or was already absent (ESRCH).
+    pub(super) async fn withdraw_route_v6(
+        handle: &rtnetlink::Handle,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+        table: u32,
+    ) -> io::Result<()> {
+        let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(dst, prefix_len)
+            .table_id(table)
+            .build();
+        match handle.route().del(msg).execute().await {
+            Ok(()) => Ok(()),
+            Err(rtnetlink::Error::NetlinkError(ref e))
+                if e.code.map_or(false, |c| c.get() == -3) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+    }
+
     /// Remove an IPv4 route from the kernel FIB.
+    ///
+    /// Returns `Ok(())` if the route was deleted **or was already absent**
+    /// (errno `ESRCH`/3). The kernel returns `ESRCH` when the route does not
+    /// exist, which is the expected outcome on a clean daemon shutdown (routes
+    /// are withdrawn from Loc-RIB before the kernel is updated) and on restart
+    /// when a previous run has already cleaned up.
     pub(super) async fn withdraw_route_v4(
         handle: &rtnetlink::Handle,
         dst: Ipv4Addr,
@@ -679,12 +776,16 @@ mod linux {
             .destination_prefix(dst, prefix_len)
             .table_id(table)
             .build();
-        handle
-            .route()
-            .del(msg)
-            .execute()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        match handle.route().del(msg).execute().await {
+            Ok(()) => Ok(()),
+            // ESRCH (3): route already absent — treat as success.
+            Err(rtnetlink::Error::NetlinkError(ref e))
+                if e.code.map_or(false, |c| c.get() == -3) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
     }
 }
 
