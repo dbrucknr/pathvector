@@ -1688,6 +1688,7 @@ dependencies = [
  "pathvector-policy",
  "pathvector-rib",
  "pathvector-session",
+ "pathvector-sys",
  "pathvector-types",
  "proptest",
  "prost",

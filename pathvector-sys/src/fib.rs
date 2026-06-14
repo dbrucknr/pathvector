@@ -303,6 +303,89 @@ impl KernelFib {
     }
 }
 
+// ── FibWriter ────────────────────────────────────────────────────────────────
+
+/// Writes BGP-learned routes into the kernel FIB via netlink.
+///
+/// On Linux, a `RTM_NEWROUTE` (with `NLM_F_REPLACE`) installs or replaces a
+/// route; `RTM_DELROUTE` removes it. All routes are tagged with
+/// `RTPROT_BGP` so they are distinguishable from static or IGP routes.
+///
+/// On non-Linux platforms all methods compile but are no-ops, preserving the
+/// API surface so `pathvectord` can use `FibWriter` unconditionally.
+pub struct FibWriter {
+    #[cfg(target_os = "linux")]
+    handle: rtnetlink::Handle,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    table: u32,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    metric: u32,
+}
+
+impl FibWriter {
+    /// Opens a netlink connection and returns a `FibWriter` for `table` / `metric`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the netlink socket cannot be created (Linux only).
+    pub fn new(table: u32, metric: u32) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let (conn, handle, _) = rtnetlink::new_connection()?;
+            tokio::spawn(conn);
+            Ok(Self { handle, table, metric })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self { table, metric })
+        }
+    }
+
+    /// Install (or replace) an IPv4 prefix route via `gateway`.
+    ///
+    /// Uses `NLM_F_REPLACE` so duplicate announcements from BGP are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the netlink call fails (Linux only).
+    #[allow(clippy::unused_async)]
+    pub async fn install_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+        gateway: Ipv4Addr,
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::install_route_v4(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
+                .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dst, prefix_len, gateway);
+            Ok(())
+        }
+    }
+
+    /// Remove an IPv4 prefix route from the kernel FIB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the netlink call fails (Linux only).
+    #[allow(clippy::unused_async)]
+    pub async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::withdraw_route_v4(&self.handle, dst, prefix_len, self.table).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dst, prefix_len);
+            Ok(())
+        }
+    }
+}
+
 // ── Linux implementation ──────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -316,12 +399,12 @@ mod linux {
     use futures::{StreamExt, TryStreamExt};
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_route::{
-        route::{RouteAddress, RouteAttribute, RouteMessage, RouteType},
+        route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteType},
         AddressFamily, RouteNetlinkMessage,
     };
     use rtnetlink::{
         multicast::MulticastGroup,
-        IpVersion,
+        IpVersion, RouteMessageBuilder,
     };
     use tokio::sync::watch;
 
@@ -558,6 +641,50 @@ mod linux {
             }
             _ => {}
         }
+    }
+
+    /// Install (or replace) an IPv4 route tagged RTPROT_BGP.
+    pub(super) async fn install_route_v4(
+        handle: &rtnetlink::Handle,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+        gateway: Ipv4Addr,
+        table: u32,
+        metric: u32,
+    ) -> io::Result<()> {
+        let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(dst, prefix_len)
+            .gateway(gateway)
+            .table_id(table)
+            .priority(metric)
+            .protocol(RouteProtocol::Bgp)
+            .build();
+        handle
+            .route()
+            .add(msg)
+            .replace()
+            .execute()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    /// Remove an IPv4 route from the kernel FIB.
+    pub(super) async fn withdraw_route_v4(
+        handle: &rtnetlink::Handle,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+        table: u32,
+    ) -> io::Result<()> {
+        let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(dst, prefix_len)
+            .table_id(table)
+            .build();
+        handle
+            .route()
+            .del(msg)
+            .execute()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 }
 

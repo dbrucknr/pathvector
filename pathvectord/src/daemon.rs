@@ -10,7 +10,7 @@ use std::{
 };
 
 use pathvector_policy::{Decision, DefaultAction, Policy};
-use pathvector_rib::{AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder};
+use pathvector_rib::{AdjRibIn, AdjRibOut, BestPathChange, LocRib, PeerId, Route, RouteBuilder};
 use pathvector_session::{
     message::{
         Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
@@ -25,7 +25,7 @@ use crate::outbound::{
     PrefixDecision, PrefixDecisionV6, flush_updates, flush_updates_v6, propagate_prefix,
     propagate_prefix_v6,
 };
-use crate::{config, grpc, proto};
+use crate::{config, fib, grpc, proto};
 
 /// Synthetic `PeerId` used as the source for locally originated routes.
 ///
@@ -165,6 +165,10 @@ pub(crate) struct DaemonState {
     ///
     /// `WatchPeers` gRPC handlers subscribe at call time.
     pub(crate) peer_tx: broadcast::Sender<proto::PeerEvent>,
+    /// FIB manager: installs / removes kernel routes on best-path changes.
+    ///
+    /// `None` when no kernel FIB integration is configured (e.g. tests).
+    pub(crate) fib_manager: Option<Arc<fib::FibManager>>,
 }
 
 impl DaemonState {
@@ -301,6 +305,7 @@ impl DaemonState {
             stalled_peers: Vec::new(),
             route_tx,
             peer_tx,
+            fib_manager: None,
         }
     }
 
@@ -517,8 +522,14 @@ impl DaemonState {
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
-        self.rib_mut().loc_rib.withdraw_peer(&peer_id);
+        let fib_changes_v4 = self.rib_mut().loc_rib.withdraw_peer(&peer_id);
         self.rib_mut().loc_rib_v6.withdraw_peer(&peer_id);
+
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes_v4 {
+                fm.apply_v4(change);
+            }
+        }
 
         // Reset this peer's outbound state for a clean reconnect.
         let cfg_pt = self
@@ -757,7 +768,7 @@ impl DaemonState {
         // Split mutable borrows across distinct struct fields explicitly so the
         // borrow checker can verify they don't alias.
         let rib = Arc::make_mut(&mut self.rib);
-        handle_update(
+        let fib_changes = handle_update(
             peer_id,
             msg,
             adj_rib_in,
@@ -768,6 +779,12 @@ impl DaemonState {
             policy_v6,
             peer_type,
         );
+
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes {
+                fm.apply_v4(change);
+            }
+        }
 
         self.sync_received(peer_ip);
 
@@ -1029,7 +1046,10 @@ impl DaemonState {
         for nlri in nlris {
             let rib = self.rib_mut();
             rib.originated_routes.remove(nlri);
-            rib.loc_rib.withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            let fib_change = rib.loc_rib.withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            if let Some(fm) = &self.fib_manager {
+                fm.apply_v4(fib_change);
+            }
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Withdrawn as i32,
                 route: None,
@@ -1065,12 +1085,18 @@ impl DaemonState {
         // Split the borrows explicitly: rib_mut() needs &mut self.rib, while
         // adj_ribs_in and import_policies are separate fields.
         let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
-        reapply_import_policy(
+        let fib_changes = reapply_import_policy(
             PeerId::from(peer_ip),
             &self.adj_ribs_in[&peer_ip],
             loc_rib,
             &self.import_policies[&peer_ip],
         );
+
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes {
+                fm.apply_v4(change);
+            }
+        }
 
         self.propagate_to_all_peers(&nlris);
         // propagate_to_all_peers fires PeerEvent::Changed (ADV); fire route
@@ -1165,6 +1191,32 @@ where
     let bgp_port = cfg.daemon.bgp_port;
     let (state, event_rx, stop_senders, incoming_senders, md5_passwords) =
         build_daemon(&cfg, spawn_fn).await;
+
+    // Spawn the kernel FIB tracker and install the FibManager.
+    //
+    // KernelFib dumps the initial routing table and then tracks RTM_NEWROUTE /
+    // RTM_DELROUTE events; KernelOracle exposes the snapshot for next-hop
+    // reachability queries.  FibWriter handles the write side (route install /
+    // remove).  On non-Linux platforms both are no-ops.
+    let kernel_fib = {
+        let (kfib, _change_rx) = pathvector_sys::KernelFib::new(pathvector_sys::RT_TABLE_MAIN);
+        kfib
+    };
+    let _daemon_oracle = fib::DaemonOracle(kernel_fib.oracle());
+    let fib_writer = match pathvector_sys::FibWriter::new(pathvector_sys::RT_TABLE_MAIN, 20) {
+        Ok(w) => {
+            tokio::spawn(kernel_fib.spawn());
+            Some(w)
+        }
+        Err(e) => {
+            tracing::warn!("FIB integration unavailable: {e} — running without kernel route install");
+            None
+        }
+    };
+    if let Some(writer) = fib_writer {
+        let manager = Arc::new(fib::FibManager::new(writer));
+        state.write().await.fib_manager = Some(manager);
+    }
 
     // Spawn the gRPC management API server alongside the BGP event loop.
     let grpc_state = Arc::clone(&state);
@@ -1420,7 +1472,8 @@ pub(crate) fn reapply_import_policy(
     adj_rib_in: &AdjRibIn<Ipv4Addr>,
     loc_rib: &mut LocRib<Ipv4Addr>,
     policy: &Policy<Route<Ipv4Addr>>,
-) {
+) -> Vec<BestPathChange<Ipv4Addr>> {
+    let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
@@ -1428,11 +1481,11 @@ pub(crate) fn reapply_import_policy(
         let mut route = raw_route.clone();
         match policy.evaluate(&mut route) {
             Decision::Accept => {
-                loc_rib.insert(peer, route);
+                fib_changes.push(loc_rib.insert(peer, route));
                 accepted += 1;
             }
             Decision::Reject | Decision::Next => {
-                loc_rib.withdraw(&peer, nlri);
+                fib_changes.push(loc_rib.withdraw(&peer, nlri));
                 rejected += 1;
             }
         }
@@ -1445,6 +1498,7 @@ pub(crate) fn reapply_import_policy(
         rib_size = loc_rib.len(),
         "soft reconfig complete"
     );
+    fib_changes
 }
 
 // UPDATE processing dispatches across all path attribute types in one pass.
@@ -1461,13 +1515,14 @@ fn handle_update(
     policy: &Policy<Route<Ipv4Addr>>,
     policy_v6: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
-) {
+) -> Vec<BestPathChange<Ipv4Addr>> {
+    let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
     let withdrawn_count = msg.withdrawn.len();
 
     // ── Traditional IPv4 withdrawals (RFC 4271 §4.3) ──────────────────────
     for nlri in &msg.withdrawn {
         adj_rib_in.withdraw(nlri);
-        loc_rib.withdraw(&peer, nlri);
+        fib_changes.push(loc_rib.withdraw(&peer, nlri));
     }
 
     // ── Single pass over path attributes ─────────────────────────────────
@@ -1556,7 +1611,7 @@ fn handle_update(
     let mp_withdrawn_count = mp_v4_withdrawn.len();
     for nlri in &mp_v4_withdrawn {
         adj_rib_in.withdraw(nlri);
-        loc_rib.withdraw(&peer, nlri);
+        fib_changes.push(loc_rib.withdraw(&peer, nlri));
     }
 
     // ── Announcements: traditional NLRIs + MP_REACH_NLRI V4 prefixes ─────
@@ -1625,7 +1680,7 @@ fn handle_update(
         let mut route = raw;
         match policy.evaluate(&mut route) {
             Decision::Accept => {
-                loc_rib.insert(peer, route);
+                fib_changes.push(loc_rib.insert(peer, route));
                 accepted += 1;
             }
             Decision::Reject | Decision::Next => {
@@ -1707,6 +1762,7 @@ fn handle_update(
         rib_v6_size = loc_rib_v6.len(),
         "processed UPDATE"
     );
+    fib_changes
 }
 
 #[cfg(test)]

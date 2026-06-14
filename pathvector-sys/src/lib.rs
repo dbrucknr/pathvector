@@ -12,5 +12,5 @@
 pub mod fib;
 pub mod tcp;
 
-pub use fib::{FibSnapshot, KernelFib, KernelOracle, RT_TABLE_MAIN};
+pub use fib::{FibSnapshot, FibWriter, KernelFib, KernelOracle, RT_TABLE_MAIN};
 pub use tcp::apply_tcp_md5sig;

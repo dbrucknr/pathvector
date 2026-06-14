@@ -1,5 +1,6 @@
 mod config;
 mod daemon;
+mod fib;
 mod grpc;
 mod outbound;
 mod proto;

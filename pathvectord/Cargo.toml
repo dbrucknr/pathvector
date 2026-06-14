@@ -15,6 +15,7 @@ keywords.workspace = true
 pathvector-policy  = { workspace = true }
 pathvector-rib     = { workspace = true }
 pathvector-session = { workspace = true }
+pathvector-sys     = { workspace = true }
 pathvector-types   = { workspace = true }
 tokio              = { workspace = true }
 tonic              = { workspace = true }
