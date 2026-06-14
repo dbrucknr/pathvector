@@ -155,10 +155,18 @@ Add once BIRD and FRR are solid. Requires an Arista account; cannot be pulled
 anonymously in public CI. Gate behind a `CI_ARISTA_IMAGE` env var so it runs only
 when the image is available.
 
-**10. Criterion benchmark suite**
-Per-crate benchmarks with the three-size pattern (small/medium/large).
-Establishes the baseline before performance optimisations. Described in detail
-under Cross-cutting → Performance below.
+**10. Criterion benchmark suite** ✅ Done (2026-06-14)
+`pathvector-rib` has three criterion benchmark groups (`select_best`, `loc_rib_insert`,
+`outbound_pipeline`). Baseline on M2 Max:
+
+| Benchmark | Small | Medium | Large |
+|---|---|---|---|
+| `select_best` | 4.9 ns (2 candidates) | 35 ns (10) | 526 ns (100) |
+| `loc_rib_insert` | 309 ns (10k prefixes) | 293 ns (100k) | 802 ns (500k) |
+| `outbound_pipeline` (minimal) | 242 ns (1 peer) | 1.61 µs (10) | 8.59 µs (50) |
+| `outbound_pipeline` (dense) | 387 ns (1 peer) | 2.64 µs (10) | 14.4 µs (50) |
+
+Run with `cargo bench -p pathvector-rib`. HTML reports in `target/criterion/`.
 
 **11. Adversarial input / NOTIFICATION path testing**
 RFC 7606 (item 3) is the prerequisite — once the error handling architecture
@@ -380,18 +388,13 @@ Remaining e2e work:
 ### Best-path selection — missing decision steps
 
 RFC 4271 §9.1 defines a 10-step decision process. The current implementation
-covers steps 2, 4, 5, 6, 7, and 10. The remaining steps are listed below.
-
-**Step 8 is unblocked and ready to implement.** It requires only a `PartialOrd`
-on peer IP address — no IGP or FIB dependency. A two-line comparison in
-`select_best` closes this gap immediately.
+covers steps 2, 3/7, 4, 5, 6, 9, and 10. The two remaining steps require
+external information not available at the RIB layer:
 
 | Step | Criterion | Blocked on |
 |---|---|---|
 | 1 | Prefer routes with a reachable next-hop | FIB integration — the RIB needs to know which next-hops are reachable |
-| 3 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally vs learned from a peer |
-| 8 | Prefer route from peer with lowest IP address | **Nothing** — `PartialOrd` on `IpAddr`; ready to implement today |
-| 9 | Prefer oldest eBGP route | Route age tracking — the RIB would need to record when each route was first received |
+| 8 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally vs learned from a peer |
 
 ### Trait-based RIB and policy seams
 
