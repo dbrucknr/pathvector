@@ -31,8 +31,7 @@ async fn frr_static_route_appears_in_pathvectord_rib() {
 /// Multiple static routes pre-announced by FRR all arrive in pathvectord.
 #[tokio::test]
 async fn frr_multiple_static_routes_appear_in_pathvectord_rib() {
-    let mut h =
-        FrrHarness::with_routes(&["10.201.0.0/24", "10.202.0.0/24", "10.203.0.0/24"]).await;
+    let mut h = FrrHarness::with_routes(&["10.201.0.0/24", "10.202.0.0/24", "10.203.0.0/24"]).await;
 
     for prefix in ["10.201.0.0/24", "10.202.0.0/24", "10.203.0.0/24"] {
         wait_for_route(&mut h.client, prefix, Duration::from_secs(15))
@@ -122,4 +121,3 @@ async fn frr_route_has_correct_peer_address() {
         "route must be attributed to FRR's IP"
     );
 }
-

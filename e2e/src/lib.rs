@@ -596,7 +596,18 @@ pub fn docker_start(
     host_grpc_port: Option<u16>,
     cmd: Option<&str>,
 ) -> ContainerGuard {
-    docker_start_with_caps(name, image, network, ip, cap_net_admin, false, volume_src, volume_dst, host_grpc_port, cmd)
+    docker_start_with_caps(
+        name,
+        image,
+        network,
+        ip,
+        cap_net_admin,
+        false,
+        volume_src,
+        volume_dst,
+        host_grpc_port,
+        cmd,
+    )
 }
 
 /// Like [`docker_start`] but with an optional `--privileged` flag for
@@ -2011,8 +2022,8 @@ impl FrrHarness {
             FRR_IMAGE,
             &network_name,
             Some(&frr_ip_str),
-            true,  // NET_ADMIN for BGP socket binding
-            true,  // privileged: bgpd requires CAP_SYS_ADMIN for netlink
+            true, // NET_ADMIN for BGP socket binding
+            true, // privileged: bgpd requires CAP_SYS_ADMIN for netlink
             &frr_config_path,
             "/etc/frr/frr.conf",
             None,
@@ -2021,8 +2032,7 @@ impl FrrHarness {
 
         wait_container_healthy(&frr.0, Duration::from_secs(60));
 
-        let pathvectord_config =
-            write_daemon_config_frr(&[(frr_ip_str.parse().unwrap(), 65001)]);
+        let pathvectord_config = write_daemon_config_frr(&[(frr_ip_str.parse().unwrap(), 65001)]);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = docker_start(

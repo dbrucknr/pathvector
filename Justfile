@@ -136,8 +136,17 @@ _build-bird-image:
         -t pathvector-bird-test:latest \
         e2e/
 
+_build-frr-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-frr-test:latest..."
+    docker build \
+        -f e2e/Dockerfile.frr \
+        -t pathvector-frr-test:latest \
+        e2e/
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge
