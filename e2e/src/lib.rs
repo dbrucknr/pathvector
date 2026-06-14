@@ -596,6 +596,30 @@ pub fn docker_start(
     host_grpc_port: Option<u16>,
     cmd: Option<&str>,
 ) -> ContainerGuard {
+    docker_start_with_caps(name, image, network, ip, cap_net_admin, false, volume_src, volume_dst, host_grpc_port, cmd)
+}
+
+/// Like [`docker_start`] but with an optional `--privileged` flag for
+/// containers that require capabilities beyond `CAP_NET_ADMIN` (e.g. FRR's
+/// bgpd requires `CAP_SYS_ADMIN` for netlink operations on Linux).
+///
+/// # Panics
+///
+/// Panics if `docker run` exits non-zero.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn docker_start_with_caps(
+    name: &str,
+    image: &str,
+    network: &str,
+    ip: Option<&str>,
+    cap_net_admin: bool,
+    privileged: bool,
+    volume_src: &str,
+    volume_dst: &str,
+    host_grpc_port: Option<u16>,
+    cmd: Option<&str>,
+) -> ContainerGuard {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--detach".into(),
@@ -607,6 +631,9 @@ pub fn docker_start(
     }
     if cap_net_admin {
         args.push("--cap-add=NET_ADMIN".into());
+    }
+    if privileged {
+        args.push("--privileged".into());
     }
     args.push(format!("--volume={volume_src}:{volume_dst}"));
     if let Some(host_port) = host_grpc_port {
@@ -1757,6 +1784,276 @@ impl BirdHarness {
             client,
             bird_id: container_id,
             bird_ip,
+            pathvectord_ip: pv_ip_str.parse().unwrap(),
+            _network: network,
+        }
+    }
+}
+
+// ── FrrHarness ────────────────────────────────────────────────────────────────
+
+/// FRRouting image built by `just e2e-images` from `e2e/Dockerfile.frr`.
+pub const FRR_IMAGE: &str = "pathvector-frr-test";
+
+/// Derives the per-test FRR subnet and fixed IPs from `test_id`.
+///
+/// Uses `172.31.{id % 256}.0/24` offset by 128 to avoid colliding with BIRD
+/// test subnets when both harnesses run concurrently.
+#[must_use]
+pub fn frr_test_subnet(test_id: u32) -> String {
+    let third = (test_id + 128) % 256;
+    format!("172.31.{third}.0/24")
+}
+
+#[must_use]
+pub fn frr_peer_ip(test_id: u32) -> String {
+    let third = (test_id + 128) % 256;
+    format!("172.31.{third}.10")
+}
+
+#[must_use]
+pub fn frr_pathvectord_ip(test_id: u32) -> String {
+    let third = (test_id + 128) % 256;
+    format!("172.31.{third}.20")
+}
+
+/// Writes a minimal FRR bgpd config.
+///
+/// `routes`: prefixes FRR announces to pathvectord via `network` statements.
+/// Pass `&[]` for session-only tests.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_frr_config(routes: &[&str], pathvectord_ip: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp frr config");
+    write!(
+        f,
+        "
+frr defaults traditional
+
+router bgp 65001
+ bgp router-id 1.0.0.1
+ no bgp ebgp-requires-policy
+ no bgp network import-check
+ neighbor {pathvectord_ip} remote-as 65002
+ neighbor {pathvectord_ip} passive
+ !
+ address-family ipv4 unicast
+  neighbor {pathvectord_ip} activate
+  neighbor {pathvectord_ip} next-hop-self
+"
+    )
+    .expect("write frr config header");
+
+    for route in routes {
+        writeln!(f, "  network {route}").expect("write frr network statement");
+    }
+
+    writeln!(f, " exit-address-family\nexit").expect("write frr config footer");
+    f
+}
+
+/// Polls `vtysh -c "show bgp ipv4 unicast <prefix>"` until `prefix` appears.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix appears.
+pub async fn wait_for_frr_rib_entry(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for prefix {prefix} to appear in FRR RIB"
+            ));
+        }
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "vtysh",
+                "-c",
+                &format!("show bgp ipv4 unicast {prefix}"),
+            ])
+            .output();
+        if let Ok(o) = output {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if o.status.success() && stdout.contains(prefix) && !stdout.contains("not found") {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Extracts the NEXT_HOP FRR stores for `prefix` from `vtysh show bgp` output.
+///
+/// Returns `None` if the prefix is absent or the next-hop line cannot be parsed.
+#[must_use]
+pub fn get_frr_next_hop(container_id: &str, prefix: &str) -> Option<std::net::Ipv4Addr> {
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            container_id,
+            "vtysh",
+            "-c",
+            &format!("show bgp ipv4 unicast {prefix}"),
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // FRR's "show bgp ipv4 unicast <prefix>" output contains a line like:
+    //   "    172.31.128.20 from 172.31.128.20 (10.0.0.2)"
+    // The first token on the indented peer-path line is the NEXT_HOP.
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(" from ") && !trimmed.starts_with("BGP") {
+            let ip_str = trimmed.split_whitespace().next()?;
+            if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
+                // Skip 0.0.0.0 (locally originated routes have no real nexthop)
+                if !addr.is_unspecified() {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn write_daemon_config_frr(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord frr config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord frr config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord frr peer config");
+    }
+    f
+}
+
+/// A fully-wired test environment: isolated Docker network + FRR container +
+/// `pathvectord` container + connected [`PathvectorClient`], with the BGP
+/// session already `Established`.
+///
+/// All resources (containers, network) are cleaned up when `FrrHarness` drops.
+pub struct FrrHarness {
+    // Containers must drop before the network (declaration order = drop order).
+    _frr: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _frr_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// Container ID of the FRR container — pass to [`wait_for_frr_rib_entry`].
+    pub frr_id: String,
+    /// The FRR container's IP on the shared network.
+    pub frr_ip: Ipv4Addr,
+    /// The pathvectord container's IP on the shared network.
+    pub pathvectord_ip: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl FrrHarness {
+    /// Stand up the environment with no pre-announced routes.
+    pub async fn new() -> Self {
+        Self::with_routes(&[]).await
+    }
+
+    /// Stand up the environment with FRR pre-announcing `routes` to pathvectord.
+    ///
+    /// Each entry in `routes` is a CIDR prefix (e.g. `"10.100.0.0/24"`) that
+    /// FRR announces via a `network` statement in its bgpd config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, the FRR image is missing (run `just
+    /// e2e-images`), or the BGP session does not reach `Established` within 30 s.
+    pub async fn with_routes(routes: &[&str]) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-frr-test-{test_id}");
+
+        let subnet = frr_test_subnet(test_id);
+        let frr_ip_str = frr_peer_ip(test_id);
+        let pv_ip_str = frr_pathvectord_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let frr_config = write_frr_config(routes, &pv_ip_str);
+        let frr_config_path = frr_config.path().to_str().unwrap().to_owned();
+
+        let frr = docker_start_with_caps(
+            &format!("frr-{test_id}"),
+            FRR_IMAGE,
+            &network_name,
+            Some(&frr_ip_str),
+            true,  // NET_ADMIN for BGP socket binding
+            true,  // privileged: bgpd requires CAP_SYS_ADMIN for netlink
+            &frr_config_path,
+            "/etc/frr/frr.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&frr.0, Duration::from_secs(60));
+
+        let pathvectord_config =
+            write_daemon_config_frr(&[(frr_ip_str.parse().unwrap(), 65001)]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start(
+            &format!("pathvectord-frr-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pv_ip_str),
+            false,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for FrrHarness");
+
+        let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+        wait_for_established(&mut client, frr_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session with FRR did not reach Established within 30 s");
+
+        let container_id = frr.0.clone();
+        FrrHarness {
+            _frr: frr,
+            _pathvectord: pathvectord,
+            _frr_config: frr_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            frr_id: container_id,
+            frr_ip,
             pathvectord_ip: pv_ip_str.parse().unwrap(),
             _network: network,
         }

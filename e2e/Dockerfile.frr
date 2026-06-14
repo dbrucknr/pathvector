@@ -1,0 +1,39 @@
+# FRRouting image for pathvector-e2e interoperability tests.
+#
+# FRR is the most widely deployed open-source BGP implementation (Cloudflare,
+# Meta, major IXPs). It enforces RFC 4271 more strictly than GoBGP and
+# exercises NEXT_HOP validation, attribute error handling, and AS_PATH
+# enforcement that GoBGP silently accepts.
+#
+# Only bgpd is enabled; zebra is required by bgpd as a routing manager.
+# Config is mounted at /etc/frr/ by the test harness.
+# vtysh connects to bgpd's Unix socket for RIB inspection.
+#
+# Uses Debian bookworm where frr is a stable apt package.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends frr \
+    && rm -rf /var/lib/apt/lists/*
+
+# Enable bgpd and zebra; disable everything else.
+RUN sed -i \
+    -e 's/^bgpd=no/bgpd=yes/' \
+    -e 's/^zebra=no/zebra=yes/' \
+    /etc/frr/daemons
+
+# FRR writes its PIDs and sockets here.
+RUN mkdir -p /run/frr && chown frr:frr /run/frr
+
+# 179 — BGP (container-to-container, never mapped to host)
+EXPOSE 179
+
+# vtysh -c "show bgp summary" exits 0 once bgpd is running and has a peer table.
+HEALTHCHECK --interval=1s --timeout=3s --retries=60 \
+    CMD vtysh -c "show bgp summary" >/dev/null 2>&1 || exit 1
+
+# frrinit.sh starts zebra + bgpd as background daemons and exits.
+# We need PID 1 to stay alive, so we start frr then tail the log to block.
+# Running as root inside the container avoids capability issues with netlink.
+CMD ["/bin/sh", "-c", "/usr/lib/frr/frrinit.sh start && tail -f /var/log/frr/frr.log 2>/dev/null || sleep infinity"]
