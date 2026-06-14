@@ -386,10 +386,15 @@ RFC 4271 §9.1 defines a 10-step decision process. The current implementation
 covers steps 2, 3/7, 4, 5, 6, 9, and 10. The two remaining steps require
 external information not available at the RIB layer:
 
-| Step | Criterion | Blocked on |
+| Step | Criterion | Status |
 |---|---|---|
-| 1 | Prefer routes with a reachable next-hop | FIB integration — the RIB needs to know which next-hops are reachable |
-| 8 | Prefer locally originated routes | Peer session type — the RIB needs to know whether a route was originated locally vs learned from a peer |
+| 1 | Prefer routes with a reachable next-hop | ❌ Blocked on FIB integration — the RIB needs to know which next-hops are reachable |
+| 8 | Prefer route with lowest IGP metric to next-hop | ❌ Blocked on FIB integration — same dependency as step 1 |
+
+Steps 3 (locally-originated routes prefer over learned) and 7 (eBGP over iBGP) are
+**done** — both are handled by the `PeerType` ordering (`Local > External > Internal`)
+in `select_best`. When a route is originated via `originate_route`, it is tagged
+`PeerType::Local` in `grpc.rs` and wins at step 3/7 against any peer-learned route.
 
 ### Trait-based RIB and policy seams
 
@@ -475,9 +480,14 @@ announce more prefixes than the limit.
 
 ### Configurable MED behaviour
 
-The current implementation treats missing MED as `0`. Real implementations
-offer:
-- `always-compare-med` — compare MED even when routes come from different ASes
+The current implementation compares MED **globally across all peers**, which is
+equivalent to `always-compare-med`. RFC 4271 §9.1.2.2 requires MED to be compared
+only between routes from the same neighboring AS; the current behavior can produce
+suboptimal selection when routes from different ASes have MED set. Step 6 is
+therefore marked ⚠️ in `pathvector-rib/RFC.md`.
+
+Real implementations offer:
+- `always-compare-med` — current behavior (violates RFC default, but widely offered)
 - `deterministic-med` — group routes by originating AS before comparing MED,
   ensuring the same best path is chosen regardless of route arrival order
 - Configurable missing-MED treatment (`0`, `u32::MAX`, or policy-set)

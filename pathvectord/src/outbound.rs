@@ -639,6 +639,41 @@ mod flush_updates_tests {
         assert!(!flush_updates(decisions, MAX_LEN, &tx));
     }
 
+    /// 1 000 withdrawals are all delivered even when they span multiple UPDATEs.
+    ///
+    /// This is the withdrawal analogue of `test_flush_splits_when_exceeding_max_len`.
+    /// The withdrawal path has its own batching loop and previously had no split test.
+    #[test]
+    fn test_flush_withdrawal_split_delivers_all_nlris() {
+        let decisions: Vec<PrefixDecision> = (0u32..1000)
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let a = (i / 256) as u8;
+                #[allow(clippy::cast_possible_truncation)]
+                let b = (i % 256) as u8;
+                PrefixDecision::Withdraw(
+                    Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap(),
+                )
+            })
+            .collect();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        assert!(flush_updates(decisions, MAX_LEN, &tx));
+
+        let mut total = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            use pathvector_session::message::BgpMessage;
+            let wire_len = BgpMessage::Update(msg.clone()).encode().len();
+            assert!(
+                wire_len <= MAX_LEN,
+                "withdraw UPDATE {wire_len} bytes exceeds MAX_LEN"
+            );
+            assert!(msg.announced.is_empty(), "withdraw batch must not announce");
+            total += msg.withdrawn.len();
+        }
+        assert_eq!(total, 1000, "all withdrawals must be delivered");
+    }
+
     /// Returns false mid-batch when channel fills during withdrawal overflow.
     #[test]
     fn test_flush_withdrawal_overflow_false_on_full_channel() {

@@ -19,20 +19,24 @@ that filters routes before they enter Adj-RIB-In lives in `pathvector-policy`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | Step 1: Reject routes with unreachable NEXT_HOP | `src/best_path.rs` | ❌ | — |
-| Step 2: Prefer route with highest LOCAL_PREF; default 100 when absent | `src/best_path.rs` | ✅ | `test_prefer_higher_local_pref`, `test_local_pref_default_100`, proptest: `prop_select_best_prefers_higher_local_pref` |
+| Step 2: Prefer route with highest LOCAL_PREF; default 100 when absent | `src/best_path.rs` | ✅ | `test_select_best_prefers_higher_local_pref`, `test_select_best_missing_local_pref_treated_as_100`, proptest: `prop_select_best_winner_has_highest_local_pref` |
 | Step 3: Prefer locally originated routes (PeerType::Local beats eBGP beats iBGP) | `src/best_path.rs` | ✅ | `test_locally_originated_beats_ebgp`, `test_locally_originated_beats_ibgp`, `test_local_pref_still_overrides_local_origin`, proptest: `prop_select_best_locally_originated_beats_peer_learned` |
-| Step 4: Prefer route with shortest AS_PATH length (confed segments count as 0) | `src/best_path.rs` | ✅ | `test_prefer_shorter_as_path`, proptest: `prop_select_best_prefers_shorter_aspath` |
-| Step 5: Prefer lowest ORIGIN (IGP < EGP < INCOMPLETE) | `src/best_path.rs` | ✅ | `test_prefer_lower_origin`, proptest: `prop_select_best_prefers_lower_origin` |
-| Step 6: Prefer lowest MED; only compare when routes are from the same AS | `src/best_path.rs` | ✅ | `test_prefer_lower_med`, `test_med_only_compared_within_same_as`, proptest: `prop_select_best_prefers_lower_med` |
-| Step 7: Prefer eBGP over iBGP (combined with step 3 via PeerType::Ord) | `src/best_path.rs` | ✅ | `test_prefer_ebgp_over_ibgp` |
+| Step 4: Prefer route with shortest AS_PATH length (confed segments count as 0) | `src/best_path.rs` | ✅ | `test_select_best_prefers_shorter_as_path`, proptest: `prop_select_best_winner_has_shortest_as_path` |
+| Step 5: Prefer lowest ORIGIN (IGP < EGP < INCOMPLETE) | `src/best_path.rs` | ✅ | `test_select_best_prefers_lower_origin`, proptest: `prop_select_best_winner_has_lowest_origin` |
+| Step 6: Prefer lowest MED; RFC requires same-AS comparison only | `src/best_path.rs` | ⚠️ | `test_select_best_prefers_lower_med`, proptest: `prop_select_best_winner_has_lowest_med` |
+| Step 7: Prefer eBGP over iBGP (combined with step 3 via PeerType::Ord) | `src/best_path.rs` | ✅ | `test_select_best_prefers_ebgp_over_ibgp` |
 | Step 8: Prefer route with lowest IGP metric to next-hop | `src/best_path.rs` | ❌ | — |
 | Step 9: Prefer oldest eBGP route (received_at: Instant, only when both are eBGP) | `src/best_path.rs` | ✅ | `test_select_best_prefers_older_ebgp_route`, `test_step9_only_applies_to_ebgp` |
-| Step 10: Prefer route from peer with lowest router-id (BGP Identifier) | `src/best_path.rs` | ✅ | `test_prefer_lower_router_id`, proptest: `prop_select_best_lower_router_id_tiebreaker` |
+| Step 10: Prefer route from peer with lowest router-id (BGP Identifier) | `src/best_path.rs` | ✅ | `test_select_best_tiebreak_lower_peer_ip`, proptest: `prop_select_best_lower_peer_ip_wins_on_full_tie` |
 
-**Deferred:**
+**Deferred / partial:**
 - **Step 1** (next-hop reachability): requires an IGP or FIB integration to determine
   whether a next-hop is reachable. Deferred until a FIB/kernel-route abstraction exists.
-- **Step 8** (IGP metric to next-hop): same dependency as step 1.
+- **Step 6** (MED, ⚠️): RFC 4271 §9.1.2.2 requires MED to be compared only between routes
+  from the same neighboring AS. The current implementation compares MED globally across all
+  peers. This can produce suboptimal selection when routes from different ASes have MED set.
+  See the `TODO.md` entry for `deterministic-med` / `always-compare-med`.
+- **Step 8** (IGP metric to next-hop): same FIB dependency as step 1.
 
 ---
 
