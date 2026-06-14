@@ -137,10 +137,7 @@ impl<A: IpAddress> LocRib<A> {
     /// changed as a result of this insert.
     pub fn insert(&mut self, peer: PeerId, route: Route<A>) -> BestPathChange<A> {
         let nlri = route.nlri;
-        let old = self
-            .best
-            .get(nlri.prefix())
-            .map(|(p, r)| (*p, r.clone()));
+        let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
         self.candidates.entry(nlri).or_default().insert(peer, route);
         self.recompute_best(nlri);
         match self.best.get(nlri.prefix()) {
@@ -165,10 +162,7 @@ impl<A: IpAddress> LocRib<A> {
     /// Returns a [`BestPathChange`] describing whether and how the best path
     /// changed as a result of this withdrawal.
     pub fn withdraw(&mut self, peer: &PeerId, nlri: &Nlri<A>) -> BestPathChange<A> {
-        let old = self
-            .best
-            .get(nlri.prefix())
-            .map(|(p, r)| (*p, r.clone()));
+        let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
         if let Some(peer_map) = self.candidates.get_mut(nlri) {
             peer_map.remove(peer);
             if peer_map.is_empty() {
@@ -596,9 +590,11 @@ mod tests {
         rib.insert(peer(1), route("192.168.0.0/16"));
         let changes = rib.withdraw_peer(&peer(1));
         assert_eq!(changes.len(), 2);
-        assert!(changes
-            .iter()
-            .all(|c| matches!(c, BestPathChange::Withdrawn(_))));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, BestPathChange::Withdrawn(_)))
+        );
     }
 
     #[test]

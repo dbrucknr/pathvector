@@ -33,20 +33,12 @@ pub(crate) mod tests {
         pub export_calls: Vec<(String, bool)>,
         /// Queued batches for `watch_peers`. Each `watch_peers` call drains one batch.
         pub peer_events: std::collections::VecDeque<
-            Vec<
-                Result<
-                    pathvector_client::types::PeerEvent,
-                    pathvector_client::error::ClientError,
-                >,
-            >,
+            Vec<Result<pathvector_client::types::PeerEvent, pathvector_client::error::ClientError>>,
         >,
         /// Queued batches for `watch_routes`. Each `watch_routes` call drains one batch.
         pub route_events: std::collections::VecDeque<
             Vec<
-                Result<
-                    pathvector_client::types::RouteEvent,
-                    pathvector_client::error::ClientError,
-                >,
+                Result<pathvector_client::types::RouteEvent, pathvector_client::error::ClientError>,
             >,
         >,
     }
@@ -69,12 +61,8 @@ pub(crate) mod tests {
         fn check_error(&self) -> Option<pathvector_client::error::ClientError> {
             use pathvector_client::error::ClientError;
             self.force_error.as_ref().map(|e| match e {
-                ClientError::Rpc(s) => {
-                    ClientError::Rpc(tonic::Status::new(s.code(), s.message()))
-                }
-                ClientError::Convert(c) => {
-                    ClientError::Rpc(tonic::Status::internal(c.to_string()))
-                }
+                ClientError::Rpc(s) => ClientError::Rpc(tonic::Status::new(s.code(), s.message())),
+                ClientError::Convert(c) => ClientError::Rpc(tonic::Status::internal(c.to_string())),
             })
         }
     }
@@ -82,10 +70,8 @@ pub(crate) mod tests {
     impl DaemonClient for MockDaemonClient {
         async fn list_peers(
             &mut self,
-        ) -> Result<
-            Vec<pathvector_client::types::PeerState>,
-            pathvector_client::error::ClientError,
-        > {
+        ) -> Result<Vec<pathvector_client::types::PeerState>, pathvector_client::error::ClientError>
+        {
             if let Some(e) = self.check_error() {
                 return Err(e);
             }
@@ -121,10 +107,8 @@ pub(crate) mod tests {
         async fn get_best_route(
             &mut self,
             _prefix: &str,
-        ) -> Result<
-            Option<pathvector_client::types::Route>,
-            pathvector_client::error::ClientError,
-        > {
+        ) -> Result<Option<pathvector_client::types::Route>, pathvector_client::error::ClientError>
+        {
             if let Some(e) = self.check_error() {
                 return Err(e);
             }

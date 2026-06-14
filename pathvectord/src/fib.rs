@@ -251,7 +251,12 @@ mod tests {
         ));
         let changes = drain(&mut rx);
         assert_eq!(changes.len(), 1);
-        let FibChange::InstallV4 { dst, prefix_len, gateway } = &changes[0] else {
+        let FibChange::InstallV4 {
+            dst,
+            prefix_len,
+            gateway,
+        } = &changes[0]
+        else {
             panic!("expected InstallV4");
         };
         assert_eq!(*dst, Ipv4Addr::new(10, 0, 0, 0));
@@ -289,7 +294,10 @@ mod tests {
             nlri4("10.0.0.0/8"),
             route4_no_nh("10.0.0.0/8"),
         ));
-        assert!(drain(&mut rx).is_empty(), "route without next-hop must not be installed");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "route without next-hop must not be installed"
+        );
     }
 
     // ── apply_v6 ─────────────────────────────────────────────────────────────
@@ -304,7 +312,12 @@ mod tests {
         ));
         let changes = drain(&mut rx);
         assert_eq!(changes.len(), 1);
-        let FibChange::InstallV6 { dst, prefix_len, gateway } = &changes[0] else {
+        let FibChange::InstallV6 {
+            dst,
+            prefix_len,
+            gateway,
+        } = &changes[0]
+        else {
             panic!("expected InstallV6");
         };
         assert_eq!(*dst, "2001:db8::".parse::<Ipv6Addr>().unwrap());
@@ -343,7 +356,11 @@ mod tests {
         let (kfib, _rx) = KernelFib::new(254);
         let oracle = super::DaemonOracle(kfib.oracle());
         assert!(!oracle.is_reachable(&NextHop::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(oracle.igp_metric(&NextHop::V4(Ipv4Addr::new(10, 0, 0, 1))).is_none());
+        assert!(
+            oracle
+                .igp_metric(&NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .is_none()
+        );
     }
 
     #[test]

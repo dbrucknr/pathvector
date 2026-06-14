@@ -1221,7 +1221,9 @@ where
             Some(w)
         }
         Err(e) => {
-            tracing::warn!("FIB integration unavailable: {e} — running without kernel route install");
+            tracing::warn!(
+                "FIB integration unavailable: {e} — running without kernel route install"
+            );
             None
         }
     };
