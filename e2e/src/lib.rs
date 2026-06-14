@@ -1569,6 +1569,53 @@ pub async fn wait_for_bird_rib_entry(
     }
 }
 
+/// Returns the NEXT_HOP (`via`) address for `prefix` in BIRD's RIB as seen by
+/// the `pathvectord` protocol, or `None` if the route is not present.
+///
+/// Runs `birdc show route all protocol pathvectord` and parses the
+/// `BGP.next_hop: <IP>` line that BIRD 2 emits in the detailed attribute dump.
+/// This is the value BIRD stored from the UPDATE's NEXT_HOP attribute — exactly
+/// what RFC 4271 §5.1.3 requires to be the session's local interface address.
+pub fn get_bird_next_hop(container_id: &str, prefix: &str) -> Option<std::net::Ipv4Addr> {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            container_id,
+            "birdc",
+            "show",
+            "route",
+            "all",
+            "protocol",
+            "pathvectord",
+        ])
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    // Only look at lines that belong to the target prefix block.
+    // BIRD output groups lines under the prefix header; we scan for
+    // `BGP.next_hop:` after we've seen the prefix header line.
+    let mut in_prefix = false;
+    for line in text.lines() {
+        if line.contains(prefix) {
+            in_prefix = true;
+        }
+        // A new non-indented line that doesn't start with whitespace signals
+        // the start of a different prefix block.
+        if in_prefix && !line.starts_with('\t') && !line.starts_with(' ') && !line.contains(prefix) {
+            in_prefix = false;
+        }
+        if in_prefix {
+            // `\tBGP.next_hop: 172.31.50.20`
+            if let Some(rest) = line.trim().strip_prefix("BGP.next_hop:") {
+                return rest.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
 /// A fully-wired test environment: isolated Docker network + BIRD 2 container
 /// + `pathvectord` container + connected [`PathvectorClient`], with the BGP
 /// session already `Established`.
