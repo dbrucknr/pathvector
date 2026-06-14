@@ -65,19 +65,28 @@ install-hooks:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run clippy inside a Linux/amd64 container — matches CI exactly and catches
-# #[cfg(target_os = "linux")] warnings invisible on macOS. Requires Docker.
-# Use before pushing if you touched any Linux-gated code.
-# First run is slow (image pull + full compile); subsequent runs reuse the cache.
+# Run clippy inside a Linux container — catches #[cfg(target_os = "linux")]
+# warnings invisible on macOS. Requires Docker.
+#
+# Two named volumes are kept across runs:
+#   pathvector-linux-cargo  — crate registry (downloaded once, stays on Linux FS)
+#   pathvector-linux-target — compiled artifacts (incremental builds, Linux FS)
+#
+# Source is mounted read-only; CARGO_TARGET_DIR redirects build output to the
+# named volume, keeping Docker Desktop's slow macOS-FS I/O out of the hot path.
+#
+# First run: ~5–10 min (image pull + compile all deps).
+# Subsequent runs: ~30 s (incremental, cache warm).
 lint-linux:
     docker run --rm \
         --platform linux/amd64 \
-        -v "{{justfile_directory()}}:/workspace" \
+        -v "{{justfile_directory()}}:/workspace:ro" \
+        -v pathvector-linux-cargo:/usr/local/cargo/registry \
+        -v pathvector-linux-target:/target \
         -w /workspace \
-        -e CARGO_HOME=/workspace/.cargo-linux-cache \
-        rust:latest \
-        sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null \
-            && rustup component add clippy \
+        -e CARGO_TARGET_DIR=/target \
+        rust:1.88-slim \
+        sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null \
             && cargo clippy --workspace --all-targets -- -D warnings"
 
 # Verify rustfmt formatting (does not modify files)
