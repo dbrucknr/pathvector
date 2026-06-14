@@ -1,0 +1,32 @@
+# BIRD 2 image for pathvector-e2e interoperability tests.
+#
+# BIRD 2 is stricter about RFC 4271 compliance than GoBGP — it validates
+# OPEN capabilities more carefully and rejects attribute errors that GoBGP
+# silently tolerates.  Running the same session and route tests against BIRD
+# catches bugs that GoBGP's more permissive parser would hide.
+#
+# Config is mounted at /etc/bird/bird.conf by the test harness.
+# birdc connects to BIRD's Unix socket at /run/bird/bird.ctl.
+#
+# Uses Debian bookworm where bird2 is a stable apt package (Alpine 3.21's
+# bird2 package is absent on aarch64 in the stable repos).
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bird2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# bird creates its control socket here at runtime; mkdir ensures the directory
+# exists before the daemon starts so birdc can connect immediately.
+RUN mkdir -p /run/bird /etc/bird
+
+# 179 — BGP (container-to-container, never mapped to host)
+EXPOSE 179
+
+# birdc show status exits 0 once BIRD is running and the control socket is live.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD birdc show status >/dev/null 2>&1 || exit 1
+
+# -f: run in foreground (required in a container — no init process to supervise)
+CMD ["bird", "-c", "/etc/bird/bird.conf", "-f"]

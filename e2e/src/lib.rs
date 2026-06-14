@@ -1424,6 +1424,272 @@ impl TwoPeerHarness {
     }
 }
 
+// ── BirdHarness ──────────────────────────────────────────────────────────────
+
+/// BIRD 2 image built by `just e2e-images` from `e2e/Dockerfile.bird`.
+pub const BIRD_IMAGE: &str = "pathvector-bird-test";
+
+/// Fixed subnet for BIRD interop tests.
+///
+/// Both IPs are known before either container starts — BIRD's config
+/// must name pathvectord's IP as the `neighbor` before BIRD launches.
+pub const BIRD_TEST_SUBNET: &str = "172.31.50.0/24";
+pub const BIRD_IP: &str = "172.31.50.10";
+pub const BIRD_PATHVECTORD_IP: &str = "172.31.50.20";
+
+/// Writes the pathvectord config for the BIRD interop harness.
+///
+/// Sets `bgp_id` to [`BIRD_PATHVECTORD_IP`] (the container's actual interface
+/// address on the shared Docker network).  This is important for BIRD
+/// compatibility: `prepare_outbound` uses `bgp_id` as the eBGP NEXT_HOP, and
+/// BIRD 2 validates RFC 4271 §5.1.3 — the NEXT_HOP must be directly reachable
+/// on the interface the BGP session uses.  GoBGP accepts any NEXT_HOP silently,
+/// but BIRD correctly rejects routes whose NEXT_HOP is not on a connected
+/// subnet.  Using the interface IP as `bgp_id` is valid practice (BGP router ID
+/// just needs to be a unique 32-bit identifier within the AS).
+fn write_daemon_config_bird(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord bird config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "{BIRD_PATHVECTORD_IP}"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord bird config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord bird peer config");
+    }
+    f
+}
+
+/// Writes a BIRD 2 config file.
+///
+/// - `routes`: prefixes BIRD announces to pathvectord via a `protocol static`
+///   (blackhole, exported with `next hop self`).  Pass `&[]` for session-only
+///   tests.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_bird_config(routes: &[&str]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp bird config");
+    write!(
+        f,
+        r#"
+log stderr all;
+
+# Opaque router ID — does not need to match the container IP.
+router id 1.0.0.1;
+
+# Required for BIRD to discover its own interfaces and next-hops.
+protocol device {{}}
+
+protocol bgp pathvectord {{
+    description "pathvectord peer";
+    local as 65001;
+    neighbor {BIRD_PATHVECTORD_IP} as 65002;
+
+    # passive: wait for pathvectord to connect; do not dial out.
+    # pathvectord is configured to dial BIRD's IP, so only one side initiates.
+    passive;
+
+    ipv4 {{
+        import all;
+        export where source = RTS_STATIC;
+        next hop self;
+    }};
+}}
+
+protocol static {{
+    ipv4;
+"#
+    )
+    .expect("write bird config header");
+
+    for route in routes {
+        writeln!(f, "    route {route} blackhole;").expect("write bird static route");
+    }
+
+    writeln!(f, "}}").expect("write bird config footer");
+    f
+}
+
+/// Polls `birdc show route` inside `container_id` until `prefix` appears.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix appears.
+pub async fn wait_for_bird_rib_entry(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for prefix {prefix} to appear in BIRD RIB"
+            ));
+        }
+        // "show route protocol pathvectord" lists all routes learned from the
+        // pathvectord BGP session — each token is a separate argv element since
+        // there's no shell expansion in docker exec.
+        let out = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "birdc",
+                "show",
+                "route",
+                "protocol",
+                "pathvectord",
+            ])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains(prefix) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// A fully-wired test environment: isolated Docker network + BIRD 2 container
+/// + `pathvectord` container + connected [`PathvectorClient`], with the BGP
+/// session already `Established`.
+///
+/// Both containers are assigned fixed IPs within [`BIRD_TEST_SUBNET`] so
+/// BIRD's config can name pathvectord's IP before either container starts.
+///
+/// All resources (containers, network) are cleaned up when `BirdHarness` drops.
+///
+/// # Panics
+///
+/// [`BirdHarness::new`] panics if:
+/// - Docker is not running.
+/// - Either image has not been built (run `just e2e-images`).
+/// - The BGP session does not reach `Established` within 30 seconds.
+pub struct BirdHarness {
+    // Containers must drop before the network (declaration order = drop order).
+    _bird: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _bird_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// Container ID of the BIRD container — pass to [`wait_for_bird_rib_entry`].
+    pub bird_id: String,
+    /// The BIRD container's IP on the shared network.
+    pub bird_ip: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl BirdHarness {
+    /// Stand up the environment with no pre-announced static routes.
+    ///
+    /// Use this for session-lifecycle tests that only need the handshake.
+    pub async fn new() -> Self {
+        Self::with_routes(&[]).await
+    }
+
+    /// Stand up the environment with BIRD pre-announcing `routes` to pathvectord.
+    ///
+    /// Each entry in `routes` is a CIDR prefix (e.g. `"10.100.0.0/24"`) that
+    /// BIRD installs as a static blackhole route and exports to pathvectord via
+    /// `next hop self`.
+    pub async fn with_routes(routes: &[&str]) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-bird-test-{test_id}");
+
+        let network =
+            DockerNetwork::create_with_subnet(network_name.clone(), BIRD_TEST_SUBNET);
+
+        // Write BIRD config — pathvectord's IP is known (fixed) before either
+        // container starts, so we can set `neighbor BIRD_PATHVECTORD_IP` now.
+        let bird_config = write_bird_config(routes);
+        let bird_config_path = bird_config.path().to_str().unwrap().to_owned();
+
+        // Start BIRD with its fixed IP and the config mounted.
+        let bird = docker_start(
+            &format!("bird-{test_id}"),
+            BIRD_IMAGE,
+            &network_name,
+            Some(BIRD_IP),
+            false,
+            &bird_config_path,
+            "/etc/bird/bird.conf",
+            None,
+            None,
+        );
+
+        // Wait for BIRD's healthcheck (control socket live, `birdc show status` OK).
+        wait_container_healthy(&bird.0, Duration::from_secs(30));
+
+        // Write pathvectord config referencing BIRD's fixed IP.
+        // Uses write_daemon_config_bird so bgp_id = BIRD_PATHVECTORD_IP,
+        // ensuring the eBGP NEXT_HOP is directly reachable from BIRD.
+        let pathvectord_config =
+            write_daemon_config_bird(&[(BIRD_IP.parse().unwrap(), 65001)]);
+        let pathvectord_config_path =
+            pathvectord_config.path().to_str().unwrap().to_owned();
+
+        // Start pathvectord with its fixed IP, mapping gRPC to the host.
+        let pathvectord = docker_start(
+            &format!("pathvectord-bird-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(BIRD_PATHVECTORD_IP),
+            false,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client =
+            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+                .expect("PathvectorClient::connect for BirdHarness");
+
+        wait_for_established(
+            &mut client,
+            BIRD_IP.parse().unwrap(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("BGP session with BIRD 2 did not reach Established within 30 s");
+
+        let bird_id = bird.0.clone();
+        BirdHarness {
+            _bird: bird,
+            _pathvectord: pathvectord,
+            _bird_config: bird_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            bird_id,
+            bird_ip: BIRD_IP.parse().unwrap(),
+            _network: network,
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 //
 // These tests cover the pure path-calculation helpers that do not require

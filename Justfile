@@ -126,8 +126,18 @@ _build-pathvectord-image:
         -t pathvector-e2e:latest \
         .
 
-# Build both test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image
+# Build the BIRD 2 test image (Alpine + bird2 package).
+_build-bird-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-bird-test:latest..."
+    docker build \
+        -f e2e/Dockerfile.bird \
+        -t pathvector-bird-test:latest \
+        e2e/
+
+# Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge
