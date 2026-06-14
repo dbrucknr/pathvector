@@ -470,12 +470,10 @@ best-path change.
 
 **Remaining gaps — ordered by impact:**
 
-**1. IPv6 FIB write path** (`pathvector-sys`, `pathvectord`) — `FibWriter` only has
-`install_v4` / `withdraw_v4`. `handle_update` and `withdraw_peer` for `loc_rib_v6`
-produce `BestPathChange<Ipv6Addr>` that is silently discarded. Fix: add
-`install_v6` / `withdraw_v6` to `FibWriter`, add `apply_v6` to `FibManager`,
-and collect/dispatch `BestPathChange<Ipv6Addr>` in `handle_update` and
-`on_terminated`.
+**1. IPv6 FIB write path** (`pathvector-sys`, `pathvectord`) — ✅ Done (2026-06-14).
+`FibWriter` has `install_v6` / `withdraw_v6`. `FibManager` has `apply_v6`.
+`handle_update` returns `(Vec<BestPathChange<Ipv4Addr>>, Vec<BestPathChange<Ipv6Addr>>)`
+and dispatches both families; `on_terminated` and `originate_routes_v6` likewise.
 
 **2. `DaemonOracle` not wired into best-path selection** (`pathvector-rib`,
 `pathvectord`) — `LocRib::recompute_best` calls `select_best` (→ `AlwaysReachable`)
@@ -497,17 +495,12 @@ remain. Fix: on startup, dump all routes with `RTPROT_BGP` in `RT_TABLE_MAIN`
 and delete any that are not in the current Loc-RIB after the first convergence
 cycle.
 
-**5. `RTM_DELROUTE` ESRCH not silenced** (`pathvectord`) — Removing a route that
-doesn't exist in the kernel returns errno `ESRCH` and logs a `WARN`. This fires
-on every clean shutdown (routes withdrawn from Loc-RIB before kernel is updated)
-and on daemon startup when a previous run already cleaned up. Fix: in
-`withdraw_route_v4` (and v6), treat `io::ErrorKind::Other` with underlying errno
-3 (`ESRCH`) as `Ok(())`.
+**5. `RTM_DELROUTE` ESRCH not silenced** — ✅ Done (2026-06-14). `withdraw_route_v4`
+and `withdraw_route_v6` both treat `NetlinkError` with code `-3` (ESRCH) as `Ok(())`.
 
-**6. `fib_table` and `fib_metric` not configurable** (`pathvectord`) — Hardcoded
-to 254 (main table) and metric 20. Fix: add optional `fib_table: u32` and
-`fib_metric: u32` to `DaemonConfig` with those defaults; pass through
-`build_daemon` → `run_with` → `FibWriter::new`.
+**6. `fib_table` and `fib_metric` not configurable** — ✅ Done (2026-06-14).
+`DaemonConfig` has `fib_table: u32` (default 254) and `fib_metric: u32` (default 20);
+both are threaded through to `FibWriter::new` and `KernelFib::new`.
 
 **7. `try_send` silently drops on channel full** (`pathvectord`) — `FibManager`
 uses `try_send` into a 4096-capacity channel. On full BGP table convergence
@@ -517,8 +510,10 @@ deduplicated map keyed by NLRI so only the latest state per prefix is queued.
 
 **Testing gaps:**
 
-- Unit tests for `FibManager::apply_v4`: verify correct `FibChange` variant
-  and fields for each `BestPathChange` input without running a background task.
+- ~~Unit tests for `FibManager::apply_v4/v6`~~ — ✅ Done (2026-06-14). 10 unit tests
+  cover `apply_v4` (announced/withdrawn/unchanged/no-next-hop), `apply_v6`
+  (announced/withdrawn/unchanged), and all three `DaemonOracle` `NextHop` variants.
+  Tests use `FibManager::from_sender` (module-private) to construct without spawning.
 - E2e test: after session with GoBGP establishes and a prefix is learned,
   assert `ip route show table 254` inside the container contains the prefix;
   on teardown assert it is removed.
@@ -647,9 +642,10 @@ Covered by `test_keepalive_in_open_confirm_with_missing_peer_open_resets_to_idle
 `BgpTransport` is a public trait (RPITIT + `+ Send` bounds) in `transport/mod.rs`.
 `FramedBgpTransport` is the production impl wrapping `FramedRead`/`FramedWrite` over TCP.
 `Session<T: BgpTransport>` is generic; `spawn()` stays non-generic (`Session<FramedBgpTransport>`).
-`spawn_with<T: BgpTransport>` (`#[cfg(test)]`) injects a pre-built transport; the first
-`InitiateTcpConnect` output activates it and queues `TcpConnected` via `pending_input`,
-bypassing real TCP. Two previously-uncovered write-failure paths are now covered:
+`spawn_with<T: BgpTransport>` injects a pre-built transport (ungated — no `#[cfg(test)]` —
+so production integrations can supply their own I/O layer); the first `InitiateTcpConnect`
+output activates it and queues `TcpConnected` via `pending_input`, bypassing real TCP.
+Two previously-uncovered write-failure paths are now covered:
 - `test_send_failure_in_execute_triggers_tcp_failed_recovery` — OPEN send fails before
   Established; `execute` returns false, `run` feeds `TcpFailed`.
 - `test_outbound_update_write_failure_emits_terminated` — UPDATE write fails after

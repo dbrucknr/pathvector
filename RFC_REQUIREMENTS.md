@@ -19,7 +19,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 4271 §9.2 | Update-Send Process / RIB Structures | pathvector-rib, pathvectord | ✅ | [rib](pathvector-rib/RFC.md#rfc-4271-92--update-send-process-rib-structures) · [daemon](pathvectord/RFC.md#rfc-4271-92--update-send-process) |
 | RFC 4360 | Extended Communities Attribute | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-4360--bgp-extended-communities-attribute) |
 | RFC 4364 | BGP/MPLS IP VPNs (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
-| RFC 4456 | BGP Route Reflection | pathvector-rib | ❌ | [rib](pathvector-rib/RFC.md#rfc-4456--bgp-route-reflection-deferred) |
+| RFC 4456 | BGP Route Reflection | pathvector-rib | ⚠️ | [rib](pathvector-rib/RFC.md#rfc-4456--bgp-route-reflection) |
 | RFC 4486 | Cease NOTIFICATION Subcodes | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4486--subcodes-for-bgp-cease-notification-message) |
 | RFC 4724 | Graceful Restart | pathvector-session, pathvector-rib | ⚠️ | [session](pathvector-session/RFC.md#rfc-4724--graceful-restart-mechanism-for-bgp) · [rib](pathvector-rib/RFC.md#rfc-4724--graceful-restart-stale-route-timer-deferred) |
 | RFC 4760 | Multiprotocol Extensions (AFI/SAFI) | pathvector-types, pathvector-session, pathvectord | ✅ | [types](pathvector-types/RFC.md#rfc-4760--multiprotocol-extensions-for-bgp-4-afisafi-registry) · [session](pathvector-session/RFC.md#rfc-4760--multiprotocol-extensions-for-bgp-4-codec) · [daemon](pathvectord/RFC.md#rfc-4760--multiprotocol-extensions-daemon-processing) |
