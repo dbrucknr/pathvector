@@ -8,7 +8,9 @@ use crate::Route;
 /// `AdjRibOut` or serialisation into an UPDATE message:
 ///
 /// - Prepend local AS to `AS_PATH` (RFC 4271 §9.2.1.2)
-/// - Rewrite `NEXT_HOP` to the local BGP identifier (RFC 4271 §5.1.3)
+/// - Rewrite `NEXT_HOP` to `local_next_hop` — the IP of the interface used to
+///   reach the peer (RFC 4271 §5.1.3). For eBGP this must be the session-local
+///   address, not the BGP router ID.
 /// - Strip `LOCAL_PREF` (RFC 4271 §5.1.5 — must not be sent to eBGP peers)
 ///
 /// iBGP peers receive the route unmodified; confederation segment stripping
@@ -18,11 +20,11 @@ pub fn prepare_outbound(
     mut route: Route<Ipv4Addr>,
     peer_type: PeerType,
     local_as: u32,
-    local_bgp_id: Ipv4Addr,
+    local_next_hop: Ipv4Addr,
 ) -> Route<Ipv4Addr> {
     if peer_type == PeerType::External {
         route.as_path.prepend(Asn::new(local_as));
-        route.next_hop = Some(NextHop::V4(local_bgp_id));
+        route.next_hop = Some(NextHop::V4(local_next_hop));
         route.local_pref = None;
     }
     route
@@ -68,28 +70,28 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ebgp_transforms_route() {
         let local_as = 65000_u32;
-        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let local_next_hop = Ipv4Addr::new(10, 0, 0, 1);
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
             .local_pref(LocalPref::new(100))
             .build();
 
-        let out = prepare_outbound(route, PeerType::External, local_as, local_bgp_id);
+        let out = prepare_outbound(route, PeerType::External, local_as, local_next_hop);
 
         assert_eq!(out.as_path.path_length(), 1);
-        assert_eq!(out.next_hop, Some(NextHop::V4(local_bgp_id)));
+        assert_eq!(out.next_hop, Some(NextHop::V4(local_next_hop)));
         assert!(out.local_pref.is_none());
     }
 
     #[test]
     fn test_prepare_outbound_ibgp_leaves_route_unchanged() {
         let local_as = 65000_u32;
-        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let local_next_hop = Ipv4Addr::new(10, 0, 0, 1);
         let lp = LocalPref::new(100);
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
             .local_pref(lp)
             .build();
 
-        let out = prepare_outbound(route, PeerType::Internal, local_as, local_bgp_id);
+        let out = prepare_outbound(route, PeerType::Internal, local_as, local_next_hop);
 
         assert_eq!(out.as_path.path_length(), 0);
         assert!(out.next_hop.is_none());

@@ -264,6 +264,7 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         pending_input: None,
         connect_task: None,
         connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
+        local_addr: None,
         update_rx,
     };
 
@@ -314,6 +315,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         pending_input: None,
         connect_task: None,
         connect_factory: None,
+        local_addr: None,
         update_rx,
     };
 
@@ -352,6 +354,9 @@ struct Session<T: BgpTransport> {
     // Constructs a T from a freshly connected TcpStream. None in injected-transport
     // (test) mode — any reconnect attempt is treated as TcpFailed instead.
     connect_factory: Option<Box<dyn Fn(TcpStream) -> T + Send>>,
+    // Local TCP address captured at connect time; forwarded in SessionEstablished
+    // so the daemon can use it as the eBGP NEXT_HOP (RFC 4271 §5.1.3).
+    local_addr: Option<Ipv4Addr>,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
 }
@@ -407,6 +412,9 @@ impl<T: BgpTransport> Session<T> {
                     self.connect_task = None;
                     return match result {
                         Ok(stream) => {
+                            self.local_addr = stream.local_addr().ok().and_then(|a| {
+                                if let std::net::IpAddr::V4(ip) = a.ip() { Some(ip) } else { None }
+                            });
                             // connect_task is only spawned when connect_factory is Some.
                             self.transport = Some(self.connect_factory.as_ref().unwrap()(stream));
                             FsmInput::TcpConnected
@@ -476,6 +484,9 @@ impl<T: BgpTransport> Session<T> {
         match self.fsm.state() {
             // No active outbound attempt — accept the incoming connection directly.
             State::Idle | State::Connect | State::Active => {
+                self.local_addr = stream.local_addr().ok().and_then(|a| {
+                    if let std::net::IpAddr::V4(ip) = a.ip() { Some(ip) } else { None }
+                });
                 if let Some(factory) = &self.connect_factory {
                     self.transport = Some(factory(stream));
                 }
@@ -500,6 +511,9 @@ impl<T: BgpTransport> Session<T> {
                     );
                     let outputs = self.fsm.process(FsmInput::CollisionDetected);
                     self.execute(outputs).await;
+                    self.local_addr = stream.local_addr().ok().and_then(|a| {
+                        if let std::net::IpAddr::V4(ip) = a.ip() { Some(ip) } else { None }
+                    });
                     if let Some(factory) = &self.connect_factory {
                         self.transport = Some(factory(stream));
                     }
@@ -582,7 +596,7 @@ impl<T: BgpTransport> Session<T> {
                 FsmOutput::StopConnectRetryTimer => {
                     self.retry_deadline = None;
                 }
-                FsmOutput::SessionEstablished(info) => {
+                FsmOutput::SessionEstablished(mut info) => {
                     // RFC 8654: raise the codec limit if both sides negotiated
                     // Extended Message capability.
                     let extended = info
@@ -595,6 +609,7 @@ impl<T: BgpTransport> Session<T> {
                     if let Some(t) = &mut self.transport {
                         t.set_extended_message(extended);
                     }
+                    info.local_addr = self.local_addr;
                     let _ = self.event_tx.send(SessionEvent::Established(info)).await;
                 }
                 FsmOutput::SessionTerminated => {

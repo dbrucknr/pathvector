@@ -1439,14 +1439,11 @@ pub const BIRD_PATHVECTORD_IP: &str = "172.31.50.20";
 
 /// Writes the pathvectord config for the BIRD interop harness.
 ///
-/// Sets `bgp_id` to [`BIRD_PATHVECTORD_IP`] (the container's actual interface
-/// address on the shared Docker network).  This is important for BIRD
-/// compatibility: `prepare_outbound` uses `bgp_id` as the eBGP NEXT_HOP, and
-/// BIRD 2 validates RFC 4271 §5.1.3 — the NEXT_HOP must be directly reachable
-/// on the interface the BGP session uses.  GoBGP accepts any NEXT_HOP silently,
-/// but BIRD correctly rejects routes whose NEXT_HOP is not on a connected
-/// subnet.  Using the interface IP as `bgp_id` is valid practice (BGP router ID
-/// just needs to be a unique 32-bit identifier within the AS).
+/// Uses the standard `bgp_id = "10.0.0.2"` (the router ID, not the interface
+/// address).  The eBGP NEXT_HOP is now set to the TCP session's local address
+/// (the container's 172.31.50.0/24 interface IP) by `prepare_outbound`, so
+/// BIRD 2's RFC 4271 §5.1.3 reachability check passes without conflating the
+/// router ID with the NEXT_HOP.
 fn write_daemon_config_bird(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp pathvectord bird config");
     write!(
@@ -1454,7 +1451,7 @@ fn write_daemon_config_bird(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
         r#"
 [daemon]
 local_as  = 65002
-bgp_id    = "{BIRD_PATHVECTORD_IP}"
+bgp_id    = "10.0.0.2"
 hold_time = 9
 grpc_port = {PATHVECTORD_GRPC_PORT}
 "#

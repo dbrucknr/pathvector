@@ -79,7 +79,7 @@ pub(crate) fn propagate_prefix(
     export_policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
     local_as: u32,
-    local_bgp_id: Ipv4Addr,
+    local_next_hop: Ipv4Addr,
 ) -> PrefixDecision {
     match loc_rib.best(&nlri) {
         Some(best) => {
@@ -95,7 +95,7 @@ pub(crate) fn propagate_prefix(
                     PrefixDecision::NoChange
                 };
             }
-            let mut route = prepare_outbound(best.clone(), peer_type, local_as, local_bgp_id);
+            let mut route = prepare_outbound(best.clone(), peer_type, local_as, local_next_hop);
             match export_policy.evaluate(&mut route) {
                 Decision::Accept => match adj_rib_out.insert(route.clone()) {
                     InsertOutcome::Accepted(prev) => {

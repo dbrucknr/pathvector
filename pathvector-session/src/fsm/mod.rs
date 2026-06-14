@@ -126,6 +126,11 @@ pub struct SessionInfo {
     /// `Internal` when `peer_as == local_as`; `External` otherwise.
     /// Used by the RIB layer for best-path step 7 and iBGP split horizon.
     pub peer_type: PeerType,
+    /// Local TCP address for this session (RFC 4271 §5.1.3 `NEXT_HOP` source).
+    ///
+    /// Set by the transport layer from `TcpStream::local_addr()` at connect
+    /// time. `None` for injected (test) transports that bypass real TCP.
+    pub local_addr: Option<Ipv4Addr>,
 }
 
 // ── States ────────────────────────────────────────────────────────────────────
@@ -676,6 +681,7 @@ impl Fsm {
             hold_time: self.negotiated_hold_time,
             peer_capabilities: peer.capabilities.clone(),
             peer_type,
+            local_addr: None,
         })
     }
 }

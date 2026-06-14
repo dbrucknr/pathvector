@@ -1078,7 +1078,7 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, PeerType::External, 65002, 90, &[]);
+        s.on_established(addr, PeerType::External, 65002, 90, &[], None);
 
         let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.session_state, proto::SessionState::Established as i32);
@@ -1094,7 +1094,7 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, PeerType::External, 65002, 90, &[]);
+        s.on_established(addr, PeerType::External, 65002, 90, &[], None);
 
         // Insert a route so the counts are non-zero.
         let n = nlri("10.0.0.0/8");
@@ -1274,7 +1274,7 @@ mod tests {
         state
             .write()
             .await
-            .on_established(addr, PeerType::External, 65002, 90, &[]);
+            .on_established(addr, PeerType::External, 65002, 90, &[], None);
 
         let svc = PeerServiceImpl { state };
         let resp = svc
@@ -1362,7 +1362,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, PeerType::External, 65002, 90, &[]);
+            s.on_established(addr, PeerType::External, 65002, 90, &[], None);
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
@@ -1420,8 +1420,8 @@ mod tests {
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         {
             let mut s = state.write().await;
-            s.on_established(a1, PeerType::External, 65002, 90, &[]);
-            s.on_established(a2, PeerType::External, 65003, 90, &[]);
+            s.on_established(a1, PeerType::External, 65002, 90, &[], None);
+            s.on_established(a2, PeerType::External, 65003, 90, &[], None);
 
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
@@ -1451,8 +1451,8 @@ mod tests {
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         {
             let mut s = state.write().await;
-            s.on_established(a1, PeerType::External, 65002, 90, &[]);
-            s.on_established(a2, PeerType::External, 65003, 90, &[]);
+            s.on_established(a1, PeerType::External, 65002, 90, &[], None);
+            s.on_established(a2, PeerType::External, 65003, 90, &[], None);
 
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
@@ -1513,7 +1513,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, PeerType::External, 65002, 90, &[]);
+            s.on_established(addr, PeerType::External, 65002, 90, &[], None);
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
@@ -1733,7 +1733,7 @@ mod tests {
         // Simulate BGP session reaching Established (GoBGP peer).
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
         }
 
         // Simulate GoBGP sending 3 routes (like exchange script phase 1).
@@ -1801,7 +1801,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
         }
 
         // Inject a route into loc_rib via origination (simulates phase 2).
@@ -2172,7 +2172,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, PeerType::External, 65002, 90, &[]);
+            s.on_established(addr, PeerType::External, 65002, 90, &[], None);
             let n = nlri6("2001:db8::/32");
             s.rib_mut()
                 .loc_rib_v6
@@ -2200,7 +2200,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, PeerType::External, 65002, 90, &[]);
+            s.on_established(addr, PeerType::External, 65002, 90, &[], None);
             let n = nlri6("2001:db8::/32");
             s.rib_mut()
                 .loc_rib_v6
@@ -2595,7 +2595,7 @@ mod tests {
     async fn test_watch_routes_with_routes_yields_current_events() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, pathvector_types::PeerType::External, 65002, 90, &[]);
+        s.on_established(addr, pathvector_types::PeerType::External, 65002, 90, &[], None);
         let n = nlri("192.0.2.0/24");
         s.rib_mut().loc_rib.insert(
             peer(addr.to_string().as_str()),
@@ -2638,7 +2638,7 @@ mod tests {
         let mut route_rx = state.read().await.route_tx.subscribe();
 
         let mut s = state.write().await;
-        s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+        s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
 
         let announced = vec![nlri("10.0.0.0/8"), nlri("172.16.0.0/12")];
         s.on_route_update(
@@ -2687,7 +2687,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
             s.on_route_update(
                 peer_ip,
                 UpdateMessage {
@@ -2744,7 +2744,7 @@ mod tests {
         let mut peer_rx = state.read().await.peer_tx.subscribe();
 
         let mut s = state.write().await;
-        s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+        s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
 
         // Drain the PeerEvent fired by on_established.
         drop(s);
@@ -2785,7 +2785,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
             s.on_route_update(
                 peer_ip,
                 UpdateMessage {
@@ -2893,7 +2893,7 @@ mod tests {
         // works without hitting the RwLock deadlock.
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, PeerType::External, 65001, 90, &[]);
+            s.on_established(peer_ip, PeerType::External, 65001, 90, &[], None);
             s.on_route_update(
                 peer_ip,
                 UpdateMessage {
