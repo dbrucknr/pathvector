@@ -388,8 +388,8 @@ external information not available at the RIB layer:
 
 | Step | Criterion | Status |
 |---|---|---|
-| 1 | Prefer routes with a reachable next-hop | ❌ Blocked on FIB integration — the RIB needs to know which next-hops are reachable |
-| 8 | Prefer route with lowest IGP metric to next-hop | ❌ Blocked on FIB integration — same dependency as step 1 |
+| 1 | Prefer routes with a reachable next-hop | ⚠️ `NextHopOracle` trait exists; `AlwaysReachable` stub — needs FIB integration |
+| 8 | Prefer route with lowest IGP metric to next-hop | ⚠️ `NextHopOracle::igp_metric` wired into decision process; stub returns `None` — needs FIB |
 
 Steps 3 (locally-originated routes prefer over learned) and 7 (eBGP over iBGP) are
 **done** — both are handled by the `PeerType` ordering (`Local > External > Internal`)
@@ -428,12 +428,14 @@ enable (`maximum-paths` knob).
 
 ### Route reflector support
 
-Intra-cluster route reflection (RFC 4456) requires the RIB to track:
-- `ORIGINATOR_ID` (type 9) — the router-id of the originating route reflector client
-- `CLUSTER_LIST` (type 10) — the sequence of cluster IDs the route has passed through
-
-Loop prevention in a route reflector topology uses these attributes instead
-of (or in addition to) the AS path.
+**Done (2026-06-14).** Full RFC 4456 route reflector implementation:
+- `ORIGINATOR_ID` (type 9) and `CLUSTER_LIST` (type 10) codec in `pathvector-session`
+- `Route<A>` carries both fields through the RIB
+- `is_rr_client = true` in peer config + optional `cluster_id` in daemon config
+- Inbound: loop detection, ORIGINATOR_ID set on first reflection, CLUSTER_LIST prepend
+- Outbound: ORIGINATOR_ID / CLUSTER_LIST included in reflected UPDATE attributes
+- Split-horizon: client→client, client↔non-client reflect; non-client→non-client blocked
+- 6 new unit tests covering all split-horizon cases and attribute encoding
 
 ### FIB integration (Netlink / kernel route installation)
 

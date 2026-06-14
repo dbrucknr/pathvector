@@ -90,6 +90,29 @@ from/to eBGP peers. Accept all routes from/to iBGP peers.
 
 ---
 
+## RFC 4456 — BGP Route Reflection
+
+**Owns:** Route Reflector configuration, inbound attribute processing (ORIGINATOR_ID,
+CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the propagation loop, and
+outbound inclusion of reflection attributes in UPDATE messages.  
+**Boundary:** ORIGINATOR_ID / CLUSTER_LIST wire codec lives in `pathvector-session`.
+Route struct fields for carrying the attributes live in `pathvector-rib`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4456
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `is_rr_client` peer config flag + `cluster_id` daemon config | `src/config.rs` | ✅ | `test_config_rr_client_field_default_false` (config tests) |
+| Loop detection: discard UPDATE if our `cluster_id` in CLUSTER_LIST | `src/daemon.rs` | ✅ | `test_rr_loop_detection_discards_update` |
+| ORIGINATOR_ID set to client's BGP ID on first reflection | `src/daemon.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
+| cluster_id prepended to CLUSTER_LIST on each reflection | `src/daemon.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
+| Client → all other clients: reflect (not back to originating client) | `src/daemon.rs` | ✅ | `test_rr_client_route_reflected_to_other_client` |
+| Client → non-client iBGP peers: reflect | `src/daemon.rs` | ✅ | `test_rr_client_route_reflected_to_non_client_ibgp` |
+| Non-client iBGP → clients: reflect | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_route_reflected_to_client` |
+| Non-client iBGP → non-client iBGP: blocked (standard split-horizon) | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_to_non_client_ibgp_still_blocked` |
+| ORIGINATOR_ID + CLUSTER_LIST included in outbound UPDATE attributes | `src/outbound.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
+
+---
+
 ## RFC 4271 §8 — Connection Collision Coordination
 
 **Owns:** The FSM-level decision of which session to keep when two peers simultaneously
