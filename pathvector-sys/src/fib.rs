@@ -311,121 +311,88 @@ impl KernelFib {
 /// route; `RTM_DELROUTE` removes it. All routes are tagged with
 /// `RTPROT_BGP` so they are distinguishable from static or IGP routes.
 ///
-/// On non-Linux platforms all methods compile but are no-ops, preserving the
-/// API surface so `pathvectord` can use `FibWriter` unconditionally.
+/// On non-Linux platforms all methods are no-ops, preserving the API surface
+/// so `pathvectord` can use `FibWriter` unconditionally.
+#[cfg(target_os = "linux")]
 pub struct FibWriter {
-    #[cfg(target_os = "linux")]
     handle: rtnetlink::Handle,
-    #[cfg(target_os = "linux")]
     table: u32,
-    #[cfg(target_os = "linux")]
     metric: u32,
 }
 
+#[cfg(not(target_os = "linux"))]
+pub struct FibWriter;
+
+#[cfg(target_os = "linux")]
 impl FibWriter {
     /// Opens a netlink connection and returns a `FibWriter` for `table` / `metric`.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the netlink socket cannot be created (Linux only).
+    /// Returns an I/O error if the netlink socket cannot be created.
     pub fn new(table: u32, metric: u32) -> std::io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            let (conn, handle, _) = rtnetlink::new_connection()?;
-            tokio::spawn(conn);
-            Ok(Self { handle, table, metric })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (table, metric);
-            Ok(Self {})
-        }
+        let (conn, handle, _) = rtnetlink::new_connection()?;
+        tokio::spawn(conn);
+        Ok(Self { handle, table, metric })
     }
 
     /// Install (or replace) an IPv4 prefix route via `gateway`.
     ///
     /// Uses `NLM_F_REPLACE` so duplicate announcements from BGP are idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the netlink call fails (Linux only).
-    #[allow(clippy::unused_async)]
     pub async fn install_v4(
         &self,
         dst: Ipv4Addr,
         prefix_len: u8,
         gateway: Ipv4Addr,
     ) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::install_route_v4(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
-                .await
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (dst, prefix_len, gateway);
-            Ok(())
-        }
+        linux::install_route_v4(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
+            .await
     }
 
     /// Remove an IPv4 prefix route from the kernel FIB.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the netlink call fails (Linux only).
-    #[allow(clippy::unused_async)]
     pub async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::withdraw_route_v4(&self.handle, dst, prefix_len, self.table).await
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (dst, prefix_len);
-            Ok(())
-        }
+        linux::withdraw_route_v4(&self.handle, dst, prefix_len, self.table).await
     }
 
     /// Install (or replace) an IPv6 prefix route via `gateway`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the netlink call fails (Linux only).
-    #[allow(clippy::unused_async)]
     pub async fn install_v6(
         &self,
         dst: Ipv6Addr,
         prefix_len: u8,
         gateway: Ipv6Addr,
     ) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::install_route_v6(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
-                .await
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (dst, prefix_len, gateway);
-            Ok(())
-        }
+        linux::install_route_v6(&self.handle, dst, prefix_len, gateway, self.table, self.metric)
+            .await
     }
 
     /// Remove an IPv6 prefix route from the kernel FIB.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the netlink call fails (Linux only).
-    #[allow(clippy::unused_async)]
     pub async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::withdraw_route_v6(&self.handle, dst, prefix_len, self.table).await
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (dst, prefix_len);
-            Ok(())
-        }
+        linux::withdraw_route_v6(&self.handle, dst, prefix_len, self.table).await
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl FibWriter {
+    /// No-op on non-Linux platforms; accepts the same arguments so call sites
+    /// need no `#[cfg]` gates.
+    pub fn new(_table: u32, _metric: u32) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub async fn install_v4(&self, _dst: Ipv4Addr, _prefix_len: u8, _gateway: Ipv4Addr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub async fn withdraw_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub async fn install_v6(&self, _dst: Ipv6Addr, _prefix_len: u8, _gateway: Ipv6Addr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub async fn withdraw_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
