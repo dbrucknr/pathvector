@@ -111,24 +111,22 @@ Tests: `test_unexpected_message_in_open_sent_sends_fsm_error_subcode_1`,
 
 ### Tier 3 — Larger scope, important but not blocking
 
-**7. BIRD 2 interoperability**
-BIRD is the most widely deployed open-source BGP implementation (IXPs, hosting
-providers, research networks) and is stricter than GoBGP about RFC compliance.
-Running the existing e2e suite against BIRD would surface any GoBGP-specific
-leniency the implementation currently relies on.
+**7. BIRD 2 interoperability** ✅ Done (2026-06-14)
+BIRD 2 interoperability is fully implemented. `e2e/Dockerfile.bird`, `e2e/fixtures/bird.conf`,
+and `BirdHarness` in `e2e/src/lib.rs` are all in place. Eight e2e tests pass against BIRD:
 
-Infrastructure needed:
-- `e2e/Dockerfile.bird` — Alpine image with `bird2` package; tiny, fast boot
-- `e2e/bird.conf.tmpl` — per-test config template (router id, AS, neighbor, filter)
-- `BirdHarness` in `e2e/src/lib.rs` or a `peer: PeerKind` enum on the existing `Harness`
-- CLI wrapper: `birdc show route` / `birdc show protocols all` for route/state queries
+- `bird_static_route_appears_in_pathvectord_rib`
+- `bird_multiple_static_routes_appear_in_pathvectord_rib`
+- `pathvectord_originated_route_reaches_bird`
+- `pathvectord_ebgp_next_hop_is_session_local_addr_not_router_id`
+- `bird_route_has_correct_peer_address`
+- (additional session + route lifecycle tests)
 
-The `Harness` abstraction generalises cleanly — the same session/route/policy/auth
-test scenarios should pass against BIRD unchanged if the protocol implementation is
-correct. Any test that passes GoBGP but fails BIRD is a real bug worth fixing.
-
-Distinct value: BIRD enforces UPDATE attribute ordering and rejects malformed
-attributes that GoBGP silently accepts. Most likely surface for hidden bugs.
+This work also surfaced and fixed RFC 4271 §5.1.3 bug: pathvectord was advertising the
+BGP router ID (`bgp_id`) as the eBGP NEXT_HOP instead of the TCP session's local interface
+address. BIRD rejected the routes; GoBGP silently accepted them. Fix: the TCP
+`local_addr()` is now threaded through `Session<T>` → `SessionInfo` → `on_established`
+→ `RibSnapshot::local_addrs` and used as the NEXT_HOP in `prepare_outbound`.
 
 **8. FRR (FRRouting) interoperability**
 FRR is what Cloudflare, Facebook, and most modern network hardware runs for BGP.
@@ -221,7 +219,7 @@ integration rather than direct unit tests.
   policy enforcement, origination, withdrawal, and multi-peer topologies.
 - Tests use the full stack: `pathvectord` binary inside a container, GoBGP as the peer,
   `PathvectorClient` gRPC API for assertions.
-- _Gap_: BIRD and FRR interoperability (stricter RFC compliance than GoBGP). See Tier 3, items 7 and 8.
+- _Gap_: FRR interoperability (stricter RFC compliance than GoBGP). BIRD is done (Tier 3 item 7). See Tier 3 item 8 for FRR.
 
 **Dependency inversion progress**
 
@@ -376,12 +374,9 @@ Remaining e2e work:
   Also fixed: `get_best_route` gRPC handler now queries `loc_rib_v6` for IPv6 prefixes;
   `originate_route`/`originate_routes` dispatch to `originate_route_v6` for IPv6 prefixes.
 
-- **BIRD interoperability** — add a second peer implementation. BIRD is stricter about RFC
-  compliance than GoBGP (it's the reference implementation for many IXP route servers) and
-  will catch things GoBGP tolerates. A `e2e/Dockerfile.bird` wrapping the official BIRD
-  package + `e2e/fixtures/bird.conf` is all that's needed; the `Harness` architecture already
-  supports multiple peer images. Target: run the same 10 session + route tests against BIRD
-  to confirm the handshake and UPDATE exchange is broadly interoperable, not just GoBGP-specific.
+- **BIRD interoperability** ✅ Done (2026-06-14) — `BirdHarness`, `e2e/Dockerfile.bird`,
+  `e2e/fixtures/bird.conf`, 8 BIRD e2e tests. Also surfaced and fixed RFC 4271 §5.1.3
+  NEXT_HOP bug (router-id used instead of TCP session local address).
 
 ## pathvector-rib
 

@@ -5,7 +5,7 @@ transport. It reads bytes off the wire and produces structured events; it writes
 structured messages back to bytes. It has no routing logic and no RIB state.
 
 **Status key:** ✅ Implemented and tested | ⚠️ Partial — see notes | ❌ Not started  
-**Verified by key:** `test_name` — unit test | `proptest` — property test | `interop:x` — GoBGP interop | `—` — no automated verification
+**Verified by key:** `test_name` — unit test | `proptest` — property test | `interop:x` — GoBGP/BIRD interop | `—` — no automated verification
 
 ---
 
@@ -18,23 +18,23 @@ Decision-making on received routes lives in `pathvector-rib`.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| 19-byte header: 16-byte all-ones marker, 2-byte length, 1-byte type | `src/codec.rs` | ✅ | `test_header_roundtrip`, `test_header_bad_marker` |
-| OPEN message encode/decode: version, my-as, hold-time, bgp-id, optional-params | `src/codec.rs` | ✅ | `test_open_roundtrip`, `test_open_invalid_version`, interop:gobgp |
-| UPDATE message encode/decode: withdrawn-routes, path-attributes, NLRI | `src/codec.rs` | ✅ | `test_update_roundtrip`, `test_update_empty`, interop:gobgp |
-| NOTIFICATION message encode/decode: error-code, error-subcode, data | `src/codec.rs` | ✅ | `test_notification_roundtrip`, `test_notification_cease` |
-| KEEPALIVE message encode/decode (header only, no body) | `src/codec.rs` | ✅ | `test_keepalive_roundtrip` |
-| Attribute flags: Optional, Transitive, Partial, Extended-Length | `src/codec.rs` | ✅ | `test_attribute_flags_roundtrip`, `test_extended_length_attribute` |
-| ORIGIN (type 1) encode/decode | `src/codec.rs` | ✅ | `test_attr_origin_roundtrip` |
-| AS_PATH (type 2) encode/decode with AS_SEQUENCE and AS_SET segments | `src/codec.rs` | ✅ | `test_attr_aspath_roundtrip`, `test_attr_aspath_with_set` |
-| NEXT_HOP (type 3) encode/decode | `src/codec.rs` | ✅ | `test_attr_next_hop_roundtrip` |
-| MULTI_EXIT_DISC (type 4) encode/decode | `src/codec.rs` | ✅ | `test_attr_med_roundtrip` |
-| LOCAL_PREF (type 5) encode/decode | `src/codec.rs` | ✅ | `test_attr_local_pref_roundtrip` |
-| ATOMIC_AGGREGATE (type 6) encode/decode | `src/codec.rs` | ✅ | `test_attr_atomic_aggregate_roundtrip` |
-| AGGREGATOR (type 7) encode/decode | `src/codec.rs` | ✅ | `test_attr_aggregator_roundtrip` |
-| COMMUNITY (type 8) encode/decode — RFC 1997 | `src/codec.rs` | ✅ | `test_attr_community_roundtrip` |
-| EXTENDED_COMMUNITIES (type 16) encode/decode — RFC 4360 | `src/codec.rs` | ✅ | `test_attr_extended_community_roundtrip` |
-| LARGE_COMMUNITY (type 32) encode/decode — RFC 8092 | `src/codec.rs` | ✅ | `test_attr_large_community_roundtrip` |
-| Unknown optional transitive attributes preserved in Partial flag | `src/codec.rs` | ✅ | `test_unknown_optional_transitive_preserved` |
+| 19-byte header: 16-byte all-ones marker, 2-byte length, 1-byte type | `src/message/` | ✅ | `test_header_roundtrip`, `test_header_bad_marker` |
+| OPEN message encode/decode: version, my-as, hold-time, bgp-id, optional-params | `src/message/` | ✅ | `test_open_roundtrip`, `test_open_invalid_version`, interop:gobgp |
+| UPDATE message encode/decode: withdrawn-routes, path-attributes, NLRI | `src/message/` | ✅ | `test_update_roundtrip`, `test_update_empty`, interop:gobgp |
+| NOTIFICATION message encode/decode: error-code, error-subcode, data | `src/message/` | ✅ | `test_notification_roundtrip`, `test_notification_cease` |
+| KEEPALIVE message encode/decode (header only, no body) | `src/message/` | ✅ | `test_keepalive_roundtrip` |
+| Attribute flags: Optional, Transitive, Partial, Extended-Length | `src/message/` | ✅ | `test_attribute_flags_roundtrip`, `test_extended_length_attribute` |
+| ORIGIN (type 1) encode/decode | `src/message/` | ✅ | `test_attr_origin_roundtrip` |
+| AS_PATH (type 2) encode/decode with AS_SEQUENCE and AS_SET segments | `src/message/` | ✅ | `test_attr_aspath_roundtrip`, `test_attr_aspath_with_set` |
+| NEXT_HOP (type 3) encode/decode | `src/message/` | ✅ | `test_attr_next_hop_roundtrip` |
+| MULTI_EXIT_DISC (type 4) encode/decode | `src/message/` | ✅ | `test_attr_med_roundtrip` |
+| LOCAL_PREF (type 5) encode/decode | `src/message/` | ✅ | `test_attr_local_pref_roundtrip` |
+| ATOMIC_AGGREGATE (type 6) encode/decode | `src/message/` | ✅ | `test_attr_atomic_aggregate_roundtrip` |
+| AGGREGATOR (type 7) encode/decode | `src/message/` | ✅ | `test_attr_aggregator_roundtrip` |
+| COMMUNITY (type 8) encode/decode — RFC 1997 | `src/message/` | ✅ | `test_attr_community_roundtrip` |
+| EXTENDED_COMMUNITIES (type 16) encode/decode — RFC 4360 | `src/message/` | ✅ | `test_attr_extended_community_roundtrip` |
+| LARGE_COMMUNITY (type 32) encode/decode — RFC 8092 | `src/message/` | ✅ | `test_attr_large_community_roundtrip` |
+| Unknown optional transitive attributes preserved in Partial flag | `src/message/` | ✅ | `test_unknown_optional_transitive_preserved` |
 
 ---
 
@@ -48,15 +48,14 @@ keep.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Idle → Connect on Start event | `src/session.rs` | ✅ | `test_fsm_start_transitions_to_connect` |
-| Connect → OpenSent on TCP connection established | `src/session.rs` | ✅ | interop:gobgp |
-| Connect → Active on ConnectRetry expiry | `src/session.rs` | ✅ | `test_fsm_connect_retry_timeout` |
-| OpenSent → OpenConfirm on valid OPEN received | `src/session.rs` | ✅ | interop:gobgp |
-| OpenConfirm → Established on KEEPALIVE received | `src/session.rs` | ✅ | interop:gobgp |
-| Any state → Idle on Hold Timer expiry | `src/session.rs` | ✅ | `test_fsm_hold_timer_expiry` |
-| Keepalive timer fires at ⌊hold-time / 3⌋ seconds | `src/session.rs` | ✅ | `test_keepalive_interval_derivation` |
-| NOTIFICATION sent before session close | `src/session.rs` | ✅ | `test_fsm_sends_notification_on_error` |
-| Hold time of 0 disables hold timer and keepalive | `src/session.rs` | ✅ | `test_hold_time_zero_disables_timers` |
+| Idle → Connect on Start event | `src/fsm/mod.rs` | ✅ | `test_manual_start_enters_connect` |
+| Connect → OpenSent on TCP connection established | `src/fsm/mod.rs` | ✅ | `test_tcp_connected_sends_open`, interop:gobgp, interop:bird |
+| OpenSent → OpenConfirm on valid OPEN received | `src/fsm/mod.rs` | ✅ | `test_receive_open_sends_keepalive_enters_open_confirm`, interop:gobgp, interop:bird |
+| OpenConfirm → Established on KEEPALIVE received | `src/fsm/mod.rs` | ✅ | `test_receive_keepalive_enters_established`, interop:gobgp, interop:bird |
+| Any state → Idle on Hold Timer expiry | `src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_established`, `test_hold_timer_expired_in_open_sent` |
+| Keepalive timer fires at ⌊hold-time / 3⌋ seconds | `src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time` |
+| NOTIFICATION sent before session close | `src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification`, `test_unacceptable_hold_time_sends_notification` |
+| Hold time of 0 disables hold timer and keepalive | `src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |
 
 ---
 
@@ -68,12 +67,12 @@ the attribute, when to reset the session.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Malformed ORIGIN: treat-as-withdraw | `src/codec.rs` | ✅ | `test_rfc7606_malformed_origin_treat_as_withdraw` |
-| Malformed AS_PATH: treat-as-withdraw | `src/codec.rs` | ✅ | `test_rfc7606_malformed_aspath_treat_as_withdraw` |
-| Malformed NEXT_HOP: treat-as-withdraw | `src/codec.rs` | ✅ | `test_rfc7606_malformed_next_hop_treat_as_withdraw` |
-| Malformed LOCAL_PREF: treat-as-withdraw | `src/codec.rs` | ✅ | `test_rfc7606_malformed_local_pref_treat_as_withdraw` |
-| Unknown optional non-transitive attribute: attribute-discard | `src/codec.rs` | ✅ | `test_rfc7606_unknown_optional_nontransitive_discarded` |
-| Unknown mandatory attribute: session-reset with NOTIFICATION | `src/codec.rs` | ✅ | `test_rfc7606_missing_mandatory_resets_session` |
+| Malformed ORIGIN: treat-as-withdraw | `src/message/` | ✅ | `test_rfc7606_malformed_origin_treat_as_withdraw` |
+| Malformed AS_PATH: treat-as-withdraw | `src/message/` | ✅ | `test_rfc7606_malformed_aspath_treat_as_withdraw` |
+| Malformed NEXT_HOP: treat-as-withdraw | `src/message/` | ✅ | `test_rfc7606_malformed_next_hop_treat_as_withdraw` |
+| Malformed LOCAL_PREF: treat-as-withdraw | `src/message/` | ✅ | `test_rfc7606_malformed_local_pref_treat_as_withdraw` |
+| Unknown optional non-transitive attribute: attribute-discard | `src/message/` | ✅ | `test_rfc7606_unknown_optional_nontransitive_discarded` |
+| Unknown mandatory attribute: session-reset with NOTIFICATION | `src/message/` | ✅ | `test_rfc7606_missing_mandatory_resets_session` |
 
 ---
 
@@ -84,8 +83,8 @@ the attribute, when to reset the session.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Capability code 2 advertised in OPEN | `src/codec.rs` | ✅ | `test_capability_route_refresh_in_open` |
-| ROUTE-REFRESH message (type 5) encode/decode with AFI + reserved + SAFI | `src/codec.rs` | ✅ | `test_route_refresh_roundtrip` |
+| Capability code 2 advertised in OPEN | `src/message/` | ✅ | `test_capability_route_refresh_in_open` |
+| ROUTE-REFRESH message (type 5) encode/decode with AFI + reserved + SAFI | `src/message/` | ✅ | `test_route_refresh_roundtrip` |
 
 ---
 
@@ -98,9 +97,9 @@ list; NOTIFICATION for unsupported capabilities.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Optional parameter type 2 TLV parsed as capability list | `src/codec.rs` | ✅ | `test_capability_tlv_roundtrip` |
-| NOTIFICATION error code 2 subcode 7 (Unsupported Capability) on mismatch | `src/codec.rs` | ✅ | `test_unsupported_capability_notification` |
-| Retry without capabilities (when peer sends Unsupported Capability NOTIFICATION) | `src/session.rs` | ❌ | — |
+| Optional parameter type 2 TLV parsed as capability list | `src/message/` | ✅ | `test_capability_tlv_roundtrip` |
+| NOTIFICATION error code 2 subcode 7 (Unsupported Capability) on mismatch | `src/message/` | ✅ | `test_unsupported_capability_notification` |
+| Retry without capabilities (when peer sends Unsupported Capability NOTIFICATION) | `src/fsm/mod.rs` | ❌ | — |
 
 **Deferred:** Retry-without-capabilities path: when the peer sends NOTIFICATION error 2/7,
 we should reconnect advertising no optional parameters. Not yet implemented.
@@ -117,10 +116,10 @@ multiprotocol routes (inserting into AdjRibIn, propagating) lives in `pathvector
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| MP_REACH_NLRI (type 14): AFI, SAFI, next-hop length, next-hop, SNPA, NLRI | `src/codec.rs` | ✅ | `test_mp_reach_ipv6_roundtrip`, interop:gobgp |
-| MP_UNREACH_NLRI (type 15): AFI, SAFI, withdrawn NLRI | `src/codec.rs` | ✅ | `test_mp_unreach_ipv6_roundtrip` |
-| IPv6 global unicast next-hop (16-byte form) | `src/codec.rs` | ✅ | `test_mp_reach_ipv6_roundtrip` |
-| IPv6 link-local next-hop (32-byte form: global + link-local) | `src/codec.rs` | ✅ | `test_mp_reach_ipv6_link_local_roundtrip` |
+| MP_REACH_NLRI (type 14): AFI, SAFI, next-hop length, next-hop, SNPA, NLRI | `src/message/` | ✅ | `test_mp_reach_ipv6_roundtrip`, interop:gobgp |
+| MP_UNREACH_NLRI (type 15): AFI, SAFI, withdrawn NLRI | `src/message/` | ✅ | `test_mp_unreach_ipv6_roundtrip` |
+| IPv6 global unicast next-hop (16-byte form) | `src/message/` | ✅ | `test_mp_reach_ipv6_roundtrip` |
+| IPv6 link-local next-hop (32-byte form: global + link-local) | `src/message/` | ✅ | `test_mp_reach_ipv6_link_local_roundtrip` |
 
 ---
 
@@ -133,9 +132,9 @@ multiprotocol routes (inserting into AdjRibIn, propagating) lives in `pathvector
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| FourByteAsn capability (code 65) advertised in OPEN | `src/codec.rs` | ✅ | `test_capability_four_byte_asn_in_open`, interop:gobgp |
-| When local ASN > 65535, 2-byte `my_as` field set to AS_TRANS (23456) | `src/codec.rs` | ✅ | `test_open_my_as_uses_as_trans_for_4byte_asn` |
-| Four-byte ASN read from NEW_AS4_PATH when peer did not send FourByteAsn cap | `src/codec.rs` | ⚠️ | `test_new_as4_path_fallback` |
+| FourByteAsn capability (code 65) advertised in OPEN | `src/message/` | ✅ | `test_capability_four_byte_asn_in_open`, interop:gobgp |
+| When local ASN > 65535, 2-byte `my_as` field set to AS_TRANS (23456) | `src/message/` | ✅ | `test_open_my_as_uses_as_trans_for_4byte_asn` |
+| Four-byte ASN read from NEW_AS4_PATH when peer did not send FourByteAsn cap | `src/message/` | ⚠️ | `test_new_as4_path_fallback` |
 
 **Deferred:** Full NEW_AS4_PATH fallback path (when negotiating with a 2-byte-only peer)
 is partially tested but the segment merging logic per RFC 6793 §4.2.3 is not complete.
@@ -149,7 +148,7 @@ is partially tested but the segment merging logic per RFC 6793 §4.2.3 is not co
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Duplicate iBGP BGP-ID rejected with NOTIFICATION (OPEN error, Bad BGP Identifier) | `src/session.rs` | ✅ | `test_duplicate_bgp_id_rejected`, interop:gobgp |
+| Duplicate iBGP BGP-ID rejected with NOTIFICATION (OPEN error, Bad BGP Identifier) | `src/fsm/mod.rs` | ✅ | `test_duplicate_bgp_id_rejected`, interop:gobgp |
 
 ---
 
@@ -161,10 +160,10 @@ The FSM restart behavior is deferred.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| GracefulRestart capability (code 64) parsed from OPEN | `src/codec.rs` | ✅ | `test_capability_graceful_restart_parsed` |
-| Capability forwarded to `SessionInfo` for upper layers | `src/session.rs` | ✅ | `test_session_info_carries_graceful_restart` |
-| Stale timer: retain routes for restart-time seconds during restart | `src/session.rs` | ❌ | — |
-| EOR (End-of-RIB) marker: empty UPDATE sent after RIB dump | `src/codec.rs` | ❌ | — |
+| GracefulRestart capability (code 64) parsed from OPEN | `src/message/` | ✅ | `test_capability_graceful_restart_parsed` |
+| Capability forwarded to `SessionInfo` for upper layers | `src/fsm/mod.rs` | ✅ | `test_session_info_carries_graceful_restart` |
+| Stale timer: retain routes for restart-time seconds during restart | `src/fsm/mod.rs` | ❌ | — |
+| EOR (End-of-RIB) marker: empty UPDATE sent after RIB dump | `src/message/` | ❌ | — |
 
 **Deferred:** FSM restart behavior (detecting peer restart, activating stale timer, sending
 EOR) requires coordination with `pathvector-rib` and is deferred.
@@ -178,16 +177,16 @@ EOR) requires coordination with `pathvector-rib` and is deferred.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Subcode 1: Maximum Number of Prefixes Reached | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 2: Administrative Shutdown | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 3: Peer De-configured | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 4: Administrative Reset | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 5: Connection Rejected | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 6: Other Configuration Change | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 7: Connection Collision Resolution | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 8: Out of Resources | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 9: Hard Reset | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
-| Subcode 10: BFD Down | `src/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 1: Maximum Number of Prefixes Reached | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 2: Administrative Shutdown | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 3: Peer De-configured | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 4: Administrative Reset | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 5: Connection Rejected | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 6: Other Configuration Change | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 7: Connection Collision Resolution | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 8: Out of Resources | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 9: Hard Reset | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
+| Subcode 10: BFD Down | `src/message/notification.rs` | ✅ | `test_cease_subcodes_all_defined` |
 
 ---
 
@@ -199,10 +198,10 @@ EOR) requires coordination with `pathvector-rib` and is deferred.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| FSM error subcode 0: Unspecified Error | `src/notification.rs` | ✅ | `test_fsm_error_subcodes_all_defined` |
-| FSM error subcode 1: Receive Unexpected Message in OpenSent State | `src/notification.rs` | ✅ | `test_fsm_error_subcodes_all_defined` |
-| FSM error subcode 2: Receive Unexpected Message in OpenConfirm State | `src/notification.rs` | ✅ | `test_fsm_error_subcodes_all_defined` |
-| FSM error subcode 3: Receive Unexpected Message in Established State | `src/notification.rs` | ✅ | `test_fsm_error_subcodes_all_defined` |
+| FSM error subcode 0: Unspecified Error | `src/message/notification.rs` | ✅ | `test_fsm_error_subcodes_all_defined` |
+| FSM error subcode 1: Receive Unexpected Message in OpenSent State | `src/fsm/mod.rs` | ✅ | `test_fsm_error_subcodes_all_defined`, `test_unexpected_message_in_open_sent_sends_fsm_error_subcode_1` |
+| FSM error subcode 2: Receive Unexpected Message in OpenConfirm State | `src/fsm/mod.rs` | ✅ | `test_fsm_error_subcodes_all_defined`, `test_unexpected_message_in_open_confirm_sends_fsm_error_subcode_2` |
+| FSM error subcode 3: Receive Unexpected Message in Established State | `src/fsm/mod.rs` | ✅ | `test_fsm_error_subcodes_all_defined`, `test_unexpected_message_in_established_sends_fsm_error_subcode_3` |
 
 ---
 
@@ -214,9 +213,9 @@ EOR) requires coordination with `pathvector-rib` and is deferred.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| ExtendedMessage capability (code 6) decoded from OPEN | `src/codec.rs` | ✅ | `test_capability_extended_message_parsed` |
-| Message size limit raised to 65535 when both peers advertise capability | `src/codec.rs` | ✅ | `test_extended_message_limit_applies_when_negotiated`, interop:gobgp |
-| Message size limit stays at 4096 when capability not negotiated | `src/codec.rs` | ✅ | `test_message_limit_4096_without_extended_message_cap` |
+| ExtendedMessage capability (code 6) decoded from OPEN | `src/message/` | ✅ | `test_capability_extended_message_parsed` |
+| Message size limit raised to 65535 when both peers advertise capability | `src/message/` | ✅ | `test_extended_message_limit_applies_when_negotiated`, interop:gobgp |
+| Message size limit stays at 4096 when capability not negotiated | `src/message/` | ✅ | `test_message_limit_4096_without_extended_message_cap` |
 
 ---
 
