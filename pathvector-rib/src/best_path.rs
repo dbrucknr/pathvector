@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::HashMap};
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::{LocalPref, PeerType};
 
-use crate::{peer::PeerId, route::Route};
+use crate::{oracle::{AlwaysReachable, NextHopOracle}, peer::PeerId, route::Route};
 
 /// Selects the best route from a set of candidates using the BGP decision
 /// process (RFC 4271 §9.1).
@@ -52,23 +52,71 @@ use crate::{peer::PeerId, route::Route};
 pub fn select_best<A: IpAddress, S: std::hash::BuildHasher>(
     candidates: &HashMap<PeerId, Route<A>, S>,
 ) -> Option<(PeerId, &Route<A>)> {
+    select_best_with_oracle(candidates, &AlwaysReachable)
+}
+
+/// Like [`select_best`] but honours RFC 4271 §9.1 steps 1 and 8 via `oracle`.
+///
+/// Step 1: routes whose `NEXT_HOP` the oracle marks unreachable are excluded
+/// from the candidate set before comparison begins.
+///
+/// Step 8: when all higher-priority criteria tie, the route whose `NEXT_HOP`
+/// has the lower IGP metric (as reported by the oracle) is preferred. If the
+/// oracle returns `None` for either route the step is skipped.
+///
+/// Passing [`AlwaysReachable`] produces identical results to [`select_best`].
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::net::{IpAddr, Ipv4Addr};
+/// use pathvector_rib::{PeerId, RouteBuilder, best_path::select_best_with_oracle};
+/// use pathvector_rib::oracle::{AlwaysReachable, NextHopOracle};
+/// use pathvector_types::{AsPath, Nlri, NextHop, Origin};
+///
+/// let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+/// let peer = PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+///
+/// let mut candidates = HashMap::new();
+/// candidates.insert(peer, RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+///     .next_hop(NextHop::V4(Ipv4Addr::new(192, 0, 2, 1)))
+///     .build());
+///
+/// // With AlwaysReachable the route is kept.
+/// assert!(select_best_with_oracle(&candidates, &AlwaysReachable).is_some());
+/// ```
+#[must_use]
+pub fn select_best_with_oracle<'a, A: IpAddress, S: std::hash::BuildHasher>(
+    candidates: &'a HashMap<PeerId, Route<A>, S>,
+    oracle: &dyn NextHopOracle,
+) -> Option<(PeerId, &'a Route<A>)> {
     candidates
         .iter()
-        .max_by(|(peer_a, route_a), (peer_b, route_b)| prefer(peer_a, route_a, peer_b, route_b))
+        .filter(|(_, route)| {
+            // Step 1: exclude routes with unreachable next-hops.
+            route
+                .next_hop
+                .as_ref()
+                .map_or(true, |nh| oracle.is_reachable(nh))
+        })
+        .max_by(|(peer_a, route_a), (peer_b, route_b)| {
+            prefer(peer_a, route_a, peer_b, route_b, oracle)
+        })
         .map(|(peer, route)| (*peer, route))
 }
 
 /// Compares two (peer, route) pairs and returns the ordering from the
 /// perspective of route preference — `Ordering::Greater` means the first
 /// pair is preferred.
-///
-/// This function encodes the partial BGP decision process. Steps that require
-/// external information (IGP metrics, session type) are not implemented here;
-/// the caller may wrap this with additional logic.
-fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Route<A>) -> Ordering {
+fn prefer<A: IpAddress>(
+    peer_a: &PeerId,
+    a: &Route<A>,
+    peer_b: &PeerId,
+    b: &Route<A>,
+    oracle: &dyn NextHopOracle,
+) -> Ordering {
     // Step 2: Highest LOCAL_PREF (missing treated as the conventional default of 100).
-    // LOCAL_PREF is the most powerful inbound policy lever — an operator can
-    // force any route to win by setting this high enough.
     let lp = a
         .local_pref
         .unwrap_or(LocalPref::DEFAULT)
@@ -78,26 +126,18 @@ fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Rout
     }
 
     // Step 4: Shortest AS path length.
-    // Shorter paths are generally closer to the destination. This is the
-    // main tool for influencing inbound traffic from eBGP peers.
     let path_len = b.as_path.path_length().cmp(&a.as_path.path_length());
     if path_len != Ordering::Equal {
         return path_len; // reverse: shorter path_len(a) → Greater → preferred
     }
 
     // Step 5: Lowest ORIGIN value.
-    // IGP (0) > EGP (1) > INCOMPLETE (2) in preference, so a lower numeric
-    // value is better. We reverse the comparison to make Greater mean preferred.
     let origin = b.origin.cmp(&a.origin);
     if origin != Ordering::Equal {
         return origin; // reverse: lower origin → Greater → preferred
     }
 
     // Step 6: Lowest MED (Multi-Exit Discriminator).
-    // MED is a hint from a neighboring AS about which of their entry points
-    // to prefer. Lower is better. Missing MED is treated as 0 (prefer routes
-    // that explicitly set MED=0 equally with routes that omit it).
-    //
     // Note: Strictly speaking, MED should only be compared between routes
     // from the same neighboring AS. This implementation compares MED
     // globally. See TODO.md (deterministic-med, always-compare-med).
@@ -108,7 +148,7 @@ fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Rout
         return med; // reverse: lower MED → Greater → preferred
     }
 
-    // Step 3/7: Prefer locally originated routes, then eBGP over iBGP
+    // Steps 3/7: Prefer locally originated routes, then eBGP over iBGP
     // (RFC 4271 §9.1 steps 3 and 7).
     // PeerType discriminants encode the preference order:
     // Local (2) > External (1) > Internal (0).
@@ -117,11 +157,21 @@ fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Rout
         return session;
     }
 
+    // Step 8: Lowest IGP metric to NEXT_HOP (RFC 4271 §9.1.2.2 step 8).
+    // Skipped when the oracle returns None for either route (AlwaysReachable,
+    // or no FIB entry for the next-hop).
+    let metric_a = a.next_hop.as_ref().and_then(|nh| oracle.igp_metric(nh));
+    let metric_b = b.next_hop.as_ref().and_then(|nh| oracle.igp_metric(nh));
+    if let (Some(ma), Some(mb)) = (metric_a, metric_b) {
+        let metric = mb.cmp(&ma); // reverse: lower metric → Greater → preferred
+        if metric != Ordering::Equal {
+            return metric;
+        }
+    }
+
     // Step 9: Oldest eBGP route (RFC 4271 §9.1 step 9).
     // Only applies when both routes are eBGP — iBGP and local routes were
-    // resolved at step 3/7. Prefer the older, more stable route to reduce
-    // churn when all policy-relevant attributes are equal.
-    // Step 8 (IGP metric) is skipped — requires FIB integration.
+    // resolved at step 3/7.
     if a.peer_type == PeerType::External {
         let age = b.received_at.cmp(&a.received_at); // older (smaller Instant) → Greater
         if age != Ordering::Equal {
@@ -130,9 +180,6 @@ fn prefer<A: IpAddress>(peer_a: &PeerId, a: &Route<A>, peer_b: &PeerId, b: &Rout
     }
 
     // Step 10: Lowest peer IP address (final tie-breaker).
-    // When all policy-relevant attributes are equal, prefer the route from
-    // the numerically lower peer address. This is deterministic and stable
-    // across policy changes.
     peer_b.cmp(peer_a) // reverse: lower peer IP → Greater → preferred
 }
 
@@ -777,5 +824,143 @@ mod tests {
         candidates.insert(peer(2), new_ebgp);
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(2)); // eBGP wins at step 3/7 before step 9 fires
+    }
+}
+
+// ── NextHopOracle tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod oracle_tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pathvector_types::{AsPath, Nlri, NextHop, Origin};
+
+    use crate::{PeerId, RouteBuilder, best_path::select_best_with_oracle, oracle::NextHopOracle};
+
+    fn peer(last_octet: u8) -> PeerId {
+        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)))
+    }
+
+    fn nlri() -> Nlri<Ipv4Addr> {
+        "10.0.0.0/24".parse().unwrap()
+    }
+
+    fn nh(a: u8, b: u8, c: u8, d: u8) -> NextHop {
+        NextHop::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    // Oracle that rejects a single specific next-hop address.
+    struct RejectOracle(Ipv4Addr);
+
+    impl NextHopOracle for RejectOracle {
+        fn is_reachable(&self, next_hop: &NextHop) -> bool {
+            match next_hop {
+                NextHop::V4(ip) => *ip != self.0,
+                _ => true,
+            }
+        }
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> { None }
+    }
+
+    // Oracle that assigns a fixed metric to next-hops by last octet.
+    struct MetricOracle;
+
+    impl NextHopOracle for MetricOracle {
+        fn is_reachable(&self, _: &NextHop) -> bool { true }
+        fn igp_metric(&self, next_hop: &NextHop) -> Option<u32> {
+            match next_hop {
+                NextHop::V4(ip) => Some(u32::from(ip.octets()[3])),
+                _ => None,
+            }
+        }
+    }
+
+    /// Step 1: a route whose NEXT_HOP the oracle rejects is excluded from
+    /// best-path selection even if it would otherwise win on all other criteria.
+    #[test]
+    fn test_unreachable_next_hop_excluded_from_selection() {
+        let unreachable_nh = Ipv4Addr::new(192, 0, 2, 1);
+        let reachable_nh = Ipv4Addr::new(192, 0, 2, 2);
+
+        // peer(1) has a higher-metric LOCAL_PREF (would win step 2) but an
+        // unreachable NEXT_HOP, so it should be filtered out at step 1.
+        let winner_route = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(unreachable_nh))
+            .build();
+        let loser_route = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(reachable_nh))
+            .build();
+
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), winner_route); // unreachable next-hop
+        candidates.insert(peer(2), loser_route);  // reachable next-hop
+
+        let oracle = RejectOracle(unreachable_nh);
+        let (winner, _) = select_best_with_oracle(&candidates, &oracle).unwrap();
+        assert_eq!(winner, peer(2), "reachable route must win over unreachable");
+    }
+
+    /// Step 1: when all candidates have unreachable next-hops, no route is
+    /// selected (no best path).
+    #[test]
+    fn test_all_unreachable_returns_none() {
+        let bad = Ipv4Addr::new(192, 0, 2, 1);
+        let route = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(bad))
+            .build();
+
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), route);
+
+        let oracle = RejectOracle(bad);
+        assert!(
+            select_best_with_oracle(&candidates, &oracle).is_none(),
+            "no reachable candidates → no best path"
+        );
+    }
+
+    /// Step 8: when all other criteria tie, the route with the lower IGP
+    /// metric to its NEXT_HOP is preferred.
+    #[test]
+    fn test_step8_lower_igp_metric_preferred() {
+        // Both routes are otherwise identical; peer(1) has metric 10
+        // (next-hop last octet = 10), peer(2) has metric 20.
+        let route_low_metric = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(nh(192, 0, 2, 10)) // metric = 10
+            .build();
+        let route_high_metric = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(nh(192, 0, 2, 20)) // metric = 20
+            .build();
+
+        // Give the high-metric route the lower peer IP so step 10 would pick
+        // it without the oracle — step 8 must fire first.
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), route_high_metric); // lower IP, higher metric
+        candidates.insert(peer(2), route_low_metric);  // higher IP, lower metric
+
+        let (winner, _) = select_best_with_oracle(&candidates, &MetricOracle).unwrap();
+        assert_eq!(winner, peer(2), "lower IGP metric must win before step 10");
+    }
+
+    /// Step 8 is skipped when oracle returns None — falls through to step 10.
+    #[test]
+    fn test_step8_skipped_when_oracle_returns_none() {
+        use crate::oracle::AlwaysReachable;
+
+        let route_a = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(nh(192, 0, 2, 1))
+            .build();
+        let route_b = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .next_hop(nh(192, 0, 2, 2))
+            .build();
+
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), route_a); // lower IP
+        candidates.insert(peer(2), route_b);
+
+        // AlwaysReachable returns None for igp_metric → step 8 skipped → step 10 picks peer(1).
+        let (winner, _) = select_best_with_oracle(&candidates, &AlwaysReachable).unwrap();
+        assert_eq!(winner, peer(1), "step 10 (lower peer IP) should win when step 8 is skipped");
     }
 }
