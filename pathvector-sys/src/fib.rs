@@ -316,9 +316,9 @@ impl KernelFib {
 pub struct FibWriter {
     #[cfg(target_os = "linux")]
     handle: rtnetlink::Handle,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     table: u32,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     metric: u32,
 }
 
@@ -337,7 +337,8 @@ impl FibWriter {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(Self { table, metric })
+            let _ = (table, metric);
+            Ok(Self {})
         }
     }
 
