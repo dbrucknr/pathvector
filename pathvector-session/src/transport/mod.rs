@@ -285,9 +285,8 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
 /// connected instantly: the FSM receives `TcpConnected` and proceeds through
 /// the normal OPEN/KEEPALIVE handshake via the injected transport.
 ///
-/// Intended exclusively for tests that need a controllable transport without
-/// binding real TCP sockets.
-#[cfg(test)]
+/// Use this in tests that need a controllable transport without binding real
+/// TCP sockets, or in production integrations that supply their own I/O layer.
 pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> SpawnedSessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(64);
@@ -672,7 +671,7 @@ impl<T: BgpTransport> Session<T> {
 /// All announced IPv4 NLRIs are moved into `withdrawn`. Any `MP_REACH_NLRI`
 /// attributes are converted to `MP_UNREACH_NLRI` so that non-IPv4 prefixes are
 /// also withdrawn. All other attributes are dropped.
-fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
+pub(crate) fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
     let mut withdrawn = update.withdrawn;
     withdrawn.extend(update.announced);
 
@@ -697,12 +696,6 @@ fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
         attributes: mp_unreaches,
         announced: vec![],
     }
-}
-
-/// Test-only re-export so `update::prop_tests` can exercise the conversion.
-#[cfg(test)]
-pub(crate) fn make_treat_as_withdraw_test(update: UpdateMessage) -> UpdateMessage {
-    make_treat_as_withdraw(update)
 }
 
 // ── TCP connect helper ────────────────────────────────────────────────────────

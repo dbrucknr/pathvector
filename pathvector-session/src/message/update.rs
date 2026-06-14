@@ -2192,7 +2192,7 @@ mod prop_tests {
                 attributes: vec![],
                 announced: announced.clone(),
             };
-            let result = super::super::super::transport::make_treat_as_withdraw_test(update);
+            let result = super::super::super::transport::make_treat_as_withdraw(update);
 
             // Every announced NLRI must appear in the result's withdrawn list.
             for nlri in &announced {

@@ -270,7 +270,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
-    use client_trait::MockDaemonClient;
+    use client_trait::tests::MockDaemonClient;
     use pathvector_client::types::{
         AsSegment, AsSegmentType, Origin, PeerState, PeerType, Route, SessionState,
     };

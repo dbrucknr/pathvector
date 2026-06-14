@@ -130,19 +130,14 @@ pub(crate) struct FibManager {
 }
 
 impl FibManager {
-    /// Spawns the background writer task and returns a `FibManager`.
     pub(crate) fn new(writer: FibWriter) -> Self {
-        let (tx, rx) = mpsc::channel::<FibChange>(4096);
+        let (tx, rx) = mpsc::channel(4096);
         spawn_writer(writer, rx);
-        Self { tx }
+        Self::from_sender(tx)
     }
 
-    /// Test constructor — returns the manager together with the channel receiver
-    /// so tests can inspect queued changes without running the background task.
-    #[cfg(test)]
-    fn new_for_test() -> (Self, mpsc::Receiver<FibChange>) {
-        let (tx, rx) = mpsc::channel::<FibChange>(4096);
-        (Self { tx }, rx)
+    fn from_sender(tx: mpsc::Sender<FibChange>) -> Self {
+        Self { tx }
     }
 
     /// Enqueue a FIB update derived from a `BestPathChange<Ipv4Addr>`.
@@ -209,7 +204,7 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{FibChange, FibManager};
+    use super::FibChange;
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -248,7 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_v4_announced_enqueues_install() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v4(BestPathChange::Announced(
             nlri4("10.0.0.0/8"),
             route4("10.0.0.0/8", "192.0.2.1"),
@@ -265,7 +261,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_v4_withdrawn_enqueues_withdraw() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v4(BestPathChange::Withdrawn(nlri4("192.168.0.0/24")));
         let changes = drain(&mut rx);
         assert_eq!(changes.len(), 1);
@@ -278,14 +275,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_v4_unchanged_enqueues_nothing() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v4(BestPathChange::Unchanged);
         assert!(drain(&mut rx).is_empty());
     }
 
     #[tokio::test]
     async fn test_apply_v4_no_next_hop_skipped() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v4(BestPathChange::Announced(
             nlri4("10.0.0.0/8"),
             route4_no_nh("10.0.0.0/8"),
@@ -297,7 +296,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_v6_announced_enqueues_install() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v6(BestPathChange::Announced(
             nlri6("2001:db8::/32"),
             route6("2001:db8::/32", "2001:db8::1"),
@@ -314,7 +314,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_v6_withdrawn_enqueues_withdraw() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v6(BestPathChange::Withdrawn(nlri6("2001:db8::/32")));
         let changes = drain(&mut rx);
         assert_eq!(changes.len(), 1);
@@ -327,7 +328,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_v6_unchanged_enqueues_nothing() {
-        let (fm, mut rx) = FibManager::new_for_test();
+        let (tx, mut rx) = mpsc::channel(4096);
+        let fm = super::FibManager::from_sender(tx);
         fm.apply_v6(BestPathChange::<Ipv6Addr>::Unchanged);
         assert!(drain(&mut rx).is_empty());
     }
