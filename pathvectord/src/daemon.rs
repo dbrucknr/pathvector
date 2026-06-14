@@ -1858,6 +1858,88 @@ mod tests {
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
     }
 
+    /// RFC 4271 §5.1.3 regression: eBGP NEXT_HOP in the full-table dump must
+    /// be the TCP session's local address, not the BGP router ID.
+    ///
+    /// Before the fix `prepare_outbound` always used `local_bgp_id` (10.0.0.1)
+    /// as NEXT_HOP.  BIRD 2 rejects such routes because the router ID is not
+    /// reachable on the session interface.
+    #[test]
+    fn test_on_established_ebgp_next_hop_uses_local_addr_not_router_id() {
+        use pathvector_session::message::PathAttribute;
+
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let local_bgp_id: Ipv4Addr = "10.0.0.1".parse().unwrap(); // router ID (make_state uses this)
+        let session_local_addr: Ipv4Addr = "172.31.50.20".parse().unwrap(); // TCP interface address
+
+        let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
+        assert_eq!(state.rib.local_bgp_id, local_bgp_id);
+
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        state.rib_mut().loc_rib.insert(
+            src,
+            RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::from_sequence(vec![Asn::new(65009)]))
+                .next_hop(NextHop::V4("10.0.0.9".parse().unwrap()))
+                .peer_type(PeerType::External)
+                .build(),
+        );
+
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[], Some(session_local_addr));
+
+        let msg = receivers.get_mut(&peer_ip).unwrap().try_recv()
+            .expect("full-table dump UPDATE expected");
+
+        let next_hop = msg.attributes.iter().find_map(|a| {
+            if let PathAttribute::NextHop(ip) = a { Some(*ip) } else { None }
+        });
+        assert_eq!(
+            next_hop,
+            Some(session_local_addr),
+            "eBGP NEXT_HOP must be the session local address, not the router ID"
+        );
+        assert_ne!(next_hop, Some(local_bgp_id), "NEXT_HOP must not be the router ID");
+    }
+
+    /// RFC 4271 §5.1.3 regression: eBGP NEXT_HOP in `propagate_to_all_peers`
+    /// must use the per-peer session local address stored in `local_addrs`.
+    #[test]
+    fn test_propagate_to_all_peers_ebgp_next_hop_uses_local_addr() {
+        use pathvector_session::message::PathAttribute;
+
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let local_bgp_id: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let session_local_addr: Ipv4Addr = "172.31.50.20".parse().unwrap();
+
+        let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
+
+        // Establish with a distinct local_addr so local_addrs is populated.
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[], Some(session_local_addr));
+        // Drain the (empty) full-table dump; no routes pre-installed.
+        while receivers.get_mut(&peer_ip).unwrap().try_recv().is_ok() {}
+
+        // Now insert a route into the loc-rib via a third-party peer and trigger propagation.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        let route = RouteBuilder::new(nlri("192.0.2.0/24"), Origin::Igp, AsPath::from_sequence(vec![Asn::new(65009)]))
+            .next_hop(NextHop::V4("10.0.0.9".parse().unwrap()))
+            .peer_type(PeerType::External)
+            .build();
+        state.rib_mut().loc_rib.insert(src, route);
+        state.propagate_to_all_peers(&[nlri("192.0.2.0/24")]);
+
+        let msg = receivers.get_mut(&peer_ip).unwrap().try_recv()
+            .expect("propagated UPDATE expected");
+
+        let next_hop = msg.attributes.iter().find_map(|a| {
+            if let PathAttribute::NextHop(ip) = a { Some(*ip) } else { None }
+        });
+        assert_eq!(
+            next_hop,
+            Some(session_local_addr),
+            "eBGP NEXT_HOP must be the session local address, not the router ID"
+        );
+        assert_ne!(next_hop, Some(local_bgp_id), "NEXT_HOP must not be the router ID");
+    }
+
     #[test]
     fn test_on_established_export_reject_sends_nothing() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
