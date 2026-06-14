@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use ipnetx::interfaces::IpAddress;
 use pathvector_policy::BgpRoute;
 use pathvector_types::{
@@ -63,6 +65,13 @@ pub struct Route<A: IpAddress> {
     pub atomic_aggregate: bool,
     /// The router that performed aggregation, if known.
     pub aggregator: Option<Aggregator>,
+    /// BGP Identifier of the router that first introduced this route into the
+    /// iBGP mesh via a route reflector (RFC 4456 `ORIGINATOR_ID`, type 9).
+    /// `None` for routes not passing through a reflector.
+    pub originator_id: Option<Ipv4Addr>,
+    /// Ordered list of cluster IDs this route has passed through
+    /// (RFC 4456 `CLUSTER_LIST`, type 10). Empty for non-reflected routes.
+    pub cluster_list: Vec<u32>,
     /// Whether this route was learned from an iBGP peer, eBGP peer, or
     /// locally originated.
     ///
@@ -283,6 +292,8 @@ impl<A: IpAddress> RouteBuilder<A> {
             extended_communities: self.extended_communities,
             atomic_aggregate: self.atomic_aggregate,
             aggregator: self.aggregator,
+            originator_id: None,
+            cluster_list: Vec::new(),
             peer_type: self.peer_type,
             received_at: self.received_at,
         }

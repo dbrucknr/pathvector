@@ -1012,11 +1012,13 @@ mod tests {
                 export_default: Some(ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+                is_rr_client: false,
             })
             .collect();
         DaemonState::new(
             local_as,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peer_configs,
             senders,

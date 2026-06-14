@@ -55,6 +55,12 @@ pub(crate) fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute>
     if let Some(agg) = route.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
+    if let Some(id) = route.originator_id {
+        attrs.push(PathAttribute::OriginatorId(id));
+    }
+    if !route.cluster_list.is_empty() {
+        attrs.push(PathAttribute::ClusterList(route.cluster_list.clone()));
+    }
     attrs
 }
 

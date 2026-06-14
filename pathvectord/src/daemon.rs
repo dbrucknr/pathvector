@@ -4,7 +4,7 @@
 //! session setup (`build_daemon`), and the TCP listener (`run_bgp_listener`).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
@@ -101,6 +101,21 @@ pub(crate) struct RibSnapshot {
     /// Used as the eBGP NEXT_HOP (RFC 4271 §5.1.3) instead of `local_bgp_id`
     /// so the NEXT_HOP is the interface address reachable by the peer.
     pub(crate) local_addrs: HashMap<Ipv4Addr, Ipv4Addr>,
+    /// Set of configured Route Reflector clients (RFC 4456).
+    ///
+    /// Empty when this daemon is not acting as a Route Reflector.
+    /// Immutable after startup.
+    pub(crate) rr_clients: std::collections::HashSet<Ipv4Addr>,
+    /// Cluster identifier used in `CLUSTER_LIST` when reflecting routes (RFC 4456).
+    ///
+    /// Defaults to the 32-bit representation of `bgp_id` when not explicitly
+    /// configured. Immutable after startup.
+    pub(crate) cluster_id: u32,
+    /// BGP Identifier of each established peer, received in their OPEN message.
+    ///
+    /// Used to set `ORIGINATOR_ID` when reflecting routes from a client (RFC 4456
+    /// §8). Populated on `Established`; removed on `Terminated`.
+    pub(crate) peer_bgp_ids: HashMap<Ipv4Addr, Ipv4Addr>,
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -157,10 +172,19 @@ impl DaemonState {
         local_as: u32,
         local_bgp_id: Ipv4Addr,
         local_ipv6: Option<Ipv6Addr>,
+        cluster_id: Option<u32>,
         peers: &[config::PeerConfig],
         update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
         config_capabilities: Vec<Capability>,
     ) -> Self {
+        let rr_clients: HashSet<Ipv4Addr> = peers
+            .iter()
+            .filter(|p| p.is_rr_client && p.remote_as == local_as)
+            .map(|p| p.address)
+            .collect();
+        let cluster_id = cluster_id
+            .unwrap_or_else(|| u32::from_be_bytes(local_bgp_id.octets()));
+        let is_rr = !rr_clients.is_empty();
         let import_policies = peers
             .iter()
             .map(|p| {
@@ -216,7 +240,12 @@ impl DaemonState {
             .iter()
             .map(|p| {
                 let pt = config_peer_type(local_as, p.remote_as);
-                (p.address, AdjRibOut::new(PeerId::from(p.address), pt))
+                let rib = if is_rr && pt == PeerType::Internal {
+                    AdjRibOut::new_reflecting(PeerId::from(p.address), pt)
+                } else {
+                    AdjRibOut::new(PeerId::from(p.address), pt)
+                };
+                (p.address, rib)
             })
             .collect();
 
@@ -224,7 +253,12 @@ impl DaemonState {
             .iter()
             .map(|p| {
                 let pt = config_peer_type(local_as, p.remote_as);
-                (p.address, AdjRibOut::new(PeerId::from(p.address), pt))
+                let rib = if is_rr && pt == PeerType::Internal {
+                    AdjRibOut::new_reflecting(PeerId::from(p.address), pt)
+                } else {
+                    AdjRibOut::new(PeerId::from(p.address), pt)
+                };
+                (p.address, rib)
             })
             .collect();
 
@@ -247,6 +281,9 @@ impl DaemonState {
             prefixes_received: HashMap::new(),
             prefixes_advertised: HashMap::new(),
             local_addrs: HashMap::new(),
+            rr_clients,
+            cluster_id,
+            peer_bgp_ids: HashMap::new(),
         });
 
         Self {
@@ -354,7 +391,12 @@ impl DaemonState {
         self.negotiated_max_len.insert(peer_ip, max_len);
 
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
-            *aro = AdjRibOut::new(peer_id, peer_type);
+            let is_rr = !self.rib.rr_clients.is_empty();
+            *aro = if is_rr && peer_type == PeerType::Internal {
+                AdjRibOut::new_reflecting(peer_id, peer_type)
+            } else {
+                AdjRibOut::new(peer_id, peer_type)
+            };
         }
         // Reset v6 RIBs so a re-established session starts clean.
         self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
@@ -460,6 +502,7 @@ impl DaemonState {
             rib.prefixes_received.remove(&peer_ip);
             rib.prefixes_advertised.remove(&peer_ip);
             rib.local_addrs.remove(&peer_ip);
+            rib.peer_bgp_ids.remove(&peer_ip);
         }
         self.negotiated_max_len.remove(&peer_ip);
 
@@ -485,7 +528,12 @@ impl DaemonState {
             .copied()
             .unwrap_or(PeerType::External);
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
-            *aro = AdjRibOut::new(peer_id, cfg_pt);
+            let is_rr = !self.rib.rr_clients.is_empty();
+            *aro = if is_rr && cfg_pt == PeerType::Internal {
+                AdjRibOut::new_reflecting(peer_id, cfg_pt)
+            } else {
+                AdjRibOut::new(peer_id, cfg_pt)
+            };
         }
         if let Some(aro) = self.adj_ribs_out_v6.get_mut(&peer_ip) {
             *aro = AdjRibOut::new(peer_id, cfg_pt);
@@ -570,7 +618,7 @@ impl DaemonState {
     /// Applies import policy, updates the RIB, and propagates best-path changes
     /// for all affected NLRIs to every established peer.
     #[allow(clippy::similar_names)]
-    pub(crate) fn on_route_update(&mut self, peer_ip: Ipv4Addr, msg: UpdateMessage) {
+    pub(crate) fn on_route_update(&mut self, peer_ip: Ipv4Addr, mut msg: UpdateMessage) {
         let peer_id = PeerId::from(peer_ip);
         let peer_type = self
             .rib
@@ -578,6 +626,49 @@ impl DaemonState {
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
+
+        // Route reflection inbound processing (RFC 4456 §8).
+        if self.rib.rr_clients.contains(&peer_ip) {
+            let cluster_id = self.rib.cluster_id;
+            // Loop detection: discard the entire UPDATE if our cluster_id
+            // already appears in CLUSTER_LIST.
+            let has_loop = msg.attributes.iter().any(|a| {
+                matches!(a, PathAttribute::ClusterList(list) if list.contains(&cluster_id))
+            });
+            if has_loop {
+                tracing::debug!(
+                    peer = %peer_ip,
+                    cluster_id,
+                    "RR loop detected in CLUSTER_LIST — discarding UPDATE"
+                );
+                return;
+            }
+            // Set ORIGINATOR_ID if not already present.
+            if !msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_)))
+            {
+                let bgp_id = self
+                    .rib
+                    .peer_bgp_ids
+                    .get(&peer_ip)
+                    .copied()
+                    .unwrap_or(peer_ip);
+                msg.attributes.push(PathAttribute::OriginatorId(bgp_id));
+            }
+            // Prepend our cluster_id to CLUSTER_LIST.
+            if let Some(PathAttribute::ClusterList(list)) = msg
+                .attributes
+                .iter_mut()
+                .find(|a| matches!(a, PathAttribute::ClusterList(_)))
+            {
+                list.insert(0, cluster_id);
+            } else {
+                msg.attributes
+                    .push(PathAttribute::ClusterList(vec![cluster_id]));
+            }
+        }
 
         // Collect all IPv4 prefixes that may change best-path: traditional
         // fields plus any IPv4 NLRIs carried in MP_REACH/MP_UNREACH attributes
@@ -708,6 +799,7 @@ impl DaemonState {
         let established_peers: Vec<Ipv4Addr> = self.rib.peer_types.keys().copied().collect();
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let is_rr = !self.rib.rr_clients.is_empty();
         for peer_ip in established_peers {
             let peer_type = self
                 .rib
@@ -738,12 +830,35 @@ impl DaemonState {
                 tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping propagation");
                 continue;
             };
+            let rr_clients = &self.rib.rr_clients;
+            let peer_types = &self.rib.peer_types;
+            let loc_rib = &self.rib.loc_rib;
+            let dest_is_client = rr_clients.contains(&peer_ip);
             let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
+                    // RR split-horizon (RFC 4456 §8): when acting as an RR,
+                    // block propagation between two non-client iBGP peers.
+                    // All other source/dest combinations are allowed; the
+                    // AdjRibOut `reflects` flag suppresses the regular iBGP
+                    // split-horizon so it does not re-block reflected routes.
+                    if is_rr && peer_type == PeerType::Internal {
+                        if let Some(src) = loc_rib.best_peer(&nlri) {
+                            if let IpAddr::V4(src_ip) = src.ip() {
+                                let src_is_client = rr_clients.contains(&src_ip);
+                                let src_is_ibgp = peer_types
+                                    .get(&src_ip)
+                                    .copied()
+                                    == Some(PeerType::Internal);
+                                if src_is_ibgp && !src_is_client && !dest_is_client {
+                                    return PrefixDecision::NoChange;
+                                }
+                            }
+                        }
+                    }
                     propagate_prefix(
                         nlri,
-                        &self.rib.loc_rib,
+                        loc_rib,
                         adj_rib_out,
                         export_policy,
                         peer_type,
@@ -1158,6 +1273,7 @@ where
         local_as,
         local_bgp_id,
         cfg.daemon.local_ipv6,
+        cfg.daemon.cluster_id,
         &cfg.peers,
         update_senders,
         local_capabilities,
@@ -1254,6 +1370,9 @@ pub(crate) async fn run_event_loop(
         let mut s = state.write().await;
         match event {
             SessionEvent::Established(info) => {
+                Arc::make_mut(&mut s.rib)
+                    .peer_bgp_ids
+                    .insert(peer_ip, info.peer_bgp_id);
                 s.on_established(
                     peer_ip,
                     info.peer_type,
@@ -1368,6 +1487,8 @@ fn handle_update(
     let mut extended_communities = Vec::new();
     let mut atomic_aggregate = false;
     let mut aggregator = None;
+    let mut originator_id: Option<Ipv4Addr> = None;
+    let mut cluster_list: Vec<u32> = Vec::new();
     // (nlri, next_hop) pairs from MP_REACH_NLRI; next_hop is mandatory there.
     let mut mp_v4_announced: Vec<(Nlri<Ipv4Addr>, NextHop)> = Vec::new();
     let mut mp_v4_withdrawn: Vec<Nlri<Ipv4Addr>> = Vec::new();
@@ -1386,6 +1507,8 @@ fn handle_update(
             PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
             PathAttribute::AtomicAggregate => atomic_aggregate = true,
             PathAttribute::Aggregator(a) => aggregator = Some(*a),
+            PathAttribute::OriginatorId(id) => originator_id = Some(*id),
+            PathAttribute::ClusterList(list) => cluster_list.clone_from(list),
             PathAttribute::MpReachNlri(mp) => {
                 if mp.afi_safi == AfiSafi::IPV4_UNICAST {
                     for prefix in &mp.prefixes {
@@ -1484,7 +1607,9 @@ fn handle_update(
             builder = builder.aggregator(agg);
         }
 
-        let raw = builder.build();
+        let mut raw = builder.build();
+        raw.originator_id = originator_id;
+        raw.cluster_list = cluster_list.clone();
 
         // RFC 7999: silently discard routes tagged with the BLACKHOLE community.
         // Store in AdjRibIn so soft-reconfig can see the raw route, but never
@@ -1671,10 +1796,11 @@ mod tests {
                 export_default: Some(config::ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+            is_rr_client: false,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
-        let state = DaemonState::new(local_as, local_bgp_id, None, &peer_configs, senders, vec![]);
+        let state = DaemonState::new(local_as, local_bgp_id, None, None, &peer_configs, senders, vec![]);
         (state, receivers)
     }
 
@@ -1784,10 +1910,12 @@ mod tests {
             import_default_v6: None,
             md5_password: None,
             export_default: None,
+            is_rr_client: false,
         }];
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peers,
             {
@@ -1952,10 +2080,12 @@ mod tests {
             md5_password: None,
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
+            is_rr_client: false,
         }];
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peers,
             {
@@ -2767,10 +2897,12 @@ mod tests {
             import_default_v6: None, // omitted → falls back to import_default
             export_default: None,
             md5_password: None,
+            is_rr_client: false,
         }];
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peers,
             {
@@ -2806,10 +2938,12 @@ mod tests {
             import_default_v6: Some(config::ImportDefault::Reject),
             export_default: None,
             md5_password: None,
+            is_rr_client: false,
         }];
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peers,
             {
@@ -4750,6 +4884,218 @@ mod tests {
         );
         assert_eq!(state.rib.loc_rib.len(), 1);
     }
+
+    // ── Route Reflection (RFC 4456) ───────────────────────────────────────────
+
+    /// Builds a DaemonState acting as an RR for the given clients.
+    /// `clients` and `non_clients` are all iBGP peers (same `local_as`).
+    fn make_rr_state(
+        local_as: u32,
+        cluster_id: u32,
+        clients: &[Ipv4Addr],
+        non_clients: &[Ipv4Addr],
+    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+        for &ip in clients.iter().chain(non_clients.iter()) {
+            let (tx, rx) = mpsc::channel(64);
+            senders.insert(ip, tx);
+            receivers.insert(ip, rx);
+        }
+        let peer_configs: Vec<config::PeerConfig> = clients
+            .iter()
+            .map(|&address| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as: local_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: true,
+            })
+            .chain(non_clients.iter().map(|&address| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as: local_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+            }))
+            .collect();
+        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let state = DaemonState::new(
+            local_as,
+            local_bgp_id,
+            None,
+            Some(cluster_id),
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        (state, receivers)
+    }
+
+    fn update_announce(prefix: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 1, 1)),
+            ],
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    #[test]
+    fn test_rr_client_route_reflected_to_other_client() {
+        let client_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let client_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_rr_state(65001, 1, &[client_a, client_b], &[]);
+
+        state.on_established(client_a, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(client_b, PeerType::Internal, 65001, 90, &[], None);
+
+        // Client A sends a route; it should be reflected to Client B
+        state.on_route_update(client_a, update_announce("192.0.2.0/24"));
+
+        let msg = receivers.get_mut(&client_b).unwrap().try_recv()
+            .expect("route from client A must be reflected to client B");
+        assert_eq!(msg.announced, vec![nlri("192.0.2.0/24")]);
+
+        // Must NOT be sent back to Client A (split-horizon)
+        assert!(
+            receivers.get_mut(&client_a).unwrap().try_recv().is_err(),
+            "route must not be reflected back to originating client"
+        );
+    }
+
+    #[test]
+    fn test_rr_client_route_reflected_to_non_client_ibgp() {
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let nc: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_rr_state(65001, 1, &[client], &[nc]);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(nc, PeerType::Internal, 65001, 90, &[], None);
+
+        state.on_route_update(client, update_announce("192.0.2.0/24"));
+
+        let msg = receivers.get_mut(&nc).unwrap().try_recv()
+            .expect("route from client must be reflected to non-client iBGP");
+        assert_eq!(msg.announced, vec![nlri("192.0.2.0/24")]);
+    }
+
+    #[test]
+    fn test_rr_non_client_ibgp_route_reflected_to_client() {
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let nc: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_rr_state(65001, 1, &[client], &[nc]);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(nc, PeerType::Internal, 65001, 90, &[], None);
+
+        // Non-client iBGP sends a route; it should be reflected to the client
+        state.on_route_update(nc, update_announce("192.0.2.0/24"));
+
+        let msg = receivers.get_mut(&client).unwrap().try_recv()
+            .expect("route from non-client iBGP must be reflected to client");
+        assert_eq!(msg.announced, vec![nlri("192.0.2.0/24")]);
+    }
+
+    #[test]
+    fn test_rr_non_client_ibgp_to_non_client_ibgp_still_blocked() {
+        let nc1: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        let nc2: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_rr_state(65001, 1, &[client], &[nc1, nc2]);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(nc1, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(nc2, PeerType::Internal, 65001, 90, &[], None);
+
+        // Non-client nc1 sends a route; nc2 must NOT receive it
+        state.on_route_update(nc1, update_announce("192.0.2.0/24"));
+
+        assert!(
+            receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
+            "non-client iBGP routes must not be re-advertised to other non-client iBGP peers"
+        );
+        // But client should receive it
+        receivers.get_mut(&client).unwrap().try_recv()
+            .expect("non-client iBGP route must be reflected to client");
+    }
+
+    #[test]
+    fn test_rr_loop_detection_discards_update() {
+        let cluster_id: u32 = 42;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_rr_state(65001, cluster_id, &[client, other], &[]);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(other, PeerType::Internal, 65001, 90, &[], None);
+
+        // UPDATE from client containing our own cluster_id in CLUSTER_LIST
+        let looped = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 1, 1)),
+                PathAttribute::ClusterList(vec![cluster_id]),
+            ],
+            announced: vec![nlri("192.0.2.0/24")],
+        };
+        state.on_route_update(client, looped);
+
+        // Route must NOT be installed or propagated
+        assert_eq!(state.rib.loc_rib.len(), 0, "looped route must be discarded");
+        assert!(
+            receivers.get_mut(&other).unwrap().try_recv().is_err(),
+            "looped route must not be propagated"
+        );
+    }
+
+    #[test]
+    fn test_rr_originator_id_and_cluster_list_set_on_reflected_route() {
+        let cluster_id: u32 = 99;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) =
+            make_rr_state(65001, cluster_id, &[client, other], &[]);
+
+        // Simulate OPEN: client's BGP ID is 10.0.0.2
+        Arc::make_mut(&mut state.rib)
+            .peer_bgp_ids
+            .insert(client, client);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(other, PeerType::Internal, 65001, 90, &[], None);
+
+        state.on_route_update(client, update_announce("192.0.2.0/24"));
+
+        let msg = receivers.get_mut(&other).unwrap().try_recv()
+            .expect("reflected UPDATE expected");
+
+        let has_originator = msg.attributes.iter().any(|a| {
+            matches!(a, PathAttribute::OriginatorId(id) if *id == client)
+        });
+        assert!(has_originator, "reflected route must carry ORIGINATOR_ID = client BGP ID");
+
+        let has_cluster = msg.attributes.iter().any(|a| {
+            matches!(a, PathAttribute::ClusterList(list) if list.contains(&cluster_id))
+        });
+        assert!(has_cluster, "reflected route must carry cluster_id in CLUSTER_LIST");
+    }
 }
 
 #[cfg(test)]
@@ -4806,11 +5152,13 @@ mod stall_tests {
                 remote_as,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+            is_rr_client: false,
             })
             .collect();
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peer_configs,
             senders,
@@ -4891,6 +5239,7 @@ mod stall_tests {
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+            is_rr_client: false,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -4900,6 +5249,7 @@ mod stall_tests {
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
+            is_rr_client: false,
             },
         ];
         let mut senders = HashMap::new();
@@ -4908,6 +5258,7 @@ mod stall_tests {
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peer_configs,
             senders,
@@ -5004,6 +5355,7 @@ mod stall_tests {
                 export_default: Some(config::ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+            is_rr_client: false,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -5013,6 +5365,7 @@ mod stall_tests {
                 export_default: Some(config::ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+            is_rr_client: false,
             },
         ];
         let mut senders = HashMap::new();
@@ -5021,6 +5374,7 @@ mod stall_tests {
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peer_configs,
             senders,
@@ -5207,12 +5561,14 @@ mod event_loop_tests {
                 export_default: Some(config::ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+            is_rr_client: false,
             })
             .collect();
 
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peer_configs,
             update_senders,
@@ -5335,6 +5691,7 @@ mod event_loop_tests {
                 export_default: Some(config::ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+            is_rr_client: false,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -5344,6 +5701,7 @@ mod event_loop_tests {
                 export_default: Some(config::ExportDefault::Accept),
                 import_default_v6: None,
                 md5_password: None,
+            is_rr_client: false,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -5352,6 +5710,7 @@ mod event_loop_tests {
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             &peer_configs,
             update_senders,
@@ -5674,6 +6033,7 @@ mod run_with_tests {
                 grpc_port: 0,
                 bgp_port: 0, // 0 = OS assigns; listener will fail to bind but tests don't need it
                 local_ipv6: None,
+                cluster_id: None,
             },
             peers: peer_ips
                 .iter()
@@ -5685,6 +6045,7 @@ mod run_with_tests {
                     export_default: None,
                     import_default_v6: None,
                     md5_password: None,
+                    is_rr_client: false,
                 })
                 .collect(),
         }

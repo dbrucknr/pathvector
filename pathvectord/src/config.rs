@@ -60,6 +60,21 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub local_ipv6: Option<Ipv6Addr>,
+    /// Route Reflector cluster identifier (RFC 4456).
+    ///
+    /// When any peer has `is_rr_client = true`, this daemon acts as a Route
+    /// Reflector. The `cluster_id` is prepended to `CLUSTER_LIST` on every
+    /// reflected route and used for loop detection. When omitted, defaults to
+    /// the 32-bit representation of `bgp_id`.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as   = 65001
+    /// bgp_id     = "10.0.0.1"
+    /// cluster_id = 1
+    /// ```
+    #[serde(default)]
+    pub cluster_id: Option<u32>,
 }
 
 fn default_hold_time() -> u16 {
@@ -181,6 +196,25 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub md5_password: Option<String>,
+    /// Whether this peer is a Route Reflector client (RFC 4456).
+    ///
+    /// When `true`, the daemon acts as a Route Reflector for this peer:
+    /// routes received from this client are reflected to all other clients and
+    /// to non-client iBGP peers (with `ORIGINATOR_ID` and `CLUSTER_LIST`
+    /// attributes set). Routes from non-client iBGP peers are reflected to
+    /// this client. Defaults to `false`.
+    ///
+    /// The `daemon.cluster_id` setting must also be set (or defaults to
+    /// `bgp_id`) for the reflector to operate correctly.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address      = "10.0.0.2"
+    /// remote_as    = 65001
+    /// is_rr_client = true
+    /// ```
+    #[serde(default)]
+    pub is_rr_client: bool,
 }
 
 fn default_bgp_port() -> u16 {

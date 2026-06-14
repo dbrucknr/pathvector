@@ -70,6 +70,11 @@ pub enum InsertOutcome<A: IpAddress> {
 pub struct AdjRibOut<A: IpAddress> {
     peer: PeerId,
     peer_type: PeerType,
+    /// When `true`, the iBGP split-horizon check in [`insert`](AdjRibOut::insert)
+    /// is bypassed. Set for Route Reflector destinations (RFC 4456) where the
+    /// caller has already enforced the correct split-horizon at the propagation
+    /// level.
+    reflects: bool,
     routes: HashMap<Nlri<A>, Route<A>>,
 }
 
@@ -80,6 +85,23 @@ impl<A: IpAddress> AdjRibOut<A> {
         Self {
             peer,
             peer_type,
+            reflects: false,
+            routes: HashMap::new(),
+        }
+    }
+
+    /// Creates an `AdjRibOut` that bypasses iBGP split-horizon.
+    ///
+    /// Use this for peers that receive reflected routes in an RFC 4456 Route
+    /// Reflector topology. The caller is responsible for enforcing the correct
+    /// RR split-horizon rules (non-client→non-client blocking) before calling
+    /// [`insert`](AdjRibOut::insert).
+    #[must_use]
+    pub fn new_reflecting(peer: PeerId, peer_type: PeerType) -> Self {
+        Self {
+            peer,
+            peer_type,
+            reflects: true,
             routes: HashMap::new(),
         }
     }
@@ -109,7 +131,10 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// route's `AS_PATH` before it is stored (RFC 5065 §5.1).  The inner
     /// `Option` is the previous route for this prefix, if any.
     pub fn insert(&mut self, route: Route<A>) -> InsertOutcome<A> {
-        if self.peer_type == PeerType::Internal && route.peer_type == PeerType::Internal {
+        if !self.reflects
+            && self.peer_type == PeerType::Internal
+            && route.peer_type == PeerType::Internal
+        {
             return InsertOutcome::Filtered(self.routes.remove(&route.nlri));
         }
 

@@ -104,6 +104,8 @@ const ATTR_LOCAL_PREF: u8 = 5;
 const ATTR_ATOMIC_AGGREGATE: u8 = 6;
 const ATTR_AGGREGATOR: u8 = 7;
 const ATTR_COMMUNITY: u8 = 8;
+const ATTR_ORIGINATOR_ID: u8 = 9;
+const ATTR_CLUSTER_LIST: u8 = 10;
 const ATTR_MP_REACH_NLRI: u8 = 14;
 const ATTR_MP_UNREACH_NLRI: u8 = 15;
 const ATTR_EXTENDED_COMMUNITIES: u8 = 16;
@@ -407,6 +409,30 @@ fn decode_attr_value(
             Ok(PathAttribute::Communities(communities))
         }
 
+        ATTR_ORIGINATOR_ID => {
+            if cur.remaining() != 4 {
+                return Err(CodecError::InvalidAttribute {
+                    type_code,
+                    detail: "ORIGINATOR_ID must be exactly 4 bytes",
+                });
+            }
+            Ok(PathAttribute::OriginatorId(cur.read_ipv4addr()?))
+        }
+
+        ATTR_CLUSTER_LIST => {
+            if !cur.remaining().is_multiple_of(4) {
+                return Err(CodecError::InvalidAttribute {
+                    type_code,
+                    detail: "CLUSTER_LIST length must be a multiple of 4",
+                });
+            }
+            let mut ids = Vec::with_capacity(cur.remaining() / 4);
+            while cur.remaining() > 0 {
+                ids.push(cur.read_u32()?);
+            }
+            Ok(PathAttribute::ClusterList(ids))
+        }
+
         ATTR_MP_REACH_NLRI => {
             if cur.remaining() < 4 {
                 return Err(CodecError::InvalidAttribute {
@@ -667,6 +693,18 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             (FLAGS_OT, ATTR_COMMUNITY, v.finish())
         }
 
+        PathAttribute::OriginatorId(id) => {
+            (FLAGS_ONT, ATTR_ORIGINATOR_ID, id.octets().to_vec())
+        }
+
+        PathAttribute::ClusterList(ids) => {
+            let mut v = Writer::new();
+            for id in ids {
+                v.put_u32(*id);
+            }
+            (FLAGS_ONT, ATTR_CLUSTER_LIST, v.finish())
+        }
+
         PathAttribute::MpReachNlri(mp) => {
             let mut v = Writer::new();
             v.put_u16(mp.afi_safi.afi.as_u16());
@@ -803,6 +841,16 @@ pub enum PathAttribute {
     Aggregator(Aggregator),
     /// `COMMUNITY` (type 8, RFC 1997) — standard 32-bit community tags.
     Communities(Vec<Community>),
+    /// `ORIGINATOR_ID` (type 9, RFC 4456) — BGP Identifier of the router
+    /// that first injected this route into the iBGP mesh via a route
+    /// reflector. Set by the first reflector to receive the route from a
+    /// client; not modified by subsequent reflectors.
+    OriginatorId(Ipv4Addr),
+    /// `CLUSTER_LIST` (type 10, RFC 4456) — ordered list of `CLUSTER_ID`
+    /// values (4-byte each) identifying the route-reflector clusters this
+    /// route has passed through. Used for loop detection: a reflector that
+    /// sees its own `cluster_id` in this list discards the route.
+    ClusterList(Vec<u32>),
     /// `MP_REACH_NLRI` (type 14, RFC 4760) — reachable prefixes for
     /// non-IPv4-unicast address families.
     MpReachNlri(MpReachNlri),
@@ -843,6 +891,8 @@ impl PathAttribute {
             Self::AtomicAggregate => ATTR_ATOMIC_AGGREGATE,
             Self::Aggregator(_) => ATTR_AGGREGATOR,
             Self::Communities(_) => ATTR_COMMUNITY,
+            Self::OriginatorId(_) => ATTR_ORIGINATOR_ID,
+            Self::ClusterList(_) => ATTR_CLUSTER_LIST,
             Self::MpReachNlri(_) => ATTR_MP_REACH_NLRI,
             Self::MpUnreachNlri(_) => ATTR_MP_UNREACH_NLRI,
             Self::ExtendedCommunities(_) => ATTR_EXTENDED_COMMUNITIES,
@@ -1824,6 +1874,90 @@ mod tests {
             }
             .type_code(),
             200
+        );
+        assert_eq!(
+            PathAttribute::OriginatorId(Ipv4Addr::UNSPECIFIED).type_code(),
+            ATTR_ORIGINATOR_ID
+        );
+        assert_eq!(
+            PathAttribute::ClusterList(vec![]).type_code(),
+            ATTR_CLUSTER_LIST
+        );
+    }
+
+    /// ORIGINATOR_ID (type 9) encodes as 4-byte IPv4 address and round-trips.
+    #[test]
+    fn test_originator_id_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)),
+                PathAttribute::OriginatorId(Ipv4Addr::new(192, 168, 1, 1)),
+            ],
+            announced: vec![nlri4("10.0.0.0/8")],
+        };
+        roundtrip(msg);
+    }
+
+    /// CLUSTER_LIST (type 10) encodes as packed u32 list and round-trips.
+    #[test]
+    fn test_cluster_list_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)),
+                PathAttribute::ClusterList(vec![0x0101_0101, 0x0202_0202, 0x0303_0303]),
+            ],
+            announced: vec![nlri4("10.0.0.0/8")],
+        };
+        roundtrip(msg);
+    }
+
+    /// Empty CLUSTER_LIST round-trips without error.
+    #[test]
+    fn test_empty_cluster_list_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)),
+                PathAttribute::ClusterList(vec![]),
+            ],
+            announced: vec![nlri4("10.0.0.0/8")],
+        };
+        roundtrip(msg);
+    }
+
+    /// ORIGINATOR_ID with wrong length (3 bytes instead of 4) is rejected.
+    ///
+    /// Hand-crafted UPDATE: 19-byte header + 2-byte withdrawn-len (0) +
+    /// 2-byte attr-len (6) + attr [flags=0x80, type=9, len=3, val=1,2,3] +
+    /// 0-byte NLRI.
+    #[test]
+    fn test_originator_id_wrong_length_is_error() {
+        // flags: optional non-transitive (0x80), type=9, length=3, value=[1,2,3]
+        let attr: &[u8] = &[0x80, 9, 3, 1, 2, 3];
+        let attr_len = attr.len() as u16;
+        let total_len = (19 + 2 + 2 + attr.len()) as u16;
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&[0xff_u8; 16]); // marker
+        msg.extend_from_slice(&total_len.to_be_bytes()); // length
+        msg.push(2); // type = UPDATE
+        msg.extend_from_slice(&0u16.to_be_bytes()); // withdrawn-len
+        msg.extend_from_slice(&attr_len.to_be_bytes()); // attr-len
+        msg.extend_from_slice(attr);
+
+        let mut cur = Cursor::new(&msg[19..]);
+        let result = UpdateMessage::decode(&mut cur);
+        assert!(
+            result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
+            "ORIGINATOR_ID with 3-byte value must be an error or partial decode"
         );
     }
 }
