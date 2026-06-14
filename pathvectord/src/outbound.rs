@@ -66,6 +66,7 @@ pub(crate) fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute>
 
 /// The outbound decision for a single prefix after AdjRibOut processing.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PrefixDecision {
     Announce(Route<Ipv4Addr>),
     Withdraw(Nlri<Ipv4Addr>),
@@ -252,6 +253,7 @@ pub(crate) fn flush_updates(
 
 /// Outbound decision for a single IPv6 prefix after AdjRibOut processing.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PrefixDecisionV6 {
     Announce(Route<Ipv6Addr>),
     Withdraw(Nlri<Ipv6Addr>),
@@ -657,9 +659,7 @@ mod flush_updates_tests {
                 let a = (i / 256) as u8;
                 #[allow(clippy::cast_possible_truncation)]
                 let b = (i % 256) as u8;
-                PrefixDecision::Withdraw(
-                    Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap(),
-                )
+                PrefixDecision::Withdraw(Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap())
             })
             .collect();
 

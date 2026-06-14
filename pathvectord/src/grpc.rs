@@ -2597,7 +2597,14 @@ mod tests {
     async fn test_watch_routes_with_routes_yields_current_events() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, pathvector_types::PeerType::External, 65002, 90, &[], None);
+        s.on_established(
+            addr,
+            pathvector_types::PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         let n = nlri("192.0.2.0/24");
         s.rib_mut().loc_rib.insert(
             peer(addr.to_string().as_str()),

@@ -1435,16 +1435,19 @@ pub const BIRD_IMAGE: &str = "pathvector-bird-test";
 /// BIRD tests can run concurrently without Docker rejecting duplicate
 /// subnets.  The low octet assignments (`.10` / `.20`) are arbitrary but
 /// must stay within the /24.
+#[must_use]
 pub fn bird_test_subnet(test_id: u32) -> String {
     let third = test_id % 256;
     format!("172.31.{third}.0/24")
 }
 
+#[must_use]
 pub fn bird_ip(test_id: u32) -> String {
     let third = test_id % 256;
     format!("172.31.{third}.10")
 }
 
+#[must_use]
 pub fn bird_pathvectord_ip(test_id: u32) -> String {
     let third = test_id % 256;
     format!("172.31.{third}.20")
@@ -1592,6 +1595,7 @@ pub async fn wait_for_bird_rib_entry(
 /// `BGP.next_hop: <IP>` line that BIRD 2 emits in the detailed attribute dump.
 /// This is the value BIRD stored from the UPDATE's NEXT_HOP attribute — exactly
 /// what RFC 4271 §5.1.3 requires to be the session's local interface address.
+#[must_use]
 pub fn get_bird_next_hop(container_id: &str, prefix: &str) -> Option<std::net::Ipv4Addr> {
     let out = Command::new("docker")
         .args([
@@ -1619,7 +1623,8 @@ pub fn get_bird_next_hop(container_id: &str, prefix: &str) -> Option<std::net::I
         }
         // A new non-indented line that doesn't start with whitespace signals
         // the start of a different prefix block.
-        if in_prefix && !line.starts_with('\t') && !line.starts_with(' ') && !line.contains(prefix) {
+        if in_prefix && !line.starts_with('\t') && !line.starts_with(' ') && !line.contains(prefix)
+        {
             in_prefix = false;
         }
         if in_prefix {
@@ -1632,11 +1637,11 @@ pub fn get_bird_next_hop(container_id: &str, prefix: &str) -> Option<std::net::I
     None
 }
 
-/// A fully-wired test environment: isolated Docker network + BIRD 2 container
-/// + `pathvectord` container + connected [`PathvectorClient`], with the BGP
+/// A fully-wired test environment: isolated Docker network + BIRD 2 container +
+/// `pathvectord` container + connected [`PathvectorClient`], with the BGP
 /// session already `Established`.
 ///
-/// Both containers are assigned fixed IPs within [`BIRD_TEST_SUBNET`] so
+/// Both containers are assigned fixed IPs within a per-test subnet so
 /// BIRD's config can name pathvectord's IP before either container starts.
 ///
 /// All resources (containers, network) are cleaned up when `BirdHarness` drops.
@@ -1678,6 +1683,11 @@ impl BirdHarness {
     /// Each entry in `routes` is a CIDR prefix (e.g. `"10.100.0.0/24"`) that
     /// BIRD installs as a static blackhole route and exports to pathvectord via
     /// `next hop self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing (run `just
+    /// e2e-images`), or the BGP session does not reach `Established` within 30 s.
     pub async fn with_routes(routes: &[&str]) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
@@ -1689,8 +1699,7 @@ impl BirdHarness {
         let bird_ip_str = bird_ip(test_id);
         let pv_ip_str = bird_pathvectord_ip(test_id);
 
-        let network =
-            DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
         // Write BIRD config — pathvectord's IP is known (fixed) before either
         // container starts, so we can set `neighbor <pv_ip>` now.
@@ -1715,12 +1724,8 @@ impl BirdHarness {
 
         // Write pathvectord config referencing BIRD's per-test IP.
         // bgp_id = pv_ip so the eBGP NEXT_HOP is directly reachable from BIRD.
-        let pathvectord_config = write_daemon_config_bird(&[(
-            bird_ip_str.parse().unwrap(),
-            65001,
-        )]);
-        let pathvectord_config_path =
-            pathvectord_config.path().to_str().unwrap().to_owned();
+        let pathvectord_config = write_daemon_config_bird(&[(bird_ip_str.parse().unwrap(), 65001)]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         // Start pathvectord with its fixed IP, mapping gRPC to the host.
         let pathvectord = docker_start(
@@ -1735,27 +1740,22 @@ impl BirdHarness {
             Some("/etc/pathvectord.toml"),
         );
 
-        let mut client =
-            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
-                .expect("PathvectorClient::connect for BirdHarness");
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for BirdHarness");
 
         let bird_ip: Ipv4Addr = bird_ip_str.parse().unwrap();
-        wait_for_established(
-            &mut client,
-            bird_ip,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("BGP session with BIRD 2 did not reach Established within 30 s");
+        wait_for_established(&mut client, bird_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session with BIRD 2 did not reach Established within 30 s");
 
-        let bird_id = bird.0.clone();
+        let container_id = bird.0.clone();
         BirdHarness {
             _bird: bird,
             _pathvectord: pathvectord,
             _bird_config: bird_config,
             _pathvectord_config: pathvectord_config,
             client,
-            bird_id,
+            bird_id: container_id,
             bird_ip,
             pathvectord_ip: pv_ip_str.parse().unwrap(),
             _network: network,

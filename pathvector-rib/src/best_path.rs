@@ -3,7 +3,11 @@ use std::{cmp::Ordering, collections::HashMap};
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::{LocalPref, PeerType};
 
-use crate::{oracle::{AlwaysReachable, NextHopOracle}, peer::PeerId, route::Route};
+use crate::{
+    oracle::{AlwaysReachable, NextHopOracle},
+    peer::PeerId,
+    route::Route,
+};
 
 /// Selects the best route from a set of candidates using the BGP decision
 /// process (RFC 4271 §9.1).
@@ -98,7 +102,7 @@ pub fn select_best_with_oracle<'a, A: IpAddress, S: std::hash::BuildHasher>(
             route
                 .next_hop
                 .as_ref()
-                .map_or(true, |nh| oracle.is_reachable(nh))
+                .is_none_or(|nh| oracle.is_reachable(nh))
         })
         .max_by(|(peer_a, route_a), (peer_b, route_b)| {
             prefer(peer_a, route_a, peer_b, route_b, oracle)
@@ -834,7 +838,7 @@ mod oracle_tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use pathvector_types::{AsPath, Nlri, NextHop, Origin};
+    use pathvector_types::{AsPath, NextHop, Nlri, Origin};
 
     use crate::{PeerId, RouteBuilder, best_path::select_best_with_oracle, oracle::NextHopOracle};
 
@@ -860,14 +864,18 @@ mod oracle_tests {
                 _ => true,
             }
         }
-        fn igp_metric(&self, _: &NextHop) -> Option<u32> { None }
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+            None
+        }
     }
 
     // Oracle that assigns a fixed metric to next-hops by last octet.
     struct MetricOracle;
 
     impl NextHopOracle for MetricOracle {
-        fn is_reachable(&self, _: &NextHop) -> bool { true }
+        fn is_reachable(&self, _: &NextHop) -> bool {
+            true
+        }
         fn igp_metric(&self, next_hop: &NextHop) -> Option<u32> {
             match next_hop {
                 NextHop::V4(ip) => Some(u32::from(ip.octets()[3])),
@@ -876,7 +884,7 @@ mod oracle_tests {
         }
     }
 
-    /// Step 1: a route whose NEXT_HOP the oracle rejects is excluded from
+    /// Step 1: a route whose `NEXT_HOP` the oracle rejects is excluded from
     /// best-path selection even if it would otherwise win on all other criteria.
     #[test]
     fn test_unreachable_next_hop_excluded_from_selection() {
@@ -894,7 +902,7 @@ mod oracle_tests {
 
         let mut candidates = HashMap::new();
         candidates.insert(peer(1), winner_route); // unreachable next-hop
-        candidates.insert(peer(2), loser_route);  // reachable next-hop
+        candidates.insert(peer(2), loser_route); // reachable next-hop
 
         let oracle = RejectOracle(unreachable_nh);
         let (winner, _) = select_best_with_oracle(&candidates, &oracle).unwrap();
@@ -921,7 +929,7 @@ mod oracle_tests {
     }
 
     /// Step 8: when all other criteria tie, the route with the lower IGP
-    /// metric to its NEXT_HOP is preferred.
+    /// metric to its `NEXT_HOP` is preferred.
     #[test]
     fn test_step8_lower_igp_metric_preferred() {
         // Both routes are otherwise identical; peer(1) has metric 10
@@ -937,7 +945,7 @@ mod oracle_tests {
         // it without the oracle — step 8 must fire first.
         let mut candidates = HashMap::new();
         candidates.insert(peer(1), route_high_metric); // lower IP, higher metric
-        candidates.insert(peer(2), route_low_metric);  // higher IP, lower metric
+        candidates.insert(peer(2), route_low_metric); // higher IP, lower metric
 
         let (winner, _) = select_best_with_oracle(&candidates, &MetricOracle).unwrap();
         assert_eq!(winner, peer(2), "lower IGP metric must win before step 10");
@@ -961,6 +969,10 @@ mod oracle_tests {
 
         // AlwaysReachable returns None for igp_metric → step 8 skipped → step 10 picks peer(1).
         let (winner, _) = select_best_with_oracle(&candidates, &AlwaysReachable).unwrap();
-        assert_eq!(winner, peer(1), "step 10 (lower peer IP) should win when step 8 is skipped");
+        assert_eq!(
+            winner,
+            peer(1),
+            "step 10 (lower peer IP) should win when step 8 is skipped"
+        );
     }
 }

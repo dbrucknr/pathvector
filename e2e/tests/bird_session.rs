@@ -22,12 +22,7 @@ use pathvector_e2e::BirdHarness;
 async fn bird_session_reaches_established() {
     let h = BirdHarness::new().await;
     // BirdHarness::new() already waited for Established — final assertion.
-    let peer = h
-        .client
-        .clone()
-        .get_peer(h.bird_ip.into())
-        .await
-        .unwrap();
+    let peer = h.client.clone().get_peer(h.bird_ip.into()).await.unwrap();
 
     assert_eq!(
         peer.session_state,
@@ -40,12 +35,7 @@ async fn bird_session_reaches_established() {
 #[tokio::test]
 async fn bird_peer_state_fields_correct() {
     let h = BirdHarness::new().await;
-    let peer = h
-        .client
-        .clone()
-        .get_peer(h.bird_ip.into())
-        .await
-        .unwrap();
+    let peer = h.client.clone().get_peer(h.bird_ip.into()).await.unwrap();
 
     assert_eq!(peer.remote_as, 65001, "BIRD is configured with AS 65001");
     assert_eq!(peer.local_as, 65002, "pathvectord runs AS 65002");

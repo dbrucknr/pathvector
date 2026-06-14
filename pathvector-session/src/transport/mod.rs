@@ -485,7 +485,11 @@ impl<T: BgpTransport> Session<T> {
             // No active outbound attempt — accept the incoming connection directly.
             State::Idle | State::Connect | State::Active => {
                 self.local_addr = stream.local_addr().ok().and_then(|a| {
-                    if let std::net::IpAddr::V4(ip) = a.ip() { Some(ip) } else { None }
+                    if let std::net::IpAddr::V4(ip) = a.ip() {
+                        Some(ip)
+                    } else {
+                        None
+                    }
                 });
                 if let Some(factory) = &self.connect_factory {
                     self.transport = Some(factory(stream));
@@ -512,7 +516,11 @@ impl<T: BgpTransport> Session<T> {
                     let outputs = self.fsm.process(FsmInput::CollisionDetected);
                     self.execute(outputs).await;
                     self.local_addr = stream.local_addr().ok().and_then(|a| {
-                        if let std::net::IpAddr::V4(ip) = a.ip() { Some(ip) } else { None }
+                        if let std::net::IpAddr::V4(ip) = a.ip() {
+                            Some(ip)
+                        } else {
+                            None
+                        }
                     });
                     if let Some(factory) = &self.connect_factory {
                         self.transport = Some(factory(stream));

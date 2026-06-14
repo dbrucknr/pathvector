@@ -660,6 +660,7 @@ fn encode_one_path_attr(w: &mut Writer, attr: &PathAttribute) {
     w.put_slice(&value);
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
     match attr {
         PathAttribute::Origin(origin) => (FLAGS_WKM, ATTR_ORIGIN, vec![origin.as_u8()]),
@@ -693,9 +694,7 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
             (FLAGS_OT, ATTR_COMMUNITY, v.finish())
         }
 
-        PathAttribute::OriginatorId(id) => {
-            (FLAGS_ONT, ATTR_ORIGINATOR_ID, id.octets().to_vec())
-        }
+        PathAttribute::OriginatorId(id) => (FLAGS_ONT, ATTR_ORIGINATOR_ID, id.octets().to_vec()),
 
         PathAttribute::ClusterList(ids) => {
             let mut v = Writer::new();
@@ -1885,7 +1884,7 @@ mod tests {
         );
     }
 
-    /// ORIGINATOR_ID (type 9) encodes as 4-byte IPv4 address and round-trips.
+    /// `ORIGINATOR_ID` (type 9) encodes as 4-byte IPv4 address and round-trips.
     #[test]
     fn test_originator_id_roundtrip() {
         let msg = UpdateMessage {
@@ -1901,7 +1900,7 @@ mod tests {
         roundtrip(msg);
     }
 
-    /// CLUSTER_LIST (type 10) encodes as packed u32 list and round-trips.
+    /// `CLUSTER_LIST` (type 10) encodes as packed u32 list and round-trips.
     #[test]
     fn test_cluster_list_roundtrip() {
         let msg = UpdateMessage {
@@ -1917,7 +1916,7 @@ mod tests {
         roundtrip(msg);
     }
 
-    /// Empty CLUSTER_LIST round-trips without error.
+    /// Empty `CLUSTER_LIST` round-trips without error.
     #[test]
     fn test_empty_cluster_list_roundtrip() {
         let msg = UpdateMessage {
@@ -1933,7 +1932,7 @@ mod tests {
         roundtrip(msg);
     }
 
-    /// ORIGINATOR_ID with wrong length (3 bytes instead of 4) is rejected.
+    /// `ORIGINATOR_ID` with wrong length (3 bytes instead of 4) is rejected.
     ///
     /// Hand-crafted UPDATE: 19-byte header + 2-byte withdrawn-len (0) +
     /// 2-byte attr-len (6) + attr [flags=0x80, type=9, len=3, val=1,2,3] +
@@ -1942,8 +1941,8 @@ mod tests {
     fn test_originator_id_wrong_length_is_error() {
         // flags: optional non-transitive (0x80), type=9, length=3, value=[1,2,3]
         let attr: &[u8] = &[0x80, 9, 3, 1, 2, 3];
-        let attr_len = attr.len() as u16;
-        let total_len = (19 + 2 + 2 + attr.len()) as u16;
+        let attr_len = u16::try_from(attr.len()).unwrap();
+        let total_len = u16::try_from(19 + 2 + 2 + attr.len()).unwrap();
 
         let mut msg = Vec::new();
         msg.extend_from_slice(&[0xff_u8; 16]); // marker

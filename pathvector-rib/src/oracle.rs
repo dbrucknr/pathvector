@@ -7,11 +7,11 @@ use pathvector_types::NextHop;
 ///
 /// # RFC context
 ///
-/// RFC 4271 §9.1.2.1 (step 1): a route whose NEXT_HOP is not reachable
+/// RFC 4271 §9.1.2.1 (step 1): a route whose `NEXT_HOP` is not reachable
 /// in the local FIB **must not** participate in best-path selection.
 ///
 /// RFC 4271 §9.1.2.2 (step 8): among otherwise-equal routes, prefer the
-/// one whose NEXT_HOP has the lowest IGP metric.
+/// one whose `NEXT_HOP` has the lowest IGP metric.
 ///
 /// # Default implementation
 ///

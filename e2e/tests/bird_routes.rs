@@ -13,9 +13,7 @@
 use std::time::Duration;
 
 use pathvector_client::types::{Origin, OriginateRouteParams};
-use pathvector_e2e::{
-    BirdHarness, get_bird_next_hop, wait_for_bird_rib_entry, wait_for_route,
-};
+use pathvector_e2e::{BirdHarness, get_bird_next_hop, wait_for_bird_rib_entry, wait_for_route};
 
 /// A static route pre-announced by BIRD must appear in pathvectord's Loc-RIB.
 ///
