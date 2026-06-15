@@ -674,6 +674,46 @@ mod tests {
         assert!(!is_bgp_route(&igp_v4_msg("10.0.0.0", 8, 100, 254)));
     }
 
+    // ── withdraw message shape ────────────────────────────────────────────────
+    //
+    // RTM_DELROUTE matches on (dst, prefix_len, tos, priority, table).
+    // Omitting priority means the kernel cannot find the installed route and
+    // silently returns an error. These tests assert that the RouteMessageBuilder
+    // output for withdrawals carries a Priority attribute matching the installed
+    // metric, so a future edit cannot accidentally drop it.
+
+    #[test]
+    fn withdraw_v4_message_carries_priority() {
+        let metric: u32 = 20;
+        let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix("10.0.0.0".parse().unwrap(), 24)
+            .table_id(254)
+            .priority(metric)
+            .build();
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Priority(m) if *m == metric)),
+            "RTM_DELROUTE must include priority({metric}) to match the installed route"
+        );
+    }
+
+    #[test]
+    fn withdraw_v6_message_carries_priority() {
+        let metric: u32 = 20;
+        let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix("2001:db8::".parse().unwrap(), 32)
+            .table_id(254)
+            .priority(metric)
+            .build();
+        assert!(
+            msg.attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Priority(m) if *m == metric)),
+            "RTM_DELROUTE (v6) must include priority({metric}) to match the installed route"
+        );
+    }
+
     // ── parse_v4 — BGP exclusion ──────────────────────────────────────────────
 
     #[test]
