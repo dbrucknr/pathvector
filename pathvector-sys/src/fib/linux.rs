@@ -76,7 +76,7 @@ impl FibWriter {
     ///
     /// Returns an I/O error if the netlink call fails.
     pub async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
-        withdraw_route_v4(&self.handle, dst, prefix_len, self.table).await
+        withdraw_route_v4(&self.handle, dst, prefix_len, self.table, self.metric).await
     }
 
     /// Install (or replace) an IPv6 prefix route via `gateway`.
@@ -107,7 +107,7 @@ impl FibWriter {
     ///
     /// Returns an I/O error if the netlink call fails.
     pub async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
-        withdraw_route_v6(&self.handle, dst, prefix_len, self.table).await
+        withdraw_route_v6(&self.handle, dst, prefix_len, self.table, self.metric).await
     }
 }
 
@@ -562,10 +562,12 @@ async fn withdraw_route_v4(
     dst: Ipv4Addr,
     prefix_len: u8,
     table: u32,
+    metric: u32,
 ) -> io::Result<()> {
     let msg = RouteMessageBuilder::<Ipv4Addr>::new()
         .destination_prefix(dst, prefix_len)
         .table_id(table)
+        .priority(metric)
         .build();
     match handle.route().del(msg).execute().await {
         Ok(()) => Ok(()),
@@ -585,10 +587,12 @@ async fn withdraw_route_v6(
     dst: Ipv6Addr,
     prefix_len: u8,
     table: u32,
+    metric: u32,
 ) -> io::Result<()> {
     let msg = RouteMessageBuilder::<Ipv6Addr>::new()
         .destination_prefix(dst, prefix_len)
         .table_id(table)
+        .priority(metric)
         .build();
     match handle.route().del(msg).execute().await {
         Ok(()) => Ok(()),
