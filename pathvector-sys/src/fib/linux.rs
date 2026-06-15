@@ -568,6 +568,7 @@ async fn withdraw_route_v4(
         .destination_prefix(dst, prefix_len)
         .table_id(table)
         .priority(metric)
+        .protocol(RouteProtocol::Bgp)
         .build();
     match handle.route().del(msg).execute().await {
         Ok(()) => Ok(()),
@@ -593,6 +594,7 @@ async fn withdraw_route_v6(
         .destination_prefix(dst, prefix_len)
         .table_id(table)
         .priority(metric)
+        .protocol(RouteProtocol::Bgp)
         .build();
     match handle.route().del(msg).execute().await {
         Ok(()) => Ok(()),
@@ -683,12 +685,13 @@ mod tests {
     // metric, so a future edit cannot accidentally drop it.
 
     #[test]
-    fn withdraw_v4_message_carries_priority() {
+    fn withdraw_v4_message_carries_priority_and_bgp_protocol() {
         let metric: u32 = 20;
         let msg = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix("10.0.0.0".parse().unwrap(), 24)
             .table_id(254)
             .priority(metric)
+            .protocol(RouteProtocol::Bgp)
             .build();
         assert!(
             msg.attributes
@@ -696,21 +699,32 @@ mod tests {
                 .any(|a| matches!(a, RouteAttribute::Priority(m) if *m == metric)),
             "RTM_DELROUTE must include priority({metric}) to match the installed route"
         );
+        assert_eq!(
+            msg.header.protocol,
+            RouteProtocol::Bgp,
+            "RTM_DELROUTE must use RTPROT_BGP — the kernel rejects if protocol mismatches the installed route"
+        );
     }
 
     #[test]
-    fn withdraw_v6_message_carries_priority() {
+    fn withdraw_v6_message_carries_priority_and_bgp_protocol() {
         let metric: u32 = 20;
         let msg = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix("2001:db8::".parse().unwrap(), 32)
             .table_id(254)
             .priority(metric)
+            .protocol(RouteProtocol::Bgp)
             .build();
         assert!(
             msg.attributes
                 .iter()
                 .any(|a| matches!(a, RouteAttribute::Priority(m) if *m == metric)),
             "RTM_DELROUTE (v6) must include priority({metric}) to match the installed route"
+        );
+        assert_eq!(
+            msg.header.protocol,
+            RouteProtocol::Bgp,
+            "RTM_DELROUTE (v6) must use RTPROT_BGP — the kernel rejects if protocol mismatches the installed route"
         );
     }
 
