@@ -267,12 +267,53 @@ mandatory attribute errors. Current implementation applies TreatAsWithdraw
 silently without notifying the peer. Low priority given RFC 7606 makes this a
 SHOULD, but worth documenting as a known deviation.
 
+### High — outbound attribute violations
+
+**F. ORIGINATOR_ID and CLUSTER_LIST not stripped for eBGP peers** (`pathvector-rib/src/outbound.rs`, `route_to_attributes`)
+
+RFC 4456 §8: these route-reflector attributes MUST be stripped before advertising
+to eBGP peers — they are internal routing metadata. Currently both attributes are
+included unconditionally in outbound UPDATE serialization. Any eBGP peer receiving
+them sees internal topology information it should not have, and may reject the UPDATE
+or behave incorrectly. Fix: in `prepare_outbound` or `route_to_attributes`, strip
+`ORIGINATOR_ID` and `CLUSTER_LIST` when `peer_type == PeerType::External`.
+
+### Medium — SHOULD violations and behavioral gaps
+
+**G. MED not stripped for eBGP peers** (`pathvector-rib/src/outbound.rs`, `route_to_attributes`)
+
+RFC 4271 §5.1.4: MED SHOULD NOT be included in UPDATEs sent to eBGP peers unless
+they are confederation members. Currently MED passes through to all eBGP peers
+unconditionally, influencing their route selection with values that were intended
+only for internal use. Fix: strip `route.med` in `prepare_outbound` for
+`PeerType::External` (same location as LOCAL_PREF stripping, line ~28).
+
+**H. MRAI not implemented** (`pathvectord/src/daemon.rs`, `flush_updates`)
+
+RFC 4271 §9.2.1 recommends a Minimum Route Advertisement Interval (30 s for eBGP,
+0 for iBGP) to dampen UPDATE bursts. Not implemented and not documented as a
+deliberate omission. Low operational impact at small scale; becomes relevant under
+route churn or before GoBGP comparison benchmarking. Document as intentional
+deferral in code comments.
+
+**I. Route Reflector split-horizon not applied during full-table dump** (`pathvectord/src/daemon.rs`, `on_established`)
+
+When a new peer reaches Established, `on_established` sends the full Loc-RIB
+without applying RR non-client split-horizon. The check exists in
+`propagate_to_all_peers` for incremental updates but is absent from the initial
+dump path (lines 503–539). A non-client iBGP peer establishing a session receives
+routes learned from other non-client iBGP peers in its initial dump, violating RR
+split-horizon. Only affects deployments using route reflection.
+
 ### Test coverage gaps added by audit
 
 - No test for UPDATE containing our own AS in AS_PATH
 - No test for UPDATE announcing NLRIs without ORIGIN / AS_PATH / NEXT_HOP
 - No test for NEXT_HOP = 0.0.0.0, multicast, broadcast, or own address
 - No test for BGP ID = multicast or broadcast
+- No test for ORIGINATOR_ID / CLUSTER_LIST present in eBGP outbound UPDATE
+- No test for MED present in eBGP outbound UPDATE
+- No test for RR split-horizon applied during full-table dump
 
 ---
 
