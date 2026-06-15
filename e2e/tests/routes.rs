@@ -14,7 +14,7 @@ use pathvector_client::{
     DaemonClient,
     types::{Origin, PeerType},
 };
-use pathvector_e2e::{Harness, wait_for_route, wait_for_route_withdrawn};
+use pathvector_e2e::{Harness, wait_for_route, wait_for_route_with_diagnostics, wait_for_route_withdrawn};
 
 /// RFC 4271 §9.2 — a route announced by GoBGP must appear in the Loc-RIB and
 /// be returned by get_best_route.
@@ -145,10 +145,11 @@ async fn announced_v6_route_appears_in_rib() {
     // via MP_REACH_NLRI (IPv6 unicast).  GoBGP uses its own loopback as next-hop.
     h.gobgp_announce_v6("2001:db8::/32", "::1");
 
-    wait_for_route(
+    wait_for_route_with_diagnostics(
         &mut h.client.clone(),
         "2001:db8::/32",
         Duration::from_secs(15),
+        Some(&h.pathvectord_id),
     )
     .await
     .expect("IPv6 route did not appear in pathvectord LocRib within 15 s");
@@ -173,10 +174,11 @@ async fn withdrawn_v6_route_removed_from_rib() {
     let h = Harness::new_v6().await;
 
     h.gobgp_announce_v6("2001:db8::/32", "::1");
-    wait_for_route(
+    wait_for_route_with_diagnostics(
         &mut h.client.clone(),
         "2001:db8::/32",
         Duration::from_secs(15),
+        Some(&h.pathvectord_id),
     )
     .await
     .expect("IPv6 route did not appear before withdrawal test");

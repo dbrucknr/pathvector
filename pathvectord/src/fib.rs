@@ -47,14 +47,15 @@ impl NextHopOracle for DaemonOracle {
             NextHop::V4(addr) => self.0.is_v4_reachable(*addr),
             NextHop::V6(addr) => self.0.is_v6_reachable(*addr),
             NextHop::V6WithLinkLocal { global, link_local } => {
-                // RFC 4760 §3: when the global address is unspecified (::) the
-                // speaker has no global IPv6 address and the link-local is the
-                // only reachable next-hop (common for eBGP over IPv4 TCP).
-                // Check the link-local against the FIB in that case.
-                if global.is_unspecified() {
-                    self.0.is_v6_reachable(*link_local)
+                // RFC 4760 §3: the link-local is included so the receiver can
+                // forward even when the global address isn't reachable via the
+                // main routing table (e.g. speaker has no global IPv6, or the
+                // global is a loopback like ::1 that only exists in table local).
+                // Prefer the global when it's reachable; fall back to link-local.
+                if !global.is_unspecified() && self.0.is_v6_reachable(*global) {
+                    true
                 } else {
-                    self.0.is_v6_reachable(*global)
+                    self.0.is_v6_reachable(*link_local)
                 }
             }
         }
@@ -65,10 +66,10 @@ impl NextHopOracle for DaemonOracle {
             NextHop::V4(addr) => self.0.igp_metric_v4(*addr),
             NextHop::V6(addr) => self.0.igp_metric_v6(*addr),
             NextHop::V6WithLinkLocal { global, link_local } => {
-                if global.is_unspecified() {
-                    self.0.igp_metric_v6(*link_local)
-                } else {
+                if !global.is_unspecified() && self.0.igp_metric_v6(*global).is_some() {
                     self.0.igp_metric_v6(*global)
+                } else {
+                    self.0.igp_metric_v6(*link_local)
                 }
             }
         }
@@ -479,7 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn test_daemon_oracle_v6_with_link_local_uses_global() {
+    fn test_daemon_oracle_v6_with_link_local_falls_back_to_link_local() {
+        // global=2001:db8::1 is not in the FIB, so we fall back to the
+        // link-local. fe80::1 is always on-link → reachable.
         use pathvector_rib::oracle::NextHopOracle;
         use pathvector_sys::KernelFib;
         let (kfib, _rx) = KernelFib::new(254);
@@ -487,6 +490,21 @@ mod tests {
         let nh = NextHop::V6WithLinkLocal {
             global: "2001:db8::1".parse().unwrap(),
             link_local: "fe80::1".parse().unwrap(),
+        };
+        assert!(oracle.is_reachable(&nh));
+    }
+
+    #[test]
+    fn test_daemon_oracle_v6_with_link_local_unreachable_when_both_miss() {
+        // When neither global nor link-local is reachable, the route is rejected.
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        // link_local here is not actually in fe80::/10, so is_link_local_v6 → false.
+        let nh = NextHop::V6WithLinkLocal {
+            global: "2001:db8::1".parse().unwrap(),
+            link_local: "2001:db8::2".parse().unwrap(),
         };
         assert!(!oracle.is_reachable(&nh));
     }

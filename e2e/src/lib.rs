@@ -1128,13 +1128,38 @@ pub async fn wait_for_route(
     prefix: &str,
     timeout: Duration,
 ) -> Result<Route, String> {
+    wait_for_route_with_diagnostics(client, prefix, timeout, None).await
+}
+
+/// Like [`wait_for_route`] but dumps the last 60 lines of `container_id`'s
+/// stderr on timeout.  Use this for hard-to-diagnose e2e failures where the
+/// daemon log is the only signal.
+pub async fn wait_for_route_with_diagnostics(
+    client: &mut PathvectorClient,
+    prefix: &str,
+    timeout: Duration,
+    container_id: Option<&str>,
+) -> Result<Route, String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if tokio::time::Instant::now() > deadline {
-            return Err(format!(
-                "timed out waiting for route {prefix} to appear in RIB"
-            ));
+            let mut msg = format!("timed out waiting for route {prefix} to appear in RIB");
+            if let Some(id) = container_id {
+                let logs = Command::new("docker")
+                    .args(["logs", "--tail", "80", id])
+                    .output()
+                    .map(|o| {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+                    })
+                    .unwrap_or_else(|e| format!("<docker logs failed: {e}>"));
+                msg.push_str(&format!(
+                    "\n\n--- daemon logs (last 80 lines) ---\n{logs}"
+                ));
+            }
+            return Err(msg);
         }
         if let Ok(Some(route)) = client.get_best_route(prefix).await {
             return Ok(route);
