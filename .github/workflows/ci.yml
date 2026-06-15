@@ -138,7 +138,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=frr
 
       - name: Run e2e tests
-        run: cargo test -p pathvector-e2e -- --test-threads=1
+        run: cargo test -p pathvector-e2e -- --test-threads=4
 
   # ── Fuzz ────────────────────────────────────────────────────────────────────
   # fuzz:

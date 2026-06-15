@@ -372,6 +372,12 @@ if internal code panics while holding the lock). No action needed.
 - No test for RR split-horizon applied during full-table dump
 - No test for AS_PATH encoding to a 2-byte-only peer (AS_TRANS / AS4_PATH)
 - No test for IPv6 routes gated on peer Multi-Protocol capability
+- No IPv6 route receive/withdraw tests for BIRD and FRR peers — requires IPv6
+  variants of `write_bird_config` / `write_frr_config`, new `BirdHarness::new_v6()`
+  / `FrrHarness::new_v6()` constructors, and `address-family ipv6` blocks in each
+  speaker's BGP config.  The same `fe80::` link-local next-hop approach used in the
+  GoBGP tests applies; primary value is interop coverage (capability negotiation,
+  attribute encoding differences across implementations).
 - No test for duplicate originate_route behavior
 
 ---
