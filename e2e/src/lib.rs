@@ -1034,17 +1034,23 @@ pub async fn wait_for_kernel_route_withdrawn(
             let full_table = Command::new("docker")
                 .args(["exec", container_id, "ip", "route", "show", "table", "254"])
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-                .unwrap_or_else(|e| format!("<ip route failed: {e}>"));
+                .map_or_else(
+                    |e| format!("<ip route failed: {e}>"),
+                    |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+                );
+
             let daemon_logs = Command::new("docker")
                 .args(["logs", "--tail", "60", container_id])
                 .output()
-                .map(|o| {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    format!("stdout:\n{stdout}\nstderr:\n{stderr}")
-                })
-                .unwrap_or_else(|e| format!("<docker logs failed: {e}>"));
+                .map_or_else(
+                    |e| format!("<docker logs failed: {e}>"),
+                    |o| {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+                    },
+                );
+
             return Err(format!(
                 "timed out waiting for kernel route {prefix} to be withdrawn in container {container_id}\n\
                  \n--- ip route show table 254 ---\n{full_table}\n\
