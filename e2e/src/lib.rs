@@ -1031,8 +1031,24 @@ pub async fn wait_for_kernel_route_withdrawn(
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if tokio::time::Instant::now() > deadline {
+            let full_table = Command::new("docker")
+                .args(["exec", container_id, "ip", "route", "show", "table", "254"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_else(|e| format!("<ip route failed: {e}>"));
+            let daemon_logs = Command::new("docker")
+                .args(["logs", "--tail", "60", container_id])
+                .output()
+                .map(|o| {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+                })
+                .unwrap_or_else(|e| format!("<docker logs failed: {e}>"));
             return Err(format!(
-                "timed out waiting for kernel route {prefix} to be withdrawn in container {container_id}"
+                "timed out waiting for kernel route {prefix} to be withdrawn in container {container_id}\n\
+                 \n--- ip route show table 254 ---\n{full_table}\n\
+                 \n--- daemon logs (last 60 lines) ---\n{daemon_logs}"
             ));
         }
         let out = Command::new("docker")
