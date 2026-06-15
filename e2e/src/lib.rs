@@ -1134,6 +1134,14 @@ pub async fn wait_for_route(
 /// Like [`wait_for_route`] but dumps the last 60 lines of `container_id`'s
 /// stderr on timeout.  Use this for hard-to-diagnose e2e failures where the
 /// daemon log is the only signal.
+/// Like [`wait_for_route`] but dumps the last 80 lines of `container_id`'s
+/// logs on timeout.  Use this for hard-to-diagnose e2e failures where the
+/// daemon log is the only signal.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the route appears in the
+/// RIB.
 pub async fn wait_for_route_with_diagnostics(
     client: &mut PathvectorClient,
     prefix: &str,
@@ -1144,21 +1152,26 @@ pub async fn wait_for_route_with_diagnostics(
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if tokio::time::Instant::now() > deadline {
-            let mut msg = format!("timed out waiting for route {prefix} to appear in RIB");
-            if let Some(id) = container_id {
-                let logs = Command::new("docker")
+            let diag = container_id.map(|id| {
+                Command::new("docker")
                     .args(["logs", "--tail", "80", id])
                     .output()
-                    .map(|o| {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        format!("stdout:\n{stdout}\nstderr:\n{stderr}")
-                    })
-                    .unwrap_or_else(|e| format!("<docker logs failed: {e}>"));
-                msg.push_str(&format!(
-                    "\n\n--- daemon logs (last 80 lines) ---\n{logs}"
-                ));
-            }
+                    .map_or_else(
+                        |e| format!("<docker logs failed: {e}>"),
+                        |o| {
+                            let stdout = String::from_utf8_lossy(&o.stdout);
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+                        },
+                    )
+            });
+            let msg = match diag {
+                Some(logs) => format!(
+                    "timed out waiting for route {prefix} to appear in RIB\n\n\
+                     --- daemon logs (last 80 lines) ---\n{logs}"
+                ),
+                None => format!("timed out waiting for route {prefix} to appear in RIB"),
+            };
             return Err(msg);
         }
         if let Ok(Some(route)) = client.get_best_route(prefix).await {
