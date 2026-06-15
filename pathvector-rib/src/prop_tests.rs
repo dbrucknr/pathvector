@@ -3,7 +3,10 @@ use std::{collections::HashMap, net::Ipv4Addr};
 use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 use proptest::prelude::*;
 
-use crate::{AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder, best_path::select_best};
+use crate::{
+    AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder, best_path::select_best,
+    oracle::AlwaysReachable,
+};
 
 // ── Strategies ───────────────────────────────────────────────────────────────
 
@@ -299,7 +302,7 @@ proptest! {
         inserts in proptest::collection::vec(arb_peer_route(), 0..=12usize),
     ) {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        for (peer, route) in inserts { rib.insert(peer, route); }
+        for (peer, route) in inserts { rib.insert(peer, route, &AlwaysReachable); }
         #[allow(clippy::len_zero)]
         let len_is_zero = rib.len() == 0;
         prop_assert_eq!(rib.is_empty(), len_is_zero);
@@ -315,7 +318,7 @@ proptest! {
         inserts in proptest::collection::vec(arb_peer_route(), 1..=12usize),
     ) {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        for (peer, route) in inserts { rib.insert(peer, route); }
+        for (peer, route) in inserts { rib.insert(peer, route, &AlwaysReachable); }
         prop_assert_eq!(rib.best_routes().count(), rib.len());
     }
 
@@ -329,7 +332,7 @@ proptest! {
     ) {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let nlri = route.nlri;
-        rib.insert(peer, route);
+        rib.insert(peer, route, &AlwaysReachable);
         prop_assert!(rib.best(&nlri).is_some());
     }
 
@@ -345,7 +348,7 @@ proptest! {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let nlris: Vec<Nlri<Ipv4Addr>> = inserts.iter().map(|(_, r)| r.nlri).collect();
 
-        for (peer, route) in inserts { rib.insert(peer, route); }
+        for (peer, route) in inserts { rib.insert(peer, route, &AlwaysReachable); }
 
         for nlri in nlris {
             if let Some(winner) = rib.best_peer(&nlri) {
@@ -368,7 +371,7 @@ proptest! {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
 
         for (peer, route) in &inserts {
-            rib.insert(*peer, route.clone());
+            rib.insert(*peer, route.clone(), &AlwaysReachable);
         }
 
         // Snapshot which NLRIs the target exclusively owns before the withdraw.
@@ -381,7 +384,7 @@ proptest! {
             })
             .collect();
 
-        rib.withdraw_peer(&target);
+        rib.withdraw_peer(&target, &AlwaysReachable);
 
         for nlri in exclusive {
             prop_assert!(rib.best(&nlri).is_none());

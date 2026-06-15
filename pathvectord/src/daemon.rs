@@ -10,7 +10,10 @@ use std::{
 };
 
 use pathvector_policy::{Decision, DefaultAction, Policy};
-use pathvector_rib::{AdjRibIn, AdjRibOut, BestPathChange, LocRib, PeerId, Route, RouteBuilder};
+use pathvector_rib::{
+    AdjRibIn, AdjRibOut, BestPathChange, LocRib, PeerId, Route, RouteBuilder,
+    oracle::{AlwaysReachable, NextHopOracle},
+};
 use pathvector_session::{
     message::{
         Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
@@ -169,6 +172,12 @@ pub(crate) struct DaemonState {
     ///
     /// `None` when no kernel FIB integration is configured (e.g. tests).
     pub(crate) fib_manager: Option<Arc<fib::FibManager>>,
+    /// Next-hop oracle consulted on every IPv4 best-path recompute (RFC 4271 §9.1
+    /// steps 1 & 8). Defaults to `AlwaysReachable`; replaced with `DaemonOracle`
+    /// once `KernelFib` is initialised at startup.
+    oracle_v4: Arc<dyn NextHopOracle + Send + Sync>,
+    /// Next-hop oracle for IPv6 best-path recompute.
+    oracle_v6: Arc<dyn NextHopOracle + Send + Sync>,
 }
 
 impl DaemonState {
@@ -306,7 +315,71 @@ impl DaemonState {
             route_tx,
             peer_tx,
             fib_manager: None,
+            oracle_v4: Arc::new(AlwaysReachable),
+            oracle_v6: Arc::new(AlwaysReachable),
         }
+    }
+
+    /// Replaces both next-hop oracles once `KernelFib` is initialised.
+    pub(crate) fn set_oracles(
+        &mut self,
+        v4: impl NextHopOracle + Send + Sync + 'static,
+        v6: impl NextHopOracle + Send + Sync + 'static,
+    ) {
+        self.oracle_v4 = Arc::new(v4);
+        self.oracle_v6 = Arc::new(v6);
+    }
+
+    // ── LocRib mutation wrappers ──────────────────────────────────────────────
+    //
+    // These clone the oracle Arc before calling rib_mut() so the borrow checker
+    // sees two independent borrows of `self` (oracle_v4 vs rib) rather than one
+    // mutable borrow of the entire struct.
+
+    pub(crate) fn rib_insert_v4(
+        &mut self,
+        peer: PeerId,
+        route: Route<Ipv4Addr>,
+    ) -> BestPathChange<Ipv4Addr> {
+        let oracle = Arc::clone(&self.oracle_v4);
+        self.rib_mut().loc_rib.insert(peer, route, &*oracle)
+    }
+
+    pub(crate) fn rib_withdraw_v4(
+        &mut self,
+        peer: &PeerId,
+        nlri: &Nlri<Ipv4Addr>,
+    ) -> BestPathChange<Ipv4Addr> {
+        let oracle = Arc::clone(&self.oracle_v4);
+        self.rib_mut().loc_rib.withdraw(peer, nlri, &*oracle)
+    }
+
+    pub(crate) fn rib_withdraw_peer_v4(&mut self, peer: &PeerId) -> Vec<BestPathChange<Ipv4Addr>> {
+        let oracle = Arc::clone(&self.oracle_v4);
+        self.rib_mut().loc_rib.withdraw_peer(peer, &*oracle)
+    }
+
+    pub(crate) fn rib_insert_v6(
+        &mut self,
+        peer: PeerId,
+        route: Route<Ipv6Addr>,
+    ) -> BestPathChange<Ipv6Addr> {
+        let oracle = Arc::clone(&self.oracle_v6);
+        self.rib_mut().loc_rib_v6.insert(peer, route, &*oracle)
+    }
+
+    pub(crate) fn rib_withdraw_v6(
+        &mut self,
+        peer: &PeerId,
+        nlri: &Nlri<Ipv6Addr>,
+    ) -> BestPathChange<Ipv6Addr> {
+        let oracle = Arc::clone(&self.oracle_v6);
+        self.rib_mut().loc_rib_v6.withdraw(peer, nlri, &*oracle)
+    }
+
+    pub(crate) fn rib_withdraw_peer_v6(&mut self, peer: &PeerId) -> Vec<BestPathChange<Ipv6Addr>> {
+        let oracle = Arc::clone(&self.oracle_v6);
+        self.rib_mut().loc_rib_v6.withdraw_peer(peer, &*oracle)
     }
 
     /// Returns a cheap clone of the snapshot Arc for lock-free gRPC reads.
@@ -522,8 +595,8 @@ impl DaemonState {
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
-        let fib_changes_v4 = self.rib_mut().loc_rib.withdraw_peer(&peer_id);
-        let fib_changes_v6 = self.rib_mut().loc_rib_v6.withdraw_peer(&peer_id);
+        let fib_changes_v4 = self.rib_withdraw_peer_v4(&peer_id);
+        let fib_changes_v6 = self.rib_withdraw_peer_v6(&peer_id);
 
         if let Some(fm) = &self.fib_manager {
             for change in fib_changes_v4 {
@@ -770,6 +843,8 @@ impl DaemonState {
 
         // Split mutable borrows across distinct struct fields explicitly so the
         // borrow checker can verify they don't alias.
+        let oracle_v4 = Arc::clone(&self.oracle_v4);
+        let oracle_v6 = Arc::clone(&self.oracle_v6);
         let rib = Arc::make_mut(&mut self.rib);
         let (fib_changes, fib_changes_v6) = handle_update(
             peer_id,
@@ -781,6 +856,8 @@ impl DaemonState {
             policy,
             policy_v6,
             peer_type,
+            &*oracle_v4,
+            &*oracle_v6,
         );
 
         if let Some(fm) = &self.fib_manager {
@@ -993,10 +1070,8 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            let rib = self.rib_mut();
-            rib.originated_routes.insert(nlri, route.clone());
-            rib.loc_rib
-                .insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
+            self.rib_mut().originated_routes.insert(nlri, route.clone());
+            self.rib_insert_v4(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Announced as i32,
@@ -1022,10 +1097,7 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            let rib = self.rib_mut();
-            let fib_change = rib
-                .loc_rib_v6
-                .insert(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
+            let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             if let Some(fm) = &self.fib_manager {
                 fm.apply_v6(fib_change);
             }
@@ -1054,9 +1126,8 @@ impl DaemonState {
     /// pass.
     pub(crate) fn withdraw_originated_routes(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
         for nlri in nlris {
-            let rib = self.rib_mut();
-            rib.originated_routes.remove(nlri);
-            let fib_change = rib.loc_rib.withdraw(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            self.rib_mut().originated_routes.remove(nlri);
+            let fib_change = self.rib_withdraw_v4(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
             if let Some(fm) = &self.fib_manager {
                 fm.apply_v4(fib_change);
             }
@@ -1092,14 +1163,16 @@ impl DaemonState {
             .unwrap_or_default();
 
         // Re-evaluate the peer's Adj-RIB-In against the new policy.
-        // Split the borrows explicitly: rib_mut() needs &mut self.rib, while
-        // adj_ribs_in and import_policies are separate fields.
+        // Clone oracle before the mutable borrow of rib so the borrow checker
+        // sees oracle_v4 and rib as independent fields of self.
+        let oracle = Arc::clone(&self.oracle_v4);
         let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
         let fib_changes = reapply_import_policy(
             PeerId::from(peer_ip),
             &self.adj_ribs_in[&peer_ip],
             loc_rib,
             &self.import_policies[&peer_ip],
+            &*oracle,
         );
 
         if let Some(fm) = &self.fib_manager {
@@ -1214,8 +1287,9 @@ where
         let (kfib, _change_rx) = pathvector_sys::KernelFib::new(fib_table);
         kfib
     };
-    let daemon_oracle_v4 = fib::DaemonOracle(kernel_fib.oracle());
-    let daemon_oracle_v6 = fib::DaemonOracle(kernel_fib.oracle());
+    // oracle() takes &self; call before spawn() consumes kernel_fib.
+    let oracle_v4 = fib::DaemonOracle(kernel_fib.oracle());
+    let oracle_v6 = fib::DaemonOracle(kernel_fib.oracle());
     let fib_writer = match pathvector_sys::FibWriter::new(fib_table, fib_metric) {
         Ok(w) => {
             tokio::spawn(kernel_fib.spawn());
@@ -1228,19 +1302,16 @@ where
             None
         }
     };
-    if let Some(writer) = fib_writer {
-        let manager = Arc::new(fib::FibManager::new(writer));
-        state.write().await.fib_manager = Some(manager);
-    }
 
-    // Wire the live oracle into both production RIBs now that KernelFib is
-    // initialised.  Sessions have not yet started, so no best-path recomputes
-    // are in flight — the swap is safe under a single write lock.
+    // Wire the live oracle and FIB writer into the daemon state now that
+    // KernelFib is initialised.  Sessions have not yet started, so no
+    // best-path recomputes are in flight — the update is safe.
     {
         let mut guard = state.write().await;
-        let rib = guard.rib_mut();
-        rib.loc_rib = LocRib::with_oracle(daemon_oracle_v4);
-        rib.loc_rib_v6 = LocRib::with_oracle(daemon_oracle_v6);
+        guard.set_oracles(oracle_v4, oracle_v6);
+        if let Some(writer) = fib_writer {
+            guard.fib_manager = Some(Arc::new(fib::FibManager::new(writer)));
+        }
     }
 
     // Spawn the gRPC management API server alongside the BGP event loop.
@@ -1497,6 +1568,7 @@ pub(crate) fn reapply_import_policy(
     adj_rib_in: &AdjRibIn<Ipv4Addr>,
     loc_rib: &mut LocRib<Ipv4Addr>,
     policy: &Policy<Route<Ipv4Addr>>,
+    oracle: &dyn NextHopOracle,
 ) -> Vec<BestPathChange<Ipv4Addr>> {
     let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
     let mut accepted = 0usize;
@@ -1506,11 +1578,11 @@ pub(crate) fn reapply_import_policy(
         let mut route = raw_route.clone();
         match policy.evaluate(&mut route) {
             Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route));
+                fib_changes.push(loc_rib.insert(peer, route, oracle));
                 accepted += 1;
             }
             Decision::Reject | Decision::Next => {
-                fib_changes.push(loc_rib.withdraw(&peer, nlri));
+                fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle));
                 rejected += 1;
             }
         }
@@ -1540,6 +1612,8 @@ fn handle_update(
     policy: &Policy<Route<Ipv4Addr>>,
     policy_v6: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
+    oracle_v4: &dyn NextHopOracle,
+    oracle_v6: &dyn NextHopOracle,
 ) -> (Vec<BestPathChange<Ipv4Addr>>, Vec<BestPathChange<Ipv6Addr>>) {
     let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
     let mut fib_changes_v6: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
@@ -1548,7 +1622,7 @@ fn handle_update(
     // ── Traditional IPv4 withdrawals (RFC 4271 §4.3) ──────────────────────
     for nlri in &msg.withdrawn {
         adj_rib_in.withdraw(nlri);
-        fib_changes.push(loc_rib.withdraw(&peer, nlri));
+        fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle_v4));
     }
 
     // ── Single pass over path attributes ─────────────────────────────────
@@ -1637,7 +1711,7 @@ fn handle_update(
     let mp_withdrawn_count = mp_v4_withdrawn.len();
     for nlri in &mp_v4_withdrawn {
         adj_rib_in.withdraw(nlri);
-        fib_changes.push(loc_rib.withdraw(&peer, nlri));
+        fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle_v4));
     }
 
     // ── Announcements: traditional NLRIs + MP_REACH_NLRI V4 prefixes ─────
@@ -1706,7 +1780,7 @@ fn handle_update(
         let mut route = raw;
         match policy.evaluate(&mut route) {
             Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route));
+                fib_changes.push(loc_rib.insert(peer, route, oracle_v4));
                 accepted += 1;
             }
             Decision::Reject | Decision::Next => {
@@ -1719,7 +1793,7 @@ fn handle_update(
     let mp_v6_withdrawn_count = mp_v6_withdrawn.len();
     for nlri in &mp_v6_withdrawn {
         adj_rib_in_v6.withdraw(nlri);
-        fib_changes_v6.push(loc_rib_v6.withdraw(&peer, nlri));
+        fib_changes_v6.push(loc_rib_v6.withdraw(&peer, nlri, oracle_v6));
     }
 
     // ── IPv6 announcements from MP_REACH_NLRI ─────────────────────────────
@@ -1766,7 +1840,7 @@ fn handle_update(
         let mut route = raw;
         match policy_v6.evaluate(&mut route) {
             Decision::Accept => {
-                fib_changes_v6.push(loc_rib_v6.insert(peer, route));
+                fib_changes_v6.push(loc_rib_v6.insert(peer, route, oracle_v6));
                 accepted_v6 += 1;
             }
             Decision::Reject | Decision::Next => {
@@ -2061,7 +2135,7 @@ mod tests {
         .next_hop(NextHop::V4("10.0.0.9".parse().unwrap()))
         .peer_type(PeerType::External)
         .build();
-        state.rib_mut().loc_rib.insert(src, route);
+        state.rib_insert_v4(src, route);
 
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[], None);
 
@@ -2091,7 +2165,7 @@ mod tests {
         assert_eq!(state.rib.local_bgp_id, local_bgp_id);
 
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             src,
             RouteBuilder::new(
                 nlri("10.0.0.0/8"),
@@ -2171,7 +2245,7 @@ mod tests {
         .next_hop(NextHop::V4("10.0.0.9".parse().unwrap()))
         .peer_type(PeerType::External)
         .build();
-        state.rib_mut().loc_rib.insert(src, route);
+        state.rib_insert_v4(src, route);
         state.propagate_to_all_peers(&[nlri("192.0.2.0/24")]);
 
         let msg = receivers
@@ -2228,7 +2302,7 @@ mod tests {
         );
 
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             src,
             RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
                 .peer_type(PeerType::External)
@@ -2260,7 +2334,7 @@ mod tests {
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[], None);
 
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             PeerId::from(peer_ip),
             RouteBuilder::new(
                 nlri("10.0.0.0/8"),
@@ -2422,6 +2496,8 @@ mod tests {
             policy,
             &policy_v6,
             pt,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
     }
 
@@ -2920,6 +2996,8 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
 
         assert_eq!(rib_v6.len(), 1, "IPv6 route must enter loc_rib_v6");
@@ -2957,6 +3035,8 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
 
         assert_eq!(ari_v6.len(), 1, "pre-policy route must be in adj_rib_in_v6");
@@ -2995,6 +3075,8 @@ mod tests {
             &accept_all(),
             &reject_policy_v6,
             PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
 
         assert!(
@@ -3133,6 +3215,8 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
         assert_eq!(rib_v6.len(), 1);
 
@@ -3154,6 +3238,8 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
 
         assert!(
@@ -3193,6 +3279,8 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
         );
 
         assert_eq!(rib.len(), 1, "IPv4 route must be in loc_rib");
@@ -3220,7 +3308,7 @@ mod tests {
             .peer_type(PeerType::External)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        rib_v6.insert(peer(), route);
+        rib_v6.insert(peer(), route, &AlwaysReachable);
 
         let decision = propagate_prefix_v6(
             nlri_v6("2001:db8::/32"),
@@ -3245,7 +3333,7 @@ mod tests {
             .peer_type(PeerType::External)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        rib_v6.insert(peer(), route);
+        rib_v6.insert(peer(), route, &AlwaysReachable);
 
         let local_v6: Ipv6Addr = "2001:db8::ff".parse().unwrap();
         let decision = propagate_prefix_v6(
@@ -3277,7 +3365,7 @@ mod tests {
             .peer_type(PeerType::External)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        rib_v6.insert(peer(), route);
+        rib_v6.insert(peer(), route, &AlwaysReachable);
 
         let decision = propagate_prefix_v6(
             nlri_v6("2001:db8::/32"),
@@ -3303,7 +3391,7 @@ mod tests {
             .peer_type(PeerType::External)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        rib_v6.insert(peer(), route.clone());
+        rib_v6.insert(peer(), route.clone(), &AlwaysReachable);
         // Announce it first so AdjRibOut records it.
         propagate_prefix_v6(
             nlri_v6("2001:db8::/32"),
@@ -3315,7 +3403,7 @@ mod tests {
         );
 
         // Now withdraw from loc_rib_v6 and propagate again.
-        rib_v6.withdraw(&peer(), &nlri_v6("2001:db8::/32"));
+        rib_v6.withdraw(&peer(), &nlri_v6("2001:db8::/32"), &AlwaysReachable);
         let decision = propagate_prefix_v6(
             nlri_v6("2001:db8::/32"),
             &rib_v6,
@@ -3346,7 +3434,7 @@ mod tests {
         .next_hop(NextHop::V6("2001:db8::9".parse().unwrap()))
         .peer_type(PeerType::External)
         .build();
-        state.rib_mut().loc_rib_v6.insert(src, v6_route);
+        state.rib_insert_v6(src, v6_route);
 
         // Set local_ipv6 so eBGP dump works.
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
@@ -3688,7 +3776,7 @@ mod tests {
         );
         assert!(rib.is_empty());
 
-        reapply_import_policy(peer(), &ari, &mut rib, &accept_all());
+        reapply_import_policy(peer(), &ari, &mut rib, &accept_all(), &AlwaysReachable);
         assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
     }
 
@@ -3713,7 +3801,7 @@ mod tests {
         );
         assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
 
-        reapply_import_policy(peer(), &ari, &mut rib, &reject_all());
+        reapply_import_policy(peer(), &ari, &mut rib, &reject_all(), &AlwaysReachable);
         assert!(rib.best(&nlri("10.0.0.0/8")).is_none());
     }
 
@@ -3746,7 +3834,7 @@ mod tests {
                 .then(Accept),
         ));
 
-        reapply_import_policy(peer(), &ari, &mut rib, &new_policy);
+        reapply_import_policy(peer(), &ari, &mut rib, &new_policy, &AlwaysReachable);
         assert_eq!(
             rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref,
             Some(LP::new(300))
@@ -3796,7 +3884,7 @@ mod tests {
         let mut new_policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Accept);
         new_policy.add_term(Term::new(CommunityCondition::new(blocked), Reject));
 
-        reapply_import_policy(peer(), &ari, &mut rib, &new_policy);
+        reapply_import_policy(peer(), &ari, &mut rib, &new_policy, &AlwaysReachable);
         assert!(
             rib.best(&nlri("10.0.0.0/8")).is_none(),
             "blocked route must be withdrawn"
@@ -4015,7 +4103,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_sends_update_for_new_route() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -4038,7 +4126,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_no_send_when_route_unchanged() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -4073,7 +4161,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_sends_withdraw_when_route_removed() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -4089,7 +4177,7 @@ mod tests {
         );
         let _ = rx.try_recv();
 
-        rib.withdraw(&peer(), &nlri("10.0.0.0/8"));
+        rib.withdraw(&peer(), &nlri("10.0.0.0/8"), &AlwaysReachable);
 
         propagate_and_flush(
             nlri("10.0.0.0/8"),
@@ -4110,7 +4198,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_sends_withdraw_when_export_policy_rejects() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -4171,7 +4259,7 @@ mod tests {
         // source peer and producing spurious WITHDRAWs.
         let (src_peer, mut aro) = ebgp_out_peer(); // same peer as source AND target
         let mut rib = LocRib::new();
-        rib.insert(src_peer, ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(src_peer, ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (tx, mut rx) = mpsc::channel(16);
 
         propagate_and_flush(
@@ -4325,7 +4413,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_ibgp_split_horizon_no_send() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ibgp_route("10.0.0.0/8"));
+        rib.insert(peer(), ibgp_route("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ibgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -4349,7 +4437,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_ebgp_prepends_local_as_in_wire_message() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -4395,7 +4483,7 @@ mod tests {
 
         // Phase 1: best path is eBGP — stored in the iBGP peer's AdjRibOut.
         let mut rib = LocRib::new();
-        rib.insert(src, ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(src, ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib,
@@ -4411,7 +4499,7 @@ mod tests {
         // Phase 2: best path switches to iBGP — split-horizon evicts the stored
         // eBGP entry and the peer must receive a WITHDRAW.
         let mut rib2 = LocRib::new();
-        rib2.insert(src, ibgp_route("10.0.0.0/8"));
+        rib2.insert(src, ibgp_route("10.0.0.0/8"), &AlwaysReachable);
         propagate_and_flush(
             nlri("10.0.0.0/8"),
             &rib2,
@@ -4489,7 +4577,7 @@ mod tests {
         // First advertise via a real LocRib, then call again with empty StubRibView
         // to verify a WITHDRAW is produced even without constructing a second LocRib.
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(16);
         propagate_and_flush(
@@ -4530,7 +4618,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_full_update_channel_returns_false() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, _rx) = mpsc::channel(1);
 
@@ -4560,7 +4648,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_full_withdraw_on_reject_returns_false() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -4605,7 +4693,7 @@ mod tests {
     #[test]
     fn test_propagate_prefix_full_withdraw_on_empty_rib_returns_false() {
         let mut rib = LocRib::new();
-        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"));
+        rib.insert(peer(), ebgp_route_with_lp("10.0.0.0/8"), &AlwaysReachable);
         let (_, mut aro) = ebgp_out_peer();
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -4624,7 +4712,7 @@ mod tests {
         let _ = rx.try_recv();
 
         // Remove the route so loc_rib.best returns None.
-        rib.withdraw(&peer(), &nlri("10.0.0.0/8"));
+        rib.withdraw(&peer(), &nlri("10.0.0.0/8"), &AlwaysReachable);
 
         // Fill the channel so the WITHDRAW try_send fails.
         tx.try_send(UpdateMessage {
@@ -4828,6 +4916,7 @@ mod tests {
         loc_rib.insert(
             peer(),
             RouteBuilder::new(n, Origin::Igp, AsPath::new()).build(),
+            &AlwaysReachable,
         );
 
         let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
@@ -4863,6 +4952,7 @@ mod tests {
             RouteBuilder::new(n, Origin::Igp, AsPath::new())
                 .peer_type(PeerType::Internal)
                 .build(),
+            &AlwaysReachable,
         );
 
         let out_peer = PeerId::new(IpAddr::V4("10.0.0.3".parse().unwrap()));
@@ -4901,6 +4991,7 @@ mod tests {
         loc_rib.insert(
             peer(),
             RouteBuilder::new(n, Origin::Igp, AsPath::new()).build(),
+            &AlwaysReachable,
         );
 
         let out_peer = PeerId::new(IpAddr::V4("10.0.0.2".parse().unwrap()));
@@ -5353,7 +5444,7 @@ mod stall_tests {
         // Pre-populate the Loc-RIB from a third-party peer so that on_established
         // has something to propagate.
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -5570,7 +5661,7 @@ mod stall_tests {
         // Populate Loc-RIB BEFORE establishing so the table dump sends the
         // route to peer_ip's Adj-RIB-Out.
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -5601,7 +5692,7 @@ mod stall_tests {
         // Peer is configured but never established — set_export_default must
         // return early without sending anything to the channel.
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             src,
             base_route(
                 "10.0.0.0/8",
@@ -5624,7 +5715,7 @@ mod stall_tests {
 
         // Pre-populate Loc-RIB so the table dump fills the channel (cap 1).
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
-        state.rib_mut().loc_rib.insert(
+        state.rib_insert_v4(
             src,
             base_route(
                 "10.0.0.0/8",

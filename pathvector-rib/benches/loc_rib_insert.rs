@@ -5,7 +5,7 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pathvector_rib::{LocRib, PeerId, Route, RouteBuilder};
+use pathvector_rib::{LocRib, PeerId, Route, RouteBuilder, oracle::AlwaysReachable};
 use pathvector_types::{AsPath, Asn, LocalPref, NextHop, Nlri, Origin, PeerType};
 
 fn peer(n: u8) -> PeerId {
@@ -39,8 +39,16 @@ fn make_route(prefix_idx: usize, lp: u32, path_len: usize, pt: PeerType) -> Rout
 fn build_rib(n: usize) -> LocRib<Ipv4Addr> {
     let mut rib = LocRib::new();
     for i in 0..n {
-        rib.insert(peer(1), make_route(i, 200, 3, PeerType::External));
-        rib.insert(peer(2), make_route(i, 100, 2, PeerType::External));
+        rib.insert(
+            peer(1),
+            make_route(i, 200, 3, PeerType::External),
+            &AlwaysReachable,
+        );
+        rib.insert(
+            peer(2),
+            make_route(i, 100, 2, PeerType::External),
+            &AlwaysReachable,
+        );
     }
     rib
 }
@@ -62,7 +70,11 @@ fn bench_loc_rib_insert(c: &mut Criterion) {
                 #[allow(clippy::cast_possible_truncation)]
                 for i in 0..(iters as usize) {
                     let lp = if i % 2 == 0 { 300u32 } else { 50u32 };
-                    rib.insert(peer(3), make_route(0, lp, 1, PeerType::External));
+                    rib.insert(
+                        peer(3),
+                        make_route(0, lp, 1, PeerType::External),
+                        &AlwaysReachable,
+                    );
                     black_box(());
                 }
                 let elapsed = start.elapsed();

@@ -1108,7 +1108,7 @@ mod tests {
             .peer_type(PeerType::External)
             .build();
         s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
-        s.rib_mut().loc_rib.insert(peer("10.0.0.2"), route);
+        s.rib_insert_v4(peer("10.0.0.2"), route);
         s.sync_received(addr);
 
         let ps = build_peer_state(&s.rib, addr).unwrap();
@@ -1372,7 +1372,7 @@ mod tests {
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
-            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), route);
+            s.rib_insert_v4(peer("10.0.0.2"), route);
         }
 
         let svc = RibServiceImpl { state };
@@ -1432,12 +1432,12 @@ mod tests {
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
             s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
-            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), r1);
+            s.rib_insert_v4(peer("10.0.0.2"), r1);
 
             let n2 = nlri("192.168.0.0/24");
             let r2 = route_igp(n2, PeerType::External);
             s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
-            s.rib_mut().loc_rib.insert(peer("10.0.0.3"), r2);
+            s.rib_insert_v4(peer("10.0.0.3"), r2);
         }
 
         let svc = RibServiceImpl { state };
@@ -1463,12 +1463,12 @@ mod tests {
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
             s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
-            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), r1);
+            s.rib_insert_v4(peer("10.0.0.2"), r1);
 
             let n2 = nlri("192.168.0.0/24");
             let r2 = route_igp(n2, PeerType::External);
             s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
-            s.rib_mut().loc_rib.insert(peer("10.0.0.3"), r2);
+            s.rib_insert_v4(peer("10.0.0.3"), r2);
         }
 
         let svc = RibServiceImpl { state };
@@ -1523,7 +1523,7 @@ mod tests {
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
             s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
-            s.rib_mut().loc_rib.insert(peer("10.0.0.2"), route);
+            s.rib_insert_v4(peer("10.0.0.2"), route);
         }
 
         let svc = RibServiceImpl { state };
@@ -2138,7 +2138,7 @@ mod tests {
         {
             let mut s = state.write().await;
             let n = nlri6("2001:db8::/32");
-            s.rib_mut().loc_rib_v6.insert(
+            s.rib_insert_v6(
                 PeerId::from(Ipv4Addr::new(10, 0, 0, 2)),
                 route_v6_igp(n, PeerType::External),
             );
@@ -2180,9 +2180,7 @@ mod tests {
             let mut s = state.write().await;
             s.on_established(addr, PeerType::External, 65002, 90, &[], None);
             let n = nlri6("2001:db8::/32");
-            s.rib_mut()
-                .loc_rib_v6
-                .insert(PeerId::from(addr), route_v6_igp(n, PeerType::External));
+            s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n, PeerType::External));
         }
         let svc = RibServiceImpl { state };
         let resp = svc
@@ -2208,9 +2206,7 @@ mod tests {
             let mut s = state.write().await;
             s.on_established(addr, PeerType::External, 65002, 90, &[], None);
             let n = nlri6("2001:db8::/32");
-            s.rib_mut()
-                .loc_rib_v6
-                .insert(PeerId::from(addr), route_v6_igp(n, PeerType::External));
+            s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n, PeerType::External));
         }
         let svc = RibServiceImpl { state };
         let resp = svc
@@ -2610,7 +2606,7 @@ mod tests {
             None,
         );
         let n = nlri("192.0.2.0/24");
-        s.rib_mut().loc_rib.insert(
+        s.rib_insert_v4(
             peer(addr.to_string().as_str()),
             route_igp(n, PeerType::External),
         );

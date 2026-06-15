@@ -1,14 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
 use routemap::RouteMap;
 
 use crate::{
-    best_path::select_best_with_oracle,
-    oracle::{AlwaysReachable, NextHopOracle},
-    peer::PeerId,
-    route::Route,
+    best_path::select_best_with_oracle, oracle::NextHopOracle, peer::PeerId, route::Route,
 };
 
 /// Describes how the best path for a prefix changed after a `LocRib` mutation.
@@ -67,6 +64,7 @@ pub enum BestPathChange<A: IpAddress> {
 /// ```
 /// use std::net::{IpAddr, Ipv4Addr};
 /// use pathvector_rib::{LocRib, PeerId, RouteBuilder};
+/// use pathvector_rib::oracle::AlwaysReachable;
 /// use pathvector_types::{AsPath, LocalPref, Nlri, Origin};
 ///
 /// let peer_a = PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -77,10 +75,10 @@ pub enum BestPathChange<A: IpAddress> {
 ///
 /// rib.insert(peer_a, RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
 ///     .local_pref(LocalPref::new(200))
-///     .build());
+///     .build(), &AlwaysReachable);
 /// rib.insert(peer_b, RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
 ///     .local_pref(LocalPref::new(100))
-///     .build());
+///     .build(), &AlwaysReachable);
 ///
 /// // peer_a wins — higher LOCAL_PREF
 /// assert_eq!(rib.best_peer(&nlri), Some(peer_a));
@@ -119,35 +117,15 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
 pub struct LocRib<A: IpAddress> {
     candidates: HashMap<Nlri<A>, HashMap<PeerId, Route<A>>>,
     best: RouteMap<A, (PeerId, Route<A>)>,
-    oracle: Arc<dyn NextHopOracle + Send + Sync>,
 }
 
 impl<A: IpAddress> LocRib<A> {
-    /// Creates an empty `LocRib` using [`AlwaysReachable`] as the next-hop oracle.
-    ///
-    /// Suitable for tests and for any context where FIB integration is not
-    /// available. Use [`with_oracle`][`LocRib::with_oracle`] to attach a live
-    /// oracle at daemon startup.
+    /// Creates an empty `LocRib`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             candidates: HashMap::new(),
             best: RouteMap::new(),
-            oracle: Arc::new(AlwaysReachable),
-        }
-    }
-
-    /// Creates an empty `LocRib` backed by the given next-hop oracle.
-    ///
-    /// The oracle is consulted on every best-path recompute (RFC 4271 §9.1
-    /// steps 1 and 8): unreachable next-hops are excluded from selection, and
-    /// among equally-preferred routes the one with the lower IGP metric wins.
-    #[must_use]
-    pub fn with_oracle(oracle: impl NextHopOracle + Send + Sync + 'static) -> Self {
-        Self {
-            candidates: HashMap::new(),
-            best: RouteMap::new(),
-            oracle: Arc::new(oracle),
         }
     }
 
@@ -160,11 +138,16 @@ impl<A: IpAddress> LocRib<A> {
     ///
     /// Returns a [`BestPathChange`] describing whether and how the best path
     /// changed as a result of this insert.
-    pub fn insert(&mut self, peer: PeerId, route: Route<A>) -> BestPathChange<A> {
+    pub fn insert(
+        &mut self,
+        peer: PeerId,
+        route: Route<A>,
+        oracle: &dyn NextHopOracle,
+    ) -> BestPathChange<A> {
         let nlri = route.nlri;
         let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
         self.candidates.entry(nlri).or_default().insert(peer, route);
-        self.recompute_best(nlri);
+        self.recompute_best(nlri, oracle);
         match self.best.get(nlri.prefix()) {
             None => BestPathChange::Unchanged,
             Some((new_peer, new_route)) => match old {
@@ -186,7 +169,12 @@ impl<A: IpAddress> LocRib<A> {
     ///
     /// Returns a [`BestPathChange`] describing whether and how the best path
     /// changed as a result of this withdrawal.
-    pub fn withdraw(&mut self, peer: &PeerId, nlri: &Nlri<A>) -> BestPathChange<A> {
+    pub fn withdraw(
+        &mut self,
+        peer: &PeerId,
+        nlri: &Nlri<A>,
+        oracle: &dyn NextHopOracle,
+    ) -> BestPathChange<A> {
         let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
         if let Some(peer_map) = self.candidates.get_mut(nlri) {
             peer_map.remove(peer);
@@ -197,7 +185,7 @@ impl<A: IpAddress> LocRib<A> {
                     return BestPathChange::Withdrawn(*nlri);
                 }
             } else {
-                self.recompute_best(*nlri);
+                self.recompute_best(*nlri, oracle);
                 return match self.best.get(nlri.prefix()) {
                     None => BestPathChange::Withdrawn(*nlri),
                     Some((new_peer, new_route)) => match old {
@@ -222,7 +210,11 @@ impl<A: IpAddress> LocRib<A> {
     ///
     /// Returns one [`BestPathChange`] per prefix that had a candidate from
     /// this peer. Prefixes unaffected by this peer are omitted.
-    pub fn withdraw_peer(&mut self, peer: &PeerId) -> Vec<BestPathChange<A>> {
+    pub fn withdraw_peer(
+        &mut self,
+        peer: &PeerId,
+        oracle: &dyn NextHopOracle,
+    ) -> Vec<BestPathChange<A>> {
         let affected: Vec<Nlri<A>> = self
             .candidates
             .iter()
@@ -232,7 +224,7 @@ impl<A: IpAddress> LocRib<A> {
 
         affected
             .into_iter()
-            .map(|nlri| self.withdraw(peer, &nlri))
+            .map(|nlri| self.withdraw(peer, &nlri, oracle))
             .collect()
     }
 
@@ -290,9 +282,9 @@ impl<A: IpAddress> LocRib<A> {
         self.candidates.is_empty()
     }
 
-    fn recompute_best(&mut self, nlri: Nlri<A>) {
+    fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
         if let Some(peer_map) = self.candidates.get(&nlri) {
-            if let Some((peer, route)) = select_best_with_oracle(peer_map, &*self.oracle) {
+            if let Some((peer, route)) = select_best_with_oracle(peer_map, oracle) {
                 self.best.insert(nlri.prefix(), (peer, route.clone()));
             } else {
                 self.best.remove(nlri.prefix());
@@ -310,7 +302,7 @@ impl<A: IpAddress> Default for LocRib<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RouteBuilder;
+    use crate::{RouteBuilder, oracle::AlwaysReachable};
     use pathvector_types::{AsPath, LocalPref, Origin};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -343,7 +335,7 @@ mod tests {
     fn test_loc_rib_insert_single() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route("10.0.0.0/8"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
         assert_eq!(rib.len(), 1);
         assert!(rib.best(&n).is_some());
         assert_eq!(rib.best_peer(&n), Some(peer(1)));
@@ -353,8 +345,8 @@ mod tests {
     fn test_loc_rib_best_path_selects_higher_local_pref() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100));
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
         assert_eq!(rib.best_peer(&n), Some(peer(2))); // higher LOCAL_PREF
     }
 
@@ -363,11 +355,11 @@ mod tests {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
         assert_eq!(rib.best_peer(&n), Some(peer(1)));
 
         // New peer with better LOCAL_PREF takes over
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200));
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
         assert_eq!(rib.best_peer(&n), Some(peer(2)));
     }
 
@@ -376,11 +368,11 @@ mod tests {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
 
         // Remove the winning peer — peer(2) should take over
-        rib.withdraw(&peer(1), &n);
+        rib.withdraw(&peer(1), &n, &AlwaysReachable);
         assert_eq!(rib.best_peer(&n), Some(peer(2)));
         assert_eq!(rib.len(), 1);
     }
@@ -390,8 +382,8 @@ mod tests {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.withdraw(&peer(1), &n);
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.withdraw(&peer(1), &n, &AlwaysReachable);
 
         assert!(rib.is_empty());
         assert!(rib.best(&n).is_none());
@@ -401,11 +393,11 @@ mod tests {
     fn test_loc_rib_withdraw_peer_removes_all_prefixes() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
 
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.insert(peer(1), route("192.168.0.0/16"));
-        rib.insert(peer(2), route("172.16.0.0/12")); // different peer
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.insert(peer(1), route("192.168.0.0/16"), &AlwaysReachable);
+        rib.insert(peer(2), route("172.16.0.0/12"), &AlwaysReachable); // different peer
 
-        rib.withdraw_peer(&peer(1));
+        rib.withdraw_peer(&peer(1), &AlwaysReachable);
 
         assert_eq!(rib.len(), 1); // only peer(2)'s prefix remains
         assert!(rib.best(&nlri("172.16.0.0/12")).is_some());
@@ -417,10 +409,10 @@ mod tests {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200)); // winning
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100)); // losing
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable); // winning
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable); // losing
 
-        rib.withdraw_peer(&peer(1));
+        rib.withdraw_peer(&peer(1), &AlwaysReachable);
 
         // peer(2)'s route should now be best
         assert_eq!(rib.best_peer(&n), Some(peer(2)));
@@ -429,9 +421,9 @@ mod tests {
     #[test]
     fn test_loc_rib_multiple_prefixes() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.insert(peer(1), route("192.168.0.0/16"));
-        rib.insert(peer(2), route("172.16.0.0/12"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.insert(peer(1), route("192.168.0.0/16"), &AlwaysReachable);
+        rib.insert(peer(2), route("172.16.0.0/12"), &AlwaysReachable);
         assert_eq!(rib.len(), 3);
     }
 
@@ -439,8 +431,8 @@ mod tests {
     fn test_loc_rib_candidates() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.insert(peer(2), route("10.0.0.0/8"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.insert(peer(2), route("10.0.0.0/8"), &AlwaysReachable);
         let candidates = rib.candidates(&n).unwrap();
         assert_eq!(candidates.len(), 2);
     }
@@ -448,15 +440,15 @@ mod tests {
     #[test]
     fn test_loc_rib_best_routes_iterator() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.insert(peer(1), route("192.168.0.0/16"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.insert(peer(1), route("192.168.0.0/16"), &AlwaysReachable);
         assert_eq!(rib.best_routes().count(), 2);
     }
 
     #[test]
     fn test_loc_rib_withdraw_nonexistent_prefix_is_noop() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.withdraw(&peer(1), &nlri("10.0.0.0/8"));
+        rib.withdraw(&peer(1), &nlri("10.0.0.0/8"), &AlwaysReachable);
         assert!(rib.is_empty());
     }
 
@@ -475,11 +467,11 @@ mod tests {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
-        rib.insert(peer(1), route("10.0.0.0/8"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
         assert!(rib.best(&n).is_some());
 
         rib.candidates.insert(n, std::collections::HashMap::new());
-        rib.recompute_best(n);
+        rib.recompute_best(n, &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());
     }
@@ -489,15 +481,15 @@ mod tests {
         // Calls recompute_best directly with a prefix that is not in candidates.
         // Covers the implicit else-fallthrough of `if let Some(peer_map)`.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.recompute_best(nlri("10.0.0.0/8"));
+        rib.recompute_best(nlri("10.0.0.0/8"), &AlwaysReachable);
         assert!(rib.is_empty());
     }
 
     #[test]
     fn test_loc_rib_longest_match() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.insert(peer(2), route("10.20.0.0/16"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.insert(peer(2), route("10.20.0.0/16"), &AlwaysReachable);
 
         // /16 is more specific than /8
         assert!(rib.longest_match(Ipv4Addr::new(10, 20, 5, 1)).is_some());
@@ -511,7 +503,7 @@ mod tests {
     fn test_rib_view_best_via_trait_object() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route("10.0.0.0/8"));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
 
         let view: &dyn RibView<Ipv4Addr> = &rib;
         assert!(view.best(&n).is_some());
@@ -523,8 +515,8 @@ mod tests {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100));
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200)); // same peer, better route
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable); // same peer, better route
 
         let candidates = rib.candidates(&n).unwrap();
         assert_eq!(candidates.len(), 1); // still only one candidate for peer(1)
@@ -538,26 +530,26 @@ mod tests {
     fn test_insert_first_route_is_announced() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        let change = rib.insert(peer(1), route("10.0.0.0/8"));
+        let change = rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
         assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
     }
 
     #[test]
     fn test_insert_inferior_route_is_unchanged() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
         // peer(2) loses best-path — best stays with peer(1)
-        let change = rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        let change = rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
         assert_eq!(change, BestPathChange::Unchanged);
     }
 
     #[test]
     fn test_insert_superior_route_is_announced() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
         let n = nlri("10.0.0.0/8");
         // peer(2) wins with higher LOCAL_PREF
-        let change = rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200));
+        let change = rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
         assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
     }
 
@@ -565,8 +557,8 @@ mod tests {
     fn test_withdraw_sole_candidate_is_withdrawn() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        let change = rib.withdraw(&peer(1), &n);
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        let change = rib.withdraw(&peer(1), &n, &AlwaysReachable);
         assert_eq!(change, BestPathChange::Withdrawn(n));
     }
 
@@ -574,10 +566,10 @@ mod tests {
     fn test_withdraw_losing_candidate_is_unchanged() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
         // withdrawing the loser changes nothing
-        let change = rib.withdraw(&peer(2), &n);
+        let change = rib.withdraw(&peer(2), &n, &AlwaysReachable);
         assert_eq!(change, BestPathChange::Unchanged);
     }
 
@@ -585,10 +577,10 @@ mod tests {
     fn test_withdraw_winning_candidate_announces_new_best() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
         // withdrawing the winner promotes peer(2) → Announced
-        let change = rib.withdraw(&peer(1), &n);
+        let change = rib.withdraw(&peer(1), &n, &AlwaysReachable);
         assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
     }
 
@@ -596,24 +588,24 @@ mod tests {
     fn test_withdraw_nonexistent_peer_is_unchanged() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        let change = rib.withdraw(&peer(99), &n);
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        let change = rib.withdraw(&peer(99), &n, &AlwaysReachable);
         assert_eq!(change, BestPathChange::Unchanged);
     }
 
     #[test]
     fn test_withdraw_nonexistent_prefix_is_unchanged() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        let change = rib.withdraw(&peer(1), &nlri("10.0.0.0/8"));
+        let change = rib.withdraw(&peer(1), &nlri("10.0.0.0/8"), &AlwaysReachable);
         assert_eq!(change, BestPathChange::Unchanged);
     }
 
     #[test]
     fn test_withdraw_peer_returns_withdrawn_for_sole_owner() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route("10.0.0.0/8"));
-        rib.insert(peer(1), route("192.168.0.0/16"));
-        let changes = rib.withdraw_peer(&peer(1));
+        rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
+        rib.insert(peer(1), route("192.168.0.0/16"), &AlwaysReachable);
+        let changes = rib.withdraw_peer(&peer(1), &AlwaysReachable);
         assert_eq!(changes.len(), 2);
         assert!(
             changes
@@ -625,10 +617,10 @@ mod tests {
     #[test]
     fn test_withdraw_peer_returns_announced_for_promoted_candidate() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200));
-        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100));
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
         // removing peer(1) promotes peer(2)
-        let changes = rib.withdraw_peer(&peer(1));
+        let changes = rib.withdraw_peer(&peer(1), &AlwaysReachable);
         assert_eq!(changes.len(), 1);
         assert!(matches!(changes[0], BestPathChange::Announced(_, _)));
     }
