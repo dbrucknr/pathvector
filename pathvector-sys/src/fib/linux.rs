@@ -200,6 +200,75 @@ pub(super) async fn run(
     Ok(())
 }
 
+// ── Stale BGP route dump ──────────────────────────────────────────────────────
+
+/// Returns `(network, prefix_len)` for every `RTPROT_BGP` IPv4 route in `table`.
+///
+/// This is the inverse of `parse_v4`: it selects *only* BGP-protocol routes,
+/// which were installed by a previous daemon run and are now stale.
+pub(super) async fn dump_stale_bgp_v4(
+    handle: &rtnetlink::Handle,
+    table: u32,
+) -> io::Result<Vec<(Ipv4Addr, u8)>> {
+    let mut out = Vec::new();
+    let mut stream = handle.route().get(IpVersion::V4).execute();
+    while let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    {
+        if !is_bgp_route(&msg) || !in_table(&msg, table) {
+            continue;
+        }
+        let prefix_len = msg.header.destination_prefix_length;
+        let network = msg
+            .attributes
+            .iter()
+            .find_map(|a| {
+                if let RouteAttribute::Destination(RouteAddress::Inet(v4)) = a {
+                    Some(*v4)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        out.push((network, prefix_len));
+    }
+    Ok(out)
+}
+
+/// Returns `(network, prefix_len)` for every `RTPROT_BGP` IPv6 route in `table`.
+pub(super) async fn dump_stale_bgp_v6(
+    handle: &rtnetlink::Handle,
+    table: u32,
+) -> io::Result<Vec<(Ipv6Addr, u8)>> {
+    let mut out = Vec::new();
+    let mut stream = handle.route().get(IpVersion::V6).execute();
+    while let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    {
+        if !is_bgp_route(&msg) || !in_table(&msg, table) {
+            continue;
+        }
+        let prefix_len = msg.header.destination_prefix_length;
+        let network = msg
+            .attributes
+            .iter()
+            .find_map(|a| {
+                if let RouteAttribute::Destination(RouteAddress::Inet6(v6)) = a {
+                    Some(*v6)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Ipv6Addr::UNSPECIFIED);
+        out.push((network, prefix_len));
+    }
+    Ok(out)
+}
+
 // ── Route parsing helpers ─────────────────────────────────────────────────────
 
 /// Returns `true` if this route was installed by our own BGP daemon.
@@ -701,6 +770,42 @@ mod tests {
             !apply_del(&mut snap, &igp_v4_msg("192.168.0.0", 24, 0, 254), 254),
             "delete of absent route must not signal change"
         );
+    }
+
+    // ── dump_stale_bgp filter logic ───────────────────────────────────────────
+    //
+    // dump_stale_bgp_v4/v6 call is_bgp_route() + in_table() to decide whether
+    // to include each route. We test those predicates directly here (the live
+    // netlink dump is integration-only and requires a real Linux kernel).
+
+    #[test]
+    fn dump_stale_v4_includes_bgp_route_in_matching_table() {
+        let msg = bgp_v4_msg("10.0.0.0", 8, 254);
+        assert!(is_bgp_route(&msg) && in_table(&msg, 254));
+    }
+
+    #[test]
+    fn dump_stale_v4_excludes_igp_route() {
+        let msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        assert!(!is_bgp_route(&msg));
+    }
+
+    #[test]
+    fn dump_stale_v4_excludes_bgp_route_in_wrong_table() {
+        let msg = bgp_v4_msg("10.0.0.0", 8, 200);
+        assert!(is_bgp_route(&msg) && !in_table(&msg, 254));
+    }
+
+    #[test]
+    fn dump_stale_v6_includes_bgp_route_in_matching_table() {
+        let msg = bgp_v6_msg("2001:db8::", 32, 254);
+        assert!(is_bgp_route(&msg) && in_table(&msg, 254));
+    }
+
+    #[test]
+    fn dump_stale_v6_excludes_igp_route() {
+        let msg = igp_v6_msg("2001:db8::", 32, 100, 254);
+        assert!(!is_bgp_route(&msg));
     }
 
     #[test]

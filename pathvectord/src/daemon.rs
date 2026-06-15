@@ -1364,6 +1364,33 @@ where
     let oracle_v6 = fib::DaemonOracle(kernel_fib.oracle());
     let fib_writer = match pathvector_sys::FibWriter::new(fib_table, fib_metric) {
         Ok(w) => {
+            // Gap 4: delete any RTPROT_BGP routes left by a previous daemon run
+            // before the event loop starts.  At this point the Loc-RIB is empty
+            // (no sessions have connected), so every kernel BGP route is stale.
+            // This matches BIRD's krt-protocol startup behaviour.
+            match kernel_fib.stale_bgp_routes().await {
+                Ok((stale_v4, stale_v6)) if !stale_v4.is_empty() || !stale_v6.is_empty() => {
+                    tracing::info!(
+                        v4 = stale_v4.len(),
+                        v6 = stale_v6.len(),
+                        "removing stale BGP routes from previous run"
+                    );
+                    for (dst, prefix_len) in stale_v4 {
+                        if let Err(e) = w.withdraw_v4(dst, prefix_len).await {
+                            tracing::warn!(%dst, prefix_len, "stale BGP route removal failed: {e}");
+                        }
+                    }
+                    for (dst, prefix_len) in stale_v6 {
+                        if let Err(e) = w.withdraw_v6(dst, prefix_len).await {
+                            tracing::warn!(%dst, prefix_len, "stale BGP v6 route removal failed: {e}");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("failed to query stale BGP routes: {e}");
+                }
+            }
             tokio::spawn(kernel_fib.spawn());
             Some(w)
         }

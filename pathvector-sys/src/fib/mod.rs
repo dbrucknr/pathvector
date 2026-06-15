@@ -33,6 +33,12 @@
 //!    another BGP route) is a distinct, explicitly opt-in feature not yet
 //!    implemented here.
 //!
+//! TODO: recursive next-hop resolution — allow BGP routes to serve as IGP
+//! paths when resolving other BGP next-hops (RFC 4271 §5.1.3 note; used in
+//! MPLS/VPN and some overlay topologies).  Requires a second snapshot layer
+//! or a recursive lookup pass in `KernelOracle::is_reachable` that consults
+//! the BGP Loc-RIB, plus loop-detection to prevent infinite recursion.
+//!
 //! # Platform behaviour
 //!
 //! On Linux the implementation uses `rtnetlink` for the initial route dump and
@@ -54,6 +60,7 @@
 //! table at the time the dump completed.
 
 use std::{
+    io,
     net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, RwLock},
 };
@@ -328,6 +335,34 @@ impl KernelFib {
         {
             let _ = (self.snapshot, self.change_tx, self.table);
             Ok(())
+        }
+    }
+
+    /// Returns all `RTPROT_BGP` routes currently in the kernel table as
+    /// `(network, prefix_len)` pairs.
+    ///
+    /// These are routes installed by a previous daemon run that are now stale.
+    /// The caller is responsible for issuing the corresponding withdrawals via
+    /// `FibWriter` before the BGP event loop starts.
+    ///
+    /// On non-Linux platforms always returns `([], [])`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the netlink dump fails (Linux only).
+    #[allow(clippy::unused_async)]
+    pub async fn stale_bgp_routes(&self) -> io::Result<(Vec<(Ipv4Addr, u8)>, Vec<(Ipv6Addr, u8)>)> {
+        #[cfg(target_os = "linux")]
+        {
+            let (conn, handle, _) = rtnetlink::new_connection()?;
+            tokio::spawn(conn);
+            let v4 = linux::dump_stale_bgp_v4(&handle, self.table).await?;
+            let v6 = linux::dump_stale_bgp_v6(&handle, self.table).await?;
+            Ok((v4, v6))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok((vec![], vec![]))
         }
     }
 }
