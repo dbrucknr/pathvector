@@ -323,12 +323,12 @@ mod prop_tests {
             candidates.insert(peer(2), without_lp);
 
             let (winner, _) = select_best(&candidates).unwrap();
-            if explicit > 100 {
-                prop_assert_eq!(winner, peer(1),
-                    "explicit {} > default 100 — peer(1) should win", explicit);
-            } else if explicit < 100 {
-                prop_assert_eq!(winner, peer(2),
-                    "default 100 > explicit {} — peer(2) should win", explicit);
+            match explicit.cmp(&100) {
+                std::cmp::Ordering::Greater => { prop_assert_eq!(winner, peer(1),
+                    "explicit {} > default 100 — peer(1) should win", explicit); }
+                std::cmp::Ordering::Less => { prop_assert_eq!(winner, peer(2),
+                    "default 100 > explicit {} — peer(2) should win", explicit); }
+                std::cmp::Ordering::Equal => {}
             }
             // explicit == 100: tie, falls to tiebreaker.
         }
@@ -358,10 +358,10 @@ mod prop_tests {
             prop_assert!(winning_len <= len_b,
                 "winner path len {} > len_b {}", winning_len, len_b);
 
-            if len_a < len_b {
-                prop_assert_eq!(winner, peer(1), "peer(1) has shorter path");
-            } else if len_b < len_a {
-                prop_assert_eq!(winner, peer(2), "peer(2) has shorter path");
+            match len_a.cmp(&len_b) {
+                std::cmp::Ordering::Less => { prop_assert_eq!(winner, peer(1), "peer(1) has shorter path"); }
+                std::cmp::Ordering::Greater => { prop_assert_eq!(winner, peer(2), "peer(2) has shorter path"); }
+                std::cmp::Ordering::Equal => {}
             }
         }
     }
@@ -389,10 +389,10 @@ mod prop_tests {
             prop_assert!(winning_route.origin <= origin_b,
                 "winner origin {:?} > origin_b {:?}", winning_route.origin, origin_b);
 
-            if origin_a < origin_b {
-                prop_assert_eq!(winner, peer(1), "peer(1) has lower origin");
-            } else if origin_b < origin_a {
-                prop_assert_eq!(winner, peer(2), "peer(2) has lower origin");
+            match origin_a.cmp(&origin_b) {
+                std::cmp::Ordering::Less => { prop_assert_eq!(winner, peer(1), "peer(1) has lower origin"); }
+                std::cmp::Ordering::Greater => { prop_assert_eq!(winner, peer(2), "peer(2) has lower origin"); }
+                std::cmp::Ordering::Equal => {}
             }
         }
     }
