@@ -41,9 +41,10 @@ RUN cargo build -p pathvectord
 
 FROM debian:bookworm-slim
 
-# netcat-openbsd provides `nc` for the HEALTHCHECK TCP probe.
+# netcat-openbsd: nc for HEALTHCHECK TCP probe.
+# iproute2: ip-route(8) for FIB e2e tests (verify RTPROT_BGP routes installed).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && apt-get install -y --no-install-recommends netcat-openbsd iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /workspace/target/debug/pathvectord /usr/local/bin/pathvectord

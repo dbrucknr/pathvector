@@ -820,6 +820,246 @@ impl Md5Harness {
     }
 }
 
+// ── FibHarness ───────────────────────────────────────────────────────────────
+
+/// Per-test subnet for FIB integration tests. Uses the third octet to avoid
+/// subnet collisions when tests run in parallel.
+#[must_use]
+pub fn fib_test_subnet(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.30.{third}.0/24")
+}
+
+#[must_use]
+pub fn fib_pathvectord_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.30.{third}.2")
+}
+
+#[must_use]
+pub fn fib_gobgp_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.30.{third}.3")
+}
+
+/// Test harness for FIB integration tests.
+///
+/// Starts pathvectord with `CAP_NET_ADMIN` so `FibWriter` can issue
+/// `RTM_NEWROUTE` / `RTM_DELROUTE` via netlink. Uses fixed container IPs on a
+/// dedicated subnet so the GoBGP peer address is known before either container
+/// starts (required for fixed-IP routing).
+///
+/// # Panics
+///
+/// [`FibHarness::new`] panics if Docker is not running, either image is
+/// missing, or the BGP session does not reach `Established` within 30 seconds.
+pub struct FibHarness {
+    _gobgpd: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// GoBGP container ID — used for `gobgp_announce` / `gobgp_withdraw`.
+    pub gobgpd_id: String,
+    /// pathvectord container ID — used for `ip route` inspection.
+    pub pathvectord_id: String,
+    pub gobgp_ip: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl FibHarness {
+    /// Stand up GoBGP + pathvectord with `CAP_NET_ADMIN` and wait for the
+    /// BGP session to reach `Established`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing, or the BGP
+    /// session does not reach `Established` within 30 seconds.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-fib-test-{test_id}");
+
+        let subnet = fib_test_subnet(test_id);
+        let gobgp_ip_str = fib_gobgp_ip(test_id);
+        let pathvectord_ip_str = fib_pathvectord_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let gobgp_ip: Ipv4Addr = gobgp_ip_str.parse().unwrap();
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord_config = write_daemon_config(&[(gobgp_ip, 65001)]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd = docker_start(
+            &format!("gobgpd-fib-{test_id}"),
+            GOBGPD_IMAGE,
+            &network_name,
+            Some(&gobgp_ip_str),
+            false,
+            &gobgpd_config_path,
+            "/etc/gobgp/gobgpd.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
+
+        // CAP_NET_ADMIN is required for FibWriter to issue RTM_NEWROUTE via netlink.
+        let pathvectord = docker_start(
+            &format!("pathvectord-fib-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pathvectord_ip_str),
+            true,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let gobgpd_id = gobgpd.0.clone();
+        let pathvectord_id = pathvectord.0.clone();
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for FibHarness");
+
+        wait_for_established(&mut client, gobgp_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            gobgpd_id,
+            pathvectord_id,
+            gobgp_ip,
+            _network: network,
+        }
+    }
+
+    /// Announce a prefix from GoBGP into pathvectord's RIB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp announce");
+        assert!(status.success(), "gobgp announce {prefix} failed: {status}");
+    }
+
+    /// Withdraw a prefix from GoBGP's RIB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_withdraw(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args(["gobgp", "global", "rib", "del", prefix])
+            .status()
+            .expect("docker exec gobgp withdraw");
+        assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
+    }
+}
+
+/// Polls `ip route show table 254 proto bgp` inside `container_id` until
+/// `prefix` appears.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix appears.
+pub async fn wait_for_kernel_route(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for kernel route {prefix} (proto bgp) in container {container_id}"
+            ));
+        }
+        let out = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "ip",
+                "route",
+                "show",
+                "table",
+                "254",
+                "proto",
+                "bgp",
+            ])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains(prefix) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Polls `ip route show table 254 proto bgp` inside `container_id` until
+/// `prefix` is absent.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix disappears.
+pub async fn wait_for_kernel_route_withdrawn(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for kernel route {prefix} to be withdrawn in container {container_id}"
+            ));
+        }
+        let out = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "ip",
+                "route",
+                "show",
+                "table",
+                "254",
+                "proto",
+                "bgp",
+            ])
+            .output();
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if !text.contains(prefix) {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
 // ── Polling helpers ───────────────────────────────────────────────────────────
 
 /// Polls until the BGP session with `peer` reaches `Established`.
