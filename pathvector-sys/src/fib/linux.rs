@@ -137,11 +137,7 @@ pub(super) async fn run(
         .route()
         .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
         .execute();
-    while let Some(msg) = stream
-        .try_next()
-        .await
-        .map_err(io::Error::other)?
-    {
+    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
         if let Some(entry) = parse_v4(&msg, table) {
             v4_entries.push(entry);
         }
@@ -152,11 +148,7 @@ pub(super) async fn run(
         .route()
         .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
         .execute();
-    while let Some(msg) = stream
-        .try_next()
-        .await
-        .map_err(io::Error::other)?
-    {
+    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
         if let Some(entry) = parse_v6(&msg, table) {
             v6_entries.push(entry);
         }
@@ -228,11 +220,7 @@ pub(super) async fn dump_stale_bgp_v4(
         .route()
         .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
         .execute();
-    while let Some(msg) = stream
-        .try_next()
-        .await
-        .map_err(io::Error::other)?
-    {
+    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
         if !is_bgp_route(&msg) || !in_table(&msg, table) {
             continue;
         }
@@ -263,11 +251,7 @@ pub(super) async fn dump_stale_bgp_v6(
         .route()
         .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
         .execute();
-    while let Some(msg) = stream
-        .try_next()
-        .await
-        .map_err(io::Error::other)?
-    {
+    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
         if !is_bgp_route(&msg) || !in_table(&msg, table) {
             continue;
         }
@@ -623,7 +607,9 @@ mod tests {
 
     use netlink_packet_route::{
         AddressFamily,
-        route::{RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteType},
+        route::{
+            RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteType,
+        },
     };
 
     use super::*;

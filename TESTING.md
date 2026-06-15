@@ -7,6 +7,11 @@ contributors.
 
 ---
 
+## Quick Start:
+1. `just e2e-images`
+2. `just ci`
+3. `just lint-linux`
+
 ## Philosophy
 
 We strive for transparency and aim for perfection in terms of system reliability.
