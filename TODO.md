@@ -305,6 +305,62 @@ dump path (lines 503–539). A non-client iBGP peer establishing a session recei
 routes learned from other non-client iBGP peers in its initial dump, violating RR
 split-horizon. Only affects deployments using route reflection.
 
+### High — capability negotiation violations
+
+**J. AS_TRANS / AS4_PATH not generated for 2-byte-only peers (RFC 6793)** (`pathvector-session/src/message/update.rs`, AS_PATH encoding)
+
+RFC 6793 §4: when sending to a peer that did not advertise the 4-byte ASN
+capability, the daemon MUST encode AS_PATH using 2-byte ASN fields, substitute
+any 4-byte ASN with AS_TRANS (23456), and carry the full 4-byte path in an
+AS4_PATH attribute. Currently AS_PATH is always encoded as 4-byte regardless of
+peer capability. A peer with a 4-byte ASN sending routes to a 2-byte-only peer
+will produce a malformed AS_PATH that the peer cannot parse. Fix: check
+`peer_capabilities.contains(FourByteAsn)` before encoding; generate split
+AS_PATH + AS4_PATH when the peer is 2-byte-only.
+
+**K. IPv6 routes advertised to peers that didn't negotiate IPv6 unicast (RFC 4760)** (`pathvectord/src/daemon.rs`, `on_established` ~line 546)
+
+RFC 4760: MP_REACH_NLRI / MP_UNREACH_NLRI for a given AFI/SAFI MUST only be
+sent to peers that advertised that AFI/SAFI via Multi-Protocol capability in
+their OPEN. Currently the full-table IPv6 dump and incremental IPv6 propagation
+fire unconditionally for all peers. A peer that did not negotiate IPv6 unicast
+will silently discard the attribute per RFC 7606 — routes are lost with no
+session-level error. Fix: gate the IPv6 dump and `propagate_to_all_peers_v6`
+on `peer_capabilities.contains(MultiProtocol(AfiSafi::IPV6_UNICAST))`.
+
+### Medium — API and behavioral gaps
+
+**L. AS 0 not rejected in gRPC originate/peer handlers** (`pathvectord/src/grpc.rs`)
+
+RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or be used as a peer ASN.
+The gRPC handlers accept AS 0 (and other reserved values) without validation.
+Fix: add a guard in `originate_route` and peer-configuration handlers rejecting
+AS 0 with `Status::invalid_argument`.
+
+**M. Duplicate `originate_route` silently overwrites without documentation** (`pathvectord/src/grpc.rs`, `daemon.rs`)
+
+Calling `originate_route` twice for the same prefix silently replaces the first
+entry via `HashMap::insert`. This is reasonable behavior but is undocumented in
+the API, has no test coverage, and returns `Ok` both times with no indication
+that the first route was replaced. Add a test and document the upsert semantics
+in the gRPC proto comments.
+
+### Low — design notes and deferred features
+
+**N. ROUTE-REFRESH receipt does not re-advertise table** (`pathvector-session/src/fsm/mod.rs`)
+
+The FSM correctly gates ROUTE-REFRESH reception on capability negotiation, but
+receiving the message is a no-op — the daemon does not re-send its full table.
+This is an acknowledged incomplete feature. Outbound ROUTE-REFRESH triggering
+is also deferred (listed separately under `pathvector-session` remaining items).
+
+**O. Panic/unwrap audit: clean pass**
+
+No crash vectors reachable from peer input, gRPC clients, or config files.
+All `expect()` calls in production code are true invariants protected by prior
+validation guards. RwLock poison `expect()` calls are low-risk (only reachable
+if internal code panics while holding the lock). No action needed.
+
 ### Test coverage gaps added by audit
 
 - No test for UPDATE containing our own AS in AS_PATH
@@ -314,6 +370,9 @@ split-horizon. Only affects deployments using route reflection.
 - No test for ORIGINATOR_ID / CLUSTER_LIST present in eBGP outbound UPDATE
 - No test for MED present in eBGP outbound UPDATE
 - No test for RR split-horizon applied during full-table dump
+- No test for AS_PATH encoding to a 2-byte-only peer (AS_TRANS / AS4_PATH)
+- No test for IPv6 routes gated on peer Multi-Protocol capability
+- No test for duplicate originate_route behavior
 
 ---
 
