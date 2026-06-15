@@ -136,6 +136,37 @@ impl DockerNetwork {
         Self { name }
     }
 
+    /// Create a Docker bridge network with both IPv4 and IPv6 enabled.
+    ///
+    /// Uses the supplied ULA prefix as the IPv6 subnet.  Containers on this
+    /// network receive link-local (`fe80::`) addresses automatically, which is
+    /// required for IPv6 BGP next-hop tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network create` fails.
+    #[must_use]
+    pub fn create_with_ipv6(name: String, ipv6_subnet: &str) -> Self {
+        let status = Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--ipv6",
+                "--subnet",
+                ipv6_subnet,
+                &name,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("docker network create --ipv6");
+        assert!(
+            status.success(),
+            "docker network create --ipv6 {name} failed: {status}"
+        );
+        Self { name }
+    }
+
     /// Create a new Docker bridge network with a specific subnet.
     ///
     /// Useful when container IPs must be known before the containers start
@@ -1267,7 +1298,7 @@ impl Harness {
     ///
     /// See the struct-level documentation.
     pub async fn new_v6() -> Self {
-        Self::new_inner(write_daemon_config_v6).await
+        Self::new_inner_v6(write_daemon_config_v6).await
     }
 
     /// Same as [`Self::new`] but with `import_default = "accept"` and
@@ -1393,6 +1424,83 @@ impl Harness {
         }
     }
 
+    /// Like [`new_inner`] but creates the Docker network with `--ipv6` so that
+    /// containers receive link-local IPv6 addresses.  Required for tests that
+    /// use `gobgp_link_local_v6()` as a BGP next-hop.
+    async fn new_inner_v6(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-test-{test_id}");
+        // Use a per-test ULA prefix so parallel tests don't collide.
+        let ipv6_subnet = format!("fd00:{:x}::/48", test_id & 0xffff);
+        let network = DockerNetwork::create_with_ipv6(network_name.clone(), &ipv6_subnet);
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config
+            .path()
+            .to_str()
+            .expect("gobgpd config path is valid UTF-8")
+            .to_owned();
+
+        let gobgpd = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-v6-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                gobgpd_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd container");
+
+        let gobgpd_container_id = gobgpd.id().to_owned();
+        let gobgpd_ip = container_network_ip(&gobgpd_container_id, &network_name);
+
+        let pathvectord_config = make_cfg(&[(gobgpd_ip, 65001)]);
+        let pathvectord_config_path = pathvectord_config
+            .path()
+            .to_str()
+            .expect("pathvectord config path is valid UTF-8")
+            .to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-v6-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient");
+
+        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
+
+        let pathvectord_container_id = pathvectord.id().to_owned();
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            gobgpd_id: gobgpd_container_id,
+            pathvectord_id: pathvectord_container_id,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            peer: gobgpd_ip,
+            _network: network,
+        }
+    }
+
     /// Announce a prefix from GoBGP into pathvectord's RIB.
     ///
     /// Runs `gobgp global rib add <prefix> nexthop <nexthop>` inside the
@@ -1460,7 +1568,16 @@ impl Harness {
     /// Panics if the container has no link-local IPv6 address.
     pub fn gobgp_link_local_v6(&self) -> String {
         let out = Command::new("docker")
-            .args(["exec", &self.gobgpd_id, "ip", "-6", "addr", "show", "scope", "link"])
+            .args([
+                "exec",
+                &self.gobgpd_id,
+                "ip",
+                "-6",
+                "addr",
+                "show",
+                "scope",
+                "link",
+            ])
             .output()
             .expect("docker exec ip -6 addr show scope link");
         let text = String::from_utf8_lossy(&out.stdout);
