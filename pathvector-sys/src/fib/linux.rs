@@ -12,7 +12,7 @@ use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteType},
 };
-use rtnetlink::{IpVersion, RouteMessageBuilder, multicast::MulticastGroup};
+use rtnetlink::{MulticastGroup, RouteMessageBuilder};
 use tokio::sync::watch;
 
 use super::{FibEntry4, FibEntry6, FibSnapshot};
@@ -129,30 +129,43 @@ pub(super) async fn run(
     tokio::spawn(conn);
 
     // Step 2 — Populate snapshot from current kernel FIB.
+    //
+    // Collect into local Vecs while awaiting so the RwLockWriteGuard is never
+    // held across an await point (std::sync::RwLockWriteGuard is !Send).
+    let mut v4_entries: Vec<FibEntry4> = Vec::new();
+    let mut stream = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
+    while let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(io::Error::other)?
+    {
+        if let Some(entry) = parse_v4(&msg, table) {
+            v4_entries.push(entry);
+        }
+    }
+
+    let mut v6_entries: Vec<FibEntry6> = Vec::new();
+    let mut stream = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .execute();
+    while let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(io::Error::other)?
+    {
+        if let Some(entry) = parse_v6(&msg, table) {
+            v6_entries.push(entry);
+        }
+    }
+
     {
         let mut snap = snapshot.write().expect("FibSnapshot poisoned");
-
-        let mut v4 = handle.route().get(IpVersion::V4).execute();
-        while let Some(msg) = v4
-            .try_next()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-        {
-            if let Some(entry) = parse_v4(&msg, table) {
-                snap.v4.push(entry);
-            }
-        }
-
-        let mut v6 = handle.route().get(IpVersion::V6).execute();
-        while let Some(msg) = v6
-            .try_next()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-        {
-            if let Some(entry) = parse_v6(&msg, table) {
-                snap.v6.push(entry);
-            }
-        }
+        snap.v4 = v4_entries;
+        snap.v6 = v6_entries;
     }
 
     // Notify watchers: initial FIB loaded.
@@ -211,11 +224,14 @@ pub(super) async fn dump_stale_bgp_v4(
     table: u32,
 ) -> io::Result<Vec<(Ipv4Addr, u8)>> {
     let mut out = Vec::new();
-    let mut stream = handle.route().get(IpVersion::V4).execute();
+    let mut stream = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
     while let Some(msg) = stream
         .try_next()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .map_err(io::Error::other)?
     {
         if !is_bgp_route(&msg) || !in_table(&msg, table) {
             continue;
@@ -243,11 +259,14 @@ pub(super) async fn dump_stale_bgp_v6(
     table: u32,
 ) -> io::Result<Vec<(Ipv6Addr, u8)>> {
     let mut out = Vec::new();
-    let mut stream = handle.route().get(IpVersion::V6).execute();
+    let mut stream = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .execute();
     while let Some(msg) = stream
         .try_next()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .map_err(io::Error::other)?
     {
         if !is_bgp_route(&msg) || !in_table(&msg, table) {
             continue;
@@ -497,7 +516,7 @@ fn apply_del(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
 
 // ── Route write helpers ───────────────────────────────────────────────────────
 
-/// Install (or replace) an IPv4 route tagged RTPROT_BGP.
+/// Install (or replace) an IPv4 route tagged `RTPROT_BGP`.
 async fn install_route_v4(
     handle: &rtnetlink::Handle,
     dst: Ipv4Addr,
@@ -519,10 +538,10 @@ async fn install_route_v4(
         .replace()
         .execute()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
-/// Install (or replace) an IPv6 route tagged RTPROT_BGP.
+/// Install (or replace) an IPv6 route tagged `RTPROT_BGP`.
 async fn install_route_v6(
     handle: &rtnetlink::Handle,
     dst: Ipv6Addr,
@@ -544,7 +563,7 @@ async fn install_route_v6(
         .replace()
         .execute()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 /// Remove an IPv4 route from the kernel FIB.
@@ -567,10 +586,10 @@ async fn withdraw_route_v4(
     match handle.route().del(msg).execute().await {
         Ok(()) => Ok(()),
         // ESRCH (3): route already absent — treat as success.
-        Err(rtnetlink::Error::NetlinkError(ref e)) if e.code.map_or(false, |c| c.get() == -3) => {
+        Err(rtnetlink::Error::NetlinkError(ref e)) if e.code.is_some_and(|c| c.get() == -3) => {
             Ok(())
         }
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        Err(e) => Err(io::Error::other(e)),
     }
 }
 
@@ -589,10 +608,10 @@ async fn withdraw_route_v6(
         .build();
     match handle.route().del(msg).execute().await {
         Ok(()) => Ok(()),
-        Err(rtnetlink::Error::NetlinkError(ref e)) if e.code.map_or(false, |c| c.get() == -3) => {
+        Err(rtnetlink::Error::NetlinkError(ref e)) if e.code.is_some_and(|c| c.get() == -3) => {
             Ok(())
         }
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        Err(e) => Err(io::Error::other(e)),
     }
 }
 
@@ -604,7 +623,7 @@ mod tests {
 
     use netlink_packet_route::{
         AddressFamily,
-        route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteType},
+        route::{RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteType},
     };
 
     use super::*;
@@ -617,7 +636,7 @@ mod tests {
         msg.header.kind = RouteType::Unicast;
         msg.header.protocol = RouteProtocol::Ospf;
         msg.header.destination_prefix_length = prefix_len;
-        msg.header.table = table as u8;
+        msg.header.table = u8::try_from(table).unwrap_or(RouteHeader::RT_TABLE_MAIN);
         msg.attributes
             .push(RouteAttribute::Destination(RouteAddress::Inet(
                 network.parse().unwrap(),
@@ -638,7 +657,7 @@ mod tests {
         msg.header.kind = RouteType::Unicast;
         msg.header.protocol = RouteProtocol::Ospf;
         msg.header.destination_prefix_length = prefix_len;
-        msg.header.table = table as u8;
+        msg.header.table = u8::try_from(table).unwrap_or(RouteHeader::RT_TABLE_MAIN);
         msg.attributes
             .push(RouteAttribute::Destination(RouteAddress::Inet6(
                 network.parse().unwrap(),
