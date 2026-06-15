@@ -1,10 +1,15 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
 use routemap::RouteMap;
 
-use crate::{best_path::select_best, peer::PeerId, route::Route};
+use crate::{
+    best_path::select_best_with_oracle,
+    oracle::{AlwaysReachable, NextHopOracle},
+    peer::PeerId,
+    route::Route,
+};
 
 /// Describes how the best path for a prefix changed after a `LocRib` mutation.
 ///
@@ -46,7 +51,7 @@ pub enum BestPathChange<A: IpAddress> {
 /// - **Candidates** — every route for that prefix that passed import policy,
 ///   keyed by the peer that announced it. A prefix may have one candidate per
 ///   peer.
-/// - **Best** — the single winning route chosen by [`select_best`], recomputed
+/// - **Best** — the single winning route chosen by `select_best_with_oracle`, recomputed
 ///   every time the candidate set changes.
 ///
 /// # Policy is applied externally
@@ -114,15 +119,35 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
 pub struct LocRib<A: IpAddress> {
     candidates: HashMap<Nlri<A>, HashMap<PeerId, Route<A>>>,
     best: RouteMap<A, (PeerId, Route<A>)>,
+    oracle: Arc<dyn NextHopOracle + Send + Sync>,
 }
 
 impl<A: IpAddress> LocRib<A> {
-    /// Creates an empty `LocRib`.
+    /// Creates an empty `LocRib` using [`AlwaysReachable`] as the next-hop oracle.
+    ///
+    /// Suitable for tests and for any context where FIB integration is not
+    /// available. Use [`with_oracle`][`LocRib::with_oracle`] to attach a live
+    /// oracle at daemon startup.
     #[must_use]
     pub fn new() -> Self {
         Self {
             candidates: HashMap::new(),
             best: RouteMap::new(),
+            oracle: Arc::new(AlwaysReachable),
+        }
+    }
+
+    /// Creates an empty `LocRib` backed by the given next-hop oracle.
+    ///
+    /// The oracle is consulted on every best-path recompute (RFC 4271 §9.1
+    /// steps 1 and 8): unreachable next-hops are excluded from selection, and
+    /// among equally-preferred routes the one with the lower IGP metric wins.
+    #[must_use]
+    pub fn with_oracle(oracle: impl NextHopOracle + Send + Sync + 'static) -> Self {
+        Self {
+            candidates: HashMap::new(),
+            best: RouteMap::new(),
+            oracle: Arc::new(oracle),
         }
     }
 
@@ -267,7 +292,7 @@ impl<A: IpAddress> LocRib<A> {
 
     fn recompute_best(&mut self, nlri: Nlri<A>) {
         if let Some(peer_map) = self.candidates.get(&nlri) {
-            if let Some((peer, route)) = select_best(peer_map) {
+            if let Some((peer, route)) = select_best_with_oracle(peer_map, &*self.oracle) {
                 self.best.insert(nlri.prefix(), (peer, route.clone()));
             } else {
                 self.best.remove(nlri.prefix());

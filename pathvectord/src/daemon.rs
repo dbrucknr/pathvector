@@ -1214,7 +1214,8 @@ where
         let (kfib, _change_rx) = pathvector_sys::KernelFib::new(fib_table);
         kfib
     };
-    let _daemon_oracle = fib::DaemonOracle(kernel_fib.oracle());
+    let daemon_oracle_v4 = fib::DaemonOracle(kernel_fib.oracle());
+    let daemon_oracle_v6 = fib::DaemonOracle(kernel_fib.oracle());
     let fib_writer = match pathvector_sys::FibWriter::new(fib_table, fib_metric) {
         Ok(w) => {
             tokio::spawn(kernel_fib.spawn());
@@ -1230,6 +1231,16 @@ where
     if let Some(writer) = fib_writer {
         let manager = Arc::new(fib::FibManager::new(writer));
         state.write().await.fib_manager = Some(manager);
+    }
+
+    // Wire the live oracle into both production RIBs now that KernelFib is
+    // initialised.  Sessions have not yet started, so no best-path recomputes
+    // are in flight — the swap is safe under a single write lock.
+    {
+        let mut guard = state.write().await;
+        let rib = guard.rib_mut();
+        rib.loc_rib = LocRib::with_oracle(daemon_oracle_v4);
+        rib.loc_rib_v6 = LocRib::with_oracle(daemon_oracle_v6);
     }
 
     // Spawn the gRPC management API server alongside the BGP event loop.
