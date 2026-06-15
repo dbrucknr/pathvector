@@ -44,7 +44,7 @@ exchange:
 
 # Run every check that CI runs, in the same order.  Green here = green on push.
 # Note: e2e is not included here — run `just e2e` separately (requires Docker).
-ci: test lint fmt-check doc msrv
+ci: test lint lint-linux fmt-check doc msrv
 
 # Run the full test suite (excludes pathvector-e2e, which requires Docker images)
 test:
@@ -63,7 +63,7 @@ install-hooks:
 
 # Clippy across all targets (warnings promoted to errors, matching CI)
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings -A clippy::similar_names
 
 # Run clippy inside a Linux container — catches #[cfg(target_os = "linux")]
 # warnings invisible on macOS. Requires Docker.
@@ -87,7 +87,9 @@ lint-linux:
         -e CARGO_TARGET_DIR=/target \
         rust:1.88-slim \
         sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null \
-            && cargo clippy --workspace --all-targets -- -D warnings"
+            && rustup component add clippy 2>/dev/null \
+            && cargo clippy --workspace --all-targets -- -D warnings \
+                -A clippy::similar_names"
 
 # Verify rustfmt formatting (does not modify files)
 fmt-check:

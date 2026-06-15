@@ -293,12 +293,16 @@ mod prop_tests {
             prop_assert!(winning_lp >= lp_a, "winner LP {} < lp_a {}", winning_lp, lp_a);
             prop_assert!(winning_lp >= lp_b, "winner LP {} < lp_b {}", winning_lp, lp_b);
 
-            if lp_a > lp_b {
-                prop_assert_eq!(winner, peer(1), "peer(1) has higher LP");
-            } else if lp_b > lp_a {
-                prop_assert_eq!(winner, peer(2), "peer(2) has higher LP");
+            match lp_a.cmp(&lp_b) {
+                std::cmp::Ordering::Greater => {
+                    prop_assert_eq!(winner, peer(1), "peer(1) has higher LP");
+                }
+                std::cmp::Ordering::Less => {
+                    prop_assert_eq!(winner, peer(2), "peer(2) has higher LP");
+                }
+                // Equal LP: falls through to tiebreaker — verified by the invariant above.
+                std::cmp::Ordering::Equal => {}
             }
-            // Equal LP: falls through to tiebreaker — verified by the invariant above.
         }
     }
 
@@ -426,10 +430,14 @@ mod prop_tests {
             prop_assert!(winning_med <= eff_b,
                 "winner MED {} > eff_b {}", winning_med, eff_b);
 
-            if eff_a < eff_b {
-                prop_assert_eq!(winner, peer(1), "peer(1) has lower MED");
-            } else if eff_b < eff_a {
-                prop_assert_eq!(winner, peer(2), "peer(2) has lower MED");
+            match eff_a.cmp(&eff_b) {
+                std::cmp::Ordering::Less => {
+                    prop_assert_eq!(winner, peer(1), "peer(1) has lower MED");
+                }
+                std::cmp::Ordering::Greater => {
+                    prop_assert_eq!(winner, peer(2), "peer(2) has lower MED");
+                }
+                std::cmp::Ordering::Equal => {}
             }
         }
     }

@@ -303,7 +303,6 @@ impl<A: IpAddress> LocRib<A> {
                 match (old, new) {
                     (None, None) => None,
                     (Some(_), None) => Some(BestPathChange::Withdrawn(nlri)),
-                    (None, Some((_, route))) => Some(BestPathChange::Announced(nlri, route)),
                     (Some((op, ref or)), Some((np, ref nr))) if op == np && or == nr => None,
                     (_, Some((_, route))) => Some(BestPathChange::Announced(nlri, route)),
                 }
@@ -748,6 +747,16 @@ mod tests {
 
     #[test]
     fn test_recompute_all_only_returns_changed_prefixes() {
+        struct NeverReachable;
+        impl NextHopOracle for NeverReachable {
+            fn is_reachable(&self, _: &NextHop) -> bool {
+                false
+            }
+            fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+                None
+            }
+        }
+
         // Three prefixes; only the one whose next-hop changes should appear.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         rib.insert(
@@ -766,18 +775,7 @@ mod tests {
             &AlwaysReachable,
         );
 
-        // NeverReachable oracle makes all three drop — but we only inserted two
-        // in the stable state, so let's verify the count.
-        struct NeverReachable;
-        impl NextHopOracle for NeverReachable {
-            fn is_reachable(&self, _: &NextHop) -> bool {
-                false
-            }
-            fn igp_metric(&self, _: &NextHop) -> Option<u32> {
-                None
-            }
-        }
-
+        // NeverReachable oracle makes all three drop.
         let changes = rib.recompute_all(&NeverReachable);
         assert_eq!(changes.len(), 3, "all three prefixes must be withdrawn");
         assert!(
@@ -812,12 +810,11 @@ mod tests {
         }
         impl NextHopOracle for SelectiveOracle {
             fn is_reachable(&self, nh: &NextHop) -> bool {
-                if self.block.load(Ordering::Relaxed) {
-                    if let NextHop::V4(a) = nh {
-                        return *a != self.blocked_nh;
-                    }
+                if let NextHop::V4(a) = nh {
+                    !self.block.load(Ordering::Relaxed) || *a != self.blocked_nh
+                } else {
+                    true
                 }
-                true
             }
             fn igp_metric(&self, _: &NextHop) -> Option<u32> {
                 None

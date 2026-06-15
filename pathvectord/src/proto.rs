@@ -1,6 +1,6 @@
-// Generated protobuf/gRPC types.  All clippy lints are suppressed because
-// this file is controlled by tonic_prost_build — we cannot fix what it emits.
-#![allow(clippy::all)]
+// Generated protobuf/gRPC types.  Clippy lints are suppressed because this
+// module is controlled by tonic_prost_build — we cannot fix what it emits.
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 
 tonic::include_proto!("pathvector.v1");
 

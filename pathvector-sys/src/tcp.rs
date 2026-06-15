@@ -105,7 +105,7 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
     {
         // AF_INET is 2 and always fits in sa_family_t (u16).
         #[allow(clippy::cast_possible_truncation)]
-        let sin = libc::sockaddr_in {
+        let addr_in = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
             // Port 0 in tcpm_addr means "match all connections to/from
             // this IP regardless of port" — the standard BGP MD5 usage.
@@ -120,7 +120,7 @@ fn apply_linux(fd: RawFd, peer_ip: IpAddr, key: &str) -> io::Result<()> {
         // into the start of the storage; the remainder stays zeroed.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                std::ptr::addr_of!(sin).cast::<u8>(),
+                std::ptr::addr_of!(addr_in).cast::<u8>(),
                 std::ptr::addr_of_mut!(sig.tcpm_addr).cast::<u8>(),
                 mem::size_of::<libc::sockaddr_in>(),
             );
