@@ -80,6 +80,8 @@ pub(crate) struct RibSnapshot {
     pub(crate) loc_rib_v6: LocRib<Ipv6Addr>,
     /// Locally originated routes (bypassed import policy; export policy applies).
     pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
+    /// IPv6 locally originated routes (bypassed import policy; export policy applies).
+    pub(crate) originated_routes_v6: HashMap<Nlri<Ipv6Addr>, Route<Ipv6Addr>>,
     /// Immutable after startup.
     pub(crate) local_as: u32,
     /// Immutable after startup.
@@ -283,6 +285,7 @@ impl DaemonState {
             loc_rib: LocRib::new(),
             loc_rib_v6: LocRib::new(),
             originated_routes: HashMap::new(),
+            originated_routes_v6: HashMap::new(),
             local_as,
             local_bgp_id,
             local_ipv6,
@@ -1114,6 +1117,9 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
+            self.rib_mut()
+                .originated_routes_v6
+                .insert(nlri, route.clone());
             let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             if let Some(fm) = &self.fib_manager {
                 fm.apply_v6(fib_change);
@@ -1155,6 +1161,31 @@ impl DaemonState {
             });
         }
         self.propagate_to_all_peers(nlris);
+    }
+
+    /// Withdraws a single locally originated IPv6 route.
+    ///
+    /// No-op if the prefix was not previously originated.
+    pub(crate) fn withdraw_originated_route_v6(&mut self, nlri: Nlri<Ipv6Addr>) {
+        self.withdraw_originated_routes_v6(&[nlri]);
+    }
+
+    /// Withdraws a batch of locally originated IPv6 routes in a single
+    /// propagation pass.
+    pub(crate) fn withdraw_originated_routes_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
+        for nlri in nlris {
+            self.rib_mut().originated_routes_v6.remove(nlri);
+            let fib_change = self.rib_withdraw_v6(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
+            if let Some(fm) = &self.fib_manager {
+                fm.apply_v6(fib_change);
+            }
+            let _ = self.route_tx.send(proto::RouteEvent {
+                r#type: proto::RouteEventType::Withdrawn as i32,
+                route: None,
+                withdrawn_prefix: Some(nlri.to_string()),
+            });
+        }
+        self.propagate_to_all_peers_v6(nlris);
     }
 
     /// Replaces the import-policy default for `peer_ip` and re-evaluates the
@@ -1277,7 +1308,7 @@ impl DaemonState {
     /// Re-evaluates best-path selection for every prefix in the Loc-RIB using
     /// the current oracle.  For each prefix whose best path changed:
     ///
-    /// - Enqueues the new state in the [`FibManager`] (install or withdraw).
+    /// - Enqueues the new state in the FIB manager (install or withdraw).
     /// - Propagates the change to all established BGP peers as an UPDATE or
     ///   WITHDRAW.
     ///
@@ -1346,7 +1377,7 @@ pub(crate) async fn run(cfg: config::Config) {
 /// the Loc-RIB is empty, so every `RTPROT_BGP` route is a stale remnant of a
 /// previous run.  Individual withdrawal errors are logged as warnings and
 /// skipped — an already-absent route (ESRCH) is already silenced by
-/// [`FibWriter::withdraw_v4`] / [`FibWriter::withdraw_v6`].
+/// `FibWriter::withdraw_v4` / `FibWriter::withdraw_v6`.
 ///
 /// On non-Linux platforms `stale_v4` and `stale_v6` are always empty (returned
 /// by [`pathvector_sys::KernelFib::stale_bgp_routes`]), so this is a no-op.
@@ -2574,7 +2605,7 @@ mod tests {
 
     #[test]
     fn test_on_fib_change_withdraws_when_next_hop_goes_down() {
-        use pathvector_types::{AsPath, Asn, NextHop, Origin};
+        use pathvector_types::{AsPath, Asn, Origin};
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
@@ -2628,7 +2659,7 @@ mod tests {
 
     #[test]
     fn test_on_fib_change_reannounces_when_next_hop_recovers() {
-        use pathvector_types::{AsPath, Asn, NextHop, Origin};
+        use pathvector_types::{AsPath, Asn, Origin};
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
@@ -4713,6 +4744,93 @@ mod tests {
     }
 
     #[test]
+    fn test_originate_routes_v6_peer_receives_announces() {
+        use pathvector_types::{AsPath, Origin};
+        let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let (mut state, mut rx_map) = make_state(65001, &[(gobgp, 65002)]);
+        state.on_established(gobgp, PeerType::External, 65002, 90, &[], None);
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+
+        let route = RouteBuilder::new(nlri_v6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        state.originate_route_v6(route);
+
+        assert!(
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8::/32"))
+                .is_some(),
+            "originated v6 route must be in loc_rib_v6"
+        );
+        assert!(
+            state
+                .rib
+                .originated_routes_v6
+                .contains_key(&nlri_v6("2001:db8::/32")),
+            "originated v6 route must be tracked in originated_routes_v6"
+        );
+    }
+
+    #[test]
+    fn test_withdraw_originated_routes_v6_removes_from_rib_and_notifies_peer() {
+        use pathvector_types::{AsPath, Origin};
+        let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let (mut state, mut rx_map) = make_state(65001, &[(gobgp, 65002)]);
+        state.on_established(gobgp, PeerType::External, 65002, 90, &[], None);
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+
+        let route = RouteBuilder::new(nlri_v6("2001:db8:1::/48"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        state.originate_route_v6(route);
+
+        // Drain the ANNOUNCE
+        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        assert!(
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8:1::/48"))
+                .is_some()
+        );
+
+        state.withdraw_originated_route_v6(nlri_v6("2001:db8:1::/48"));
+
+        assert!(
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8:1::/48"))
+                .is_none(),
+            "withdrawn v6 route must be removed from loc_rib_v6"
+        );
+        assert!(
+            !state
+                .rib
+                .originated_routes_v6
+                .contains_key(&nlri_v6("2001:db8:1::/48")),
+            "withdrawn v6 route must be removed from originated_routes_v6"
+        );
+    }
+
+    #[test]
+    fn test_withdraw_originated_routes_v6_noop_for_unknown_prefix() {
+        let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(gobgp, 65002)]);
+        // Should not panic on an unknown prefix.
+        state.withdraw_originated_route_v6(nlri_v6("2001:db8:ff::/48"));
+        assert!(
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8:ff::/48"))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_propagate_prefix_ibgp_split_horizon_no_send() {
         let mut rib = LocRib::new();
         rib.insert(peer(), ibgp_route("10.0.0.0/8"), &AlwaysReachable);
@@ -6345,7 +6463,7 @@ mod event_loop_tests {
 
     #[tokio::test]
     async fn event_loop_fib_change_withdraws_unreachable_routes() {
-        use pathvector_types::{AsPath, Asn, NextHop, Origin};
+        use pathvector_types::{AsPath, Asn, Origin};
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();

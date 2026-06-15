@@ -424,6 +424,11 @@ fn parse_nlri(s: &str) -> Result<pathvector_types::Nlri<Ipv4Addr>, Status> {
         .map_err(|_| Status::invalid_argument(format!("'{s}' is not valid CIDR notation")))
 }
 
+fn parse_nlri_v6(s: &str) -> Result<pathvector_types::Nlri<Ipv6Addr>, Status> {
+    s.parse()
+        .map_err(|_| Status::invalid_argument(format!("'{s}' is not valid IPv6 CIDR notation")))
+}
+
 #[tonic::async_trait]
 impl RibService for RibServiceImpl {
     type WatchRoutesStream = RouteEventStream;
@@ -879,9 +884,15 @@ impl OriginationService for OriginationServiceImpl {
         request: Request<WithdrawOriginatedRouteRequest>,
     ) -> Result<Response<WithdrawOriginatedRouteResponse>, Status> {
         let prefix = request.into_inner().prefix;
-        let nlri: pathvector_types::Nlri<Ipv4Addr> = parse_nlri(&prefix)?;
         tracing::info!(%prefix, "WithdrawOriginatedRoute");
-        self.state.write().await.withdraw_originated_route(nlri);
+        let mut state = self.state.write().await;
+        if is_ipv6_prefix(&prefix) {
+            let nlri = parse_nlri_v6(&prefix)?;
+            state.withdraw_originated_route_v6(nlri);
+        } else {
+            let nlri: pathvector_types::Nlri<Ipv4Addr> = parse_nlri(&prefix)?;
+            state.withdraw_originated_route(nlri);
+        }
         Ok(Response::new(WithdrawOriginatedRouteResponse {}))
     }
 
@@ -891,12 +902,23 @@ impl OriginationService for OriginationServiceImpl {
     ) -> Result<Response<WithdrawOriginatedRoutesResponse>, Status> {
         let prefixes = request.into_inner().prefixes;
         let count = u32::try_from(prefixes.len()).unwrap_or(u32::MAX);
-        let nlris: Vec<pathvector_types::Nlri<Ipv4Addr>> = prefixes
-            .iter()
-            .map(|p| parse_nlri(p))
-            .collect::<Result<_, _>>()?;
         tracing::info!(count, "WithdrawOriginatedRoutes (batch)");
-        self.state.write().await.withdraw_originated_routes(&nlris);
+        let mut v4: Vec<pathvector_types::Nlri<Ipv4Addr>> = Vec::new();
+        let mut v6: Vec<pathvector_types::Nlri<Ipv6Addr>> = Vec::new();
+        for p in &prefixes {
+            if is_ipv6_prefix(p) {
+                v6.push(parse_nlri_v6(p)?);
+            } else {
+                v4.push(parse_nlri(p)?);
+            }
+        }
+        let mut state = self.state.write().await;
+        if !v4.is_empty() {
+            state.withdraw_originated_routes(&v4);
+        }
+        if !v6.is_empty() {
+            state.withdraw_originated_routes_v6(&v6);
+        }
         Ok(Response::new(WithdrawOriginatedRoutesResponse { count }))
     }
 
