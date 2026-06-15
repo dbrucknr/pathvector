@@ -5,14 +5,33 @@
 //! Three components cooperate to provide live next-hop reachability to the BGP
 //! decision process:
 //!
-//! - [`FibSnapshot`] — an in-memory copy of the kernel routing table for one
-//!   or both address families. Cheap to query under a shared `RwLock`.
+//! - [`FibSnapshot`] — an in-memory copy of the **IGP / kernel routing table**
+//!   for one or both address families. Cheap to query under a shared `RwLock`.
 //! - [`KernelFib`] — drives the snapshot: dumps the initial kernel FIB on
 //!   startup and then applies `RTM_NEWROUTE` / `RTM_DELROUTE` netlink events as
 //!   they arrive. Signals change via a `watch` channel so the daemon can
 //!   re-evaluate best-paths whose next-hops were affected.
 //! - [`KernelOracle`] — a thin wrapper that consumers can hold to query
 //!   the snapshot; see `pathvectord::fib` for the `NextHopOracle` impl.
+//!
+//! # BGP route exclusion
+//!
+//! Routes tagged `RTPROT_BGP` (protocol 186) are **excluded** from
+//! [`FibSnapshot`].  This matches the approach used by BIRD (`krt.c`
+//! protocol-tag filter) and FRR/Zebra (`rtm_protocol` skip in
+//! `kernel_netlink.c`).  The reasons are:
+//!
+//! 1. **No feedback loop** — every route `FibWriter` installs generates a
+//!    `RTM_NEWROUTE` multicast event.  Including it in the snapshot would fire
+//!    `change_tx`, waking the event loop and triggering a full `recompute_all`
+//!    scan over the Loc-RIB — for every single FIB install.
+//!
+//! 2. **Semantic correctness** — the oracle answers "is there an IGP/kernel
+//!    path to this next-hop?"  BGP routes are *destinations* we compute from,
+//!    not the IGP paths we use to *reach* BGP next-hops.  Recursive next-hop
+//!    resolution (a BGP route whose next-hop is itself reachable only via
+//!    another BGP route) is a distinct, explicitly opt-in feature not yet
+//!    implemented here.
 //!
 //! # Platform behaviour
 //!

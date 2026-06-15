@@ -6330,21 +6330,29 @@ mod event_loop_tests {
         // Drain initial propagation.
         rxs.get_mut(&peer_b).unwrap().try_recv().ok();
 
-        // Simulate next-hop going down then fire a FIB change tick.
+        // Simulate next-hop going down.
         oracle.0.store(false, Ordering::Relaxed);
-        let (fib_tx, fib_rx) = watch::channel(());
+
+        // Keep the event channel open so the loop does not exit via the event
+        // arm before it has a chance to process the FIB change.  Both arms
+        // could otherwise be immediately ready and select! is non-deterministic.
         let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
+        let (fib_tx, fib_rx) = watch::channel(());
 
-        // Send a FIB change notification, then close the event channel so the loop exits.
+        // Spawn the loop as a background task, then signal the FIB change.
+        let loop_handle = tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            stop_senders,
+            Some(fib_rx),
+        ));
         fib_tx.send(()).unwrap();
-        drop(event_tx);
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            run_event_loop(event_rx, Arc::clone(&state), stop_senders, Some(fib_rx)),
-        )
-        .await
-        .expect("event loop must exit when event channel closes");
+        // Yield repeatedly to give the event loop task a chance to wake up and
+        // call on_fib_change before we inspect state.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
 
         // Route must be withdrawn from Loc-RIB.
         let s = state.read().await;
@@ -6362,6 +6370,13 @@ mod event_loop_tests {
             .expect("peer_b must receive WITHDRAW via FIB change");
         assert!(!msg.withdrawn.is_empty());
         assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
+
+        // Shut down: close the event channel so the loop exits.
+        drop(event_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), loop_handle)
+            .await
+            .expect("event loop must exit within timeout")
+            .expect("loop task must not panic");
     }
 
     // ── Channel closed → loop exits ───────────────────────────────────────────
