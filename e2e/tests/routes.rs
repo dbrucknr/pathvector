@@ -144,8 +144,11 @@ async fn announced_v6_route_appears_in_rib() {
     let h = Harness::new_v6().await;
 
     // GoBGP injects the prefix into its own RIB and advertises it to pathvectord
-    // via MP_REACH_NLRI (IPv6 unicast).  GoBGP uses its own loopback as next-hop.
-    h.gobgp_announce_v6("2001:db8::/32", "::1");
+    // via MP_REACH_NLRI (IPv6 unicast).  We use GoBGP's link-local address as
+    // next-hop: it is always on-link and reachable from pathvectord without
+    // requiring a global IPv6 subnet on the test Docker network.
+    let nh = h.gobgp_link_local_v6();
+    h.gobgp_announce_v6("2001:db8::/32", &nh);
 
     wait_for_route_with_diagnostics(
         &mut h.client.clone(),
@@ -175,7 +178,8 @@ async fn announced_v6_route_appears_in_rib() {
 async fn withdrawn_v6_route_removed_from_rib() {
     let h = Harness::new_v6().await;
 
-    h.gobgp_announce_v6("2001:db8::/32", "::1");
+    let nh = h.gobgp_link_local_v6();
+    h.gobgp_announce_v6("2001:db8::/32", &nh);
     wait_for_route_with_diagnostics(
         &mut h.client.clone(),
         "2001:db8::/32",

@@ -1447,6 +1447,39 @@ impl Harness {
         );
     }
 
+    /// Returns the link-local IPv6 address (`fe80::…`) of the GoBGP container's
+    /// primary network interface.
+    ///
+    /// Docker containers always receive a link-local address via SLAAC even when
+    /// IPv6 is not explicitly enabled on the Docker network.  This address is
+    /// always on-link from pathvectord's perspective, making it the correct
+    /// next-hop to use when testing IPv6 route reception over an IPv4 TCP session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the container has no link-local IPv6 address.
+    pub fn gobgp_link_local_v6(&self) -> String {
+        let out = Command::new("docker")
+            .args(["exec", &self.gobgpd_id, "ip", "-6", "addr", "show", "scope", "link"])
+            .output()
+            .expect("docker exec ip -6 addr show scope link");
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Extract `fe80::…/64` then strip the prefix-length suffix.
+        for token in text.split_whitespace() {
+            if token.starts_with("fe80::") {
+                return token
+                    .split('/')
+                    .next()
+                    .expect("addr token has prefix-length")
+                    .to_owned();
+            }
+        }
+        panic!(
+            "GoBGP container {id} has no link-local IPv6 address; ip -6 output:\n{text}",
+            id = self.gobgpd_id
+        );
+    }
+
     /// Announce an IPv6 prefix into GoBGP's RIB (AFI/SAFI = ipv6-unicast).
     ///
     /// # Panics
