@@ -7,16 +7,32 @@
 //!   can consult the live kernel FIB for next-hop reachability and IGP metrics.
 //!
 //! - [`FibManager`] — consumes [`BestPathChange`] values from the event loop
-//!   and serialises the corresponding `RTM_NEWROUTE` / `RTM_DELROUTE` calls
-//!   to a background task, keeping route installation off the BGP event-loop
-//!   hot path.
+//!   and forwards them to a background task that issues `RTM_NEWROUTE` /
+//!   `RTM_DELROUTE` netlink calls.
+//!
+//! # Deduplication
+//!
+//! Rather than a bounded channel (which silently drops updates when full),
+//! `FibManager` maintains a `HashMap<Nlri, PendingOp>` for each address
+//! family, protected by a `std::sync::Mutex`. Every `apply_v4/v6` call
+//! overwrites the entry for that NLRI — only the *latest desired state* per
+//! prefix is kept. A [`tokio::sync::Notify`] signals the background writer
+//! that work is pending.
+//!
+//! This eliminates silent drops during full-table convergence and naturally
+//! coalesces rapid best-path oscillations (e.g., from FIB re-evaluation) into
+//! a single kernel operation per prefix.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::{Arc, Mutex},
+};
 
 use pathvector_rib::{BestPathChange, oracle::NextHopOracle};
 use pathvector_sys::{FibWriter, KernelOracle as SysOracle};
-use pathvector_types::NextHop;
-use tokio::sync::mpsc;
+use pathvector_types::{NextHop, Nlri};
+use tokio::sync::Notify;
 
 // ── DaemonOracle ─────────────────────────────────────────────────────────────
 
@@ -47,150 +63,171 @@ impl NextHopOracle for DaemonOracle {
 
 // ── FibManager ───────────────────────────────────────────────────────────────
 
-enum FibChange {
-    InstallV4 {
-        dst: Ipv4Addr,
-        prefix_len: u8,
-        gateway: Ipv4Addr,
-    },
-    WithdrawV4 {
-        dst: Ipv4Addr,
-        prefix_len: u8,
-    },
-    InstallV6 {
-        dst: Ipv6Addr,
-        prefix_len: u8,
-        gateway: Ipv6Addr,
-    },
-    WithdrawV6 {
-        dst: Ipv6Addr,
-        prefix_len: u8,
-    },
+/// The desired kernel state for an IPv4 prefix.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PendingV4 {
+    Install { gateway: Ipv4Addr },
+    Withdraw,
 }
 
-fn spawn_writer(writer: FibWriter, mut rx: mpsc::Receiver<FibChange>) {
-    tokio::spawn(async move {
-        while let Some(change) = rx.recv().await {
-            match change {
-                FibChange::InstallV4 {
-                    dst,
-                    prefix_len,
-                    gateway,
-                } => {
-                    if let Err(e) = writer.install_v4(dst, prefix_len, gateway).await {
-                        tracing::warn!(
-                            prefix = %format!("{dst}/{prefix_len}"),
-                            gateway = %gateway,
-                            "FIB install failed: {e}"
-                        );
-                    }
-                }
-                FibChange::WithdrawV4 { dst, prefix_len } => {
-                    if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
-                        tracing::warn!(
-                            prefix = %format!("{dst}/{prefix_len}"),
-                            "FIB withdraw failed: {e}"
-                        );
-                    }
-                }
-                FibChange::InstallV6 {
-                    dst,
-                    prefix_len,
-                    gateway,
-                } => {
-                    if let Err(e) = writer.install_v6(dst, prefix_len, gateway).await {
-                        tracing::warn!(
-                            prefix = %format!("{dst}/{prefix_len}"),
-                            gateway = %gateway,
-                            "FIB install (v6) failed: {e}"
-                        );
-                    }
-                }
-                FibChange::WithdrawV6 { dst, prefix_len } => {
-                    if let Err(e) = writer.withdraw_v6(dst, prefix_len).await {
-                        tracing::warn!(
-                            prefix = %format!("{dst}/{prefix_len}"),
-                            "FIB withdraw (v6) failed: {e}"
-                        );
-                    }
-                }
-            }
-        }
-    });
+/// The desired kernel state for an IPv6 prefix.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PendingV6 {
+    Install { gateway: Ipv6Addr },
+    Withdraw,
 }
 
-/// Serialises FIB mutations from the BGP event loop to a background task.
+/// Serialises FIB mutations from the BGP event loop to a background writer task.
 ///
-/// `apply_v4` is intentionally synchronous: it puts a `FibChange` onto a
-/// bounded channel and returns immediately so the event loop is never blocked
-/// on kernel I/O. The background task drains the channel and issues the
-/// actual netlink calls via [`FibWriter`].
+/// `apply_v4/v6` are non-blocking: they overwrite the pending entry for the
+/// given NLRI and signal the writer via a [`Notify`]. The writer drains both
+/// maps in one batch per wakeup and issues the actual netlink calls.
+///
+/// Because each NLRI has exactly one pending slot, rapid best-path oscillations
+/// are automatically coalesced — the kernel always converges to the correct
+/// final state without intermediate churn, and no updates are ever dropped.
 pub(crate) struct FibManager {
-    tx: mpsc::Sender<FibChange>,
+    pending_v4: Arc<Mutex<HashMap<Nlri<Ipv4Addr>, PendingV4>>>,
+    pending_v6: Arc<Mutex<HashMap<Nlri<Ipv6Addr>, PendingV6>>>,
+    notify: Arc<Notify>,
 }
 
 impl FibManager {
     pub(crate) fn new(writer: FibWriter) -> Self {
-        let (tx, rx) = mpsc::channel(4096);
-        spawn_writer(writer, rx);
-        Self::from_sender(tx)
+        let pending_v4 = Arc::new(Mutex::new(HashMap::new()));
+        let pending_v6 = Arc::new(Mutex::new(HashMap::new()));
+        let notify = Arc::new(Notify::new());
+        spawn_writer(
+            writer,
+            Arc::clone(&pending_v4),
+            Arc::clone(&pending_v6),
+            Arc::clone(&notify),
+        );
+        Self {
+            pending_v4,
+            pending_v6,
+            notify,
+        }
     }
 
-    fn from_sender(tx: mpsc::Sender<FibChange>) -> Self {
-        Self { tx }
+    /// Snapshot the pending IPv4 map — used only in tests.
+    #[cfg(test)]
+    pub(crate) fn pending_v4_snapshot(&self) -> HashMap<Nlri<Ipv4Addr>, PendingV4> {
+        self.pending_v4.lock().unwrap().clone()
     }
 
-    /// Enqueue a FIB update derived from a `BestPathChange<Ipv4Addr>`.
+    /// Snapshot the pending IPv6 map — used only in tests.
+    #[cfg(test)]
+    pub(crate) fn pending_v6_snapshot(&self) -> HashMap<Nlri<Ipv6Addr>, PendingV6> {
+        self.pending_v6.lock().unwrap().clone()
+    }
+
+    /// Record the desired FIB state for the prefix in `change`.
     ///
-    /// No-op for `BestPathChange::Unchanged` and for `Announced` routes that
-    /// carry no IPv4 next-hop.
+    /// For `Announced`: records `Install { gateway }`. For `Withdrawn`: records
+    /// `Withdraw`. For `Unchanged`: no-op. Routes with no usable IPv4 next-hop
+    /// are silently skipped.
+    ///
+    /// If a pending entry already exists for this NLRI, it is overwritten —
+    /// only the latest desired state is retained.
     pub(crate) fn apply_v4(&self, change: BestPathChange<Ipv4Addr>) {
-        match change {
+        let (nlri, op) = match change {
             BestPathChange::Announced(nlri, route) => {
                 let Some(NextHop::V4(gateway)) = route.next_hop else {
                     return;
                 };
-                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
-                let _ = self.tx.try_send(FibChange::InstallV4 {
-                    dst,
-                    prefix_len,
-                    gateway,
-                });
+                (nlri, PendingV4::Install { gateway })
             }
-            BestPathChange::Withdrawn(nlri) => {
-                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
-                let _ = self.tx.try_send(FibChange::WithdrawV4 { dst, prefix_len });
-            }
-            BestPathChange::Unchanged => {}
-        }
+            BestPathChange::Withdrawn(nlri) => (nlri, PendingV4::Withdraw),
+            BestPathChange::Unchanged => return,
+        };
+        self.pending_v4.lock().unwrap().insert(nlri, op);
+        self.notify.notify_one();
     }
 
-    /// Enqueue a FIB update derived from a `BestPathChange<Ipv6Addr>`.
+    /// Record the desired FIB state for the IPv6 prefix in `change`.
     ///
-    /// No-op for `BestPathChange::Unchanged` and for `Announced` routes whose
-    /// next-hop is not an IPv6 global address (e.g. the next-hop was not set).
+    /// Routes with no usable IPv6 global next-hop are silently skipped.
     pub(crate) fn apply_v6(&self, change: BestPathChange<Ipv6Addr>) {
-        match change {
+        let (nlri, op) = match change {
             BestPathChange::Announced(nlri, route) => {
                 let gateway = match route.next_hop {
                     Some(NextHop::V6(gw)) => gw,
                     Some(NextHop::V6WithLinkLocal { global, .. }) => global,
                     _ => return,
                 };
-                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
-                let _ = self.tx.try_send(FibChange::InstallV6 {
-                    dst,
-                    prefix_len,
-                    gateway,
-                });
+                (nlri, PendingV6::Install { gateway })
             }
-            BestPathChange::Withdrawn(nlri) => {
-                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
-                let _ = self.tx.try_send(FibChange::WithdrawV6 { dst, prefix_len });
-            }
-            BestPathChange::Unchanged => {}
-        }
+            BestPathChange::Withdrawn(nlri) => (nlri, PendingV6::Withdraw),
+            BestPathChange::Unchanged => return,
+        };
+        self.pending_v6.lock().unwrap().insert(nlri, op);
+        self.notify.notify_one();
     }
+}
+
+fn spawn_writer(
+    writer: FibWriter,
+    pending_v4: Arc<Mutex<HashMap<Nlri<Ipv4Addr>, PendingV4>>>,
+    pending_v6: Arc<Mutex<HashMap<Nlri<Ipv6Addr>, PendingV6>>>,
+    notify: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        loop {
+            notify.notified().await;
+
+            // Drain both maps atomically so the event loop can keep writing
+            // new entries while we process this batch.
+            let v4_batch = std::mem::take(&mut *pending_v4.lock().unwrap());
+            let v6_batch = std::mem::take(&mut *pending_v6.lock().unwrap());
+
+            for (nlri, op) in v4_batch {
+                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
+                match op {
+                    PendingV4::Install { gateway } => {
+                        if let Err(e) = writer.install_v4(dst, prefix_len, gateway).await {
+                            tracing::warn!(
+                                prefix = %format!("{dst}/{prefix_len}"),
+                                %gateway,
+                                "FIB install failed: {e}"
+                            );
+                        }
+                    }
+                    PendingV4::Withdraw => {
+                        if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
+                            tracing::warn!(
+                                prefix = %format!("{dst}/{prefix_len}"),
+                                "FIB withdraw failed: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            for (nlri, op) in v6_batch {
+                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
+                match op {
+                    PendingV6::Install { gateway } => {
+                        if let Err(e) = writer.install_v6(dst, prefix_len, gateway).await {
+                            tracing::warn!(
+                                prefix = %format!("{dst}/{prefix_len}"),
+                                %gateway,
+                                "FIB install (v6) failed: {e}"
+                            );
+                        }
+                    }
+                    PendingV6::Withdraw => {
+                        if let Err(e) = writer.withdraw_v6(dst, prefix_len).await {
+                            tracing::warn!(
+                                prefix = %format!("{dst}/{prefix_len}"),
+                                "FIB withdraw (v6) failed: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -202,9 +239,7 @@ mod tests {
     use pathvector_rib::{BestPathChange, RouteBuilder};
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
 
-    use tokio::sync::mpsc;
-
-    use super::FibChange;
+    use super::{FibManager, PendingV4, PendingV6};
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -230,121 +265,176 @@ mod tests {
         RouteBuilder::new(nlri4(prefix), Origin::Igp, AsPath::new()).build()
     }
 
-    /// Drain all pending `FibChange` entries from the test receiver.
-    fn drain(rx: &mut mpsc::Receiver<FibChange>) -> Vec<FibChange> {
-        let mut out = Vec::new();
-        while let Ok(c) = rx.try_recv() {
-            out.push(c);
+    fn make_fm() -> FibManager {
+        FibManager {
+            pending_v4: Default::default(),
+            pending_v6: Default::default(),
+            notify: Default::default(),
         }
-        out
     }
 
     // ── apply_v4 ─────────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_apply_v4_announced_enqueues_install() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v4_announced_records_install() {
+        let fm = make_fm();
         fm.apply_v4(BestPathChange::Announced(
             nlri4("10.0.0.0/8"),
             route4("10.0.0.0/8", "192.0.2.1"),
         ));
-        let changes = drain(&mut rx);
-        assert_eq!(changes.len(), 1);
-        let FibChange::InstallV4 {
-            dst,
-            prefix_len,
-            gateway,
-        } = &changes[0]
-        else {
-            panic!("expected InstallV4");
-        };
-        assert_eq!(*dst, Ipv4Addr::new(10, 0, 0, 0));
-        assert_eq!(*prefix_len, 8);
-        assert_eq!(*gateway, "192.0.2.1".parse::<Ipv4Addr>().unwrap());
+        let snap = fm.pending_v4_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri4("10.0.0.0/8")],
+            PendingV4::Install {
+                gateway: "192.0.2.1".parse().unwrap()
+            }
+        );
     }
 
-    #[tokio::test]
-    async fn test_apply_v4_withdrawn_enqueues_withdraw() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v4_withdrawn_records_withdraw() {
+        let fm = make_fm();
         fm.apply_v4(BestPathChange::Withdrawn(nlri4("192.168.0.0/24")));
-        let changes = drain(&mut rx);
-        assert_eq!(changes.len(), 1);
-        let FibChange::WithdrawV4 { dst, prefix_len } = &changes[0] else {
-            panic!("expected WithdrawV4");
-        };
-        assert_eq!(*dst, Ipv4Addr::new(192, 168, 0, 0));
-        assert_eq!(*prefix_len, 24);
+        let snap = fm.pending_v4_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[&nlri4("192.168.0.0/24")], PendingV4::Withdraw);
     }
 
-    #[tokio::test]
-    async fn test_apply_v4_unchanged_enqueues_nothing() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v4_unchanged_records_nothing() {
+        let fm = make_fm();
         fm.apply_v4(BestPathChange::Unchanged);
-        assert!(drain(&mut rx).is_empty());
+        assert!(fm.pending_v4_snapshot().is_empty());
     }
 
-    #[tokio::test]
-    async fn test_apply_v4_no_next_hop_skipped() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v4_no_next_hop_skipped() {
+        let fm = make_fm();
         fm.apply_v4(BestPathChange::Announced(
             nlri4("10.0.0.0/8"),
             route4_no_nh("10.0.0.0/8"),
         ));
         assert!(
-            drain(&mut rx).is_empty(),
-            "route without next-hop must not be installed"
+            fm.pending_v4_snapshot().is_empty(),
+            "route without next-hop must not be recorded"
         );
+    }
+
+    #[test]
+    fn test_apply_v4_deduplicates_same_prefix() {
+        // A rapid withdraw followed by a re-announce should leave only Install.
+        let fm = make_fm();
+        fm.apply_v4(BestPathChange::Withdrawn(nlri4("10.0.0.0/8")));
+        fm.apply_v4(BestPathChange::Announced(
+            nlri4("10.0.0.0/8"),
+            route4("10.0.0.0/8", "192.0.2.1"),
+        ));
+        let snap = fm.pending_v4_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri4("10.0.0.0/8")],
+            PendingV4::Install {
+                gateway: "192.0.2.1".parse().unwrap()
+            },
+            "last write wins — Install must overwrite the earlier Withdraw"
+        );
+    }
+
+    #[test]
+    fn test_apply_v4_deduplicates_oscillating_gateway() {
+        // Two rapid best-path changes for the same prefix — only the last gateway survives.
+        let fm = make_fm();
+        fm.apply_v4(BestPathChange::Announced(
+            nlri4("10.0.0.0/8"),
+            route4("10.0.0.0/8", "192.0.2.1"),
+        ));
+        fm.apply_v4(BestPathChange::Announced(
+            nlri4("10.0.0.0/8"),
+            route4("10.0.0.0/8", "192.0.2.2"),
+        ));
+        let snap = fm.pending_v4_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri4("10.0.0.0/8")],
+            PendingV4::Install {
+                gateway: "192.0.2.2".parse().unwrap()
+            },
+            "last gateway wins"
+        );
+    }
+
+    #[test]
+    fn test_apply_v4_multiple_prefixes_tracked_independently() {
+        let fm = make_fm();
+        fm.apply_v4(BestPathChange::Announced(
+            nlri4("10.0.0.0/8"),
+            route4("10.0.0.0/8", "192.0.2.1"),
+        ));
+        fm.apply_v4(BestPathChange::Withdrawn(nlri4("172.16.0.0/12")));
+        let snap = fm.pending_v4_snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(
+            snap[&nlri4("10.0.0.0/8")],
+            PendingV4::Install {
+                gateway: "192.0.2.1".parse().unwrap()
+            }
+        );
+        assert_eq!(snap[&nlri4("172.16.0.0/12")], PendingV4::Withdraw);
     }
 
     // ── apply_v6 ─────────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_apply_v6_announced_enqueues_install() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v6_announced_records_install() {
+        let fm = make_fm();
         fm.apply_v6(BestPathChange::Announced(
             nlri6("2001:db8::/32"),
             route6("2001:db8::/32", "2001:db8::1"),
         ));
-        let changes = drain(&mut rx);
-        assert_eq!(changes.len(), 1);
-        let FibChange::InstallV6 {
-            dst,
-            prefix_len,
-            gateway,
-        } = &changes[0]
-        else {
-            panic!("expected InstallV6");
-        };
-        assert_eq!(*dst, "2001:db8::".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(*prefix_len, 32);
-        assert_eq!(*gateway, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        let snap = fm.pending_v6_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri6("2001:db8::/32")],
+            PendingV6::Install {
+                gateway: "2001:db8::1".parse().unwrap()
+            }
+        );
     }
 
-    #[tokio::test]
-    async fn test_apply_v6_withdrawn_enqueues_withdraw() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v6_withdrawn_records_withdraw() {
+        let fm = make_fm();
         fm.apply_v6(BestPathChange::Withdrawn(nlri6("2001:db8::/32")));
-        let changes = drain(&mut rx);
-        assert_eq!(changes.len(), 1);
-        let FibChange::WithdrawV6 { dst, prefix_len } = &changes[0] else {
-            panic!("expected WithdrawV6");
-        };
-        assert_eq!(*dst, "2001:db8::".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(*prefix_len, 32);
+        let snap = fm.pending_v6_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[&nlri6("2001:db8::/32")], PendingV6::Withdraw);
     }
 
-    #[tokio::test]
-    async fn test_apply_v6_unchanged_enqueues_nothing() {
-        let (tx, mut rx) = mpsc::channel(4096);
-        let fm = super::FibManager::from_sender(tx);
+    #[test]
+    fn test_apply_v6_unchanged_records_nothing() {
+        let fm = make_fm();
         fm.apply_v6(BestPathChange::<Ipv6Addr>::Unchanged);
-        assert!(drain(&mut rx).is_empty());
+        assert!(fm.pending_v6_snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_apply_v6_deduplicates_same_prefix() {
+        let fm = make_fm();
+        fm.apply_v6(BestPathChange::Withdrawn(nlri6("2001:db8::/32")));
+        fm.apply_v6(BestPathChange::Announced(
+            nlri6("2001:db8::/32"),
+            route6("2001:db8::/32", "2001:db8::1"),
+        ));
+        let snap = fm.pending_v6_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri6("2001:db8::/32")],
+            PendingV6::Install {
+                gateway: "2001:db8::1".parse().unwrap()
+            },
+            "Install must overwrite the earlier Withdraw"
+        );
     }
 
     // ── DaemonOracle ─────────────────────────────────────────────────────────

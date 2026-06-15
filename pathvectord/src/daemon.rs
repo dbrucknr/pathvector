@@ -22,7 +22,7 @@ use pathvector_session::{
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
 use pathvector_types::{AfiSafi, AsPath, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::outbound::{
     PrefixDecision, PrefixDecisionV6, flush_updates, flush_updates_v6, propagate_prefix,
@@ -380,6 +380,23 @@ impl DaemonState {
     pub(crate) fn rib_withdraw_peer_v6(&mut self, peer: &PeerId) -> Vec<BestPathChange<Ipv6Addr>> {
         let oracle = Arc::clone(&self.oracle_v6);
         self.rib_mut().loc_rib_v6.withdraw_peer(peer, &*oracle)
+    }
+
+    /// Re-evaluates best-path for every IPv4 prefix in the Loc-RIB using the
+    /// current oracle.  Returns only the prefixes whose best path changed.
+    ///
+    /// Called when the kernel FIB changes (next-hop gained / lost) so that
+    /// routes whose next-hop became unreachable are withdrawn and routes that
+    /// recovered are re-announced.
+    pub(crate) fn rib_recompute_all_v4(&mut self) -> Vec<BestPathChange<Ipv4Addr>> {
+        let oracle = Arc::clone(&self.oracle_v4);
+        self.rib_mut().loc_rib.recompute_all(&*oracle)
+    }
+
+    /// Re-evaluates best-path for every IPv6 prefix in the Loc-RIB.
+    pub(crate) fn rib_recompute_all_v6(&mut self) -> Vec<BestPathChange<Ipv6Addr>> {
+        let oracle = Arc::clone(&self.oracle_v6);
+        self.rib_mut().loc_rib_v6.recompute_all(&*oracle)
     }
 
     /// Returns a cheap clone of the snapshot Arc for lock-free gRPC reads.
@@ -1254,6 +1271,64 @@ impl DaemonState {
         }
         self.sync_advertised(peer_ip);
     }
+
+    /// Called when the kernel FIB changes (next-hop gained or lost).
+    ///
+    /// Re-evaluates best-path selection for every prefix in the Loc-RIB using
+    /// the current oracle.  For each prefix whose best path changed:
+    ///
+    /// - Enqueues the new state in the [`FibManager`] (install or withdraw).
+    /// - Propagates the change to all established BGP peers as an UPDATE or
+    ///   WITHDRAW.
+    ///
+    /// Only prefixes that actually changed are processed; the full-table scan
+    /// runs in O(n) and the expensive peer-propagation path is entered only
+    /// for the affected subset.
+    pub(crate) fn on_fib_change(&mut self) {
+        let fib_changes_v4 = self.rib_recompute_all_v4();
+        let fib_changes_v6 = self.rib_recompute_all_v6();
+
+        let changed_nlris_v4: Vec<Nlri<Ipv4Addr>> = fib_changes_v4
+            .iter()
+            .filter_map(|c| match c {
+                BestPathChange::Announced(n, _) | BestPathChange::Withdrawn(n) => Some(*n),
+                BestPathChange::Unchanged => None,
+            })
+            .collect();
+
+        let changed_nlris_v6: Vec<Nlri<Ipv6Addr>> = fib_changes_v6
+            .iter()
+            .filter_map(|c| match c {
+                BestPathChange::Announced(n, _) | BestPathChange::Withdrawn(n) => Some(*n),
+                BestPathChange::Unchanged => None,
+            })
+            .collect();
+
+        if !changed_nlris_v4.is_empty() || !changed_nlris_v6.is_empty() {
+            tracing::debug!(
+                changed_v4 = changed_nlris_v4.len(),
+                changed_v6 = changed_nlris_v6.len(),
+                "FIB change triggered best-path re-evaluation"
+            );
+        }
+
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes_v4 {
+                fm.apply_v4(change);
+            }
+            for change in fib_changes_v6 {
+                fm.apply_v6(change);
+            }
+        }
+
+        if !changed_nlris_v4.is_empty() {
+            self.propagate_to_all_peers(&changed_nlris_v4);
+            self.emit_route_events(&changed_nlris_v4);
+        }
+        if !changed_nlris_v6.is_empty() {
+            self.propagate_to_all_peers_v6(&changed_nlris_v6);
+        }
+    }
 }
 
 pub(crate) async fn run(cfg: config::Config) {
@@ -1283,10 +1358,7 @@ where
     // RTM_DELROUTE events; KernelOracle exposes the snapshot for next-hop
     // reachability queries.  FibWriter handles the write side (route install /
     // remove).  On non-Linux platforms both are no-ops.
-    let kernel_fib = {
-        let (kfib, _change_rx) = pathvector_sys::KernelFib::new(fib_table);
-        kfib
-    };
+    let (kernel_fib, fib_change_rx) = pathvector_sys::KernelFib::new(fib_table);
     // oracle() takes &self; call before spawn() consumes kernel_fib.
     let oracle_v4 = fib::DaemonOracle(kernel_fib.oracle());
     let oracle_v6 = fib::DaemonOracle(kernel_fib.oracle());
@@ -1325,7 +1397,7 @@ where
         run_bgp_listener(bgp_port, incoming_senders, md5_passwords).await;
     });
 
-    run_event_loop(event_rx, state, stop_senders).await;
+    run_event_loop(event_rx, state, stop_senders, Some(fib_change_rx)).await;
 }
 
 /// Sets up BGP sessions for every configured peer and constructs the initial
@@ -1503,6 +1575,12 @@ async fn run_bgp_listener(
 /// [`DaemonState`], then closes any sessions whose outbound UPDATE channel
 /// overflowed during that dispatch.
 ///
+/// `fib_change_rx` is a `watch::Receiver` that fires whenever the kernel FIB
+/// snapshot changes.  On each tick the event loop calls
+/// [`DaemonState::on_fib_change`] to re-evaluate best-paths whose next-hops
+/// may have been affected.  Pass `None` in tests that do not exercise FIB
+/// re-evaluation — the select arm is skipped entirely.
+///
 /// Extracted from `run()` so it can be driven in unit tests by injecting a
 /// pre-built channel and a pre-populated `DaemonState` — no TCP connections
 /// or real session tasks required.
@@ -1510,43 +1588,77 @@ pub(crate) async fn run_event_loop(
     mut event_rx: mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
     state: Arc<RwLock<DaemonState>>,
     stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
+    mut fib_change_rx: Option<watch::Receiver<()>>,
 ) {
-    while let Some((peer_ip, event)) = event_rx.recv().await {
-        let mut s = state.write().await;
-        match event {
-            SessionEvent::Established(info) => {
-                Arc::make_mut(&mut s.rib)
-                    .peer_bgp_ids
-                    .insert(peer_ip, info.peer_bgp_id);
-                s.on_established(
-                    peer_ip,
-                    info.peer_type,
-                    info.peer_as,
-                    info.hold_time,
-                    &info.peer_capabilities,
-                    info.local_addr,
-                );
+    loop {
+        // `std::future::pending()` for the None branch ensures the select arm
+        // is compiled in but never resolves, keeping the loop alive on the
+        // BGP event path alone.
+        let fib_changed = async {
+            match fib_change_rx.as_mut() {
+                Some(rx) => rx.changed().await,
+                None => std::future::pending().await,
             }
-            SessionEvent::Terminated => {
-                s.on_terminated(peer_ip);
-            }
-            SessionEvent::RouteUpdate(msg) => {
-                s.on_route_update(peer_ip, msg);
-            }
-        }
-        // Collect any peers whose outbound channel overflowed.  Drain outside
-        // the write-lock so we don't hold it across the async stop-sender sends.
-        let stalled = s.take_stalled_peers();
-        drop(s);
+        };
 
-        for peer in stalled {
-            tracing::error!(
-                peer = %peer,
-                "closing session: outbound UPDATE channel overflowed; \
-                 session will re-establish and perform a fresh full-table dump"
-            );
-            if let Some(tx) = stop_senders.get(&peer) {
-                let _ = tx.send(SessionCommand::Stop).await;
+        tokio::select! {
+            event = event_rx.recv() => {
+                let Some((peer_ip, event)) = event else { break; };
+                let mut s = state.write().await;
+                match event {
+                    SessionEvent::Established(info) => {
+                        Arc::make_mut(&mut s.rib)
+                            .peer_bgp_ids
+                            .insert(peer_ip, info.peer_bgp_id);
+                        s.on_established(
+                            peer_ip,
+                            info.peer_type,
+                            info.peer_as,
+                            info.hold_time,
+                            &info.peer_capabilities,
+                            info.local_addr,
+                        );
+                    }
+                    SessionEvent::Terminated => {
+                        s.on_terminated(peer_ip);
+                    }
+                    SessionEvent::RouteUpdate(msg) => {
+                        s.on_route_update(peer_ip, msg);
+                    }
+                }
+                // Collect any peers whose outbound channel overflowed.  Drain
+                // outside the write-lock so we don't hold it across async sends.
+                let stalled = s.take_stalled_peers();
+                drop(s);
+
+                for peer in stalled {
+                    tracing::error!(
+                        peer = %peer,
+                        "closing session: outbound UPDATE channel overflowed; \
+                         session will re-establish and perform a fresh full-table dump"
+                    );
+                    if let Some(tx) = stop_senders.get(&peer) {
+                        let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                }
+            }
+
+            Ok(()) = fib_changed => {
+                let mut s = state.write().await;
+                s.on_fib_change();
+                let stalled = s.take_stalled_peers();
+                drop(s);
+
+                for peer in stalled {
+                    tracing::error!(
+                        peer = %peer,
+                        "closing session: outbound UPDATE channel overflowed after FIB change; \
+                         session will re-establish and perform a fresh full-table dump"
+                    );
+                    if let Some(tx) = stop_senders.get(&peer) {
+                        let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                }
             }
         }
     }
@@ -2386,6 +2498,152 @@ mod tests {
             .expect("peer_b should receive WITHDRAW after peer_a terminates");
         assert!(!msg.withdrawn.is_empty());
         assert_eq!(msg.withdrawn[0], nlri("192.168.0.0/16"));
+    }
+
+    // ── DaemonState::on_fib_change ────────────────────────────────────────────
+
+    /// Oracle that can be toggled reachable/unreachable at test time.
+    #[derive(Clone)]
+    struct ToggleOracle(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl ToggleOracle {
+        fn reachable() -> Self {
+            Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )))
+        }
+
+        fn set(&self, v: bool) {
+            self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl NextHopOracle for ToggleOracle {
+        fn is_reachable(&self, _: &pathvector_types::NextHop) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn igp_metric(&self, _: &pathvector_types::NextHop) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn test_on_fib_change_withdraws_when_next_hop_goes_down() {
+        use pathvector_types::{AsPath, Asn, NextHop, Origin};
+
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        // Install a toggle oracle (both peers initially reachable).
+        let oracle = ToggleOracle::reachable();
+        state.set_oracles(oracle.clone(), oracle.clone());
+
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // Announce a route from peer_a with an explicit next-hop.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        // Drain initial propagation to peer_b.
+        receivers.get_mut(&peer_b).unwrap().try_recv().ok();
+
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some(),
+            "route must be in Loc-RIB"
+        );
+
+        // Next-hop goes down — FIB change fires.
+        oracle.set(false);
+        state.on_fib_change();
+
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "route must be removed from Loc-RIB when next-hop is unreachable"
+        );
+
+        let msg = receivers
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b must receive WITHDRAW when next-hop goes down");
+        assert!(!msg.withdrawn.is_empty(), "UPDATE must carry a WITHDRAW");
+        assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn test_on_fib_change_reannounces_when_next_hop_recovers() {
+        use pathvector_types::{AsPath, Asn, NextHop, Origin};
+
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        // Start with next-hop unreachable so the initial INSERT produces no best path.
+        let oracle = ToggleOracle::reachable();
+        oracle.set(false);
+        state.set_oracles(oracle.clone(), oracle.clone());
+
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
+
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        // No best path yet — nothing should have been sent to peer_b.
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none());
+        receivers.get_mut(&peer_b).unwrap().try_recv().ok(); // discard any spurious message
+
+        // Next-hop recovers.
+        oracle.set(true);
+        state.on_fib_change();
+
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some(),
+            "route must appear in Loc-RIB after next-hop recovery"
+        );
+
+        let msg = receivers
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b must receive UPDATE when next-hop recovers");
+        assert!(!msg.announced.is_empty(), "UPDATE must carry an ANNOUNCE");
+        assert_eq!(msg.announced[0], nlri("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn test_on_fib_change_noop_when_nothing_changes() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // FIB change fires with empty RIB — should be a no-op.
+        state.on_fib_change();
+        assert!(receivers.get_mut(&peer_b).unwrap().try_recv().is_err());
     }
 
     // ── DaemonState::on_route_update ──────────────────────────────────────────
@@ -5741,13 +5999,20 @@ mod stall_tests {
 
 #[cfg(test)]
 mod event_loop_tests {
-    use std::collections::HashMap;
-    use std::net::Ipv4Addr;
+    use std::{
+        collections::HashMap,
+        net::Ipv4Addr,
+        sync::{
+            Arc as StdArc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
+    use pathvector_rib::oracle::NextHopOracle;
     use pathvector_session::fsm::SessionInfo;
     use pathvector_session::message::{Capability, UpdateMessage};
     use pathvector_session::transport::{SessionCommand, SessionEvent};
-    use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
+    use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -5763,6 +6028,25 @@ mod event_loop_tests {
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
+    }
+
+    #[derive(Clone)]
+    struct ToggleOracle(StdArc<AtomicBool>);
+
+    impl ToggleOracle {
+        fn reachable() -> Self {
+            Self(StdArc::new(AtomicBool::new(true)))
+        }
+    }
+
+    impl NextHopOracle for ToggleOracle {
+        fn is_reachable(&self, _: &NextHop) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+            None
+        }
     }
 
     fn established_info(peer_as: u32) -> SessionInfo {
@@ -5834,7 +6118,7 @@ mod event_loop_tests {
             .unwrap();
         drop(event_tx); // close channel so event loop exits after one event
 
-        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
 
         let s = state.read().await;
         assert!(
@@ -5863,7 +6147,7 @@ mod event_loop_tests {
             .unwrap();
         drop(event_tx);
 
-        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
 
         let s = state.read().await;
         assert!(
@@ -5901,7 +6185,7 @@ mod event_loop_tests {
             .unwrap();
         drop(event_tx);
 
-        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
 
         let s = state.read().await;
         assert_eq!(
@@ -6001,7 +6285,7 @@ mod event_loop_tests {
             .unwrap();
         drop(event_tx);
 
-        run_event_loop(event_rx, Arc::clone(&state), stop_senders).await;
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
 
         // The event loop must have sent SessionCommand::Stop to peer_b.
         let cmd = cmd_rx_b
@@ -6011,6 +6295,73 @@ mod event_loop_tests {
             matches!(cmd, SessionCommand::Stop),
             "expected Stop command, got {cmd:?}"
         );
+    }
+
+    // ── FIB change → recompute_all + propagate ────────────────────────────────
+
+    #[tokio::test]
+    async fn event_loop_fib_change_withdraws_unreachable_routes() {
+        use pathvector_types::{AsPath, Asn, NextHop, Origin};
+
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (state, mut rxs, stop_senders) = make_state(&[(peer_a, 65002), (peer_b, 65003)], 64);
+
+        // Install a ToggleOracle (initially reachable).
+        let oracle = ToggleOracle::reachable();
+        {
+            let mut s = state.write().await;
+            s.set_oracles(oracle.clone(), oracle.clone());
+            s.on_established(peer_a, PeerType::External, 65002, 90, &[], None);
+            s.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
+            s.on_route_update(
+                peer_a,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                        PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+                    ],
+                    announced: vec![nlri("10.0.0.0/8")],
+                },
+            );
+        }
+        // Drain initial propagation.
+        rxs.get_mut(&peer_b).unwrap().try_recv().ok();
+
+        // Simulate next-hop going down then fire a FIB change tick.
+        oracle.0.store(false, Ordering::Relaxed);
+        let (fib_tx, fib_rx) = watch::channel(());
+        let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
+
+        // Send a FIB change notification, then close the event channel so the loop exits.
+        fib_tx.send(()).unwrap();
+        drop(event_tx);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_event_loop(event_rx, Arc::clone(&state), stop_senders, Some(fib_rx)),
+        )
+        .await
+        .expect("event loop must exit when event channel closes");
+
+        // Route must be withdrawn from Loc-RIB.
+        let s = state.read().await;
+        assert!(
+            s.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "Loc-RIB must not have a best path when next-hop is unreachable"
+        );
+        drop(s);
+
+        // peer_b must have received a WITHDRAW.
+        let msg = rxs
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b must receive WITHDRAW via FIB change");
+        assert!(!msg.withdrawn.is_empty());
+        assert_eq!(msg.withdrawn[0], nlri("10.0.0.0/8"));
     }
 
     // ── Channel closed → loop exits ───────────────────────────────────────────
@@ -6023,7 +6374,7 @@ mod event_loop_tests {
         drop(event_tx);
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run_event_loop(event_rx, state, stop_senders),
+            run_event_loop(event_rx, state, stop_senders, None),
         )
         .await
         .expect("run_event_loop must exit when the event channel is closed");

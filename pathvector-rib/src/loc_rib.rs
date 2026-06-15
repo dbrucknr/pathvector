@@ -282,6 +282,35 @@ impl<A: IpAddress> LocRib<A> {
         self.candidates.is_empty()
     }
 
+    /// Re-evaluates best-path selection for every prefix currently in the RIB.
+    ///
+    /// Called when the next-hop oracle's view of the world changes — for example,
+    /// when the kernel FIB gains or loses a route that a BGP next-hop depends on.
+    /// Only prefixes whose best path actually changed are included in the result;
+    /// unchanged prefixes are silently skipped.
+    ///
+    /// The returned `Vec` follows the same semantics as [`insert`][Self::insert]:
+    /// each entry tells the caller whether to install, update, or withdraw a route
+    /// in the FIB and whether to advertise or withdraw it to BGP peers.
+    pub fn recompute_all(&mut self, oracle: &dyn NextHopOracle) -> Vec<BestPathChange<A>> {
+        let nlris: Vec<Nlri<A>> = self.candidates.keys().copied().collect();
+        nlris
+            .into_iter()
+            .filter_map(|nlri| {
+                let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
+                self.recompute_best(nlri, oracle);
+                let new = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
+                match (old, new) {
+                    (None, None) => None,
+                    (Some(_), None) => Some(BestPathChange::Withdrawn(nlri)),
+                    (None, Some((_, route))) => Some(BestPathChange::Announced(nlri, route)),
+                    (Some((op, ref or)), Some((np, ref nr))) if op == np && or == nr => None,
+                    (_, Some((_, route))) => Some(BestPathChange::Announced(nlri, route)),
+                }
+            })
+            .collect()
+    }
+
     fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
         if let Some(peer_map) = self.candidates.get(&nlri) {
             if let Some((peer, route)) = select_best_with_oracle(peer_map, oracle) {
@@ -301,10 +330,15 @@ impl<A: IpAddress> Default for LocRib<A> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::Cell,
+        net::{IpAddr, Ipv4Addr},
+    };
+
+    use pathvector_types::{AsPath, LocalPref, NextHop, Origin};
+
     use super::*;
     use crate::{RouteBuilder, oracle::AlwaysReachable};
-    use pathvector_types::{AsPath, LocalPref, Origin};
-    use std::net::{IpAddr, Ipv4Addr};
 
     fn peer(n: u8) -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
@@ -322,6 +356,35 @@ mod tests {
 
     fn route(prefix: &str) -> Route<Ipv4Addr> {
         RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::new()).build()
+    }
+
+    fn route_with_nh(prefix: &str, nh: &str) -> Route<Ipv4Addr> {
+        RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(nh.parse().unwrap()))
+            .build()
+    }
+
+    /// Oracle whose reachability verdict can be toggled during a test.
+    struct ToggleOracle(Cell<bool>);
+
+    impl ToggleOracle {
+        fn reachable() -> Self {
+            Self(Cell::new(true))
+        }
+
+        fn set(&self, reachable: bool) {
+            self.0.set(reachable);
+        }
+    }
+
+    impl NextHopOracle for ToggleOracle {
+        fn is_reachable(&self, _: &NextHop) -> bool {
+            self.0.get()
+        }
+
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+            None
+        }
     }
 
     #[test]
@@ -623,5 +686,170 @@ mod tests {
         let changes = rib.withdraw_peer(&peer(1), &AlwaysReachable);
         assert_eq!(changes.len(), 1);
         assert!(matches!(changes[0], BestPathChange::Announced(_, _)));
+    }
+
+    // ── recompute_all ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_recompute_all_empty_rib_returns_nothing() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        assert!(rib.recompute_all(&AlwaysReachable).is_empty());
+    }
+
+    #[test]
+    fn test_recompute_all_no_change_returns_nothing() {
+        // Oracle says reachable before and after — no change.
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let oracle = ToggleOracle::reachable();
+        rib.insert(peer(1), route_with_nh("10.0.0.0/8", "192.0.2.1"), &oracle);
+        let changes = rib.recompute_all(&oracle);
+        assert!(
+            changes.is_empty(),
+            "no FIB change expected when reachability is stable"
+        );
+    }
+
+    #[test]
+    fn test_recompute_all_next_hop_goes_down_withdraws_prefix() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let oracle = ToggleOracle::reachable();
+        rib.insert(peer(1), route_with_nh("10.0.0.0/8", "192.0.2.1"), &oracle);
+        assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
+
+        oracle.set(false); // next-hop goes down
+        let changes = rib.recompute_all(&oracle);
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(changes[0], BestPathChange::Withdrawn(n) if n == nlri("10.0.0.0/8")),
+            "prefix must be withdrawn when the only candidate's next-hop is unreachable"
+        );
+        assert!(rib.best(&nlri("10.0.0.0/8")).is_none());
+    }
+
+    #[test]
+    fn test_recompute_all_next_hop_recovers_announces_prefix() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let oracle = ToggleOracle::reachable();
+        oracle.set(false); // insert while unreachable — no best selected
+        rib.insert(peer(1), route_with_nh("10.0.0.0/8", "192.0.2.1"), &oracle);
+        assert!(rib.best(&nlri("10.0.0.0/8")).is_none());
+
+        oracle.set(true); // next-hop recovers
+        let changes = rib.recompute_all(&oracle);
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(changes[0], BestPathChange::Announced(n, _) if n == nlri("10.0.0.0/8")),
+            "prefix must be announced when the candidate's next-hop becomes reachable"
+        );
+        assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
+    }
+
+    #[test]
+    fn test_recompute_all_only_returns_changed_prefixes() {
+        // Three prefixes; only the one whose next-hop changes should appear.
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", "192.0.2.1"),
+            &AlwaysReachable,
+        );
+        rib.insert(
+            peer(1),
+            route_with_nh("172.16.0.0/12", "192.0.2.1"),
+            &AlwaysReachable,
+        );
+        rib.insert(
+            peer(1),
+            route_with_nh("192.168.0.0/16", "192.0.2.1"),
+            &AlwaysReachable,
+        );
+
+        // NeverReachable oracle makes all three drop — but we only inserted two
+        // in the stable state, so let's verify the count.
+        struct NeverReachable;
+        impl NextHopOracle for NeverReachable {
+            fn is_reachable(&self, _: &NextHop) -> bool {
+                false
+            }
+            fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+                None
+            }
+        }
+
+        let changes = rib.recompute_all(&NeverReachable);
+        assert_eq!(changes.len(), 3, "all three prefixes must be withdrawn");
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, BestPathChange::Withdrawn(_)))
+        );
+    }
+
+    #[test]
+    fn test_recompute_all_alternate_candidate_promoted_on_reachability_change() {
+        // peer(1) has higher LOCAL_PREF but unreachable next-hop.
+        // peer(2) has lower LOCAL_PREF but reachable next-hop.
+        // Initially peer(1) wins (oracle says all reachable).
+        // After oracle flips peer(1)'s next-hop unreachable, peer(2) should win.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SelectiveOracle {
+            block: AtomicBool,
+            blocked_nh: Ipv4Addr,
+        }
+        impl SelectiveOracle {
+            fn new(blocked_nh: Ipv4Addr) -> Self {
+                Self {
+                    block: AtomicBool::new(false),
+                    blocked_nh,
+                }
+            }
+            fn block(&self) {
+                self.block.store(true, Ordering::Relaxed);
+            }
+        }
+        impl NextHopOracle for SelectiveOracle {
+            fn is_reachable(&self, nh: &NextHop) -> bool {
+                if self.block.load(Ordering::Relaxed) {
+                    if let NextHop::V4(a) = nh {
+                        return *a != self.blocked_nh;
+                    }
+                }
+                true
+            }
+            fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+                None
+            }
+        }
+
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let oracle = SelectiveOracle::new("192.0.2.1".parse().unwrap());
+
+        // peer(1): LP=200, next-hop 192.0.2.1 (will be blocked)
+        let r1 = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(200))
+            .next_hop(NextHop::V4("192.0.2.1".parse().unwrap()))
+            .build();
+        // peer(2): LP=100, next-hop 192.0.2.2 (always reachable)
+        let r2 = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .next_hop(NextHop::V4("192.0.2.2".parse().unwrap()))
+            .build();
+
+        rib.insert(peer(1), r1, &oracle);
+        rib.insert(peer(2), r2, &oracle);
+        assert_eq!(rib.best_peer(&nlri("10.0.0.0/8")), Some(peer(1)));
+
+        oracle.block();
+        let changes = rib.recompute_all(&oracle);
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], BestPathChange::Announced(n, _) if *n == nlri("10.0.0.0/8")),
+            "best-path change expected when winner's next-hop goes down and runner-up is reachable"
+        );
+        assert_eq!(rib.best_peer(&nlri("10.0.0.0/8")), Some(peer(2)));
     }
 }
