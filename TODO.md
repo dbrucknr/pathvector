@@ -214,6 +214,68 @@ Real implementations offer:
 
 ---
 
+## RFC 4271 Correctness Audit — Findings (2026-06-15)
+
+Findings from a systematic audit of the codebase against RFC 4271. Items are
+ordered by severity. High items should be fixed before deploying in any real
+environment.
+
+### High — MUST violations
+
+**A. AS_PATH loop detection missing** (`pathvectord/src/daemon.rs`, `handle_update`)
+
+RFC 4271 §9.1.2 and §6.1.4: if the local AS appears in the AS_PATH of a
+received UPDATE, the route MUST be silently ignored. Currently the AS_PATH is
+extracted but never checked against `local_as`. Routes containing our own AS
+are accepted, inserted into the Loc-RIB, and re-advertised — forming a routing
+loop. Fix: after extracting `as_path` in `handle_update`, check
+`as_path.contains_asn(local_as)` and skip the route if true.
+
+**B. Mandatory attribute presence not checked** (`pathvectord/src/daemon.rs`, `handle_update`)
+
+RFC 4271 §5 and §6.3: IPv4 unicast UPDATE announcements MUST include ORIGIN,
+AS_PATH, and NEXT_HOP. Currently missing attributes are silently substituted
+with defaults (`Origin::Incomplete`, empty `AsPath`, `None` next-hop). A well-
+behaved peer will always send these, but a buggy or malicious peer can omit
+them and the route will be accepted. Fix: after processing all attributes,
+check that any UPDATE with announced NLRIs has all three; send NOTIFICATION
+error code 3 (Update Message Error) subcode 3 (Missing Well-known Attribute)
+and close the session if any are absent.
+
+### Medium — correctness gaps, lower exploitability
+
+**C. NEXT_HOP not validated** (`pathvectord/src/daemon.rs`, `handle_update`)
+
+RFC 4271 §5.1.3 and §9.1.2: NEXT_HOP must be a valid unicast address, must not
+be 0.0.0.0, multicast (224.0.0.0/4), broadcast (255.255.255.255), or the
+receiving router's own address. Currently extracted and stored without any
+checks. Sending NEXT_HOP equal to the receiver's own address causes traffic to
+be black-holed. Fix: validate in `handle_update` after extracting `next_hop`;
+treat violations as policy rejection (silently skip) or TreatAsWithdraw.
+
+**D. BGP Identifier multicast not rejected** (`pathvector-session/src/fsm/mod.rs`, ~line 607)
+
+RFC 4271 §6.2: BGP Identifier must be a valid unicast IPv4 address. Currently
+only 0.0.0.0 is rejected; multicast (224.0.0.0/4) and broadcast
+(255.255.255.255) are accepted. Fix: add `!bgp_id.is_multicast()` and
+`bgp_id != Ipv4Addr::BROADCAST` to the existing BGP ID validation block.
+
+**E. RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641)
+
+RFC 7606 §1 states the speaker SHOULD send NOTIFICATION for well-known
+mandatory attribute errors. Current implementation applies TreatAsWithdraw
+silently without notifying the peer. Low priority given RFC 7606 makes this a
+SHOULD, but worth documenting as a known deviation.
+
+### Test coverage gaps added by audit
+
+- No test for UPDATE containing our own AS in AS_PATH
+- No test for UPDATE announcing NLRIs without ORIGIN / AS_PATH / NEXT_HOP
+- No test for NEXT_HOP = 0.0.0.0, multicast, broadcast, or own address
+- No test for BGP ID = multicast or broadcast
+
+---
+
 ## pathvector-session
 
 ### Remaining
