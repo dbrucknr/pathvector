@@ -45,8 +45,17 @@ impl NextHopOracle for DaemonOracle {
     fn is_reachable(&self, next_hop: &NextHop) -> bool {
         match next_hop {
             NextHop::V4(addr) => self.0.is_v4_reachable(*addr),
-            NextHop::V6(addr) | NextHop::V6WithLinkLocal { global: addr, .. } => {
-                self.0.is_v6_reachable(*addr)
+            NextHop::V6(addr) => self.0.is_v6_reachable(*addr),
+            NextHop::V6WithLinkLocal { global, link_local } => {
+                // RFC 4760 §3: when the global address is unspecified (::) the
+                // speaker has no global IPv6 address and the link-local is the
+                // only reachable next-hop (common for eBGP over IPv4 TCP).
+                // Check the link-local against the FIB in that case.
+                if global.is_unspecified() {
+                    self.0.is_v6_reachable(*link_local)
+                } else {
+                    self.0.is_v6_reachable(*global)
+                }
             }
         }
     }
@@ -54,8 +63,13 @@ impl NextHopOracle for DaemonOracle {
     fn igp_metric(&self, next_hop: &NextHop) -> Option<u32> {
         match next_hop {
             NextHop::V4(addr) => self.0.igp_metric_v4(*addr),
-            NextHop::V6(addr) | NextHop::V6WithLinkLocal { global: addr, .. } => {
-                self.0.igp_metric_v6(*addr)
+            NextHop::V6(addr) => self.0.igp_metric_v6(*addr),
+            NextHop::V6WithLinkLocal { global, link_local } => {
+                if global.is_unspecified() {
+                    self.0.igp_metric_v6(*link_local)
+                } else {
+                    self.0.igp_metric_v6(*global)
+                }
             }
         }
     }

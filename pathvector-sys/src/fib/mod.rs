@@ -89,6 +89,15 @@ pub struct FibEntry4 {
     pub metric: u32,
 }
 
+/// Returns `true` if `addr` is a link-local IPv6 address (fe80::/10).
+///
+/// Link-local addresses are always on-link and are not stored in the main
+/// routing table, so they must be handled explicitly rather than via LPM.
+fn is_link_local_v6(addr: Ipv6Addr) -> bool {
+    let o = addr.octets();
+    o[0] == 0xfe && (o[1] & 0xc0) == 0x80
+}
+
 /// IPv6 equivalent of [`FibEntry4`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FibEntry6 {
@@ -131,8 +140,15 @@ impl FibSnapshot {
     }
 
     /// Returns `true` if `addr` is covered by any IPv6 route in the snapshot.
+    ///
+    /// Link-local addresses (fe80::/10) are always considered reachable —
+    /// they are on-link by definition and do not appear in the main routing
+    /// table, so LPM would incorrectly return false for them.
     #[must_use]
     pub fn is_v6_reachable(&self, addr: Ipv6Addr) -> bool {
+        if is_link_local_v6(addr) {
+            return true;
+        }
         self.lpm_v6(addr).is_some()
     }
 
