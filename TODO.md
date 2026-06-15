@@ -172,13 +172,6 @@ plus loop-detection to prevent infinite recursion. Explicitly not implemented; t
 current design excludes BGP routes from `FibSnapshot` for correctness (no feedback loop,
 semantic separation of IGP and BGP RIBs).
 
-**2. `DaemonOracle` not wired into best-path selection** (`pathvector-rib`,
-`pathvectord`) — `LocRib::recompute_best` calls `select_best` (→ `AlwaysReachable`)
-rather than `select_best_with_oracle`. RFC 4271 §9.1 steps 1 and 8 remain dead
-code at runtime. Fix: add `oracle: &dyn NextHopOracle` to `LocRib` construction
-or to `recompute_best`; thread `DaemonOracle` in from `run_with`. This is the
-architecturally deepest remaining gap.
-
 **Testing gaps:**
 
 - E2e test (Gap 8): after session with GoBGP establishes and a prefix is learned,

@@ -6,6 +6,15 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-06-15
 
+### [pathvector-rib, pathvectord] DaemonOracle wired into best-path selection (Gap 2)
+`DaemonOracle` (wrapping `KernelOracle` → live `FibSnapshot`) is now the oracle used for
+all LocRib operations. `DaemonState` holds `oracle_v4/v6: Arc<dyn NextHopOracle + Send + Sync>`,
+initialized to `AlwaysReachable` and replaced by `set_oracles()` in `run_with()` before the
+event loop starts. All LocRib methods (`insert`, `withdraw`, `withdraw_peer`, `recompute_all`)
+receive `Arc::clone(&self.oracle_v4/v6)`. `select_best_with_oracle` filters unreachable
+next-hops (step 1) and uses `igp_metric` for the step-8 tiebreaker. RFC 4271 §9.1 steps 1
+and 8 are fully live at runtime.
+
 ### [pathvector-sys, pathvectord] Stale BGP route cleanup on restart (Gap 4)
 `KernelFib::stale_bgp_routes()` dumps all `RTPROT_BGP` routes from the kernel table at daemon
 startup. `withdraw_stale_bgp_routes` (extracted `pub(crate) async fn` in `daemon.rs`) iterates
