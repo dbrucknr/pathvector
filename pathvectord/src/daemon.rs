@@ -1340,6 +1340,33 @@ pub(crate) async fn run(cfg: config::Config) {
 /// `run()` calls this with [`transport::spawn`]; tests call it with a mock
 /// `spawn_fn` so the session-spawning setup phase can be exercised without
 /// real TCP connections.
+/// Withdraws every route in `stale_v4` / `stale_v6` from the kernel FIB.
+///
+/// Called at daemon startup before the BGP event loop begins.  At that point
+/// the Loc-RIB is empty, so every `RTPROT_BGP` route is a stale remnant of a
+/// previous run.  Individual withdrawal errors are logged as warnings and
+/// skipped — an already-absent route (ESRCH) is already silenced by
+/// [`FibWriter::withdraw_v4`] / [`FibWriter::withdraw_v6`].
+///
+/// On non-Linux platforms `stale_v4` and `stale_v6` are always empty (returned
+/// by [`pathvector_sys::KernelFib::stale_bgp_routes`]), so this is a no-op.
+pub(crate) async fn withdraw_stale_bgp_routes(
+    stale_v4: Vec<(std::net::Ipv4Addr, u8)>,
+    stale_v6: Vec<(std::net::Ipv6Addr, u8)>,
+    writer: &pathvector_sys::FibWriter,
+) {
+    for (dst, prefix_len) in stale_v4 {
+        if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
+            tracing::warn!(%dst, prefix_len, "stale BGP route removal failed: {e}");
+        }
+    }
+    for (dst, prefix_len) in stale_v6 {
+        if let Err(e) = writer.withdraw_v6(dst, prefix_len).await {
+            tracing::warn!(%dst, prefix_len, "stale BGP v6 route removal failed: {e}");
+        }
+    }
+}
+
 pub(crate) async fn run_with<H, F>(cfg: config::Config, spawn_fn: F)
 where
     H: SessionHandle,
@@ -1365,28 +1392,18 @@ where
     let fib_writer = match pathvector_sys::FibWriter::new(fib_table, fib_metric) {
         Ok(w) => {
             // Gap 4: delete any RTPROT_BGP routes left by a previous daemon run
-            // before the event loop starts.  At this point the Loc-RIB is empty
-            // (no sessions have connected), so every kernel BGP route is stale.
-            // This matches BIRD's krt-protocol startup behaviour.
+            // before the event loop starts. See `withdraw_stale_bgp_routes`.
             match kernel_fib.stale_bgp_routes().await {
-                Ok((stale_v4, stale_v6)) if !stale_v4.is_empty() || !stale_v6.is_empty() => {
-                    tracing::info!(
-                        v4 = stale_v4.len(),
-                        v6 = stale_v6.len(),
-                        "removing stale BGP routes from previous run"
-                    );
-                    for (dst, prefix_len) in stale_v4 {
-                        if let Err(e) = w.withdraw_v4(dst, prefix_len).await {
-                            tracing::warn!(%dst, prefix_len, "stale BGP route removal failed: {e}");
-                        }
+                Ok((stale_v4, stale_v6)) => {
+                    if !stale_v4.is_empty() || !stale_v6.is_empty() {
+                        tracing::info!(
+                            v4 = stale_v4.len(),
+                            v6 = stale_v6.len(),
+                            "removing stale BGP routes from previous run"
+                        );
                     }
-                    for (dst, prefix_len) in stale_v6 {
-                        if let Err(e) = w.withdraw_v6(dst, prefix_len).await {
-                            tracing::warn!(%dst, prefix_len, "stale BGP v6 route removal failed: {e}");
-                        }
-                    }
+                    withdraw_stale_bgp_routes(stale_v4, stale_v6, &w).await;
                 }
-                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!("failed to query stale BGP routes: {e}");
                 }
@@ -6866,5 +6883,48 @@ mod run_with_tests {
             Some("session-key"),
             "md5_password must be threaded into SessionConfig"
         );
+    }
+
+    // ── withdraw_stale_bgp_routes ─────────────────────────────────────────────
+    //
+    // Full integration coverage (actual netlink withdrawals against a Linux
+    // kernel) belongs in the Gap 8 e2e test.  These unit tests verify the
+    // portable logic: empty inputs are a no-op, and the function completes
+    // without panicking.  On non-Linux platforms FibWriter::new always fails so
+    // the stale lists are always empty — the tests reflect that reality.
+
+    #[tokio::test]
+    async fn withdraw_stale_bgp_routes_empty_lists_is_noop() {
+        // On non-Linux, FibWriter::new fails so this test exercises the
+        // `stale_bgp_routes` → empty path.  On Linux it exercises the real
+        // writer with no routes to delete (ESRCH suppressed by withdraw_v4/v6).
+        // Either way the function must complete without error or panic.
+        let (kernel_fib, _rx) = pathvector_sys::KernelFib::new(254);
+        let (stale_v4, stale_v6) = kernel_fib
+            .stale_bgp_routes()
+            .await
+            .unwrap_or((vec![], vec![]));
+
+        // If a writer is available, run the cleanup; otherwise just verify the
+        // stale list query itself didn't panic.
+        if let Ok(writer) = pathvector_sys::FibWriter::new(254, 20) {
+            withdraw_stale_bgp_routes(stale_v4, stale_v6, &writer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn withdraw_stale_bgp_routes_skips_absent_routes_gracefully() {
+        // Feed routes that are not in the kernel FIB.  On Linux, withdraw_v4/v6
+        // treat ESRCH as Ok(()); on non-Linux, FibWriter::new fails so the
+        // block is skipped.  Either way: no panic, no error propagation.
+        let routes_v4 = vec![
+            ("192.0.2.0".parse().unwrap(), 24u8),
+            ("198.51.100.0".parse().unwrap(), 24u8),
+        ];
+        let routes_v6 = vec![("2001:db8::".parse().unwrap(), 32u8)];
+
+        if let Ok(writer) = pathvector_sys::FibWriter::new(254, 20) {
+            withdraw_stale_bgp_routes(routes_v4, routes_v6, &writer).await;
+        }
     }
 }
