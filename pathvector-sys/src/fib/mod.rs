@@ -33,11 +33,8 @@
 //!    another BGP route) is a distinct, explicitly opt-in feature not yet
 //!    implemented here.
 //!
-//! TODO: recursive next-hop resolution — allow BGP routes to serve as IGP
-//! paths when resolving other BGP next-hops (RFC 4271 §5.1.3 note; used in
-//! MPLS/VPN and some overlay topologies).  Requires a second snapshot layer
-//! or a recursive lookup pass in `KernelOracle::is_reachable` that consults
-//! the BGP Loc-RIB, plus loop-detection to prevent infinite recursion.
+//! Recursive next-hop resolution (tracked in TODO.md) is explicitly not
+//! implemented — see TODO.md § "Recursive next-hop resolution".
 //!
 //! # Platform behaviour
 //!

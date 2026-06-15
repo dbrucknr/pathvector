@@ -162,7 +162,15 @@ enable (`maximum-paths` knob).
 
 ### FIB integration (Netlink / kernel route installation) — remaining gaps
 
-**Remaining gap:**
+**Remaining gaps:**
+
+**Recursive next-hop resolution** (`pathvector-sys`, `pathvector-rib`) — allow BGP
+routes to serve as IGP paths when resolving other BGP next-hops (RFC 4271 §5.1.3 note;
+used in MPLS/VPN and some overlay topologies). Requires a second snapshot layer or a
+recursive lookup pass in `KernelOracle::is_reachable` that consults the BGP Loc-RIB,
+plus loop-detection to prevent infinite recursion. Explicitly not implemented; the
+current design excludes BGP routes from `FibSnapshot` for correctness (no feedback loop,
+semantic separation of IGP and BGP RIBs).
 
 **2. `DaemonOracle` not wired into best-path selection** (`pathvector-rib`,
 `pathvectord`) — `LocRib::recompute_best` calls `select_best` (→ `AlwaysReachable`)
