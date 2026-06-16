@@ -4,6 +4,97 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-16
+
+### [pathvectord] RFC 4271 correctness audit — fixes (A, B, H, J)
+
+**A — AS_PATH loop detection** (`pathvectord/src/daemon.rs`)
+`handle_update` checks `as_path.contains(local_as)` and silently drops announcements
+(not withdrawals), matching RFC 4271 §6.3 SHOULD. Tests: `test_as_path_loop_detection_*` (4 tests).
+
+**B — Mandatory attribute presence** (`pathvectord/src/daemon.rs`)
+`handle_update` now detects absent ORIGIN/AS_PATH/NEXT_HOP and returns a `NotificationMessage`
+with `error = UpdateMessage(MissingWellKnownAttribute)` and `data = [attr_type]` (RFC 4271
+§6.3 MUST). The full message is threaded through the event loop →
+`SessionCommand::Notification` → FSM → wire. Tests: `missing_origin_returns_notification_*`,
+`missing_as_path_returns_notification_*`, `missing_next_hop_*`,
+`withdraw_only_update_no_notification_for_missing_attrs`,
+`all_mandatory_attributes_present_no_notification`,
+`malformed_update_missing_origin_sends_notification_to_session`.
+
+**H — MRAI** (`pathvectord/src/daemon.rs`)
+eBGP MRAI (30 s window) implemented via per-NLRI per-peer `mrai_last_sent` / `mrai_pending`
+maps in `DaemonState`. Suppression converts `PrefixDecision::Announce` → `NoChange` after
+`propagate_prefix` updates AdjRibOut (RIB is always correct; only wire transmission is
+deferred). A half-MRAI flush timer calls `flush_mrai_pending` on elapsed NLRIs using
+`partition()` — avoids the `max()` bug. Tests: `mrai_suppresses_ebgp_announcement_within_window`,
+`mrai_passes_after_window_elapsed`, `has_mrai_pending_*` (2), `flush_mrai_pending_clears_elapsed_pending`,
+`mrai_withdrawal_bypasses_suppression`. iBGP MRAI (RFC 4271 SHOULD ≥5 s) deferred.
+
+**J — AS_TRANS / AS4_PATH for 2-byte-only peers (RFC 6793)** (`pathvectord/src/outbound.rs`)
+`route_to_attributes` accepts `peer_four_byte: bool`. When `false`,
+`AsPath::downgrade_for_two_byte_peer()` substitutes 4-byte ASNs with AS_TRANS (23456) in the
+wire AS_PATH and appends AS4_PATH (type 17, flags 0xC0 optional+transitive) last per RFC 6793
+§4. Tests: `two_byte_asns_to_two_byte_peer_no_trans_no_as4_path`,
+`four_byte_asn_to_two_byte_peer_inserts_trans_and_as4_path`,
+`four_byte_asn_to_four_byte_peer_no_trans_no_as4_path`,
+`as4_path_is_last_attribute_for_two_byte_peer`,
+`all_four_byte_asns_to_two_byte_peer_full_trans_substitution`.
+
+### [pathvectord] RFC 4271 correctness audit — fixes (C, D, F, G, K)
+
+**C — NEXT_HOP validation** (`pathvectord/src/daemon.rs`)
+`is_valid_next_hop_v4` rejects 0.0.0.0, loopback, multicast (224.0.0.0/4), and broadcast.
+Own-address check deferred (FIB oracle reachability gates this anyway).
+Tests: `test_invalid_next_hop_*` (3) + `test_valid_next_hop_is_accepted`.
+
+**D — BGP Identifier validation** (`pathvector-session/src/fsm/mod.rs`)
+`validate_open` rejects loopback, multicast, and broadcast BGP IDs in addition to 0.0.0.0.
+Tests: `test_multicast_bgp_id_rejected`, `test_broadcast_bgp_id_rejected`.
+
+**F — ORIGINATOR_ID and CLUSTER_LIST stripping for eBGP** (`pathvectord/src/outbound.rs`)
+`route_to_attributes` strips both when `peer_type == External` (RFC 4456 §8 MUST).
+Tests: `test_route_to_attributes_ebgp_strips_originator_id_and_cluster_list`,
+`test_route_to_attributes_ibgp_preserves_rr_attributes`.
+
+**G — MED stripping for eBGP** (`pathvectord/src/outbound.rs`)
+`route_to_attributes` strips MED when `peer_type == External` (RFC 4271 §5.1.4 SHOULD NOT).
+Tests: `test_route_to_attributes_ebgp_strips_med`, `test_route_to_attributes_ibgp_preserves_med`.
+
+**K — IPv6 routes gated on Multi-Protocol capability** (`pathvectord/src/daemon.rs`)
+`on_established` gates IPv6 full-table dump and `propagate_to_all_peers_v6` on
+`peer_capabilities.contains(MultiProtocol(IPV6_UNICAST))`.
+Tests: `test_ipv6_route_not_propagated_to_non_ipv6_capable_peer`,
+`test_ipv6_full_table_dump_not_sent_to_non_ipv6_capable_peer`.
+
+**O — Panic/unwrap audit: clean pass**
+No crash vectors reachable from peer input, gRPC clients, or config files. All `expect()`
+calls in production code are true invariants protected by prior validation guards.
+
+### [cross-cutting] Test coverage expansion (98.0% workspace)
+
+Workspace unit test count increased from ~320 to 376. Key additions:
+- `pathvectord/src/fib.rs`: `FibWrite` trait + `MockFibWriter`, `FibManager::new()` spawn
+  loop, `DaemonOracle` V6WithLinkLocal branch, V6 error path via `failing_v6()`
+- `pathvectord/src/grpc.rs`: `route_v6_to_proto` V4/V6WithLinkLocal/aggregator branches,
+  `parse_nlri_v6` error, `originate_route_v6` Incomplete origin, peer-filter mismatch branches
+- `pathvectord/src/outbound.rs`: `propagate_prefix`/`_v6` split-horizon and iBGP filtered
+  paths, batch-overflow flush tests (fixed 1 000 → 1 500 NLRI threshold), `AtomicAggregate`
+  and `AS4_PATH` v6 attr tests
+- `pathvector-sys/src/fib/stub.rs`: UFCS tests for all four `FibWrite` trait impl bodies
+
+### [pathvectord] macOS interop fix — DaemonOracle gated on Linux
+
+`KernelFib` on macOS is a no-op stub with an always-empty `FibSnapshot`. Without this fix
+`DaemonOracle` marked every peer-learned next-hop unreachable, so `select_best_with_oracle`
+excluded all routes from `LocRib.best` — routes were accepted and counted but never selected,
+making them invisible in `pv route list` and the dashboard.
+
+Fix: gate oracle construction and `set_oracles()` on `#[cfg(target_os = "linux")]`. On
+non-Linux the default `AlwaysReachable` oracle remains in place. No behavioural change on Linux.
+
+---
+
 ## 2026-06-15
 
 ### [pathvector-rib, pathvectord] DaemonOracle wired into best-path selection (Gap 2)

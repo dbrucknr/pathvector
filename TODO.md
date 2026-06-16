@@ -90,6 +90,8 @@ integration rather than direct unit tests.
   harness or lightweight integration scaffolding to drive the event loop without real TCP.
 - `pathvector-sys/src/tcp.rs` (94.9%) — missed lines likely require real socket setup or
   Linux-only TCP MD5 paths; investigate whether mock sockets or platform-gated tests can close the gap.
+- No e2e test for AS_TRANS wire encoding against a real 2-byte-only peer (GoBGP `--as2` mode) — unit tests exist but no interop verification.
+- No IPv6 route receive/withdraw tests for BIRD and FRR peers — requires IPv6 variants of `write_bird_config` / `write_frr_config`, new `BirdHarness::new_v6()` / `FrrHarness::new_v6()` constructors, and `address-family ipv6` blocks in each speaker's config.
 - `pathvector-session/src/transport/mod.rs` (96.0%) — `SessionCommand::Notification` branch
   (~line 411) and TCP send failure path (~line 479) require a real or mock transport pair
   to drive the async session loop.
@@ -152,19 +154,21 @@ enable (`maximum-paths` knob).
 
 ### Route reflector — known gaps
 
-1. **ORIGINATOR_ID loop detection** — RFC 4456 §8 SHOULD: if received `ORIGINATOR_ID` equals
+1. **Split-horizon not applied during full-table dump** (`pathvectord/src/daemon.rs`, `on_established`) — when a new peer reaches Established, `on_established` sends the full Loc-RIB without applying RR non-client split-horizon. The check exists in `propagate_to_all_peers` for incremental updates but is absent from the initial dump. A non-client iBGP peer therefore receives routes learned from other non-client iBGP peers in its initial dump. Only affects deployments using route reflection. No test for this path yet.
+
+3. **ORIGINATOR_ID loop detection** — RFC 4456 §8 SHOULD: if received `ORIGINATOR_ID` equals
    our own `bgp_id`, discard the UPDATE. Currently only `CLUSTER_LIST` loop detection is
    implemented. Low priority (prevents mis-configured self-reflection).
 
-2. **CLUSTER_LIST loop detection scope** — The inbound loop check fires only for routes
+4. **CLUSTER_LIST loop detection scope** — The inbound loop check fires only for routes
    from RR clients. Routes from non-client iBGP peers that carry a `CLUSTER_LIST` (i.e.,
    already reflected by another RR) should also be loop-checked before entering our Loc-RIB.
 
-3. **eBGP routes not getting reflection attributes** — When an eBGP-learned route is
+5. **eBGP routes not getting reflection attributes** — When an eBGP-learned route is
    reflected to iBGP clients, it does not receive `ORIGINATOR_ID` / `CLUSTER_LIST`. RFC 4456
    §8 requires these on all reflected routes, including those learned from eBGP peers.
 
-4. **IPv6 AdjRibOut not RR-aware** — `on_established` and `on_terminated` reset IPv6
+6. **IPv6 AdjRibOut not RR-aware** — `on_established` and `on_terminated` reset IPv6
    `AdjRibOut` without calling `new_reflecting`. `propagate_to_all_peers_v6` has no
    RR split-horizon logic. IPv6 reflection requires the same changes applied to IPv4.
 
@@ -222,163 +226,11 @@ Real implementations offer:
 
 ---
 
-## RFC 4271 Correctness Audit — Findings (2026-06-15)
-
-Findings from a systematic audit of the codebase against RFC 4271. Items are
-ordered by severity. High items should be fixed before deploying in any real
-environment.
-
-### High — MUST violations
-
-✅ **A. AS_PATH loop detection** — Fixed 2026-06-15. `handle_update` checks
-`as_path.contains(local_as)` and silently drops announcements (not withdrawals).
-Regression tests: `test_as_path_loop_detection_*` (4 tests).
-
-✅ **B. Mandatory attribute presence not checked** — Fixed 2026-06-16.
-`handle_update` now detects absent ORIGIN/AS_PATH/NEXT_HOP and returns a
-`NotificationMessage` with `error = UpdateMessage(MissingWellKnownAttribute)` and
-`data = [attr_type]` (RFC 4271 §6.3 MUST). The full message is threaded through
-the event loop → `SessionCommand::Notification` → FSM → wire; the FSM no longer
-reconstructs an empty-data NOTIFICATION.
-Tests: `missing_origin_returns_notification_data_type_code_1`,
-`missing_as_path_returns_notification_data_type_code_2`,
-`missing_next_hop_for_traditional_ipv4_returns_notification_data_type_code_3`,
-`withdraw_only_update_no_notification_for_missing_attrs`,
-`all_mandatory_attributes_present_no_notification`,
-`malformed_update_missing_origin_sends_notification_to_session` (event loop integration).
-
-### Medium — correctness gaps, lower exploitability
-
-✅ **C. NEXT_HOP validation** — Partially fixed 2026-06-15. `is_valid_next_hop_v4`
-rejects 0.0.0.0, loopback, multicast (224.0.0.0/4), and broadcast. Regression
-tests: `test_invalid_next_hop_*` (3 tests) + `test_valid_next_hop_is_accepted`.
-Remaining: own-address check deferred (FIB oracle reachability gates this anyway).
-
-✅ **D. BGP Identifier multicast/broadcast not rejected** — Fixed 2026-06-15.
-`validate_open` now rejects loopback, multicast, and broadcast BGP IDs in addition
-to 0.0.0.0. Regression tests: `test_multicast_bgp_id_rejected`,
-`test_broadcast_bgp_id_rejected`.
-
-**E. RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641)
-
-RFC 7606 §1 states the speaker SHOULD send NOTIFICATION for well-known
-mandatory attribute errors. Current implementation applies TreatAsWithdraw
-silently without notifying the peer. Low priority given RFC 7606 makes this a
-SHOULD, but worth documenting as a known deviation.
-
-### High — outbound attribute violations
-
-✅ **F. ORIGINATOR_ID and CLUSTER_LIST not stripped for eBGP peers** — Fixed
-2026-06-15. `route_to_attributes` strips both when `peer_type == External`.
-Regression tests: `test_route_to_attributes_ebgp_strips_originator_id_and_cluster_list`,
-`test_route_to_attributes_ibgp_preserves_rr_attributes`.
-
-### Medium — SHOULD violations and behavioral gaps
-
-✅ **G. MED not stripped for eBGP peers** — Fixed 2026-06-15. `route_to_attributes`
-strips MED when `peer_type == External`. Regression tests:
-`test_route_to_attributes_ebgp_strips_med`, `test_route_to_attributes_ibgp_preserves_med`.
-
-✅ **H. MRAI not implemented** — Fixed 2026-06-16.
-eBGP MRAI (30 s window) implemented via per-NLRI per-peer `mrai_last_sent` /
-`mrai_pending` maps in `DaemonState`. Suppression converts `PrefixDecision::Announce`
-→ `NoChange` after `propagate_prefix` updates AdjRibOut (so the RIB is correct; only
-wire transmission is deferred). A half-MRAI flush timer calls `flush_mrai_pending` on
-elapsed NLRIs using `partition()` — avoids the `max()` bug where a recently-sent
-non-pending NLRI could mask a ready pending NLRI.
-Tests: `mrai_suppresses_ebgp_announcement_within_window`,
-`mrai_passes_after_window_elapsed`, `has_mrai_pending_*` (2 tests),
-`flush_mrai_pending_clears_elapsed_pending`, `mrai_withdrawal_bypasses_suppression`.
-Remaining: iBGP MRAI (RFC 4271 SHOULD ≥5 s) not implemented; deferred.
-
-**I. Route Reflector split-horizon not applied during full-table dump** (`pathvectord/src/daemon.rs`, `on_established`)
-
-When a new peer reaches Established, `on_established` sends the full Loc-RIB
-without applying RR non-client split-horizon. The check exists in
-`propagate_to_all_peers` for incremental updates but is absent from the initial
-dump path. A non-client iBGP peer establishing a session receives routes learned
-from other non-client iBGP peers in its initial dump, violating RR split-horizon.
-Only affects deployments using route reflection.
-
-### High — capability negotiation violations
-
-✅ **J. AS_TRANS / AS4_PATH not generated for 2-byte-only peers (RFC 6793)** — Fixed 2026-06-16.
-`route_to_attributes` in `pathvectord/src/outbound.rs` now accepts `peer_four_byte: bool`.
-When `false`, `AsPath::downgrade_for_two_byte_peer()` substitutes 4-byte ASNs with
-AS_TRANS (23456) in the wire AS_PATH and returns the original path as AS4_PATH (type 17,
-flags 0xC0 optional+transitive), appended last per RFC 6793 §4. The `peer_four_byte` flag
-is derived from `peer_capabilities.contains(FourByteAsn)` in `propagate_to_all_peers`.
-Tests: `two_byte_asns_to_two_byte_peer_no_trans_no_as4_path`,
-`four_byte_asn_to_two_byte_peer_inserts_trans_and_as4_path`,
-`four_byte_asn_to_four_byte_peer_no_trans_no_as4_path`,
-`as4_path_is_last_attribute_for_two_byte_peer`,
-`all_four_byte_asns_to_two_byte_peer_full_trans_substitution`.
-Remaining gap: no e2e test against a real 2-byte-only peer (GoBGP `--as2` mode).
-Inbound AS4_PATH merging (RFC 6793 §4.2.3) in `pathvector-session` is still ⚠️ partial.
-
-✅ **K. IPv6 routes advertised to non-IPv6-capable peers** — Fixed 2026-06-15.
-`on_established` now gates IPv6 full-table dump and `propagate_to_all_peers_v6`
-on `peer_capabilities.contains(MultiProtocol(IPV6_UNICAST))`. Regression tests:
-`test_ipv6_route_not_propagated_to_non_ipv6_capable_peer`,
-`test_ipv6_full_table_dump_not_sent_to_non_ipv6_capable_peer`.
-
-### Medium — API and behavioral gaps
-
-**L. AS 0 not rejected in gRPC originate/peer handlers** (`pathvectord/src/grpc.rs`)
-
-RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or be used as a peer ASN.
-The gRPC handlers accept AS 0 (and other reserved values) without validation.
-Fix: add a guard in `originate_route` and peer-configuration handlers rejecting
-AS 0 with `Status::invalid_argument`.
-
-**M. Duplicate `originate_route` silently overwrites without documentation** (`pathvectord/src/grpc.rs`, `daemon.rs`)
-
-Calling `originate_route` twice for the same prefix silently replaces the first
-entry via `HashMap::insert`. This is reasonable behavior but is undocumented in
-the API, has no test coverage, and returns `Ok` both times with no indication
-that the first route was replaced. Add a test and document the upsert semantics
-in the gRPC proto comments.
-
-### Low — design notes and deferred features
-
-**N. ROUTE-REFRESH receipt does not re-advertise table** (`pathvector-session/src/fsm/mod.rs`)
-
-The FSM correctly gates ROUTE-REFRESH reception on capability negotiation, but
-receiving the message is a no-op — the daemon does not re-send its full table.
-This is an acknowledged incomplete feature. Outbound ROUTE-REFRESH triggering
-is also deferred (listed separately under `pathvector-session` remaining items).
-
-**O. Panic/unwrap audit: clean pass**
-
-No crash vectors reachable from peer input, gRPC clients, or config files.
-All `expect()` calls in production code are true invariants protected by prior
-validation guards. RwLock poison `expect()` calls are low-risk (only reachable
-if internal code panics while holding the lock). No action needed.
-
-### Test coverage gaps added by audit
-
-✅ No test for UPDATE containing our own AS in AS_PATH — Fixed 2026-06-15 (`test_as_path_loop_detection_*`)
-✅ No test for UPDATE announcing NLRIs without ORIGIN / AS_PATH / NEXT_HOP — Fixed 2026-06-16 (`missing_origin_*`, `missing_as_path_*`, `missing_next_hop_*`)
-✅ No test for NEXT_HOP = 0.0.0.0, multicast, broadcast, or own address — Fixed 2026-06-15 (`test_invalid_next_hop_*`)
-✅ No test for BGP ID = multicast or broadcast — Fixed 2026-06-15 (`test_multicast_bgp_id_rejected`, `test_broadcast_bgp_id_rejected`)
-✅ No test for ORIGINATOR_ID / CLUSTER_LIST present in eBGP outbound UPDATE — Fixed 2026-06-15 (`test_route_to_attributes_ebgp_strips_originator_id_and_cluster_list`)
-✅ No test for MED present in eBGP outbound UPDATE — Fixed 2026-06-15 (`test_route_to_attributes_ebgp_strips_med`)
-✅ No test for AS_PATH encoding to a 2-byte-only peer (AS_TRANS / AS4_PATH) — Fixed 2026-06-16 (`outbound::route_to_attributes_tests::*`, 5 tests)
-✅ No test for IPv6 routes gated on peer Multi-Protocol capability — Fixed 2026-06-15 (`test_ipv6_route_not_propagated_to_non_ipv6_capable_peer`)
-- No test for RR split-horizon applied during full-table dump — open (Finding I)
-- No IPv6 route receive/withdraw tests for BIRD and FRR peers — open; requires IPv6
-  variants of `write_bird_config` / `write_frr_config`, new `BirdHarness::new_v6()`
-  / `FrrHarness::new_v6()` constructors, and `address-family ipv6` blocks in each
-  speaker's BGP config.
-- No test for duplicate originate_route behavior — open (Finding M)
-- No e2e test for AS_TRANS wire encoding against a real 2-byte-only peer (GoBGP `--as2` mode) — open
-
----
-
 ## pathvector-session
 
 ### Remaining
 
+- **RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641) — RFC 7606 §1 states the speaker SHOULD send NOTIFICATION for well-known mandatory attribute errors. Current implementation applies TreatAsWithdraw silently without notifying the peer. Low priority (SHOULD, not MUST), but a known deviation.
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 - NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during the GR window without tearing down the restart; extends RFC 4724; depends on Graceful Restart FSM
@@ -404,6 +256,10 @@ Not yet started. Key work items:
 ## pathvectord
 
 ### Remaining
+
+- **AS 0 not rejected in gRPC originate/peer handlers** (`pathvectord/src/grpc.rs`) — RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or be used as a peer ASN. The gRPC handlers accept AS 0 without validation. Fix: add a guard in `originate_route` and peer-configuration handlers rejecting AS 0 with `Status::invalid_argument`.
+
+- **Duplicate `originate_route` silently overwrites** (`pathvectord/src/grpc.rs`, `daemon.rs`) — calling `originate_route` twice for the same prefix silently replaces the first entry via `HashMap::insert`. Reasonable behavior but undocumented in the API and has no test coverage. Add a test and document the upsert semantics in the proto comments.
 
 - **Dynamic peer reconfiguration (runtime config)** — the daemon reads its
   configuration once at startup; adding, removing, or modifying a peer requires
