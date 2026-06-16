@@ -452,6 +452,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_v6_with_link_local_uses_global_as_gateway() {
+        let fm = make_fm();
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6WithLinkLocal { global, link_local })
+            .build();
+        fm.apply_v6(BestPathChange::Announced(nlri6("2001:db8::/32"), route));
+        let snap = fm.pending_v6_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri6("2001:db8::/32")],
+            PendingV6::Install { gateway: global },
+            "V6WithLinkLocal must use the global address as the kernel gateway"
+        );
+    }
+
+    #[test]
+    fn test_apply_v6_non_v6_next_hop_skipped() {
+        let fm = make_fm();
+        // A route with a V4 next-hop applied to apply_v6 should be silently dropped.
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(192, 0, 2, 1)))
+            .build();
+        fm.apply_v6(BestPathChange::Announced(nlri6("2001:db8::/32"), route));
+        assert!(
+            fm.pending_v6_snapshot().is_empty(),
+            "V4 next-hop on a V6 change must be silently skipped"
+        );
+    }
+
+    #[test]
+    fn test_apply_v6_no_next_hop_skipped() {
+        let fm = make_fm();
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new()).build();
+        fm.apply_v6(BestPathChange::Announced(nlri6("2001:db8::/32"), route));
+        assert!(fm.pending_v6_snapshot().is_empty());
+    }
+
     // ── DaemonOracle ─────────────────────────────────────────────────────────
 
     #[test]
@@ -492,6 +532,37 @@ mod tests {
             link_local: "fe80::1".parse().unwrap(),
         };
         assert!(oracle.is_reachable(&nh));
+    }
+
+    #[test]
+    fn test_daemon_oracle_igp_metric_v6_with_link_local_no_metric_when_both_miss() {
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        let nh = NextHop::V6WithLinkLocal {
+            global: "2001:db8::1".parse().unwrap(),
+            link_local: "2001:db8::2".parse().unwrap(),
+        };
+        assert!(
+            oracle.igp_metric(&nh).is_none(),
+            "no route in FIB means no IGP metric for V6WithLinkLocal"
+        );
+    }
+
+    #[test]
+    fn test_daemon_oracle_igp_metric_v6_with_link_local_unspecified_global_checks_link_local() {
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        // global=:: (unspecified) forces the code to skip the global branch
+        // and look up the link-local. Neither is in the empty FIB, so None.
+        let nh = NextHop::V6WithLinkLocal {
+            global: Ipv6Addr::UNSPECIFIED,
+            link_local: "fe80::1".parse().unwrap(),
+        };
+        assert!(oracle.igp_metric(&nh).is_none());
     }
 
     #[test]

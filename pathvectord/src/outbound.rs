@@ -1063,7 +1063,7 @@ mod prop_tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use pathvector_rib::RouteBuilder;
-    use pathvector_session::message::{BgpMessage, MAX_LEN};
+    use pathvector_session::message::{BgpMessage, MAX_LEN, PathAttribute, Prefix};
     use pathvector_types::{AsPath, NextHop, Nlri, Origin, PeerType};
     use proptest::prelude::*;
     use tokio::sync::mpsc;
@@ -1219,6 +1219,78 @@ mod prop_tests {
                     prop_assert!(wire.len() <= MAX_LEN,
                         "encoded IPv6 UPDATE {} bytes > MAX_LEN {}", wire.len(), MAX_LEN);
                 }
+                Ok(())
+            })?;
+        }
+
+        /// Every IPv6 Announce decision appears in exactly one outbound MP_REACH UPDATE.
+        #[test]
+        fn prop_flush_updates_v6_all_announces_sent(
+            decisions in proptest::collection::vec(arb_decision_v6(), 0..=100),
+        ) {
+            let expected: Vec<Nlri<Ipv6Addr>> = decisions.iter()
+                .filter_map(|d| if let PrefixDecisionV6::Announce(r) = d { Some(r.nlri) } else { None })
+                .collect();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build().unwrap();
+            rt.block_on(async {
+                let (tx, mut rx) = mpsc::channel(512);
+                let _ = flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let mut sent: Vec<Nlri<Ipv6Addr>> = Vec::new();
+                while let Ok(msg) = rx.try_recv() {
+                    for attr in &msg.attributes {
+                        if let PathAttribute::MpReachNlri(mp) = attr {
+                            for p in &mp.prefixes {
+                                if let Prefix::V6(nlri) = p {
+                                    sent.push(*nlri);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut sent_sorted = sent.clone();
+                let mut expected_sorted = expected.clone();
+                sent_sorted.sort_by_key(|n| format!("{n}"));
+                expected_sorted.sort_by_key(|n| format!("{n}"));
+                prop_assert_eq!(sent_sorted, expected_sorted,
+                    "every IPv6 announced NLRI must appear in an outbound MP_REACH UPDATE");
+                Ok(())
+            })?;
+        }
+
+        /// Every IPv6 Withdraw decision appears in exactly one outbound MP_UNREACH UPDATE.
+        #[test]
+        fn prop_flush_updates_v6_all_withdrawals_sent(
+            decisions in proptest::collection::vec(arb_decision_v6(), 0..=100),
+        ) {
+            let expected: Vec<Nlri<Ipv6Addr>> = decisions.iter()
+                .filter_map(|d| if let PrefixDecisionV6::Withdraw(n) = d { Some(*n) } else { None })
+                .collect();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build().unwrap();
+            rt.block_on(async {
+                let (tx, mut rx) = mpsc::channel(512);
+                let _ = flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let mut sent: Vec<Nlri<Ipv6Addr>> = Vec::new();
+                while let Ok(msg) = rx.try_recv() {
+                    for attr in &msg.attributes {
+                        if let PathAttribute::MpUnreachNlri(mp) = attr {
+                            for p in &mp.prefixes {
+                                if let Prefix::V6(nlri) = p {
+                                    sent.push(*nlri);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut sent_sorted = sent.clone();
+                let mut expected_sorted = expected.clone();
+                sent_sorted.sort_by_key(|n| format!("{n}"));
+                expected_sorted.sort_by_key(|n| format!("{n}"));
+                prop_assert_eq!(sent_sorted, expected_sorted,
+                    "every IPv6 withdrawn NLRI must appear in an outbound MP_UNREACH UPDATE");
                 Ok(())
             })?;
         }

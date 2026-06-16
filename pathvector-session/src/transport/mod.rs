@@ -1365,4 +1365,106 @@ mod tests {
             "expected Established after peer-wins collision, got {event:?}"
         );
     }
+
+    // ── make_treat_as_withdraw unit tests ─────────────────────────────────────
+
+    #[test]
+    fn test_make_treat_as_withdraw_moves_announced_to_withdrawn() {
+        use pathvector_types::Nlri;
+
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let update = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![nlri],
+        };
+        let result = super::make_treat_as_withdraw(update);
+        assert_eq!(result.withdrawn, vec![nlri]);
+        assert!(result.announced.is_empty());
+        assert!(result.attributes.is_empty());
+    }
+
+    #[test]
+    fn test_make_treat_as_withdraw_strips_non_mp_reach_attributes() {
+        use pathvector_types::Origin;
+
+        let update = UpdateMessage {
+            withdrawn: vec![],
+            // LOCAL_PREF and ORIGIN are not MpReachNlri — they must be stripped.
+            attributes: vec![
+                PathAttribute::LocalPref(100),
+                PathAttribute::Origin(Origin::Igp),
+            ],
+            announced: vec![],
+        };
+        let result = super::make_treat_as_withdraw(update);
+        assert!(result.attributes.is_empty(), "non-MpReach attrs must be stripped");
+        assert!(result.withdrawn.is_empty());
+        assert!(result.announced.is_empty());
+    }
+
+    #[test]
+    fn test_make_treat_as_withdraw_mixed_attrs_keeps_only_mp_unreach() {
+        use std::net::Ipv6Addr;
+
+        use crate::message::{MpReachNlri, Prefix};
+        use pathvector_types::{AfiSafi, NextHop, Nlri, Origin};
+
+        let prefix: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let update = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::LocalPref(200),
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                    prefixes: vec![Prefix::V6(prefix)],
+                }),
+                PathAttribute::Origin(Origin::Egp),
+            ],
+            announced: vec![],
+        };
+        let result = super::make_treat_as_withdraw(update);
+        // Only the converted MpUnreachNlri should remain.
+        assert_eq!(result.attributes.len(), 1);
+        assert!(
+            matches!(&result.attributes[0], PathAttribute::MpUnreachNlri(m) if m.afi_safi == AfiSafi::IPV6_UNICAST),
+            "expected MpUnreachNlri after conversion"
+        );
+        assert!(result.announced.is_empty());
+    }
+
+    #[test]
+    fn test_make_treat_as_withdraw_empty_update_is_noop() {
+        let update = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        };
+        let result = super::make_treat_as_withdraw(update);
+        assert!(result.withdrawn.is_empty());
+        assert!(result.attributes.is_empty());
+        assert!(result.announced.is_empty());
+    }
+
+    /// `SpawnedSessionHandle::stop` sends `SessionCommand::Stop` and the session
+    /// terminates, emitting `Terminated`.
+    #[tokio::test]
+    async fn test_spawned_handle_stop_terminates_session() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        handle.stop().await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Terminated after stop()")
+            .expect("session exited without emitting Terminated");
+        assert!(
+            matches!(event, SessionEvent::Terminated),
+            "expected Terminated after stop(), got {event:?}"
+        );
+    }
 }

@@ -71,3 +71,52 @@ impl FibWriter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::FibWriter;
+
+    #[test]
+    fn new_returns_ok() {
+        assert!(FibWriter::new(254, 20).is_ok());
+    }
+
+    #[tokio::test]
+    async fn install_v4_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(
+            fw.install_v4(Ipv4Addr::new(10, 0, 0, 0), 8, Ipv4Addr::new(192, 0, 2, 1))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_v4_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(fw.withdraw_v4(Ipv4Addr::new(10, 0, 0, 0), 8).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn install_v6_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(
+            fw.install_v6("2001:db8::".parse().unwrap(), 32, gw)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_v6_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(
+            fw.withdraw_v6("2001:db8::".parse().unwrap(), 32)
+                .await
+                .is_ok()
+        );
+    }
+}
