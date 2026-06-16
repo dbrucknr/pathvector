@@ -39,6 +39,9 @@ use tokio::sync::Notify;
 /// Implements [`NextHopOracle`] by querying the in-process [`FibSnapshot`].
 ///
 /// [`FibSnapshot`]: pathvector_sys::FibSnapshot
+// Constructed only on Linux (where KernelFib::spawn() populates the snapshot);
+// tests on all platforms use it directly.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct DaemonOracle(pub(crate) SysOracle);
 
 impl NextHopOracle for DaemonOracle {

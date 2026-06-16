@@ -353,6 +353,8 @@ impl DaemonState {
     }
 
     /// Replaces both next-hop oracles once `KernelFib` is initialised.
+    // Called only in Linux production code; tests call it on all platforms.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set_oracles(
         &mut self,
         v4: impl NextHopOracle + Send + Sync + 'static,
@@ -806,6 +808,13 @@ impl DaemonState {
         peer_ip: Ipv4Addr,
         mut msg: UpdateMessage,
     ) -> Option<NotificationMessage> {
+        tracing::debug!(
+            peer = %peer_ip,
+            withdrawn = msg.withdrawn.len(),
+            announced = msg.announced.len(),
+            attrs = msg.attributes.len(),
+            "on_route_update called"
+        );
         let peer_id = PeerId::from(peer_ip);
         let peer_type = self
             .rib
@@ -1602,9 +1611,17 @@ where
     // reachability queries.  FibWriter handles the write side (route install /
     // remove).  On non-Linux platforms both are no-ops.
     let (kernel_fib, fib_change_rx) = pathvector_sys::KernelFib::new(fib_table);
-    // oracle() takes &self; call before spawn() consumes kernel_fib.
+    // oracle() takes &self; build oracles before spawn() moves kernel_fib into
+    // the background task.  Only constructed on Linux where spawn() actually
+    // populates the FIB snapshot via rtnetlink — on non-Linux the snapshot stays
+    // empty (stub spawn is a no-op), so wiring DaemonOracle would mark every
+    // next-hop unreachable and silently drop all peer routes from best-path
+    // selection.  AlwaysReachable (the DaemonState default) is correct there.
+    #[cfg(target_os = "linux")]
     let oracle_v4 = fib::DaemonOracle(kernel_fib.oracle());
+    #[cfg(target_os = "linux")]
     let oracle_v6 = fib::DaemonOracle(kernel_fib.oracle());
+
     let fib_writer = match pathvector_sys::FibWriter::new(fib_table, fib_metric) {
         Ok(w) => {
             // Gap 4: delete any RTPROT_BGP routes left by a previous daemon run
@@ -1640,6 +1657,7 @@ where
     // best-path recomputes are in flight — the update is safe.
     {
         let mut guard = state.write().await;
+        #[cfg(target_os = "linux")]
         guard.set_oracles(oracle_v4, oracle_v6);
         if let Some(writer) = fib_writer {
             guard.fib_manager = Some(Arc::new(fib::FibManager::new(writer)));
