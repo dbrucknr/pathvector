@@ -384,7 +384,7 @@ impl AsPath {
     /// assert!(as4.is_none());
     ///
     /// // 4-byte ASN → downgrade substitutes AS_TRANS and returns original.
-    /// let path4 = AsPath::from_sequence(vec![Asn::new(131072), Asn::new(65001)]);
+    /// let path4 = AsPath::from_sequence(vec![Asn::new(131_072), Asn::new(65001)]);
     /// let (down4, as4_path) = path4.downgrade_for_two_byte_peer();
     /// assert_eq!(down4.segments()[0].asns()[0], Asn::TRANS);
     /// assert!(as4_path.is_some());
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn downgrade_for_two_byte_peer_replaces_four_byte_with_trans() {
         let path =
-            AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131072), Asn::new(65002)]);
+            AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131_072), Asn::new(65002)]);
         let (downgraded, orig) = path.downgrade_for_two_byte_peer();
         assert!(orig.is_some(), "substitution occurred");
         // Original preserved intact.
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn downgrade_for_two_byte_peer_all_four_byte() {
-        let path = AsPath::from_sequence(vec![Asn::new(131072), Asn::new(200000)]);
+        let path = AsPath::from_sequence(vec![Asn::new(131_072), Asn::new(200_000)]);
         let (downgraded, orig) = path.downgrade_for_two_byte_peer();
         assert!(orig.is_some());
         let asns = downgraded.segments()[0].asns();
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn downgrade_for_two_byte_peer_preserves_segment_type() {
         let path = AsPath::from_segments(vec![
-            AsPathSegment::Set(vec![Asn::new(131072), Asn::new(65001)]),
+            AsPathSegment::Set(vec![Asn::new(131_072), Asn::new(65001)]),
         ]);
         let (downgraded, _) = path.downgrade_for_two_byte_peer();
         assert!(matches!(downgraded.segments()[0], AsPathSegment::Set(_)));

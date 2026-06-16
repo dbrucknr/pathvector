@@ -1154,7 +1154,7 @@ impl DaemonState {
                     self.mrai_last_sent
                         .get(&peer_ip)
                         .and_then(|m| m.get(nlri))
-                        .map_or(true, |t| now.saturating_duration_since(*t) >= MRAI)
+                        .is_none_or(|t| now.saturating_duration_since(*t) >= MRAI)
                 });
 
             if ready.is_empty() {
@@ -2030,7 +2030,7 @@ fn is_valid_next_hop_v4(addr: Ipv4Addr, own_addr: Option<Ipv4Addr>) -> bool {
         && !addr.is_loopback()
         && !addr.is_multicast()
         && addr != Ipv4Addr::BROADCAST
-        && own_addr.map_or(true, |own| addr != own)
+        && own_addr.is_none_or(|own| addr != own)
 }
 
 // RFC 4291 §2.5 / RFC 4271 §5.1.3 for IPv6 next-hops carried in MP_REACH_NLRI.
@@ -2259,17 +2259,11 @@ fn handle_update(
             continue;
         }
         // RFC 4271 §5.1.3: validate NEXT_HOP before accepting the route.
-        if let Some(NextHop::V4(addr)) = nh {
-            if !is_valid_next_hop_v4(addr, local_v4_addr) {
-                tracing::warn!(
-                    peer = %peer,
-                    prefix = %nlri,
-                    next_hop = %addr,
-                    "dropping route: invalid NEXT_HOP (RFC 4271 §5.1.3)"
-                );
-                rejected += 1;
-                continue;
-            }
+        if let Some(NextHop::V4(addr)) = nh && !is_valid_next_hop_v4(addr, local_v4_addr) {
+            tracing::warn!(peer = %peer, prefix = %nlri, next_hop = %addr,
+                "dropping route: invalid NEXT_HOP (RFC 4271 §5.1.3)");
+            rejected += 1;
+            continue;
         }
 
         let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
@@ -2354,7 +2348,7 @@ fn handle_update(
                     || local_v6_addr.is_some_and(|local| local == global)
                     || link_local.is_multicast()
             }
-            _ => false,
+            NextHop::V4(_) => false,
         };
         if bad_v6_nh {
             tracing::warn!(
@@ -5399,9 +5393,9 @@ mod tests {
     fn test_as_path_loop_detection_fires_for_as_set() {
         // RFC 4271 §9.1.2 applies regardless of segment type. If the local AS
         // appears in an AS_SET produced by aggregation, the route must still be dropped.
+        use pathvector_types::AsPathSegment;
         let mut rib = LocRib::new();
         let mut ari = fresh_ari();
-        use pathvector_types::AsPathSegment;
         let path = AsPath::from_segments(vec![
             AsPathSegment::Sequence(vec![Asn::new(65100)]),
             AsPathSegment::Set(vec![Asn::new(65002), Asn::new(65200)]), // local AS in set
@@ -8583,7 +8577,6 @@ mod run_with_tests {
     struct MockPeerWithStop {
         event_tx: mpsc::Sender<SessionEvent>,
         stop_rx: mpsc::Receiver<SessionCommand>,
-        started: Arc<AtomicBool>,
     }
 
     fn make_mock_spawn_capturing_stop() -> (
@@ -8600,7 +8593,6 @@ mod run_with_tests {
             peers_clone.lock().unwrap().push(MockPeerWithStop {
                 event_tx,
                 stop_rx,
-                started: Arc::clone(&started),
             });
             MockSessionHandle {
                 event_rx,

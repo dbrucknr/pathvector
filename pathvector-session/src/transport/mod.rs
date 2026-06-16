@@ -154,7 +154,7 @@ pub enum SessionCommand {
     /// Used for RFC 4271 §6.3 mandatory attribute violations.
     ///
     /// The `data` field carries the RFC-mandated diagnostic payload (e.g. the
-    /// type code of the missing attribute for MissingWellKnownAttribute).
+    /// type code of the missing attribute for `MissingWellKnownAttribute`).
     Notification(crate::message::NotificationMessage),
     /// An inbound TCP connection from this peer was accepted by the daemon's
     /// BGP listener.  The session applies RFC 4271 §6.8 collision detection

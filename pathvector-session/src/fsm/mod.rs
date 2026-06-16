@@ -1149,7 +1149,7 @@ mod tests {
             version: 4,
             my_as: 65002,
             hold_time: 90,
-            bgp_id: Ipv4Addr::new(127, 0, 0, 1),
+            bgp_id: Ipv4Addr::LOCALHOST,
             capabilities: vec![Capability::FourByteAsn(65002)],
         });
         let out = fsm.process(FsmInput::MessageReceived(open));
