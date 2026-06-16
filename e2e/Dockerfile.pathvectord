@@ -18,6 +18,9 @@ RUN apt-get update \
 
 WORKDIR /workspace
 
+# CARGO_PROFILE: "debug" (default, used by e2e tests) or "release" (published image).
+ARG CARGO_PROFILE=debug
+
 # Copy workspace manifest and lock file first so dependency fetching is
 # cached as a separate layer — only invalidated when Cargo.lock changes.
 COPY Cargo.toml Cargo.lock ./
@@ -35,7 +38,11 @@ COPY pathvectord/         pathvectord/
 COPY e2e/                 e2e/
 COPY proto/               proto/
 
-RUN cargo build -p pathvectord
+RUN if [ "$CARGO_PROFILE" = "release" ]; then \
+        cargo build --release -p pathvectord; \
+    else \
+        cargo build -p pathvectord; \
+    fi
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 
@@ -47,7 +54,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends netcat-openbsd iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /workspace/target/debug/pathvectord /usr/local/bin/pathvectord
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/pathvectord /usr/local/bin/pathvectord
 
 # 51200 — gRPC management API (mapped to a dynamic host port by testcontainers)
 EXPOSE 51200

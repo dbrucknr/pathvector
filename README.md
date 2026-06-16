@@ -1,6 +1,7 @@
 # pathvector
 
 [![CI](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml/badge.svg)](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml)
+[![Publish](https://github.com/dbrucknr/pathvector/actions/workflows/publish.yml/badge.svg)](https://github.com/dbrucknr/pathvector/actions/workflows/publish.yml)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/dbrucknr/pathvector/graph/badge.svg)](https://codecov.io/gh/dbrucknr/pathvector)
@@ -39,6 +40,51 @@ cargo run -p pathvector -- dashboard        # live ratatui TUI
 
 See [DAEMON.md](DAEMON.md) for the full configuration reference and gRPC API examples.
 See [CLI.md](CLI.md) for all subcommands and the policy reload workflow.
+
+---
+
+## Docker
+
+A pre-built image is published to the GitHub Container Registry on every merge to `main`:
+
+```bash
+docker pull ghcr.io/dbrucknr/pathvector:latest
+```
+
+The image requires a config file mounted at startup. A minimal `docker-compose.yml`
+that peers pathvectord with a GoBGP instance on the same bridge network:
+
+```yaml
+services:
+  pathvectord:
+    image: ghcr.io/dbrucknr/pathvector:latest
+    volumes:
+      - ./config.toml:/etc/pathvectord/config.toml:ro
+    command: ["/etc/pathvectord/config.toml"]
+    ports:
+      - "51200:51200"   # gRPC management API
+    cap_add:
+      - NET_ADMIN       # required for kernel route installation (RTPROT_BGP)
+    networks:
+      - bgp
+
+  gobgp:
+    image: ghcr.io/dbrucknr/pathvector-gobgpd-test:latest
+    networks:
+      - bgp
+
+networks:
+  bgp:
+    driver: bridge
+```
+
+> **Note:** `NET_ADMIN` is only needed for FIB (kernel routing table) updates.
+> If you are using pathvectord purely as a route collector or policy engine you
+> can omit it.
+
+> **Platform:** the published image is `linux/amd64` only. The daemon peers and
+> exchanges routes correctly on any platform but will not install routes into the
+> host kernel on macOS Docker Desktop (no Linux FIB available).
 
 ---
 

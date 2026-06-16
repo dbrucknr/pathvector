@@ -1,0 +1,82 @@
+name: Publish
+
+# Pushes a pathvectord image to GHCR on every merge to main and on semver tags.
+#
+# Tags produced:
+#   ghcr.io/dbrucknr/pathvector:latest        — every main push
+#   ghcr.io/dbrucknr/pathvector:v1.2.3        — on tag v1.2.3
+#   ghcr.io/dbrucknr/pathvector:v1.2          — on tag v1.2.3 (minor alias)
+#   ghcr.io/dbrucknr/pathvector:sha-<short>   — every push (immutable reference)
+#
+# The image is built for linux/amd64 (GitHub-hosted runners) only. Multi-arch
+# (linux/arm64) can be added later with QEMU once the project stabilises.
+#
+# Required secrets: none — GITHUB_TOKEN is sufficient for GHCR.
+# Required repository settings: Settings → Actions → "Allow GitHub Actions to
+# create and approve pull requests" does not apply here, but the default
+# GITHUB_TOKEN must have packages:write permission — enable via
+# Settings → Actions → General → Workflow permissions → "Read and write".
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/pathvector
+
+jobs:
+  publish:
+    name: Build & push pathvectord
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive tags and OCI labels from git metadata.
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=pathvectord
+            org.opencontainers.image.description=BGP daemon — pathvector project (alpha)
+            org.opencontainers.image.licenses=MIT
+
+      # Reuse the Dockerfile that the e2e job already validates, but swap in a
+      # --release build so the published image has optimised code.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/Dockerfile.pathvectord
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CARGO_PROFILE=release
+          cache-from: type=gha,scope=publish-pathvectord
+          cache-to: type=gha,mode=max,scope=publish-pathvectord
+          platforms: linux/amd64
