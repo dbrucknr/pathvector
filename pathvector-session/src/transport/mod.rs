@@ -147,6 +147,15 @@ pub enum SessionCommand {
     Start,
     /// Send CEASE NOTIFICATION and drop the connection.
     Stop,
+    /// Send a specific NOTIFICATION (e.g. UPDATE Message Error) then tear down.
+    ///
+    /// Unlike `Stop` (which always sends CEASE), this lets the daemon signal
+    /// a protocol-level error back to the peer before closing the session.
+    /// Used for RFC 4271 §6.3 mandatory attribute violations.
+    ///
+    /// The `data` field carries the RFC-mandated diagnostic payload (e.g. the
+    /// type code of the missing attribute for `MissingWellKnownAttribute`).
+    Notification(crate::message::NotificationMessage),
     /// An inbound TCP connection from this peer was accepted by the daemon's
     /// BGP listener.  The session applies RFC 4271 §6.8 collision detection
     /// and either adopts the incoming connection or discards it.
@@ -399,6 +408,9 @@ impl<T: BgpTransport> Session<T> {
                     Some(SessionCommand::Start) => return FsmInput::ManualStart,
                     // None = handle dropped → treat as operator stop.
                     Some(SessionCommand::Stop) | None => return FsmInput::ManualStop,
+                    Some(SessionCommand::Notification(msg)) => {
+                        return FsmInput::NotificationToSend(msg);
+                    }
                     Some(SessionCommand::IncomingConnection(stream)) => {
                         if let Some(input) = self.handle_incoming_connection(stream).await {
                             return input;

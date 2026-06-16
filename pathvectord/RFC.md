@@ -20,6 +20,7 @@ of UPDATE messages lives in `pathvector-session`.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
+| Mandatory attributes (ORIGIN, AS_PATH, NEXT_HOP) checked on arrival; absent → NOTIFICATION with RFC 4271 §6.3 data field containing missing attr type code | `src/daemon.rs` | ✅ | `missing_origin_returns_notification_data_type_code_1`, `missing_as_path_returns_notification_data_type_code_2`, `missing_next_hop_for_traditional_ipv4_returns_notification_data_type_code_3`, `withdraw_only_update_no_notification_for_missing_attrs`, `malformed_update_missing_origin_sends_notification_to_session` |
 | LOCAL_PREF stripped when advertising to eBGP peers | `src/outbound.rs` | ✅ | `test_prepare_outbound_ebgp_strips_local_pref` |
 | AS_PATH prepended with local ASN before advertising to eBGP peers | `src/outbound.rs` | ✅ | `test_prepare_outbound_ebgp_prepends_local_as`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message` |
 | NEXT_HOP rewritten to TCP session local interface address for eBGP peers (RFC 4271 §5.1.3) | `src/outbound.rs`, `src/daemon.rs` | ✅ | `test_prepare_outbound_ebgp_rewrites_next_hop`, `test_on_established_ebgp_next_hop_uses_local_addr_not_router_id`, `test_propagate_to_all_peers_ebgp_next_hop_uses_local_addr`, e2e: `pathvectord_ebgp_next_hop_is_session_local_addr_not_router_id` |
@@ -30,6 +31,54 @@ of UPDATE messages lives in `pathvector-session`.
 | NLRI batching: announcements with same path attributes packed into fewest UPDATEs within `max_len` | `src/outbound.rs` | ✅ | `test_flush_same_attrs_batched_into_one_message`, `test_flush_splits_when_exceeding_max_len`, `test_flush_withdrawal_split_delivers_all_nlris` |
 | Announcement groups with distinct path attributes go into separate UPDATEs | `src/outbound.rs` | ✅ | `test_flush_different_attrs_two_messages` |
 | Withdrawals sent before announcements; withdrawal list packed within `max_len` | `src/outbound.rs` | ✅ | `test_flush_withdrawals_before_announces`, `test_flush_withdrawal_split_delivers_all_nlris` |
+
+---
+
+## RFC 4271 §9.2.1.1 — Minimum Route Advertisement Interval (MRAI)
+
+**Owns:** eBGP MRAI enforcement: suppressing repeated announcements of the same NLRI
+within a 30-second window to dampen UPDATE bursts toward eBGP peers. Withdrawals bypass
+MRAI unconditionally.  
+**Boundary:** Wire serialisation lives in `pathvector-session`. AdjRibOut is updated
+before the MRAI gate, so the RIB reflects correct state even while wire transmission is
+deferred.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9.2.1.1
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| 30 s MRAI for eBGP peers; repeated announcement within window suppressed | `src/daemon.rs` | ✅ | `mrai_suppresses_ebgp_announcement_within_window` |
+| Announcement allowed after MRAI window elapses | `src/daemon.rs` | ✅ | `mrai_passes_after_window_elapsed` |
+| Suppressed NLRIs tracked in `mrai_pending`; flushed by half-MRAI timer | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending`, `has_mrai_pending_true_when_set_nonempty` |
+| Per-NLRI readiness: only NLRIs whose individual window elapsed are flushed | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending` |
+| Withdrawals bypass MRAI (RFC 4271 §9.2.1.1 explicit exemption) | `src/daemon.rs` | ✅ | `mrai_withdrawal_bypasses_suppression` |
+| iBGP MRAI (SHOULD ≥5 s per RFC 4271 §9.2.1.1) | — | ❌ | — |
+
+**Deferred:** iBGP MRAI. The RFC says SHOULD ≥5 s for iBGP; current implementation applies
+no MRAI to iBGP peers. Low operational impact at typical iBGP topologies; deferred until
+route dampening is implemented (both share the `Clock` trait prerequisite).
+
+---
+
+## RFC 6793 — Four-Octet AS Number Capability (Outbound Encoding)
+
+**Owns:** Outbound AS_PATH encoding for 2-byte-only peers: substituting 4-byte ASNs with
+AS_TRANS (23456) and appending the original path as AS4_PATH (type 17, flags 0xC0 =
+optional+transitive) so downstream 4-byte-capable routers can reconstruct the full path.  
+**Boundary:** `Asn::TRANS` constant and `AsPath::downgrade_for_two_byte_peer()` live in
+`pathvector-types`. Inbound AS4_PATH merging (receiving from 2-byte peers) is owned by
+`pathvector-session`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc6793#section-4
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| 4-byte ASNs replaced by AS_TRANS in wire AS_PATH for 2-byte-only peers | `src/outbound.rs` | ✅ | `four_byte_asn_to_two_byte_peer_inserts_trans_and_as4_path` |
+| Original 4-byte ASNs preserved in AS4_PATH attribute for 2-byte-only peers | `src/outbound.rs` | ✅ | `four_byte_asn_to_two_byte_peer_inserts_trans_and_as4_path`, `all_four_byte_asns_to_two_byte_peer_full_trans_substitution` |
+| No AS_TRANS / AS4_PATH for 4-byte-capable peers | `src/outbound.rs` | ✅ | `four_byte_asn_to_four_byte_peer_no_trans_no_as4_path` |
+| No AS4_PATH when all ASNs fit in 2 bytes (no substitution occurred) | `src/outbound.rs` | ✅ | `two_byte_asns_to_two_byte_peer_no_trans_no_as4_path` |
+| AS4_PATH appears as last attribute (2-byte speakers can skip unknown optional attributes) | `src/outbound.rs` | ✅ | `as4_path_is_last_attribute_for_two_byte_peer` |
+| E2e verification against real 2-byte-only peer (GoBGP `--as2` mode) | — | ❌ | — |
+
+**Deferred:** E2e test against GoBGP in 2-byte-only mode to verify wire format on a live session.
 
 ---
 

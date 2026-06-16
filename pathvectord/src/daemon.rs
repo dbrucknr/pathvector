@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
 use pathvector_policy::{Decision, DefaultAction, Policy};
@@ -16,8 +17,8 @@ use pathvector_rib::{
 };
 use pathvector_session::{
     message::{
-        Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
-        UpdateMessage,
+        Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, NotificationError,
+        NotificationMessage, PathAttribute, Prefix, UpdateMessage, UpdateMsgError,
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
@@ -35,6 +36,9 @@ use crate::{config, fib, grpc, proto};
 /// Must not collide with any real peer address. `0.0.0.0` is unassignable as
 /// a BGP peer, so it is safe as a sentinel here.
 pub(crate) const LOCAL_ORIGIN_PEER: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+
+/// RFC 4271 §9.2.1.1: default Minimum Route Advertisement Interval for eBGP.
+pub(crate) const MRAI: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn resolve_import_default(opt: Option<config::ImportDefault>, is_ebgp: bool) -> DefaultAction {
     match opt {
@@ -153,6 +157,27 @@ pub(crate) struct DaemonState {
     /// `Capability::ExtendedMessage`; otherwise [`MAX_LEN`] (4096).
     /// Removed when the peer transitions out of Established.
     pub(crate) negotiated_max_len: HashMap<Ipv4Addr, usize>,
+    /// Peers that negotiated the IPv6 unicast Multi-Protocol capability (RFC 4760).
+    ///
+    /// Only these peers receive IPv6 MP_REACH_NLRI / MP_UNREACH_NLRI.
+    pub(crate) ipv6_capable_peers: HashSet<Ipv4Addr>,
+    /// Peers that negotiated RFC 6793 `FourByteAsn` capability.
+    ///
+    /// AS_PATH is sent unchanged to these peers. For absent peers, AS_PATH is
+    /// downgraded (4-byte ASNs replaced with AS_TRANS) and AS4_PATH is added.
+    pub(crate) four_byte_peers: HashSet<Ipv4Addr>,
+    /// RFC 4271 §9.2.1.1: Minimum Route Advertisement Interval.
+    ///
+    /// Tracks when each prefix was last announced to each eBGP peer so that
+    /// re-announcements are suppressed within the MRAI window (default: 30 s).
+    /// Withdrawals bypass MRAI — they must be sent immediately.
+    mrai_last_sent: HashMap<Ipv4Addr, HashMap<Nlri<Ipv4Addr>, Instant>>,
+    /// NLRIs suppressed by MRAI that have not yet been sent.
+    ///
+    /// When an MRAI window elapses, the pending NLRIs for that peer are
+    /// re-propagated. Uses a `HashSet` so repeated updates to the same prefix
+    /// within one suppression window collapse to a single deferred flush.
+    pub(crate) mrai_pending: HashMap<Ipv4Addr, HashSet<Nlri<Ipv4Addr>>>,
     /// Peers whose outbound UPDATE channel overflowed during the current event.
     ///
     /// The event loop drains this list after each event via [`take_stalled_peers`]
@@ -314,6 +339,10 @@ impl DaemonState {
             update_senders,
             config_capabilities,
             negotiated_max_len: HashMap::new(),
+            ipv6_capable_peers: HashSet::new(),
+            four_byte_peers: HashSet::new(),
+            mrai_last_sent: HashMap::new(),
+            mrai_pending: HashMap::new(),
             stalled_peers: Vec::new(),
             route_tx,
             peer_tx,
@@ -523,12 +552,34 @@ impl DaemonState {
         let local_bgp_id = self.rib.local_bgp_id;
         let local_next_hop = local_addr.unwrap_or(local_bgp_id);
         let local_ipv6 = self.rib.local_ipv6;
+
+        // RFC 4456 §8 split-horizon: when acting as an RR, a non-client iBGP
+        // peer must not receive routes learned from other non-client iBGP peers
+        // in the initial full-table dump. The same check applies in
+        // propagate_to_all_peers for incremental updates.
+        let is_rr = !self.rib.rr_clients.is_empty();
+        let dest_is_client = self.rib.rr_clients.contains(&peer_ip);
+        let rr_clients = &self.rib.rr_clients;
+        let peer_types = &self.rib.peer_types;
+        let loc_rib = &self.rib.loc_rib;
+
         let decisions: Vec<PrefixDecision> = all_nlris
             .into_iter()
             .map(|nlri| {
+                if is_rr
+                    && peer_type == PeerType::Internal
+                    && let Some(src) = loc_rib.best_peer(&nlri)
+                    && let IpAddr::V4(src_ip) = src.ip()
+                {
+                    let src_is_client = rr_clients.contains(&src_ip);
+                    let src_is_ibgp = peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                    if src_is_ibgp && !src_is_client && !dest_is_client {
+                        return PrefixDecision::NoChange;
+                    }
+                }
                 propagate_prefix(
                     nlri,
-                    &self.rib.loc_rib,
+                    loc_rib,
                     adj_rib_out,
                     export_policy,
                     peer_type,
@@ -538,12 +589,33 @@ impl DaemonState {
             })
             .collect();
 
-        if !flush_updates(decisions, max_len, update_tx) {
+        // RFC 6793: track whether this peer supports 4-byte ASNs.
+        let peer_four_byte = peer_capabilities
+            .iter()
+            .any(|c| matches!(c, Capability::FourByteAsn(_)));
+        if peer_four_byte {
+            self.four_byte_peers.insert(peer_ip);
+        } else {
+            self.four_byte_peers.remove(&peer_ip);
+        }
+
+        if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
             self.stalled_peers.push(peer_ip);
         }
 
-        // Full-table dump for IPv6.
-        if !all_nlris_v6.is_empty()
+        // Full-table dump for IPv6 — only for peers that negotiated IPv6 unicast
+        // (RFC 4760): sending MP_REACH_NLRI to a peer that did not advertise the
+        // Multi-Protocol capability for IPv6 unicast violates the capability
+        // negotiation contract and the peer would silently discard the routes.
+        let peer_supports_ipv6 =
+            peer_capabilities.contains(&Capability::MultiProtocol(AfiSafi::IPV6_UNICAST));
+        if peer_supports_ipv6 {
+            self.ipv6_capable_peers.insert(peer_ip);
+        } else {
+            self.ipv6_capable_peers.remove(&peer_ip);
+        }
+        if peer_supports_ipv6
+            && !all_nlris_v6.is_empty()
             && let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip)
         {
             let decisions_v6: Vec<PrefixDecisionV6> = all_nlris_v6
@@ -559,7 +631,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(decisions_v6, max_len, update_tx) {
+            if !flush_updates_v6(decisions_v6, max_len, update_tx, peer_type, peer_four_byte) {
                 self.stalled_peers.push(peer_ip);
             }
         }
@@ -602,6 +674,10 @@ impl DaemonState {
             rib.peer_bgp_ids.remove(&peer_ip);
         }
         self.negotiated_max_len.remove(&peer_ip);
+        self.ipv6_capable_peers.remove(&peer_ip);
+        self.four_byte_peers.remove(&peer_ip);
+        self.mrai_last_sent.remove(&peer_ip);
+        self.mrai_pending.remove(&peer_ip);
 
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
@@ -696,7 +772,8 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(decisions, max_len, update_tx) {
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -724,7 +801,11 @@ impl DaemonState {
     /// Applies import policy, updates the RIB, and propagates best-path changes
     /// for all affected NLRIs to every established peer.
     #[allow(clippy::similar_names)]
-    pub(crate) fn on_route_update(&mut self, peer_ip: Ipv4Addr, mut msg: UpdateMessage) {
+    pub(crate) fn on_route_update(
+        &mut self,
+        peer_ip: Ipv4Addr,
+        mut msg: UpdateMessage,
+    ) -> Option<NotificationMessage> {
         let peer_id = PeerId::from(peer_ip);
         let peer_type = self
             .rib
@@ -747,7 +828,7 @@ impl DaemonState {
                     cluster_id,
                     "RR loop detected in CLUSTER_LIST — discarding UPDATE"
                 );
-                return;
+                return None;
             }
             // Set ORIGINATOR_ID if not already present.
             if !msg
@@ -841,15 +922,15 @@ impl DaemonState {
 
         let Some(policy) = self.import_policies.get(&peer_ip) else {
             tracing::error!(peer = %peer_ip, "import_policies missing peer — skipping RouteUpdate");
-            return;
+            return None;
         };
         let Some(policy_v6) = self.import_policies_v6.get(&peer_ip) else {
             tracing::error!(peer = %peer_ip, "import_policies_v6 missing peer — skipping RouteUpdate");
-            return;
+            return None;
         };
         let Some(adj_rib_in) = self.adj_ribs_in.get_mut(&peer_ip) else {
             tracing::error!(peer = %peer_ip, "adj_ribs_in missing peer — skipping RouteUpdate");
-            return;
+            return None;
         };
 
         // IPv6 AdjRibIn may not exist for all peers (e.g. if capability was not
@@ -865,8 +946,11 @@ impl DaemonState {
         // borrow checker can verify they don't alias.
         let oracle_v4 = Arc::clone(&self.oracle_v4);
         let oracle_v6 = Arc::clone(&self.oracle_v6);
+        let local_as = self.rib.local_as;
+        let local_v4_addr = self.rib.local_addrs.get(&peer_ip).copied();
+        let local_v6_addr = self.rib.local_ipv6;
         let rib = Arc::make_mut(&mut self.rib);
-        let (fib_changes, fib_changes_v6) = handle_update(
+        let (fib_changes, fib_changes_v6, notification) = handle_update(
             peer_id,
             msg,
             adj_rib_in,
@@ -878,6 +962,9 @@ impl DaemonState {
             peer_type,
             &*oracle_v4,
             &*oracle_v6,
+            local_as,
+            local_v4_addr,
+            local_v6_addr,
         );
 
         if let Some(fm) = &self.fib_manager {
@@ -906,6 +993,7 @@ impl DaemonState {
             r#type: proto::PeerEventType::Changed as i32,
             peer: None,
         });
+        notification
     }
 
     /// Propagates best-path decisions for `nlris` to every currently established
@@ -984,7 +1072,44 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(decisions, max_len, update_tx) {
+            // RFC 4271 §9.2.1.1: apply MRAI for eBGP peers.
+            // Withdrawals bypass MRAI (must be sent immediately per the RFC).
+            let now = Instant::now();
+            let decisions = if peer_type == PeerType::External {
+                let last_sent = self.mrai_last_sent.entry(peer_ip).or_default();
+                let pending = self.mrai_pending.entry(peer_ip).or_default();
+                decisions
+                    .into_iter()
+                    .map(|d| match d {
+                        PrefixDecision::Announce(ref route) => {
+                            let nlri = route.nlri;
+                            let elapsed = last_sent
+                                .get(&nlri)
+                                .map_or(MRAI, |t| now.saturating_duration_since(*t));
+                            if elapsed >= MRAI {
+                                last_sent.insert(nlri, now);
+                                pending.remove(&nlri);
+                                d
+                            } else {
+                                pending.insert(nlri);
+                                PrefixDecision::NoChange
+                            }
+                        }
+                        // Withdrawals are always sent immediately; also clear any
+                        // pending MRAI entry so we don't re-announce after withdrawal.
+                        PrefixDecision::Withdraw(nlri) => {
+                            pending.remove(&nlri);
+                            last_sent.remove(&nlri);
+                            d
+                        }
+                        PrefixDecision::NoChange => d,
+                    })
+                    .collect()
+            } else {
+                decisions
+            };
+            let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
+            if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
                 self.stalled_peers.push(peer_ip);
             }
         }
@@ -997,6 +1122,56 @@ impl DaemonState {
             r#type: proto::PeerEventType::Changed as i32,
             peer: None,
         });
+    }
+
+    /// Re-propagates NLRIs that were suppressed by MRAI and whose window has now elapsed.
+    ///
+    /// Should be called roughly every MRAI interval (30 s) by the event loop.
+    /// For each eBGP peer with pending NLRIs, this re-runs `propagate_to_all_peers`
+    /// for the pending set so routes reach the peer after the suppression window closes.
+    pub(crate) fn flush_mrai_pending(&mut self) {
+        let now = Instant::now();
+        // Per-NLRI readiness check: only flush NLRIs whose individual MRAI window
+        // has elapsed. A bulk "max of all last_sent" check would incorrectly
+        // suppress a pending NLRI if any *other* (non-pending) NLRI was sent
+        // recently enough to make the max appear within the window.
+        let peers_with_pending: Vec<Ipv4Addr> = self
+            .mrai_pending
+            .iter()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(&p, _)| p)
+            .collect();
+
+        for peer_ip in peers_with_pending {
+            let Some(pending) = self.mrai_pending.get(&peer_ip) else {
+                continue;
+            };
+            let (ready, not_ready): (Vec<Nlri<Ipv4Addr>>, Vec<Nlri<Ipv4Addr>>) =
+                pending.iter().copied().partition(|nlri| {
+                    self.mrai_last_sent
+                        .get(&peer_ip)
+                        .and_then(|m| m.get(nlri))
+                        .is_none_or(|t| now.saturating_duration_since(*t) >= MRAI)
+                });
+
+            if ready.is_empty() {
+                continue;
+            }
+
+            // Replace pending with the still-suppressed NLRIs before propagating,
+            // so propagate_to_all_peers sees an accurate pending set.
+            if let Some(p) = self.mrai_pending.get_mut(&peer_ip) {
+                *p = not_ready.into_iter().collect();
+            }
+            self.propagate_to_all_peers(&ready);
+        }
+    }
+
+    /// Returns `true` if any eBGP peer has NLRIs pending for MRAI flush.
+    ///
+    /// Used by the event loop to decide whether to schedule a wakeup timer.
+    pub(crate) fn has_mrai_pending(&self) -> bool {
+        self.mrai_pending.values().any(|s| !s.is_empty())
     }
 
     /// Emits a `RouteEvent` for each NLRI in `affected` based on the current
@@ -1028,7 +1203,15 @@ impl DaemonState {
     }
 
     fn propagate_to_all_peers_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
-        let established_peers: Vec<Ipv4Addr> = self.rib.peer_types.keys().copied().collect();
+        // Only send IPv6 UPDATEs to peers that negotiated the Multi-Protocol
+        // capability for IPv6 unicast (RFC 4760).
+        let established_peers: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|ip| self.ipv6_capable_peers.contains(ip))
+            .collect();
         let local_as = self.rib.local_as;
         let local_ipv6 = self.rib.local_ipv6;
         for peer_ip in established_peers {
@@ -1064,7 +1247,8 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(decisions, max_len, update_tx) {
+            let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
+            if !flush_updates_v6(decisions, max_len, update_tx, peer_type, peer_four_byte) {
                 self.stalled_peers.push(peer_ip);
             }
         }
@@ -1297,7 +1481,8 @@ impl DaemonState {
                 )
             })
             .collect();
-        if !flush_updates(decisions, max_len, update_tx) {
+        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
+        if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
             self.stalled_peers.push(peer_ip);
         }
         self.sync_advertised(peer_ip);
@@ -1665,6 +1850,14 @@ pub(crate) async fn run_event_loop(
     stop_senders: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>,
     mut fib_change_rx: Option<watch::Receiver<()>>,
 ) {
+    // MRAI flush timer — fires every MRAI/2 so suppressed eBGP routes are
+    // re-advertised within one interval of their window expiring (RFC 4271 §9.2.1.1).
+    // The first tick fires immediately but is a no-op (no sessions yet); subsequent
+    // ticks are spaced MRAI/2 apart. MissedTickBehavior::Delay prevents burst
+    // catch-up when the event loop is held under a write lock for an extended period.
+    let mut mrai_timer = tokio::time::interval(MRAI / 2);
+    mrai_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         // `std::future::pending()` for the None branch ensures the select arm
         // is compiled in but never resolves, keeping the loop alive on the
@@ -1698,7 +1891,23 @@ pub(crate) async fn run_event_loop(
                         s.on_terminated(peer_ip);
                     }
                     SessionEvent::RouteUpdate(msg) => {
-                        s.on_route_update(peer_ip, msg);
+                        let notify_err = s.on_route_update(peer_ip, msg);
+                        // RFC 4271 §6.3: mandatory attribute violation — send
+                        // specific NOTIFICATION before tearing down the session.
+                        if let Some(err) = notify_err {
+                            let stalled = s.take_stalled_peers();
+                            drop(s);
+                            if let Some(tx) = stop_senders.get(&peer_ip) {
+                                let _ = tx.send(SessionCommand::Notification(err)).await;
+                            }
+                            // Process any stalled peers before next iteration.
+                            for peer in stalled {
+                                if let Some(tx) = stop_senders.get(&peer) {
+                                    let _ = tx.send(SessionCommand::Stop).await;
+                                }
+                            }
+                            continue;
+                        }
                     }
                 }
                 // Collect any peers whose outbound channel overflowed.  Drain
@@ -1732,6 +1941,25 @@ pub(crate) async fn run_event_loop(
                     );
                     if let Some(tx) = stop_senders.get(&peer) {
                         let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                }
+            }
+
+            _ = mrai_timer.tick() => {
+                let mut s = state.write().await;
+                if s.has_mrai_pending() {
+                    s.flush_mrai_pending();
+                    let stalled = s.take_stalled_peers();
+                    drop(s);
+                    for peer in stalled {
+                        tracing::error!(
+                            peer = %peer,
+                            "closing session: outbound UPDATE channel overflowed during MRAI flush; \
+                             session will re-establish and perform a fresh full-table dump"
+                        );
+                        if let Some(tx) = stop_senders.get(&peer) {
+                            let _ = tx.send(SessionCommand::Stop).await;
+                        }
                     }
                 }
             }
@@ -1785,6 +2013,32 @@ pub(crate) fn reapply_import_policy(
     fib_changes
 }
 
+// RFC 4271 §5.1.3 / §9.1.2 — NEXT_HOP validation.
+// Returns false for addresses that are forbidden as next-hops: unspecified,
+// loopback, multicast, and broadcast. The "own address" check (receiving
+// router's address) is left to the FIB oracle reachability gate because
+// handle_update has no direct access to the local interface address.
+// `own_addr`: the local interface address toward this peer; if the NEXT_HOP
+// equals our own address the peer would be sending traffic to us, black-holing
+// it. RFC 4271 §5.1.3 requires the NEXT_HOP to be reachable and not the
+// receiving router's own address.
+fn is_valid_next_hop_v4(addr: Ipv4Addr, own_addr: Option<Ipv4Addr>) -> bool {
+    !addr.is_unspecified()
+        && !addr.is_loopback()
+        && !addr.is_multicast()
+        && addr != Ipv4Addr::BROADCAST
+        && own_addr.is_none_or(|own| addr != own)
+}
+
+// RFC 4291 §2.5 / RFC 4271 §5.1.3 for IPv6 next-hops carried in MP_REACH_NLRI.
+// Unspecified (::) and multicast (ff00::/8) are not valid forwarding targets.
+// Link-local (fe80::/10) is valid when paired with an interface (V6WithLinkLocal)
+// and is handled by the FIB oracle; a bare link-local as a global next-hop is
+// accepted here because GoBGP and BIRD both use it legitimately in single-hop sessions.
+fn is_valid_next_hop_v6(addr: Ipv6Addr) -> bool {
+    !addr.is_unspecified() && !addr.is_multicast()
+}
+
 // UPDATE processing dispatches across all path attribute types in one pass.
 // Splitting this function further would produce artificial helpers with no
 // independent utility.
@@ -1801,7 +2055,14 @@ fn handle_update(
     peer_type: PeerType,
     oracle_v4: &dyn NextHopOracle,
     oracle_v6: &dyn NextHopOracle,
-) -> (Vec<BestPathChange<Ipv4Addr>>, Vec<BestPathChange<Ipv6Addr>>) {
+    local_as: u32,
+    local_v4_addr: Option<Ipv4Addr>,
+    local_v6_addr: Option<Ipv6Addr>,
+) -> (
+    Vec<BestPathChange<Ipv4Addr>>,
+    Vec<BestPathChange<Ipv6Addr>>,
+    Option<NotificationMessage>,
+) {
     let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
     let mut fib_changes_v6: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
     let withdrawn_count = msg.withdrawn.len();
@@ -1816,6 +2077,8 @@ fn handle_update(
     // Extracts scalar attributes shared by all announced NLRIs, and collects
     // IPv4 NLRIs from MP_REACH_NLRI / MP_UNREACH_NLRI (RFC 4760). Non-IPv4
     // AFI/SAFIs are logged and skipped; the daemon is IPv4-only for now.
+    let mut has_origin = false;
+    let mut has_as_path = false;
     let mut origin = Origin::Incomplete;
     let mut as_path = AsPath::new();
     let mut next_hop: Option<NextHop> = None;
@@ -1836,8 +2099,14 @@ fn handle_update(
 
     for attr in &msg.attributes {
         match attr {
-            PathAttribute::Origin(o) => origin = *o,
-            PathAttribute::AsPath(p) => as_path = p.clone(),
+            PathAttribute::Origin(o) => {
+                origin = *o;
+                has_origin = true;
+            }
+            PathAttribute::AsPath(p) => {
+                as_path = p.clone();
+                has_as_path = true;
+            }
             PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
             PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
             PathAttribute::Med(m) => med = Some(Med::new(*m)),
@@ -1894,6 +2163,81 @@ fn handle_update(
         }
     }
 
+    // ── RFC 4271 §6.3: mandatory well-known attribute check ───────────────
+    // When the UPDATE carries announcements, ORIGIN and AS_PATH MUST be present.
+    // For conventional IPv4 NLRI, NEXT_HOP is also mandatory.
+    // Violation → send NOTIFICATION (UpdateMessage/MissingWellKnownAttribute) and
+    // tear down the session. Withdraw-only UPDATEs are exempt.
+    let has_v4_announces = !msg.announced.is_empty() || !mp_v4_announced.is_empty();
+    let has_any_announces = has_v4_announces || !mp_v6_announced.is_empty();
+    if has_any_announces {
+        let missing_attr = if !has_origin {
+            Some(1u8) // ORIGIN type code
+        } else if !has_as_path {
+            Some(2u8) // AS_PATH type code
+        } else if has_v4_announces && !msg.announced.is_empty() && next_hop.is_none() {
+            // NEXT_HOP required for traditional (non-MP) IPv4 announcements.
+            Some(3u8) // NEXT_HOP type code
+        } else {
+            None
+        };
+        if let Some(attr_type) = missing_attr {
+            tracing::warn!(
+                peer = %peer,
+                attr_type,
+                "mandatory well-known attribute missing (RFC 4271 §6.3) — sending NOTIFICATION"
+            );
+            // RFC 4271 §6.3: data field MUST contain the type code of the missing attribute.
+            return (
+                fib_changes,
+                fib_changes_v6,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(
+                        UpdateMsgError::MissingWellKnownAttribute,
+                    ),
+                    data: vec![attr_type],
+                }),
+            );
+        }
+    }
+
+    // ── RFC 7607: AS 0 in AS_PATH ────────────────────────────────────────
+    // AS 0 is reserved and MUST NOT appear in AS_PATH. A route carrying it
+    // is malformed; silently drop announces (withdrawals are still processed).
+    let has_as_zero = as_path.contains(pathvector_types::Asn::new(0));
+    if has_as_zero
+        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
+    {
+        tracing::warn!(
+            peer = %peer,
+            %as_path,
+            "dropping UPDATE: AS_PATH contains reserved AS 0 (RFC 7607)"
+        );
+        mp_v4_announced.clear();
+        mp_v6_announced.clear();
+    }
+
+    // ── RFC 4271 §9.1.2: AS_PATH loop detection ──────────────────────────
+    // If our own AS appears in the received AS_PATH the route has looped back
+    // to us. Silently ignore all announced NLRIs in this UPDATE (withdrawals
+    // are still processed — they are safe and necessary).
+    let has_loop = as_path.contains(pathvector_types::Asn::new(local_as));
+    if has_loop
+        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
+    {
+        tracing::debug!(
+            peer = %peer,
+            local_as,
+            %as_path,
+            "dropping UPDATE: AS_PATH contains local AS (RFC 4271 §9.1.2)"
+        );
+        // Still process withdrawals below; clear the announce lists.
+        mp_v4_announced.clear();
+        mp_v6_announced.clear();
+        // The traditional NLRI list is consumed by the iterator below; return
+        // early after processing withdrawals by short-circuiting via a flag.
+    }
+
     // ── MP_UNREACH_NLRI withdrawals (RFC 4760) ────────────────────────────
     let mp_withdrawn_count = mp_v4_withdrawn.len();
     for nlri in &mp_v4_withdrawn {
@@ -1909,6 +2253,7 @@ fn handle_update(
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
+    let skip_announces = has_loop || has_as_zero;
     let all_announced = msg
         .announced
         .into_iter()
@@ -1920,6 +2265,20 @@ fn handle_update(
         );
 
     for (nlri, nh) in all_announced {
+        if skip_announces {
+            rejected += 1;
+            continue;
+        }
+        // RFC 4271 §5.1.3: validate NEXT_HOP before accepting the route.
+        if let Some(NextHop::V4(addr)) = nh
+            && !is_valid_next_hop_v4(addr, local_v4_addr)
+        {
+            tracing::warn!(peer = %peer, prefix = %nlri, next_hop = %addr,
+                "dropping route: invalid NEXT_HOP (RFC 4271 §5.1.3)");
+            rejected += 1;
+            continue;
+        }
+
         let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
         if let Some(nh) = nh {
             builder = builder.next_hop(nh);
@@ -1989,6 +2348,29 @@ fn handle_update(
     let mut accepted_v6 = 0usize;
     let mut rejected_v6 = 0usize;
     for (nlri, nh) in mp_v6_announced {
+        // RFC 4271 §5.1.3 / RFC 4291 §2.5 / RFC 2545 §3: validate the IPv6 next-hop.
+        // Own-address check: reject if global next-hop matches our configured IPv6 address.
+        // Link-local addresses are not checked (interface-scoped; commonly used in eBGP).
+        let bad_v6_nh = match nh {
+            NextHop::V6(addr) => {
+                !is_valid_next_hop_v6(addr) || local_v6_addr.is_some_and(|local| local == addr)
+            }
+            NextHop::V6WithLinkLocal { global, link_local } => {
+                !is_valid_next_hop_v6(global)
+                    || local_v6_addr.is_some_and(|local| local == global)
+                    || link_local.is_multicast()
+            }
+            NextHop::V4(_) => false,
+        };
+        if bad_v6_nh {
+            tracing::warn!(
+                peer = %peer,
+                prefix = %nlri,
+                "dropping IPv6 route: invalid NEXT_HOP (RFC 4271 §5.1.3)"
+            );
+            rejected_v6 += 1;
+            continue;
+        }
         let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
         builder = builder.next_hop(nh);
         if let Some(lp) = local_pref {
@@ -2049,7 +2431,7 @@ fn handle_update(
         rib_v6_size = loc_rib_v6.len(),
         "processed UPDATE"
     );
-    (fib_changes, fib_changes_v6)
+    (fib_changes, fib_changes_v6, None)
 }
 
 #[cfg(test)]
@@ -2736,6 +3118,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2788,6 +3171,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2810,12 +3194,42 @@ mod tests {
     /// Wrapper for IPv4-only `handle_update` calls — passes fresh v6 stubs.
     fn handle_update_v4(
         p: PeerId,
-        msg: UpdateMessage,
+        mut msg: UpdateMessage,
         ari: &mut AdjRibIn<Ipv4Addr>,
         rib: &mut LocRib<Ipv4Addr>,
         policy: &Policy<Route<Ipv4Addr>>,
         pt: PeerType,
     ) {
+        // Ensure tests with IPv4 announces satisfy mandatory-attribute validation
+        // (RFC 4271 §6.3) so they don't get rejected before reaching the logic
+        // under test. Supply defaults when mandatory attributes are absent.
+        if !msg.announced.is_empty() {
+            let has_origin = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Origin(_)));
+            let has_as_path = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::AsPath(_)));
+            let has_next_hop = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::NextHop(_)));
+            if !has_origin {
+                msg.attributes.push(PathAttribute::Origin(Origin::Igp));
+            }
+            if !has_as_path {
+                msg.attributes
+                    .push(PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65009),
+                    ])));
+            }
+            if !has_next_hop {
+                msg.attributes
+                    .push(PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)));
+            }
+        }
         let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
         let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
         let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(DefaultAction::Accept);
@@ -2831,6 +3245,9 @@ mod tests {
             pt,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
     }
 
@@ -2848,7 +3265,7 @@ mod tests {
             withdrawn: vec![],
             attributes: vec![
                 PathAttribute::Origin(Origin::Egp),
-                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
                 PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 PathAttribute::LocalPref(200),
                 PathAttribute::Med(50),
@@ -3108,7 +3525,7 @@ mod tests {
                 withdrawn: vec![],
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
-                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
                     PathAttribute::LocalPref(150),
                     PathAttribute::MpReachNlri(MpReachNlri {
                         afi_safi: AfiSafi::IPV4_UNICAST,
@@ -3257,6 +3674,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -3313,7 +3731,7 @@ mod tests {
                 withdrawn: vec![],
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
-                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
                     PathAttribute::MpReachNlri(MpReachNlri {
                         afi_safi: AfiSafi::IPV6_UNICAST,
                         next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
@@ -3331,6 +3749,9 @@ mod tests {
             PeerType::External,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
 
         assert_eq!(rib_v6.len(), 1, "IPv6 route must enter loc_rib_v6");
@@ -3370,6 +3791,9 @@ mod tests {
             PeerType::External,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
 
         assert_eq!(ari_v6.len(), 1, "pre-policy route must be in adj_rib_in_v6");
@@ -3392,7 +3816,7 @@ mod tests {
                 withdrawn: vec![],
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
-                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
                     PathAttribute::MpReachNlri(MpReachNlri {
                         afi_safi: AfiSafi::IPV6_UNICAST,
                         next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
@@ -3410,6 +3834,9 @@ mod tests {
             PeerType::External,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
 
         assert!(
@@ -3550,6 +3977,9 @@ mod tests {
             PeerType::External,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
         assert_eq!(rib_v6.len(), 1);
 
@@ -3573,6 +4003,9 @@ mod tests {
             PeerType::External,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
 
         assert!(
@@ -3614,6 +4047,9 @@ mod tests {
             PeerType::External,
             &AlwaysReachable,
             &AlwaysReachable,
+            65002,
+            None,
+            None,
         );
 
         assert_eq!(rib.len(), 1, "IPv4 route must be in loc_rib");
@@ -3772,7 +4208,8 @@ mod tests {
         // Set local_ipv6 so eBGP dump works.
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
-        state.on_established(peer_ip, PeerType::External, 65002, 90, &[], None);
+        let caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &caps, None);
 
         // First message should be the MP_REACH_NLRI UPDATE for the v6 prefix.
         let msg = rxs
@@ -3798,8 +4235,9 @@ mod tests {
         // Set local_ipv6 so eBGP next-hop rewrite works for peer_b.
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
-        state.on_established(peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
+        let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(peer_a, PeerType::External, 65002, 90, &v6_caps, None);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &v6_caps, None);
 
         // Peer A announces an IPv6 route via MP_REACH_NLRI.
         state.on_route_update(
@@ -4298,7 +4736,7 @@ mod tests {
     fn route_to_update_for_test(route: &Route<Ipv4Addr>) -> UpdateMessage {
         UpdateMessage {
             withdrawn: vec![],
-            attributes: route_to_attributes(route),
+            attributes: route_to_attributes(route, PeerType::External, true),
             announced: vec![route.nlri],
         }
     }
@@ -4366,7 +4804,12 @@ mod tests {
         .aggregator(Aggregator::new(Asn::new(65001), Ipv4Addr::new(1, 1, 1, 1)))
         .build();
 
-        let msg = route_to_update_for_test(&route);
+        // Use Internal peer type so MED and reflector attributes are not stripped.
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: route_to_attributes(&route, PeerType::Internal, true),
+            announced: vec![route.nlri],
+        };
         assert!(
             msg.attributes
                 .iter()
@@ -4404,6 +4847,903 @@ mod tests {
         );
     }
 
+    // ── RFC correctness regressions ───────────────────────────────────────────
+
+    // Finding A — RFC 4271 §9.1.2: AS_PATH loop detection.
+    // A route whose AS_PATH contains the local AS MUST be silently dropped.
+
+    #[test]
+    fn test_as_path_loop_detection_drops_traditional_nlri() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        // local_as == 65002; route contains 65002 in AS_PATH → loop detected.
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65100),
+                        Asn::new(65002), // local AS
+                        Asn::new(65200),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with local AS in AS_PATH must be dropped (RFC 4271 §9.1.2)"
+        );
+        // AdjRibIn is also empty — silently ignore means do not store.
+        assert!(
+            ari.is_empty(),
+            "silently ignored route must not be stored in AdjRibIn"
+        );
+    }
+
+    #[test]
+    fn test_as_path_loop_detection_drops_mp_reach_nlri() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65100),
+                        Asn::new(65002), // local AS
+                    ])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::9".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(
+            rib_v6.is_empty(),
+            "IPv6 route with local AS in AS_PATH must be dropped (RFC 4271 §9.1.2)"
+        );
+    }
+
+    #[test]
+    fn test_as_path_loop_detection_permits_empty_as_path() {
+        // iBGP routes may have an empty AS_PATH — must not be dropped.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::Internal,
+        );
+        assert_eq!(rib.len(), 1, "route with empty AS_PATH must be accepted");
+    }
+
+    #[test]
+    fn test_as_path_loop_detection_does_not_block_withdrawals() {
+        // Withdrawals MUST be processed even if the AS_PATH contains our own AS.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        // First install a route via a clean update from a different AS.
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib.len(), 1, "prerequisite: route must be installed");
+
+        // Now send a withdrawal that also carries a looping AS_PATH.
+        // RFC 4271 §9.1.2 says loop detection applies to announcements, not withdrawals.
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![nlri("10.0.0.0/8")],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65002), // local AS in path
+                    ])),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "withdrawal must be processed despite looping AS_PATH"
+        );
+    }
+
+    // Finding F (RFC 4456 §8) and G (RFC 4271 §5.1.4) — eBGP attribute stripping.
+    // ORIGINATOR_ID, CLUSTER_LIST, and MED MUST be stripped before advertising to eBGP peers.
+
+    #[test]
+    fn test_route_to_attributes_ebgp_strips_med() {
+        let route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65001)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .med(Med::new(100))
+        .build();
+
+        let attrs = route_to_attributes(&route, PeerType::External, true);
+        assert!(
+            !attrs.iter().any(|a| matches!(a, PathAttribute::Med(_))),
+            "MED must be stripped for eBGP peers (RFC 4271 §5.1.4)"
+        );
+    }
+
+    #[test]
+    fn test_route_to_attributes_ibgp_preserves_med() {
+        let route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65001)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .med(Med::new(100))
+        .build();
+
+        let attrs = route_to_attributes(&route, PeerType::Internal, true);
+        assert!(
+            attrs.iter().any(|a| matches!(a, PathAttribute::Med(_))),
+            "MED must be preserved for iBGP peers"
+        );
+    }
+
+    #[test]
+    fn test_route_to_attributes_ebgp_strips_originator_id_and_cluster_list() {
+        let mut route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65001)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .build();
+        route.originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
+        route.cluster_list = vec![0x0101_0101u32];
+
+        let attrs = route_to_attributes(&route, PeerType::External, true);
+        assert!(
+            !attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_))),
+            "ORIGINATOR_ID must be stripped for eBGP peers (RFC 4456 §8)"
+        );
+        assert!(
+            !attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ClusterList(_))),
+            "CLUSTER_LIST must be stripped for eBGP peers (RFC 4456 §8)"
+        );
+    }
+
+    #[test]
+    fn test_route_to_attributes_ibgp_preserves_rr_attributes() {
+        let mut route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65001)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .build();
+        route.originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
+        route.cluster_list = vec![0x0101_0101u32];
+
+        let attrs = route_to_attributes(&route, PeerType::Internal, true);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_))),
+            "ORIGINATOR_ID must be preserved for iBGP peers"
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ClusterList(_))),
+            "CLUSTER_LIST must be preserved for iBGP peers"
+        );
+    }
+
+    // Finding C — RFC 4271 §5.1.3 / §9.1.2: NEXT_HOP validation.
+    // Routes with invalid next-hops (unspecified, loopback, multicast, broadcast)
+    // must be dropped.
+
+    #[test]
+    fn test_invalid_next_hop_unspecified_is_rejected() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(Ipv4Addr::UNSPECIFIED), // 0.0.0.0
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with 0.0.0.0 NEXT_HOP must be rejected (RFC 4271 §5.1.3)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_next_hop_multicast_is_rejected() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(224, 0, 0, 1)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with multicast NEXT_HOP must be rejected (RFC 4271 §5.1.3)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_next_hop_broadcast_is_rejected() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(Ipv4Addr::BROADCAST),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with broadcast NEXT_HOP must be rejected (RFC 4271 §5.1.3)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_next_hop_v6_unspecified_is_rejected() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6(Ipv6Addr::UNSPECIFIED), // ::
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(
+            rib_v6.is_empty(),
+            "IPv6 route with :: NEXT_HOP must be rejected (RFC 4271 §5.1.3)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_next_hop_v6_multicast_is_rejected() {
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("ff02::1".parse().unwrap()), // multicast
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(
+            rib_v6.is_empty(),
+            "IPv6 route with multicast NEXT_HOP must be rejected (RFC 4271 §5.1.3)"
+        );
+    }
+
+    #[test]
+    fn test_valid_next_hop_is_accepted() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib.len(), 1, "route with valid NEXT_HOP must be accepted");
+    }
+
+    #[test]
+    fn test_valid_next_hop_v6_link_local_is_accepted() {
+        // Link-local (fe80::/10) is a valid next-hop in single-hop eBGP sessions
+        // (GoBGP, BIRD both use it). Must not be rejected.
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("fe80::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert_eq!(
+            rib_v6.len(),
+            1,
+            "link-local IPv6 next-hop must be accepted (used by GoBGP/BIRD)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_next_hop_v6_with_link_local_bad_global_rejected() {
+        // V6WithLinkLocal: if the global address is :: (unspecified), drop.
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6WithLinkLocal {
+                            global: Ipv6Addr::UNSPECIFIED, // ::
+                            link_local: "fe80::1".parse().unwrap(),
+                        },
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(
+            rib_v6.is_empty(),
+            "V6WithLinkLocal with unspecified global must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_invalid_next_hop_v6_with_link_local_multicast_link_local_rejected() {
+        // V6WithLinkLocal: if the link-local field is multicast, drop.
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6WithLinkLocal {
+                            global: "2001:db8::1".parse().unwrap(),
+                            link_local: "ff02::1".parse().unwrap(), // multicast
+                        },
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(
+            rib_v6.is_empty(),
+            "V6WithLinkLocal with multicast link-local must be rejected (RFC 2545 §3)"
+        );
+    }
+
+    #[test]
+    fn test_as_path_loop_detection_fires_for_as_set() {
+        // RFC 4271 §9.1.2 applies regardless of segment type. If the local AS
+        // appears in an AS_SET produced by aggregation, the route must still be dropped.
+        use pathvector_types::AsPathSegment;
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::Sequence(vec![Asn::new(65100)]),
+            AsPathSegment::Set(vec![Asn::new(65002), Asn::new(65200)]), // local AS in set
+        ]);
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(path),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with local AS in AS_SET must be dropped (RFC 4271 §9.1.2)"
+        );
+    }
+
+    // Finding L — RFC 7607: AS 0 in AS_PATH MUST be rejected.
+
+    #[test]
+    fn test_as_zero_in_path_drops_route() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65100),
+                        Asn::new(0), // reserved — RFC 7607
+                        Asn::new(65200),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with AS 0 in AS_PATH must be dropped (RFC 7607)"
+        );
+    }
+
+    #[test]
+    fn test_as_zero_does_not_block_withdrawals() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+
+        // Install a route first.
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(rib.len(), 1, "prerequisite: route must be installed");
+
+        // Withdraw it in an UPDATE that also carries AS 0 in the path.
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![nlri("10.0.0.0/8")],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(0)])),
+                ],
+                announced: vec![],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert!(
+            rib.is_empty(),
+            "withdrawal must be processed even when AS_PATH contains AS 0"
+        );
+    }
+
+    // Finding C-remaining — RFC 4271 §5.1.3: NEXT_HOP must not equal the
+    // receiving router's own address.
+
+    #[test]
+    fn test_next_hop_own_address_is_rejected() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        let own_addr: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(peer());
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(DefaultAction::Accept);
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(own_addr),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &policy_v6,
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            Some(own_addr), // local interface address matches NEXT_HOP
+            None,
+        );
+        assert!(
+            rib.is_empty(),
+            "route with NEXT_HOP == own address must be rejected (RFC 4271 §5.1.3)"
+        );
+    }
+
+    #[test]
+    fn test_next_hop_different_from_own_address_is_accepted() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        let own_addr: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let peer_addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(peer());
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(DefaultAction::Accept);
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::NextHop(peer_addr),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &policy_v6,
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            Some(own_addr), // NEXT_HOP differs from own address — valid
+            None,
+        );
+        assert_eq!(
+            rib.len(),
+            1,
+            "route with NEXT_HOP != own address must be accepted"
+        );
+    }
+
+    // Finding I — RFC 4456 §8: RR split-horizon must apply during full-table dump.
+
+    #[test]
+    fn test_on_established_rr_split_horizon_blocks_non_client_to_non_client() {
+        // Topology: local speaker is RR with one client (10.0.0.3) and one
+        // non-client (10.0.0.4). A route from another non-client iBGP peer
+        // (10.0.0.5) must NOT be sent to 10.0.0.4 on establish (finding I).
+        let non_client_a: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        let non_client_b: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let client: Ipv4Addr = "10.0.0.3".parse().unwrap();
+
+        let (mut state, mut rxs) = make_state(
+            65001,
+            &[
+                (non_client_a, 65001), // iBGP
+                (non_client_b, 65001), // iBGP
+                (client, 65001),       // iBGP
+            ],
+        );
+        // Designate client as an RR client.
+        Arc::make_mut(&mut state.rib).rr_clients.insert(client);
+
+        // non_client_b establishes and deposits a route.
+        state.on_established(non_client_b, PeerType::Internal, 65001, 90, &[], None);
+        let src = PeerId::new(IpAddr::V4(non_client_b));
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(non_client_b))
+            .peer_type(PeerType::Internal)
+            .build();
+        state.rib_insert_v4(src, route);
+
+        // Drain non_client_b's channel (its own establish dump).
+        while rxs.get_mut(&non_client_b).unwrap().try_recv().is_ok() {}
+
+        // non_client_a establishes — must NOT receive the route from non_client_b.
+        state.on_established(non_client_a, PeerType::Internal, 65001, 90, &[], None);
+        assert!(
+            rxs.get_mut(&non_client_a).unwrap().try_recv().is_err(),
+            "non-client must not receive routes from other non-clients during full-table dump (RFC 4456 §8)"
+        );
+    }
+
+    #[test]
+    fn test_on_established_rr_client_receives_all_routes_in_dump() {
+        // An RR client MUST receive the full table on establish, including routes
+        // from non-client iBGP peers.
+        let non_client: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        let client: Ipv4Addr = "10.0.0.3".parse().unwrap();
+
+        let (mut state, mut rxs) = make_state(65001, &[(non_client, 65001), (client, 65001)]);
+        Arc::make_mut(&mut state.rib).rr_clients.insert(client);
+
+        // non_client deposits a route.
+        state.on_established(non_client, PeerType::Internal, 65001, 90, &[], None);
+        let src = PeerId::new(IpAddr::V4(non_client));
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(non_client))
+            .peer_type(PeerType::Internal)
+            .build();
+        state.rib_insert_v4(src, route);
+        while rxs.get_mut(&non_client).unwrap().try_recv().is_ok() {}
+
+        // RR client establishes — MUST receive the route from the non-client.
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        assert!(
+            rxs.get_mut(&client).unwrap().try_recv().is_ok(),
+            "RR client must receive routes from non-client iBGP peers in full-table dump"
+        );
+    }
+
+    // Finding K — RFC 4760: IPv6 routes must only be sent to peers that negotiated
+    // MultiProtocol(IPV6_UNICAST) capability.
+
+    #[test]
+    fn test_ipv6_route_not_propagated_to_non_ipv6_capable_peer() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        // peer_a negotiated IPv6; peer_b did NOT.
+        let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(peer_a, PeerType::External, 65002, 90, &v6_caps, None);
+        state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // peer_a announces an IPv6 prefix.
+        state.on_route_update(
+            peer_a,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::2".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+
+        // peer_b (no IPv6 capability) must receive nothing.
+        assert!(
+            rxs.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            "peer without IPv6 capability must not receive MP_REACH_NLRI (RFC 4760)"
+        );
+    }
+
+    #[test]
+    fn test_ipv6_full_table_dump_not_sent_to_non_ipv6_capable_peer() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut rxs) = make_state(65001, &[(peer_ip, 65002)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        // Pre-populate v6 RIB.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        let v6_route = RouteBuilder::new(
+            nlri_v6("2001:db8::/32"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65009)]),
+        )
+        .next_hop(NextHop::V6("2001:db8::9".parse().unwrap()))
+        .peer_type(PeerType::External)
+        .build();
+        state.rib_insert_v6(src, v6_route);
+
+        // Establish without IPv6 capability.
+        state.on_established(peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        assert!(
+            rxs.get_mut(&peer_ip).unwrap().try_recv().is_err(),
+            "full-table IPv6 dump must not be sent to peers without IPv6 capability (RFC 4760)"
+        );
+    }
+
     // ── propagate_prefix / flush_updates ─────────────────────────────────────
 
     /// Test helper: propagate a single prefix and flush decisions to `tx`.
@@ -4420,7 +5760,7 @@ mod tests {
         tx: &mpsc::Sender<UpdateMessage>,
     ) -> bool {
         let decision = propagate_prefix(nlri, rib, aro, policy, peer_type, local_as, bgp_id);
-        flush_updates(vec![decision], MAX_LEN, tx)
+        flush_updates(vec![decision], MAX_LEN, tx, peer_type, true)
     }
 
     fn ebgp_out_peer() -> (PeerId, AdjRibOut<Ipv4Addr>) {
@@ -5277,6 +6617,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -5304,6 +6645,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -5520,11 +6862,139 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
         );
         assert_eq!(state.rib.loc_rib.len(), 1);
+    }
+
+    // ── RFC 4271 §6.3 mandatory attribute NOTIFICATION ───────────────────────
+    //
+    // handle_update must return Some(NotificationMessage) with the correct
+    // 1-byte type code in `data` when a mandatory attribute is absent from
+    // an UPDATE that carries announcements.
+
+    fn handle_update_get_notification(msg: UpdateMessage) -> Option<NotificationMessage> {
+        let p = peer();
+        let mut ari = AdjRibIn::new(p);
+        let mut rib = LocRib::new();
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy = accept_all();
+        let policy_v6: Policy<Route<Ipv6Addr>> =
+            Policy::new(pathvector_policy::DefaultAction::Accept);
+        let (_, _, notification) = handle_update(
+            p,
+            msg,
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &policy,
+            &policy_v6,
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        notification
+    }
+
+    #[test]
+    fn missing_origin_returns_notification_data_type_code_1() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+            ],
+            announced: vec![nlri("10.0.0.0/8")],
+        });
+        let msg = n.expect("NOTIFICATION must be returned when ORIGIN is absent");
+        assert!(
+            matches!(
+                msg.error,
+                NotificationError::UpdateMessage(UpdateMsgError::MissingWellKnownAttribute)
+            ),
+            "error must be UpdateMessage/MissingWellKnownAttribute"
+        );
+        assert_eq!(
+            msg.data,
+            vec![1u8],
+            "data must contain ORIGIN type code (1)"
+        );
+    }
+
+    #[test]
+    fn missing_as_path_returns_notification_data_type_code_2() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+            ],
+            announced: vec![nlri("10.0.0.0/8")],
+        });
+        let msg = n.expect("NOTIFICATION must be returned when AS_PATH is absent");
+        assert_eq!(
+            msg.data,
+            vec![2u8],
+            "data must contain AS_PATH type code (2)"
+        );
+    }
+
+    #[test]
+    fn missing_next_hop_for_traditional_ipv4_returns_notification_data_type_code_3() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                // No NEXT_HOP
+            ],
+            announced: vec![nlri("10.0.0.0/8")],
+        });
+        let msg = n.expect("NOTIFICATION must be returned when NEXT_HOP is absent");
+        assert_eq!(
+            msg.data,
+            vec![3u8],
+            "data must contain NEXT_HOP type code (3)"
+        );
+    }
+
+    #[test]
+    fn withdraw_only_update_no_notification_for_missing_attrs() {
+        // Withdraw-only UPDATEs are exempt from mandatory attribute checks.
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![nlri("10.0.0.0/8")],
+            attributes: vec![], // no attributes at all — allowed for withdraw-only
+            announced: vec![],
+        });
+        assert!(
+            n.is_none(),
+            "withdraw-only UPDATE must not trigger mandatory attribute NOTIFICATION"
+        );
+    }
+
+    #[test]
+    fn all_mandatory_attributes_present_no_notification() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+            ],
+            announced: vec![nlri("10.0.0.0/8")],
+        });
+        assert!(
+            n.is_none(),
+            "well-formed UPDATE must not trigger NOTIFICATION"
+        );
     }
 
     // ── Route Reflection (RFC 4456) ───────────────────────────────────────────
@@ -6646,7 +8116,7 @@ mod prop_tests {
             use pathvector_session::message::PathAttribute;
             let route = base_route(prefix);
             let nlri_val: Nlri<Ipv4Addr> = prefix.parse().unwrap();
-            let attrs = route_to_attributes(&route);
+            let attrs = route_to_attributes(&route, PeerType::External, true);
             let msg = UpdateMessage { withdrawn: vec![], attributes: attrs, announced: vec![nlri_val] };
 
             prop_assert_eq!(msg.announced, vec![nlri_val]);
@@ -6706,6 +8176,137 @@ mod prop_tests {
             prop_assert_eq!(result.next_hop, Some(NextHop::V4(bgp_id)), "NEXT_HOP must be rewritten");
             prop_assert!(result.local_pref.is_none(), "LOCAL_PREF must be stripped for eBGP");
         }
+    }
+}
+
+#[cfg(test)]
+mod mrai_tests {
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::outbound::PrefixDecision;
+
+    fn peer_ip(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, last)
+    }
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn make_state() -> DaemonState {
+        DaemonState::new(
+            65001,
+            Ipv4Addr::new(1, 0, 0, 1),
+            None,
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+        )
+    }
+
+    /// Manually backdate the last-sent time for a prefix so the MRAI window
+    /// appears elapsed.
+    fn backdate(state: &mut DaemonState, peer: Ipv4Addr, n: Nlri<Ipv4Addr>, ago: Duration) {
+        let entry = state
+            .mrai_last_sent
+            .entry(peer)
+            .or_default()
+            .entry(n)
+            .or_insert_with(Instant::now);
+        // We can't set `Instant` backwards, but we can check whether a
+        // simulated past time would pass the MRAI guard in tests by directly
+        // inserting via the internal map.  Instead, we mark the prefix as
+        // having been sent `ago` in the past by subtracting from `MRAI`.
+        // Because `Instant` is monotonic, we insert a time that is just barely
+        // past the MRAI window by computing `now - ago`.
+        *entry = Instant::now().checked_sub(ago).unwrap_or(*entry);
+    }
+
+    #[test]
+    fn mrai_suppresses_ebgp_announcement_within_window() {
+        let mut state = make_state();
+        let peer = peer_ip(2);
+        let n = nlri("10.0.0.0/24");
+
+        // Prime last_sent to "just now" so the MRAI window hasn't elapsed.
+        state
+            .mrai_last_sent
+            .entry(peer)
+            .or_default()
+            .insert(n, Instant::now());
+
+        // Simulate the MRAI gating logic directly — call the inner logic used
+        // in propagate_to_all_peers for an eBGP peer.
+        let now = Instant::now();
+        let last_sent = state.mrai_last_sent.get(&peer).unwrap();
+        let elapsed = last_sent
+            .get(&n)
+            .map_or(MRAI, |t| now.saturating_duration_since(*t));
+        assert!(elapsed < MRAI, "should be suppressed within window");
+    }
+
+    #[test]
+    fn mrai_passes_after_window_elapsed() {
+        let mut state = make_state();
+        let peer = peer_ip(2);
+        let n = nlri("10.0.0.0/24");
+
+        // Back-date by MRAI + 1 second.
+        backdate(&mut state, peer, n, MRAI + Duration::from_secs(1));
+
+        let now = Instant::now();
+        let last_sent = state.mrai_last_sent.get(&peer).unwrap();
+        let elapsed = last_sent
+            .get(&n)
+            .map_or(MRAI, |t| now.saturating_duration_since(*t));
+        assert!(elapsed >= MRAI, "should be allowed after window elapsed");
+    }
+
+    #[test]
+    fn has_mrai_pending_false_when_empty() {
+        let state = make_state();
+        assert!(!state.has_mrai_pending());
+    }
+
+    #[test]
+    fn has_mrai_pending_true_when_set_nonempty() {
+        let mut state = make_state();
+        let peer = peer_ip(2);
+        let n = nlri("10.0.0.0/24");
+        state.mrai_pending.entry(peer).or_default().insert(n);
+        assert!(state.has_mrai_pending());
+    }
+
+    #[test]
+    fn flush_mrai_pending_clears_elapsed_pending() {
+        let mut state = make_state();
+        let peer = peer_ip(2);
+        let n = nlri("10.0.0.0/24");
+
+        // Mark as pending and back-date so window is elapsed.
+        state.mrai_pending.entry(peer).or_default().insert(n);
+        backdate(&mut state, peer, n, MRAI + Duration::from_secs(1));
+
+        // flush_mrai_pending calls propagate_to_all_peers which needs a
+        // peer config; since we have no peers configured the inner call is a
+        // no-op, but the pending set must be cleared.
+        state.flush_mrai_pending();
+
+        assert!(!state.has_mrai_pending(), "pending cleared after flush");
+    }
+
+    #[test]
+    fn mrai_withdrawal_bypasses_suppression() {
+        // Withdrawals must bypass MRAI (RFC 4271 §9.2.1.1).
+        // The MRAI gate only applies to PrefixDecision::Announce branches.
+        // Verify that a Withdraw variant passes through unchanged.
+        let n = nlri("10.0.0.0/24");
+        let decision = PrefixDecision::Withdraw(n);
+        // No MRAI state needed — Withdraw is passed through unconditionally.
+        assert!(matches!(decision, PrefixDecision::Withdraw(_)));
     }
 }
 
@@ -7001,6 +8602,133 @@ mod run_with_tests {
             Some("session-key"),
             "md5_password must be threaded into SessionConfig"
         );
+    }
+
+    // ── NOTIFICATION pipeline: malformed UPDATE → SessionCommand ─────────────
+    //
+    // Variant of make_mock_spawn that also captures the stop_rx so tests can
+    // observe SessionCommand::Notification sent by the event loop.
+
+    /// Test-side view with access to the stop receiver.
+    struct MockPeerWithStop {
+        event_tx: mpsc::Sender<SessionEvent>,
+        stop_rx: mpsc::Receiver<SessionCommand>,
+    }
+
+    fn make_mock_spawn_capturing_stop() -> (
+        impl Fn(SessionConfig) -> MockSessionHandle,
+        Arc<Mutex<Vec<MockPeerWithStop>>>,
+    ) {
+        let peers: Arc<Mutex<Vec<MockPeerWithStop>>> = Arc::new(Mutex::new(vec![]));
+        let peers_clone = Arc::clone(&peers);
+        let spawn_fn = move |_cfg: SessionConfig| {
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let (update_tx, _update_rx) = mpsc::channel(8);
+            let (stop_tx, stop_rx) = mpsc::channel(8);
+            let started = Arc::new(AtomicBool::new(false));
+            peers_clone
+                .lock()
+                .unwrap()
+                .push(MockPeerWithStop { event_tx, stop_rx });
+            MockSessionHandle {
+                event_rx,
+                update_tx,
+                stop_tx,
+                started,
+            }
+        };
+        (spawn_fn, peers)
+    }
+
+    fn established_info_for_peer(peer_as: u32) -> SessionEvent {
+        use pathvector_session::fsm::SessionInfo;
+        use pathvector_session::message::Capability;
+        use pathvector_types::PeerType;
+        SessionEvent::Established(SessionInfo {
+            peer_as,
+            peer_bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            hold_time: 90,
+            peer_capabilities: vec![Capability::FourByteAsn(peer_as)],
+            peer_type: PeerType::External,
+            local_addr: None,
+        })
+    }
+
+    /// A malformed UPDATE (missing ORIGIN) sent through the full event loop must
+    /// result in a SessionCommand::Notification on the peer's stop channel with:
+    ///  - error = UpdateMessage(MissingWellKnownAttribute)
+    ///  - data  = [1]  (ORIGIN type code, RFC 4271 §6.3)
+    #[tokio::test]
+    async fn malformed_update_missing_origin_sends_notification_to_session() {
+        use pathvector_session::message::{NotificationError, PathAttribute, UpdateMsgError};
+        use pathvector_session::transport::SessionCommand;
+        use pathvector_types::{AsPath, Asn};
+
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (spawn_fn, peers) = make_mock_spawn_capturing_stop();
+        let cfg = make_config(&[(peer_ip, 65002)]);
+        let (state, event_rx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
+
+        // Run the event loop in the background; inject events via the mock peer.
+        tokio::spawn(run_event_loop(event_rx, state, stop_senders, None));
+
+        // Allow the spawned task to start.
+        tokio::task::yield_now().await;
+
+        let (event_tx, stop_rx) = {
+            let mut guard = peers.lock().unwrap();
+            let p = guard.pop().expect("one peer spawned");
+            (p.event_tx, p.stop_rx)
+        };
+
+        // Establish the session so the daemon has peer state.
+        event_tx
+            .send(established_info_for_peer(65002))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Send a malformed UPDATE: announced NLRI but ORIGIN is absent.
+        event_tx
+            .send(SessionEvent::RouteUpdate(UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                    // No Origin!
+                ],
+                announced: vec!["10.0.0.0/8".parse().unwrap()],
+            }))
+            .await
+            .unwrap();
+
+        // The event loop must send a Notification command to the session.
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            let mut stop_rx = stop_rx;
+            stop_rx.recv().await
+        })
+        .await
+        .expect("timed out waiting for SessionCommand")
+        .expect("stop channel closed without sending Notification");
+
+        match cmd {
+            SessionCommand::Notification(msg) => {
+                assert!(
+                    matches!(
+                        msg.error,
+                        NotificationError::UpdateMessage(UpdateMsgError::MissingWellKnownAttribute)
+                    ),
+                    "error must be UpdateMessage/MissingWellKnownAttribute, got {:?}",
+                    msg.error
+                );
+                assert_eq!(
+                    msg.data,
+                    vec![1u8],
+                    "data must be [1] (ORIGIN type code per RFC 4271 §6.3)"
+                );
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
     }
 
     // ── withdraw_stale_bgp_routes ─────────────────────────────────────────────

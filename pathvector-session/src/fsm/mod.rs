@@ -73,6 +73,12 @@ pub enum FsmInput {
     CollisionDetected,
     /// A complete BGP message was received from the peer.
     MessageReceived(BgpMessage),
+    /// The daemon requests that a specific NOTIFICATION be sent before tearing
+    /// down the session (RFC 4271 §6.3 mandatory attribute errors).
+    ///
+    /// The full [`NotificationMessage`] is carried so the RFC-mandated data
+    /// field (e.g. the missing attribute type code) is preserved verbatim.
+    NotificationToSend(crate::message::NotificationMessage),
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -537,6 +543,18 @@ impl Fsm {
                     FsmOutput::SessionTerminated,
                 ]
             }
+            // RFC 4271 §6.3: daemon detected a mandatory attribute error and
+            // requested we send a specific NOTIFICATION before tearing down.
+            FsmInput::NotificationToSend(msg) => {
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
+                    FsmOutput::SendMessage(BgpMessage::Notification(msg)),
+                    FsmOutput::CloseTcpConnection,
+                    FsmOutput::SessionTerminated,
+                ]
+            }
             _ => vec![],
         }
     }
@@ -604,7 +622,12 @@ impl Fsm {
             ));
         }
 
-        if peer.bgp_id == Ipv4Addr::UNSPECIFIED {
+        // RFC 4271 §6.2: BGP Identifier must be a valid unicast IPv4 address.
+        // Multicast (224.0.0.0/4) and broadcast (255.255.255.255) are not unicast.
+        // Unspecified (0.0.0.0) is explicitly prohibited by §4.2.
+        let bgp_id = peer.bgp_id;
+        if bgp_id == Ipv4Addr::UNSPECIFIED || bgp_id.is_multicast() || bgp_id == Ipv4Addr::BROADCAST
+        {
             return Err((
                 NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
                 vec![],
@@ -1100,6 +1123,76 @@ mod tests {
             my_as: 65002,
             hold_time: 90,
             bgp_id: Ipv4Addr::UNSPECIFIED,
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(bad_open));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_loopback_bgp_id_accepted() {
+        // RFC 4271 §6.2 requires a "valid unicast IPv4 address". Loopback (127.x.x.x)
+        // is unicast — RFC does not prohibit it. We must not over-reject.
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::LOCALHOST,
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(open));
+        assert_eq!(
+            fsm.state(),
+            State::OpenConfirm,
+            "loopback BGP ID must not be rejected"
+        );
+        // FSM sends KEEPALIVE on entering OpenConfirm — not a NOTIFICATION.
+        assert!(matches!(find_send(&out), Some(BgpMessage::Keepalive)));
+    }
+
+    #[test]
+    fn test_multicast_bgp_id_rejected() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let bad_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(224, 0, 0, 1), // multicast — RFC 4271 §6.2
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(bad_open));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(matches!(
+            find_send(&out),
+            Some(BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_broadcast_bgp_id_rejected() {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let bad_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::BROADCAST, // 255.255.255.255 — RFC 4271 §6.2
             capabilities: vec![Capability::FourByteAsn(65002)],
         });
         let out = fsm.process(FsmInput::MessageReceived(bad_open));

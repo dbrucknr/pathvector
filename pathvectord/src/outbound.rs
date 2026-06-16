@@ -22,10 +22,31 @@ use tokio::sync::mpsc;
 pub(crate) const UPDATE_FIXED_OVERHEAD: usize = 19 + 2 + 2;
 
 /// Builds the path-attribute list for an outbound route.
-pub(crate) fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute> {
+///
+/// `peer_type` controls attribute stripping:
+/// - ORIGINATOR_ID and CLUSTER_LIST are route-reflector metadata (RFC 4456 §8)
+///   and MUST be stripped before sending to eBGP peers.
+/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4).
+///
+/// `peer_four_byte` indicates whether the peer negotiated RFC 6793
+/// `FourByteAsn` capability. When `false`, any 4-byte ASN in AS_PATH is
+/// replaced by AS_TRANS (23456) on the wire and the original path is included
+/// as AS4_PATH so 4-byte-capable speakers on the other side can reconstruct it.
+pub(crate) fn route_to_attributes(
+    route: &Route<Ipv4Addr>,
+    peer_type: PeerType,
+    peer_four_byte: bool,
+) -> Vec<PathAttribute> {
+    let is_ebgp = peer_type == PeerType::External;
+    let (wire_as_path, as4_path) = if peer_four_byte {
+        (route.as_path.clone(), None)
+    } else {
+        let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
+        (d, orig)
+    };
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
-        PathAttribute::AsPath(route.as_path.clone()),
+        PathAttribute::AsPath(wire_as_path),
     ];
     if let Some(NextHop::V4(nh)) = route.next_hop {
         attrs.push(PathAttribute::NextHop(nh));
@@ -33,8 +54,11 @@ pub(crate) fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute>
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if let Some(m) = route.med {
-        attrs.push(PathAttribute::Med(m.as_u32()));
+    if !is_ebgp {
+        // RFC 4271 §5.1.4: MED SHOULD NOT be sent to eBGP peers.
+        if let Some(m) = route.med {
+            attrs.push(PathAttribute::Med(m.as_u32()));
+        }
     }
     if !route.communities.is_empty() {
         attrs.push(PathAttribute::Communities(route.communities.clone()));
@@ -55,11 +79,20 @@ pub(crate) fn route_to_attributes(route: &Route<Ipv4Addr>) -> Vec<PathAttribute>
     if let Some(agg) = route.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
-    if let Some(id) = route.originator_id {
-        attrs.push(PathAttribute::OriginatorId(id));
+    if !is_ebgp {
+        // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
+        if let Some(id) = route.originator_id {
+            attrs.push(PathAttribute::OriginatorId(id));
+        }
+        if !route.cluster_list.is_empty() {
+            attrs.push(PathAttribute::ClusterList(route.cluster_list.clone()));
+        }
     }
-    if !route.cluster_list.is_empty() {
-        attrs.push(PathAttribute::ClusterList(route.cluster_list.clone()));
+    // RFC 6793 §4: when the peer is 2-byte-only, include AS4_PATH so that
+    // 4-byte-capable routers further along the path can reconstruct the full
+    // AS path. Only emitted when downgrade actually substituted AS_TRANS above.
+    if let Some(as4) = as4_path {
+        attrs.push(PathAttribute::As4Path(as4));
     }
     attrs
 }
@@ -150,6 +183,8 @@ pub(crate) fn flush_updates(
     decisions: Vec<PrefixDecision>,
     max_len: usize,
     update_tx: &mpsc::Sender<UpdateMessage>,
+    peer_type: PeerType,
+    peer_four_byte: bool,
 ) -> bool {
     let mut withdrawals: Vec<Nlri<Ipv4Addr>> = Vec::new();
     let mut announce_groups: Vec<AnnounceGroup> = Vec::new();
@@ -158,7 +193,7 @@ pub(crate) fn flush_updates(
         match decision {
             PrefixDecision::Withdraw(nlri) => withdrawals.push(nlri),
             PrefixDecision::Announce(route) => {
-                let attrs = route_to_attributes(&route);
+                let attrs = route_to_attributes(&route, peer_type, peer_four_byte);
                 let attr_bytes = encode_attributes(&attrs);
                 // Linear scan — typically 1-3 distinct attribute groups per batch.
                 if let Some((_, _, nlris)) = announce_groups
@@ -324,6 +359,8 @@ pub(crate) fn flush_updates_v6(
     decisions: Vec<PrefixDecisionV6>,
     max_len: usize,
     update_tx: &mpsc::Sender<UpdateMessage>,
+    peer_type: PeerType,
+    peer_four_byte: bool,
 ) -> bool {
     // (encoded-attr-bytes, attribute-list-with-mp-reach, nlri-list)
     type AnnounceGroupV6 = (Vec<u8>, Vec<PathAttribute>, Vec<Nlri<Ipv6Addr>>);
@@ -338,7 +375,8 @@ pub(crate) fn flush_updates_v6(
                 // MP_UNREACH_NLRI is the only attribute on the announce message;
                 // we group routes with identical scalar attributes (same attrs
                 // minus the NLRI list) and pack them together.
-                let (mut attrs, mp_reach) = route_v6_to_attributes(&route);
+                let (mut attrs, mp_reach) =
+                    route_v6_to_attributes(&route, peer_type, peer_four_byte);
                 let key = encode_attributes(&attrs);
                 // Restore the MP_REACH_NLRI placeholder next-hop in the group leader.
                 if let Some((_, group_attrs, nlris)) =
@@ -429,18 +467,36 @@ pub(crate) fn send_mp_unreach_v6(
 
 /// Builds the path-attribute list for an outbound IPv6 route.
 ///
+/// `peer_type` controls attribute stripping — same rules as [`route_to_attributes`]:
+/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4).
+/// - ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP peers (RFC 4456 §8).
+///
 /// The NLRI is carried in MP_REACH_NLRI (RFC 4760); the traditional
 /// `NEXT_HOP` attribute is not emitted for IPv6 routes.
-pub(crate) fn route_v6_to_attributes(route: &Route<Ipv6Addr>) -> (Vec<PathAttribute>, MpReachNlri) {
+pub(crate) fn route_v6_to_attributes(
+    route: &Route<Ipv6Addr>,
+    peer_type: PeerType,
+    peer_four_byte: bool,
+) -> (Vec<PathAttribute>, MpReachNlri) {
+    let is_ebgp = peer_type == PeerType::External;
+    let (wire_as_path, as4_path) = if peer_four_byte {
+        (route.as_path.clone(), None)
+    } else {
+        let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
+        (d, orig)
+    };
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
-        PathAttribute::AsPath(route.as_path.clone()),
+        PathAttribute::AsPath(wire_as_path),
     ];
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if let Some(m) = route.med {
-        attrs.push(PathAttribute::Med(m.as_u32()));
+    if !is_ebgp {
+        // RFC 4271 §5.1.4: MED SHOULD NOT be sent to eBGP peers.
+        if let Some(m) = route.med {
+            attrs.push(PathAttribute::Med(m.as_u32()));
+        }
     }
     if !route.communities.is_empty() {
         attrs.push(PathAttribute::Communities(route.communities.clone()));
@@ -461,6 +517,18 @@ pub(crate) fn route_v6_to_attributes(route: &Route<Ipv6Addr>) -> (Vec<PathAttrib
     if let Some(agg) = route.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
+    if !is_ebgp {
+        // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
+        if let Some(id) = route.originator_id {
+            attrs.push(PathAttribute::OriginatorId(id));
+        }
+        if !route.cluster_list.is_empty() {
+            attrs.push(PathAttribute::ClusterList(route.cluster_list.clone()));
+        }
+    }
+    if let Some(as4) = as4_path {
+        attrs.push(PathAttribute::As4Path(as4));
+    }
     let next_hop = route.next_hop.unwrap_or(NextHop::V6(Ipv6Addr::UNSPECIFIED));
     let mp_reach = MpReachNlri {
         afi_safi: AfiSafi::IPV6_UNICAST,
@@ -478,7 +546,7 @@ mod flush_updates_tests {
 
     use pathvector_rib::{Route, RouteBuilder};
     use pathvector_session::message::{MAX_LEN, UpdateMessage};
-    use pathvector_types::{AsPath, Nlri, Origin};
+    use pathvector_types::{AsPath, Nlri, Origin, PeerType};
     use tokio::sync::mpsc;
 
     use super::{PrefixDecision, flush_updates};
@@ -497,7 +565,13 @@ mod flush_updates_tests {
         let route = base_route("10.0.0.0/8");
         let decisions = vec![PrefixDecision::Announce(route)];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let msg = rx.try_recv().expect("one UPDATE expected");
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
@@ -513,7 +587,13 @@ mod flush_updates_tests {
             .map(|p| PrefixDecision::Announce(base_route(p)))
             .collect();
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let msg = rx.try_recv().expect("one batched UPDATE expected");
         assert_eq!(msg.announced.len(), 3);
         assert!(rx.try_recv().is_err(), "all NLRIs in a single UPDATE");
@@ -531,7 +611,13 @@ mod flush_updates_tests {
             .build();
         let decisions = vec![PrefixDecision::Announce(r1), PrefixDecision::Announce(r2)];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let first = rx.try_recv().expect("first UPDATE");
         let second = rx.try_recv().expect("second UPDATE");
         assert_eq!(first.announced.len(), 1);
@@ -562,7 +648,13 @@ mod flush_updates_tests {
             .collect();
 
         let (tx, mut rx) = mpsc::channel(64);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
 
         // Drain all messages and verify: total announced == 1000, each message ≤ MAX_LEN.
         let mut total = 0usize;
@@ -586,7 +678,13 @@ mod flush_updates_tests {
             .map(|p| PrefixDecision::Withdraw(nlri(p)))
             .collect();
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let msg = rx.try_recv().expect("one withdraw UPDATE expected");
         assert_eq!(msg.withdrawn.len(), 3);
         assert!(msg.announced.is_empty());
@@ -601,7 +699,13 @@ mod flush_updates_tests {
             PrefixDecision::Withdraw(nlri("192.168.0.0/16")),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let first = rx.try_recv().expect("first message");
         assert!(!first.withdrawn.is_empty(), "withdraw must come first");
         let second = rx.try_recv().expect("second message");
@@ -613,7 +717,13 @@ mod flush_updates_tests {
     fn test_flush_no_change_produces_nothing() {
         let decisions = vec![PrefixDecision::NoChange, PrefixDecision::NoChange];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         assert!(rx.try_recv().is_err(), "no messages for NoChange");
     }
 
@@ -630,7 +740,13 @@ mod flush_updates_tests {
         .unwrap();
 
         let decisions = vec![PrefixDecision::Withdraw(nlri("10.0.0.0/8"))];
-        assert!(!flush_updates(decisions, MAX_LEN, &tx));
+        assert!(!flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// Returns false when the channel is closed (announcement path).
@@ -639,7 +755,13 @@ mod flush_updates_tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let decisions = vec![PrefixDecision::Announce(base_route("10.0.0.0/8"))];
-        assert!(!flush_updates(decisions, MAX_LEN, &tx));
+        assert!(!flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// 1 000 withdrawals are all delivered even when they span multiple UPDATEs.
@@ -659,7 +781,13 @@ mod flush_updates_tests {
             .collect();
 
         let (tx, mut rx) = mpsc::channel(64);
-        assert!(flush_updates(decisions, MAX_LEN, &tx));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
 
         let mut total = 0usize;
         while let Ok(msg) = rx.try_recv() {
@@ -691,7 +819,13 @@ mod flush_updates_tests {
         // Drop the receiver after the first message is queued so the second fails.
         drop(rx);
         // Channel is already closed; even the first send will fail.
-        assert!(!flush_updates(decisions, MAX_LEN, &tx));
+        assert!(!flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 }
 
@@ -703,7 +837,7 @@ mod v6_tests {
     use pathvector_session::message::{MAX_LEN, PathAttribute, UpdateMessage};
     use pathvector_types::{
         Aggregator, AsPath, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med,
-        NextHop, Nlri, Origin,
+        NextHop, Nlri, Origin, PeerType,
     };
     use tokio::sync::mpsc;
 
@@ -726,7 +860,7 @@ mod v6_tests {
             .med(Med::new(100))
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let (attrs, _) = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(attrs.iter().any(|a| matches!(a, PathAttribute::Med(100))));
     }
 
@@ -737,7 +871,7 @@ mod v6_tests {
             .community(Community::from(0x0001_0001u32))
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let (attrs, _) = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
             attrs
                 .iter()
@@ -757,7 +891,7 @@ mod v6_tests {
             .large_community(lc)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let (attrs, _) = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
             attrs
                 .iter()
@@ -773,7 +907,7 @@ mod v6_tests {
             .extended_community(ec)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let (attrs, _) = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
             attrs
                 .iter()
@@ -788,7 +922,7 @@ mod v6_tests {
             .local_pref(LocalPref::new(200))
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let (attrs, _) = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
             attrs
                 .iter()
@@ -807,11 +941,89 @@ mod v6_tests {
             .aggregator(agg)
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        let (attrs, _) = route_v6_to_attributes(&route);
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
             attrs
                 .iter()
                 .any(|a| matches!(a, PathAttribute::Aggregator(_)))
+        );
+    }
+
+    // ── IPv6 eBGP attribute stripping (findings F and G) ─────────────────────
+
+    /// MED must be stripped for eBGP peers on the IPv6 path (RFC 4271 §5.1.4).
+    #[test]
+    fn test_route_v6_to_attributes_ebgp_strips_med() {
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .med(Med::new(100))
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::External, true);
+        assert!(
+            !attrs.iter().any(|a| matches!(a, PathAttribute::Med(_))),
+            "MED must be stripped for eBGP IPv6 peers (RFC 4271 §5.1.4)"
+        );
+    }
+
+    /// MED must be preserved for iBGP peers on the IPv6 path.
+    #[test]
+    fn test_route_v6_to_attributes_ibgp_preserves_med() {
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .med(Med::new(100))
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
+        assert!(
+            attrs.iter().any(|a| matches!(a, PathAttribute::Med(_))),
+            "MED must be preserved for iBGP IPv6 peers"
+        );
+    }
+
+    /// ORIGINATOR_ID and CLUSTER_LIST must be stripped for eBGP on the IPv6 path (RFC 4456 §8).
+    #[test]
+    fn test_route_v6_to_attributes_ebgp_strips_rr_attributes() {
+        let mut route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        route.originator_id = Some("1.1.1.1".parse().unwrap());
+        route.cluster_list = vec![0x0101_0101u32];
+
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::External, true);
+        assert!(
+            !attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_))),
+            "ORIGINATOR_ID must be stripped for eBGP IPv6 peers (RFC 4456 §8)"
+        );
+        assert!(
+            !attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ClusterList(_))),
+            "CLUSTER_LIST must be stripped for eBGP IPv6 peers (RFC 4456 §8)"
+        );
+    }
+
+    /// ORIGINATOR_ID and CLUSTER_LIST must be preserved for iBGP on the IPv6 path.
+    #[test]
+    fn test_route_v6_to_attributes_ibgp_preserves_rr_attributes() {
+        let mut route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        route.originator_id = Some("1.1.1.1".parse().unwrap());
+        route.cluster_list = vec![0x0101_0101u32];
+
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_))),
+            "ORIGINATOR_ID must be preserved for iBGP IPv6 peers"
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ClusterList(_))),
+            "CLUSTER_LIST must be preserved for iBGP IPv6 peers"
         );
     }
 
@@ -821,7 +1033,13 @@ mod v6_tests {
         let (tx, rx) = mpsc::channel::<UpdateMessage>(1);
         drop(rx);
         let decisions = vec![PrefixDecisionV6::Announce(base_route_v6("2001:db8::/32"))];
-        assert!(!flush_updates_v6(decisions, MAX_LEN, &tx));
+        assert!(!flush_updates_v6(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// flush_updates_v6 returns false for withdrawals when channel is closed.
@@ -830,7 +1048,13 @@ mod v6_tests {
         let (tx, rx) = mpsc::channel::<UpdateMessage>(1);
         drop(rx);
         let decisions = vec![PrefixDecisionV6::Withdraw(nlri6("2001:db8::/32"))];
-        assert!(!flush_updates_v6(decisions, MAX_LEN, &tx));
+        assert!(!flush_updates_v6(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 }
 
@@ -840,7 +1064,7 @@ mod prop_tests {
 
     use pathvector_rib::RouteBuilder;
     use pathvector_session::message::{BgpMessage, MAX_LEN};
-    use pathvector_types::{AsPath, NextHop, Nlri, Origin};
+    use pathvector_types::{AsPath, NextHop, Nlri, Origin, PeerType};
     use proptest::prelude::*;
     use tokio::sync::mpsc;
 
@@ -910,7 +1134,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates(decisions, MAX_LEN, &tx);
+                let _ = flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true);
                 while let Ok(msg) = rx.try_recv() {
                     let wire = BgpMessage::Update(msg).encode();
                     prop_assert!(wire.len() <= MAX_LEN,
@@ -933,7 +1157,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates(decisions, MAX_LEN, &tx);
+                let _ = flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true);
                 let mut sent: Vec<Nlri<Ipv4Addr>> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     sent.extend(msg.announced);
@@ -961,7 +1185,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates(decisions, MAX_LEN, &tx);
+                let _ = flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true);
                 let mut sent: Vec<Nlri<Ipv4Addr>> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     sent.extend(msg.withdrawn);
@@ -980,7 +1204,7 @@ mod prop_tests {
     // ── IPv6 flush_updates_v6 properties ─────────────────────────────────────
 
     proptest! {
-        /// No IPv6 UPDATE message may exceed `max_len` bytes on the wire.
+        /// No IPv6 UPDATE message may exceed MAX_LEN bytes on the wire.
         #[test]
         fn prop_flush_updates_v6_no_message_exceeds_max_len(
             decisions in proptest::collection::vec(arb_decision_v6(), 0..=100),
@@ -989,7 +1213,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates_v6(decisions, MAX_LEN, &tx);
+                let _ = flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true);
                 while let Ok(msg) = rx.try_recv() {
                     let wire = BgpMessage::Update(msg).encode();
                     prop_assert!(wire.len() <= MAX_LEN,
@@ -998,5 +1222,158 @@ mod prop_tests {
                 Ok(())
             })?;
         }
+    }
+}
+
+// ── AS_TRANS / AS4_PATH (RFC 6793 §4) ────────────────────────────────────────
+#[cfg(test)]
+mod route_to_attributes_tests {
+    use std::net::Ipv4Addr;
+
+    use pathvector_rib::RouteBuilder;
+    use pathvector_session::message::PathAttribute;
+    use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
+
+    use super::route_to_attributes;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn route_with_asns(asns: Vec<Asn>) -> pathvector_rib::Route<Ipv4Addr> {
+        RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::from_sequence(asns))
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .build()
+    }
+
+    fn as_path_asns(attrs: &[PathAttribute]) -> Vec<Asn> {
+        attrs
+            .iter()
+            .find_map(|a| {
+                if let PathAttribute::AsPath(p) = a {
+                    Some(p.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("AS_PATH must be present")
+            .segments()
+            .iter()
+            .flat_map(|s| s.asns().to_vec())
+            .collect()
+    }
+
+    fn as4_path_asns(attrs: &[PathAttribute]) -> Option<Vec<Asn>> {
+        attrs.iter().find_map(|a| {
+            if let PathAttribute::As4Path(p) = a {
+                Some(
+                    p.segments()
+                        .iter()
+                        .flat_map(|s| s.asns().to_vec())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 2-byte-only peer with all-2-byte ASNs: no AS_TRANS substitution, no AS4_PATH.
+    #[test]
+    fn two_byte_asns_to_two_byte_peer_no_trans_no_as4_path() {
+        let route = route_with_asns(vec![Asn::new(65001), Asn::new(65002)]);
+        let attrs = route_to_attributes(&route, PeerType::External, false);
+
+        let asns = as_path_asns(&attrs);
+        assert!(
+            !asns.contains(&Asn::TRANS),
+            "no AS_TRANS for all-2-byte path"
+        );
+        assert!(asns.contains(&Asn::new(65001)));
+
+        assert!(
+            as4_path_asns(&attrs).is_none(),
+            "no AS4_PATH when no substitution occurred"
+        );
+    }
+
+    /// 4-byte ASN sent to 2-byte-only peer: AS_TRANS substituted in AS_PATH;
+    /// original ASN preserved in AS4_PATH (RFC 6793 §4).
+    #[test]
+    fn four_byte_asn_to_two_byte_peer_inserts_trans_and_as4_path() {
+        let route = route_with_asns(vec![Asn::new(65001), Asn::new(131_072)]);
+        let attrs = route_to_attributes(&route, PeerType::External, false);
+
+        let wire_asns = as_path_asns(&attrs);
+        assert!(
+            wire_asns.contains(&Asn::TRANS),
+            "AS_TRANS must replace 4-byte ASN in AS_PATH"
+        );
+        assert!(
+            !wire_asns.contains(&Asn::new(131_072)),
+            "original 4-byte ASN must not appear in wire AS_PATH"
+        );
+
+        let as4_asns =
+            as4_path_asns(&attrs).expect("AS4_PATH must be present for 2-byte-only peer");
+        assert!(
+            as4_asns.contains(&Asn::new(131_072)),
+            "original 4-byte ASN must be preserved in AS4_PATH"
+        );
+    }
+
+    /// 4-byte ASN sent to 4-byte-capable peer: no substitution, no AS4_PATH.
+    #[test]
+    fn four_byte_asn_to_four_byte_peer_no_trans_no_as4_path() {
+        let route = route_with_asns(vec![Asn::new(65001), Asn::new(131_072)]);
+        let attrs = route_to_attributes(&route, PeerType::External, true);
+
+        let wire_asns = as_path_asns(&attrs);
+        assert!(
+            !wire_asns.contains(&Asn::TRANS),
+            "no AS_TRANS for 4-byte-capable peer"
+        );
+        assert!(
+            wire_asns.contains(&Asn::new(131_072)),
+            "original 4-byte ASN preserved"
+        );
+
+        assert!(
+            as4_path_asns(&attrs).is_none(),
+            "no AS4_PATH for 4-byte-capable peer"
+        );
+    }
+
+    /// AS4_PATH must appear as the last attribute so 2-byte speakers that don't
+    /// understand it can skip it without affecting earlier well-known attributes.
+    #[test]
+    fn as4_path_is_last_attribute_for_two_byte_peer() {
+        let route = route_with_asns(vec![Asn::new(131_072)]);
+        let attrs = route_to_attributes(&route, PeerType::External, false);
+        assert!(
+            matches!(attrs.last(), Some(PathAttribute::As4Path(_))),
+            "AS4_PATH must be the last attribute"
+        );
+    }
+
+    /// All-4-byte path sent to 2-byte peer: every ASN becomes AS_TRANS, all
+    /// original ASNs are recoverable from AS4_PATH.
+    #[test]
+    fn all_four_byte_asns_to_two_byte_peer_full_trans_substitution() {
+        let asns = vec![Asn::new(131_072), Asn::new(262_144), Asn::new(393_216)];
+        let route = route_with_asns(asns.clone());
+        let attrs = route_to_attributes(&route, PeerType::External, false);
+
+        let wire_asns = as_path_asns(&attrs);
+        assert!(
+            wire_asns.iter().all(|&a| a == Asn::TRANS),
+            "every wire ASN must be AS_TRANS when all ASNs are 4-byte"
+        );
+
+        let as4_asns = as4_path_asns(&attrs).expect("AS4_PATH must be present");
+        assert_eq!(
+            as4_asns, asns,
+            "AS4_PATH must preserve all original 4-byte ASNs in order"
+        );
     }
 }
