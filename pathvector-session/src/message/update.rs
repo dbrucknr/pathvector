@@ -1979,7 +1979,11 @@ mod prop_tests {
             // Mask the host bits so the network address is canonical.
             let shift = 32u32.saturating_sub(u32::from(prefix_len));
             let raw = u32::from_be_bytes([10, b, 0, 0]);
-            let masked = if shift >= 32 { 0 } else { (raw >> shift) << shift };
+            let masked = if shift >= 32 {
+                0
+            } else {
+                (raw >> shift) << shift
+            };
             let addr = Ipv4Addr::from(masked);
             format!("{addr}/{prefix_len}").parse().unwrap()
         })

@@ -628,15 +628,14 @@ mod flush_updates_tests {
     /// A batch too large for MAX_LEN is split across multiple UPDATEs.
     #[test]
     fn test_flush_splits_when_exceeding_max_len() {
-        // Each /24 encodes as 4 bytes of NLRI. With default MAX_LEN=4096:
-        // fixed overhead = 23 bytes; attr bytes ~4 bytes (Origin+AsPath minimal).
-        // 1000 NLRIs × 4 bytes = 4000 bytes of NLRIs, plus overhead > 4096.
-        let decisions: Vec<PrefixDecision> = (0u32..1000)
+        // 1 500 /24 NLRIs with identical attrs (Origin+AsPath) exceed MAX_LEN=4096
+        // in a single group, exercising the mid-loop announcement batch-flush path.
+        let decisions: Vec<PrefixDecision> = (0u32..1500)
             .map(|i| {
                 #[allow(clippy::cast_possible_truncation)]
-                let a = (i / 256) as u8; // i < 1000, so i/256 ≤ 3
+                let a = (i / 256) as u8;
                 #[allow(clippy::cast_possible_truncation)]
-                let b = (i % 256) as u8; // always ≤ 255
+                let b = (i % 256) as u8;
                 let route = RouteBuilder::new(
                     Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap(),
                     Origin::Igp,
@@ -647,7 +646,7 @@ mod flush_updates_tests {
             })
             .collect();
 
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(128);
         assert!(flush_updates(
             decisions,
             MAX_LEN,
@@ -656,7 +655,6 @@ mod flush_updates_tests {
             true
         ));
 
-        // Drain all messages and verify: total announced == 1000, each message ≤ MAX_LEN.
         let mut total = 0usize;
         while let Ok(msg) = rx.try_recv() {
             use pathvector_session::message::BgpMessage;
@@ -667,7 +665,7 @@ mod flush_updates_tests {
             );
             total += msg.announced.len();
         }
-        assert_eq!(total, 1000, "all NLRIs must be sent");
+        assert_eq!(total, 1500, "all NLRIs must be sent");
     }
 
     /// Withdrawals are batched into a single withdraw-only UPDATE.
@@ -764,13 +762,13 @@ mod flush_updates_tests {
         ));
     }
 
-    /// 1 000 withdrawals are all delivered even when they span multiple UPDATEs.
+    /// 1 500 withdrawals are all delivered even when they span multiple UPDATEs.
     ///
-    /// This is the withdrawal analogue of `test_flush_splits_when_exceeding_max_len`.
-    /// The withdrawal path has its own batching loop and previously had no split test.
+    /// 1 500 /24 NLRIs (4 bytes each) at MAX_LEN=4096 with 23-byte overhead
+    /// fills more than one UPDATE, exercising the mid-loop batch-flush path.
     #[test]
     fn test_flush_withdrawal_split_delivers_all_nlris() {
-        let decisions: Vec<PrefixDecision> = (0u32..1000)
+        let decisions: Vec<PrefixDecision> = (0u32..1500)
             .map(|i| {
                 #[allow(clippy::cast_possible_truncation)]
                 let a = (i / 256) as u8;
@@ -780,7 +778,7 @@ mod flush_updates_tests {
             })
             .collect();
 
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(128);
         assert!(flush_updates(
             decisions,
             MAX_LEN,
@@ -800,32 +798,50 @@ mod flush_updates_tests {
             assert!(msg.announced.is_empty(), "withdraw batch must not announce");
             total += msg.withdrawn.len();
         }
-        assert_eq!(total, 1000, "all withdrawals must be delivered");
+        assert_eq!(total, 1500, "all withdrawals must be delivered");
     }
 
-    /// Returns false mid-batch when channel fills during withdrawal overflow.
+    /// Returns false when channel is pre-filled and a mid-batch overflow flush fails.
+    ///
+    /// max_len = 26: fits exactly one /8 NLRI (23-byte overhead + 2 bytes = 25 ≤ 26).
+    /// The second /8 NLRI triggers overflow (25 + 2 = 27 > 26) and try_send fails
+    /// because the channel was pre-filled — covering the `return false` at line 229.
     #[test]
-    fn test_flush_withdrawal_overflow_false_on_full_channel() {
-        // Use a tiny max_len so the second withdrawal forces a flush of the first.
-        // Channel capacity 1 lets the first flush succeed; channel drops so the
-        // second try_send (the overflow flush) fails.
-        let (tx, rx) = mpsc::channel(1);
-        // 23 bytes fixed overhead; each /8 NLRI is 2 bytes.  max_len=25 fits
-        // exactly one withdrawal per message, so the second triggers overflow.
-        let decisions: Vec<PrefixDecision> = ["10.0.0.0/8", "192.0.2.0/24"]
-            .iter()
-            .map(|p| PrefixDecision::Withdraw(nlri(p)))
-            .collect();
-        // Drop the receiver after the first message is queued so the second fails.
-        drop(rx);
-        // Channel is already closed; even the first send will fail.
-        assert!(!flush_updates(
-            decisions,
-            MAX_LEN,
-            &tx,
-            PeerType::External,
-            true
-        ));
+    fn test_flush_withdrawal_mid_batch_overflow_full_channel_returns_false() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+        let decisions = vec![
+            PrefixDecision::Withdraw(nlri("10.0.0.0/8")),
+            PrefixDecision::Withdraw(nlri("11.0.0.0/8")),
+        ];
+        assert!(!flush_updates(decisions, 26, &tx, PeerType::External, true));
+    }
+
+    /// Returns false when channel fills during a mid-batch announce overflow.
+    ///
+    /// max_len = 50: smaller than 23-byte overhead + minimal attr block + two /8 NLRIs,
+    /// forcing the announcement batch to split mid-loop with a pre-filled channel.
+    #[test]
+    fn test_flush_announce_mid_batch_overflow_full_channel_returns_false() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+        // Two identical-attrs /8 routes.  With max_len=50, the second NLRI triggers
+        // an overflow try_send which fails because the channel is full.
+        let decisions = vec![
+            PrefixDecision::Announce(base_route("10.0.0.0/8")),
+            PrefixDecision::Announce(base_route("11.0.0.0/8")),
+        ];
+        assert!(!flush_updates(decisions, 50, &tx, PeerType::External, true));
     }
 }
 
@@ -1055,6 +1071,121 @@ mod v6_tests {
             PeerType::External,
             true
         ));
+    }
+
+    /// Returns false when channel fills during a mid-batch v6 withdrawal overflow.
+    ///
+    /// max_len = 35 fits exactly one /32 v6 NLRI (23-byte overhead + 7-byte
+    /// MP_UNREACH_NLRI header + 5-byte /32 NLRI = 35).  The second NLRI triggers
+    /// an overflow try_send which fails because the channel is pre-filled.
+    #[test]
+    fn test_flush_v6_withdrawal_mid_batch_overflow_full_channel_returns_false() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .unwrap();
+        let decisions = vec![
+            PrefixDecisionV6::Withdraw(nlri6("2001:db8::/32")),
+            PrefixDecisionV6::Withdraw(nlri6("2001:db8:1::/32")),
+        ];
+        assert!(!flush_updates_v6(
+            decisions,
+            35,
+            &tx,
+            PeerType::External,
+            true
+        ));
+    }
+
+    /// 1 500 IPv6 withdrawals span multiple MP_UNREACH_NLRI UPDATEs.
+    ///
+    /// Each /32 NLRI encodes to 5 bytes; MAX_LEN=4096 with 23-byte overhead
+    /// and a 7-byte MP_UNREACH_NLRI header holds ~(4096-23-7)/5 ≈ 813 NLRIs per
+    /// message.  1 500 NLRIs forces at least one mid-loop batch flush.
+    #[test]
+    fn test_flush_v6_withdrawal_split_delivers_all_nlris() {
+        use pathvector_session::message::BgpMessage;
+        let decisions: Vec<PrefixDecisionV6> = (0u32..1500)
+            .map(|i| {
+                let a = ((i >> 8) & 0xff) as u8;
+                let b = (i & 0xff) as u8;
+                let prefix: std::net::Ipv6Addr = format!("2001:{a:02x}{b:02x}::").parse().unwrap();
+                PrefixDecisionV6::Withdraw(pathvector_types::Nlri::new(prefix, 32).unwrap())
+            })
+            .collect();
+
+        let (tx, mut rx) = mpsc::channel(128);
+        assert!(flush_updates_v6(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
+
+        let mut total = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            let wire_len = BgpMessage::Update(msg.clone()).encode().len();
+            assert!(
+                wire_len <= MAX_LEN,
+                "v6 withdraw UPDATE {wire_len} bytes > MAX_LEN"
+            );
+            total += msg
+                .attributes
+                .iter()
+                .filter_map(|a| {
+                    if let PathAttribute::MpUnreachNlri(u) = a {
+                        Some(u.prefixes.len())
+                    } else {
+                        None
+                    }
+                })
+                .sum::<usize>();
+        }
+        assert_eq!(total, 1500, "all IPv6 withdrawals must be delivered");
+    }
+
+    /// route_v6_to_attributes includes AtomicAggregate when set.
+    #[test]
+    fn test_route_v6_to_attributes_with_atomic_aggregate() {
+        use pathvector_rib::RouteBuilder;
+        let n = nlri6("2001:db8::/32");
+        let route = RouteBuilder::new(
+            n,
+            pathvector_types::Origin::Igp,
+            pathvector_types::AsPath::new(),
+        )
+        .atomic_aggregate()
+        .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+        .build();
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::AtomicAggregate)),
+            "AtomicAggregate must be present when route.atomic_aggregate is true"
+        );
+    }
+
+    /// route_v6_to_attributes includes As4Path when peer is two-byte-only.
+    #[test]
+    fn test_route_v6_to_attributes_includes_as4path_for_two_byte_peer() {
+        use pathvector_rib::RouteBuilder;
+        use pathvector_types::{AsPath, Asn};
+        let n = nlri6("2001:db8::/32");
+        // A 4-byte ASN triggers AS4_PATH when the peer is two-byte-only.
+        let path = AsPath::from_sequence(vec![Asn::new(131_072)]); // 0x0002_0000 — four-byte
+        let route = RouteBuilder::new(n, pathvector_types::Origin::Igp, path)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::External, false);
+        assert!(
+            attrs.iter().any(|a| matches!(a, PathAttribute::As4Path(_))),
+            "As4Path must be present when 4-byte ASNs are downgraded for a two-byte peer"
+        );
     }
 }
 
@@ -1446,6 +1577,209 @@ mod route_to_attributes_tests {
         assert_eq!(
             as4_asns, asns,
             "AS4_PATH must preserve all original 4-byte ASNs in order"
+        );
+    }
+}
+
+#[cfg(test)]
+mod propagate_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use pathvector_policy::{DefaultAction, Policy};
+    use pathvector_rib::{AdjRibOut, LocRib, PeerId, RouteBuilder};
+    use pathvector_types::{AsPath, NextHop, Nlri, Origin, PeerType};
+
+    use super::{PrefixDecision, PrefixDecisionV6, propagate_prefix, propagate_prefix_v6};
+
+    fn peer(ip: &str) -> PeerId {
+        PeerId::from(ip.parse::<Ipv4Addr>().unwrap())
+    }
+
+    fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn nlri6(s: &str) -> Nlri<Ipv6Addr> {
+        s.parse().unwrap()
+    }
+
+    fn route_v4(n: Nlri<Ipv4Addr>) -> pathvector_rib::Route<Ipv4Addr> {
+        RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .peer_type(PeerType::External)
+            .build()
+    }
+
+    fn route_v6(n: Nlri<Ipv6Addr>) -> pathvector_rib::Route<Ipv6Addr> {
+        RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .peer_type(PeerType::External)
+            .build()
+    }
+
+    fn accept_policy() -> Policy<pathvector_rib::Route<Ipv4Addr>> {
+        Policy::new(DefaultAction::Accept)
+    }
+
+    // ── propagate_prefix ─────────────────────────────────────────────────────
+
+    /// Split-horizon Withdraw: when the best route came from the target peer and
+    /// there was a previously advertised route, propagate_prefix must withdraw it.
+    #[test]
+    fn test_propagate_prefix_split_horizon_withdraw() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(src, route_v4(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        // adj_rib_out for the same source peer — split-horizon applies.
+        let mut adj_out = AdjRibOut::new(src, PeerType::External);
+
+        // Pre-advertise the route so withdraw() returns Some.
+        adj_out.insert(route_v4(n));
+
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+        );
+        assert!(
+            matches!(decision, PrefixDecision::Withdraw(_)),
+            "split-horizon must produce Withdraw when route was previously advertised"
+        );
+    }
+
+    // ── propagate_prefix_v6 ──────────────────────────────────────────────────
+
+    /// Split-horizon Withdraw (v6): same as above for IPv6.
+    #[test]
+    fn test_propagate_prefix_v6_split_horizon_withdraw() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(src, route_v6(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(src, PeerType::External);
+        adj_out.insert(route_v6(n));
+
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+        );
+        assert!(
+            matches!(decision, PrefixDecisionV6::Withdraw(_)),
+            "split-horizon must produce Withdraw for v6 when route was previously advertised"
+        );
+    }
+
+    /// NoChange (v6): inserting the same route twice yields NoChange on the second call.
+    #[test]
+    fn test_propagate_prefix_v6_no_change_when_route_unchanged() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(src, route_v6(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+
+        // First call: Announce.
+        let _ = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+        );
+
+        // Second call with same best route: NoChange.
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+        );
+        assert!(
+            matches!(decision, PrefixDecisionV6::NoChange),
+            "re-propagating the same route must produce NoChange"
+        );
+    }
+
+    /// Filtered(Some) (v6): iBGP split horizon evicts a previously stored route.
+    #[test]
+    fn test_propagate_prefix_v6_ibgp_filtered_with_eviction() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let ibgp_dest = peer("10.0.0.3");
+
+        // Route comes from an iBGP peer.
+        let ibgp_route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .peer_type(PeerType::Internal)
+            .build();
+
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            ibgp_route.clone(),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        // adj_rib_out for an iBGP peer — iBGP split horizon applies.
+        let mut adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
+
+        // Pre-seed adj_rib_out by forcing a direct insert (bypassing propagate),
+        // so that AdjRibOut::insert later returns Filtered(Some(_)).
+        let seed_route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .peer_type(PeerType::External) // eBGP type passes the filter
+            .build();
+        adj_out.insert(seed_route);
+
+        // Now propagate with an iBGP-sourced route → AdjRibOut::insert returns
+        // Filtered(Some(prev)) because peer_type == Internal on both sides.
+        let decision =
+            propagate_prefix_v6(n, &loc_rib, &mut adj_out, PeerType::Internal, 65001, None);
+        assert!(
+            matches!(decision, PrefixDecisionV6::Withdraw(_)),
+            "iBGP split-horizon with evicted route must produce Withdraw"
+        );
+    }
+
+    /// Filtered(None) (v6): iBGP split horizon with no previous entry → NoChange.
+    #[test]
+    fn test_propagate_prefix_v6_ibgp_filtered_no_prior_entry() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let ibgp_dest = peer("10.0.0.3");
+
+        let ibgp_route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .peer_type(PeerType::Internal)
+            .build();
+
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(src, ibgp_route, &pathvector_rib::oracle::AlwaysReachable);
+
+        // Empty adj_rib_out for an iBGP peer → Filtered(None).
+        let mut adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
+
+        let decision =
+            propagate_prefix_v6(n, &loc_rib, &mut adj_out, PeerType::Internal, 65001, None);
+        assert!(
+            matches!(decision, PrefixDecisionV6::NoChange),
+            "iBGP split-horizon with no prior entry must produce NoChange"
         );
     }
 }

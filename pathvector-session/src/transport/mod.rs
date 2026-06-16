@@ -1398,7 +1398,10 @@ mod tests {
             announced: vec![],
         };
         let result = super::make_treat_as_withdraw(update);
-        assert!(result.attributes.is_empty(), "non-MpReach attrs must be stripped");
+        assert!(
+            result.attributes.is_empty(),
+            "non-MpReach attrs must be stripped"
+        );
         assert!(result.withdrawn.is_empty());
         assert!(result.announced.is_empty());
     }

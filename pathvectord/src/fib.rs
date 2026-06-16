@@ -291,6 +291,7 @@ mod tests {
     struct MockFibWriter {
         calls: Arc<Mutex<Calls>>,
         fail_v4: bool,
+        fail_v6: bool,
     }
 
     impl MockFibWriter {
@@ -300,6 +301,7 @@ mod tests {
                 Self {
                     calls: Arc::clone(&calls),
                     fail_v4: false,
+                    fail_v6: false,
                 },
                 calls,
             )
@@ -308,6 +310,12 @@ mod tests {
         fn failing() -> (Self, Arc<Mutex<Calls>>) {
             let (mut w, calls) = Self::new();
             w.fail_v4 = true;
+            (w, calls)
+        }
+
+        fn failing_v6() -> (Self, Arc<Mutex<Calls>>) {
+            let (mut w, calls) = Self::new();
+            w.fail_v6 = true;
             (w, calls)
         }
     }
@@ -322,12 +330,20 @@ mod tests {
             if self.fail_v4 {
                 return Err(std::io::Error::other("mock install_v4 failure"));
             }
-            self.calls.lock().unwrap().installed_v4.push((dst, prefix_len, gateway));
+            self.calls
+                .lock()
+                .unwrap()
+                .installed_v4
+                .push((dst, prefix_len, gateway));
             Ok(())
         }
 
         async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
-            self.calls.lock().unwrap().withdrawn_v4.push((dst, prefix_len));
+            self.calls
+                .lock()
+                .unwrap()
+                .withdrawn_v4
+                .push((dst, prefix_len));
             Ok(())
         }
 
@@ -337,12 +353,26 @@ mod tests {
             prefix_len: u8,
             gateway: Ipv6Addr,
         ) -> std::io::Result<()> {
-            self.calls.lock().unwrap().installed_v6.push((dst, prefix_len, gateway));
+            if self.fail_v6 {
+                return Err(std::io::Error::other("mock install_v6 failure"));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .installed_v6
+                .push((dst, prefix_len, gateway));
             Ok(())
         }
 
         async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
-            self.calls.lock().unwrap().withdrawn_v6.push((dst, prefix_len));
+            if self.fail_v6 {
+                return Err(std::io::Error::other("mock withdraw_v6 failure"));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .withdrawn_v6
+                .push((dst, prefix_len));
             Ok(())
         }
     }
@@ -355,7 +385,9 @@ mod tests {
     // at compile time; no vtable is involved.
 
     fn v4_install(gw: &str) -> PendingV4 {
-        PendingV4::Install { gateway: gw.parse().unwrap() }
+        PendingV4::Install {
+            gateway: gw.parse().unwrap(),
+        }
     }
 
     #[tokio::test]
@@ -392,7 +424,10 @@ mod tests {
         v6.insert(nlri, PendingV6::Install { gateway: gw });
         super::process_batch(&mock, HashMap::new(), v6).await;
         let c = calls.lock().unwrap();
-        assert_eq!(c.installed_v6, vec![("2001:db8::".parse().unwrap(), 32, gw)]);
+        assert_eq!(
+            c.installed_v6,
+            vec![("2001:db8::".parse().unwrap(), 32, gw)]
+        );
         assert!(c.withdrawn_v6.is_empty());
     }
 
@@ -421,7 +456,10 @@ mod tests {
         super::process_batch(&mock, v4, HashMap::new()).await;
         let c = calls.lock().unwrap();
         // install_v4 errored (fail_v4=true), withdraw_v4 succeeded.
-        assert!(c.installed_v4.is_empty(), "failed install must not be recorded");
+        assert!(
+            c.installed_v4.is_empty(),
+            "failed install must not be recorded"
+        );
         assert_eq!(c.withdrawn_v4.len(), 1);
     }
 
@@ -765,5 +803,61 @@ mod tests {
             link_local: "2001:db8::2".parse().unwrap(),
         };
         assert!(!oracle.is_reachable(&nh));
+    }
+
+    #[test]
+    fn test_daemon_oracle_v6_with_link_local_global_reachable_returns_true() {
+        // global = fe80::1 is link-local → is_v6_reachable returns true immediately,
+        // so the "prefer global" branch (line 59) is taken and true is returned
+        // without consulting the link-local.
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        let nh = NextHop::V6WithLinkLocal {
+            global: "fe80::1".parse().unwrap(),
+            link_local: "fe80::2".parse().unwrap(),
+        };
+        assert!(oracle.is_reachable(&nh));
+    }
+
+    #[tokio::test]
+    async fn test_fib_manager_new_spawns_writer_and_processes_batch() {
+        // FibManager::new() is never called in the other tests (they use make_fm()
+        // to bypass the tokio::spawn). This test exercises the real constructor and
+        // the spawned writer loop by applying a change and waiting for it to drain.
+        let (mock, calls) = MockFibWriter::new();
+        let fm = FibManager::new(mock);
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        fm.apply_v4(BestPathChange::Withdrawn(nlri));
+        // Give the spawned writer task one scheduler tick to wake and drain.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.lock().unwrap().withdrawn_v4,
+            vec![(Ipv4Addr::new(10, 0, 0, 0), 8)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_v6_install_failure_logs_and_continues() {
+        // The v6 install/withdraw error arms (tracing::warn inside process_batch)
+        // are reached when the writer returns Err for install_v6/withdraw_v6.
+        let (mock, calls) = MockFibWriter::failing_v6();
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let nlri6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let nlri6b: Nlri<Ipv6Addr> = "2001:db8:1::/48".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri6, PendingV6::Install { gateway: gw });
+        v6.insert(nlri6b, PendingV6::Withdraw);
+        super::process_batch(&mock, HashMap::new(), v6).await;
+        let c = calls.lock().unwrap();
+        assert!(
+            c.installed_v6.is_empty(),
+            "failed install_v6 must not be recorded"
+        );
+        assert!(
+            c.withdrawn_v6.is_empty(),
+            "failed withdraw_v6 must not be recorded"
+        );
     }
 }

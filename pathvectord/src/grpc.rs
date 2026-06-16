@@ -1244,7 +1244,16 @@ mod tests {
         assert_eq!(seg.asns, vec![65200, 65201]);
     }
 
-    // ── parse_nlri ────────────────────────────────────────────────────────────
+    // ── parse_nlri / parse_nlri_v6 ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_nlri_v6_invalid_returns_invalid_argument() {
+        let err = super::parse_nlri_v6("not-a-cidr").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let err2 = super::parse_nlri_v6("2001:db8::/999").unwrap_err();
+        assert_eq!(err2.code(), tonic::Code::InvalidArgument);
+    }
 
     #[test]
     fn test_parse_nlri_valid_cidrs() {
@@ -2100,6 +2109,76 @@ mod tests {
         assert_eq!(route.origin, pathvector_types::Origin::Egp);
     }
 
+    #[test]
+    fn test_parse_originate_request_v6_incomplete_origin() {
+        use super::parse_originate_request_v6;
+        let mut req = minimal_originate_req_v6();
+        req.origin = proto::Origin::Incomplete as i32;
+        let route = parse_originate_request_v6(req).unwrap();
+        assert_eq!(route.origin, pathvector_types::Origin::Incomplete);
+    }
+
+    // ── list_routes: peer-filter mismatch (v6 None branch) ───────────────────
+
+    #[tokio::test]
+    async fn test_list_routes_v6_peer_filter_excludes_unmatched_peer() {
+        // Insert a v6 route from peer 10.0.0.2, but filter on 10.0.0.3.
+        // The v6 filter_map must take the None branch (line 518 in original).
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        {
+            let mut s = state.write().await;
+            s.on_established(addr, PeerType::External, 65002, 90, &[], None);
+            let n = nlri6("2001:db8::/32");
+            s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n, PeerType::External));
+        }
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .list_routes(Request::new(proto::ListRoutesRequest {
+                peer_address: "10.0.0.3".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            resp.into_inner().routes.is_empty(),
+            "mismatched peer filter must exclude v6 routes"
+        );
+    }
+
+    // ── watch_routes: peer-filter mismatch (None branches) ───────────────────
+
+    #[tokio::test]
+    async fn test_watch_routes_peer_filter_excludes_unmatched_v4_and_v6() {
+        // Insert routes from peer 10.0.0.2 (v4 + v6), filter on 10.0.0.3.
+        // Both filter_map None branches (v4 line 558, v6 line 570) must be taken.
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let mut s = make_state(65001, &[(addr, 65002)]);
+        s.on_established(addr, PeerType::External, 65002, 90, &[], None);
+        let n4 = nlri("192.0.2.0/24");
+        s.rib_insert_v4(peer("10.0.0.2"), route_igp(n4, PeerType::External));
+        let n6 = nlri6("2001:db8::/32");
+        s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n6, PeerType::External));
+        let state = Arc::new(RwLock::new(s));
+
+        let svc = RibServiceImpl { state };
+        let resp = svc
+            .watch_routes(Request::new(WatchRoutesRequest {
+                peer_address: "10.0.0.3".into(),
+            }))
+            .await
+            .unwrap();
+        drop(svc);
+        let mut stream = resp.into_inner();
+
+        // Only the EndInitial marker must arrive — no Current events for any route.
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            first.r#type,
+            proto::RouteEventType::EndInitial as i32,
+            "mismatched peer filter must suppress all current events"
+        );
+    }
+
     // ── route_v6_to_proto ─────────────────────────────────────────────────────
 
     fn nlri6(s: &str) -> pathvector_types::Nlri<std::net::Ipv6Addr> {
@@ -2130,6 +2209,46 @@ mod tests {
         assert_eq!(r.peer_address, "10.0.0.2");
         assert_eq!(r.next_hop, "2001:db8::1");
         assert_eq!(r.origin, proto_origin(pathvector_types::Origin::Igp));
+    }
+
+    #[test]
+    fn test_route_v6_to_proto_v4_next_hop() {
+        use pathvector_types::NextHop;
+        let n = nlri6("2001:db8::/32");
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .peer_type(PeerType::External)
+            .build();
+        let r = route_v6_to_proto(peer6("10.0.0.2"), n, &route);
+        assert_eq!(r.next_hop, "10.0.0.1");
+    }
+
+    #[test]
+    fn test_route_v6_to_proto_v6_with_link_local_next_hop() {
+        use pathvector_types::NextHop;
+        let n = nlri6("2001:db8::/32");
+        let global: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let link_local: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6WithLinkLocal { global, link_local })
+            .peer_type(PeerType::External)
+            .build();
+        let r = route_v6_to_proto(peer6("10.0.0.2"), n, &route);
+        assert_eq!(r.next_hop, "2001:db8::1");
+    }
+
+    #[test]
+    fn test_route_v6_to_proto_with_aggregator() {
+        use pathvector_types::{Aggregator, Asn};
+        let n = nlri6("2001:db8::/32");
+        let route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .aggregator(Aggregator::new(Asn::new(65001), Ipv4Addr::new(10, 0, 0, 1)))
+            .peer_type(PeerType::External)
+            .build();
+        let r = route_v6_to_proto(peer6("10.0.0.2"), n, &route);
+        let agg = r.aggregator.expect("aggregator must be set");
+        assert_eq!(agg.asn, 65001);
+        assert_eq!(agg.address, "10.0.0.1");
     }
 
     #[test]
