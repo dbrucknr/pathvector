@@ -1566,10 +1566,10 @@ pub(crate) async fn run(cfg: config::Config) {
 ///
 /// On non-Linux platforms `stale_v4` and `stale_v6` are always empty (returned
 /// by [`pathvector_sys::KernelFib::stale_bgp_routes`]), so this is a no-op.
-pub(crate) async fn withdraw_stale_bgp_routes(
+pub(crate) async fn withdraw_stale_bgp_routes<W: pathvector_sys::FibWrite>(
     stale_v4: Vec<(std::net::Ipv4Addr, u8)>,
     stale_v6: Vec<(std::net::Ipv6Addr, u8)>,
-    writer: &pathvector_sys::FibWriter,
+    writer: &W,
 ) {
     for (dst, prefix_len) in stale_v4 {
         if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {

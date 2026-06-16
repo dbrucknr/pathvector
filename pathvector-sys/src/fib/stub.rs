@@ -9,6 +9,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use super::FibWrite;
+
 /// No-op FIB writer for non-Linux platforms.
 ///
 /// Preserves the API surface of the Linux [`FibWriter`] so `pathvectord` can
@@ -68,6 +70,24 @@ impl FibWriter {
     ///
     /// Never errors on non-Linux platforms.
     pub async fn withdraw_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl FibWrite for FibWriter {
+    async fn install_v4(&self, _dst: Ipv4Addr, _prefix_len: u8, _gateway: Ipv4Addr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn withdraw_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn install_v6(&self, _dst: Ipv6Addr, _prefix_len: u8, _gateway: Ipv6Addr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn withdraw_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
         Ok(())
     }
 }

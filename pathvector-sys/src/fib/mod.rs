@@ -57,6 +57,7 @@
 //! table at the time the dump completed.
 
 use std::{
+    future::Future,
     io,
     net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, RwLock},
@@ -75,6 +76,51 @@ pub use linux::FibWriter;
 mod stub;
 #[cfg(not(target_os = "linux"))]
 pub use stub::FibWriter;
+
+// ── FibWrite trait ────────────────────────────────────────────────────────────
+
+/// Capability to write routes into the kernel FIB.
+///
+/// Implemented by [`FibWriter`] on every supported platform. Callers that
+/// accept `impl FibWrite` (or `W: FibWrite`) receive static dispatch —
+/// the compiler monomorphises the call site and the vtable is never needed.
+///
+/// Async methods return `impl Future<Output = io::Result<()>> + Send + '_`
+/// so that callers inside `tokio::spawn` blocks can `.await` them safely.
+/// The `'_` lifetime ties the returned future to `&self`, which is necessary
+/// for implementations (like the Linux backend) that borrow internal handles
+/// across the await point.
+pub trait FibWrite {
+    /// Install or replace an IPv4 prefix route via `gateway`.
+    fn install_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+        gateway: Ipv4Addr,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Remove an IPv4 prefix route.
+    fn withdraw_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Install or replace an IPv6 prefix route via `gateway`.
+    fn install_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+        gateway: Ipv6Addr,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Remove an IPv6 prefix route.
+    fn withdraw_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+}
 
 // ── FibSnapshot ──────────────────────────────────────────────────────────────
 
