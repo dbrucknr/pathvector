@@ -222,43 +222,26 @@ environment.
 
 ### High — MUST violations
 
-**A. AS_PATH loop detection missing** (`pathvectord/src/daemon.rs`, `handle_update`)
-
-RFC 4271 §9.1.2 and §6.1.4: if the local AS appears in the AS_PATH of a
-received UPDATE, the route MUST be silently ignored. Currently the AS_PATH is
-extracted but never checked against `local_as`. Routes containing our own AS
-are accepted, inserted into the Loc-RIB, and re-advertised — forming a routing
-loop. Fix: after extracting `as_path` in `handle_update`, check
-`as_path.contains_asn(local_as)` and skip the route if true.
+✅ **A. AS_PATH loop detection** — Fixed 2026-06-15. `handle_update` checks
+`as_path.contains(local_as)` and silently drops announcements (not withdrawals).
+Regression tests: `test_as_path_loop_detection_*` (4 tests).
 
 **B. Mandatory attribute presence not checked** (`pathvectord/src/daemon.rs`, `handle_update`)
 
-RFC 4271 §5 and §6.3: IPv4 unicast UPDATE announcements MUST include ORIGIN,
-AS_PATH, and NEXT_HOP. Currently missing attributes are silently substituted
-with defaults (`Origin::Incomplete`, empty `AsPath`, `None` next-hop). A well-
-behaved peer will always send these, but a buggy or malicious peer can omit
-them and the route will be accepted. Fix: after processing all attributes,
-check that any UPDATE with announced NLRIs has all three; send NOTIFICATION
-error code 3 (Update Message Error) subcode 3 (Missing Well-known Attribute)
-and close the session if any are absent.
+RFC 4271 §5 and §6.3: full NOTIFICATION for missing ORIGIN/AS_PATH/NEXT_HOP
+belongs at the session layer. Deferred pending session-layer refactor (see E).
 
 ### Medium — correctness gaps, lower exploitability
 
-**C. NEXT_HOP not validated** (`pathvectord/src/daemon.rs`, `handle_update`)
+✅ **C. NEXT_HOP validation** — Partially fixed 2026-06-15. `is_valid_next_hop_v4`
+rejects 0.0.0.0, loopback, multicast (224.0.0.0/4), and broadcast. Regression
+tests: `test_invalid_next_hop_*` (3 tests) + `test_valid_next_hop_is_accepted`.
+Remaining: own-address check deferred (FIB oracle reachability gates this anyway).
 
-RFC 4271 §5.1.3 and §9.1.2: NEXT_HOP must be a valid unicast address, must not
-be 0.0.0.0, multicast (224.0.0.0/4), broadcast (255.255.255.255), or the
-receiving router's own address. Currently extracted and stored without any
-checks. Sending NEXT_HOP equal to the receiver's own address causes traffic to
-be black-holed. Fix: validate in `handle_update` after extracting `next_hop`;
-treat violations as policy rejection (silently skip) or TreatAsWithdraw.
-
-**D. BGP Identifier multicast not rejected** (`pathvector-session/src/fsm/mod.rs`, ~line 607)
-
-RFC 4271 §6.2: BGP Identifier must be a valid unicast IPv4 address. Currently
-only 0.0.0.0 is rejected; multicast (224.0.0.0/4) and broadcast
-(255.255.255.255) are accepted. Fix: add `!bgp_id.is_multicast()` and
-`bgp_id != Ipv4Addr::BROADCAST` to the existing BGP ID validation block.
+✅ **D. BGP Identifier multicast/broadcast not rejected** — Fixed 2026-06-15.
+`validate_open` now rejects loopback, multicast, and broadcast BGP IDs in addition
+to 0.0.0.0. Regression tests: `test_multicast_bgp_id_rejected`,
+`test_broadcast_bgp_id_rejected`.
 
 **E. RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641)
 
@@ -269,24 +252,16 @@ SHOULD, but worth documenting as a known deviation.
 
 ### High — outbound attribute violations
 
-**F. ORIGINATOR_ID and CLUSTER_LIST not stripped for eBGP peers** (`pathvector-rib/src/outbound.rs`, `route_to_attributes`)
-
-RFC 4456 §8: these route-reflector attributes MUST be stripped before advertising
-to eBGP peers — they are internal routing metadata. Currently both attributes are
-included unconditionally in outbound UPDATE serialization. Any eBGP peer receiving
-them sees internal topology information it should not have, and may reject the UPDATE
-or behave incorrectly. Fix: in `prepare_outbound` or `route_to_attributes`, strip
-`ORIGINATOR_ID` and `CLUSTER_LIST` when `peer_type == PeerType::External`.
+✅ **F. ORIGINATOR_ID and CLUSTER_LIST not stripped for eBGP peers** — Fixed
+2026-06-15. `route_to_attributes` strips both when `peer_type == External`.
+Regression tests: `test_route_to_attributes_ebgp_strips_originator_id_and_cluster_list`,
+`test_route_to_attributes_ibgp_preserves_rr_attributes`.
 
 ### Medium — SHOULD violations and behavioral gaps
 
-**G. MED not stripped for eBGP peers** (`pathvector-rib/src/outbound.rs`, `route_to_attributes`)
-
-RFC 4271 §5.1.4: MED SHOULD NOT be included in UPDATEs sent to eBGP peers unless
-they are confederation members. Currently MED passes through to all eBGP peers
-unconditionally, influencing their route selection with values that were intended
-only for internal use. Fix: strip `route.med` in `prepare_outbound` for
-`PeerType::External` (same location as LOCAL_PREF stripping, line ~28).
+✅ **G. MED not stripped for eBGP peers** — Fixed 2026-06-15. `route_to_attributes`
+strips MED when `peer_type == External`. Regression tests:
+`test_route_to_attributes_ebgp_strips_med`, `test_route_to_attributes_ibgp_preserves_med`.
 
 **H. MRAI not implemented** (`pathvectord/src/daemon.rs`, `flush_updates`)
 
@@ -301,9 +276,9 @@ deferral in code comments.
 When a new peer reaches Established, `on_established` sends the full Loc-RIB
 without applying RR non-client split-horizon. The check exists in
 `propagate_to_all_peers` for incremental updates but is absent from the initial
-dump path (lines 503–539). A non-client iBGP peer establishing a session receives
-routes learned from other non-client iBGP peers in its initial dump, violating RR
-split-horizon. Only affects deployments using route reflection.
+dump path. A non-client iBGP peer establishing a session receives routes learned
+from other non-client iBGP peers in its initial dump, violating RR split-horizon.
+Only affects deployments using route reflection.
 
 ### High — capability negotiation violations
 
@@ -318,15 +293,11 @@ will produce a malformed AS_PATH that the peer cannot parse. Fix: check
 `peer_capabilities.contains(FourByteAsn)` before encoding; generate split
 AS_PATH + AS4_PATH when the peer is 2-byte-only.
 
-**K. IPv6 routes advertised to peers that didn't negotiate IPv6 unicast (RFC 4760)** (`pathvectord/src/daemon.rs`, `on_established` ~line 546)
-
-RFC 4760: MP_REACH_NLRI / MP_UNREACH_NLRI for a given AFI/SAFI MUST only be
-sent to peers that advertised that AFI/SAFI via Multi-Protocol capability in
-their OPEN. Currently the full-table IPv6 dump and incremental IPv6 propagation
-fire unconditionally for all peers. A peer that did not negotiate IPv6 unicast
-will silently discard the attribute per RFC 7606 — routes are lost with no
-session-level error. Fix: gate the IPv6 dump and `propagate_to_all_peers_v6`
-on `peer_capabilities.contains(MultiProtocol(AfiSafi::IPV6_UNICAST))`.
+✅ **K. IPv6 routes advertised to non-IPv6-capable peers** — Fixed 2026-06-15.
+`on_established` now gates IPv6 full-table dump and `propagate_to_all_peers_v6`
+on `peer_capabilities.contains(MultiProtocol(IPV6_UNICAST))`. Regression tests:
+`test_ipv6_route_not_propagated_to_non_ipv6_capable_peer`,
+`test_ipv6_full_table_dump_not_sent_to_non_ipv6_capable_peer`.
 
 ### Medium — API and behavioral gaps
 

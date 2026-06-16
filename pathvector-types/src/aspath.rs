@@ -363,6 +363,64 @@ impl AsPath {
         Self { segments }
     }
 
+    /// Produces the wire representation for a 2-byte-only peer (RFC 6793 §4).
+    ///
+    /// Returns `(downgraded, Some(original))` when at least one 4-byte ASN was
+    /// replaced, so the caller can attach the original as `AS4_PATH`. Returns
+    /// `(original_clone, None)` when all ASNs fit in 16 bits (no downgrade needed).
+    ///
+    /// Confederation segments are treated like ordinary Sequence/Set segments for
+    /// the purpose of downgrade — they are not stripped here; stripping is a
+    /// separate concern.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath};
+    ///
+    /// // All 2-byte → no AS4_PATH produced.
+    /// let path = AsPath::from_sequence(vec![Asn::new(65001)]);
+    /// let (down, as4) = path.downgrade_for_two_byte_peer();
+    /// assert!(as4.is_none());
+    ///
+    /// // 4-byte ASN → downgrade substitutes AS_TRANS and returns original.
+    /// let path4 = AsPath::from_sequence(vec![Asn::new(131072), Asn::new(65001)]);
+    /// let (down4, as4_path) = path4.downgrade_for_two_byte_peer();
+    /// assert_eq!(down4.segments()[0].asns()[0], Asn::TRANS);
+    /// assert!(as4_path.is_some());
+    /// ```
+    #[must_use]
+    pub fn downgrade_for_two_byte_peer(&self) -> (Self, Option<Self>) {
+        let mut needs_downgrade = false;
+        for seg in &self.segments {
+            if seg.asns().iter().any(|a| a.is_four_byte()) {
+                needs_downgrade = true;
+                break;
+            }
+        }
+        if !needs_downgrade {
+            return (self.clone(), None);
+        }
+        let downgraded_segments: Vec<AsPathSegment> = self
+            .segments
+            .iter()
+            .map(|seg| {
+                let downgraded: Vec<crate::Asn> = seg
+                    .asns()
+                    .iter()
+                    .map(|&a| if a.is_four_byte() { crate::Asn::TRANS } else { a })
+                    .collect();
+                match seg {
+                    AsPathSegment::Sequence(_) => AsPathSegment::Sequence(downgraded),
+                    AsPathSegment::Set(_) => AsPathSegment::Set(downgraded),
+                    AsPathSegment::ConfedSequence(_) => AsPathSegment::ConfedSequence(downgraded),
+                    AsPathSegment::ConfedSet(_) => AsPathSegment::ConfedSet(downgraded),
+                }
+            })
+            .collect();
+        (Self { segments: downgraded_segments }, Some(self.clone()))
+    }
+
     /// Returns a new `AsPath` with all confederation segments removed.
     ///
     /// RFC 5065 §5.1 requires that `AS_CONFED_SEQUENCE` and `AS_CONFED_SET`
@@ -670,5 +728,52 @@ mod tests {
         assert!(matches!(stripped.segments()[0], AsPathSegment::Sequence(_)));
         assert!(matches!(stripped.segments()[1], AsPathSegment::Set(_)));
         assert!(matches!(stripped.segments()[2], AsPathSegment::Sequence(_)));
+    }
+
+    #[test]
+    fn downgrade_for_two_byte_peer_noop_when_all_two_byte() {
+        let path = AsPath::from_sequence(vec![Asn::new(65001), Asn::new(65002)]);
+        let (downgraded, orig) = path.downgrade_for_two_byte_peer();
+        assert!(orig.is_none(), "no downgrade needed");
+        assert_eq!(downgraded.segments(), path.segments());
+    }
+
+    #[test]
+    fn downgrade_for_two_byte_peer_replaces_four_byte_with_trans() {
+        let path =
+            AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131072), Asn::new(65002)]);
+        let (downgraded, orig) = path.downgrade_for_two_byte_peer();
+        assert!(orig.is_some(), "substitution occurred");
+        // Original preserved intact.
+        let orig = orig.unwrap();
+        assert_eq!(orig.segments(), path.segments());
+        // Downgraded has AS_TRANS in place of 131072.
+        let segs = downgraded.segments();
+        assert_eq!(segs.len(), 1);
+        let asns = segs[0].asns();
+        assert_eq!(asns[0], Asn::new(65001));
+        assert_eq!(asns[1], Asn::TRANS);
+        assert_eq!(asns[2], Asn::new(65002));
+    }
+
+    #[test]
+    fn downgrade_for_two_byte_peer_all_four_byte() {
+        let path = AsPath::from_sequence(vec![Asn::new(131072), Asn::new(200000)]);
+        let (downgraded, orig) = path.downgrade_for_two_byte_peer();
+        assert!(orig.is_some());
+        let asns = downgraded.segments()[0].asns();
+        assert!(asns.iter().all(|&a| a == Asn::TRANS));
+    }
+
+    #[test]
+    fn downgrade_for_two_byte_peer_preserves_segment_type() {
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::Set(vec![Asn::new(131072), Asn::new(65001)]),
+        ]);
+        let (downgraded, _) = path.downgrade_for_two_byte_peer();
+        assert!(matches!(downgraded.segments()[0], AsPathSegment::Set(_)));
+        let asns = downgraded.segments()[0].asns();
+        assert_eq!(asns[0], Asn::TRANS);
+        assert_eq!(asns[1], Asn::new(65001));
     }
 }
