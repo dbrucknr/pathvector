@@ -572,8 +572,7 @@ impl DaemonState {
                     && let IpAddr::V4(src_ip) = src.ip()
                 {
                     let src_is_client = rr_clients.contains(&src_ip);
-                    let src_is_ibgp =
-                        peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                    let src_is_ibgp = peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
                     if src_is_ibgp && !src_is_client && !dest_is_client {
                         return PrefixDecision::NoChange;
                     }
@@ -608,8 +607,8 @@ impl DaemonState {
         // (RFC 4760): sending MP_REACH_NLRI to a peer that did not advertise the
         // Multi-Protocol capability for IPv6 unicast violates the capability
         // negotiation contract and the peer would silently discard the routes.
-        let peer_supports_ipv6 = peer_capabilities
-            .contains(&Capability::MultiProtocol(AfiSafi::IPV6_UNICAST));
+        let peer_supports_ipv6 =
+            peer_capabilities.contains(&Capability::MultiProtocol(AfiSafi::IPV6_UNICAST));
         if peer_supports_ipv6 {
             self.ipv6_capable_peers.insert(peer_ip);
         } else {
@@ -1147,10 +1146,8 @@ impl DaemonState {
             let Some(pending) = self.mrai_pending.get(&peer_ip) else {
                 continue;
             };
-            let (ready, not_ready): (Vec<Nlri<Ipv4Addr>>, Vec<Nlri<Ipv4Addr>>) = pending
-                .iter()
-                .copied()
-                .partition(|nlri| {
+            let (ready, not_ready): (Vec<Nlri<Ipv4Addr>>, Vec<Nlri<Ipv4Addr>>) =
+                pending.iter().copied().partition(|nlri| {
                     self.mrai_last_sent
                         .get(&peer_ip)
                         .and_then(|m| m.get(nlri))
@@ -2061,7 +2058,11 @@ fn handle_update(
     local_as: u32,
     local_v4_addr: Option<Ipv4Addr>,
     local_v6_addr: Option<Ipv6Addr>,
-) -> (Vec<BestPathChange<Ipv4Addr>>, Vec<BestPathChange<Ipv6Addr>>, Option<NotificationMessage>) {
+) -> (
+    Vec<BestPathChange<Ipv4Addr>>,
+    Vec<BestPathChange<Ipv6Addr>>,
+    Option<NotificationMessage>,
+) {
     let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
     let mut fib_changes_v6: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
     let withdrawn_count = msg.withdrawn.len();
@@ -2098,8 +2099,14 @@ fn handle_update(
 
     for attr in &msg.attributes {
         match attr {
-            PathAttribute::Origin(o) => { origin = *o; has_origin = true; }
-            PathAttribute::AsPath(p) => { as_path = p.clone(); has_as_path = true; }
+            PathAttribute::Origin(o) => {
+                origin = *o;
+                has_origin = true;
+            }
+            PathAttribute::AsPath(p) => {
+                as_path = p.clone();
+                has_as_path = true;
+            }
             PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
             PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
             PathAttribute::Med(m) => med = Some(Med::new(*m)),
@@ -2198,7 +2205,9 @@ fn handle_update(
     // AS 0 is reserved and MUST NOT appear in AS_PATH. A route carrying it
     // is malformed; silently drop announces (withdrawals are still processed).
     let has_as_zero = as_path.contains(pathvector_types::Asn::new(0));
-    if has_as_zero && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty()) {
+    if has_as_zero
+        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
+    {
         tracing::warn!(
             peer = %peer,
             %as_path,
@@ -2213,7 +2222,9 @@ fn handle_update(
     // to us. Silently ignore all announced NLRIs in this UPDATE (withdrawals
     // are still processed — they are safe and necessary).
     let has_loop = as_path.contains(pathvector_types::Asn::new(local_as));
-    if has_loop && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty()) {
+    if has_loop
+        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
+    {
         tracing::debug!(
             peer = %peer,
             local_as,
@@ -2259,7 +2270,9 @@ fn handle_update(
             continue;
         }
         // RFC 4271 §5.1.3: validate NEXT_HOP before accepting the route.
-        if let Some(NextHop::V4(addr)) = nh && !is_valid_next_hop_v4(addr, local_v4_addr) {
+        if let Some(NextHop::V4(addr)) = nh
+            && !is_valid_next_hop_v4(addr, local_v4_addr)
+        {
             tracing::warn!(peer = %peer, prefix = %nlri, next_hop = %addr,
                 "dropping route: invalid NEXT_HOP (RFC 4271 §5.1.3)");
             rejected += 1;
@@ -2340,8 +2353,7 @@ fn handle_update(
         // Link-local addresses are not checked (interface-scoped; commonly used in eBGP).
         let bad_v6_nh = match nh {
             NextHop::V6(addr) => {
-                !is_valid_next_hop_v6(addr)
-                    || local_v6_addr.is_some_and(|local| local == addr)
+                !is_valid_next_hop_v6(addr) || local_v6_addr.is_some_and(|local| local == addr)
             }
             NextHop::V6WithLinkLocal { global, link_local } => {
                 !is_valid_next_hop_v6(global)
@@ -3192,17 +3204,30 @@ mod tests {
         // (RFC 4271 §6.3) so they don't get rejected before reaching the logic
         // under test. Supply defaults when mandatory attributes are absent.
         if !msg.announced.is_empty() {
-            let has_origin = msg.attributes.iter().any(|a| matches!(a, PathAttribute::Origin(_)));
-            let has_as_path = msg.attributes.iter().any(|a| matches!(a, PathAttribute::AsPath(_)));
-            let has_next_hop = msg.attributes.iter().any(|a| matches!(a, PathAttribute::NextHop(_)));
+            let has_origin = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::Origin(_)));
+            let has_as_path = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::AsPath(_)));
+            let has_next_hop = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::NextHop(_)));
             if !has_origin {
                 msg.attributes.push(PathAttribute::Origin(Origin::Igp));
             }
             if !has_as_path {
-                msg.attributes.push(PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])));
+                msg.attributes
+                    .push(PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65009),
+                    ])));
             }
             if !has_next_hop {
-                msg.attributes.push(PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)));
+                msg.attributes
+                    .push(PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)));
             }
         }
         let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
@@ -3726,7 +3751,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
 
         assert_eq!(rib_v6.len(), 1, "IPv6 route must enter loc_rib_v6");
@@ -3768,7 +3793,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
 
         assert_eq!(ari_v6.len(), 1, "pre-policy route must be in adj_rib_in_v6");
@@ -3811,7 +3836,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
 
         assert!(
@@ -3954,7 +3979,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert_eq!(rib_v6.len(), 1);
 
@@ -3980,7 +4005,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
 
         assert!(
@@ -4024,7 +4049,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
 
         assert_eq!(rib.len(), 1, "IPv4 route must be in loc_rib");
@@ -4898,7 +4923,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert!(
             rib_v6.is_empty(),
@@ -5187,7 +5212,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert!(
             rib_v6.is_empty(),
@@ -5227,7 +5252,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert!(
             rib_v6.is_empty(),
@@ -5292,7 +5317,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert_eq!(
             rib_v6.len(),
@@ -5337,7 +5362,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert!(
             rib_v6.is_empty(),
@@ -5381,7 +5406,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             None,
-        None,
+            None,
         );
         assert!(
             rib_v6.is_empty(),
@@ -5533,7 +5558,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             Some(own_addr), // local interface address matches NEXT_HOP
-        None,
+            None,
         );
         assert!(
             rib.is_empty(),
@@ -5572,7 +5597,7 @@ mod tests {
             &AlwaysReachable,
             65002,
             Some(own_addr), // NEXT_HOP differs from own address — valid
-        None,
+            None,
         );
         assert_eq!(
             rib.len(),
@@ -5601,9 +5626,7 @@ mod tests {
             ],
         );
         // Designate client as an RR client.
-        Arc::make_mut(&mut state.rib)
-            .rr_clients
-            .insert(client);
+        Arc::make_mut(&mut state.rib).rr_clients.insert(client);
 
         // non_client_b establishes and deposits a route.
         state.on_established(non_client_b, PeerType::Internal, 65001, 90, &[], None);
@@ -5632,11 +5655,8 @@ mod tests {
         let non_client: Ipv4Addr = "10.0.0.4".parse().unwrap();
         let client: Ipv4Addr = "10.0.0.3".parse().unwrap();
 
-        let (mut state, mut rxs) =
-            make_state(65001, &[(non_client, 65001), (client, 65001)]);
-        Arc::make_mut(&mut state.rib)
-            .rr_clients
-            .insert(client);
+        let (mut state, mut rxs) = make_state(65001, &[(non_client, 65001), (client, 65001)]);
+        Arc::make_mut(&mut state.rib).rr_clients.insert(client);
 
         // non_client deposits a route.
         state.on_established(non_client, PeerType::Internal, 65001, 90, &[], None);
@@ -6863,7 +6883,8 @@ mod tests {
         let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
         let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
         let policy = accept_all();
-        let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(pathvector_policy::DefaultAction::Accept);
+        let policy_v6: Policy<Route<Ipv6Addr>> =
+            Policy::new(pathvector_policy::DefaultAction::Accept);
         let (_, _, notification) = handle_update(
             p,
             msg,
@@ -6901,7 +6922,11 @@ mod tests {
             ),
             "error must be UpdateMessage/MissingWellKnownAttribute"
         );
-        assert_eq!(msg.data, vec![1u8], "data must contain ORIGIN type code (1)");
+        assert_eq!(
+            msg.data,
+            vec![1u8],
+            "data must contain ORIGIN type code (1)"
+        );
     }
 
     #[test]
@@ -6915,7 +6940,11 @@ mod tests {
             announced: vec![nlri("10.0.0.0/8")],
         });
         let msg = n.expect("NOTIFICATION must be returned when AS_PATH is absent");
-        assert_eq!(msg.data, vec![2u8], "data must contain AS_PATH type code (2)");
+        assert_eq!(
+            msg.data,
+            vec![2u8],
+            "data must contain AS_PATH type code (2)"
+        );
     }
 
     #[test]
@@ -6930,7 +6959,11 @@ mod tests {
             announced: vec![nlri("10.0.0.0/8")],
         });
         let msg = n.expect("NOTIFICATION must be returned when NEXT_HOP is absent");
-        assert_eq!(msg.data, vec![3u8], "data must contain NEXT_HOP type code (3)");
+        assert_eq!(
+            msg.data,
+            vec![3u8],
+            "data must contain NEXT_HOP type code (3)"
+        );
     }
 
     #[test]
@@ -6958,7 +6991,10 @@ mod tests {
             ],
             announced: vec![nlri("10.0.0.0/8")],
         });
-        assert!(n.is_none(), "well-formed UPDATE must not trigger NOTIFICATION");
+        assert!(
+            n.is_none(),
+            "well-formed UPDATE must not trigger NOTIFICATION"
+        );
     }
 
     // ── Route Reflection (RFC 4456) ───────────────────────────────────────────
@@ -8590,10 +8626,10 @@ mod run_with_tests {
             let (update_tx, _update_rx) = mpsc::channel(8);
             let (stop_tx, stop_rx) = mpsc::channel(8);
             let started = Arc::new(AtomicBool::new(false));
-            peers_clone.lock().unwrap().push(MockPeerWithStop {
-                event_tx,
-                stop_rx,
-            });
+            peers_clone
+                .lock()
+                .unwrap()
+                .push(MockPeerWithStop { event_tx, stop_rx });
             MockSessionHandle {
                 event_rx,
                 update_tx,
@@ -8605,8 +8641,8 @@ mod run_with_tests {
     }
 
     fn established_info_for_peer(peer_as: u32) -> SessionEvent {
-        use pathvector_session::message::Capability;
         use pathvector_session::fsm::SessionInfo;
+        use pathvector_session::message::Capability;
         use pathvector_types::PeerType;
         SessionEvent::Established(SessionInfo {
             peer_as,
@@ -8646,7 +8682,10 @@ mod run_with_tests {
         };
 
         // Establish the session so the daemon has peer state.
-        event_tx.send(established_info_for_peer(65002)).await.unwrap();
+        event_tx
+            .send(established_info_for_peer(65002))
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
 
         // Send a malformed UPDATE: announced NLRI but ORIGIN is absent.
@@ -8664,13 +8703,10 @@ mod run_with_tests {
             .unwrap();
 
         // The event loop must send a Notification command to the session.
-        let cmd = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async move {
-                let mut stop_rx = stop_rx;
-                stop_rx.recv().await
-            },
-        )
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            let mut stop_rx = stop_rx;
+            stop_rx.recv().await
+        })
         .await
         .expect("timed out waiting for SessionCommand")
         .expect("stop channel closed without sending Notification");

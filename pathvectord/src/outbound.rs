@@ -375,7 +375,8 @@ pub(crate) fn flush_updates_v6(
                 // MP_UNREACH_NLRI is the only attribute on the announce message;
                 // we group routes with identical scalar attributes (same attrs
                 // minus the NLRI list) and pack them together.
-                let (mut attrs, mp_reach) = route_v6_to_attributes(&route, peer_type, peer_four_byte);
+                let (mut attrs, mp_reach) =
+                    route_v6_to_attributes(&route, peer_type, peer_four_byte);
                 let key = encode_attributes(&attrs);
                 // Restore the MP_REACH_NLRI placeholder next-hop in the group leader.
                 if let Some((_, group_attrs, nlris)) =
@@ -564,7 +565,13 @@ mod flush_updates_tests {
         let route = base_route("10.0.0.0/8");
         let decisions = vec![PrefixDecision::Announce(route)];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let msg = rx.try_recv().expect("one UPDATE expected");
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
         assert!(msg.withdrawn.is_empty());
@@ -580,7 +587,13 @@ mod flush_updates_tests {
             .map(|p| PrefixDecision::Announce(base_route(p)))
             .collect();
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let msg = rx.try_recv().expect("one batched UPDATE expected");
         assert_eq!(msg.announced.len(), 3);
         assert!(rx.try_recv().is_err(), "all NLRIs in a single UPDATE");
@@ -598,7 +611,13 @@ mod flush_updates_tests {
             .build();
         let decisions = vec![PrefixDecision::Announce(r1), PrefixDecision::Announce(r2)];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let first = rx.try_recv().expect("first UPDATE");
         let second = rx.try_recv().expect("second UPDATE");
         assert_eq!(first.announced.len(), 1);
@@ -629,7 +648,13 @@ mod flush_updates_tests {
             .collect();
 
         let (tx, mut rx) = mpsc::channel(64);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
 
         // Drain all messages and verify: total announced == 1000, each message ≤ MAX_LEN.
         let mut total = 0usize;
@@ -653,7 +678,13 @@ mod flush_updates_tests {
             .map(|p| PrefixDecision::Withdraw(nlri(p)))
             .collect();
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let msg = rx.try_recv().expect("one withdraw UPDATE expected");
         assert_eq!(msg.withdrawn.len(), 3);
         assert!(msg.announced.is_empty());
@@ -668,7 +699,13 @@ mod flush_updates_tests {
             PrefixDecision::Withdraw(nlri("192.168.0.0/16")),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         let first = rx.try_recv().expect("first message");
         assert!(!first.withdrawn.is_empty(), "withdraw must come first");
         let second = rx.try_recv().expect("second message");
@@ -680,7 +717,13 @@ mod flush_updates_tests {
     fn test_flush_no_change_produces_nothing() {
         let decisions = vec![PrefixDecision::NoChange, PrefixDecision::NoChange];
         let (tx, mut rx) = mpsc::channel(16);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
         assert!(rx.try_recv().is_err(), "no messages for NoChange");
     }
 
@@ -697,7 +740,13 @@ mod flush_updates_tests {
         .unwrap();
 
         let decisions = vec![PrefixDecision::Withdraw(nlri("10.0.0.0/8"))];
-        assert!(!flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(!flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// Returns false when the channel is closed (announcement path).
@@ -706,7 +755,13 @@ mod flush_updates_tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let decisions = vec![PrefixDecision::Announce(base_route("10.0.0.0/8"))];
-        assert!(!flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(!flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// 1 000 withdrawals are all delivered even when they span multiple UPDATEs.
@@ -726,7 +781,13 @@ mod flush_updates_tests {
             .collect();
 
         let (tx, mut rx) = mpsc::channel(64);
-        assert!(flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
 
         let mut total = 0usize;
         while let Ok(msg) = rx.try_recv() {
@@ -758,7 +819,13 @@ mod flush_updates_tests {
         // Drop the receiver after the first message is queued so the second fails.
         drop(rx);
         // Channel is already closed; even the first send will fail.
-        assert!(!flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(!flush_updates(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 }
 
@@ -923,11 +990,15 @@ mod v6_tests {
 
         let (attrs, _) = route_v6_to_attributes(&route, PeerType::External, true);
         assert!(
-            !attrs.iter().any(|a| matches!(a, PathAttribute::OriginatorId(_))),
+            !attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_))),
             "ORIGINATOR_ID must be stripped for eBGP IPv6 peers (RFC 4456 §8)"
         );
         assert!(
-            !attrs.iter().any(|a| matches!(a, PathAttribute::ClusterList(_))),
+            !attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ClusterList(_))),
             "CLUSTER_LIST must be stripped for eBGP IPv6 peers (RFC 4456 §8)"
         );
     }
@@ -943,11 +1014,15 @@ mod v6_tests {
 
         let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
-            attrs.iter().any(|a| matches!(a, PathAttribute::OriginatorId(_))),
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(_))),
             "ORIGINATOR_ID must be preserved for iBGP IPv6 peers"
         );
         assert!(
-            attrs.iter().any(|a| matches!(a, PathAttribute::ClusterList(_))),
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::ClusterList(_))),
             "CLUSTER_LIST must be preserved for iBGP IPv6 peers"
         );
     }
@@ -958,7 +1033,13 @@ mod v6_tests {
         let (tx, rx) = mpsc::channel::<UpdateMessage>(1);
         drop(rx);
         let decisions = vec![PrefixDecisionV6::Announce(base_route_v6("2001:db8::/32"))];
-        assert!(!flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(!flush_updates_v6(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// flush_updates_v6 returns false for withdrawals when channel is closed.
@@ -967,7 +1048,13 @@ mod v6_tests {
         let (tx, rx) = mpsc::channel::<UpdateMessage>(1);
         drop(rx);
         let decisions = vec![PrefixDecisionV6::Withdraw(nlri6("2001:db8::/32"))];
-        assert!(!flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true));
+        assert!(!flush_updates_v6(
+            decisions,
+            MAX_LEN,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 }
 
@@ -1162,7 +1249,13 @@ mod route_to_attributes_tests {
     fn as_path_asns(attrs: &[PathAttribute]) -> Vec<Asn> {
         attrs
             .iter()
-            .find_map(|a| if let PathAttribute::AsPath(p) = a { Some(p.clone()) } else { None })
+            .find_map(|a| {
+                if let PathAttribute::AsPath(p) = a {
+                    Some(p.clone())
+                } else {
+                    None
+                }
+            })
             .expect("AS_PATH must be present")
             .segments()
             .iter()
@@ -1173,7 +1266,12 @@ mod route_to_attributes_tests {
     fn as4_path_asns(attrs: &[PathAttribute]) -> Option<Vec<Asn>> {
         attrs.iter().find_map(|a| {
             if let PathAttribute::As4Path(p) = a {
-                Some(p.segments().iter().flat_map(|s| s.asns().to_vec()).collect())
+                Some(
+                    p.segments()
+                        .iter()
+                        .flat_map(|s| s.asns().to_vec())
+                        .collect(),
+                )
             } else {
                 None
             }
@@ -1187,10 +1285,16 @@ mod route_to_attributes_tests {
         let attrs = route_to_attributes(&route, PeerType::External, false);
 
         let asns = as_path_asns(&attrs);
-        assert!(!asns.contains(&Asn::TRANS), "no AS_TRANS for all-2-byte path");
+        assert!(
+            !asns.contains(&Asn::TRANS),
+            "no AS_TRANS for all-2-byte path"
+        );
         assert!(asns.contains(&Asn::new(65001)));
 
-        assert!(as4_path_asns(&attrs).is_none(), "no AS4_PATH when no substitution occurred");
+        assert!(
+            as4_path_asns(&attrs).is_none(),
+            "no AS4_PATH when no substitution occurred"
+        );
     }
 
     /// 4-byte ASN sent to 2-byte-only peer: AS_TRANS substituted in AS_PATH;
@@ -1201,13 +1305,17 @@ mod route_to_attributes_tests {
         let attrs = route_to_attributes(&route, PeerType::External, false);
 
         let wire_asns = as_path_asns(&attrs);
-        assert!(wire_asns.contains(&Asn::TRANS), "AS_TRANS must replace 4-byte ASN in AS_PATH");
+        assert!(
+            wire_asns.contains(&Asn::TRANS),
+            "AS_TRANS must replace 4-byte ASN in AS_PATH"
+        );
         assert!(
             !wire_asns.contains(&Asn::new(131_072)),
             "original 4-byte ASN must not appear in wire AS_PATH"
         );
 
-        let as4_asns = as4_path_asns(&attrs).expect("AS4_PATH must be present for 2-byte-only peer");
+        let as4_asns =
+            as4_path_asns(&attrs).expect("AS4_PATH must be present for 2-byte-only peer");
         assert!(
             as4_asns.contains(&Asn::new(131_072)),
             "original 4-byte ASN must be preserved in AS4_PATH"
@@ -1221,10 +1329,19 @@ mod route_to_attributes_tests {
         let attrs = route_to_attributes(&route, PeerType::External, true);
 
         let wire_asns = as_path_asns(&attrs);
-        assert!(!wire_asns.contains(&Asn::TRANS), "no AS_TRANS for 4-byte-capable peer");
-        assert!(wire_asns.contains(&Asn::new(131_072)), "original 4-byte ASN preserved");
+        assert!(
+            !wire_asns.contains(&Asn::TRANS),
+            "no AS_TRANS for 4-byte-capable peer"
+        );
+        assert!(
+            wire_asns.contains(&Asn::new(131_072)),
+            "original 4-byte ASN preserved"
+        );
 
-        assert!(as4_path_asns(&attrs).is_none(), "no AS4_PATH for 4-byte-capable peer");
+        assert!(
+            as4_path_asns(&attrs).is_none(),
+            "no AS4_PATH for 4-byte-capable peer"
+        );
     }
 
     /// AS4_PATH must appear as the last attribute so 2-byte speakers that don't

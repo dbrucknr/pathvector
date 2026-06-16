@@ -626,9 +626,7 @@ impl Fsm {
         // Multicast (224.0.0.0/4) and broadcast (255.255.255.255) are not unicast.
         // Unspecified (0.0.0.0) is explicitly prohibited by §4.2.
         let bgp_id = peer.bgp_id;
-        if bgp_id == Ipv4Addr::UNSPECIFIED
-            || bgp_id.is_multicast()
-            || bgp_id == Ipv4Addr::BROADCAST
+        if bgp_id == Ipv4Addr::UNSPECIFIED || bgp_id.is_multicast() || bgp_id == Ipv4Addr::BROADCAST
         {
             return Err((
                 NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
@@ -1153,7 +1151,11 @@ mod tests {
             capabilities: vec![Capability::FourByteAsn(65002)],
         });
         let out = fsm.process(FsmInput::MessageReceived(open));
-        assert_eq!(fsm.state(), State::OpenConfirm, "loopback BGP ID must not be rejected");
+        assert_eq!(
+            fsm.state(),
+            State::OpenConfirm,
+            "loopback BGP ID must not be rejected"
+        );
         // FSM sends KEEPALIVE on entering OpenConfirm — not a NOTIFICATION.
         assert!(matches!(find_send(&out), Some(BgpMessage::Keepalive)));
     }

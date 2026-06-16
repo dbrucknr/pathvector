@@ -408,7 +408,13 @@ impl AsPath {
                 let downgraded: Vec<crate::Asn> = seg
                     .asns()
                     .iter()
-                    .map(|&a| if a.is_four_byte() { crate::Asn::TRANS } else { a })
+                    .map(|&a| {
+                        if a.is_four_byte() {
+                            crate::Asn::TRANS
+                        } else {
+                            a
+                        }
+                    })
                     .collect();
                 match seg {
                     AsPathSegment::Sequence(_) => AsPathSegment::Sequence(downgraded),
@@ -418,7 +424,12 @@ impl AsPath {
                 }
             })
             .collect();
-        (Self { segments: downgraded_segments }, Some(self.clone()))
+        (
+            Self {
+                segments: downgraded_segments,
+            },
+            Some(self.clone()),
+        )
     }
 
     /// Returns a new `AsPath` with all confederation segments removed.
@@ -740,8 +751,7 @@ mod tests {
 
     #[test]
     fn downgrade_for_two_byte_peer_replaces_four_byte_with_trans() {
-        let path =
-            AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131_072), Asn::new(65002)]);
+        let path = AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131_072), Asn::new(65002)]);
         let (downgraded, orig) = path.downgrade_for_two_byte_peer();
         assert!(orig.is_some(), "substitution occurred");
         // Original preserved intact.
@@ -767,9 +777,10 @@ mod tests {
 
     #[test]
     fn downgrade_for_two_byte_peer_preserves_segment_type() {
-        let path = AsPath::from_segments(vec![
-            AsPathSegment::Set(vec![Asn::new(131_072), Asn::new(65001)]),
-        ]);
+        let path = AsPath::from_segments(vec![AsPathSegment::Set(vec![
+            Asn::new(131_072),
+            Asn::new(65001),
+        ])]);
         let (downgraded, _) = path.downgrade_for_two_byte_peer();
         assert!(matches!(downgraded.segments()[0], AsPathSegment::Set(_)));
         let asns = downgraded.segments()[0].asns();
