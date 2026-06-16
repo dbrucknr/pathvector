@@ -30,7 +30,7 @@ use std::{
 };
 
 use pathvector_rib::{BestPathChange, oracle::NextHopOracle};
-use pathvector_sys::{FibWriter, KernelOracle as SysOracle};
+use pathvector_sys::{FibWrite, KernelOracle as SysOracle};
 use pathvector_types::{NextHop, Nlri};
 use tokio::sync::Notify;
 
@@ -39,6 +39,9 @@ use tokio::sync::Notify;
 /// Implements [`NextHopOracle`] by querying the in-process [`FibSnapshot`].
 ///
 /// [`FibSnapshot`]: pathvector_sys::FibSnapshot
+// Constructed only on Linux (where KernelFib::spawn() populates the snapshot);
+// tests on all platforms use it directly.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct DaemonOracle(pub(crate) SysOracle);
 
 impl NextHopOracle for DaemonOracle {
@@ -108,7 +111,7 @@ pub(crate) struct FibManager {
 }
 
 impl FibManager {
-    pub(crate) fn new(writer: FibWriter) -> Self {
+    pub(crate) fn new<W: FibWrite + Send + Sync + 'static>(writer: W) -> Self {
         let pending_v4 = Arc::new(Mutex::new(HashMap::new()));
         let pending_v6 = Arc::new(Mutex::new(HashMap::new()));
         let notify = Arc::new(Notify::new());
@@ -181,8 +184,65 @@ impl FibManager {
     }
 }
 
-fn spawn_writer(
-    writer: FibWriter,
+/// Apply one drained batch to the kernel FIB.
+///
+/// Extracted from the `spawn_writer` loop so it can be called directly in
+/// tests without going through the tokio scheduler. Static dispatch via
+/// `W: FibWrite` — no vtable.
+pub(crate) async fn process_batch<W: FibWrite>(
+    writer: &W,
+    v4_batch: HashMap<Nlri<Ipv4Addr>, PendingV4>,
+    v6_batch: HashMap<Nlri<Ipv6Addr>, PendingV6>,
+) {
+    for (nlri, op) in v4_batch {
+        let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
+        match op {
+            PendingV4::Install { gateway } => {
+                if let Err(e) = writer.install_v4(dst, prefix_len, gateway).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        %gateway,
+                        "FIB install failed: {e}"
+                    );
+                }
+            }
+            PendingV4::Withdraw => {
+                if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        "FIB withdraw failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    for (nlri, op) in v6_batch {
+        let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
+        match op {
+            PendingV6::Install { gateway } => {
+                if let Err(e) = writer.install_v6(dst, prefix_len, gateway).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        %gateway,
+                        "FIB install (v6) failed: {e}"
+                    );
+                }
+            }
+            PendingV6::Withdraw => {
+                if let Err(e) = writer.withdraw_v6(dst, prefix_len).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        "FIB withdraw (v6) failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn spawn_writer<W: FibWrite + Send + Sync + 'static>(
+    writer: W,
     pending_v4: Arc<Mutex<HashMap<Nlri<Ipv4Addr>, PendingV4>>>,
     pending_v6: Arc<Mutex<HashMap<Nlri<Ipv6Addr>, PendingV6>>>,
     notify: Arc<Notify>,
@@ -190,57 +250,11 @@ fn spawn_writer(
     tokio::spawn(async move {
         loop {
             notify.notified().await;
-
             // Drain both maps atomically so the event loop can keep writing
             // new entries while we process this batch.
             let v4_batch = std::mem::take(&mut *pending_v4.lock().unwrap());
             let v6_batch = std::mem::take(&mut *pending_v6.lock().unwrap());
-
-            for (nlri, op) in v4_batch {
-                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
-                match op {
-                    PendingV4::Install { gateway } => {
-                        if let Err(e) = writer.install_v4(dst, prefix_len, gateway).await {
-                            tracing::warn!(
-                                prefix = %format!("{dst}/{prefix_len}"),
-                                %gateway,
-                                "FIB install failed: {e}"
-                            );
-                        }
-                    }
-                    PendingV4::Withdraw => {
-                        if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
-                            tracing::warn!(
-                                prefix = %format!("{dst}/{prefix_len}"),
-                                "FIB withdraw failed: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-
-            for (nlri, op) in v6_batch {
-                let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
-                match op {
-                    PendingV6::Install { gateway } => {
-                        if let Err(e) = writer.install_v6(dst, prefix_len, gateway).await {
-                            tracing::warn!(
-                                prefix = %format!("{dst}/{prefix_len}"),
-                                %gateway,
-                                "FIB install (v6) failed: {e}"
-                            );
-                        }
-                    }
-                    PendingV6::Withdraw => {
-                        if let Err(e) = writer.withdraw_v6(dst, prefix_len).await {
-                            tracing::warn!(
-                                prefix = %format!("{dst}/{prefix_len}"),
-                                "FIB withdraw (v6) failed: {e}"
-                            );
-                        }
-                    }
-                }
-            }
+            process_batch(&writer, v4_batch, v6_batch).await;
         }
     });
 }
@@ -249,12 +263,223 @@ fn spawn_writer(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::{
+        collections::HashMap,
+        net::{Ipv4Addr, Ipv6Addr},
+        sync::{Arc, Mutex},
+    };
 
     use pathvector_rib::{BestPathChange, RouteBuilder};
+    use pathvector_sys::FibWrite;
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
 
     use super::{FibManager, PendingV4, PendingV6};
+
+    // ── MockFibWriter ─────────────────────────────────────────────────────────
+
+    #[derive(Debug, Default, Clone)]
+    struct Calls {
+        installed_v4: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+        withdrawn_v4: Vec<(Ipv4Addr, u8)>,
+        installed_v6: Vec<(Ipv6Addr, u8, Ipv6Addr)>,
+        withdrawn_v6: Vec<(Ipv6Addr, u8)>,
+    }
+
+    /// A `FibWrite` implementation that records every call for inspection.
+    /// Static dispatch — no vtable. Returns `impl Future` via `async fn`.
+    #[derive(Clone)]
+    struct MockFibWriter {
+        calls: Arc<Mutex<Calls>>,
+        fail_v4: bool,
+        fail_v6: bool,
+    }
+
+    impl MockFibWriter {
+        fn new() -> (Self, Arc<Mutex<Calls>>) {
+            let calls = Arc::new(Mutex::new(Calls::default()));
+            (
+                Self {
+                    calls: Arc::clone(&calls),
+                    fail_v4: false,
+                    fail_v6: false,
+                },
+                calls,
+            )
+        }
+
+        fn failing() -> (Self, Arc<Mutex<Calls>>) {
+            let (mut w, calls) = Self::new();
+            w.fail_v4 = true;
+            (w, calls)
+        }
+
+        fn failing_v6() -> (Self, Arc<Mutex<Calls>>) {
+            let (mut w, calls) = Self::new();
+            w.fail_v6 = true;
+            (w, calls)
+        }
+    }
+
+    impl FibWrite for MockFibWriter {
+        async fn install_v4(
+            &self,
+            dst: Ipv4Addr,
+            prefix_len: u8,
+            gateway: Ipv4Addr,
+        ) -> std::io::Result<()> {
+            if self.fail_v4 {
+                return Err(std::io::Error::other("mock install_v4 failure"));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .installed_v4
+                .push((dst, prefix_len, gateway));
+            Ok(())
+        }
+
+        async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .withdrawn_v4
+                .push((dst, prefix_len));
+            Ok(())
+        }
+
+        async fn install_v6(
+            &self,
+            dst: Ipv6Addr,
+            prefix_len: u8,
+            gateway: Ipv6Addr,
+        ) -> std::io::Result<()> {
+            if self.fail_v6 {
+                return Err(std::io::Error::other("mock install_v6 failure"));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .installed_v6
+                .push((dst, prefix_len, gateway));
+            Ok(())
+        }
+
+        async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_v6 {
+                return Err(std::io::Error::other("mock withdraw_v6 failure"));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .withdrawn_v6
+                .push((dst, prefix_len));
+            Ok(())
+        }
+    }
+
+    // ── process_batch unit tests ──────────────────────────────────────────────
+    //
+    // These call `process_batch` directly, bypassing the tokio scheduler
+    // entirely — no yields, no timing, no spawned-task race conditions.
+    // Static dispatch: the compiler monomorphises `process_batch<MockFibWriter>`
+    // at compile time; no vtable is involved.
+
+    fn v4_install(gw: &str) -> PendingV4 {
+        PendingV4::Install {
+            gateway: gw.parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_install_v4_calls_writer() {
+        let (mock, calls) = MockFibWriter::new();
+        let gw: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, v4_install("192.0.2.1"));
+        super::process_batch(&mock, v4, HashMap::new()).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(c.installed_v4, vec![(Ipv4Addr::new(10, 0, 0, 0), 8, gw)]);
+        assert!(c.withdrawn_v4.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_withdraw_v4_calls_writer() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::Withdraw);
+        super::process_batch(&mock, v4, HashMap::new()).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(c.withdrawn_v4, vec![(Ipv4Addr::new(10, 0, 0, 0), 8)]);
+        assert!(c.installed_v4.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_install_v6_calls_writer() {
+        let (mock, calls) = MockFibWriter::new();
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::Install { gateway: gw });
+        super::process_batch(&mock, HashMap::new(), v6).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            c.installed_v6,
+            vec![("2001:db8::".parse().unwrap(), 32, gw)]
+        );
+        assert!(c.withdrawn_v6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_withdraw_v6_calls_writer() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::Withdraw);
+        super::process_batch(&mock, HashMap::new(), v6).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(c.withdrawn_v6, vec![("2001:db8::".parse().unwrap(), 32)]);
+        assert!(c.installed_v6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_install_failure_does_not_panic() {
+        // A failing writer must log a warning and continue — not panic or abort.
+        let (mock, calls) = MockFibWriter::failing();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, v4_install("192.0.2.1"));
+        // The withdraw on a different prefix must still succeed after the install fails.
+        let nlri2: Nlri<Ipv4Addr> = "172.16.0.0/12".parse().unwrap();
+        v4.insert(nlri2, PendingV4::Withdraw);
+        super::process_batch(&mock, v4, HashMap::new()).await;
+        let c = calls.lock().unwrap();
+        // install_v4 errored (fail_v4=true), withdraw_v4 succeeded.
+        assert!(
+            c.installed_v4.is_empty(),
+            "failed install must not be recorded"
+        );
+        assert_eq!(c.withdrawn_v4.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_mixed_v4_and_v6_processed_independently() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri4: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let nlri6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let gw6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri4, PendingV4::Withdraw);
+        let mut v6 = HashMap::new();
+        v6.insert(nlri6, PendingV6::Install { gateway: gw6 });
+        super::process_batch(&mock, v4, v6).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(c.withdrawn_v4.len(), 1);
+        assert_eq!(c.installed_v6.len(), 1);
+        assert!(c.installed_v4.is_empty());
+        assert!(c.withdrawn_v6.is_empty());
+    }
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -452,6 +677,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_v6_with_link_local_uses_global_as_gateway() {
+        let fm = make_fm();
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6WithLinkLocal { global, link_local })
+            .build();
+        fm.apply_v6(BestPathChange::Announced(nlri6("2001:db8::/32"), route));
+        let snap = fm.pending_v6_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[&nlri6("2001:db8::/32")],
+            PendingV6::Install { gateway: global },
+            "V6WithLinkLocal must use the global address as the kernel gateway"
+        );
+    }
+
+    #[test]
+    fn test_apply_v6_non_v6_next_hop_skipped() {
+        let fm = make_fm();
+        // A route with a V4 next-hop applied to apply_v6 should be silently dropped.
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(192, 0, 2, 1)))
+            .build();
+        fm.apply_v6(BestPathChange::Announced(nlri6("2001:db8::/32"), route));
+        assert!(
+            fm.pending_v6_snapshot().is_empty(),
+            "V4 next-hop on a V6 change must be silently skipped"
+        );
+    }
+
+    #[test]
+    fn test_apply_v6_no_next_hop_skipped() {
+        let fm = make_fm();
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new()).build();
+        fm.apply_v6(BestPathChange::Announced(nlri6("2001:db8::/32"), route));
+        assert!(fm.pending_v6_snapshot().is_empty());
+    }
+
     // ── DaemonOracle ─────────────────────────────────────────────────────────
 
     #[test]
@@ -495,6 +760,37 @@ mod tests {
     }
 
     #[test]
+    fn test_daemon_oracle_igp_metric_v6_with_link_local_no_metric_when_both_miss() {
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        let nh = NextHop::V6WithLinkLocal {
+            global: "2001:db8::1".parse().unwrap(),
+            link_local: "2001:db8::2".parse().unwrap(),
+        };
+        assert!(
+            oracle.igp_metric(&nh).is_none(),
+            "no route in FIB means no IGP metric for V6WithLinkLocal"
+        );
+    }
+
+    #[test]
+    fn test_daemon_oracle_igp_metric_v6_with_link_local_unspecified_global_checks_link_local() {
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        // global=:: (unspecified) forces the code to skip the global branch
+        // and look up the link-local. Neither is in the empty FIB, so None.
+        let nh = NextHop::V6WithLinkLocal {
+            global: Ipv6Addr::UNSPECIFIED,
+            link_local: "fe80::1".parse().unwrap(),
+        };
+        assert!(oracle.igp_metric(&nh).is_none());
+    }
+
+    #[test]
     fn test_daemon_oracle_v6_with_link_local_unreachable_when_both_miss() {
         // When neither global nor link-local is reachable, the route is rejected.
         use pathvector_rib::oracle::NextHopOracle;
@@ -507,5 +803,61 @@ mod tests {
             link_local: "2001:db8::2".parse().unwrap(),
         };
         assert!(!oracle.is_reachable(&nh));
+    }
+
+    #[test]
+    fn test_daemon_oracle_v6_with_link_local_global_reachable_returns_true() {
+        // global = fe80::1 is link-local → is_v6_reachable returns true immediately,
+        // so the "prefer global" branch (line 59) is taken and true is returned
+        // without consulting the link-local.
+        use pathvector_rib::oracle::NextHopOracle;
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        let nh = NextHop::V6WithLinkLocal {
+            global: "fe80::1".parse().unwrap(),
+            link_local: "fe80::2".parse().unwrap(),
+        };
+        assert!(oracle.is_reachable(&nh));
+    }
+
+    #[tokio::test]
+    async fn test_fib_manager_new_spawns_writer_and_processes_batch() {
+        // FibManager::new() is never called in the other tests (they use make_fm()
+        // to bypass the tokio::spawn). This test exercises the real constructor and
+        // the spawned writer loop by applying a change and waiting for it to drain.
+        let (mock, calls) = MockFibWriter::new();
+        let fm = FibManager::new(mock);
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        fm.apply_v4(BestPathChange::Withdrawn(nlri));
+        // Give the spawned writer task one scheduler tick to wake and drain.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.lock().unwrap().withdrawn_v4,
+            vec![(Ipv4Addr::new(10, 0, 0, 0), 8)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_v6_install_failure_logs_and_continues() {
+        // The v6 install/withdraw error arms (tracing::warn inside process_batch)
+        // are reached when the writer returns Err for install_v6/withdraw_v6.
+        let (mock, calls) = MockFibWriter::failing_v6();
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let nlri6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let nlri6b: Nlri<Ipv6Addr> = "2001:db8:1::/48".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri6, PendingV6::Install { gateway: gw });
+        v6.insert(nlri6b, PendingV6::Withdraw);
+        super::process_batch(&mock, HashMap::new(), v6).await;
+        let c = calls.lock().unwrap();
+        assert!(
+            c.installed_v6.is_empty(),
+            "failed install_v6 must not be recorded"
+        );
+        assert!(
+            c.withdrawn_v6.is_empty(),
+            "failed withdraw_v6 must not be recorded"
+        );
     }
 }

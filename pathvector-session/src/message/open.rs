@@ -447,6 +447,86 @@ mod tests {
     }
 
     #[test]
+    fn test_graceful_restart_zero_families_roundtrip() {
+        let mut msg = base_open();
+        msg.capabilities = vec![Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 300,
+            families: vec![],
+        }];
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_graceful_restart_nonzero_restart_flags_roundtrip() {
+        // restart_flags=8 sets the Restart State (R) bit in the high nibble.
+        let mut msg = base_open();
+        msg.capabilities = vec![Capability::GracefulRestart {
+            restart_flags: 8,
+            restart_time: 60,
+            families: vec![GracefulRestartFamily {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                forwarding_preserved: false,
+            }],
+        }];
+        let rt = roundtrip(&msg);
+        assert_eq!(rt, msg);
+        if let Capability::GracefulRestart { restart_flags, .. } = &rt.capabilities[0] {
+            assert_eq!(*restart_flags, 8);
+        } else {
+            panic!("expected GracefulRestart");
+        }
+    }
+
+    #[test]
+    fn test_graceful_restart_max_restart_time_roundtrip() {
+        // restart_time is a 12-bit field (max 4095).
+        let mut msg = base_open();
+        msg.capabilities = vec![Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 4095,
+            families: vec![],
+        }];
+        let rt = roundtrip(&msg);
+        if let Capability::GracefulRestart { restart_time, .. } = &rt.capabilities[0] {
+            assert_eq!(*restart_time, 4095);
+        } else {
+            panic!("expected GracefulRestart");
+        }
+    }
+
+    #[test]
+    fn test_unknown_capability_empty_value_roundtrip() {
+        let mut msg = base_open();
+        msg.capabilities = vec![Capability::Unknown {
+            code: 201,
+            value: vec![],
+        }];
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_multiple_opt_param_blocks_merged() {
+        // Two separate optional parameter TLVs of type 2, each containing one capability.
+        // RFC 3392 allows multiple opt-param blocks; capabilities from all must be collected.
+        let params: Vec<u8> = vec![
+            OPT_PARAM_CAPABILITIES,
+            2,
+            6,
+            0, // ExtendedMessage
+            OPT_PARAM_CAPABILITIES,
+            2,
+            2,
+            0, // RouteRefresh
+        ];
+        let body = open_with_raw_opt_params(&params);
+        let open = decode_open_body(&body).unwrap();
+        assert_eq!(open.capabilities.len(), 2);
+        assert!(open.capabilities.contains(&Capability::ExtendedMessage));
+        assert!(open.capabilities.contains(&Capability::RouteRefresh));
+    }
+
+    #[test]
     fn test_extended_message_capability_roundtrip() {
         // cap_code=6 (ExtendedMessage), cap_len=0
         let params = [OPT_PARAM_CAPABILITIES, 2, 6, 0];

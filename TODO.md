@@ -85,6 +85,14 @@ integration rather than direct unit tests.
 - `pathvectord` clock/timer behaviour (hold timer, connect-retry timer) — no `Clock` trait
   injection yet. Deferred until MRAI or dampening requires it.
 - `pathvector-client` conversion layer fuzz target — deferred until proto types stabilise.
+- `pathvectord/src/daemon.rs` (96.5%, ~194 missed lines) — async event-loop branches
+  (session events, peer state transitions, route update handlers) require a mock session
+  harness or lightweight integration scaffolding to drive the event loop without real TCP.
+- `pathvector-sys/src/tcp.rs` (94.9%) — missed lines likely require real socket setup or
+  Linux-only TCP MD5 paths; investigate whether mock sockets or platform-gated tests can close the gap.
+- `pathvector-session/src/transport/mod.rs` (96.0%) — `SessionCommand::Notification` branch
+  (~line 411) and TCP send failure path (~line 479) require a real or mock transport pair
+  to drive the async session loop.
 
 ---
 

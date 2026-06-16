@@ -15,7 +15,7 @@ use netlink_packet_route::{
 use rtnetlink::{MulticastGroup, RouteMessageBuilder};
 use tokio::sync::watch;
 
-use super::{FibEntry4, FibEntry6, FibSnapshot};
+use super::{FibEntry4, FibEntry6, FibSnapshot, FibWrite};
 
 // ── FibWriter ─────────────────────────────────────────────────────────────────
 
@@ -108,6 +108,24 @@ impl FibWriter {
     /// Returns an I/O error if the netlink call fails.
     pub async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
         withdraw_route_v6(&self.handle, dst, prefix_len, self.table, self.metric).await
+    }
+}
+
+impl FibWrite for FibWriter {
+    async fn install_v4(&self, dst: Ipv4Addr, prefix_len: u8, gateway: Ipv4Addr) -> io::Result<()> {
+        self.install_v4(dst, prefix_len, gateway).await
+    }
+
+    async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+        self.withdraw_v4(dst, prefix_len).await
+    }
+
+    async fn install_v6(&self, dst: Ipv6Addr, prefix_len: u8, gateway: Ipv6Addr) -> io::Result<()> {
+        self.install_v6(dst, prefix_len, gateway).await
+    }
+
+    async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> io::Result<()> {
+        self.withdraw_v6(dst, prefix_len).await
     }
 }
 

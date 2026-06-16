@@ -25,7 +25,7 @@ gobgp-up:
 
 # Start pathvectord against the local interop config (config.toml).
 dev:
-    cargo run -p pathvectord -- config.toml
+    RUST_LOG=pathvectord=debug,pathvector_session=debug cargo run -p pathvectord -- config.toml
 
 # Open the live TUI dashboard pointed at the local dev daemon.
 dashboard:

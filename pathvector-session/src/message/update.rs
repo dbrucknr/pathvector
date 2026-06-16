@@ -1965,9 +1965,100 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests {
+    use std::net::Ipv4Addr;
+
     use proptest::prelude::*;
 
     use super::*;
+
+    // ── Encode/decode roundtrip properties ───────────────────────────────────
+
+    /// Generate an arbitrary `Nlri<Ipv4Addr>` within the 10.x.0.0/8..24 block.
+    fn arb_nlri_v4() -> impl Strategy<Value = Nlri<Ipv4Addr>> {
+        (0u8..=255u8, 0u8..=24u8).prop_map(|(b, prefix_len)| {
+            // Mask the host bits so the network address is canonical.
+            let shift = 32u32.saturating_sub(u32::from(prefix_len));
+            let raw = u32::from_be_bytes([10, b, 0, 0]);
+            let masked = if shift >= 32 {
+                0
+            } else {
+                (raw >> shift) << shift
+            };
+            let addr = Ipv4Addr::from(masked);
+            format!("{addr}/{prefix_len}").parse().unwrap()
+        })
+    }
+
+    /// Generate a small set of withdrawn-only NLRIs — no attributes needed.
+    fn arb_withdraw_only_update() -> impl Strategy<Value = UpdateMessage> {
+        proptest::collection::vec(arb_nlri_v4(), 0..=8).prop_map(|withdrawn| UpdateMessage {
+            withdrawn,
+            attributes: vec![],
+            announced: vec![],
+        })
+    }
+
+    /// Generate an update with announced NLRIs + the three mandatory attributes.
+    fn arb_announce_update() -> impl Strategy<Value = UpdateMessage> {
+        (
+            proptest::collection::vec(arb_nlri_v4(), 1..=8),
+            proptest::collection::vec(arb_nlri_v4(), 0..=4),
+            0u32..=200,
+            (0u8..=2_u8), // Origin: 0=IGP, 1=EGP, 2=Incomplete
+        )
+            .prop_map(|(announced, withdrawn, med, origin_byte)| {
+                let origin = match origin_byte {
+                    0 => Origin::Igp,
+                    1 => Origin::Egp,
+                    _ => Origin::Incomplete,
+                };
+                UpdateMessage {
+                    withdrawn,
+                    attributes: vec![
+                        PathAttribute::Origin(origin),
+                        PathAttribute::AsPath(AsPath::new()),
+                        PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
+                        PathAttribute::Med(med),
+                    ],
+                    announced,
+                }
+            })
+    }
+
+    proptest! {
+        /// Withdraw-only updates survive a full encode→decode roundtrip.
+        #[test]
+        fn prop_withdraw_only_update_roundtrip(msg in arb_withdraw_only_update()) {
+            let encoded = msg.encode();
+            let mut cur = Cursor::new(&encoded[19..]);
+            let decoded = UpdateMessage::decode(&mut cur)
+                .expect("structural decode error on well-formed message");
+            prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
+        }
+
+        /// Announce updates with mandatory attributes survive a full encode→decode roundtrip.
+        #[test]
+        fn prop_announce_update_roundtrip(msg in arb_announce_update()) {
+            let encoded = msg.encode();
+            let mut cur = Cursor::new(&encoded[19..]);
+            let decoded = UpdateMessage::decode(&mut cur)
+                .expect("structural decode error on well-formed message");
+            prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
+        }
+
+        /// encode→decode is idempotent: encoding the decoded message produces identical bytes.
+        #[test]
+        fn prop_encode_is_idempotent(msg in arb_announce_update()) {
+            let first = msg.encode();
+            let mut cur = Cursor::new(&first[19..]);
+            let roundtripped = match UpdateMessage::decode(&mut cur).unwrap() {
+                UpdateDecodeOutcome::Clean(m) => m,
+                UpdateDecodeOutcome::Partial { .. } => panic!("expected Clean, got Partial"),
+            };
+            let second = roundtripped.encode();
+            prop_assert_eq!(first, second, "double-encode must be byte-identical");
+        }
+    }
 
     // (type_code, canonical malformed value) for TreatAsWithdraw attributes.
     //
