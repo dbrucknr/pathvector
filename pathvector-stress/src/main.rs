@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pathvector_client::{DaemonClient, PathvectorClient, types::{Origin, OriginateRouteParams}};
+use pathvector_client::{
+    DaemonClient, PathvectorClient,
+    types::{Origin, OriginateRouteParams},
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -20,11 +23,7 @@ use tokio::{
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Sizes for the three stress phases.
-const PHASES: &[(u32, &str)] = &[
-    (10_000,  "10k"),
-    (100_000, "100k"),
-    (500_000, "500k"),
-];
+const PHASES: &[(u32, &str)] = &[(10_000, "10k"), (100_000, "100k"), (500_000, "500k")];
 
 /// Batch size for `originate_routes` / `withdraw_originated_routes` calls.
 const BATCH: usize = 500;
@@ -144,12 +143,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("pathvectord PID: {pid}  (verify: ps -p {pid} -o rss=)");
 
     let error_count = Arc::new(AtomicUsize::new(0));
-    let warn_count  = Arc::new(AtomicUsize::new(0));
-    let peak_kb     = Arc::new(AtomicU64::new(0));
+    let warn_count = Arc::new(AtomicUsize::new(0));
+    let peak_kb = Arc::new(AtomicU64::new(0));
     let rss_running = Arc::new(AtomicUsize::new(1));
 
-    tokio::spawn(stderr_logger(stderr, Arc::clone(&error_count), Arc::clone(&warn_count)));
-    tokio::spawn(rss_sampler(pid, Arc::clone(&peak_kb), Arc::clone(&rss_running)));
+    tokio::spawn(stderr_logger(
+        stderr,
+        Arc::clone(&error_count),
+        Arc::clone(&warn_count),
+    ));
+    tokio::spawn(rss_sampler(
+        pid,
+        Arc::clone(&peak_kb),
+        Arc::clone(&rss_running),
+    ));
 
     let endpoint = format!("http://127.0.0.1:{GRPC_PORT}");
     let mut client = wait_for_grpc(&endpoint, pid).await?;
@@ -237,7 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..total_originated {
         batch.push(prefix_for(i));
         if batch.len() == BATCH {
-            client.withdraw_originated_routes(std::mem::take(&mut batch)).await?;
+            client
+                .withdraw_originated_routes(std::mem::take(&mut batch))
+                .await?;
         }
     }
     if !batch.is_empty() {
@@ -250,11 +259,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rss_post_withdraw = sample_rss_kb(pid);
     let reclaimed_kb = rss_pre_withdraw.saturating_sub(rss_post_withdraw);
 
+    println!("  Before:    {}", fmt_kb(rss_pre_withdraw),);
     println!(
-        "  Before:    {}", fmt_kb(rss_pre_withdraw),
-    );
-    println!(
-        "  After:     {}  ({:.2}s)", fmt_kb(rss_post_withdraw), withdraw_elapsed.as_secs_f64(),
+        "  After:     {}  ({:.2}s)",
+        fmt_kb(rss_post_withdraw),
+        withdraw_elapsed.as_secs_f64(),
     );
     println!(
         "  Reclaimed: {}  ({:.0}%)",
@@ -304,7 +313,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..CHURN_ROUTES {
             batch.push(prefix_for(i));
             if batch.len() == BATCH {
-                client.withdraw_originated_routes(std::mem::take(&mut batch)).await?;
+                client
+                    .withdraw_originated_routes(std::mem::take(&mut batch))
+                    .await?;
             }
         }
         if !batch.is_empty() {
@@ -346,10 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gobgp_results = gobgp_bench::run(PHASES, BATCH).await?;
 
-    println!(
-        "{:<8}  {:>10}  {:>10}",
-        "Phase", "Time (s)", "Peak RSS",
-    );
+    println!("{:<8}  {:>10}  {:>10}", "Phase", "Time (s)", "Peak RSS",);
     println!("{}", "-".repeat(32));
     for r in &gobgp_results {
         println!(
@@ -381,10 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("── Side-by-side: peak RSS ───────────────────────────────────────────");
-    println!(
-        "{:<8}  {:>14}  {:>14}",
-        "Phase", "pathvectord", "GoBGP",
-    );
+    println!("{:<8}  {:>14}  {:>14}", "Phase", "pathvectord", "GoBGP",);
     println!("{}", "-".repeat(40));
     for (pv, go) in pv_phase_results.iter().zip(gobgp_results.iter()) {
         println!("{:<8}  {:>14}  {:>14}", pv.label, pv.peak_rss, go.peak_rss);
@@ -433,15 +438,16 @@ fn workspace_bin(name: &str) -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    Err(format!(
-        "'{name}' binary not found — run `cargo build -p pathvectord` first"
-    )
-    .into())
+    Err(format!("'{name}' binary not found — run `cargo build -p pathvectord` first").into())
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn reclaim_pct(reclaimed: u64, total: u64) -> f64 {
-    if total > 0 { reclaimed as f64 / total as f64 * 100.0 } else { 0.0 }
+    if total > 0 {
+        reclaimed as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]

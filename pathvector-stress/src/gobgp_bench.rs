@@ -31,10 +31,8 @@ mod api {
 
 use api::{
     AddPathStreamRequest, AsPathAttribute, Attribute, Family, Global, IpAddressPrefix,
-    LocalPrefAttribute, Nlri, NextHopAttribute, OriginAttribute, Path, StartBgpRequest,
-    attribute::Attr,
-    go_bgp_service_client::GoBgpServiceClient,
-    nlri::Nlri as NlriOneof,
+    LocalPrefAttribute, NextHopAttribute, Nlri, OriginAttribute, Path, StartBgpRequest,
+    attribute::Attr, go_bgp_service_client::GoBgpServiceClient, nlri::Nlri as NlriOneof,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -62,14 +60,20 @@ fn make_path(n: u32, nexthop: &str) -> Path {
     };
 
     let pattrs = vec![
-        Attribute { attr: Some(Attr::Origin(OriginAttribute { origin: 0 })) },
-        Attribute { attr: Some(Attr::AsPath(AsPathAttribute { segments: vec![] })) },
+        Attribute {
+            attr: Some(Attr::Origin(OriginAttribute { origin: 0 })),
+        },
+        Attribute {
+            attr: Some(Attr::AsPath(AsPathAttribute { segments: vec![] })),
+        },
         Attribute {
             attr: Some(Attr::NextHop(NextHopAttribute {
                 next_hop: nexthop.to_owned(),
             })),
         },
-        Attribute { attr: Some(Attr::LocalPref(LocalPrefAttribute { local_pref: 100 })) },
+        Attribute {
+            attr: Some(Attr::LocalPref(LocalPrefAttribute { local_pref: 100 })),
+        },
     ];
 
     Path {
@@ -159,8 +163,10 @@ pub async fn run(
 
     let mut child = Command::new(&bin)
         .args([
-            "--api-hosts", &format!(":{GOBGP_GRPC_PORT}"),
-            "--log-level", "panic",
+            "--api-hosts",
+            &format!(":{GOBGP_GRPC_PORT}"),
+            "--log-level",
+            "panic",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -172,12 +178,20 @@ pub async fn run(
     println!();
 
     let error_count = Arc::new(AtomicUsize::new(0));
-    let warn_count  = Arc::new(AtomicUsize::new(0));
-    let peak_kb     = Arc::new(AtomicU64::new(0));
+    let warn_count = Arc::new(AtomicUsize::new(0));
+    let peak_kb = Arc::new(AtomicU64::new(0));
     let rss_running = Arc::new(AtomicUsize::new(1));
 
-    tokio::spawn(stderr_logger(stderr, Arc::clone(&error_count), Arc::clone(&warn_count)));
-    tokio::spawn(rss_sampler(pid, Arc::clone(&peak_kb), Arc::clone(&rss_running)));
+    tokio::spawn(stderr_logger(
+        stderr,
+        Arc::clone(&error_count),
+        Arc::clone(&warn_count),
+    ));
+    tokio::spawn(rss_sampler(
+        pid,
+        Arc::clone(&peak_kb),
+        Arc::clone(&rss_running),
+    ));
 
     let mut client = connect(pid).await?;
 
