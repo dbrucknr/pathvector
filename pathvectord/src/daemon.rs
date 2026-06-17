@@ -1811,14 +1811,27 @@ where
             incoming_cmd,
             event_tx,
             spawn_fn,
-            local_as,
-            local_bgp_id,
-            hold_time,
-            local_caps,
+            SpawnConfig {
+                local_as,
+                local_bgp_id,
+                hold_time,
+                local_capabilities: local_caps,
+            },
         ));
     }
 
     run_event_loop(event_rx, state, stop_senders, Some(fib_change_rx)).await;
+}
+
+/// Static session-spawn parameters forwarded to [`run_command_processor`].
+///
+/// Bundles the fields that are fixed at daemon startup and needed whenever a new
+/// session is created by an `AddPeer` command at runtime.
+struct SpawnConfig {
+    local_as: u32,
+    local_bgp_id: Ipv4Addr,
+    hold_time: u16,
+    local_capabilities: Vec<Capability>,
 }
 
 /// Processes [`DaemonCommand`]s from the gRPC layer.
@@ -1833,10 +1846,7 @@ async fn run_command_processor<H, F>(
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     event_tx: mpsc::Sender<(Ipv4Addr, SessionEvent)>,
     spawn_fn: F,
-    local_as: u32,
-    local_bgp_id: Ipv4Addr,
-    hold_time: u16,
-    local_capabilities: Vec<Capability>,
+    cfg: SpawnConfig,
 ) where
     H: SessionHandle + 'static,
     F: Fn(SessionConfig) -> H,
@@ -1851,10 +1861,10 @@ async fn run_command_processor<H, F>(
                 }
 
                 let session_cfg = SessionConfig {
-                    local_as,
-                    local_bgp_id,
-                    hold_time,
-                    capabilities: local_capabilities.clone(),
+                    local_as: cfg.local_as,
+                    local_bgp_id: cfg.local_bgp_id,
+                    hold_time: cfg.hold_time,
+                    capabilities: cfg.local_capabilities.clone(),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
                     peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
@@ -8505,10 +8515,12 @@ mod event_loop_tests {
             incoming,
             event_tx_clone,
             |_cfg| unreachable!("spawn_fn must not be called by RemovePeer"),
-            65001,
-            "1.2.3.4".parse().unwrap(),
-            180,
-            vec![],
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: 180,
+                local_capabilities: vec![],
+            },
         ));
 
         cmd_tx

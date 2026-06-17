@@ -4,8 +4,8 @@ use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 use proptest::prelude::*;
 
 use crate::{
-    AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder, best_path::select_best,
-    oracle::AlwaysReachable,
+    best_path::select_best, oracle::AlwaysReachable, AdjRibIn, AdjRibOut, LocRib, PeerId, Route,
+    RouteBuilder,
 };
 
 // ── Strategies ───────────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ proptest! {
         let as1 = AsPath::from_sequence(vec![Asn::new(65001)]);
         let as2 = AsPath::from_sequence(vec![Asn::new(65002)]);
 
-        let make = |path: AsPath, med: u32, ip: u8| -> Route<Ipv4Addr> {
+        let make = |path: AsPath, med: u32, _ip: u8| -> Route<Ipv4Addr> {
             RouteBuilder::new(nlri, Origin::Igp, path)
                 .local_pref(LocalPref::new(100))
                 .med(Med::new(med))
@@ -307,7 +307,7 @@ proptest! {
             .iter()
             .map(|order| {
                 let mut candidates = HashMap::new();
-                for (peer, route) in order.iter() {
+                for (peer, route) in *order {
                     candidates.insert(**peer, (*route).clone());
                 }
                 select_best(&candidates).unwrap().0
