@@ -425,20 +425,40 @@ async fn wait_for_grpc(
 
 fn workspace_bin(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
+
+    // Determine which profile this stress binary was compiled under by looking
+    // at its own path (…/target/release/stress or …/target/debug/stress).
+    // Always load the daemon from the same profile — mixing release stress with
+    // a debug daemon (or vice-versa) silently produces meaningless numbers.
+    let own_profile = exe
+        .ancestors()
+        .find_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            if name == "release" || name == "debug" {
+                Some(name.to_owned())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "release".to_owned());
+
     let target_dir = exe
         .ancestors()
         .find(|p| p.join("debug").is_dir() || p.join("release").is_dir())
         .map(std::path::Path::to_path_buf)
         .ok_or("could not locate target directory")?;
 
-    for profile in ["release", "debug"] {
-        let candidate = target_dir.join(profile).join(name);
-        if candidate.exists() {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
+    let candidate = target_dir.join(&own_profile).join(name);
+    if candidate.exists() {
+        return Ok(candidate.to_string_lossy().into_owned());
     }
 
-    Err(format!("'{name}' binary not found — run `cargo build -p pathvectord` first").into())
+    Err(format!(
+        "'{name}' binary not found in target/{own_profile}/ — \
+         run `cargo build{} -p {name}` first",
+        if own_profile == "release" { " --release" } else { "" }
+    )
+    .into())
 }
 
 #[allow(clippy::cast_precision_loss)]

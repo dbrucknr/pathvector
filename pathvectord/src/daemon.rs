@@ -2326,13 +2326,16 @@ fn handle_update(
         }
 
         let mut raw = builder.build();
-        raw.originator_id = originator_id;
-        raw.cluster_list.clone_from(&cluster_list);
+        if originator_id.is_some() || !cluster_list.is_empty() {
+            let r = raw.rare_mut();
+            r.originator_id = originator_id;
+            r.cluster_list.clone_from(&cluster_list);
+        }
 
         // RFC 7999: silently discard routes tagged with the BLACKHOLE community.
         // Store in AdjRibIn so soft-reconfig can see the raw route, but never
         // install into LocRib or advertise outbound.
-        if raw.communities.iter().any(|c| c.is_blackhole()) {
+        if raw.rare_or_default().communities.iter().any(|c| c.is_blackhole()) {
             adj_rib_in.insert(raw.clone());
             tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged route (RFC 7999)");
             rejected += 1;
@@ -2418,7 +2421,7 @@ fn handle_update(
 
         let raw = builder.build();
 
-        if raw.communities.iter().any(|c| c.is_blackhole()) {
+        if raw.rare_or_default().communities.iter().any(|c| c.is_blackhole()) {
             adj_rib_in_v6.insert(raw.clone());
             tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged IPv6 route (RFC 7999)");
             rejected_v6 += 1;
@@ -3316,11 +3319,12 @@ mod tests {
         assert_eq!(route.origin, Origin::Egp);
         assert_eq!(route.local_pref, Some(LocalPref::new(200)));
         assert_eq!(route.med, Some(Med::new(50)));
-        assert_eq!(route.communities.len(), 1);
-        assert_eq!(route.large_communities.len(), 1);
-        assert_eq!(route.extended_communities.len(), 1);
-        assert!(route.atomic_aggregate);
-        assert!(route.aggregator.is_some());
+        let rare = route.rare_or_default();
+        assert_eq!(rare.communities.len(), 1);
+        assert_eq!(rare.large_communities.len(), 1);
+        assert_eq!(rare.extended_communities.len(), 1);
+        assert!(rare.atomic_aggregate);
+        assert!(rare.aggregator.is_some());
     }
 
     #[test]
@@ -5074,8 +5078,8 @@ mod tests {
         )
         .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
         .build();
-        route.originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
-        route.cluster_list = vec![0x0101_0101u32];
+        route.rare_mut().originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
+        route.rare_mut().cluster_list = vec![0x0101_0101u32];
 
         let attrs = route_to_attributes(&route, PeerType::External, true);
         assert!(
@@ -5101,8 +5105,8 @@ mod tests {
         )
         .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
         .build();
-        route.originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
-        route.cluster_list = vec![0x0101_0101u32];
+        route.rare_mut().originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
+        route.rare_mut().cluster_list = vec![0x0101_0101u32];
 
         let attrs = route_to_attributes(&route, PeerType::Internal, true);
         assert!(

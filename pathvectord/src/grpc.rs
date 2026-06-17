@@ -125,9 +125,9 @@ pub(crate) fn route_to_proto(
         .map(proto_as_segment)
         .collect();
 
-    let communities: Vec<u32> = route.communities.iter().map(|c| c.as_u32()).collect();
-
-    let large_communities: Vec<LargeCommunity> = route
+    let rare = route.rare_or_default();
+    let communities: Vec<u32> = rare.communities.iter().map(|c| c.as_u32()).collect();
+    let large_communities: Vec<LargeCommunity> = rare
         .large_communities
         .iter()
         .map(|lc| LargeCommunity {
@@ -136,14 +136,12 @@ pub(crate) fn route_to_proto(
             local_data2: lc.local_data_2,
         })
         .collect();
-
-    let extended_communities: Vec<Vec<u8>> = route
+    let extended_communities: Vec<Vec<u8>> = rare
         .extended_communities
         .iter()
         .map(|ec| ec.as_bytes().to_vec())
         .collect();
-
-    let aggregator = route.aggregator.map(|agg| Aggregator {
+    let aggregator = rare.aggregator.map(|agg| Aggregator {
         asn: agg.asn.as_u32(),
         address: agg.ip.to_string(),
     });
@@ -160,7 +158,7 @@ pub(crate) fn route_to_proto(
         communities,
         large_communities,
         extended_communities,
-        atomic_aggregate: route.atomic_aggregate,
+        atomic_aggregate: rare.atomic_aggregate,
         aggregator,
     }
 }
@@ -186,9 +184,9 @@ pub(crate) fn route_v6_to_proto(
         .map(proto_as_segment)
         .collect();
 
-    let communities: Vec<u32> = route.communities.iter().map(|c| c.as_u32()).collect();
-
-    let large_communities: Vec<LargeCommunity> = route
+    let rare = route.rare_or_default();
+    let communities: Vec<u32> = rare.communities.iter().map(|c| c.as_u32()).collect();
+    let large_communities: Vec<LargeCommunity> = rare
         .large_communities
         .iter()
         .map(|lc| LargeCommunity {
@@ -197,14 +195,12 @@ pub(crate) fn route_v6_to_proto(
             local_data2: lc.local_data_2,
         })
         .collect();
-
-    let extended_communities: Vec<Vec<u8>> = route
+    let extended_communities: Vec<Vec<u8>> = rare
         .extended_communities
         .iter()
         .map(|ec| ec.as_bytes().to_vec())
         .collect();
-
-    let aggregator = route.aggregator.map(|agg| Aggregator {
+    let aggregator = rare.aggregator.map(|agg| Aggregator {
         asn: agg.asn.as_u32(),
         address: agg.ip.to_string(),
     });
@@ -221,7 +217,7 @@ pub(crate) fn route_v6_to_proto(
         communities,
         large_communities,
         extended_communities,
-        atomic_aggregate: route.atomic_aggregate,
+        atomic_aggregate: rare.atomic_aggregate,
         aggregator,
     }
 }
@@ -2004,9 +2000,10 @@ mod tests {
         }];
         req.extended_communities = vec![vec![0u8; 8]];
         let route = parse_originate_request(req).unwrap();
-        assert!(!route.communities.is_empty());
-        assert!(!route.large_communities.is_empty());
-        assert!(!route.extended_communities.is_empty());
+        let rare = route.rare_or_default();
+        assert!(!rare.communities.is_empty());
+        assert!(!rare.large_communities.is_empty());
+        assert!(!rare.extended_communities.is_empty());
     }
 
     #[test]
@@ -2078,9 +2075,10 @@ mod tests {
         }];
         req.extended_communities = vec![vec![0u8; 8]];
         let route = parse_originate_request_v6(req).unwrap();
-        assert!(!route.communities.is_empty());
-        assert!(!route.large_communities.is_empty());
-        assert!(!route.extended_communities.is_empty());
+        let rare = route.rare_or_default();
+        assert!(!rare.communities.is_empty());
+        assert!(!rare.large_communities.is_empty());
+        assert!(!rare.extended_communities.is_empty());
     }
 
     #[test]

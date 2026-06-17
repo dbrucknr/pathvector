@@ -41,6 +41,32 @@ use pathvector_types::{
 /// assert_eq!(route.origin, Origin::Igp);
 /// assert_eq!(route.as_path.path_length(), 1);
 /// ```
+/// Path attributes that are absent on the vast majority of routes.
+///
+/// Stored behind `Option<Box<_>>` on [`Route`] so that routes without any of
+/// these attributes pay only 8 bytes (a null pointer) instead of 96+ bytes of
+/// inline empty `Vec`s. The box is allocated lazily — only when at least one
+/// field is non-default.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RareAttrs {
+    /// Standard BGP communities (RFC 1997).
+    pub communities: Vec<Community>,
+    /// Large communities (RFC 8092).
+    pub large_communities: Vec<LargeCommunity>,
+    /// Extended communities (RFC 4360).
+    pub extended_communities: Vec<ExtendedCommunity>,
+    /// Ordered list of cluster IDs this route has passed through
+    /// (RFC 4456 `CLUSTER_LIST`, type 10). Empty for non-reflected routes.
+    pub cluster_list: Vec<u32>,
+    /// Flag indicating this route is an aggregate with suppressed path info.
+    pub atomic_aggregate: bool,
+    /// The router that performed aggregation, if known.
+    pub aggregator: Option<Aggregator>,
+    /// BGP Identifier of the router that first introduced this route into the
+    /// iBGP mesh via a route reflector (RFC 4456 `ORIGINATOR_ID`, type 9).
+    pub originator_id: Option<Ipv4Addr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route<A: IpAddress> {
     /// The advertised prefix.
@@ -58,23 +84,6 @@ pub struct Route<A: IpAddress> {
     pub local_pref: Option<LocalPref>,
     /// External exit discriminator (hint to neighboring ASes).
     pub med: Option<Med>,
-    /// Standard BGP communities (RFC 1997).
-    pub communities: Vec<Community>,
-    /// Large communities (RFC 8092).
-    pub large_communities: Vec<LargeCommunity>,
-    /// Extended communities (RFC 4360).
-    pub extended_communities: Vec<ExtendedCommunity>,
-    /// Flag indicating this route is an aggregate with suppressed path info.
-    pub atomic_aggregate: bool,
-    /// The router that performed aggregation, if known.
-    pub aggregator: Option<Aggregator>,
-    /// BGP Identifier of the router that first introduced this route into the
-    /// iBGP mesh via a route reflector (RFC 4456 `ORIGINATOR_ID`, type 9).
-    /// `None` for routes not passing through a reflector.
-    pub originator_id: Option<Ipv4Addr>,
-    /// Ordered list of cluster IDs this route has passed through
-    /// (RFC 4456 `CLUSTER_LIST`, type 10). Empty for non-reflected routes.
-    pub cluster_list: Vec<u32>,
     /// Whether this route was learned from an iBGP peer, eBGP peer, or
     /// locally originated.
     ///
@@ -88,7 +97,37 @@ pub struct Route<A: IpAddress> {
     /// otherwise equal, prefer the one received first (oldest). Set
     /// automatically to `Instant::now()` by [`RouteBuilder::build`].
     pub received_at: std::time::Instant,
+    /// Infrequently-set attributes: communities, cluster list, aggregator, etc.
+    ///
+    /// `None` when all rare attributes are at their default values, saving
+    /// ~96 bytes per route (four empty `Vec`s + padding) on the common path.
+    pub rare: Option<Box<RareAttrs>>,
 }
+
+impl<A: IpAddress> Route<A> {
+    /// Returns the rare attributes, or a static default if absent.
+    #[inline]
+    pub fn rare_or_default(&self) -> &RareAttrs {
+        self.rare.as_deref().unwrap_or(&RARE_DEFAULT)
+    }
+
+    /// Returns a mutable reference to rare attributes, allocating the box if
+    /// not yet present.
+    #[inline]
+    pub fn rare_mut(&mut self) -> &mut RareAttrs {
+        self.rare.get_or_insert_with(Box::default)
+    }
+}
+
+static RARE_DEFAULT: RareAttrs = RareAttrs {
+    communities: Vec::new(),
+    large_communities: Vec::new(),
+    extended_communities: Vec::new(),
+    cluster_list: Vec::new(),
+    atomic_aggregate: false,
+    aggregator: None,
+    originator_id: None,
+};
 
 impl<A: IpAddress> BgpRoute for Route<A> {
     type Addr = A;
@@ -106,16 +145,16 @@ impl<A: IpAddress> BgpRoute for Route<A> {
         self.med
     }
     fn as_path(&self) -> &AsPath {
-        &self.as_path  // Arc<AsPath> derefs to AsPath
+        &self.as_path
     }
     fn communities(&self) -> &[Community] {
-        &self.communities
+        &self.rare_or_default().communities
     }
     fn large_communities(&self) -> &[LargeCommunity] {
-        &self.large_communities
+        &self.rare_or_default().large_communities
     }
     fn extended_communities(&self) -> &[ExtendedCommunity] {
-        &self.extended_communities
+        &self.rare_or_default().extended_communities
     }
     fn next_hop(&self) -> Option<NextHop> {
         self.next_hop
@@ -134,13 +173,25 @@ impl<A: IpAddress> BgpRoute for Route<A> {
         self.as_path = Arc::new(path);
     }
     fn set_communities(&mut self, c: Vec<Community>) {
-        self.communities = c;
+        if c.is_empty() {
+            if let Some(r) = &mut self.rare { r.communities.clear(); }
+        } else {
+            self.rare_mut().communities = c;
+        }
     }
     fn set_large_communities(&mut self, c: Vec<LargeCommunity>) {
-        self.large_communities = c;
+        if c.is_empty() {
+            if let Some(r) = &mut self.rare { r.large_communities.clear(); }
+        } else {
+            self.rare_mut().large_communities = c;
+        }
     }
     fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) {
-        self.extended_communities = c;
+        if c.is_empty() {
+            if let Some(r) = &mut self.rare { r.extended_communities.clear(); }
+        } else {
+            self.rare_mut().extended_communities = c;
+        }
     }
     fn set_next_hop(&mut self, nh: Option<NextHop>) {
         self.next_hop = nh;
@@ -171,7 +222,7 @@ impl<A: IpAddress> BgpRoute for Route<A> {
 /// .build();
 ///
 /// assert_eq!(route.local_pref, Some(LocalPref::new(200)));
-/// assert_eq!(route.communities.len(), 1);
+/// assert_eq!(route.rare_or_default().communities.len(), 1);
 /// ```
 pub struct RouteBuilder<A: IpAddress> {
     nlri: Nlri<A>,
@@ -180,13 +231,9 @@ pub struct RouteBuilder<A: IpAddress> {
     next_hop: Option<NextHop>,
     local_pref: Option<LocalPref>,
     med: Option<Med>,
-    communities: Vec<Community>,
-    large_communities: Vec<LargeCommunity>,
-    extended_communities: Vec<ExtendedCommunity>,
-    atomic_aggregate: bool,
-    aggregator: Option<Aggregator>,
     peer_type: PeerType,
     received_at: std::time::Instant,
+    rare: Option<Box<RareAttrs>>,
 }
 
 impl<A: IpAddress> RouteBuilder<A> {
@@ -204,13 +251,9 @@ impl<A: IpAddress> RouteBuilder<A> {
             next_hop: None,
             local_pref: None,
             med: None,
-            communities: Vec::new(),
-            large_communities: Vec::new(),
-            extended_communities: Vec::new(),
-            atomic_aggregate: false,
-            aggregator: None,
             peer_type: PeerType::External,
             received_at: std::time::Instant::now(),
+            rare: None,
         }
     }
 
@@ -227,13 +270,9 @@ impl<A: IpAddress> RouteBuilder<A> {
             next_hop: None,
             local_pref: None,
             med: None,
-            communities: Vec::new(),
-            large_communities: Vec::new(),
-            extended_communities: Vec::new(),
-            atomic_aggregate: false,
-            aggregator: None,
             peer_type: PeerType::External,
             received_at: std::time::Instant::now(),
+            rare: None,
         }
     }
 
@@ -261,35 +300,35 @@ impl<A: IpAddress> RouteBuilder<A> {
     /// Appends a standard community.
     #[must_use]
     pub fn community(mut self, c: Community) -> Self {
-        self.communities.push(c);
+        self.rare.get_or_insert_with(Box::default).communities.push(c);
         self
     }
 
     /// Appends a large community.
     #[must_use]
     pub fn large_community(mut self, lc: LargeCommunity) -> Self {
-        self.large_communities.push(lc);
+        self.rare.get_or_insert_with(Box::default).large_communities.push(lc);
         self
     }
 
     /// Appends an extended community.
     #[must_use]
     pub fn extended_community(mut self, ec: ExtendedCommunity) -> Self {
-        self.extended_communities.push(ec);
+        self.rare.get_or_insert_with(Box::default).extended_communities.push(ec);
         self
     }
 
     /// Sets the `ATOMIC_AGGREGATE` flag.
     #[must_use]
     pub fn atomic_aggregate(mut self) -> Self {
-        self.atomic_aggregate = true;
+        self.rare.get_or_insert_with(Box::default).atomic_aggregate = true;
         self
     }
 
     /// Sets the `AGGREGATOR` attribute.
     #[must_use]
     pub fn aggregator(mut self, agg: Aggregator) -> Self {
-        self.aggregator = Some(agg);
+        self.rare.get_or_insert_with(Box::default).aggregator = Some(agg);
         self
     }
 
@@ -309,19 +348,13 @@ impl<A: IpAddress> RouteBuilder<A> {
         Route {
             nlri: self.nlri,
             origin: self.origin,
-            as_path: self.as_path, // already Arc<AsPath>
+            as_path: self.as_path,
             next_hop: self.next_hop,
             local_pref: self.local_pref,
             med: self.med,
-            communities: self.communities,
-            large_communities: self.large_communities,
-            extended_communities: self.extended_communities,
-            atomic_aggregate: self.atomic_aggregate,
-            aggregator: self.aggregator,
-            originator_id: None,
-            cluster_list: Vec::new(),
             peer_type: self.peer_type,
             received_at: self.received_at,
+            rare: self.rare,
         }
     }
 }
@@ -342,9 +375,9 @@ mod tests {
         assert!(route.next_hop.is_none());
         assert!(route.local_pref.is_none());
         assert!(route.med.is_none());
-        assert!(route.communities.is_empty());
-        assert!(!route.atomic_aggregate);
-        assert!(route.aggregator.is_none());
+        assert!(route.rare_or_default().communities.is_empty());
+        assert!(!route.rare_or_default().atomic_aggregate);
+        assert!(route.rare_or_default().aggregator.is_none());
     }
 
     #[test]
@@ -365,9 +398,9 @@ mod tests {
 
         assert_eq!(route.local_pref, Some(LocalPref::new(200)));
         assert_eq!(route.med, Some(Med::new(50)));
-        assert_eq!(route.communities.len(), 1);
-        assert!(route.atomic_aggregate);
-        assert!(route.aggregator.is_some());
+        assert_eq!(route.rare_or_default().communities.len(), 1);
+        assert!(route.rare_or_default().atomic_aggregate);
+        assert!(route.rare_or_default().aggregator.is_some());
     }
 
     #[test]
@@ -420,8 +453,8 @@ mod tests {
             .extended_community(ExtendedCommunity::route_target_as2(65000, 1))
             .build();
 
-        assert_eq!(route.large_communities.len(), 2);
-        assert_eq!(route.extended_communities.len(), 1);
+        assert_eq!(route.rare_or_default().large_communities.len(), 2);
+        assert_eq!(route.rare_or_default().extended_communities.len(), 1);
     }
 
     #[test]
