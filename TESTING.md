@@ -7,6 +7,32 @@ contributors.
 
 ---
 
+## What test should I write?
+
+```
+New pure function with a correctness invariant that should hold
+for all inputs?                                 → proptest (pathvector-types, pathvector-policy, pathvector-rib)
+
+New codec encode/decode path (BGP messages)?    → fuzz target in pathvector-fuzz/
+                                                  + unit test in pathvector-session
+
+New CLI command output format?                  → snapshot test (ratatui TestBackend + insta)
+
+New gRPC handler or end-to-end behaviour?       → pathvector-e2e test (Docker + GoBGP)
+
+New DaemonClient method or CLI command?         → unit test via MockDaemonClient in pathvector/src/client_trait.rs
+                                                  (no network, no daemon — just inject mock)
+
+New Linux kernel integration?                   → unit test the validation layer cross-platform,
+                                                  Linux syscall test in pathvector-sys under
+                                                  #[cfg(target_os = "linux")]
+
+Everything else?                                → unit test in a #[cfg(test)] mod tests block
+                                                  in the same file as the code being tested
+```
+
+---
+
 ## Quick Start:
 1. `just e2e-images`
 2. `just ci`

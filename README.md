@@ -6,9 +6,44 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/dbrucknr/pathvector/graph/badge.svg)](https://codecov.io/gh/dbrucknr/pathvector)
 
-A production-quality BGP implementation in Rust. Fast, memory-efficient, and designed as a library-first stack — usable as a full daemon or embedded directly into an application.
+A production-quality BGP implementation in Rust. Usable as a standalone daemon or
+embedded directly into an application.
 
-BGP is formally classified as a *path vector* routing protocol, the only widely deployed one at internet scale.
+---
+
+## BGP in 90 seconds
+
+*(Skip this if you already know BGP.)*
+
+The internet is not one network — it is tens of thousands of independent networks
+stitched together. Each network is called an **Autonomous System (AS)**: a collection of
+IP prefixes under common administrative control. Your ISP is an AS. Google is an AS.
+
+**BGP (Border Gateway Protocol)** is how these ASes tell each other what prefixes they
+can reach. It is the routing protocol of the public internet and has been since the early
+1990s. BGP-4 is defined in [RFC 4271](https://www.rfc-editor.org/rfc/rfc4271).
+
+BGP is a *path vector* protocol — every route advertisement carries the full sequence of
+autonomous systems it has passed through. That sequence is the **AS path**. When you
+receive a route, the AS path tells you: "to reach this prefix, packets will travel through
+AS 65001, then 65002, then 65003." If your own AS number appears in the path, the route
+has looped back — you reject it.
+
+**eBGP** (external) is the session between two routers in *different* ASes. This is what
+ISPs use to exchange routes.
+
+**iBGP** (internal) is the session between two routers in the *same* AS. Every BGP
+router inside a network must have the same view of the external routing table.
+
+The **three-table RIB model** is how a BGP router organises what it knows:
+
+- **Adj-RIB-In** — one table per peer, routes exactly as received, before any filtering
+- **Loc-RIB** — the decision table; import policy filters here, best-path picks a winner
+- **Adj-RIB-Out** — one table per peer, routes after export policy, ready to advertise
+
+**Import policy** decides which routes from a peer enter Loc-RIB. **Export policy**
+decides which Loc-RIB routes get advertised to each peer. pathvector defaults to
+*reject-by-default* for eBGP peers (RFC 8212) — you must explicitly accept routes.
 
 ---
 
@@ -20,11 +55,13 @@ BGP is formally classified as a *path vector* routing protocol, the only widely 
 # config.toml — minimal eBGP peer config
 [daemon]
 local_as = 65002
-bgp_id   = "10.0.0.2"
+bgp_id   = "10.0.0.2"   # must be a non-loopback address on this machine
 
 [[peers]]
-address   = "10.0.0.1"
-remote_as = 65001
+address        = "10.0.0.1"
+remote_as      = 65001
+import_default = "accept"   # opt in: accept routes from this peer
+export_default = "accept"   # opt in: advertise our routes to this peer
 ```
 
 ```bash
@@ -32,27 +69,98 @@ remote_as = 65001
 cargo build --release -p pathvectord
 ./target/release/pathvectord config.toml
 
-# In another terminal — inspect peers and routes via the CLI
+# In another terminal — inspect peers and routes
 cargo run -p pathvector -- peer list
 cargo run -p pathvector -- route list
 cargo run -p pathvector -- dashboard        # live ratatui TUI
 ```
 
-See [DAEMON.md](DAEMON.md) for the full configuration reference and gRPC API examples.
-See [CLI.md](CLI.md) for all subcommands and the policy reload workflow.
+See [pathvectord/README.md](pathvectord/README.md) for the full configuration reference,
+gRPC API, and GoBGP/BIRD interop guide.
+
+---
+
+## Performance
+
+Measured by replaying a real RIPE RIS full-table MRT dump (`latest-bview.gz`,
+1.13M IPv4 prefixes) against a live `pathvectord` over a loopback BGP TCP session
+on Apple M2 Max.
+
+| Metric | Result | Context |
+|---|---|---|
+| Prefixes announced | 1,133,510 | Full internet routing table |
+| Announcement time | 3.30 s | Wall-clock from first to last UPDATE sent |
+| **Announcement throughput** | **343,920 prefixes/sec** | On par with BIRD 2.x (~100–300k/sec, written in C) |
+| Unique path-attribute sets | 168,840 | Attribute deduplication reduces UPDATE message count by ~99% |
+| **RIB convergence time** | **3.70 s** | Between BIRD (~2–5s) and GoBGP (~15–30s) |
+| Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 | 95 rejected: MRT records multiple peer views per prefix |
+| **Total (announce + converge)** | **7.00 s** | End-to-end benchmark time |
+
+To reproduce:
+
+```bash
+curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
+just mrt ./latest-bview.gz
+```
+
+---
+
+## Crate family
+
+Each layer is a separate published crate. A library user can take only the pieces they need.
+
+| Crate | Description | Start here if you want to… |
+|---|---|---|
+| [`pathvector-types`](pathvector-types) | AS numbers, AS paths, communities, NLRI, path attributes | Understand BGP data structures |
+| [`pathvector-policy`](pathvector-policy) | Route policy engine: conditions, actions, term evaluation | Write or test BGP route policies |
+| [`pathvector-rib`](pathvector-rib) | Adj-RIB-In, Loc-RIB, Adj-RIB-Out, best-path selection | Understand route decision logic |
+| [`pathvector-session`](pathvector-session) | BGP FSM, TCP transport, message codec | Embed BGP session handling in an app |
+| [`pathvector-sys`](pathvector-sys) | Linux FIB (rtnetlink) and TCP MD5SIG | Understand kernel integration |
+| [`pathvector-bmp`](pathvector-bmp) | BMP receiver (RFC 7854) — **planned** | Monitor a router's routing table passively |
+| [`pathvector-client`](pathvector-client) | Typed async Rust client for the gRPC management API | Control the daemon from Rust code |
+| [`pathvectord`](pathvectord) | BGP daemon: TOML config, gRPC management API | Run a BGP router |
+| [`pathvector`](pathvector) | CLI management tool (`peer`, `route`, `policy`, `dashboard`) | Inspect a running daemon |
+
+Dependency graph (compile-time):
+
+```
+pathvector-types
+├── pathvector-policy
+│   └── pathvector-rib
+│       └── pathvectord ──── gRPC (runtime) ──── pathvector-client ──── pathvector (CLI)
+└── pathvector-session
+    └── pathvectord
+pathvector-sys
+└── pathvectord
+```
+
+---
+
+## Reading guide
+
+| I want to… | Read |
+|---|---|
+| Run the daemon and configure peers | [pathvectord/README.md](pathvectord/README.md) |
+| Use the CLI to inspect peers and routes | [pathvector/README.md](pathvector/README.md) |
+| Control the daemon from Rust code | [pathvector-client/README.md](pathvector-client/README.md) |
+| Understand BGP session and wire format | [pathvector-session/README.md](pathvector-session/README.md) |
+| Understand the three-table RIB and best-path | [pathvector-rib/README.md](pathvector-rib/README.md) |
+| Write or test a route policy | [pathvector-policy/README.md](pathvector-policy/README.md) |
+| Understand BGP types (ASN, community, NLRI) | [pathvector-types/README.md](pathvector-types/README.md) |
+| Understand Linux FIB / TCP MD5 integration | [pathvector-sys/README.md](pathvector-sys/README.md) |
+| Benchmark with a real internet table | [pathvector-mrt/README.md](pathvector-mrt/README.md) |
+| Contribute code | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Understand the test strategy | [TESTING.md](TESTING.md) |
 
 ---
 
 ## Docker
 
-A pre-built image is published to the GitHub Container Registry on every merge to `main`:
-
 ```bash
 docker pull ghcr.io/dbrucknr/pathvector:latest
 ```
 
-The image requires a config file mounted at startup. A minimal `docker-compose.yml`
-that peers pathvectord with a GoBGP instance on the same bridge network:
+Minimal `docker-compose.yml` peering pathvectord with GoBGP:
 
 ```yaml
 services:
@@ -78,54 +186,43 @@ networks:
     driver: bridge
 ```
 
-> **Note:** `NET_ADMIN` is only needed for FIB (kernel routing table) updates.
-> If you are using pathvectord purely as a route collector or policy engine you
-> can omit it.
-
-> **Platform:** the published image is `linux/amd64` only. The daemon peers and
-> exchanges routes correctly on any platform but will not install routes into the
-> host kernel on macOS Docker Desktop (no Linux FIB available).
+> `NET_ADMIN` is only needed for FIB (kernel routing table) updates. Omit it if
+> you are using pathvectord purely as a route collector or policy engine.
 
 ---
 
-## Crate family
+## Testing
 
-The implementation is split into focused, independently published crates. Each layer depends only on those below it.
+The test suite combines seven layers: unit tests, compiled documentation examples,
+property-based tests (proptest), fuzz targets on the codec decode path, ratatui snapshot
+tests for the TUI dashboard, Docker-based end-to-end tests against a real GoBGP peer,
+and dependency-inversion tests that exercise every CLI subcommand through
+`MockDaemonClient` without a live daemon.
 
-| Crate | Description |
-|---|---|
-| [`pathvector-types`](pathvector-types) | AS numbers, AS paths, communities, NLRI, and route attributes |
-| [`pathvector-policy`](pathvector-policy) | Route policy engine: prefix-list, community, and AS path match/action |
-| [`pathvector-rib`](pathvector-rib) | Adj-RIB-In, Loc-RIB, Adj-RIB-Out, and best-path selection |
-| [`pathvector-session`](pathvector-session) | BGP FSM, TCP transport, and message codec |
-| [`pathvector-bmp`](pathvector-bmp) | BMP receiver (RFC 7854): route monitoring and peer state |
-| [`pathvector-client`](pathvector-client) | Typed async Rust client for the gRPC management API |
-| [`pathvectord`](pathvectord) | BGP daemon: TOML config and gRPC management API |
-| [`pathvector`](pathvector) | CLI management tool (`pathvector peer`, `route`, `policy`, `dashboard`) |
-
-Dependency flow (compile-time crate graph):
-
+```bash
+just ci          # unit + property + doc tests, clippy, fmt, MSRV — no Docker required
+just e2e         # Docker-based end-to-end suite against a real GoBGP peer
+just lint-linux  # run clippy inside a Linux container (catches macOS blind spots)
 ```
-pathvector-types
-├── pathvector-policy
-│   └── pathvector-rib
-│       └── pathvectord ──── gRPC API (runtime) ──── pathvector-client
-│                                                          └── pathvector (CLI)
-└── pathvector-session
-    └── pathvectord
-```
+
+See [TESTING.md](TESTING.md) for the full description of each layer.
 
 ---
 
 ## Use cases
 
-**Full BGP daemon** — run `pathvectord` on a Linux server and peer with upstream providers or route reflectors.
+**Full BGP daemon** — run `pathvectord` on a Linux server and peer with upstream
+providers or route reflectors.
 
-**Embedded BGP speaker** — link `pathvector-session` and `pathvector-types` directly into an application. Useful for load balancers advertising VIPs, or Kubernetes nodes announcing pod CIDRs.
+**Embedded BGP speaker** — link `pathvector-session` and `pathvector-types` directly
+into an application. Useful for load balancers advertising VIPs, or Kubernetes nodes
+announcing pod CIDRs.
 
-**BGP monitoring** — deploy `pathvector-bmp` as a standalone BMP collector to receive and inspect route updates from existing routers without participating in the routing protocol.
+**BGP monitoring** — deploy `pathvector-bmp` (planned) as a standalone BMP collector to
+receive and inspect route updates from existing routers without participating in routing.
 
-**Policy testing** — use `pathvector-policy` in isolation to validate and unit-test BGP route policies before deploying them to production.
+**Policy testing** — use `pathvector-policy` in isolation to validate and unit-test BGP
+route policies before deploying them to production.
 
 ---
 
@@ -133,38 +230,10 @@ pathvector-types
 
 pathvector builds on two standalone foundation crates:
 
-- [`ipnetx`](https://crates.io/crates/ipnetx) — set algebra on IP address space (union, intersection, difference, complement)
+- [`ipnetx`](https://crates.io/crates/ipnetx) — set algebra on IP address space (union, intersection, difference)
 - [`routemap`](https://crates.io/crates/routemap) — in-memory longest-prefix-match table via stride-4 treebitmap
 
-These crates are independently useful and published separately. pathvector depends on them but they have no dependency on pathvector.
-
----
-
-## Performance
-
-Measured by replaying a real RIPE RIS full-table MRT dump (`latest-bview.gz`, 1.13M IPv4 prefixes) against a live `pathvectord` instance over a loopback BGP TCP session on Apple M2 Max.
-
-| Metric | Result |
-|---|---|
-| Prefixes announced | 1,133,510 |
-| Announcement time | 3.30 s |
-| **Announcement throughput** | **343,920 prefixes/sec** |
-| Unique path-attribute sets | 168,840 |
-| **RIB convergence time** | **3.70 s** |
-| Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 (99.99%) |
-| **Total (announce + converge)** | **7.00 s** |
-
-Announcement throughput is on par with BIRD 2.x (~100–300k prefixes/sec). RIB convergence of 6.78s for a full internet table falls between BIRD (2–5s, written in C) and GoBGP (~15–30s). The 95 rejected prefixes are expected: the MRT dump records multiple peer perspectives per prefix and only the best-path winner enters Loc-RIB.
-
-To reproduce:
-
-```bash
-# Download a RIPE RIS full-table snapshot (~90 MB)
-curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
-
-# Build, start pathvectord, run the MRT replayer
-just mrt ./latest-bview.gz
-```
+Both are independently published and have no dependency on pathvector.
 
 ---
 
@@ -176,28 +245,12 @@ Active development. Crates are not yet published to crates.io.
 |---|---|---|
 | `pathvector-types` | Stable | Newtypes, AS path, communities, NLRI, all path attributes |
 | `pathvector-policy` | Stable | Prefix-list, community, AS-path, local-pref, MED conditions and actions |
-| `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2, 4–7, 10; LPM forwarding queries |
+| `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2–7, 9–10; LPM forwarding queries |
 | `pathvector-session` | Stable | Full BGP FSM; all five message types; 4-byte ASN; GoBGP-validated |
-| `pathvector-client` | Stable | Typed async Rust client wrapping all three gRPC services |
+| `pathvector-client` | Stable | Typed async Rust client wrapping all gRPC services |
 | `pathvectord` | Active | Full BGP speaker; gRPC management API; GoBGP-validated |
-| `pathvector` | Active | CLI: peer/route/policy subcommands; live ratatui dashboard |
+| `pathvector` | Active | CLI: peer/route/policy/origination subcommands; live ratatui dashboard |
 | `pathvector-bmp` | Planned | BMP receiver for passive route monitoring |
-
----
-
-## Testing
-
-pathvector takes correctness seriously. The test suite combines seven layers: unit tests, compiled documentation examples, property-based tests (proptest), fuzz targets on the codec decode path, ratatui snapshot tests for the TUI dashboard, Docker-based end-to-end tests against a real GoBGP peer, and dependency-inversion tests that exercise every CLI subcommand through `MockDaemonClient` without a live daemon. See [TESTING.md](TESTING.md) for the full description of each layer and how to run them.
-
-```sh
-just ci          # unit + property + doc tests, clippy, fmt, MSRV — no Docker required
-just e2e         # Docker-based end-to-end suite against a real GoBGP peer
-just install-hooks  # install the pre-push hook (run once after cloning)
-```
-
-The pre-push hook runs `just e2e` automatically before each push. Skip it for a specific push with `git push --no-verify`.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime data flow and crate design.
 
 ---
 

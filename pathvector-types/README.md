@@ -182,10 +182,6 @@ assert_eq!(custom.to_string(), "IPv4 SAFI(200)");
 
 ---
 
-## Coming soon
-
-The following types are planned and will be documented here as they are implemented.
-
 ### `Nlri<A>` — Network Layer Reachability Information
 
 **Concept:** NLRI is the actual payload of a BGP UPDATE message — the IP prefixes being advertised or withdrawn. Every route in BGP reduces to: "I can reach these prefixes, via this path, with these attributes."
@@ -231,14 +227,16 @@ The decision process runs through these steps in order until one route wins ([RF
 
 | Step | Criterion | Winner | Notes |
 |---|---|---|---|
-| 1 | `LOCAL_PREF` | **higher** | iBGP only — stripped before sending to eBGP peers |
-| 2 | Locally originated | — | `network` / `redistribute` beats learned routes |
-| 3 | AS path length | **shorter** | Counts segments, not raw ASNs |
-| 4 | `ORIGIN` | **lower** | IGP(0) < EGP(1) < INCOMPLETE(2) |
-| 5 | `MED` | **lower** | Only compared within the same neighboring AS |
-| 6 | Peer type | eBGP > iBGP | External routes preferred over internal |
-| 7 | IGP metric to next-hop | **lower** | Closest exit wins |
-| 8 | Router-ID | **lower** | Final tie-breaker |
+| 1 | Next-hop reachability | — | Requires FIB integration; partially implemented |
+| 2 | `LOCAL_PREF` | **higher** | iBGP only — stripped before sending to eBGP peers |
+| 3 | Locally originated | — | Routes originated by this router beat learned routes |
+| 4 | AS path length | **shorter** | Counts segments, not raw ASNs |
+| 5 | `ORIGIN` | **lower** | IGP(0) < EGP(1) < INCOMPLETE(2) |
+| 6 | `MED` | **lower** | Only compared within the same neighbouring AS |
+| 7 | Peer type | eBGP > iBGP | External routes preferred over internal |
+| 8 | IGP metric to next-hop | **lower** | Requires IGP integration; deferred |
+| 9 | Route age | — | Oldest eBGP route when both candidates are eBGP |
+| 10 | Router-ID | **lower** | Final tie-breaker |
 
 **`ORIGIN`** — how the route was born. `Igp` means injected from an interior routing protocol; `Incomplete` means redistributed from something else (static routes, etc.). Rarely changes the outcome in practice since `LOCAL_PREF` dominates.
 
@@ -283,6 +281,19 @@ assert!(v6_nh.is_v6());
 // AGGREGATOR: identifies who aggregated the route
 let agg = Aggregator::new(Asn::new(65000), Ipv4Addr::new(10, 0, 0, 1));
 assert_eq!(agg.to_string(), "AS65000 10.0.0.1");
+```
+
+---
+
+## Property-based tests
+
+Every type in this crate has property tests that verify wire-encoding roundtrips,
+ordering invariants, and boundary conditions. The tests use
+[`proptest`](https://crates.io/crates/proptest) and cover 20+ invariants. See
+[TESTING.md](../TESTING.md#pathvector-types) for the full invariant list.
+
+```bash
+cargo test -p pathvector-types prop_
 ```
 
 ---

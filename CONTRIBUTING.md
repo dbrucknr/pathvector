@@ -1,5 +1,21 @@
 # Contributing to pathvector
 
+---
+
+## Which crate do I edit?
+
+| I want to add… | Edit these crates |
+|---|---|
+| A new path attribute (AS4_PATH, BGPsec, etc.) | `pathvector-types` → `pathvector-session` (codec) → `pathvector-rib` (RIB storage) → `pathvectord` (UPDATE handling) |
+| A new gRPC RPC | `proto/pathvector/v1/management.proto` → `pathvectord/src/grpc.rs` → `pathvector-client/src/client_trait.rs` → `pathvector/src/` (CLI command) |
+| A new policy condition or action | `pathvector-policy/src/` → update `pathvectord` if the daemon needs to apply it |
+| A new BGP message type or capability | `pathvector-session/src/codec/` |
+| A new Linux kernel integration (FIB, syscall) | `pathvector-sys/src/` → `pathvectord/src/daemon.rs` |
+| A new CLI subcommand | `pathvector/src/` (uses `DaemonClient` trait; add mock test in same file) |
+| A new daemon config field | `pathvectord/src/config.rs` → `pathvectord/README.md` (document it) |
+
+---
+
 This document covers the local development workflow, CI requirements, and known
 pain points. Read it before your first pull request.
 
