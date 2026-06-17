@@ -438,6 +438,21 @@ GoBGP:
 
 ---
 
+## Behavior on restart
+
+When pathvectord starts, it removes all kernel routes it installed in a previous run
+(`RTPROT_BGP` protocol tag) before the BGP event loop begins. This prevents stale routes
+from being forwarded during the reconvergence window. The cleanup is logged at startup:
+
+```
+INFO removing stale BGP routes v4=42 v6=0
+```
+
+This is equivalent to BIRD's default `krt` protocol behavior. RFC 4724 graceful restart
+(holding stale routes across a planned restart) is not yet implemented.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

@@ -257,11 +257,7 @@ Not yet started. Key work items:
 
 ### Remaining
 
-- **AS 0 not rejected in gRPC originate/peer handlers** (`pathvectord/src/grpc.rs`) — RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or be used as a peer ASN. The gRPC handlers accept AS 0 without validation. Fix: add a guard in `originate_route` and peer-configuration handlers rejecting AS 0 with `Status::invalid_argument`.
-
-- **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Fix options: (a) add a `CountRoutes` RPC returning only the route count, (b) add server-side cursor pagination to `ListRoutes`, or (c) use the existing `WatchRoutes` stream for large snapshots. Option (a) is the smallest change; option (b) is the most correct for a public API.
-
-- **Duplicate `originate_route` silently overwrites** (`pathvectord/src/grpc.rs`, `daemon.rs`) — calling `originate_route` twice for the same prefix silently replaces the first entry via `HashMap::insert`. Reasonable behavior but undocumented in the API and has no test coverage. Add a test and document the upsert semantics in the proto comments.
+- **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
 
 - **Dynamic peer reconfiguration (runtime config)** — the daemon reads its
   configuration once at startup; adding, removing, or modifying a peer requires

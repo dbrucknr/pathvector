@@ -754,17 +754,30 @@ fn parse_originate_request(
         _ => Origin::Incomplete,
     };
 
+    if next_hop_ip.is_unspecified() {
+        return Err(Status::invalid_argument("next_hop must not be 0.0.0.0"));
+    }
+
     let communities: Vec<Community> = req.communities.into_iter().map(Community::from).collect();
 
     let large_communities: Vec<TypesLargeCommunity> = req
         .large_communities
         .into_iter()
-        .map(|lc| TypesLargeCommunity {
-            global_administrator: lc.global_admin,
-            local_data_1: lc.local_data1,
-            local_data_2: lc.local_data2,
+        .map(|lc| {
+            // RFC 7607: AS 0 is reserved and MUST NOT be used as an ASN.
+            // Large community global_admin is semantically an AS number (RFC 8092 §2).
+            if lc.global_admin == 0 {
+                return Err(Status::invalid_argument(
+                    "large_community global_admin 0 is reserved (RFC 7607)",
+                ));
+            }
+            Ok(TypesLargeCommunity {
+                global_administrator: lc.global_admin,
+                local_data_1: lc.local_data1,
+                local_data_2: lc.local_data2,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let extended_communities: Vec<ExtendedCommunity> = req
         .extended_communities
@@ -823,12 +836,19 @@ fn parse_originate_request_v6(
     let large_communities: Vec<TypesLargeCommunity> = req
         .large_communities
         .into_iter()
-        .map(|lc| TypesLargeCommunity {
-            global_administrator: lc.global_admin,
-            local_data_1: lc.local_data1,
-            local_data_2: lc.local_data2,
+        .map(|lc| {
+            if lc.global_admin == 0 {
+                return Err(Status::invalid_argument(
+                    "large_community global_admin 0 is reserved (RFC 7607)",
+                ));
+            }
+            Ok(TypesLargeCommunity {
+                global_administrator: lc.global_admin,
+                local_data_1: lc.local_data1,
+                local_data_2: lc.local_data2,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let extended_communities: Vec<ExtendedCommunity> = req
         .extended_communities
         .into_iter()
@@ -3256,5 +3276,206 @@ mod tests {
             .set_import_default(&peer_ip.to_string(), true)
             .await
             .expect("set_import_default accept via H2C failed");
+    }
+
+    // ── parse_originate_request — AS 0 / RFC 7607 validation ─────────────────
+
+    #[test]
+    fn test_parse_originate_request_rejects_as0_in_large_community() {
+        let req = OriginateRouteRequest {
+            prefix: "10.0.0.0/8".into(),
+            next_hop: "10.0.0.1".into(),
+            origin: 0,
+            communities: vec![],
+            large_communities: vec![proto::LargeCommunity {
+                global_admin: 0,   // AS 0 — reserved by RFC 7607
+                local_data1: 1,
+                local_data2: 2,
+            }],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        };
+        let err = super::parse_originate_request(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("reserved"), "error should mention RFC 7607 reservation");
+    }
+
+    #[test]
+    fn test_parse_originate_request_v6_rejects_as0_in_large_community() {
+        let req = OriginateRouteRequest {
+            prefix: "2001:db8::/32".into(),
+            next_hop: String::new(),
+            origin: 0,
+            communities: vec![],
+            large_communities: vec![proto::LargeCommunity {
+                global_admin: 0,
+                local_data1: 100,
+                local_data2: 200,
+            }],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        };
+        let err = super::parse_originate_request_v6(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_originate_request_accepts_nonzero_large_community_admin() {
+        let req = OriginateRouteRequest {
+            prefix: "10.0.0.0/8".into(),
+            next_hop: "10.0.0.1".into(),
+            origin: 0,
+            communities: vec![],
+            large_communities: vec![proto::LargeCommunity {
+                global_admin: 65000,
+                local_data1: 1,
+                local_data2: 2,
+            }],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        };
+        assert!(super::parse_originate_request(req).is_ok());
+    }
+
+    #[test]
+    fn test_parse_originate_request_rejects_unspecified_next_hop() {
+        let req = OriginateRouteRequest {
+            prefix: "10.0.0.0/8".into(),
+            next_hop: "0.0.0.0".into(),
+            origin: 0,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        };
+        let err = super::parse_originate_request(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── OriginationService::originate_route — upsert semantics ───────────────
+
+    #[tokio::test]
+    async fn test_originate_route_upsert_replaces_previous_route() {
+        // RFC: "Idempotent: re-originating the same prefix replaces the previous route."
+        // Verify that the second origination wins, including updated attributes.
+        let state = arc_state(65001, &[]);
+        let svc = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        // First origination: no community.
+        svc.originate_route(Request::new(OriginateRouteRequest {
+            prefix: "10.0.0.0/8".into(),
+            next_hop: "10.0.0.1".into(),
+            origin: 0,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        }))
+        .await
+        .unwrap();
+
+        // Second origination: same prefix, adds a community.
+        svc.originate_route(Request::new(OriginateRouteRequest {
+            prefix: "10.0.0.0/8".into(),
+            next_hop: "10.0.0.2".into(),
+            origin: 0,
+            communities: vec![Community::from_parts(65000, 100).as_u32()],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        }))
+        .await
+        .unwrap();
+
+        // Only one route should be in the Loc-RIB, and it must be the second one.
+        let svc_rib = super::RibServiceImpl {
+            state: Arc::clone(&state),
+        };
+        let resp = svc_rib
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+                page_size: 0,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.routes.len(), 1, "upsert must not duplicate the prefix");
+        let route = &resp.routes[0];
+        assert_eq!(route.next_hop, "10.0.0.2", "second origination must win");
+        assert_eq!(
+            route.communities,
+            vec![Community::from_parts(65000, 100).as_u32()],
+            "updated attributes must be present"
+        );
+    }
+
+    // ── RibService::list_routes — pagination ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_routes_pagination_returns_all_routes_across_pages() {
+        use pathvector_types::PeerType;
+
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+
+        // Insert 10 routes across distinct /24 prefixes.
+        {
+            let mut s = state.write().await;
+            s.on_established(addr, PeerType::External, 65002, 90, &[], None);
+            for i in 0..10u8 {
+                let prefix: pathvector_types::Nlri<Ipv4Addr> =
+                    format!("10.0.{i}.0/24").parse().unwrap();
+                let route = RouteBuilder::new(
+                    prefix,
+                    Origin::Igp,
+                    pathvector_types::AsPath::from_sequence(vec![Asn::new(65002)]),
+                )
+                .next_hop(pathvector_types::NextHop::V4("10.0.0.2".parse().unwrap()))
+                .peer_type(PeerType::External)
+                .build();
+                s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+                s.rib_insert_v4(peer("10.0.0.2"), route);
+            }
+        }
+
+        let svc = RibServiceImpl { state };
+
+        // Fetch 3 pages of 4, then a final page of 2.
+        let mut all_prefixes = Vec::new();
+        let mut token = String::new();
+        loop {
+            let resp = svc
+                .list_routes(Request::new(ListRoutesRequest {
+                    peer_address: String::new(),
+                    page_size: 4,
+                    page_token: token.clone(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            for r in &resp.routes {
+                all_prefixes.push(r.prefix.clone());
+            }
+            token = resp.next_page_token;
+            if token.is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(all_prefixes.len(), 10, "all 10 routes must be returned across pages");
+        // Each prefix must appear exactly once.
+        all_prefixes.sort();
+        all_prefixes.dedup();
+        assert_eq!(all_prefixes.len(), 10, "no duplicates across pages");
     }
 }
