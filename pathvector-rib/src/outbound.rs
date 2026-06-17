@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 use pathvector_types::{Asn, NextHop, PeerType};
 
@@ -23,7 +26,7 @@ pub fn prepare_outbound(
     local_next_hop: Ipv4Addr,
 ) -> Route<Ipv4Addr> {
     if peer_type == PeerType::External {
-        route.as_path.prepend(Asn::new(local_as));
+        Arc::make_mut(&mut route.as_path).prepend(Asn::new(local_as));
         route.next_hop = Some(NextHop::V4(local_next_hop));
         route.local_pref = None;
     }
@@ -48,7 +51,7 @@ pub fn prepare_outbound_v6(
     local_ipv6: Option<Ipv6Addr>,
 ) -> Route<Ipv6Addr> {
     if peer_type == PeerType::External {
-        route.as_path.prepend(Asn::new(local_as));
+        Arc::make_mut(&mut route.as_path).prepend(Asn::new(local_as));
         if let Some(addr) = local_ipv6 {
             route.next_hop = Some(NextHop::V6(addr));
         }

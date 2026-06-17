@@ -217,10 +217,24 @@ message ListRoutesRequest {
   /// If non-empty, return only routes whose best-path winner is this peer.
   /// Dotted-decimal IPv4 address.
   string peer_address = 1;
+
+  /// Maximum number of routes to return in this response.
+  /// 0 (default) means no limit — the server returns all matching routes in
+  /// one response, which may fail with RESOURCE_EXHAUSTED for large tables.
+  /// Use a non-zero value (e.g. 5000) to enable pagination.
+  uint32 page_size = 2;
+
+  /// Cursor returned by a previous ListRoutes call.
+  /// Empty string (default) requests the first page.
+  string page_token = 3;
 }
 
 message ListRoutesResponse {
   repeated Route routes = 1;
+
+  /// Cursor for the next page.  Empty when this is the last page.
+  /// Pass this value as page_token in the next ListRoutes request.
+  string next_page_token = 2;
 }
 
 message ListCandidatesRequest {

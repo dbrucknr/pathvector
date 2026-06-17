@@ -1,0 +1,22 @@
+# pathvectord configuration for MRT replay (Stage 2 stress test).
+#
+# Run on a non-privileged port (1179) so no CAP_NET_BIND_SERVICE is needed.
+# The MRT replayer connects from 127.0.0.1 as AS 65001.
+#
+# Usage:
+#   cargo build --release -p pathvectord
+#   ./target/release/pathvectord e2e/fixtures/mrt-pathvectord.toml &
+#   cargo run --release -p pathvector-mrt -- --mrt /path/to/dump.mrt
+
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 90
+grpc_port = 51200
+bgp_port  = 1179
+
+[[peers]]
+address        = "127.0.0.1"
+remote_as      = 65001
+import_default = "accept"
+export_default = "reject"

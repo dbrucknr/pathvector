@@ -182,6 +182,57 @@ e2e-down:
 e2e-logs:
     docker compose -f e2e/docker-compose.yml logs -f
 
+# ── Stress ────────────────────────────────────────────────────────────────────
+
+# Run the full-table stress harness (Stage 1 — no Docker required).
+# Builds pathvectord and the stress binary in debug mode, then runs all phases:
+#   - pathvectord: originate 10k / 100k / 500k routes, measure time + RSS
+#   - withdrawal: withdraw all 500k, check RSS reclamation
+#   - churn: 5× announce/withdraw cycles of 10k routes, check for RSS growth
+#   - GoBGP 1:1 comparison: same phases against gobgpd via AddPathStream
+#
+# Prerequisites: protoc on PATH (brew install protobuf).
+# GoBGP comparison also requires: gobgpd 4.x on PATH or in $GOPATH/bin.
+# See pathvector-stress/README.md for full documentation.
+stress:
+    cargo build -p pathvectord -p pathvector-stress
+    cargo run -p pathvector-stress --bin stress
+
+# Same as `stress` but with release builds — use this for numbers worth recording.
+stress-release:
+    cargo build --release -p pathvectord -p pathvector-stress
+    ./target/release/stress
+
+# ── MRT replay ───────────────────────────────────────────────────────────────
+
+# Replay an MRT TABLE_DUMP_V2 file against a running pathvectord (Stage 2 benchmark).
+#
+# Requires an MRT file (RouteViews or RIPE RIS RIB dump).  Download one with:
+#   curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
+#
+# Starts pathvectord on port 1179 (non-privileged) and the MRT replayer, then
+# prints convergence time, throughput, and final RIB prefix count.
+#
+# Usage:
+#   just mrt ./latest-bview.gz
+mrt mrt_file='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{mrt_file}}" ]; then
+        echo "Usage: just mrt ./latest-bview.gz"
+        exit 1
+    fi
+    cargo build --release -p pathvectord -p pathvector-mrt
+    # Kill any leftover pathvectord holding port 1179 or 51200 from a previous run.
+    pkill -x pathvectord 2>/dev/null || true
+    sleep 0.3
+    echo "Starting pathvectord on port 1179..."
+    ./target/release/pathvectord e2e/fixtures/mrt-pathvectord.toml &
+    PVDPID=$!
+    trap "kill $PVDPID 2>/dev/null || true" EXIT
+    sleep 1
+    ./target/release/pathvector-mrt --mrt "{{mrt_file}}" --peer 127.0.0.1:1179
+
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
 # Compile all fuzz targets (no fuzzing — fast compile check)

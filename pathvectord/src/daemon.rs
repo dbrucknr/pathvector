@@ -6,7 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::Arc, // also used for Arc<AsPath> sharing in UPDATE decode
     time::Instant,
 };
 
@@ -82,10 +82,10 @@ pub(crate) struct RibSnapshot {
     pub(crate) loc_rib: LocRib<Ipv4Addr>,
     /// IPv6 Loc-RIB — best IPv6 routes, post-import-policy.
     pub(crate) loc_rib_v6: LocRib<Ipv6Addr>,
-    /// Locally originated routes (bypassed import policy; export policy applies).
-    pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
-    /// IPv6 locally originated routes (bypassed import policy; export policy applies).
-    pub(crate) originated_routes_v6: HashMap<Nlri<Ipv6Addr>, Route<Ipv6Addr>>,
+    /// NLRI set for locally originated IPv4 routes; routes live in `loc_rib`.
+    pub(crate) originated_routes: HashSet<Nlri<Ipv4Addr>>,
+    /// NLRI set for locally originated IPv6 routes; routes live in `loc_rib_v6`.
+    pub(crate) originated_routes_v6: HashSet<Nlri<Ipv6Addr>>,
     /// Immutable after startup.
     pub(crate) local_as: u32,
     /// Immutable after startup.
@@ -309,8 +309,8 @@ impl DaemonState {
         let rib = Arc::new(RibSnapshot {
             loc_rib: LocRib::new(),
             loc_rib_v6: LocRib::new(),
-            originated_routes: HashMap::new(),
-            originated_routes_v6: HashMap::new(),
+            originated_routes: HashSet::new(),
+            originated_routes_v6: HashSet::new(),
             local_as,
             local_bgp_id,
             local_ipv6,
@@ -1283,7 +1283,7 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            self.rib_mut().originated_routes.insert(nlri, route.clone());
+            self.rib_mut().originated_routes.insert(nlri);
             self.rib_insert_v4(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
@@ -1310,9 +1310,7 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            self.rib_mut()
-                .originated_routes_v6
-                .insert(nlri, route.clone());
+            self.rib_mut().originated_routes_v6.insert(nlri);
             let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             if let Some(fm) = &self.fib_manager {
                 fm.apply_v6(fib_change);
@@ -2271,6 +2269,9 @@ fn handle_update(
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
+    // Wrap once; every route in this UPDATE shares the same Arc<AsPath>.
+    let shared_as_path = Arc::new(as_path);
+
     let skip_announces = has_loop || has_as_zero;
     let all_announced = msg
         .announced
@@ -2297,7 +2298,9 @@ fn handle_update(
             continue;
         }
 
-        let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+        let mut builder =
+            RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
+                .peer_type(peer_type);
         if let Some(nh) = nh {
             builder = builder.next_hop(nh);
         }
@@ -2324,13 +2327,21 @@ fn handle_update(
         }
 
         let mut raw = builder.build();
-        raw.originator_id = originator_id;
-        raw.cluster_list.clone_from(&cluster_list);
+        if originator_id.is_some() || !cluster_list.is_empty() {
+            let r = raw.rare_mut();
+            r.originator_id = originator_id;
+            r.cluster_list.clone_from(&cluster_list);
+        }
 
         // RFC 7999: silently discard routes tagged with the BLACKHOLE community.
         // Store in AdjRibIn so soft-reconfig can see the raw route, but never
         // install into LocRib or advertise outbound.
-        if raw.communities.iter().any(|c| c.is_blackhole()) {
+        if raw
+            .rare_or_default()
+            .communities
+            .iter()
+            .any(|c| c.is_blackhole())
+        {
             adj_rib_in.insert(raw.clone());
             tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged route (RFC 7999)");
             rejected += 1;
@@ -2389,7 +2400,9 @@ fn handle_update(
             rejected_v6 += 1;
             continue;
         }
-        let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+        let mut builder =
+            RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
+                .peer_type(peer_type);
         builder = builder.next_hop(nh);
         if let Some(lp) = local_pref {
             builder = builder.local_pref(lp);
@@ -2415,7 +2428,12 @@ fn handle_update(
 
         let raw = builder.build();
 
-        if raw.communities.iter().any(|c| c.is_blackhole()) {
+        if raw
+            .rare_or_default()
+            .communities
+            .iter()
+            .any(|c| c.is_blackhole())
+        {
             adj_rib_in_v6.insert(raw.clone());
             tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged IPv6 route (RFC 7999)");
             rejected_v6 += 1;
@@ -3313,11 +3331,12 @@ mod tests {
         assert_eq!(route.origin, Origin::Egp);
         assert_eq!(route.local_pref, Some(LocalPref::new(200)));
         assert_eq!(route.med, Some(Med::new(50)));
-        assert_eq!(route.communities.len(), 1);
-        assert_eq!(route.large_communities.len(), 1);
-        assert_eq!(route.extended_communities.len(), 1);
-        assert!(route.atomic_aggregate);
-        assert!(route.aggregator.is_some());
+        let rare = route.rare_or_default();
+        assert_eq!(rare.communities.len(), 1);
+        assert_eq!(rare.large_communities.len(), 1);
+        assert_eq!(rare.extended_communities.len(), 1);
+        assert!(rare.atomic_aggregate);
+        assert!(rare.aggregator.is_some());
     }
 
     #[test]
@@ -5071,8 +5090,8 @@ mod tests {
         )
         .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
         .build();
-        route.originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
-        route.cluster_list = vec![0x0101_0101u32];
+        route.rare_mut().originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
+        route.rare_mut().cluster_list = vec![0x0101_0101u32];
 
         let attrs = route_to_attributes(&route, PeerType::External, true);
         assert!(
@@ -5098,8 +5117,8 @@ mod tests {
         )
         .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
         .build();
-        route.originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
-        route.cluster_list = vec![0x0101_0101u32];
+        route.rare_mut().originator_id = Some("1.1.1.1".parse::<Ipv4Addr>().unwrap());
+        route.rare_mut().cluster_list = vec![0x0101_0101u32];
 
         let attrs = route_to_attributes(&route, PeerType::Internal, true);
         assert!(
@@ -6126,7 +6145,7 @@ mod tests {
             state
                 .rib
                 .originated_routes_v6
-                .contains_key(&nlri_v6("2001:db8::/32")),
+                .contains(&nlri_v6("2001:db8::/32")),
             "originated v6 route must be tracked in originated_routes_v6"
         );
     }
@@ -6168,7 +6187,7 @@ mod tests {
             !state
                 .rib
                 .originated_routes_v6
-                .contains_key(&nlri_v6("2001:db8:1::/48")),
+                .contains(&nlri_v6("2001:db8:1::/48")),
             "withdrawn v6 route must be removed from originated_routes_v6"
         );
     }

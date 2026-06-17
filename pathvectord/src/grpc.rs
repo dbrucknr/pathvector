@@ -125,9 +125,9 @@ pub(crate) fn route_to_proto(
         .map(proto_as_segment)
         .collect();
 
-    let communities: Vec<u32> = route.communities.iter().map(|c| c.as_u32()).collect();
-
-    let large_communities: Vec<LargeCommunity> = route
+    let rare = route.rare_or_default();
+    let communities: Vec<u32> = rare.communities.iter().map(|c| c.as_u32()).collect();
+    let large_communities: Vec<LargeCommunity> = rare
         .large_communities
         .iter()
         .map(|lc| LargeCommunity {
@@ -136,14 +136,12 @@ pub(crate) fn route_to_proto(
             local_data2: lc.local_data_2,
         })
         .collect();
-
-    let extended_communities: Vec<Vec<u8>> = route
+    let extended_communities: Vec<Vec<u8>> = rare
         .extended_communities
         .iter()
         .map(|ec| ec.as_bytes().to_vec())
         .collect();
-
-    let aggregator = route.aggregator.map(|agg| Aggregator {
+    let aggregator = rare.aggregator.map(|agg| Aggregator {
         asn: agg.asn.as_u32(),
         address: agg.ip.to_string(),
     });
@@ -160,7 +158,7 @@ pub(crate) fn route_to_proto(
         communities,
         large_communities,
         extended_communities,
-        atomic_aggregate: route.atomic_aggregate,
+        atomic_aggregate: rare.atomic_aggregate,
         aggregator,
     }
 }
@@ -186,9 +184,9 @@ pub(crate) fn route_v6_to_proto(
         .map(proto_as_segment)
         .collect();
 
-    let communities: Vec<u32> = route.communities.iter().map(|c| c.as_u32()).collect();
-
-    let large_communities: Vec<LargeCommunity> = route
+    let rare = route.rare_or_default();
+    let communities: Vec<u32> = rare.communities.iter().map(|c| c.as_u32()).collect();
+    let large_communities: Vec<LargeCommunity> = rare
         .large_communities
         .iter()
         .map(|lc| LargeCommunity {
@@ -197,14 +195,12 @@ pub(crate) fn route_v6_to_proto(
             local_data2: lc.local_data_2,
         })
         .collect();
-
-    let extended_communities: Vec<Vec<u8>> = route
+    let extended_communities: Vec<Vec<u8>> = rare
         .extended_communities
         .iter()
         .map(|ec| ec.as_bytes().to_vec())
         .collect();
-
-    let aggregator = route.aggregator.map(|agg| Aggregator {
+    let aggregator = rare.aggregator.map(|agg| Aggregator {
         asn: agg.asn.as_u32(),
         address: agg.ip.to_string(),
     });
@@ -221,7 +217,7 @@ pub(crate) fn route_v6_to_proto(
         communities,
         large_communities,
         extended_communities,
-        atomic_aggregate: route.atomic_aggregate,
+        atomic_aggregate: rare.atomic_aggregate,
         aggregator,
     }
 }
@@ -488,7 +484,10 @@ impl RibService for RibServiceImpl {
         &self,
         request: Request<ListRoutesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        let peer_filter_str = request.into_inner().peer_address;
+        let req = request.into_inner();
+        let peer_filter_str = req.peer_address;
+        let page_size = req.page_size as usize;
+        let page_token = req.page_token;
 
         // Parse the optional peer filter; error early on a bad address.
         let peer_filter: Option<PeerId> = if peer_filter_str.is_empty() {
@@ -518,9 +517,40 @@ impl RibService for RibServiceImpl {
                 None
             }
         });
-        let routes: Vec<Route> = v4_routes.chain(v6_routes).collect();
 
-        Ok(Response::new(ListRoutesResponse { routes }))
+        // Collect and sort so the cursor (last prefix CIDR) gives a stable ordering
+        // across pages.  The sort is O(n log n) but list_routes is a management
+        // operation, not a hot path.
+        let mut all: Vec<Route> = v4_routes.chain(v6_routes).collect();
+        if page_size > 0 {
+            all.sort_unstable_by(|a, b| a.prefix.cmp(&b.prefix));
+        }
+
+        let (routes, next_page_token) = if page_size == 0 {
+            // No pagination requested — return everything (original behaviour).
+            (all, String::new())
+        } else {
+            // Skip entries up to and including the cursor prefix.
+            let start = if page_token.is_empty() {
+                0
+            } else {
+                all.iter()
+                    .position(|r| r.prefix == page_token)
+                    .map_or(0, |i| i + 1)
+            };
+            let page: Vec<Route> = all.iter().skip(start).take(page_size).cloned().collect();
+            let next_token = if start + page_size < all.len() {
+                page.last().map(|r| r.prefix.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (page, next_token)
+        };
+
+        Ok(Response::new(ListRoutesResponse {
+            routes,
+            next_page_token,
+        }))
     }
 
     async fn watch_routes(
@@ -617,7 +647,10 @@ impl RibService for RibServiceImpl {
             })
             .unwrap_or_default();
 
-        Ok(Response::new(ListRoutesResponse { routes }))
+        Ok(Response::new(ListRoutesResponse {
+            routes,
+            next_page_token: String::new(),
+        }))
     }
 }
 
@@ -931,7 +964,10 @@ impl OriginationService for OriginationServiceImpl {
         let routes: Vec<Route> = snap
             .originated_routes
             .iter()
-            .map(|(&nlri, route)| route_to_proto(local_peer, nlri, route))
+            .filter_map(|&nlri| {
+                let route = snap.loc_rib.best(&nlri)?;
+                Some(route_to_proto(local_peer, nlri, route))
+            })
             .collect();
         Ok(Response::new(ListOriginatedRoutesResponse { routes }))
     }
@@ -1444,6 +1480,8 @@ mod tests {
         let resp = svc
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: String::new(),
+                page_size: 0,
+                page_token: String::new(),
             }))
             .await
             .unwrap();
@@ -1475,6 +1513,8 @@ mod tests {
         let resp = svc
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: String::new(),
+                page_size: 0,
+                page_token: String::new(),
             }))
             .await
             .unwrap();
@@ -1506,6 +1546,8 @@ mod tests {
         let resp = svc
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: "10.0.0.2".into(),
+                page_size: 0,
+                page_token: String::new(),
             }))
             .await
             .unwrap();
@@ -1522,10 +1564,115 @@ mod tests {
         let err = svc
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: "not-an-ip".into(),
+                page_size: 0,
+                page_token: String::new(),
             }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── RibService::list_routes (pagination) ─────────────────────────────────
+
+    /// Build a RIB with three routes on two peers for pagination tests.
+    async fn three_route_state() -> Arc<tokio::sync::RwLock<DaemonState>> {
+        let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
+        let mut s = state.write().await;
+        s.on_established(a1, PeerType::External, 65002, 90, &[], None);
+        s.on_established(a2, PeerType::External, 65003, 90, &[], None);
+        for (prefix, addr) in [
+            ("10.0.0.0/8", a1),
+            ("172.16.0.0/12", a2),
+            ("192.168.0.0/24", a1),
+        ] {
+            let n = nlri(prefix);
+            let r = route_igp(n, PeerType::External);
+            s.adj_ribs_in.get_mut(&addr).unwrap().insert(r.clone());
+            s.rib_insert_v4(peer(&addr.to_string()), r);
+        }
+        drop(s);
+        state
+    }
+
+    #[tokio::test]
+    async fn test_list_routes_pagination_first_page() {
+        let svc = RibServiceImpl {
+            state: three_route_state().await,
+        };
+        let resp = svc
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+                page_size: 2,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.routes.len(), 2, "first page should have 2 routes");
+        assert!(
+            !resp.next_page_token.is_empty(),
+            "should have a next page token"
+        );
+        // sorted by prefix string; first two alphabetically
+        assert_eq!(resp.routes[0].prefix, "10.0.0.0/8");
+        assert_eq!(resp.routes[1].prefix, "172.16.0.0/12");
+    }
+
+    #[tokio::test]
+    async fn test_list_routes_pagination_second_page_is_last() {
+        let svc = RibServiceImpl {
+            state: three_route_state().await,
+        };
+        // Get the cursor from the first page.
+        let first = svc
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+                page_size: 2,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let cursor = first.next_page_token.clone();
+
+        let svc2 = RibServiceImpl {
+            state: three_route_state().await,
+        };
+        let resp = svc2
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+                page_size: 2,
+                page_token: cursor,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.routes.len(), 1, "second page should have 1 route");
+        assert!(resp.next_page_token.is_empty(), "no more pages");
+        assert_eq!(resp.routes[0].prefix, "192.168.0.0/24");
+    }
+
+    #[tokio::test]
+    async fn test_list_routes_pagination_page_size_zero_returns_all() {
+        let svc = RibServiceImpl {
+            state: three_route_state().await,
+        };
+        let resp = svc
+            .list_routes(Request::new(ListRoutesRequest {
+                peer_address: String::new(),
+                page_size: 0,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.routes.len(), 3, "page_size=0 should return all routes");
+        assert!(
+            resp.next_page_token.is_empty(),
+            "no pagination token when all returned"
+        );
     }
 
     // ── RibService::list_candidates ───────────────────────────────────────────
@@ -2001,9 +2148,10 @@ mod tests {
         }];
         req.extended_communities = vec![vec![0u8; 8]];
         let route = parse_originate_request(req).unwrap();
-        assert!(!route.communities.is_empty());
-        assert!(!route.large_communities.is_empty());
-        assert!(!route.extended_communities.is_empty());
+        let rare = route.rare_or_default();
+        assert!(!rare.communities.is_empty());
+        assert!(!rare.large_communities.is_empty());
+        assert!(!rare.extended_communities.is_empty());
     }
 
     #[test]
@@ -2075,9 +2223,10 @@ mod tests {
         }];
         req.extended_communities = vec![vec![0u8; 8]];
         let route = parse_originate_request_v6(req).unwrap();
-        assert!(!route.communities.is_empty());
-        assert!(!route.large_communities.is_empty());
-        assert!(!route.extended_communities.is_empty());
+        let rare = route.rare_or_default();
+        assert!(!rare.communities.is_empty());
+        assert!(!rare.large_communities.is_empty());
+        assert!(!rare.extended_communities.is_empty());
     }
 
     #[test]
@@ -2136,6 +2285,8 @@ mod tests {
         let resp = svc
             .list_routes(Request::new(proto::ListRoutesRequest {
                 peer_address: "10.0.0.3".into(),
+                page_size: 0,
+                page_token: String::new(),
             }))
             .await
             .unwrap();
@@ -2327,6 +2478,8 @@ mod tests {
         let resp = svc
             .list_routes(Request::new(proto::ListRoutesRequest {
                 peer_address: String::new(),
+                page_size: 0,
+                page_token: String::new(),
             }))
             .await
             .unwrap();
@@ -2401,7 +2554,7 @@ mod tests {
 
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
-        assert!(s.rib.originated_routes.contains_key(&nlri));
+        assert!(s.rib.originated_routes.contains(&nlri));
     }
 
     #[tokio::test]
@@ -2506,7 +2659,7 @@ mod tests {
 
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
-        assert!(!s.rib.originated_routes.contains_key(&nlri));
+        assert!(!s.rib.originated_routes.contains(&nlri));
     }
 
     #[tokio::test]

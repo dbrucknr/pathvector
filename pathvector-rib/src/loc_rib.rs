@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
 use routemap::RouteMap;
+use smallvec::SmallVec;
 
 use crate::{
     best_path::select_best_with_oracle, oracle::NextHopOracle, peer::PeerId, route::Route,
@@ -105,7 +105,7 @@ pub trait RibView<A: IpAddress> {
 
 impl<A: IpAddress> RibView<A> for LocRib<A> {
     fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        self.best.get(nlri.prefix()).map(|pair| &pair.1)
+        LocRib::best(self, nlri)
     }
 
     fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
@@ -113,10 +113,29 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
     }
 }
 
+/// Flat route table: `(prefix, peer) → Route`.
+///
+/// Uses `AHashMap` (non-cryptographic hasher) — ~15–20% faster than std's
+/// `SipHash` for internal keys that are not attacker-controlled.
+type CandidateMap<A> = AHashMap<(Nlri<A>, PeerId), Route<A>>;
+
+/// Reverse index: prefix → list of peers that have a candidate for it.
+///
+/// `SmallVec<[PeerId; 4]>` stores up to 4 peers inline (no heap allocation)
+/// which covers the vast majority of real-world prefixes (1–8 eBGP peers).
+/// Kept in sync with `candidates` so `recompute_best` is O(k) per prefix.
+type PeerIndex<A> = AHashMap<Nlri<A>, SmallVec<[PeerId; 4]>>;
+
 #[derive(Clone)]
 pub struct LocRib<A: IpAddress> {
-    candidates: HashMap<Nlri<A>, HashMap<PeerId, Route<A>>>,
-    best: RouteMap<A, (PeerId, Route<A>)>,
+    /// All candidate routes, keyed by `(prefix, peer)`.
+    candidates: CandidateMap<A>,
+    /// Which peers have a candidate for each prefix.
+    peer_index: PeerIndex<A>,
+    /// Winning peer per prefix.  Stores only the `PeerId` — the actual Route
+    /// is always available via `candidates[(prefix, peer)]`.  This avoids
+    /// keeping a second full clone of every best route in memory.
+    best: RouteMap<A, PeerId>,
 }
 
 impl<A: IpAddress> LocRib<A> {
@@ -124,7 +143,8 @@ impl<A: IpAddress> LocRib<A> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            candidates: HashMap::new(),
+            candidates: AHashMap::new(),
+            peer_index: AHashMap::new(),
             best: RouteMap::new(),
         }
     }
@@ -145,19 +165,37 @@ impl<A: IpAddress> LocRib<A> {
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
         let nlri = route.nlri;
-        let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
-        self.candidates.entry(nlri).or_default().insert(peer, route);
+
+        // Snapshot old best peer before mutation so we can detect Unchanged.
+        let old_best_peer = self.best.get(nlri.prefix()).copied();
+
+        self.candidates.insert((nlri, peer), route);
+        let peers = self.peer_index.entry(nlri).or_default();
+        if !peers.contains(&peer) {
+            peers.push(peer);
+        }
         self.recompute_best(nlri, oracle);
-        match self.best.get(nlri.prefix()) {
+
+        match self.best.get(nlri.prefix()).copied() {
             None => BestPathChange::Unchanged,
-            Some((new_peer, new_route)) => match old {
-                Some((old_peer, ref old_route))
-                    if old_peer == *new_peer && old_route == new_route =>
-                {
-                    BestPathChange::Unchanged
+            Some(new_peer) => {
+                let new_route = &self.candidates[&(nlri, new_peer)];
+                match old_best_peer {
+                    Some(old_peer) if old_peer == new_peer => {
+                        // Same winning peer — unchanged unless its route content changed.
+                        // We only need to check content when the inserting peer is the
+                        // current winner (otherwise its route didn't change this round).
+                        if peer == new_peer {
+                            // The winning peer just updated its route; we don't have the
+                            // old content anymore so conservatively signal Announced.
+                            BestPathChange::Announced(nlri, new_route.clone())
+                        } else {
+                            BestPathChange::Unchanged
+                        }
+                    }
+                    _ => BestPathChange::Announced(nlri, new_route.clone()),
                 }
-                _ => BestPathChange::Announced(nlri, new_route.clone()),
-            },
+            }
         }
     }
 
@@ -175,31 +213,42 @@ impl<A: IpAddress> LocRib<A> {
         nlri: &Nlri<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
-        let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
-        if let Some(peer_map) = self.candidates.get_mut(nlri) {
-            peer_map.remove(peer);
-            if peer_map.is_empty() {
-                self.candidates.remove(nlri);
-                self.best.remove(nlri.prefix());
-                if old.is_some() {
-                    return BestPathChange::Withdrawn(*nlri);
-                }
+        let had_best = self.best.get(nlri.prefix()).is_some();
+
+        if self.candidates.remove(&(*nlri, *peer)).is_none() {
+            return BestPathChange::Unchanged;
+        }
+
+        let has_remaining = if let Some(peers) = self.peer_index.get_mut(nlri) {
+            peers.retain(|p| p != peer);
+            !peers.is_empty()
+        } else {
+            false
+        };
+        if !has_remaining {
+            self.peer_index.remove(nlri);
+            self.best.remove(nlri.prefix());
+            return if had_best {
+                BestPathChange::Withdrawn(*nlri)
             } else {
-                self.recompute_best(*nlri, oracle);
-                return match self.best.get(nlri.prefix()) {
-                    None => BestPathChange::Withdrawn(*nlri),
-                    Some((new_peer, new_route)) => match old {
-                        Some((old_peer, ref old_route))
-                            if old_peer == *new_peer && old_route == new_route =>
-                        {
-                            BestPathChange::Unchanged
-                        }
-                        _ => BestPathChange::Announced(*nlri, new_route.clone()),
-                    },
-                };
+                BestPathChange::Unchanged
+            };
+        }
+
+        let old_best_peer = self.best.get(nlri.prefix()).copied();
+        self.recompute_best(*nlri, oracle);
+
+        match self.best.get(nlri.prefix()).copied() {
+            None => BestPathChange::Withdrawn(*nlri),
+            Some(new_peer) => {
+                if old_best_peer == Some(new_peer) && old_best_peer != Some(*peer) {
+                    // Same winner and it wasn't the peer we just withdrew — no change.
+                    BestPathChange::Unchanged
+                } else {
+                    BestPathChange::Announced(*nlri, self.candidates[&(*nlri, new_peer)].clone())
+                }
             }
         }
-        BestPathChange::Unchanged
     }
 
     /// Removes all routes contributed by `peer` and recomputes best-path
@@ -216,9 +265,9 @@ impl<A: IpAddress> LocRib<A> {
         oracle: &dyn NextHopOracle,
     ) -> Vec<BestPathChange<A>> {
         let affected: Vec<Nlri<A>> = self
-            .candidates
+            .peer_index
             .iter()
-            .filter(|(_, pm)| pm.contains_key(peer))
+            .filter(|(_, peers)| peers.contains(peer))
             .map(|(n, _)| *n)
             .collect();
 
@@ -229,18 +278,16 @@ impl<A: IpAddress> LocRib<A> {
     }
 
     /// Returns the current best route for `nlri`, if any.
-    ///
-    /// This is the route that passed import policy and won best-path selection
-    /// from among all peers that announced this prefix.
     #[must_use]
     pub fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        self.best.get(nlri.prefix()).map(|pair| &pair.1)
+        let peer = *self.best.get(nlri.prefix())?;
+        self.candidates.get(&(*nlri, peer))
     }
 
     /// Returns the peer whose route is currently best for `nlri`.
     #[must_use]
     pub fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        self.best.get(nlri.prefix()).map(|pair| pair.0)
+        self.best.get(nlri.prefix()).copied()
     }
 
     /// Iterates over all `(prefix, best_route)` pairs.
@@ -248,9 +295,11 @@ impl<A: IpAddress> LocRib<A> {
     /// Useful for building `AdjRibOut` — iterate this, apply export policy,
     /// and insert accepted routes into the peer's outbound table.
     pub fn best_routes(&self) -> impl Iterator<Item = (Nlri<A>, &Route<A>)> {
-        self.best
-            .iter()
-            .map(|(prefix, pair)| (Nlri::from_prefix(prefix), &pair.1))
+        self.best.iter().filter_map(|(prefix, peer)| {
+            let nlri = Nlri::from_prefix(prefix);
+            let route = self.candidates.get(&(nlri, *peer))?;
+            Some((nlri, route))
+        })
     }
 
     /// Returns the best route whose prefix most specifically covers `addr`.
@@ -259,27 +308,38 @@ impl<A: IpAddress> LocRib<A> {
     /// to forward a packet destined for `addr`.
     #[must_use]
     pub fn longest_match(&self, addr: A) -> Option<&Route<A>> {
-        self.best.longest_match(addr).map(|pair| &pair.1)
+        let (prefix, peer) = self.best.longest_match_entry(addr)?;
+        let nlri = Nlri::from_prefix(prefix);
+        self.candidates.get(&(nlri, *peer))
     }
 
     /// Returns all candidate routes for `nlri`, keyed by peer.
     ///
     /// Useful for diagnostics and "show bgp detail" output.
     #[must_use]
-    pub fn candidates(&self, nlri: &Nlri<A>) -> Option<&HashMap<PeerId, Route<A>>> {
-        self.candidates.get(nlri)
+    pub fn candidates(&self, nlri: &Nlri<A>) -> Option<AHashMap<PeerId, &Route<A>>> {
+        let peers = self.peer_index.get(nlri)?;
+        let routes: AHashMap<PeerId, &Route<A>> = peers
+            .iter()
+            .filter_map(|p| Some((*p, self.candidates.get(&(*nlri, *p))?)))
+            .collect();
+        if routes.is_empty() {
+            None
+        } else {
+            Some(routes)
+        }
     }
 
     /// Returns the number of unique prefixes with at least one candidate.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.candidates.len()
+        self.peer_index.len()
     }
 
     /// Returns `true` if the `LocRib` contains no routes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.candidates.is_empty()
+        self.peer_index.is_empty()
     }
 
     /// Re-evaluates best-path selection for every prefix currently in the RIB.
@@ -288,35 +348,43 @@ impl<A: IpAddress> LocRib<A> {
     /// when the kernel FIB gains or loses a route that a BGP next-hop depends on.
     /// Only prefixes whose best path actually changed are included in the result;
     /// unchanged prefixes are silently skipped.
-    ///
-    /// The returned `Vec` follows the same semantics as [`insert`][Self::insert]:
-    /// each entry tells the caller whether to install, update, or withdraw a route
-    /// in the FIB and whether to advertise or withdraw it to BGP peers.
     pub fn recompute_all(&mut self, oracle: &dyn NextHopOracle) -> Vec<BestPathChange<A>> {
-        let nlris: Vec<Nlri<A>> = self.candidates.keys().copied().collect();
+        let nlris: Vec<Nlri<A>> = self.peer_index.keys().copied().collect();
+
         nlris
             .into_iter()
             .filter_map(|nlri| {
-                let old = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
+                let old_peer = self.best.get(nlri.prefix()).copied();
                 self.recompute_best(nlri, oracle);
-                let new = self.best.get(nlri.prefix()).map(|(p, r)| (*p, r.clone()));
-                match (old, new) {
+                let new_peer = self.best.get(nlri.prefix()).copied();
+                match (old_peer, new_peer) {
                     (None, None) => None,
                     (Some(_), None) => Some(BestPathChange::Withdrawn(nlri)),
-                    (Some((op, ref or)), Some((np, ref nr))) if op == np && or == nr => None,
-                    (_, Some((_, route))) => Some(BestPathChange::Announced(nlri, route)),
+                    (Some(op), Some(np)) if op == np => None,
+                    (_, Some(np)) => Some(BestPathChange::Announced(
+                        nlri,
+                        self.candidates[&(nlri, np)].clone(),
+                    )),
                 }
             })
             .collect()
     }
 
     fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
-        if let Some(peer_map) = self.candidates.get(&nlri) {
-            if let Some((peer, route)) = select_best_with_oracle(peer_map, oracle) {
-                self.best.insert(nlri.prefix(), (peer, route.clone()));
-            } else {
-                self.best.remove(nlri.prefix());
-            }
+        // Use peer_index for O(k) lookup instead of scanning the full flat map.
+        // Clone routes into a temp AHashMap — k is typically 1–8, negligible cost.
+        let peer_map: AHashMap<PeerId, Route<A>> = self
+            .peer_index
+            .get(&nlri)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| Some((*p, self.candidates.get(&(nlri, *p))?.clone())))
+            .collect();
+
+        if let Some((peer, _)) = select_best_with_oracle(&peer_map, oracle) {
+            self.best.insert(nlri.prefix(), peer);
+        } else {
+            self.best.remove(nlri.prefix());
         }
     }
 }
@@ -524,15 +592,19 @@ mod tests {
     #[test]
     fn test_recompute_best_clears_best_when_candidates_empty() {
         // Covers the defensive else-branch in recompute_best where select_best
-        // returns None. Unreachable through the public API, so we reach it by
-        // injecting an empty peer map directly into the private candidates field.
+        // returns None. With the flat map we trigger this by removing the only
+        // candidate and calling recompute_best directly.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
 
         rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
         assert!(rib.best(&n).is_some());
 
-        rib.candidates.insert(n, std::collections::HashMap::new());
+        rib.candidates.remove(&(n, peer(1)));
+        rib.peer_index
+            .get_mut(&n)
+            .unwrap()
+            .retain(|p| *p != peer(1));
         rib.recompute_best(n, &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());

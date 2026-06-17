@@ -35,6 +35,8 @@ COPY pathvector-bmp/      pathvector-bmp/
 COPY pathvector-client/   pathvector-client/
 COPY pathvector/          pathvector/
 COPY pathvectord/         pathvectord/
+COPY pathvector-stress/   pathvector-stress/
+COPY pathvector-mrt/      pathvector-mrt/
 COPY e2e/                 e2e/
 COPY proto/               proto/
 

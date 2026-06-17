@@ -1,3 +1,6 @@
+# GZipped Routing Test Files
+*.gz
+
 # Rust build artifacts
 /target
 fuzz/target/

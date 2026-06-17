@@ -16,6 +16,8 @@ pathvector-types  = { workspace = true }
 pathvector-policy = { workspace = true }
 ipnetx            = { workspace = true }
 routemap          = { workspace = true }
+ahash             = { workspace = true }
+smallvec          = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

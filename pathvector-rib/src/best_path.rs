@@ -177,7 +177,7 @@ fn prefer<A: IpAddress>(
     // Only applies when both routes are eBGP — iBGP and local routes were
     // resolved at step 3/7.
     if a.peer_type == PeerType::External {
-        let age = b.received_at.cmp(&a.received_at); // older (smaller Instant) → Greater
+        let age = b.received_at.cmp(&a.received_at); // older (smaller u32) → Greater
         if age != Ordering::Equal {
             return age;
         }
@@ -790,14 +790,11 @@ mod tests {
 
     #[test]
     fn test_select_best_prefers_older_ebgp_route() {
-        use std::time::{Duration, Instant};
-
         let older = {
             let mut r = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
                 .peer_type(PeerType::External)
                 .build();
-            // Backdate received_at to simulate an older route.
-            r.received_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+            r.received_at = r.received_at.saturating_sub(60);
             r
         };
         let newer = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
@@ -814,17 +811,13 @@ mod tests {
 
     #[test]
     fn test_step9_only_applies_to_ebgp() {
-        use std::time::{Duration, Instant};
-
         // iBGP route that is very old — should NOT win over a newer eBGP route
         // because step 3/7 resolves in favour of eBGP first.
         let old_ibgp = {
             let mut r = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
                 .peer_type(PeerType::Internal)
                 .build();
-            r.received_at = Instant::now()
-                .checked_sub(Duration::from_secs(3600))
-                .unwrap();
+            r.received_at = r.received_at.saturating_sub(3600);
             r
         };
         let new_ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())

@@ -39,7 +39,7 @@ pub(crate) fn route_to_attributes(
 ) -> Vec<PathAttribute> {
     let is_ebgp = peer_type == PeerType::External;
     let (wire_as_path, as4_path) = if peer_four_byte {
-        (route.as_path.clone(), None)
+        ((*route.as_path).clone(), None)
     } else {
         let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
         (d, orig)
@@ -60,32 +60,33 @@ pub(crate) fn route_to_attributes(
             attrs.push(PathAttribute::Med(m.as_u32()));
         }
     }
-    if !route.communities.is_empty() {
-        attrs.push(PathAttribute::Communities(route.communities.clone()));
+    let rare = route.rare_or_default();
+    if !rare.communities.is_empty() {
+        attrs.push(PathAttribute::Communities(rare.communities.clone()));
     }
-    if !route.large_communities.is_empty() {
+    if !rare.large_communities.is_empty() {
         attrs.push(PathAttribute::LargeCommunities(
-            route.large_communities.clone(),
+            rare.large_communities.clone(),
         ));
     }
-    if !route.extended_communities.is_empty() {
+    if !rare.extended_communities.is_empty() {
         attrs.push(PathAttribute::ExtendedCommunities(
-            route.extended_communities.clone(),
+            rare.extended_communities.clone(),
         ));
     }
-    if route.atomic_aggregate {
+    if rare.atomic_aggregate {
         attrs.push(PathAttribute::AtomicAggregate);
     }
-    if let Some(agg) = route.aggregator {
+    if let Some(agg) = rare.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
     if !is_ebgp {
         // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
-        if let Some(id) = route.originator_id {
+        if let Some(id) = rare.originator_id {
             attrs.push(PathAttribute::OriginatorId(id));
         }
-        if !route.cluster_list.is_empty() {
-            attrs.push(PathAttribute::ClusterList(route.cluster_list.clone()));
+        if !rare.cluster_list.is_empty() {
+            attrs.push(PathAttribute::ClusterList(rare.cluster_list.clone()));
         }
     }
     // RFC 6793 §4: when the peer is 2-byte-only, include AS4_PATH so that
@@ -480,7 +481,7 @@ pub(crate) fn route_v6_to_attributes(
 ) -> (Vec<PathAttribute>, MpReachNlri) {
     let is_ebgp = peer_type == PeerType::External;
     let (wire_as_path, as4_path) = if peer_four_byte {
-        (route.as_path.clone(), None)
+        ((*route.as_path).clone(), None)
     } else {
         let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
         (d, orig)
@@ -498,32 +499,33 @@ pub(crate) fn route_v6_to_attributes(
             attrs.push(PathAttribute::Med(m.as_u32()));
         }
     }
-    if !route.communities.is_empty() {
-        attrs.push(PathAttribute::Communities(route.communities.clone()));
+    let rare = route.rare_or_default();
+    if !rare.communities.is_empty() {
+        attrs.push(PathAttribute::Communities(rare.communities.clone()));
     }
-    if !route.large_communities.is_empty() {
+    if !rare.large_communities.is_empty() {
         attrs.push(PathAttribute::LargeCommunities(
-            route.large_communities.clone(),
+            rare.large_communities.clone(),
         ));
     }
-    if !route.extended_communities.is_empty() {
+    if !rare.extended_communities.is_empty() {
         attrs.push(PathAttribute::ExtendedCommunities(
-            route.extended_communities.clone(),
+            rare.extended_communities.clone(),
         ));
     }
-    if route.atomic_aggregate {
+    if rare.atomic_aggregate {
         attrs.push(PathAttribute::AtomicAggregate);
     }
-    if let Some(agg) = route.aggregator {
+    if let Some(agg) = rare.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
     if !is_ebgp {
         // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
-        if let Some(id) = route.originator_id {
+        if let Some(id) = rare.originator_id {
             attrs.push(PathAttribute::OriginatorId(id));
         }
-        if !route.cluster_list.is_empty() {
-            attrs.push(PathAttribute::ClusterList(route.cluster_list.clone()));
+        if !rare.cluster_list.is_empty() {
+            attrs.push(PathAttribute::ClusterList(rare.cluster_list.clone()));
         }
     }
     if let Some(as4) = as4_path {
@@ -1001,8 +1003,8 @@ mod v6_tests {
         let mut route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        route.originator_id = Some("1.1.1.1".parse().unwrap());
-        route.cluster_list = vec![0x0101_0101u32];
+        route.rare_mut().originator_id = Some("1.1.1.1".parse().unwrap());
+        route.rare_mut().cluster_list = vec![0x0101_0101u32];
 
         let (attrs, _) = route_v6_to_attributes(&route, PeerType::External, true);
         assert!(
@@ -1025,8 +1027,8 @@ mod v6_tests {
         let mut route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
             .build();
-        route.originator_id = Some("1.1.1.1".parse().unwrap());
-        route.cluster_list = vec![0x0101_0101u32];
+        route.rare_mut().originator_id = Some("1.1.1.1".parse().unwrap());
+        route.rare_mut().cluster_list = vec![0x0101_0101u32];
 
         let (attrs, _) = route_v6_to_attributes(&route, PeerType::Internal, true);
         assert!(
