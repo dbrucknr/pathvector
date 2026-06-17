@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use ipnetx::interfaces::IpAddress;
-use pathvector_types::{LocalPref, PeerType};
+use pathvector_types::{Asn, LocalPref, PeerType};
 
 use crate::{
     oracle::{AlwaysReachable, NextHopOracle},
@@ -22,7 +22,7 @@ use crate::{
 /// | 3/7 | Source type | `Local` > `External` > `Internal` |
 /// | 4 | AS path length | shorter |
 /// | 5 | `ORIGIN` | lower (`IGP=0` best) |
-/// | 6 | `MED` | lower (missing → `0`) |
+/// | 6 | `MED` (same neighboring AS only) | lower (missing → `0`) |
 /// | 9 | Route age (eBGP only) | older |
 /// | 10 | Peer IP address | lower |
 ///
@@ -95,18 +95,46 @@ pub fn select_best_with_oracle<'a, A: IpAddress, S: std::hash::BuildHasher>(
     candidates: &'a HashMap<PeerId, Route<A>, S>,
     oracle: &dyn NextHopOracle,
 ) -> Option<(PeerId, &'a Route<A>)> {
-    candidates
+    // Step 1: exclude routes with unreachable next-hops.
+    let reachable: Vec<_> = candidates
         .iter()
-        .filter(|(_, route)| {
-            // Step 1: exclude routes with unreachable next-hops.
-            route
-                .next_hop
-                .as_ref()
-                .is_none_or(|nh| oracle.is_reachable(nh))
+        .filter(|(_, route)| route.next_hop.as_ref().is_none_or(|nh| oracle.is_reachable(nh)))
+        .collect();
+
+    if reachable.is_empty() {
+        return None;
+    }
+
+    // RFC 4271 §9.1.2.2 step 6: MED is only comparable within routes from the
+    // same neighboring AS. A naive pairwise max_by comparator that conditionally
+    // applies MED is non-transitive for 3+ routes across multiple ASes, producing
+    // unspecified results. The correct algorithm:
+    //
+    //   1. Group routes by neighboring AS (first AS in the path).
+    //   2. Select the best within each group — prefer() applies MED because all
+    //      routes in a group share the same neighboring_as().
+    //   3. Compare group winners — prefer() skips MED because winners come from
+    //      different ASes, guaranteeing a total order for the final comparison.
+    let mut groups: HashMap<Option<Asn>, Vec<(&PeerId, &Route<A>)>> = HashMap::new();
+    for (peer, route) in &reachable {
+        groups
+            .entry(route.as_path.neighboring_as())
+            .or_default()
+            .push((peer, route));
+    }
+
+    let group_winners: Vec<_> = groups
+        .into_values()
+        .filter_map(|group| {
+            group
+                .into_iter()
+                .max_by(|(pa, ra), (pb, rb)| prefer(pa, ra, pb, rb, oracle))
         })
-        .max_by(|(peer_a, route_a), (peer_b, route_b)| {
-            prefer(peer_a, route_a, peer_b, route_b, oracle)
-        })
+        .collect();
+
+    group_winners
+        .into_iter()
+        .max_by(|(pa, ra), (pb, rb)| prefer(pa, ra, pb, rb, oracle))
         .map(|(peer, route)| (*peer, route))
 }
 
@@ -142,14 +170,18 @@ fn prefer<A: IpAddress>(
     }
 
     // Step 6: Lowest MED (Multi-Exit Discriminator).
-    // Note: Strictly speaking, MED should only be compared between routes
-    // from the same neighboring AS. This implementation compares MED
-    // globally. See TODO.md (deterministic-med, always-compare-med).
-    let med_a = a.med.map_or(0, pathvector_types::Med::as_u32);
-    let med_b = b.med.map_or(0, pathvector_types::Med::as_u32);
-    let med = med_b.cmp(&med_a);
-    if med != Ordering::Equal {
-        return med; // reverse: lower MED → Greater → preferred
+    // RFC 4271 §9.1.2.2: compare MED only between routes from the same
+    // neighboring AS (first AS in path). Routes from different ASes skip
+    // this step — MED is not a meaningful cross-AS metric.
+    let neighbor_a = a.as_path.neighboring_as();
+    let neighbor_b = b.as_path.neighboring_as();
+    if neighbor_a.is_some() && neighbor_a == neighbor_b {
+        let med_a = a.med.map_or(0, pathvector_types::Med::as_u32);
+        let med_b = b.med.map_or(0, pathvector_types::Med::as_u32);
+        let med = med_b.cmp(&med_a);
+        if med != Ordering::Equal {
+            return med; // reverse: lower MED → Greater → preferred
+        }
     }
 
     // Steps 3/7: Prefer locally originated routes, then eBGP over iBGP
@@ -409,12 +441,14 @@ mod prop_tests {
         ) {
             let eff_a = med_a.unwrap_or(0);
             let eff_b = med_b.unwrap_or(0);
+            // Shared neighboring AS so MED comparison fires (RFC 4271 §9.1.2.2).
+            let neighbor = AsPath::from_sequence(vec![Asn::new(65001)]);
 
-            let mut ra = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            let mut ra = RouteBuilder::new(nlri(), Origin::Igp, neighbor.clone())
                 .local_pref(LocalPref::new(100));
             if let Some(m) = med_a { ra = ra.med(Med::new(m)); }
 
-            let mut rb = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            let mut rb = RouteBuilder::new(nlri(), Origin::Igp, neighbor)
                 .local_pref(LocalPref::new(100));
             if let Some(m) = med_b { rb = rb.med(Med::new(m)); }
 
@@ -647,6 +681,70 @@ mod tests {
         candidates.insert(peer(2), basic(Origin::Igp, 2, Some(100), Some(1))); // MED = 1
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(1)); // MED 0 < 1
+    }
+
+    #[test]
+    fn test_med_ignored_for_different_neighboring_as() {
+        // Routes from AS 65001 and AS 65002 — MED must not be compared across ASes.
+        // The lower MED from AS 65002 must NOT win just because its MED is lower.
+        // Tiebreaker falls through to step 10 (lower peer IP wins).
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            peer(1),
+            RouteBuilder::new(
+                nlri(),
+                Origin::Igp,
+                AsPath::from_sequence(vec![Asn::new(65001)]),
+            )
+            .local_pref(LocalPref::new(100))
+            .med(Med::new(500))
+            .build(),
+        );
+        candidates.insert(
+            peer(2),
+            RouteBuilder::new(
+                nlri(),
+                Origin::Igp,
+                AsPath::from_sequence(vec![Asn::new(65002)]),
+            )
+            .local_pref(LocalPref::new(100))
+            .med(Med::new(1))
+            .build(),
+        );
+        let (winner, _) = select_best(&candidates).unwrap();
+        // MED skipped — peer(1) wins on lower peer IP (step 10)
+        assert_eq!(winner, peer(1));
+    }
+
+    #[test]
+    fn test_med_compared_within_same_neighboring_as() {
+        // Two routes both from AS 65001 — MED comparison applies.
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            peer(1),
+            RouteBuilder::new(
+                nlri(),
+                Origin::Igp,
+                AsPath::from_sequence(vec![Asn::new(65001)]),
+            )
+            .local_pref(LocalPref::new(100))
+            .med(Med::new(200))
+            .build(),
+        );
+        candidates.insert(
+            peer(2),
+            RouteBuilder::new(
+                nlri(),
+                Origin::Igp,
+                AsPath::from_sequence(vec![Asn::new(65001)]),
+            )
+            .local_pref(LocalPref::new(100))
+            .med(Med::new(50))
+            .build(),
+        );
+        let (winner, _) = select_best(&candidates).unwrap();
+        // MED 50 < 200 → peer(2) wins
+        assert_eq!(winner, peer(2));
     }
 
     #[test]

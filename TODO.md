@@ -123,7 +123,7 @@ stabilise (adding streaming RPCs will change the generated types).
 ### Best-path selection — missing decision steps
 
 RFC 4271 §9.1 defines a 10-step decision process. The current implementation
-covers steps 2, 3/7, 4, 5, 6, 9, and 10. The two remaining steps require
+covers steps 2, 3/7, 4, 5, 6, 9, and 10 fully. The two remaining steps require
 external information not available at the RIB layer:
 
 | Step | Criterion | Status |
@@ -212,17 +212,16 @@ announce more prefixes than the limit.
 
 ### Configurable MED behaviour
 
-The current implementation compares MED **globally across all peers**, which is
-equivalent to `always-compare-med`. RFC 4271 §9.1.2.2 requires MED to be compared
-only between routes from the same neighboring AS; the current behavior can produce
-suboptimal selection when routes from different ASes have MED set. Step 6 is
-therefore marked ⚠️ in `pathvector-rib/RFC.md`.
+Step 6 now correctly applies MED only between routes from the same neighboring AS
+(`AsPath::neighboring_as()` comparison in `select_best`). Routes from different ASes
+skip the MED step entirely, falling through to step 3/7 (peer type) and beyond.
 
-Real implementations offer:
-- `always-compare-med` — current behavior (violates RFC default, but widely offered)
-- `deterministic-med` — group routes by originating AS before comparing MED,
-  ensuring the same best path is chosen regardless of route arrival order
-- Configurable missing-MED treatment (`0`, `u32::MAX`, or policy-set)
+What remains as optional future work:
+- `always-compare-med` knob — some operators want cross-AS MED comparison; JUNOS/IOS
+  both offer this as an explicit opt-in
+- Configurable missing-MED treatment (`0`, `u32::MAX`, or policy-set; current: `0`)
+- `deterministic-med` — ensures stable selection regardless of route arrival order
+  when multiple routes from the same AS arrive at different times
 
 ---
 
@@ -276,15 +275,6 @@ Not yet started. Key work items:
   Either approach requires the session spawn path to be callable at runtime, not
   just during `build_daemon`. The gRPC approach is simpler to implement correctly
   first; config-file reload can wrap it.
-
-- **`on_terminated` missing RouteEvents** — when a peer session drops,
-  `loc_rib.withdraw_peer` removes the peer's routes but no `RouteEvent`s are
-  emitted to the broadcast channel. The dashboard therefore shows stale routes
-  after a peer disconnects until the next reconnect/snapshot. Fix:
-  call `emit_route_events(&prev_prefixes)` after `withdraw_peer` (routes that
-  lost their only candidate emit Withdrawn; routes promoted to another peer's
-  candidate emit Announced with the new best). Tests: assert that
-  `route_tx` receives Withdrawn events for each route removed on termination.
 
 - **IPv6 BGP transport** — TCP sessions over IPv6 (bind listener on `[::]:179`,
   dial peers at IPv6 addresses). Distinct from IPv6 NLRI (MP_REACH_NLRI over IPv4
@@ -448,21 +438,25 @@ Any function that can fail should say so in its return type. Conduct a systemati
 
 ### Performance
 
-#### Memory audit (deferred until Stage 2 stress test)
+#### Memory — resolved by rib-memory-opt (2026-06-17)
 
-Baseline from Stage 1 synthetic stress (2026-06-17): ~2.6 KB per route, ~1.3 GB
-RSS at 500k routes. Extrapolated full table (~950k routes): ~2.5 GB — workable on
-developer hardware but likely 3–5× higher than GoBGP (~500–800 MB at full table).
+Stress benchmark (release profile, Apple M2 Max, synthetic uniform routes):
 
-Do not audit against synthetic routes. Audit after Stage 2 MRT replay, which
-provides real attribute diversity (varied AS paths, community sets, aggregators)
-that will shift per-route cost in ways synthetic uniform routes cannot predict.
-Likely suspects once profiling data is available:
+| Table size | pathvectord RSS | GoBGP RSS | Ratio |
+|---|---|---|---|
+| 10k  | 11.8 MB  | 51.7 MB  | pathvector 4.4× less |
+| 100k | 66.8 MB  | 133.2 MB | pathvector 2.0× less |
+| 500k | 461.2 MB | 465.4 MB | ~equal |
+| 900k | 515.2 MB | 792.4 MB | pathvector 35% less |
 
-- `HashMap`-backed `AdjRibIn` / `AdjRibOut` — one allocation per route entry
-- Full attribute clone per route rather than interned / `Arc`-shared attributes
-- `Vec<Asn>` in `AsPath` not interned across routes sharing the same path
-- No attribute compression (many real routes share identical AS paths)
+Per-route at 900k: **0.57 KB/route** (pathvectord) vs **0.88 KB/route** (GoBGP).
+
+The RSS plateau between 500k–900k (+54 MB for 400k additional routes) confirms
+that attribute interning / Arc-sharing is effective — real internet routes converge
+onto a small set of shared attribute sets as the table grows.
+
+No further memory audit planned unless profiling on a real multi-peer internet
+table (not synthetic) reveals a regression.
 
 #### Known architectural concerns
 

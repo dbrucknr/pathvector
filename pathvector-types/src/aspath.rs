@@ -311,6 +311,34 @@ impl AsPath {
         })
     }
 
+    /// Returns the directly neighboring AS — the first ASN in the first
+    /// `Sequence` segment.
+    ///
+    /// This is the AS that most recently prepended its number, i.e. the peer
+    /// that sent us the route. Used for RFC 4271 §9.1.2.2 step 6: MED is only
+    /// compared between routes received from the same neighboring AS.
+    ///
+    /// Returns `None` for locally originated routes (empty path) or paths that
+    /// begin with a `Set` or confederation segment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath};
+    ///
+    /// let path = AsPath::from_sequence(vec![Asn::new(65001), Asn::new(65002)]);
+    /// assert_eq!(path.neighboring_as(), Some(Asn::new(65001)));
+    ///
+    /// assert_eq!(AsPath::new().neighboring_as(), None);
+    /// ```
+    #[must_use]
+    pub fn neighboring_as(&self) -> Option<crate::Asn> {
+        self.segments.iter().find_map(|seg| match seg {
+            AsPathSegment::Sequence(asns) => asns.first().copied(),
+            _ => None,
+        })
+    }
+
     /// Returns `true` if this AS path has no segments (or all segments are empty).
     ///
     /// # Examples

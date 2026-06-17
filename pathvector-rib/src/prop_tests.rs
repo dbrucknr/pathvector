@@ -238,12 +238,15 @@ proptest! {
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         let med_vec: Vec<u32> = med_values.into_iter().collect();
         let min_med = *med_vec.iter().min().unwrap();
+        // All routes share the same neighboring AS so MED comparison applies
+        // (RFC 4271 §9.1.2.2: MED only compared within same neighboring AS).
+        let shared_neighbor = AsPath::from_sequence(vec![Asn::new(65001)]);
 
         let mut candidates: HashMap<PeerId, Route<Ipv4Addr>> = HashMap::new();
         for (i, &med) in med_vec.iter().enumerate() {
             candidates.insert(
                 peers[i],
-                RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+                RouteBuilder::new(nlri, Origin::Igp, shared_neighbor.clone())
                     .local_pref(LocalPref::new(100))
                     .med(Med::new(med))
                     .build(),
@@ -252,6 +255,73 @@ proptest! {
 
         let (_, winner) = select_best(&candidates).unwrap();
         prop_assert_eq!(winner.med, Some(Med::new(min_med)));
+    }
+
+    /// The winner is the same regardless of the order routes are inserted into
+    /// the candidate map.
+    ///
+    /// A pairwise MED comparator that conditionally skips MED for cross-AS pairs
+    /// is non-transitive for 3+ routes across multiple ASes, causing `max_by` to
+    /// return different winners depending on HashMap iteration order. The group-
+    /// based implementation must be stable under all permutations.
+    #[test]
+    fn prop_med_winner_is_insertion_order_independent(
+        med_as1_a in 0u32..=1000u32,
+        med_as1_b in 0u32..=1000u32,
+        med_as2   in 0u32..=1000u32,
+        peer1_ip  in 1u8..=50u8,
+        peer2_ip  in 51u8..=100u8,
+        peer3_ip  in 101u8..=150u8,
+    ) {
+        // Three routes: two from AS 65001 (MED comparable), one from AS 65002 (MED skipped).
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let as1 = AsPath::from_sequence(vec![Asn::new(65001)]);
+        let as2 = AsPath::from_sequence(vec![Asn::new(65002)]);
+
+        let make = |path: AsPath, med: u32, ip: u8| -> Route<Ipv4Addr> {
+            RouteBuilder::new(nlri, Origin::Igp, path)
+                .local_pref(LocalPref::new(100))
+                .med(Med::new(med))
+                .build()
+        };
+
+        let p1 = PeerId::from(Ipv4Addr::new(10, 0, 0, peer1_ip));
+        let p2 = PeerId::from(Ipv4Addr::new(10, 0, 0, peer2_ip));
+        let p3 = PeerId::from(Ipv4Addr::new(10, 0, 0, peer3_ip));
+
+        let r1 = make(as1.clone(), med_as1_a, peer1_ip);
+        let r2 = make(as1.clone(), med_as1_b, peer2_ip);
+        let r3 = make(as2.clone(), med_as2,   peer3_ip);
+
+        // All six insertion orders must produce the same winner.
+        let orders: [&[(&PeerId, &Route<Ipv4Addr>)]; 6] = [
+            &[(&p1, &r1), (&p2, &r2), (&p3, &r3)],
+            &[(&p1, &r1), (&p3, &r3), (&p2, &r2)],
+            &[(&p2, &r2), (&p1, &r1), (&p3, &r3)],
+            &[(&p2, &r2), (&p3, &r3), (&p1, &r1)],
+            &[(&p3, &r3), (&p1, &r1), (&p2, &r2)],
+            &[(&p3, &r3), (&p2, &r2), (&p1, &r1)],
+        ];
+
+        let results: Vec<PeerId> = orders
+            .iter()
+            .map(|order| {
+                let mut candidates = HashMap::new();
+                for (peer, route) in order.iter() {
+                    candidates.insert(**peer, (*route).clone());
+                }
+                select_best(&candidates).unwrap().0
+            })
+            .collect();
+
+        let first = results[0];
+        for (i, &winner) in results.iter().enumerate().skip(1) {
+            prop_assert_eq!(
+                winner, first,
+                "insertion order {} produced different winner {:?} vs {:?}",
+                i, winner, first
+            );
+        }
     }
 
     /// When there is at least one eBGP candidate and all routes share the same
