@@ -160,7 +160,25 @@ pathvector-sys
 docker pull ghcr.io/dbrucknr/pathvector:latest
 ```
 
-Minimal `docker-compose.yml` for running pathvectord:
+To peer pathvectord with GoBGP in Docker, save this as `Dockerfile.gobgp`:
+
+```dockerfile
+FROM alpine
+
+RUN wget -q https://github.com/osrg/gobgp/releases/download/v4.6.0/gobgp_4.6.0_linux_amd64.tar.gz \
+    && tar xf gobgp_4.6.0_linux_amd64.tar.gz \
+    && rm gobgp_4.6.0_linux_amd64.tar.gz
+
+EXPOSE 179 50051
+
+CMD ["./gobgpd", "--log-level=info", "--config-file=/gobgp.conf"]
+```
+
+> This Dockerfile hardcodes `linux_amd64`. On Apple Silicon, Docker Desktop
+> runs Linux/amd64 under emulation by default, so this works — but it will be
+> slower than a native arm64 build.
+
+Then a `docker-compose.yml` that wires them together:
 
 ```yaml
 services:
@@ -175,19 +193,55 @@ services:
       - NET_ADMIN       # required for kernel route installation (RTPROT_BGP)
     networks:
       - bgp
+    depends_on:
+      - gobgp
+
+  gobgp:
+    build:
+      context: .
+      dockerfile: Dockerfile.gobgp
+    volumes:
+      - ./gobgp.conf:/gobgp.conf:ro
+    networks:
+      - bgp
 
 networks:
   bgp:
     driver: bridge
 ```
 
+With a minimal `gobgp.conf`:
+
+```toml
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "pathvectord"   # Docker DNS resolves the service name
+    peer-as          = 65002
+  [neighbors.transport.config]
+    passive-mode = true
+```
+
+And `config.toml` for pathvectord pointing at the GoBGP container:
+
+```toml
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+grpc_port = 51200
+
+[[peers]]
+address        = "gobgp"   # Docker DNS resolves the service name
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"
+```
+
 > `NET_ADMIN` is only needed for FIB (kernel routing table) updates. Omit it if
 > you are using pathvectord purely as a route collector or policy engine.
-
-> The `pathvector-gobgpd-test` image used in the e2e test suite is built locally
-> during CI and is not published. To peer with GoBGP, install it directly
-> (`go install github.com/osrg/gobgp/v4/cmd/gobgpd@v4.6.0`) or use
-> `just e2e-up` which builds the test image locally.
 
 ---
 
