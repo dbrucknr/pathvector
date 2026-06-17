@@ -24,8 +24,14 @@ const PHASES: &[(u32, &str)] = &[
     (500_000, "500k"),
 ];
 
-/// Batch size for `originate_routes` calls.
+/// Batch size for `originate_routes` / `withdraw_originated_routes` calls.
 const BATCH: usize = 500;
+
+/// Number of prefixes used in the churn phase (announce → withdraw cycles).
+const CHURN_ROUTES: u32 = 10_000;
+
+/// Number of announce/withdraw cycles in the churn phase.
+const CHURN_CYCLES: u32 = 5;
 
 /// gRPC port pathvectord will listen on.
 /// Chosen to be well above Docker's default port range and the standard 51200.
@@ -34,7 +40,7 @@ const GRPC_PORT: u16 = 59_372;
 /// Minimal pathvectord config for the stress harness.
 ///
 /// A dummy peer (RFC 5737 TEST-NET — 192.0.2.1) is included so that
-/// run_event_loop's mpsc channel has a live sender and does not exit
+/// `run_event_loop`'s mpsc channel has a live sender and does not exit
 /// immediately.  The peer will never connect; that is intentional.
 const CONFIG: &str = r#"
 [daemon]
@@ -109,6 +115,7 @@ async fn stderr_logger(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = std::env::temp_dir().join("pathvectord-stress.toml");
     std::fs::write(&cfg_path, CONFIG)?;
@@ -198,6 +205,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_originated = target;
     }
 
+    // ── Withdrawal phase ──────────────────────────────────────────────────────
+    // Withdraw all 500k routes and verify RSS returns toward the baseline.
+    // A daemon that does not release memory on withdrawal will silently grow
+    // under normal BGP churn (peer flaps, route updates).
+
+    println!();
+    println!("Withdrawal (500k routes)");
+    println!("{}", "-".repeat(80));
+
+    let rss_pre_withdraw = sample_rss_kb(pid);
+    peak_kb.store(rss_pre_withdraw, Ordering::Relaxed);
+    let start = Instant::now();
+
+    let mut batch: Vec<String> = Vec::with_capacity(BATCH);
+    for i in 0..total_originated {
+        batch.push(prefix_for(i));
+        if batch.len() == BATCH {
+            client.withdraw_originated_routes(std::mem::take(&mut batch)).await?;
+        }
+    }
+    if !batch.is_empty() {
+        client.withdraw_originated_routes(batch).await?;
+    }
+    let withdraw_elapsed = start.elapsed();
+
+    // Give the allocator a moment to release pages before sampling.
+    sleep(Duration::from_millis(600)).await;
+    let rss_post_withdraw = sample_rss_kb(pid);
+    let reclaimed_kb = rss_pre_withdraw.saturating_sub(rss_post_withdraw);
+
+    println!(
+        "  Before:    {}", fmt_kb(rss_pre_withdraw),
+    );
+    println!(
+        "  After:     {}  ({:.2}s)", fmt_kb(rss_post_withdraw), withdraw_elapsed.as_secs_f64(),
+    );
+    println!(
+        "  Reclaimed: {}  ({:.0}%)",
+        fmt_kb(reclaimed_kb),
+        reclaim_pct(reclaimed_kb, rss_pre_withdraw),
+    );
+
+    // ── Churn phase ───────────────────────────────────────────────────────────
+    // Repeatedly announce and withdraw the same 10k prefixes for N cycles.
+    // RSS should remain stable across cycles — any growth indicates a leak.
+
+    println!();
+    println!("Churn ({CHURN_ROUTES} routes × {CHURN_CYCLES} announce/withdraw cycles)");
+    println!("{}", "-".repeat(80));
+    println!(
+        "  {:<8}  {:>10}  {:>10}  {:>10}",
+        "Cycle", "Ann (s)", "With (s)", "RSS after"
+    );
+
+    for cycle in 1..=CHURN_CYCLES {
+        // Announce.
+        let mut batch = Vec::with_capacity(BATCH);
+        let ann_start = Instant::now();
+        for i in 0..CHURN_ROUTES {
+            batch.push(OriginateRouteParams {
+                prefix: prefix_for(i),
+                next_hop: Ipv4Addr::new(192, 0, 2, 1).to_string(),
+                origin: Origin::Igp,
+                communities: vec![],
+                large_communities: vec![],
+                extended_communities: vec![],
+                local_pref: Some(100),
+                med: None,
+            });
+            if batch.len() == BATCH {
+                client.originate_routes(std::mem::take(&mut batch)).await?;
+            }
+        }
+        if !batch.is_empty() {
+            client.originate_routes(batch).await?;
+        }
+        let ann_elapsed = ann_start.elapsed();
+
+        // Withdraw.
+        let mut batch: Vec<String> = Vec::with_capacity(BATCH);
+        let with_start = Instant::now();
+        for i in 0..CHURN_ROUTES {
+            batch.push(prefix_for(i));
+            if batch.len() == BATCH {
+                client.withdraw_originated_routes(std::mem::take(&mut batch)).await?;
+            }
+        }
+        if !batch.is_empty() {
+            client.withdraw_originated_routes(batch).await?;
+        }
+        let with_elapsed = with_start.elapsed();
+
+        sleep(Duration::from_millis(300)).await;
+        let rss = sample_rss_kb(pid);
+
+        println!(
+            "  {:<8}  {:>10.2}  {:>10.2}  {:>10}",
+            cycle,
+            ann_elapsed.as_secs_f64(),
+            with_elapsed.as_secs_f64(),
+            fmt_kb(rss),
+        );
+    }
+
     println!();
     let total_errors = error_count.load(Ordering::Relaxed);
     if total_errors > 0 {
@@ -257,6 +368,11 @@ fn workspace_bin(name: &str) -> Result<String, Box<dyn std::error::Error>> {
         "'{name}' binary not found — run `cargo build -p pathvectord` first"
     )
     .into())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn reclaim_pct(reclaimed: u64, total: u64) -> f64 {
+    if total > 0 { reclaimed as f64 / total as f64 * 100.0 } else { 0.0 }
 }
 
 #[allow(clippy::cast_precision_loss)]

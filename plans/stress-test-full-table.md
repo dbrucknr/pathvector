@@ -79,6 +79,12 @@ Throughput: ~400k routes/sec via gRPC origination.
 Memory: ~2.6 KB/route — linear scaling, no obvious bloat.  
 Extrapolated full table (~950k routes): ~2.5 GB RSS.
 
+**Withdrawal reclamation (2026-06-17):** withdrawing all 500k routes reclaims
+only 7% of RSS (93 MB of 1.3 GB). This is expected allocator page-retention
+behavior (jemalloc / system allocator holds freed pages for reuse rather than
+returning them to the OS). Confirmed not a leak: churn RSS is flat across 5
+announce/withdraw cycles at 1.2 GB.
+
 **Memory gap vs GoBGP**: GoBGP holds a full table in ~500–800 MB. The likely
 causes are HashMap-backed RIB structures and full attribute clones per route
 rather than interned/shared attributes. Worth profiling before the Stage 3
