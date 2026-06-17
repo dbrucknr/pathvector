@@ -174,6 +174,7 @@ impl RibService for MockRib {
     ) -> Result<Response<ListRoutesResponse>, Status> {
         Ok(Response::new(ListRoutesResponse {
             routes: vec![proto_route("10.0.0.0/8"), proto_route("192.168.0.0/16")],
+            next_page_token: String::new(),
         }))
     }
 
@@ -183,6 +184,7 @@ impl RibService for MockRib {
     ) -> Result<Response<ListRoutesResponse>, Status> {
         Ok(Response::new(ListRoutesResponse {
             routes: vec![proto_route("10.0.0.0/8")],
+            next_page_token: String::new(),
         }))
     }
 
@@ -216,14 +218,14 @@ impl RibService for MockRibWithEvents {
         &self,
         _req: Request<proto::ListRoutesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        Ok(Response::new(ListRoutesResponse { routes: vec![] }))
+        Ok(Response::new(ListRoutesResponse { routes: vec![], next_page_token: String::new() }))
     }
 
     async fn list_candidates(
         &self,
         _req: Request<proto::ListCandidatesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        Ok(Response::new(ListRoutesResponse { routes: vec![] }))
+        Ok(Response::new(ListRoutesResponse { routes: vec![], next_page_token: String::new() }))
     }
 
     type WatchRoutesStream =

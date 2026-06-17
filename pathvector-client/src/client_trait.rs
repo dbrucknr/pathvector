@@ -21,6 +21,9 @@
 //!     fn list_routes(&mut self, _: Option<IpAddr>) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send {
 //!         async { Ok(vec![]) }
 //!     }
+//!     fn list_all_routes(&mut self, _: Option<IpAddr>) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send {
+//!         async { Ok(vec![]) }
+//!     }
 //!     fn get_best_route(&mut self, _: &str) -> impl Future<Output = Result<Option<Route>, ClientError>> + Send {
 //!         async { Ok(None) }
 //!     }
@@ -96,7 +99,23 @@ pub trait DaemonClient {
     ) -> impl Future<Output = Result<PeerState, ClientError>> + Send;
 
     /// Return all best routes, optionally filtered to routes won by `peer`.
+    ///
+    /// May fail with [`ClientError::Rpc`] / `RESOURCE_EXHAUSTED` when the
+    /// table exceeds ~26k routes (gRPC 4 MB limit).  Use [`list_all_routes`]
+    /// for large tables.
+    ///
+    /// [`list_all_routes`]: DaemonClient::list_all_routes
     fn list_routes(
+        &mut self,
+        peer: Option<IpAddr>,
+    ) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send;
+
+    /// Return all best routes using automatic pagination.
+    ///
+    /// Issues multiple `ListRoutes` RPCs with a fixed page size so the
+    /// response never exceeds the gRPC message-size limit.  Safe for any
+    /// table size.
+    fn list_all_routes(
         &mut self,
         peer: Option<IpAddr>,
     ) -> impl Future<Output = Result<Vec<Route>, ClientError>> + Send;
@@ -254,6 +273,8 @@ impl DaemonClient for PathvectorClient {
             .rib
             .list_routes(ListRoutesRequest {
                 peer_address: peer.map_or_else(String::new, |a| a.to_string()),
+                page_size: 0,
+                page_token: String::new(),
             })
             .await?
             .into_inner();
@@ -262,6 +283,53 @@ impl DaemonClient for PathvectorClient {
             .into_iter()
             .map(|r| Route::try_from(r).map_err(ClientError::from))
             .collect()
+    }
+
+    /// Return all best routes using automatic pagination, optionally filtered
+    /// to routes won by `peer`.
+    ///
+    /// Unlike [`list_routes`], this method works for any table size — it
+    /// issues multiple `ListRoutes` RPCs with `page_size = 5000` and
+    /// accumulates the results.  Use this instead of `list_routes` when the
+    /// table may exceed ~26k routes (the gRPC 4 MB response limit).
+    ///
+    /// [`list_routes`]: DaemonClient::list_routes
+    async fn list_all_routes(
+        &mut self,
+        peer: Option<IpAddr>,
+    ) -> Result<Vec<Route>, ClientError> {
+        const PAGE_SIZE: u32 = 5_000;
+        let peer_address = peer.map_or_else(String::new, |a| a.to_string());
+
+        let mut all: Vec<Route> = Vec::new();
+        let mut page_token = String::new();
+
+        loop {
+            let resp = self
+                .rib
+                .list_routes(ListRoutesRequest {
+                    peer_address: peer_address.clone(),
+                    page_size: PAGE_SIZE,
+                    page_token: page_token.clone(),
+                })
+                .await?
+                .into_inner();
+
+            let page: Vec<Route> = resp
+                .routes
+                .into_iter()
+                .map(|r| Route::try_from(r).map_err(ClientError::from))
+                .collect::<Result<_, _>>()?;
+
+            all.extend(page);
+
+            if resp.next_page_token.is_empty() {
+                break;
+            }
+            page_token = resp.next_page_token;
+        }
+
+        Ok(all)
     }
 
     /// Return the best route for a single prefix, or [`None`] if no route
@@ -484,6 +552,13 @@ mod tests {
         }
 
         async fn list_routes(&mut self, _peer: Option<IpAddr>) -> Result<Vec<Route>, ClientError> {
+            Ok(vec![])
+        }
+
+        async fn list_all_routes(
+            &mut self,
+            _peer: Option<IpAddr>,
+        ) -> Result<Vec<Route>, ClientError> {
             Ok(vec![])
         }
 

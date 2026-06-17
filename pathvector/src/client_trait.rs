@@ -200,6 +200,17 @@ pub(crate) mod tests {
             Ok(vec![])
         }
 
+        async fn list_all_routes(
+            &mut self,
+            _peer: Option<std::net::IpAddr>,
+        ) -> Result<Vec<pathvector_client::types::Route>, pathvector_client::error::ClientError>
+        {
+            if let Some(e) = self.check_error() {
+                return Err(e);
+            }
+            Ok(self.routes.clone())
+        }
+
         async fn watch_routes(
             &mut self,
             _peer: Option<&str>,
