@@ -199,6 +199,11 @@ impl<A: IpAddress> BgpRoute for Route<A> {
     }
 }
 
+fn shared_empty_as_path() -> Arc<AsPath> {
+    static EMPTY: std::sync::OnceLock<Arc<AsPath>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(AsPath::new())))
+}
+
 fn now_unix_secs() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -252,10 +257,15 @@ impl<A: IpAddress> RouteBuilder<A> {
     /// traversed.
     #[must_use]
     pub fn new(nlri: Nlri<A>, origin: Origin, as_path: AsPath) -> Self {
+        let as_path = if as_path.is_empty() {
+            shared_empty_as_path()
+        } else {
+            Arc::new(as_path)
+        };
         Self {
             nlri,
             origin,
-            as_path: Arc::new(as_path),
+            as_path,
             next_hop: None,
             local_pref: None,
             med: None,

@@ -94,19 +94,39 @@ are clearest at 10k/100k where per-prefix overhead dominates over per-route size
 
 ## Commit: AHashMap in AdjRibIn + AdjRibOut
 
-`git: (pending)`
-
-| Phase | pathvectord | GoBGP | pv/go |
-|---|---|---|---|
-| 500k memory | — | — | — |
-| 500k speed | — | — | — |
+`git: aba361f`
 
 Changes:
 - AHashMap replaces std HashMap in AdjRibIn and AdjRibOut.
 
-Notes: AdjRib maps are per-session (not shared); benefit is per-session hash op
-speed, not total memory. Memory numbers expected unchanged in stress test which
-uses originated routes (bypass AdjRibIn).
+Notes: AdjRib maps are per-session; benefit is hash op speed. Memory numbers
+unchanged in stress test (originated routes bypass AdjRibIn).
+
+---
+
+## Commit: intern empty AsPath via shared static Arc
+
+`git: (latest)`
+
+| Phase | pathvectord | GoBGP | pv/go |
+|---|---|---|---|
+| 10k memory | 12.7 MB | 50.7 MB | 0.25× |
+| 100k memory | 67.8 MB | 130.8 MB | 0.52× |
+| 500k memory | **461.6 MB** | 455.5 MB | **1.01×** |
+| 500k speed | 0.67 s | 1.51 s | 0.44× |
+| withdrawal (500k) | 0.53 s | — | — |
+
+Changes:
+- `RouteBuilder::new` checks `as_path.is_empty()` and reuses a process-wide
+  `static OnceLock<Arc<AsPath>>` instead of allocating a new Arc per route.
+  `Arc::make_mut` in `prepare_outbound` still gives CoW semantics when prepend
+  is needed for eBGP advertisement.
+
+Root cause: 500k originated routes each called `Arc::new(AsPath::new())` → 500k
+separate 40-byte heap allocations (16-byte ArcInner + 24-byte empty Vec header)
+= ~20 MB. Sharing one Arc collapses this to a single allocation.
+
+Result: −25 MB at 500k, now within noise of GoBGP (461.6 vs 455.5 MB).
 
 ---
 
