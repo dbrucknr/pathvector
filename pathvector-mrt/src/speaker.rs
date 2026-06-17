@@ -77,13 +77,15 @@ impl BgpSpeaker {
         // Group prefixes by attribute bytes for efficient batching.
         let mut by_attrs: HashMap<&[u8], Vec<(Ipv4Addr, u8)>> = HashMap::new();
         for e in entries {
-            by_attrs.entry(e.attrs.as_slice()).or_default().push((e.prefix, e.prefix_len));
+            by_attrs
+                .entry(e.attrs.as_slice())
+                .or_default()
+                .push((e.prefix, e.prefix_len));
         }
 
         let unique_attr_sets = by_attrs.len();
         let mut prefixes_sent: u64 = 0;
         let mut updates_sent: u64 = 0;
-
 
         for (attrs, prefixes) in &by_attrs {
             let mut batch: Vec<(Ipv4Addr, u8)> = Vec::new();
@@ -122,7 +124,11 @@ impl BgpSpeaker {
             }
         }
 
-        Ok(AnnounceResult { prefixes_sent, updates_sent, unique_attr_sets })
+        Ok(AnnounceResult {
+            prefixes_sent,
+            updates_sent,
+            unique_attr_sets,
+        })
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

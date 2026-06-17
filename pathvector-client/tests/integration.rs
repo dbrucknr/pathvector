@@ -218,14 +218,20 @@ impl RibService for MockRibWithEvents {
         &self,
         _req: Request<proto::ListRoutesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        Ok(Response::new(ListRoutesResponse { routes: vec![], next_page_token: String::new() }))
+        Ok(Response::new(ListRoutesResponse {
+            routes: vec![],
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_candidates(
         &self,
         _req: Request<proto::ListCandidatesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        Ok(Response::new(ListRoutesResponse { routes: vec![], next_page_token: String::new() }))
+        Ok(Response::new(ListRoutesResponse {
+            routes: vec![],
+            next_page_token: String::new(),
+        }))
     }
 
     type WatchRoutesStream =

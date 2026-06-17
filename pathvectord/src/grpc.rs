@@ -547,7 +547,10 @@ impl RibService for RibServiceImpl {
             (page, next_token)
         };
 
-        Ok(Response::new(ListRoutesResponse { routes, next_page_token }))
+        Ok(Response::new(ListRoutesResponse {
+            routes,
+            next_page_token,
+        }))
     }
 
     async fn watch_routes(
@@ -644,7 +647,10 @@ impl RibService for RibServiceImpl {
             })
             .unwrap_or_default();
 
-        Ok(Response::new(ListRoutesResponse { routes, next_page_token: String::new() }))
+        Ok(Response::new(ListRoutesResponse {
+            routes,
+            next_page_token: String::new(),
+        }))
     }
 }
 
@@ -1592,7 +1598,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_routes_pagination_first_page() {
-        let svc = RibServiceImpl { state: three_route_state().await };
+        let svc = RibServiceImpl {
+            state: three_route_state().await,
+        };
         let resp = svc
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: String::new(),
@@ -1603,7 +1611,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(resp.routes.len(), 2, "first page should have 2 routes");
-        assert!(!resp.next_page_token.is_empty(), "should have a next page token");
+        assert!(
+            !resp.next_page_token.is_empty(),
+            "should have a next page token"
+        );
         // sorted by prefix string; first two alphabetically
         assert_eq!(resp.routes[0].prefix, "10.0.0.0/8");
         assert_eq!(resp.routes[1].prefix, "172.16.0.0/12");
@@ -1611,7 +1622,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_routes_pagination_second_page_is_last() {
-        let svc = RibServiceImpl { state: three_route_state().await };
+        let svc = RibServiceImpl {
+            state: three_route_state().await,
+        };
         // Get the cursor from the first page.
         let first = svc
             .list_routes(Request::new(ListRoutesRequest {
@@ -1624,7 +1637,9 @@ mod tests {
             .into_inner();
         let cursor = first.next_page_token.clone();
 
-        let svc2 = RibServiceImpl { state: three_route_state().await };
+        let svc2 = RibServiceImpl {
+            state: three_route_state().await,
+        };
         let resp = svc2
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: String::new(),
@@ -1641,7 +1656,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_routes_pagination_page_size_zero_returns_all() {
-        let svc = RibServiceImpl { state: three_route_state().await };
+        let svc = RibServiceImpl {
+            state: three_route_state().await,
+        };
         let resp = svc
             .list_routes(Request::new(ListRoutesRequest {
                 peer_address: String::new(),
@@ -1652,7 +1669,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(resp.routes.len(), 3, "page_size=0 should return all routes");
-        assert!(resp.next_page_token.is_empty(), "no pagination token when all returned");
+        assert!(
+            resp.next_page_token.is_empty(),
+            "no pagination token when all returned"
+        );
     }
 
     // ── RibService::list_candidates ───────────────────────────────────────────

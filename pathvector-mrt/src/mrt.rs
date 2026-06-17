@@ -120,7 +120,11 @@ fn parse_rib_ipv4(body: &[u8]) -> Option<RibEntry> {
     }
     let attrs = body[pos..pos + attr_len].to_vec();
 
-    Some(RibEntry { prefix, prefix_len, attrs })
+    Some(RibEntry {
+        prefix,
+        prefix_len,
+        attrs,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

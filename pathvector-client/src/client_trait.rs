@@ -294,10 +294,7 @@ impl DaemonClient for PathvectorClient {
     /// table may exceed ~26k routes (the gRPC 4 MB response limit).
     ///
     /// [`list_routes`]: DaemonClient::list_routes
-    async fn list_all_routes(
-        &mut self,
-        peer: Option<IpAddr>,
-    ) -> Result<Vec<Route>, ClientError> {
+    async fn list_all_routes(&mut self, peer: Option<IpAddr>) -> Result<Vec<Route>, ClientError> {
         const PAGE_SIZE: u32 = 5_000;
         let peer_address = peer.map_or_else(String::new, |a| a.to_string());
 

@@ -31,10 +31,7 @@ use std::{
 
 use clap::Parser;
 use futures::StreamExt as _;
-use pathvector_client::{
-    DaemonClient, PathvectorClient,
-    types::RouteEventType,
-};
+use pathvector_client::{DaemonClient, PathvectorClient, types::RouteEventType};
 use tokio::time::sleep;
 
 mod mrt;
@@ -213,11 +210,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "  RIB convergence:{:.2}s  (announcement start to stable snapshot)",
         convergence_elapsed.as_secs_f64(),
     );
+    println!("  Total:          {:.2}s", total_elapsed.as_secs_f64(),);
     println!(
-        "  Total:          {:.2}s",
-        total_elapsed.as_secs_f64(),
+        "  Unique attr sets: {}",
+        fmt_count(result.unique_attr_sets as u64)
     );
-    println!("  Unique attr sets: {}", fmt_count(result.unique_attr_sets as u64));
     println!(
         "  Accepted:  {} / {} sent",
         fmt_count(rib_count),
@@ -251,10 +248,18 @@ fn read_mrt(path: &PathBuf) -> Result<Vec<RibEntry>, Box<dyn std::error::Error>>
 }
 
 /// Compute prefixes-per-second as a u64.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn prefixes_per_sec(count: u64, elapsed: Duration) -> u64 {
     let secs = elapsed.as_secs_f64();
-    if secs == 0.0 { 0 } else { (count as f64 / secs) as u64 }
+    if secs == 0.0 {
+        0
+    } else {
+        (count as f64 / secs) as u64
+    }
 }
 
 /// Format a large number with thousands separators.
