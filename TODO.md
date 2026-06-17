@@ -264,19 +264,16 @@ Not yet started. Key work items:
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
 
-- **Dynamic peer reconfiguration** ✅ done (2026-06-17) — `AddPeer` / `RemovePeer`
-  gRPC RPCs on `PeerService`; `DaemonCommand` enum bridges gRPC to event loop;
-  `pending_removal` HashSet sequences route withdrawal before state cleanup;
-  synthesized `Terminated` event handles the no-live-session edge case.
-  Remaining follow-on work:
-  - **`UpdatePeer`** — modify import/export policy or timers on an existing peer
-    without a session reset. Requires diffing old vs. new `PeerConfig` and only
-    touching what changed (e.g. policy update needs no session bounce; hold-timer
-    change requires NOTIFICATION + reconnect).
-  - **Config-file watch + partial reload** — inotify/kqueue watcher re-reads
-    `pathvectord.toml` on change and diffs against running state, then drives
-    `AddPeer` / `RemovePeer` / `UpdatePeer` commands. Can be implemented as a
-    thin wrapper around the gRPC command path now that it exists.
+- **`UpdatePeer` RPC** — modify import/export policy or timers on an existing peer
+  without a full session reset. Requires diffing old vs. new `PeerConfig` and only
+  touching what changed: a policy update needs no session bounce; a hold-timer change
+  requires a NOTIFICATION + reconnect to the affected peer only. Builds on the
+  `DaemonCommand` + `run_command_processor` pattern introduced for `AddPeer`/`RemovePeer`.
+
+- **Config-file watch + partial reload** — inotify/kqueue watcher re-reads
+  `pathvectord.toml` on change, diffs against running state, and drives
+  `AddPeer` / `RemovePeer` / `UpdatePeer` commands. Thin wrapper around the gRPC
+  command path; `UpdatePeer` is the prerequisite.
 
 - **IPv6 BGP transport** — TCP sessions over IPv6 (bind listener on `[::]:179`,
   dial peers at IPv6 addresses). Distinct from IPv6 NLRI (MP_REACH_NLRI over IPv4

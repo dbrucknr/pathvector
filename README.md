@@ -344,7 +344,7 @@ Active development. Crates are not yet published to crates.io.
 | `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2–7, 9–10; LPM forwarding queries |
 | `pathvector-session` | Stable | Full BGP FSM; all five message types; 4-byte ASN; GoBGP-validated |
 | `pathvector-client` | Stable | Typed async Rust client wrapping all gRPC services |
-| `pathvectord` | Active | Full BGP speaker; gRPC management API; GoBGP-validated |
+| `pathvectord` | Active | Full BGP speaker; gRPC management API; dynamic peer add/remove; GoBGP-validated |
 | `pathvector` | Active | CLI: peer/route/policy/origination subcommands; live ratatui dashboard |
 | `pathvector-bmp` | Planned | BMP receiver for passive route monitoring |
 

@@ -6,6 +6,48 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-06-17
 
+### [pathvectord, pathvector-client] Dynamic peer reconfiguration — AddPeer / RemovePeer gRPC RPCs
+
+Runtime peer management without daemon restart. Operators can now add and remove BGP
+peers over the gRPC management API while other sessions remain unaffected.
+
+**Proto:** `AddPeer` and `RemovePeer` RPCs on `PeerService`; `AddPeerRequest` carries
+address, remote AS, port, import/export default policy (`PolicyAction`), and optional
+RFC 2385 MD5 password. AS 0 and AS 23456 (AS_TRANS, RFC 7607) rejected with
+`INVALID_ARGUMENT`.
+
+**Architecture:** `DaemonCommand` enum bridges the gRPC layer to the event loop without
+leaking generics. A separate `run_command_processor` task handles commands so the event
+loop signature stays stable. `incoming_senders` and `md5_passwords` are
+`Arc<RwLock<HashMap>>` so the BGP listener picks up newly added peers immediately.
+`stop_senders` is `Arc<Mutex<HashMap>>` with a lock-clone-await pattern so the sender
+is never held across an `await`.
+
+**Teardown sequencing:** `pending_removal: HashSet<Ipv4Addr>` in `DaemonState` signals
+the `Terminated` handler to run a full state purge (`remove_peer` — clears all
+per-peer RIB/policy maps) instead of a reconnect-ready reset (`on_terminated`). This
+guarantees routes are withdrawn from the Loc-RIB before peer state is destroyed.
+
+**Liveness fix:** if the session actor has already exited between reconnects (stop sender
+dropped), the command processor synthesizes `SessionEvent::Terminated` directly via
+`event_tx` so the `pending_removal` cleanup still runs.
+
+**`AddPeer` is idempotent** — re-adding an existing peer is a no-op. `RemovePeer` on
+an unknown peer returns `NOT_FOUND`.
+
+**Client:** `AddPeerParams` type + `add_peer` / `remove_peer` on the `DaemonClient`
+trait; `PathvectorClient` implementation; `MockDaemonClient` stubs.
+
+Tests added: `add_peer_inserts_all_state_maps`, `add_peer_is_idempotent`,
+`remove_peer_clears_all_state_maps`, `remove_peer_returns_false_when_not_found`,
+`terminated_with_pending_removal_calls_remove_peer`,
+`terminated_without_pending_removal_keeps_peer_state`,
+`remove_peer_synthesizes_terminated_when_no_stop_sender`,
+`test_add_peer_invalid_address`, `test_add_peer_rejects_as_zero`,
+`test_add_peer_rejects_as_trans`, `test_add_peer_sends_command_on_valid_request`,
+`test_remove_peer_invalid_address`, `test_remove_peer_not_found`,
+`test_remove_peer_sends_command_when_peer_exists`.
+
 ### [pathvector-rib] RFC-correct same-AS MED comparison in best-path selection
 
 RFC 4271 §9.1.2.2 requires MED to be compared only between routes from the same neighboring
