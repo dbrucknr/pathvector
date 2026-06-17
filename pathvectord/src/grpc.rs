@@ -23,7 +23,9 @@ use pathvector_policy::DefaultAction;
 use pathvector_rib::PeerId;
 use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType};
 
-use crate::{DaemonState, RibSnapshot};
+use tokio::sync::mpsc;
+
+use crate::{DaemonState, RibSnapshot, daemon::DaemonCommand};
 
 // ── Generated protobuf/gRPC code ─────────────────────────────────────────────
 //
@@ -38,12 +40,13 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::proto;
 
 use proto::{
-    Aggregator, AsSegment, GetBestRouteRequest, GetPeerRequest, LargeCommunity,
-    ListCandidatesRequest, ListOriginatedRoutesRequest, ListOriginatedRoutesResponse,
-    ListPeersRequest, ListPeersResponse, ListRoutesRequest, ListRoutesResponse,
-    OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest, OriginateRoutesResponse,
-    PeerEvent, PeerEventType, PeerState, PolicyAction, Route, RouteEvent, RouteEventType,
-    RouteResponse, SetExportDefaultRequest, SetExportDefaultResponse, SetImportDefaultRequest,
+    AddPeerRequest, AddPeerResponse, Aggregator, AsSegment, GetBestRouteRequest, GetPeerRequest,
+    LargeCommunity, ListCandidatesRequest, ListOriginatedRoutesRequest,
+    ListOriginatedRoutesResponse, ListPeersRequest, ListPeersResponse, ListRoutesRequest,
+    ListRoutesResponse, OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest,
+    OriginateRoutesResponse, PeerEvent, PeerEventType, PeerState, PolicyAction, RemovePeerRequest,
+    RemovePeerResponse, Route, RouteEvent, RouteEventType, RouteResponse,
+    SetExportDefaultRequest, SetExportDefaultResponse, SetImportDefaultRequest,
     SetImportDefaultResponse, WatchPeersRequest, WatchRoutesRequest,
     WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse,
     WithdrawOriginatedRoutesRequest, WithdrawOriginatedRoutesResponse,
@@ -226,6 +229,8 @@ pub(crate) fn route_v6_to_proto(
 
 struct PeerServiceImpl {
     state: Arc<tokio::sync::RwLock<DaemonState>>,
+    /// Channel to the command processor for AddPeer / RemovePeer at runtime.
+    cmd_tx: mpsc::Sender<DaemonCommand>,
 }
 
 /// Build a `PeerState` proto message from daemon state for `addr`.
@@ -295,6 +300,33 @@ type PeerEventStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
 type RouteEventStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<RouteEvent, Status>> + Send>>;
+
+fn proto_policy_to_config_import(action: i32) -> Option<crate::config::ImportDefault> {
+    match PolicyAction::try_from(action).unwrap_or(PolicyAction::Unspecified) {
+        PolicyAction::Accept => Some(crate::config::ImportDefault::Accept),
+        PolicyAction::Reject => Some(crate::config::ImportDefault::Reject),
+        PolicyAction::Unspecified => None,
+    }
+}
+
+fn proto_policy_to_config_export(action: i32) -> Option<crate::config::ExportDefault> {
+    match PolicyAction::try_from(action).unwrap_or(PolicyAction::Unspecified) {
+        PolicyAction::Accept => Some(crate::config::ExportDefault::Accept),
+        PolicyAction::Reject => Some(crate::config::ExportDefault::Reject),
+        PolicyAction::Unspecified => None,
+    }
+}
+
+/// RFC 7607 §2: AS 0 and AS 23456 (AS_TRANS) are invalid in `remote_as`.
+fn validate_remote_as(remote_as: u32) -> Result<(), Status> {
+    match remote_as {
+        0 => Err(Status::invalid_argument("remote_as must not be 0")),
+        23456 => Err(Status::invalid_argument(
+            "remote_as must not be 23456 (AS_TRANS is reserved, RFC 6793)",
+        )),
+        _ => Ok(()),
+    }
+}
 
 #[tonic::async_trait]
 impl PeerService for PeerServiceImpl {
@@ -406,6 +438,79 @@ impl PeerService for PeerServiceImpl {
         };
 
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn add_peer(
+        &self,
+        request: Request<AddPeerRequest>,
+    ) -> Result<Response<AddPeerResponse>, Status> {
+        let req = request.into_inner();
+
+        let addr: std::net::Ipv4Addr = req
+            .address
+            .parse()
+            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+
+        validate_remote_as(req.remote_as)?;
+
+        let port: u16 = if req.port == 0 {
+            179
+        } else {
+            u16::try_from(req.port)
+                .map_err(|_| Status::invalid_argument("port must be in range 1–65535"))?
+        };
+
+        let import_default = proto_policy_to_config_import(req.import_default);
+        let export_default = proto_policy_to_config_export(req.export_default);
+        let md5_password = if req.md5_password.is_empty() {
+            None
+        } else {
+            Some(req.md5_password)
+        };
+
+        let peer = crate::config::PeerConfig {
+            address: addr,
+            port,
+            remote_as: req.remote_as,
+            import_default,
+            export_default,
+            import_default_v6: None,
+            md5_password,
+            is_rr_client: false,
+        };
+
+        self.cmd_tx
+            .send(DaemonCommand::AddPeer(peer))
+            .await
+            .map_err(|_| Status::internal("daemon command channel closed"))?;
+
+        Ok(Response::new(AddPeerResponse {}))
+    }
+
+    async fn remove_peer(
+        &self,
+        request: Request<RemovePeerRequest>,
+    ) -> Result<Response<RemovePeerResponse>, Status> {
+        let addr: std::net::Ipv4Addr = request
+            .into_inner()
+            .address
+            .parse()
+            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+
+        // Verify the peer exists before sending the command so the caller gets a
+        // NOT_FOUND immediately rather than silently doing nothing.
+        let snap = self.state.read().await.snapshot();
+        if !snap.peer_remote_as.contains_key(&addr) {
+            return Err(Status::not_found(format!("peer {addr} is not configured")));
+        }
+        drop(snap);
+
+        self.cmd_tx
+            .send(DaemonCommand::RemovePeer(addr))
+            .await
+            .map_err(|_| Status::internal("daemon command channel closed"))?;
+
+        Ok(Response::new(RemovePeerResponse {}))
     }
 }
 
@@ -984,13 +1089,18 @@ impl OriginationService for OriginationServiceImpl {
 /// Called once from `run()` as a background Tokio task.  Logs an error and
 /// returns (rather than panicking) if the server fails to bind or encounters a
 /// fatal transport error.
-pub(crate) async fn serve(state: Arc<tokio::sync::RwLock<DaemonState>>, port: u16) {
+pub(crate) async fn serve(
+    state: Arc<tokio::sync::RwLock<DaemonState>>,
+    port: u16,
+    cmd_tx: mpsc::Sender<DaemonCommand>,
+) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!(%addr, "gRPC management API listening");
 
     let peer_svc = PeerServiceServer::new(PeerServiceImpl {
         state: Arc::clone(&state),
+        cmd_tx,
     });
     let rib_svc = RibServiceServer::new(RibServiceImpl {
         state: Arc::clone(&state),
@@ -1049,13 +1159,23 @@ mod tests {
     };
     use tokio_stream::StreamExt as _;
 
+    /// Returns a no-op DaemonCommand sender for tests that do not exercise
+    /// AddPeer / RemovePeer.  The receiver is immediately dropped so any
+    /// attempted sends are silently discarded.
+    fn noop_cmd_tx() -> mpsc::Sender<crate::daemon::DaemonCommand> {
+        let (tx, _rx) = mpsc::channel(1);
+        tx
+    }
+
     use crate::{
         DaemonState,
         config::{self, ExportDefault, ImportDefault},
+        daemon::DaemonCommand,
     };
     use proto::{
-        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListOriginatedRoutesRequest,
-        ListPeersRequest, ListRoutesRequest, OriginateRouteRequest, OriginateRoutesRequest,
+        AddPeerRequest, AddPeerResponse, GetBestRouteRequest, GetPeerRequest,
+        ListCandidatesRequest, ListOriginatedRoutesRequest, ListPeersRequest, ListRoutesRequest,
+        OriginateRouteRequest, OriginateRoutesRequest, RemovePeerRequest,
         SetExportDefaultRequest, SetImportDefaultRequest, WatchPeersRequest, WatchRoutesRequest,
         WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
         origination_service_server::OriginationService, peer_service_server::PeerService,
@@ -1316,7 +1436,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_peers_empty_state() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
             .await
@@ -1329,7 +1449,7 @@ mod tests {
         let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
             .await
@@ -1353,7 +1473,7 @@ mod tests {
             .await
             .on_established(addr, PeerType::External, 65002, 90, &[], None);
 
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
             .await
@@ -1373,7 +1493,7 @@ mod tests {
     async fn test_get_peer_idle() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
 
         let resp = svc
             .get_peer(Request::new(GetPeerRequest {
@@ -1390,7 +1510,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_peer_not_found_returns_not_found_status() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
 
         let err = svc
             .get_peer(Request::new(GetPeerRequest {
@@ -1404,7 +1524,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_peer_invalid_address_returns_invalid_argument() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
 
         let err = svc
             .get_peer(Request::new(GetPeerRequest {
@@ -1413,6 +1533,125 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── PeerService::add_peer / remove_peer ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_add_peer_invalid_address() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let err = svc
+            .add_peer(Request::new(AddPeerRequest {
+                address: "not-an-ip".into(),
+                remote_as: 65002,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_rejects_as_zero() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let err = svc
+            .add_peer(Request::new(AddPeerRequest {
+                address: "10.0.0.2".into(),
+                remote_as: 0,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("remote_as must not be 0"));
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_rejects_as_trans() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let err = svc
+            .add_peer(Request::new(AddPeerRequest {
+                address: "10.0.0.2".into(),
+                remote_as: 23456,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("23456"));
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_sends_command_on_valid_request() {
+        let state = arc_state(65001, &[]);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let svc = PeerServiceImpl { state, cmd_tx };
+        let resp = svc
+            .add_peer(Request::new(AddPeerRequest {
+                address: "10.0.0.2".into(),
+                remote_as: 65002,
+                port: 0,
+                ..Default::default()
+            }))
+            .await
+            .expect("add_peer must succeed for valid args");
+        assert_eq!(resp.into_inner(), AddPeerResponse {});
+
+        let cmd = cmd_rx.try_recv().expect("command must have been sent");
+        let DaemonCommand::AddPeer(cfg) = cmd else {
+            panic!("expected AddPeer command")
+        };
+        assert_eq!(cfg.address, "10.0.0.2".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(cfg.remote_as, 65002);
+        assert_eq!(cfg.port, 179, "port 0 must default to 179");
+    }
+
+    #[tokio::test]
+    async fn test_remove_peer_invalid_address() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let err = svc
+            .remove_peer(Request::new(RemovePeerRequest {
+                address: "bad".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_remove_peer_not_found() {
+        let state = arc_state(65001, &[]);
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let err = svc
+            .remove_peer(Request::new(RemovePeerRequest {
+                address: "10.0.0.2".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_remove_peer_sends_command_when_peer_exists() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let svc = PeerServiceImpl { state, cmd_tx };
+        svc.remove_peer(Request::new(RemovePeerRequest {
+            address: "10.0.0.2".into(),
+        }))
+        .await
+        .expect("remove_peer must succeed for a configured peer");
+
+        let cmd = cmd_rx.try_recv().expect("command must have been sent");
+        let DaemonCommand::RemovePeer(ip) = cmd else {
+            panic!("expected RemovePeer command")
+        };
+        assert_eq!(ip, addr);
     }
 
     // ── RibService::get_best_route ────────────────────────────────────────────
@@ -2763,7 +3002,7 @@ mod tests {
     #[tokio::test]
     async fn test_watch_peers_empty_state_yields_end_initial() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
             .await
@@ -2781,7 +3020,7 @@ mod tests {
     async fn test_watch_peers_with_peer_yields_current_then_end_initial() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
-        let svc = PeerServiceImpl { state };
+        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
             .await
@@ -2804,6 +3043,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         let svc = PeerServiceImpl {
             state: Arc::clone(&state),
+            cmd_tx: noop_cmd_tx(),
         };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
@@ -3164,6 +3404,7 @@ mod tests {
             });
         let peer_svc = proto::peer_service_server::PeerServiceServer::new(PeerServiceImpl {
             state: Arc::clone(&state),
+            cmd_tx: noop_cmd_tx(),
         });
         let origination_svc = proto::origination_service_server::OriginationServiceServer::new(
             OriginationServiceImpl {

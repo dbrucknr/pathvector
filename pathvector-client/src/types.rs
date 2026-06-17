@@ -190,6 +190,32 @@ pub struct OriginateRouteParams {
     pub med: Option<u32>,
 }
 
+// ── Dynamic peer management ───────────────────────────────────────────────────
+
+/// Parameters for adding a new BGP peer at runtime.
+///
+/// Pass to [`DaemonClient::add_peer`].
+///
+/// [`DaemonClient::add_peer`]: crate::DaemonClient::add_peer
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct AddPeerParams {
+    /// IPv4 address of the new peer.
+    pub address: IpAddr,
+    /// Remote AS number.  Must not be 0 or 23456 (AS_TRANS, RFC 6793).
+    pub remote_as: u32,
+    /// TCP port to dial.  `None` defaults to 179.
+    pub port: Option<u16>,
+    /// Import-policy default action.  `None` means RFC 8212 default
+    /// (reject for eBGP, accept for iBGP).  `Some(true)` accepts all routes;
+    /// `Some(false)` rejects all routes by default.
+    pub import_default: Option<bool>,
+    /// Export-policy default action.  Same semantics as `import_default`.
+    pub export_default: Option<bool>,
+    /// RFC 2385 TCP MD5 authentication key.  `None` means no MD5.
+    pub md5_password: Option<String>,
+}
+
 // ── Streaming watch events ────────────────────────────────────────────────────
 
 /// Discriminant for events on the [`WatchRoutes`] stream.

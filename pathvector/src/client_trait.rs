@@ -231,6 +231,20 @@ pub(crate) mod tests {
             let events = self.peer_events.pop_front().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(events)))
         }
+
+        async fn add_peer(
+            &mut self,
+            _params: pathvector_client::types::AddPeerParams,
+        ) -> Result<(), pathvector_client::error::ClientError> {
+            Ok(())
+        }
+
+        async fn remove_peer(
+            &mut self,
+            _address: std::net::IpAddr,
+        ) -> Result<(), pathvector_client::error::ClientError> {
+            Ok(())
+        }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────

@@ -33,7 +33,7 @@ use proto::{
     origination_service_client::OriginationServiceClient, peer_service_client::PeerServiceClient,
     policy_service_client::PolicyServiceClient, rib_service_client::RibServiceClient,
 };
-use types::OriginateRouteParams;
+use types::{AddPeerParams, OriginateRouteParams};
 
 /// A heap-allocated, `Send` stream of fallible items.
 ///
