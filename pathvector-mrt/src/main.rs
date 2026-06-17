@@ -210,7 +210,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "  RIB convergence:{:.2}s  (announcement start to stable snapshot)",
         convergence_elapsed.as_secs_f64(),
     );
-    println!("  Total:          {:.2}s", total_elapsed.as_secs_f64(),);
+    println!("  Total:          {:.2}s", total_elapsed.as_secs_f64());
     println!(
         "  Unique attr sets: {}",
         fmt_count(result.unique_attr_sets as u64)
