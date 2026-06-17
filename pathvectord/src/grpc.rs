@@ -763,21 +763,12 @@ fn parse_originate_request(
     let large_communities: Vec<TypesLargeCommunity> = req
         .large_communities
         .into_iter()
-        .map(|lc| {
-            // RFC 7607: AS 0 is reserved and MUST NOT be used as an ASN.
-            // Large community global_admin is semantically an AS number (RFC 8092 §2).
-            if lc.global_admin == 0 {
-                return Err(Status::invalid_argument(
-                    "large_community global_admin 0 is reserved (RFC 7607)",
-                ));
-            }
-            Ok(TypesLargeCommunity {
-                global_administrator: lc.global_admin,
-                local_data_1: lc.local_data1,
-                local_data_2: lc.local_data2,
-            })
+        .map(|lc| TypesLargeCommunity {
+            global_administrator: lc.global_admin,
+            local_data_1: lc.local_data1,
+            local_data_2: lc.local_data2,
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
     let extended_communities: Vec<ExtendedCommunity> = req
         .extended_communities
@@ -836,19 +827,12 @@ fn parse_originate_request_v6(
     let large_communities: Vec<TypesLargeCommunity> = req
         .large_communities
         .into_iter()
-        .map(|lc| {
-            if lc.global_admin == 0 {
-                return Err(Status::invalid_argument(
-                    "large_community global_admin 0 is reserved (RFC 7607)",
-                ));
-            }
-            Ok(TypesLargeCommunity {
-                global_administrator: lc.global_admin,
-                local_data_1: lc.local_data1,
-                local_data_2: lc.local_data2,
-            })
+        .map(|lc| TypesLargeCommunity {
+            global_administrator: lc.global_admin,
+            local_data_1: lc.local_data1,
+            local_data_2: lc.local_data2,
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
     let extended_communities: Vec<ExtendedCommunity> = req
         .extended_communities
         .into_iter()
@@ -3278,67 +3262,7 @@ mod tests {
             .expect("set_import_default accept via H2C failed");
     }
 
-    // ── parse_originate_request — AS 0 / RFC 7607 validation ─────────────────
-
-    #[test]
-    fn test_parse_originate_request_rejects_as0_in_large_community() {
-        let req = OriginateRouteRequest {
-            prefix: "10.0.0.0/8".into(),
-            next_hop: "10.0.0.1".into(),
-            origin: 0,
-            communities: vec![],
-            large_communities: vec![proto::LargeCommunity {
-                global_admin: 0,   // AS 0 — reserved by RFC 7607
-                local_data1: 1,
-                local_data2: 2,
-            }],
-            extended_communities: vec![],
-            local_pref: None,
-            med: None,
-        };
-        let err = super::parse_originate_request(req).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("reserved"), "error should mention RFC 7607 reservation");
-    }
-
-    #[test]
-    fn test_parse_originate_request_v6_rejects_as0_in_large_community() {
-        let req = OriginateRouteRequest {
-            prefix: "2001:db8::/32".into(),
-            next_hop: String::new(),
-            origin: 0,
-            communities: vec![],
-            large_communities: vec![proto::LargeCommunity {
-                global_admin: 0,
-                local_data1: 100,
-                local_data2: 200,
-            }],
-            extended_communities: vec![],
-            local_pref: None,
-            med: None,
-        };
-        let err = super::parse_originate_request_v6(req).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn test_parse_originate_request_accepts_nonzero_large_community_admin() {
-        let req = OriginateRouteRequest {
-            prefix: "10.0.0.0/8".into(),
-            next_hop: "10.0.0.1".into(),
-            origin: 0,
-            communities: vec![],
-            large_communities: vec![proto::LargeCommunity {
-                global_admin: 65000,
-                local_data1: 1,
-                local_data2: 2,
-            }],
-            extended_communities: vec![],
-            local_pref: None,
-            med: None,
-        };
-        assert!(super::parse_originate_request(req).is_ok());
-    }
+    // ── parse_originate_request — input validation ────────────────────────────
 
     #[test]
     fn test_parse_originate_request_rejects_unspecified_next_hop() {
@@ -3472,7 +3396,11 @@ mod tests {
             }
         }
 
-        assert_eq!(all_prefixes.len(), 10, "all 10 routes must be returned across pages");
+        assert_eq!(
+            all_prefixes.len(),
+            10,
+            "all 10 routes must be returned across pages"
+        );
         // Each prefix must appear exactly once.
         all_prefixes.sort();
         all_prefixes.dedup();

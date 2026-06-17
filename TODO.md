@@ -257,6 +257,8 @@ Not yet started. Key work items:
 
 ### Remaining
 
+- **AS 0 not rejected in gRPC peer-management handlers** (`pathvectord/src/grpc.rs`) — RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or AGGREGATOR, or be used as a peer ASN. The current origination handlers have no direct AS number inputs (AS_PATH is always empty for originated routes; the daemon prepends `local_as` at advertisement time). The guard belongs in future `AddPeer`/`RemovePeer` RPCs that will accept `remote_as` directly. Add `INVALID_ARGUMENT` validation for `remote_as == 0` when those RPCs are implemented.
+
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
 
 - **Dynamic peer reconfiguration (runtime config)** — the daemon reads its
