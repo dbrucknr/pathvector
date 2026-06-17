@@ -115,8 +115,8 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
 
 /// Flat route table: `(prefix, peer) → Route`.
 ///
-/// Uses AHashMap (non-cryptographic hasher) — ~15–20% faster than std's
-/// SipHash for internal keys that are not attacker-controlled.
+/// Uses `AHashMap` (non-cryptographic hasher) — ~15–20% faster than std's
+/// `SipHash` for internal keys that are not attacker-controlled.
 type CandidateMap<A> = AHashMap<(Nlri<A>, PeerId), Route<A>>;
 
 /// Reverse index: prefix → list of peers that have a candidate for it.

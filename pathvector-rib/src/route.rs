@@ -76,7 +76,7 @@ pub struct Route<A: IpAddress> {
     /// The sequence of ASes this route has traversed.
     ///
     /// Stored as `Arc` so routes from the same UPDATE message can share a
-    /// single allocation. Use `Arc::make_mut` for CoW mutation.
+    /// single allocation. Use `Arc::make_mut` for copy-on-write mutation.
     pub as_path: Arc<AsPath>,
     /// The next-hop IP address for forwarding.
     pub next_hop: Option<NextHop>,
@@ -211,10 +211,11 @@ fn shared_empty_as_path() -> Arc<AsPath> {
 }
 
 fn now_unix_secs() -> u32 {
-    std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as u32
+        .as_secs();
+    u32::try_from(secs).unwrap_or(u32::MAX)
 }
 
 /// Builder for constructing a [`Route<A>`].

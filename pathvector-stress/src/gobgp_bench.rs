@@ -1,7 +1,7 @@
-/// GoBGP v4 benchmark phase.
+/// `GoBGP` v4 benchmark phase.
 ///
-/// Spawns gobgpd (v4.x), initialises it via StartBgp, then injects routes
-/// using AddPathStream (client-streaming).  Mirrors the pathvectord stress
+/// Spawns gobgpd (v4.x), initialises it via `StartBgp`, then injects routes
+/// using `AddPathStream` (client-streaming).  Mirrors the pathvectord stress
 /// harness for a direct, apples-to-apples comparison.
 use std::{
     process::Stdio,
@@ -88,7 +88,6 @@ fn make_path(n: u32, nexthop: &str) -> Path {
 
 async fn connect(pid: u32) -> Result<GoBgpServiceClient<Channel>, Box<dyn std::error::Error>> {
     let endpoint = format!("http://127.0.0.1:{GOBGP_GRPC_PORT}");
-    let mut started = false;
     for _ in 0..80 {
         if sample_rss_kb(pid) == 0 {
             return Err(format!(
@@ -103,26 +102,19 @@ async fn connect(pid: u32) -> Result<GoBgpServiceClient<Channel>, Box<dyn std::e
             .connect_lazy();
         let mut c = GoBgpServiceClient::new(ch);
 
-        if !started {
-            let req = StartBgpRequest {
-                global: Some(Global {
-                    asn: GOBGP_AS,
-                    router_id: GOBGP_ROUTER_ID.to_owned(),
-                    listen_port: -1, // gRPC only — no BGP listener needed
-                    ..Default::default()
-                }),
-            };
-            match c.start_bgp(req).await {
-                Ok(_) => {
-                    started = true;
-                    return Ok(c);
-                }
-                // Daemon already started (e.g. by a previous run that didn't clean up).
-                Err(s) if s.code() == tonic::Code::AlreadyExists => return Ok(c),
-                Err(_) => {}
-            }
-        } else {
-            return Ok(c);
+        let req = StartBgpRequest {
+            global: Some(Global {
+                asn: GOBGP_AS,
+                router_id: GOBGP_ROUTER_ID.to_owned(),
+                listen_port: -1, // gRPC only — no BGP listener needed
+                ..Default::default()
+            }),
+        };
+        match c.start_bgp(req).await {
+            Ok(_) => return Ok(c),
+            // Daemon already started (e.g. by a previous run that didn't clean up).
+            Err(s) if s.code() == tonic::Code::AlreadyExists => return Ok(c),
+            Err(_) => {}
         }
         sleep(Duration::from_millis(200)).await;
     }
