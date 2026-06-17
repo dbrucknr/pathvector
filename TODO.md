@@ -262,25 +262,21 @@ Not yet started. Key work items:
 
 ### Remaining
 
-- **AS 0 not rejected in gRPC peer-management handlers** (`pathvectord/src/grpc.rs`) — RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or AGGREGATOR, or be used as a peer ASN. The current origination handlers have no direct AS number inputs (AS_PATH is always empty for originated routes; the daemon prepends `local_as` at advertisement time). The guard belongs in future `AddPeer`/`RemovePeer` RPCs that will accept `remote_as` directly. Add `INVALID_ARGUMENT` validation for `remote_as == 0` when those RPCs are implemented.
-
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
 
-- **Dynamic peer reconfiguration (runtime config)** — the daemon reads its
-  configuration once at startup; adding, removing, or modifying a peer requires
-  a full restart. Real operators need to add/remove peers, change import/export
-  policy, and adjust timers without a restart (and without a BGP session reset
-  to unaffected peers). This is the primary operational gap separating pathvector
-  from a production-grade replacement for GoBGP or BIRD. Approaches to consider:
-  - **gRPC-driven live config**: extend `DaemonService` with `AddPeer` / `RemovePeer`
-    / `UpdatePeer` RPCs; `DaemonState` grows a mutable peer table; new sessions are
-    spawned on-the-fly, existing sessions receive a `Stop` if the peer is removed.
-  - **Config-file watch + partial reload**: inotify/kqueue watcher re-reads
-    `pathvectord.toml` on change and diffs against running state; only affected
-    sessions are touched.
-  Either approach requires the session spawn path to be callable at runtime, not
-  just during `build_daemon`. The gRPC approach is simpler to implement correctly
-  first; config-file reload can wrap it.
+- **Dynamic peer reconfiguration** ✅ done (2026-06-17) — `AddPeer` / `RemovePeer`
+  gRPC RPCs on `PeerService`; `DaemonCommand` enum bridges gRPC to event loop;
+  `pending_removal` HashSet sequences route withdrawal before state cleanup;
+  synthesized `Terminated` event handles the no-live-session edge case.
+  Remaining follow-on work:
+  - **`UpdatePeer`** — modify import/export policy or timers on an existing peer
+    without a session reset. Requires diffing old vs. new `PeerConfig` and only
+    touching what changed (e.g. policy update needs no session bounce; hold-timer
+    change requires NOTIFICATION + reconnect).
+  - **Config-file watch + partial reload** — inotify/kqueue watcher re-reads
+    `pathvectord.toml` on change and diffs against running state, then drives
+    `AddPeer` / `RemovePeer` / `UpdatePeer` commands. Can be implemented as a
+    thin wrapper around the gRPC command path now that it exists.
 
 - **IPv6 BGP transport** — TCP sessions over IPv6 (bind listener on `[::]:179`,
   dial peers at IPv6 addresses). Distinct from IPv6 NLRI (MP_REACH_NLRI over IPv4

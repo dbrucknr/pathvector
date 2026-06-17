@@ -1916,10 +1916,17 @@ async fn run_command_processor<H, F>(
                     .await
                     .remove(&IpAddr::V4(peer_ip));
 
-                // Send Cease NOTIFICATION; the session will then send Terminated.
-                let tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
-                if let Some(tx) = tx {
+                // Send Cease NOTIFICATION; the session will emit Terminated which
+                // triggers full state cleanup in the event loop.
+                let stop_tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
+                if let Some(tx) = stop_tx {
                     let _ = tx.send(SessionCommand::Stop).await;
+                } else {
+                    // No live session actor (peer is idle / between reconnects and the
+                    // stop sender was dropped).  Synthesize Terminated directly so the
+                    // event loop still performs the pending_removal cleanup path —
+                    // otherwise the peer would be stuck in pending_removal forever.
+                    let _ = event_tx.send((peer_ip, SessionEvent::Terminated)).await;
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
                 // remove_peer() is called by the event loop.
@@ -8449,6 +8456,80 @@ mod event_loop_tests {
         assert!(
             !s.pending_removal.contains(&peer_ip),
             "pending_removal entry must be cleaned up"
+        );
+    }
+
+    /// When RemovePeer is issued but the stop sender is absent (session already
+    /// exited between reconnects), the command processor must synthesize a
+    /// Terminated event so the pending_removal cleanup still runs.
+    #[tokio::test]
+    async fn remove_peer_synthesizes_terminated_when_no_stop_sender() {
+        // A SessionHandle stub that is never actually spawned — RemovePeer does
+        // not call spawn_fn, so we just need any type that satisfies the bound.
+        struct NeverSpawned;
+        impl SessionHandle for NeverSpawned {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+        }
+
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        // Build state with the peer but deliberately provide an empty stop_senders
+        // map — simulates the window where the session actor has exited and its
+        // stop sender has been dropped.
+        let (state, _rxs, _orig_stop) = make_state(&[(peer_ip, 65099)], 8);
+        let empty_stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+
+        let state_clone = Arc::clone(&state);
+        let stop_clone = Arc::clone(&empty_stop_senders);
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let event_tx_clone = event_tx.clone();
+
+        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+            cmd_rx,
+            state_clone,
+            stop_clone,
+            incoming,
+            event_tx_clone,
+            |_cfg| unreachable!("spawn_fn must not be called by RemovePeer"),
+            65001,
+            "1.2.3.4".parse().unwrap(),
+            180,
+            vec![],
+        ));
+
+        cmd_tx.send(DaemonCommand::RemovePeer(peer_ip)).await.unwrap();
+        drop(cmd_tx);
+        // Drop our own event_tx so the event loop terminates after draining.
+        drop(event_tx);
+
+        // The command processor should have synthesized Terminated; run the event
+        // loop to consume it and complete the cleanup.
+        run_event_loop(event_rx, Arc::clone(&state), empty_stop_senders, None).await;
+
+        let s = state.read().await;
+        assert!(
+            !s.adj_ribs_in.contains_key(&peer_ip),
+            "adj_ribs_in must be cleared after synthesized Terminated"
+        );
+        assert!(
+            !s.pending_removal.contains(&peer_ip),
+            "pending_removal entry must be cleared"
         );
     }
 
