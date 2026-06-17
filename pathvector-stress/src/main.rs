@@ -22,8 +22,15 @@ use tokio::{
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-/// Sizes for the three stress phases.
-const PHASES: &[(u32, &str)] = &[(10_000, "10k"), (100_000, "100k"), (500_000, "500k")];
+/// Sizes for the stress phases.
+const PHASES: &[(u32, &str)] = &[
+    (10_000, "10k"),
+    (100_000, "100k"),
+    (250_000, "250k"),
+    (500_000, "500k"),
+    (750_000, "750k"),
+    (900_000, "900k"),
+];
 
 /// Batch size for `originate_routes` / `withdraw_originated_routes` calls.
 const BATCH: usize = 500;

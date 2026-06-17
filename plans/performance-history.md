@@ -156,6 +156,32 @@ pathvector-types, saves ~8 bytes/route at the cost of API complexity.
 
 ---
 
+---
+
+## Commit: extended stress phases (250k, 750k, 900k)
+
+`git: (latest)`
+
+| Phase | pathvectord | GoBGP | pv/go memory |
+|---|---|---|---|
+| 10k | 12.7 MB | 51.4 MB | **0.25×** |
+| 100k | 67.8 MB | 127.8 MB | **0.53×** |
+| 250k | 233.7 MB | 248.2 MB | **0.94×** |
+| 500k | 461.5 MB | 443.9 MB | 1.04× |
+| 750k | 495.2 MB | 626.8 MB | **0.79×** |
+| 900k | 515.5 MB | 759.8 MB | **0.68×** |
+
+Speed (all phases): pathvectord ~2× faster than GoBGP.
+
+Note: phases are cumulative — each phase adds routes on top of the prior one.
+Times for 750k/900k reflect the *incremental* batch, not a full cold start.
+At 900k pathvectord uses 244 MB less than GoBGP; Go GC overhead compounds at scale.
+
+Crossover point: ~500k routes where per-route cost overtakes Go runtime overhead.
+Below 250k pathvectord uses less; above 500k pathvectord uses significantly less.
+
+---
+
 ## Next candidates
 
 | Candidate | Expected saving | Complexity |
