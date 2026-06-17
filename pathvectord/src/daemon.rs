@@ -82,10 +82,10 @@ pub(crate) struct RibSnapshot {
     pub(crate) loc_rib: LocRib<Ipv4Addr>,
     /// IPv6 Loc-RIB — best IPv6 routes, post-import-policy.
     pub(crate) loc_rib_v6: LocRib<Ipv6Addr>,
-    /// Locally originated routes (bypassed import policy; export policy applies).
-    pub(crate) originated_routes: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
-    /// IPv6 locally originated routes (bypassed import policy; export policy applies).
-    pub(crate) originated_routes_v6: HashMap<Nlri<Ipv6Addr>, Route<Ipv6Addr>>,
+    /// NLRI set for locally originated IPv4 routes; routes live in `loc_rib`.
+    pub(crate) originated_routes: HashSet<Nlri<Ipv4Addr>>,
+    /// NLRI set for locally originated IPv6 routes; routes live in `loc_rib_v6`.
+    pub(crate) originated_routes_v6: HashSet<Nlri<Ipv6Addr>>,
     /// Immutable after startup.
     pub(crate) local_as: u32,
     /// Immutable after startup.
@@ -309,8 +309,8 @@ impl DaemonState {
         let rib = Arc::new(RibSnapshot {
             loc_rib: LocRib::new(),
             loc_rib_v6: LocRib::new(),
-            originated_routes: HashMap::new(),
-            originated_routes_v6: HashMap::new(),
+            originated_routes: HashSet::new(),
+            originated_routes_v6: HashSet::new(),
             local_as,
             local_bgp_id,
             local_ipv6,
@@ -1283,7 +1283,7 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            self.rib_mut().originated_routes.insert(nlri, route.clone());
+            self.rib_mut().originated_routes.insert(nlri);
             self.rib_insert_v4(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             nlris.push(nlri);
             let _ = self.route_tx.send(proto::RouteEvent {
@@ -1310,9 +1310,7 @@ impl DaemonState {
         let mut nlris = Vec::with_capacity(routes.len());
         for route in routes {
             let nlri = route.nlri;
-            self.rib_mut()
-                .originated_routes_v6
-                .insert(nlri, route.clone());
+            self.rib_mut().originated_routes_v6.insert(nlri);
             let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
             if let Some(fm) = &self.fib_manager {
                 fm.apply_v6(fib_change);
@@ -6126,7 +6124,7 @@ mod tests {
             state
                 .rib
                 .originated_routes_v6
-                .contains_key(&nlri_v6("2001:db8::/32")),
+                .contains(&nlri_v6("2001:db8::/32")),
             "originated v6 route must be tracked in originated_routes_v6"
         );
     }
@@ -6168,7 +6166,7 @@ mod tests {
             !state
                 .rib
                 .originated_routes_v6
-                .contains_key(&nlri_v6("2001:db8:1::/48")),
+                .contains(&nlri_v6("2001:db8:1::/48")),
             "withdrawn v6 route must be removed from originated_routes_v6"
         );
     }

@@ -97,6 +97,24 @@ comparison.
 - Stage 3: pathvector convergence time and RSS within 2× of GoBGP (acceptable gap
   for a first implementation; identify root causes if larger)
 
+## Stage 1c — Post-optimization baseline (2026-06-17, M2 Max, release binary, branch rib-memory-opt)
+
+Three structural changes to `LocRib`:
+1. `best: RouteMap<A, PeerId>` — stores winning peer ID only (not a full Route clone)
+2. Flat `CandidateMap<A> = HashMap<(Nlri, PeerId), Route>` + `PeerIndex<A> = HashMap<Nlri, HashSet<PeerId>>` secondary index — eliminates ~320 B per-prefix nested HashMap allocation while keeping `recompute_best` O(k)
+3. `originated_routes: HashSet<Nlri>` in daemon — routes live in `loc_rib.candidates`; no duplicate copy
+
+| Phase | Peak RSS | Final RSS | vs previous |
+|---|---|---|---|
+| 10k  | 18.2 MB  | 18.2 MB  | −46% |
+| 100k | 91.9 MB  | 91.9 MB  | −61% |
+| 500k | 604.8 MB | 604.8 MB | −57% |
+
+~1.2 KB/route at 500k (down from ~2.6 KB/route). Remaining gap to GoBGP (~0.9 KB/route)
+is primarily route attribute storage — full clones per route vs GoBGP's interned path attributes.
+
+---
+
 ## Stage 1b — GoBGP 1:1 comparison (2026-06-17, M2 Max, release binary)
 
 Same harness, same batch size (500), same host.  GoBGP 4.5.0 vs pathvectord.
@@ -117,7 +135,7 @@ implementations, not just BGP processing — the API encoding (strongly-typed
 oneofs in GoBGP v4 vs. repeated messages in pathvector-client) may contribute.
 Worth profiling to separate RIB insertion cost from transport overhead.
 
-### Peak RSS
+### Peak RSS (pre-optimization, main branch)
 
 | Phase | pathvectord | GoBGP 4.5.0 |
 |---|---|---|
@@ -125,11 +143,9 @@ Worth profiling to separate RIB insertion cost from transport overhead.
 | 100k | 265.1 MB | 121.3 MB |
 | 500k | 1.4 GB   | 451.8 MB |
 
-**Takeaway:** GoBGP is dramatically more memory-efficient at scale (~3× at
-500k routes).  pathvectord's ~2.6 KB/route vs GoBGP's ~0.9 KB/route.  The
-likely causes: HashMap-backed `LocRib` with full attribute clones per route
-rather than interned/shared attributes.  Attribute interning is the highest-
-priority memory optimisation before a Stage 3 comparison.
+**After `rib-memory-opt` (see Stage 1c above):** 500k routes drop to 605 MB (~1.35× GoBGP).
+The remaining gap is route attribute storage — full clones per route vs GoBGP's interned
+path attributes. Attribute interning is the next memory optimisation before Stage 3.
 
 ## Known blockers
 

@@ -931,7 +931,10 @@ impl OriginationService for OriginationServiceImpl {
         let routes: Vec<Route> = snap
             .originated_routes
             .iter()
-            .map(|(&nlri, route)| route_to_proto(local_peer, nlri, route))
+            .filter_map(|&nlri| {
+                let route = snap.loc_rib.best(&nlri)?;
+                Some(route_to_proto(local_peer, nlri, route))
+            })
             .collect();
         Ok(Response::new(ListOriginatedRoutesResponse { routes }))
     }
@@ -2401,7 +2404,7 @@ mod tests {
 
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
-        assert!(s.rib.originated_routes.contains_key(&nlri));
+        assert!(s.rib.originated_routes.contains(&nlri));
     }
 
     #[tokio::test]
@@ -2506,7 +2509,7 @@ mod tests {
 
         let s = state.read().await;
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
-        assert!(!s.rib.originated_routes.contains_key(&nlri));
+        assert!(!s.rib.originated_routes.contains(&nlri));
     }
 
     #[tokio::test]
