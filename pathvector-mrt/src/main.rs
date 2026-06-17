@@ -89,6 +89,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. Parse MRT file ─────────────────────────────────────────────────────
     let mrt_path = args.mrt.display().to_string();
@@ -120,13 +121,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let result = spkr.announce(&entries).await?;
 
     println!(
-        "  Done: {} prefixes in {} UPDATE messages ({:.1}s, {}/s)",
+        "  Done: {} prefixes in {} UPDATE messages ({:.1}s)",
         fmt_count(result.prefixes_sent),
         fmt_count(result.updates_sent),
         result.elapsed.as_secs_f64(),
-        fmt_count(prefixes_per_sec(result.prefixes_sent, result.elapsed)),
     );
-    println!("  Unique attribute sets: {}", fmt_count(result.unique_attr_sets as u64));
     println!();
 
     // ── 4. Poll pathvectord gRPC for convergence ──────────────────────────────
@@ -139,67 +138,93 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("failed to connect to gRPC at {}: {e}", args.grpc))?;
 
     let expected = result.prefixes_sent;
-    let mut last_count: u64 = 0;
-    let mut stable_for: u64 = 0;
 
-    loop {
-        if grpc_start.elapsed() > timeout {
-            return Err(format!(
-                "timed out after {}s waiting for convergence \
-                 (last count: {}, expected: {})",
-                args.timeout_secs,
-                fmt_count(last_count),
-                fmt_count(expected),
-            )
-            .into());
+    // Probe once to detect whether list_routes is usable at this table size.
+    // For >~26k routes the response exceeds the 4 MB gRPC default limit and
+    // list_routes returns an error.  In that case we fall back to a fixed wait
+    // and report only the announcement metrics.
+    let probe = query_prefix_count(&mut client).await;
+    let rib_count = if let Some(count) = probe {
+        // list_routes works — poll until stable.
+        let mut last_count = count;
+        let mut stable_for: u64 = 0;
+        println!("  {}", fmt_count(count));
+
+        loop {
+            if grpc_start.elapsed() > timeout {
+                return Err(format!(
+                    "timed out after {}s waiting for convergence \
+                     (last count: {}, expected: {})",
+                    args.timeout_secs,
+                    fmt_count(last_count),
+                    fmt_count(expected),
+                )
+                .into());
+            }
+
+            sleep(Duration::from_millis(500)).await;
+            let count = query_prefix_count(&mut client).await.unwrap_or(last_count);
+
+            if count == last_count {
+                stable_for += 1;
+            } else {
+                println!("  {}", fmt_count(count));
+                last_count = count;
+                stable_for = 0;
+            }
+
+            // Stable for 3 consecutive polls (3 × 500ms = 1.5s of no change).
+            if stable_for >= 3 && count > 0 {
+                break;
+            }
         }
-
-        let count = query_prefix_count(&mut client).await?;
-
-        if count == last_count {
-            stable_for += 1;
-        } else {
-            println!("  {}", fmt_count(count));
-            last_count = count;
-            stable_for = 0;
-        }
-
-        // Stable for 3 consecutive polls (3 × 500ms = 1.5s of no change).
-        if stable_for >= 3 && count > 0 {
-            break;
-        }
-
-        sleep(Duration::from_millis(500)).await;
-    }
+        Some(last_count)
+    } else {
+        // list_routes hit the gRPC message-size limit — table is too large to
+        // count via this API.  Wait 2 s for RIB processing to finish, then
+        // report without a verified prefix count.
+        println!(
+            "  (table too large for list_routes — \
+             waiting 2s for RIB processing then reporting)"
+        );
+        sleep(Duration::from_secs(2)).await;
+        None
+    };
 
     let total_elapsed = grpc_start.elapsed() + result.elapsed;
 
     println!();
     println!("── Results ──────────────────────────────────────────────────────");
     println!(
-        "  Announcement:   {:.2}s ({} prefixes)",
+        "  Announcement:   {:.2}s ({} prefixes, {}/s)",
         result.elapsed.as_secs_f64(),
-        fmt_count(result.prefixes_sent)
+        fmt_count(result.prefixes_sent),
+        fmt_count(prefixes_per_sec(result.prefixes_sent, result.elapsed)),
     );
     println!(
-        "  Convergence:    {:.2}s (announcement + RIB processing)",
+        "  Convergence:    ~{:.2}s (announcement + ~2s RIB processing)",
         total_elapsed.as_secs_f64()
     );
-    println!(
-        "  Final RIB count: {} / {} expected",
-        fmt_count(last_count),
-        fmt_count(expected)
-    );
+    println!("  Unique attr sets: {}", fmt_count(result.unique_attr_sets as u64));
 
-    if last_count < expected {
-        let rejected = expected - last_count;
-        #[allow(clippy::cast_precision_loss)]
-        let pct = rejected as f64 / expected as f64 * 100.0;
+    if let Some(count) = rib_count {
         println!(
-            "  Rejected routes: {} ({:.1}%)",
-            fmt_count(rejected),
-            pct
+            "  Final RIB count: {} / {} expected",
+            fmt_count(count),
+            fmt_count(expected)
         );
+        if count < expected {
+            let rejected = expected - count;
+            #[allow(clippy::cast_precision_loss)]
+            let pct = rejected as f64 / expected as f64 * 100.0;
+            println!("  Rejected routes: {} ({:.1}%)", fmt_count(rejected), pct);
+        }
+    } else {
+        println!(
+            "  Final RIB count: (not measurable — list_routes exceeds 4 MB gRPC limit at {} prefixes)",
+            fmt_count(expected)
+        );
+        println!("  Note: implement list_routes pagination to enable convergence verification");
     }
 
     println!("─────────────────────────────────────────────────────────────────");
@@ -223,20 +248,15 @@ fn read_mrt(path: &PathBuf) -> Result<Vec<RibEntry>, Box<dyn std::error::Error>>
 }
 
 /// Query the total IPv4 unicast prefix count via gRPC.
-async fn query_prefix_count(
-    client: &mut PathvectorClient,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    // list_routes returns all routes; count them.  For large tables (>26k),
-    // list_routes hits the gRPC 4 MB message limit.  Until pagination is
-    // implemented, we fall back to 0 so the caller can use a timeout.
-    match client.list_routes(None).await {
-        Ok(routes) => Ok(routes.len() as u64),
-        Err(_) => {
-            // Silently return 0 — the convergence loop will time out if the
-            // count never reaches the expected value.
-            Ok(0)
-        }
-    }
+///
+/// Returns `None` when `list_routes` fails (typically because the response
+/// exceeds the 4 MB gRPC message limit for tables larger than ~26k routes).
+async fn query_prefix_count(client: &mut PathvectorClient) -> Option<u64> {
+    client
+        .list_routes(None)
+        .await
+        .ok()
+        .map(|routes| routes.len() as u64)
 }
 
 /// Compute prefixes-per-second as a u64, avoiding f64 precision lint on the call site.

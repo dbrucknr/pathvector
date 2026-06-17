@@ -214,15 +214,21 @@ stress-release:
 # prints convergence time, throughput, and final RIB prefix count.
 #
 # Usage:
-#   just mrt MRT=/path/to/latest-bview.gz
-mrt MRT='':
-    @[ -n "{{MRT}}" ] || { echo "Usage: just mrt MRT=/path/to/latest-bview.gz"; exit 1; }
+#   just mrt ./latest-bview.gz
+mrt mrt_file='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{mrt_file}}" ]; then
+        echo "Usage: just mrt ./latest-bview.gz"
+        exit 1
+    fi
     cargo build --release -p pathvectord -p pathvector-mrt
-    @echo "Starting pathvectord on port 1179..."
+    echo "Starting pathvectord on port 1179..."
     ./target/release/pathvectord e2e/fixtures/mrt-pathvectord.toml &
-    @PVDPID=$$! && sleep 1 && \
-        ./target/release/pathvector-mrt --mrt {{MRT}} --peer 127.0.0.1:1179 && \
-        kill $$PVDPID 2>/dev/null; exit 0
+    PVDPID=$!
+    trap "kill $PVDPID 2>/dev/null || true" EXIT
+    sleep 1
+    ./target/release/pathvector-mrt --mrt "{{mrt_file}}" --peer 127.0.0.1:1179
 
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
