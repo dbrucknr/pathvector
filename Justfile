@@ -203,6 +203,27 @@ stress-release:
     cargo build --release -p pathvectord -p pathvector-stress
     ./target/release/stress
 
+# ── MRT replay ───────────────────────────────────────────────────────────────
+
+# Replay an MRT TABLE_DUMP_V2 file against a running pathvectord (Stage 2 benchmark).
+#
+# Requires an MRT file (RouteViews or RIPE RIS RIB dump).  Download one with:
+#   curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
+#
+# Starts pathvectord on port 1179 (non-privileged) and the MRT replayer, then
+# prints convergence time, throughput, and final RIB prefix count.
+#
+# Usage:
+#   just mrt MRT=/path/to/latest-bview.gz
+mrt MRT='':
+    @[ -n "{{MRT}}" ] || { echo "Usage: just mrt MRT=/path/to/latest-bview.gz"; exit 1; }
+    cargo build --release -p pathvectord -p pathvector-mrt
+    @echo "Starting pathvectord on port 1179..."
+    ./target/release/pathvectord e2e/fixtures/mrt-pathvectord.toml &
+    @PVDPID=$$! && sleep 1 && \
+        ./target/release/pathvector-mrt --mrt {{MRT}} --peer 127.0.0.1:1179 && \
+        kill $$PVDPID 2>/dev/null; exit 0
+
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
 # Compile all fuzz targets (no fuzzing — fast compile check)
