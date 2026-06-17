@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, sync::Arc};
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_policy::BgpRoute;
@@ -48,7 +48,10 @@ pub struct Route<A: IpAddress> {
     /// How this route was introduced into BGP.
     pub origin: Origin,
     /// The sequence of ASes this route has traversed.
-    pub as_path: AsPath,
+    ///
+    /// Stored as `Arc` so routes from the same UPDATE message can share a
+    /// single allocation. Use `Arc::make_mut` for CoW mutation.
+    pub as_path: Arc<AsPath>,
     /// The next-hop IP address for forwarding.
     pub next_hop: Option<NextHop>,
     /// Internal preference (iBGP only; stripped on eBGP export).
@@ -103,7 +106,7 @@ impl<A: IpAddress> BgpRoute for Route<A> {
         self.med
     }
     fn as_path(&self) -> &AsPath {
-        &self.as_path
+        &self.as_path  // Arc<AsPath> derefs to AsPath
     }
     fn communities(&self) -> &[Community] {
         &self.communities
@@ -128,7 +131,7 @@ impl<A: IpAddress> BgpRoute for Route<A> {
         self.med = med;
     }
     fn set_as_path(&mut self, path: AsPath) {
-        self.as_path = path;
+        self.as_path = Arc::new(path);
     }
     fn set_communities(&mut self, c: Vec<Community>) {
         self.communities = c;
@@ -173,7 +176,7 @@ impl<A: IpAddress> BgpRoute for Route<A> {
 pub struct RouteBuilder<A: IpAddress> {
     nlri: Nlri<A>,
     origin: Origin,
-    as_path: AsPath,
+    as_path: Arc<AsPath>,
     next_hop: Option<NextHop>,
     local_pref: Option<LocalPref>,
     med: Option<Med>,
@@ -194,6 +197,29 @@ impl<A: IpAddress> RouteBuilder<A> {
     /// traversed.
     #[must_use]
     pub fn new(nlri: Nlri<A>, origin: Origin, as_path: AsPath) -> Self {
+        Self {
+            nlri,
+            origin,
+            as_path: Arc::new(as_path),
+            next_hop: None,
+            local_pref: None,
+            med: None,
+            communities: Vec::new(),
+            large_communities: Vec::new(),
+            extended_communities: Vec::new(),
+            atomic_aggregate: false,
+            aggregator: None,
+            peer_type: PeerType::External,
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Creates a builder sharing an already-allocated `AsPath`.
+    ///
+    /// Use this in the UPDATE decode loop to share one `Arc<AsPath>` across all
+    /// routes in the same UPDATE message instead of allocating per-NLRI.
+    #[must_use]
+    pub fn with_shared_as_path(nlri: Nlri<A>, origin: Origin, as_path: Arc<AsPath>) -> Self {
         Self {
             nlri,
             origin,
@@ -283,7 +309,7 @@ impl<A: IpAddress> RouteBuilder<A> {
         Route {
             nlri: self.nlri,
             origin: self.origin,
-            as_path: self.as_path,
+            as_path: self.as_path, // already Arc<AsPath>
             next_hop: self.next_hop,
             local_pref: self.local_pref,
             med: self.med,

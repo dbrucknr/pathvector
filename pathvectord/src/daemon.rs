@@ -6,7 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::Arc, // also used for Arc<AsPath> sharing in UPDATE decode
     time::Instant,
 };
 
@@ -2269,6 +2269,9 @@ fn handle_update(
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
+    // Wrap once; every route in this UPDATE shares the same Arc<AsPath>.
+    let shared_as_path = Arc::new(as_path);
+
     let skip_announces = has_loop || has_as_zero;
     let all_announced = msg
         .announced
@@ -2295,7 +2298,8 @@ fn handle_update(
             continue;
         }
 
-        let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+        let mut builder = RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
+            .peer_type(peer_type);
         if let Some(nh) = nh {
             builder = builder.next_hop(nh);
         }
@@ -2387,7 +2391,8 @@ fn handle_update(
             rejected_v6 += 1;
             continue;
         }
-        let mut builder = RouteBuilder::new(nlri, origin, as_path.clone()).peer_type(peer_type);
+        let mut builder = RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
+            .peer_type(peer_type);
         builder = builder.next_hop(nh);
         if let Some(lp) = local_pref {
             builder = builder.local_pref(lp);

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::{Nlri, PeerType};
@@ -140,7 +140,7 @@ impl<A: IpAddress> AdjRibOut<A> {
 
         let mut route = route;
         if self.peer_type == PeerType::External {
-            route.as_path = route.as_path.strip_confed_segments();
+            route.as_path = Arc::new(route.as_path.strip_confed_segments());
         }
 
         InsertOutcome::Accepted(self.routes.insert(route.nlri, route))

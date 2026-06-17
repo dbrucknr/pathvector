@@ -97,6 +97,25 @@ comparison.
 - Stage 3: pathvector convergence time and RSS within 2× of GoBGP (acceptable gap
   for a first implementation; identify root causes if larger)
 
+## Stage 1d — Arc<AsPath> interning (2026-06-17, M2 Max, release binary, branch rib-memory-opt)
+
+`Route.as_path` changed from owned `AsPath` to `Arc<AsPath>`. Routes from the
+same BGP UPDATE message now share one allocation via `RouteBuilder::with_shared_as_path`.
+`prepare_outbound` uses `Arc::make_mut` for CoW prepend.
+
+Struct-layout saving: `Vec<AsPathSegment>` (24 B inline) → `Arc<AsPath>` (8 B pointer) =
+16 bytes/route = ~8 MB at 500k routes.  Real sharing benefit (many NLRIs per UPDATE with
+identical non-trivial AS paths) is not captured by the gRPC origination test since those
+routes carry empty AS paths; it will be visible in Stage 2 MRT-replay tests.
+
+| Phase | Peak RSS | vs Stage 1c |
+|---|---|---|
+| 10k  | 18.2 MB  | ≈ same |
+| 100k | 94.4 MB  | +2.5 MB (noise) |
+| 500k | 597.6 MB | −7 MB  |
+
+---
+
 ## Stage 1c — Post-optimization baseline (2026-06-17, M2 Max, release binary, branch rib-memory-opt)
 
 Three structural changes to `LocRib`:

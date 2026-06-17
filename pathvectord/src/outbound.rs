@@ -39,7 +39,7 @@ pub(crate) fn route_to_attributes(
 ) -> Vec<PathAttribute> {
     let is_ebgp = peer_type == PeerType::External;
     let (wire_as_path, as4_path) = if peer_four_byte {
-        (route.as_path.clone(), None)
+        ((*route.as_path).clone(), None)
     } else {
         let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
         (d, orig)
@@ -480,7 +480,7 @@ pub(crate) fn route_v6_to_attributes(
 ) -> (Vec<PathAttribute>, MpReachNlri) {
     let is_ebgp = peer_type == PeerType::External;
     let (wire_as_path, as4_path) = if peer_four_byte {
-        (route.as_path.clone(), None)
+        ((*route.as_path).clone(), None)
     } else {
         let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
         (d, orig)
