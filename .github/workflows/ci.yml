@@ -98,7 +98,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: e2e/Dockerfile
+          file: pathvector-e2e/Dockerfile
           load: true
           tags: pathvector-gobgpd-test:latest
           build-args: |
@@ -111,7 +111,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: e2e/Dockerfile.pathvectord
+          file: pathvector-e2e/Dockerfile.pathvectord
           load: true
           tags: pathvector-e2e:latest
           cache-from: type=gha,scope=pathvectord
@@ -121,7 +121,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: e2e/Dockerfile.bird
+          file: pathvector-e2e/Dockerfile.bird
           load: true
           tags: pathvector-bird-test:latest
           cache-from: type=gha,scope=bird
@@ -131,7 +131,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: e2e/Dockerfile.frr
+          file: pathvector-e2e/Dockerfile.frr
           load: true
           tags: pathvector-frr-test:latest
           cache-from: type=gha,scope=frr
@@ -169,7 +169,7 @@ jobs:
   #       uses: actions/upload-artifact@v4
   #       with:
   #         name: fuzz-crashes
-  #         path: fuzz/artifacts/
+  #         path: pathvector-fuzz/artifacts/
   #         if-no-files-found: ignore
 
   coverage:

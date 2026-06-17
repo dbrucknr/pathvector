@@ -8,7 +8,7 @@ members = [
     "pathvector-client",
     "pathvectord",
     "pathvector",
-    "e2e",
+    "pathvector-e2e",
     "pathvector-sys",
     "pathvector-stress",
     "pathvector-mrt",

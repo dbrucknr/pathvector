@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! # 1. Start pathvectord with mrt-pathvectord.toml (peer = 127.0.0.1, AS 65001)
-//! pathvectord e2e/fixtures/mrt-pathvectord.toml &
+//! pathvectord pathvector-e2e/fixtures/mrt-pathvectord.toml &
 //!
 //! # 2. Run the replayer (accepts .mrt or .mrt.gz)
 //! pathvector-mrt --mrt /path/to/latest-bview.gz

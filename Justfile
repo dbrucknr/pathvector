@@ -123,7 +123,7 @@ _build-gobgpd-image:
     docker build \
         --build-arg TARGETARCH="${ARCH}" \
         --build-arg GOBGP_VERSION={{gobgp-version}} \
-        -f e2e/Dockerfile \
+        -f pathvector-e2e/Dockerfile \
         -t pathvector-gobgpd-test:latest \
         .
 
@@ -133,7 +133,7 @@ _build-pathvectord-image:
     set -euo pipefail
     echo "Building pathvector-e2e:latest..."
     docker build \
-        -f e2e/Dockerfile.pathvectord \
+        -f pathvector-e2e/Dockerfile.pathvectord \
         -t pathvector-e2e:latest \
         .
 
@@ -143,18 +143,18 @@ _build-bird-image:
     set -euo pipefail
     echo "Building pathvector-bird-test:latest..."
     docker build \
-        -f e2e/Dockerfile.bird \
+        -f pathvector-e2e/Dockerfile.bird \
         -t pathvector-bird-test:latest \
-        e2e/
+        pathvector-e2e/
 
 _build-frr-image:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building pathvector-frr-test:latest..."
     docker build \
-        -f e2e/Dockerfile.frr \
+        -f pathvector-e2e/Dockerfile.frr \
         -t pathvector-frr-test:latest \
-        e2e/
+        pathvector-e2e/
 
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
 e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image
@@ -172,15 +172,15 @@ e2e-up:
     #!/usr/bin/env bash
     set -euo pipefail
     ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
-        docker compose -f e2e/docker-compose.yml up --build -d
+        docker compose -f pathvector-e2e/docker-compose.yml up --build -d
 
 # Stop and remove the compose dev environment.
 e2e-down:
-    docker compose -f e2e/docker-compose.yml down
+    docker compose -f pathvector-e2e/docker-compose.yml down
 
 # Stream logs from the compose dev environment.
 e2e-logs:
-    docker compose -f e2e/docker-compose.yml logs -f
+    docker compose -f pathvector-e2e/docker-compose.yml logs -f
 
 # ── Stress ────────────────────────────────────────────────────────────────────
 
@@ -227,7 +227,7 @@ mrt mrt_file='':
     pkill -x pathvectord 2>/dev/null || true
     sleep 0.3
     echo "Starting pathvectord on port 1179..."
-    ./target/release/pathvectord e2e/fixtures/mrt-pathvectord.toml &
+    ./target/release/pathvectord pathvector-e2e/fixtures/mrt-pathvectord.toml &
     PVDPID=$!
     trap "kill $PVDPID 2>/dev/null || true" EXIT
     sleep 1
@@ -241,13 +241,13 @@ fuzz-build:
 
 # Smoke-run every target for 60 s each — used by CI
 fuzz-smoke: fuzz-build
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_framing fuzz/corpus/session_framing -- -max_total_time=60
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_message fuzz/corpus/session_message -- -max_total_time=60
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_framing pathvector-fuzz/corpus/session_framing -- -max_total_time=60
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_message pathvector-fuzz/corpus/session_message -- -max_total_time=60
 
 # Extended fuzzing of the framing decode path — runs until Ctrl-C, grows corpus
-fuzz-framing corpus="fuzz/corpus/session_framing":
+fuzz-framing corpus="pathvector-fuzz/corpus/session_framing":
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_framing {{corpus}}
 
 # Extended fuzzing of the message decode path — runs until Ctrl-C, grows corpus
-fuzz-message corpus="fuzz/corpus/session_message":
+fuzz-message corpus="pathvector-fuzz/corpus/session_message":
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_message {{corpus}}
