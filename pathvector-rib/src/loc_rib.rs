@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
-
+use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
 use routemap::RouteMap;
+use smallvec::SmallVec;
 
 use crate::{
     best_path::select_best_with_oracle, oracle::NextHopOracle, peer::PeerId, route::Route,
@@ -115,17 +115,16 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
 
 /// Flat route table: `(prefix, peer) → Route`.
 ///
-/// Previously `HashMap<Nlri, HashMap<PeerId, Route>>` — the nested structure
-/// allocated a separate heap object per prefix for the inner map, adding ~320 B
-/// of overhead per prefix regardless of how many peers advertise it.  A flat
-/// key eliminates that per-prefix allocation.
-type CandidateMap<A> = HashMap<(Nlri<A>, PeerId), Route<A>>;
+/// Uses AHashMap (non-cryptographic hasher) — ~15–20% faster than std's
+/// SipHash for internal keys that are not attacker-controlled.
+type CandidateMap<A> = AHashMap<(Nlri<A>, PeerId), Route<A>>;
 
-/// Reverse index: prefix → set of peers that have a candidate for it.
+/// Reverse index: prefix → list of peers that have a candidate for it.
 ///
-/// Kept in sync with `candidates` so `recompute_best` is O(k) per prefix
-/// (k = number of peers) rather than O(N) over the whole flat map.
-type PeerIndex<A> = HashMap<Nlri<A>, HashSet<PeerId>>;
+/// `SmallVec<[PeerId; 4]>` stores up to 4 peers inline (no heap allocation)
+/// which covers the vast majority of real-world prefixes (1–8 eBGP peers).
+/// Kept in sync with `candidates` so `recompute_best` is O(k) per prefix.
+type PeerIndex<A> = AHashMap<Nlri<A>, SmallVec<[PeerId; 4]>>;
 
 #[derive(Clone)]
 pub struct LocRib<A: IpAddress> {
@@ -144,8 +143,8 @@ impl<A: IpAddress> LocRib<A> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            candidates: HashMap::new(),
-            peer_index: HashMap::new(),
+            candidates: AHashMap::new(),
+            peer_index: AHashMap::new(),
             best: RouteMap::new(),
         }
     }
@@ -171,7 +170,10 @@ impl<A: IpAddress> LocRib<A> {
         let old_best_peer = self.best.get(nlri.prefix()).copied();
 
         self.candidates.insert((nlri, peer), route);
-        self.peer_index.entry(nlri).or_default().insert(peer);
+        let peers = self.peer_index.entry(nlri).or_default();
+        if !peers.contains(&peer) {
+            peers.push(peer);
+        }
         self.recompute_best(nlri, oracle);
 
         match self.best.get(nlri.prefix()).copied() {
@@ -218,7 +220,7 @@ impl<A: IpAddress> LocRib<A> {
         }
 
         let has_remaining = if let Some(peers) = self.peer_index.get_mut(nlri) {
-            peers.remove(peer);
+            peers.retain(|p| p != peer);
             !peers.is_empty()
         } else {
             false
@@ -315,9 +317,9 @@ impl<A: IpAddress> LocRib<A> {
     ///
     /// Useful for diagnostics and "show bgp detail" output.
     #[must_use]
-    pub fn candidates(&self, nlri: &Nlri<A>) -> Option<HashMap<PeerId, &Route<A>>> {
+    pub fn candidates(&self, nlri: &Nlri<A>) -> Option<AHashMap<PeerId, &Route<A>>> {
         let peers = self.peer_index.get(nlri)?;
-        let routes: HashMap<PeerId, &Route<A>> = peers
+        let routes: AHashMap<PeerId, &Route<A>> = peers
             .iter()
             .filter_map(|p| Some((*p, self.candidates.get(&(*nlri, *p))?)))
             .collect();
@@ -366,8 +368,8 @@ impl<A: IpAddress> LocRib<A> {
 
     fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
         // Use peer_index for O(k) lookup instead of scanning the full flat map.
-        // Clone routes into a temp map — k is typically 1–8, negligible cost.
-        let peer_map: HashMap<PeerId, Route<A>> = self
+        // Clone routes into a temp AHashMap — k is typically 1–8, negligible cost.
+        let peer_map: AHashMap<PeerId, Route<A>> = self
             .peer_index
             .get(&nlri)
             .into_iter()
@@ -595,7 +597,7 @@ mod tests {
         assert!(rib.best(&n).is_some());
 
         rib.candidates.remove(&(n, peer(1)));
-        rib.peer_index.get_mut(&n).unwrap().remove(&peer(1));
+        rib.peer_index.get_mut(&n).unwrap().retain(|p| *p != peer(1));
         rib.recompute_best(n, &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());

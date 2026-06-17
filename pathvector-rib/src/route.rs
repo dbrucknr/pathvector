@@ -91,12 +91,13 @@ pub struct Route<A: IpAddress> {
     /// split horizon enforcement. Defaults to [`PeerType::External`] when
     /// built with [`RouteBuilder`] without an explicit call to `.peer_type()`.
     pub peer_type: PeerType,
-    /// When this route was first received or created.
+    /// Unix timestamp (seconds) when this route was first received or created.
     ///
-    /// Used for best-path step 9 (RFC 4271 §9.1): when two eBGP routes are
-    /// otherwise equal, prefer the one received first (oldest). Set
-    /// automatically to `Instant::now()` by [`RouteBuilder::build`].
-    pub received_at: std::time::Instant,
+    /// Stored as `u32` (saves 12 bytes vs `Instant`). Used for best-path
+    /// step 9 (RFC 4271 §9.1): when two eBGP routes are otherwise equal,
+    /// prefer the one received first (smaller value). Set automatically by
+    /// [`RouteBuilder::build`]. Wraps in year 2106.
+    pub received_at: u32,
     /// Infrequently-set attributes: communities, cluster list, aggregator, etc.
     ///
     /// `None` when all rare attributes are at their default values, saving
@@ -198,6 +199,13 @@ impl<A: IpAddress> BgpRoute for Route<A> {
     }
 }
 
+fn now_unix_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
+}
+
 /// Builder for constructing a [`Route<A>`].
 ///
 /// Only `nlri`, `origin`, and `as_path` are mandatory — all other attributes
@@ -232,7 +240,7 @@ pub struct RouteBuilder<A: IpAddress> {
     local_pref: Option<LocalPref>,
     med: Option<Med>,
     peer_type: PeerType,
-    received_at: std::time::Instant,
+    received_at: u32,
     rare: Option<Box<RareAttrs>>,
 }
 
@@ -252,7 +260,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             local_pref: None,
             med: None,
             peer_type: PeerType::External,
-            received_at: std::time::Instant::now(),
+            received_at: now_unix_secs(),
             rare: None,
         }
     }
@@ -271,7 +279,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             local_pref: None,
             med: None,
             peer_type: PeerType::External,
-            received_at: std::time::Instant::now(),
+            received_at: now_unix_secs(),
             rare: None,
         }
     }
@@ -518,4 +526,5 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original, cloned);
     }
+
 }
