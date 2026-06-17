@@ -120,21 +120,27 @@ stabilise (adding streaming RPCs will change the generated types).
 
 ## pathvector-rib
 
-### Best-path selection — missing decision steps
+### Best-path selection — decision steps
 
-RFC 4271 §9.1 defines a 10-step decision process. The current implementation
-covers steps 2, 3/7, 4, 5, 6, 9, and 10 fully. The two remaining steps require
-external information not available at the RIB layer:
+All 10 RFC 4271 §9.1 decision steps are implemented. Steps 1 and 8 require live
+FIB data and are active only on Linux where `KernelFib` populates the snapshot via
+rtnetlink. On macOS (development) the daemon falls back to `AlwaysReachable`.
 
 | Step | Criterion | Status |
 |---|---|---|
-| 1 | Prefer routes with a reachable next-hop | ⚠️ `NextHopOracle` trait exists; `AlwaysReachable` stub — needs FIB integration |
-| 8 | Prefer route with lowest IGP metric to next-hop | ⚠️ `NextHopOracle::igp_metric` wired into decision process; stub returns `None` — needs FIB |
+| 1 | Prefer routes with a reachable next-hop | ✅ `DaemonOracle` + `KernelFib` on Linux; `AlwaysReachable` on macOS |
+| 2 | Highest LOCAL_PREF | ✅ |
+| 3/7 | Local origin > eBGP > iBGP | ✅ `PeerType` ordering |
+| 4 | Shortest AS_PATH | ✅ |
+| 5 | Lowest ORIGIN | ✅ |
+| 6 | Lowest MED (same neighboring AS only) | ✅ Group-based selection, insertion-order stable |
+| 8 | Lowest IGP metric to next-hop | ✅ `KernelOracle::igp_metric` on Linux; skipped on macOS |
+| 9 | Oldest eBGP route | ✅ |
+| 10 | Lowest peer router-id | ✅ |
 
-Steps 3 (locally-originated routes prefer over learned) and 7 (eBGP over iBGP) are
-**done** — both are handled by the `PeerType` ordering (`Local > External > Internal`)
-in `select_best`. When a route is originated via `originate_route`, it is tagged
-`PeerType::Local` in `grpc.rs` and wins at step 3/7 against any peer-learned route.
+Tested via `test_on_fib_change_withdraws_when_next_hop_goes_down`,
+`test_on_fib_change_reannounces_when_next_hop_recovers`, and
+`test_on_fib_change_noop_when_nothing_changes` in `daemon.rs`.
 
 ### Trait-based RIB and policy seams
 
