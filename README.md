@@ -147,12 +147,12 @@ Measured by replaying a real RIPE RIS full-table MRT dump (`latest-bview.gz`, 1.
 | Metric | Result |
 |---|---|
 | Prefixes announced | 1,133,510 |
-| Announcement time | 3.26 s |
-| **Announcement throughput** | **347,532 prefixes/sec** |
+| Announcement time | 3.30 s |
+| **Announcement throughput** | **343,920 prefixes/sec** |
 | Unique path-attribute sets | 168,840 |
-| RIB convergence time | 6.78 s |
+| **RIB convergence time** | **3.70 s** |
 | Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 (99.99%) |
-| Total (announce + converge) | 10.04 s |
+| **Total (announce + converge)** | **7.00 s** |
 
 Announcement throughput is on par with BIRD 2.x (~100–300k prefixes/sec). RIB convergence of 6.78s for a full internet table falls between BIRD (2–5s, written in C) and GoBGP (~15–30s). The 95 rejected prefixes are expected: the MRT dump records multiple peer perspectives per prefix and only the best-path winner enters Loc-RIB.
 
