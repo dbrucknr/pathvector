@@ -266,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rss_post_withdraw = sample_rss_kb(pid);
     let reclaimed_kb = rss_pre_withdraw.saturating_sub(rss_post_withdraw);
 
-    println!("  Before:    {}", fmt_kb(rss_pre_withdraw),);
+    println!("  Before:    {}", fmt_kb(rss_pre_withdraw));
     println!(
         "  After:     {}  ({:.2}s)",
         fmt_kb(rss_post_withdraw),
@@ -364,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gobgp_results = gobgp_bench::run(PHASES, BATCH).await?;
 
-    println!("{:<8}  {:>10}  {:>10}", "Phase", "Time (s)", "Peak RSS",);
+    println!("{:<8}  {:>10}  {:>10}", "Phase", "Time (s)", "Peak RSS");
     println!("{}", "-".repeat(32));
     for r in &gobgp_results {
         println!(
@@ -396,7 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("── Side-by-side: peak RSS ───────────────────────────────────────────");
-    println!("{:<8}  {:>14}  {:>14}", "Phase", "pathvectord", "GoBGP",);
+    println!("{:<8}  {:>14}  {:>14}", "Phase", "pathvectord", "GoBGP");
     println!("{}", "-".repeat(40));
     for (pv, go) in pv_phase_results.iter().zip(gobgp_results.iter()) {
         println!("{:<8}  {:>14}  {:>14}", pv.label, pv.peak_rss, go.peak_rss);
