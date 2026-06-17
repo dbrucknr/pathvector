@@ -160,7 +160,7 @@ pathvector-sys
 docker pull ghcr.io/dbrucknr/pathvector:latest
 ```
 
-Minimal `docker-compose.yml` peering pathvectord with GoBGP:
+Minimal `docker-compose.yml` for running pathvectord:
 
 ```yaml
 services:
@@ -176,11 +176,6 @@ services:
     networks:
       - bgp
 
-  gobgp:
-    image: ghcr.io/dbrucknr/pathvector-gobgpd-test:latest
-    networks:
-      - bgp
-
 networks:
   bgp:
     driver: bridge
@@ -188,6 +183,11 @@ networks:
 
 > `NET_ADMIN` is only needed for FIB (kernel routing table) updates. Omit it if
 > you are using pathvectord purely as a route collector or policy engine.
+
+> The `pathvector-gobgpd-test` image used in the e2e test suite is built locally
+> during CI and is not published. To peer with GoBGP, install it directly
+> (`go install github.com/osrg/gobgp/v4/cmd/gobgpd@v4.6.0`) or use
+> `just e2e-up` which builds the test image locally.
 
 ---
 

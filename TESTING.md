@@ -471,8 +471,8 @@ the `pathvectord` container. Routes are injected via `docker exec <id> gobgp glo
 
 | Image | Built from | Purpose |
 |---|---|---|
-| `pathvector-gobgpd-test:latest` | `e2e/Dockerfile` | GoBGP 4.6.0 on Alpine; includes `gobgp` CLI |
-| `pathvector-e2e:latest` | `e2e/Dockerfile.pathvectord` | Multi-stage Rust build; debian:bookworm-slim runtime |
+| `pathvector-gobgpd-test:latest` | `pathvector-e2e/Dockerfile` | GoBGP 4.6.0 on Alpine; includes `gobgp` CLI |
+| `pathvector-e2e:latest` | `pathvector-e2e/Dockerfile.pathvectord` | Multi-stage Rust build; debian:bookworm-slim runtime |
 
 Both are Linux/arm64 on Apple Silicon and Linux/amd64 on x86 CI runners. The GoBGP
 version is pinned in the `Justfile` (`gobgp-version := "4.6.0"`).
