@@ -323,7 +323,11 @@ impl<A: IpAddress> LocRib<A> {
             .iter()
             .filter_map(|p| Some((*p, self.candidates.get(&(*nlri, *p))?)))
             .collect();
-        if routes.is_empty() { None } else { Some(routes) }
+        if routes.is_empty() {
+            None
+        } else {
+            Some(routes)
+        }
     }
 
     /// Returns the number of unique prefixes with at least one candidate.
@@ -597,7 +601,10 @@ mod tests {
         assert!(rib.best(&n).is_some());
 
         rib.candidates.remove(&(n, peer(1)));
-        rib.peer_index.get_mut(&n).unwrap().retain(|p| *p != peer(1));
+        rib.peer_index
+            .get_mut(&n)
+            .unwrap()
+            .retain(|p| *p != peer(1));
         rib.recompute_best(n, &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());

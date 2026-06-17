@@ -65,10 +65,14 @@ pub(crate) fn route_to_attributes(
         attrs.push(PathAttribute::Communities(rare.communities.clone()));
     }
     if !rare.large_communities.is_empty() {
-        attrs.push(PathAttribute::LargeCommunities(rare.large_communities.clone()));
+        attrs.push(PathAttribute::LargeCommunities(
+            rare.large_communities.clone(),
+        ));
     }
     if !rare.extended_communities.is_empty() {
-        attrs.push(PathAttribute::ExtendedCommunities(rare.extended_communities.clone()));
+        attrs.push(PathAttribute::ExtendedCommunities(
+            rare.extended_communities.clone(),
+        ));
     }
     if rare.atomic_aggregate {
         attrs.push(PathAttribute::AtomicAggregate);
@@ -500,10 +504,14 @@ pub(crate) fn route_v6_to_attributes(
         attrs.push(PathAttribute::Communities(rare.communities.clone()));
     }
     if !rare.large_communities.is_empty() {
-        attrs.push(PathAttribute::LargeCommunities(rare.large_communities.clone()));
+        attrs.push(PathAttribute::LargeCommunities(
+            rare.large_communities.clone(),
+        ));
     }
     if !rare.extended_communities.is_empty() {
-        attrs.push(PathAttribute::ExtendedCommunities(rare.extended_communities.clone()));
+        attrs.push(PathAttribute::ExtendedCommunities(
+            rare.extended_communities.clone(),
+        ));
     }
     if rare.atomic_aggregate {
         attrs.push(PathAttribute::AtomicAggregate);

@@ -175,21 +175,27 @@ impl<A: IpAddress> BgpRoute for Route<A> {
     }
     fn set_communities(&mut self, c: Vec<Community>) {
         if c.is_empty() {
-            if let Some(r) = &mut self.rare { r.communities.clear(); }
+            if let Some(r) = &mut self.rare {
+                r.communities.clear();
+            }
         } else {
             self.rare_mut().communities = c;
         }
     }
     fn set_large_communities(&mut self, c: Vec<LargeCommunity>) {
         if c.is_empty() {
-            if let Some(r) = &mut self.rare { r.large_communities.clear(); }
+            if let Some(r) = &mut self.rare {
+                r.large_communities.clear();
+            }
         } else {
             self.rare_mut().large_communities = c;
         }
     }
     fn set_extended_communities(&mut self, c: Vec<ExtendedCommunity>) {
         if c.is_empty() {
-            if let Some(r) = &mut self.rare { r.extended_communities.clear(); }
+            if let Some(r) = &mut self.rare {
+                r.extended_communities.clear();
+            }
         } else {
             self.rare_mut().extended_communities = c;
         }
@@ -318,21 +324,30 @@ impl<A: IpAddress> RouteBuilder<A> {
     /// Appends a standard community.
     #[must_use]
     pub fn community(mut self, c: Community) -> Self {
-        self.rare.get_or_insert_with(Box::default).communities.push(c);
+        self.rare
+            .get_or_insert_with(Box::default)
+            .communities
+            .push(c);
         self
     }
 
     /// Appends a large community.
     #[must_use]
     pub fn large_community(mut self, lc: LargeCommunity) -> Self {
-        self.rare.get_or_insert_with(Box::default).large_communities.push(lc);
+        self.rare
+            .get_or_insert_with(Box::default)
+            .large_communities
+            .push(lc);
         self
     }
 
     /// Appends an extended community.
     #[must_use]
     pub fn extended_community(mut self, ec: ExtendedCommunity) -> Self {
-        self.rare.get_or_insert_with(Box::default).extended_communities.push(ec);
+        self.rare
+            .get_or_insert_with(Box::default)
+            .extended_communities
+            .push(ec);
         self
     }
 
@@ -536,5 +551,4 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original, cloned);
     }
-
 }

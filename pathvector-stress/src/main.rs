@@ -463,7 +463,11 @@ fn workspace_bin(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     Err(format!(
         "'{name}' binary not found in target/{own_profile}/ — \
          run `cargo build{} -p {name}` first",
-        if own_profile == "release" { " --release" } else { "" }
+        if own_profile == "release" {
+            " --release"
+        } else {
+            ""
+        }
     )
     .into())
 }

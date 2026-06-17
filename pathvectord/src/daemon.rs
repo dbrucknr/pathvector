@@ -2298,8 +2298,9 @@ fn handle_update(
             continue;
         }
 
-        let mut builder = RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
-            .peer_type(peer_type);
+        let mut builder =
+            RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
+                .peer_type(peer_type);
         if let Some(nh) = nh {
             builder = builder.next_hop(nh);
         }
@@ -2335,7 +2336,12 @@ fn handle_update(
         // RFC 7999: silently discard routes tagged with the BLACKHOLE community.
         // Store in AdjRibIn so soft-reconfig can see the raw route, but never
         // install into LocRib or advertise outbound.
-        if raw.rare_or_default().communities.iter().any(|c| c.is_blackhole()) {
+        if raw
+            .rare_or_default()
+            .communities
+            .iter()
+            .any(|c| c.is_blackhole())
+        {
             adj_rib_in.insert(raw.clone());
             tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged route (RFC 7999)");
             rejected += 1;
@@ -2394,8 +2400,9 @@ fn handle_update(
             rejected_v6 += 1;
             continue;
         }
-        let mut builder = RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
-            .peer_type(peer_type);
+        let mut builder =
+            RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
+                .peer_type(peer_type);
         builder = builder.next_hop(nh);
         if let Some(lp) = local_pref {
             builder = builder.local_pref(lp);
@@ -2421,7 +2428,12 @@ fn handle_update(
 
         let raw = builder.build();
 
-        if raw.rare_or_default().communities.iter().any(|c| c.is_blackhole()) {
+        if raw
+            .rare_or_default()
+            .communities
+            .iter()
+            .any(|c| c.is_blackhole())
+        {
             adj_rib_in_v6.insert(raw.clone());
             tracing::debug!(peer = %peer, prefix = %nlri, "discarding BLACKHOLE-tagged IPv6 route (RFC 7999)");
             rejected_v6 += 1;
