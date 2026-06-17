@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
 
@@ -40,7 +39,7 @@ use crate::{peer::PeerId, route::Route};
 #[derive(Clone)]
 pub struct AdjRibIn<A: IpAddress> {
     peer: PeerId,
-    routes: HashMap<Nlri<A>, Route<A>>,
+    routes: AHashMap<Nlri<A>, Route<A>>,
 }
 
 impl<A: IpAddress> AdjRibIn<A> {
@@ -49,7 +48,7 @@ impl<A: IpAddress> AdjRibIn<A> {
     pub fn new(peer: PeerId) -> Self {
         Self {
             peer,
-            routes: HashMap::new(),
+            routes: AHashMap::new(),
         }
     }
 

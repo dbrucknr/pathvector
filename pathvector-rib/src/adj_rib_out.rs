@@ -1,4 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
+
+use ahash::AHashMap;
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::{Nlri, PeerType};
@@ -75,7 +77,7 @@ pub struct AdjRibOut<A: IpAddress> {
     /// caller has already enforced the correct split-horizon at the propagation
     /// level.
     reflects: bool,
-    routes: HashMap<Nlri<A>, Route<A>>,
+    routes: AHashMap<Nlri<A>, Route<A>>,
 }
 
 impl<A: IpAddress> AdjRibOut<A> {
@@ -86,7 +88,7 @@ impl<A: IpAddress> AdjRibOut<A> {
             peer,
             peer_type,
             reflects: false,
-            routes: HashMap::new(),
+            routes: AHashMap::new(),
         }
     }
 
@@ -102,7 +104,7 @@ impl<A: IpAddress> AdjRibOut<A> {
             peer,
             peer_type,
             reflects: true,
-            routes: HashMap::new(),
+            routes: AHashMap::new(),
         }
     }
 
