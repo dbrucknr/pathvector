@@ -18,8 +18,8 @@
 //! ## What it measures
 //!
 //! - BGP announcement throughput (prefixes/second into pathvectord)
-//! - RIB convergence time: from first UPDATE sent to last `Announced` event
-//!   received on the `watch_routes` stream (no polling — event-driven)
+//! - RIB convergence time: from first UPDATE sent to when two consecutive
+//!   `watch_routes` snapshots report the same route count (stable RIB)
 //! - Accepted vs rejected route count
 
 use std::{
@@ -35,7 +35,7 @@ use pathvector_client::{
     DaemonClient, PathvectorClient,
     types::RouteEventType,
 };
-use tokio::time::timeout;
+use tokio::time::sleep;
 
 mod mrt;
 mod speaker;
@@ -109,30 +109,12 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("MRT file contains no IPv4 unicast entries".into());
     }
 
-    // ── 2. Open watch_routes stream before announcing ─────────────────────────
-    // We open the stream first so no Announced events are missed between the
-    // end of the announcement and when we start listening.
+    // ── 2. Verify gRPC connectivity ───────────────────────────────────────────
     println!("Connecting to gRPC at {}...", args.grpc);
-
-    let mut client = PathvectorClient::connect(args.grpc.clone())
+    // Quick connectivity check — open and immediately close.
+    PathvectorClient::connect(args.grpc.clone())
         .map_err(|e| format!("gRPC connect failed: {e}"))?;
-
-    let mut route_stream = client
-        .watch_routes(None)
-        .await
-        .map_err(|e| format!("watch_routes failed: {e}"))?;
-
-    // Drain the initial snapshot — the RIB should be empty since no peer has
-    // connected yet, so this exits immediately on EndInitial.
-    loop {
-        match route_stream.next().await {
-            Some(Ok(ev)) if ev.event_type == RouteEventType::EndInitial => break,
-            Some(Ok(_)) => {}  // Current events (empty RIB → none expected)
-            Some(Err(e)) => return Err(format!("stream error during snapshot: {e}").into()),
-            None => return Err("watch_routes stream closed before EndInitial".into()),
-        }
-    }
-    println!("  Stream open, snapshot drained");
+    println!("  gRPC reachable");
     println!();
 
     // ── 3. Establish BGP session ──────────────────────────────────────────────
@@ -159,22 +141,25 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
-    // ── 5. Count Announced events until idle ──────────────────────────────────
-    // The watch_routes stream fires one Announced event per best-route
-    // accepted into the Loc-RIB.  We count them until no new event arrives
-    // within `idle_ms` milliseconds — that is convergence.
-    println!("Waiting for RIB convergence via watch_routes stream...");
+    // ── 5. Poll snapshots until RIB stabilises ────────────────────────────────
+    // We open a fresh watch_routes stream after each poll interval and count
+    // the Current events in the snapshot (before EndInitial).  When two
+    // consecutive snapshots agree the RIB has converged.
+    //
+    // This avoids the broadcast-channel lag problem: individual Announced
+    // delta events are never observed; only the point-in-time snapshot is
+    // used, which has no size limit.
+    println!("Waiting for RIB convergence (snapshot polling)...");
 
-    let idle = Duration::from_millis(args.idle_ms);
+    let poll_interval = Duration::from_millis(args.idle_ms);
     let hard_deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
 
+    let mut prev_count: Option<u64> = None;
     let mut rib_count: u64 = 0;
-    let mut last_progress_report: u64 = 0;
     let convergence_start = Instant::now();
 
     loop {
-        let remaining = hard_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if Instant::now() >= hard_deadline {
             return Err(format!(
                 "timed out after {}s — last RIB count: {}",
                 args.timeout_secs,
@@ -183,25 +168,33 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
 
-        match timeout(idle.min(remaining), route_stream.next()).await {
-            Ok(Some(Ok(ev))) => match ev.event_type {
-                RouteEventType::Announced => {
-                    rib_count += 1;
-                    // Print progress every 100k routes.
-                    if rib_count - last_progress_report >= 100_000 {
-                        println!("  {} routes accepted", fmt_count(rib_count));
-                        last_progress_report = rib_count;
-                    }
-                }
-                RouteEventType::Withdrawn => {
-                    rib_count = rib_count.saturating_sub(1);
-                }
-                _ => {}
-            },
-            Ok(Some(Err(e))) => return Err(format!("stream error: {e}").into()),
-            Ok(None) => break,          // stream closed cleanly
-            Err(_idle_timeout) => break, // no new event for idle_ms → converged
+        // Open a fresh stream and count the snapshot.
+        let mut client = PathvectorClient::connect(args.grpc.clone())
+            .map_err(|e| format!("gRPC reconnect failed: {e}"))?;
+        let mut stream = client
+            .watch_routes(None)
+            .await
+            .map_err(|e| format!("watch_routes failed: {e}"))?;
+
+        let mut snap_count: u64 = 0;
+        loop {
+            match stream.next().await {
+                Some(Ok(ev)) if ev.event_type == RouteEventType::Current => snap_count += 1,
+                Some(Ok(ev)) if ev.event_type == RouteEventType::EndInitial => break,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(format!("stream error during snapshot: {e}").into()),
+                None => break,
+            }
         }
+
+        rib_count = snap_count;
+        println!("  snapshot: {} routes", fmt_count(rib_count));
+
+        if prev_count == Some(rib_count) {
+            break; // stable
+        }
+        prev_count = Some(rib_count);
+        sleep(poll_interval).await;
     }
 
     let convergence_elapsed = convergence_start.elapsed();
@@ -217,7 +210,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         fmt_count(prefixes_per_sec(result.prefixes_sent, announce_elapsed)),
     );
     println!(
-        "  RIB convergence:{:.2}s  (time from first UPDATE to last Announced event)",
+        "  RIB convergence:{:.2}s  (announcement start to stable snapshot)",
         convergence_elapsed.as_secs_f64(),
     );
     println!(
