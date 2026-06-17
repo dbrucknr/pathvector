@@ -1,3 +1,5 @@
+mod gobgp_bench;
+
 use std::{
     net::Ipv4Addr,
     process::Stdio,
@@ -53,6 +55,12 @@ bgp_port  = 11179
 address   = "192.0.2.1"
 remote_as = 65002
 "#;
+
+struct PvPhaseResult {
+    label: &'static str,
+    elapsed_secs: f64,
+    peak_rss: String,
+}
 
 // ── Route generation ──────────────────────────────────────────────────────────
 
@@ -153,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "-".repeat(80));
 
     let mut total_originated: u32 = 0;
+    let mut pv_phase_results: Vec<PvPhaseResult> = Vec::with_capacity(PHASES.len());
 
     for &(target, label) in PHASES {
         // Seed peak with the current RSS so the sampler's fetch_max is accurate.
@@ -191,17 +200,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sleep(Duration::from_millis(600)).await;
         let phase_peak = peak_kb.load(Ordering::Relaxed).max(final_kb);
 
+        let elapsed_secs = elapsed.as_secs_f64();
         println!(
             "{:<8}  {:>12}  {:>10.2}  {:>10}  {:>10}  {:>8}  {:>8}",
             label,
             target,
-            elapsed.as_secs_f64(),
+            elapsed_secs,
             fmt_kb(phase_peak),
             fmt_kb(final_kb),
             error_count.load(Ordering::Relaxed),
             warn_count.load(Ordering::Relaxed),
         );
 
+        pv_phase_results.push(PvPhaseResult {
+            label,
+            elapsed_secs,
+            peak_rss: fmt_kb(phase_peak),
+        });
         total_originated = target;
     }
 
@@ -321,6 +336,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rss_running.store(0, Ordering::Relaxed);
     child.kill().await?;
+
+    // ── GoBGP benchmark ───────────────────────────────────────────────────────
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════");
+    println!("  GoBGP 1:1 comparison  (same phases, same batch size, same host)");
+    println!("═══════════════════════════════════════════════════════════════════");
+    println!();
+
+    let gobgp_results = gobgp_bench::run(PHASES, BATCH).await?;
+
+    println!(
+        "{:<8}  {:>10}  {:>10}",
+        "Phase", "Time (s)", "Peak RSS",
+    );
+    println!("{}", "-".repeat(32));
+    for r in &gobgp_results {
+        println!(
+            "{:<8}  {:>10.2}  {:>10}",
+            r.label, r.elapsed_secs, r.peak_rss,
+        );
+    }
+
+    // ── Side-by-side summary ──────────────────────────────────────────────────
+    println!();
+    println!("── Side-by-side: convergence time ──────────────────────────────────");
+    println!(
+        "{:<8}  {:>14}  {:>14}  {:>10}",
+        "Phase", "pathvectord", "GoBGP", "Ratio (pv/go)",
+    );
+    println!("{}", "-".repeat(55));
+    for (pv, go) in pv_phase_results.iter().zip(gobgp_results.iter()) {
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = if go.elapsed_secs > 0.0 {
+            pv.elapsed_secs / go.elapsed_secs
+        } else {
+            f64::NAN
+        };
+        println!(
+            "{:<8}  {:>11.2} s  {:>11.2} s  {:>10.2}×",
+            pv.label, pv.elapsed_secs, go.elapsed_secs, ratio,
+        );
+    }
+
+    println!();
+    println!("── Side-by-side: peak RSS ───────────────────────────────────────────");
+    println!(
+        "{:<8}  {:>14}  {:>14}",
+        "Phase", "pathvectord", "GoBGP",
+    );
+    println!("{}", "-".repeat(40));
+    for (pv, go) in pv_phase_results.iter().zip(gobgp_results.iter()) {
+        println!("{:<8}  {:>14}  {:>14}", pv.label, pv.peak_rss, go.peak_rss);
+    }
+
     Ok(())
 }
 

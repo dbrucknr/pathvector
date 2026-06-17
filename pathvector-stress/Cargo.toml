@@ -14,7 +14,15 @@ path = "src/main.rs"
 
 [dependencies]
 pathvector-client = { workspace = true }
-tokio = { workspace = true, features = ["process"] }
+tokio        = { workspace = true, features = ["process"] }
+tokio-stream = "0.1"
+tonic        = { workspace = true }
+tonic-prost  = { workspace = true }
+prost        = { workspace = true }
+prost-types  = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [lints.rust]
 unsafe_code = "forbid"

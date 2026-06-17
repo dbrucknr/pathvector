@@ -97,6 +97,40 @@ comparison.
 - Stage 3: pathvector convergence time and RSS within 2× of GoBGP (acceptable gap
   for a first implementation; identify root causes if larger)
 
+## Stage 1b — GoBGP 1:1 comparison (2026-06-17, M2 Max, release binary)
+
+Same harness, same batch size (500), same host.  GoBGP 4.5.0 vs pathvectord.
+Route injection via each daemon's native gRPC API: `AddPathStream` (GoBGP) vs
+`originate_routes` (pathvectord).
+
+### Convergence time
+
+| Phase | pathvectord | GoBGP 4.5.0 | Ratio (pv/go) |
+|---|---|---|---|
+| 10k  | 0.03 s | 0.05 s | 0.48× |
+| 100k | 0.21 s | 0.38 s | 0.54× |
+| 500k | 0.85 s | 1.62 s | 0.52× |
+
+**Takeaway:** pathvectord converges roughly **2× faster** than GoBGP at all
+three sizes.  This reflects the gRPC overhead difference between the two
+implementations, not just BGP processing — the API encoding (strongly-typed
+oneofs in GoBGP v4 vs. repeated messages in pathvector-client) may contribute.
+Worth profiling to separate RIB insertion cost from transport overhead.
+
+### Peak RSS
+
+| Phase | pathvectord | GoBGP 4.5.0 |
+|---|---|---|
+| 10k  | 33.9 MB  | 50.7 MB  |
+| 100k | 265.1 MB | 121.3 MB |
+| 500k | 1.4 GB   | 451.8 MB |
+
+**Takeaway:** GoBGP is dramatically more memory-efficient at scale (~3× at
+500k routes).  pathvectord's ~2.6 KB/route vs GoBGP's ~0.9 KB/route.  The
+likely causes: HashMap-backed `LocRib` with full attribute clones per route
+rather than interned/shared attributes.  Attribute interning is the highest-
+priority memory optimisation before a Stage 3 comparison.
+
 ## Known blockers
 
 - Performance concern #3 (lock-hold during full-table dump) is likely to cause

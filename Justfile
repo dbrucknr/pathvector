@@ -185,11 +185,23 @@ e2e-logs:
 # ── Stress ────────────────────────────────────────────────────────────────────
 
 # Run the full-table stress harness (Stage 1 — no Docker required).
-# Builds pathvectord and the stress binary, then originates 10k / 100k / 500k
-# routes and reports convergence time, peak RSS, and error count per phase.
+# Builds pathvectord and the stress binary in debug mode, then runs all phases:
+#   - pathvectord: originate 10k / 100k / 500k routes, measure time + RSS
+#   - withdrawal: withdraw all 500k, check RSS reclamation
+#   - churn: 5× announce/withdraw cycles of 10k routes, check for RSS growth
+#   - GoBGP 1:1 comparison: same phases against gobgpd via AddPathStream
+#
+# Prerequisites: protoc on PATH (brew install protobuf).
+# GoBGP comparison also requires: gobgpd 4.x on PATH or in $GOPATH/bin.
+# See pathvector-stress/README.md for full documentation.
 stress:
     cargo build -p pathvectord -p pathvector-stress
     cargo run -p pathvector-stress --bin stress
+
+# Same as `stress` but with release builds — use this for numbers worth recording.
+stress-release:
+    cargo build --release -p pathvectord -p pathvector-stress
+    ./target/release/stress
 
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 

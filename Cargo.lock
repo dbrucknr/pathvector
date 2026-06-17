@@ -1662,7 +1662,13 @@ name = "pathvector-stress"
 version = "0.1.0"
 dependencies = [
  "pathvector-client",
+ "prost",
+ "prost-types",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
