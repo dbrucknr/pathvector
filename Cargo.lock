@@ -1674,10 +1674,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "flate2",
+ "futures",
  "pathvector-client",
  "pathvector-session",
  "pathvector-types",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

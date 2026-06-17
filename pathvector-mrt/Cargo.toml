@@ -15,9 +15,11 @@ path = "src/main.rs"
 pathvector-session = { workspace = true }
 pathvector-client  = { workspace = true }
 pathvector-types   = { workspace = true }
-tokio  = { workspace = true }
-clap   = { workspace = true }
-flate2 = "1"
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+futures      = { workspace = true }
+clap         = { workspace = true }
+flate2       = "1"
 
 [lints]
 workspace = true

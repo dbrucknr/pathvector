@@ -12,7 +12,6 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
-    time::Duration,
 };
 
 use tokio::{
@@ -43,7 +42,6 @@ pub struct AnnounceResult {
     pub prefixes_sent: u64,
     pub updates_sent: u64,
     pub unique_attr_sets: usize,
-    pub elapsed: Duration,
 }
 
 // ── BgpSpeaker ────────────────────────────────────────────────────────────────
@@ -85,7 +83,7 @@ impl BgpSpeaker {
         let unique_attr_sets = by_attrs.len();
         let mut prefixes_sent: u64 = 0;
         let mut updates_sent: u64 = 0;
-        let start = std::time::Instant::now();
+
 
         for (attrs, prefixes) in &by_attrs {
             let mut batch: Vec<(Ipv4Addr, u8)> = Vec::new();
@@ -124,12 +122,7 @@ impl BgpSpeaker {
             }
         }
 
-        Ok(AnnounceResult {
-            prefixes_sent,
-            updates_sent,
-            unique_attr_sets,
-            elapsed: start.elapsed(),
-        })
+        Ok(AnnounceResult { prefixes_sent, updates_sent, unique_attr_sets })
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

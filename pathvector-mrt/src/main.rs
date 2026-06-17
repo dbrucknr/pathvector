@@ -12,27 +12,30 @@
 //!
 //! Download a RouteViews/RIPE RIS snapshot:
 //! ```text
-//! curl -O https://archive.routeviews.org/bgpdata/2024.12/RIBS/rib.20241201.0000.bz2
-//! bunzip2 rib.20241201.0000.bz2
+//! curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
 //! ```
 //!
 //! ## What it measures
 //!
-//! - Time for the BGP speaker to announce all prefixes from the MRT file
-//! - Time for pathvectord's Loc-RIB to reach the expected prefix count
-//!   (polled via gRPC — total = announcement + RIB processing lag)
-//! - Peak RSS of pathvectord at convergence
+//! - BGP announcement throughput (prefixes/second into pathvectord)
+//! - RIB convergence time: from first UPDATE sent to last `Announced` event
+//!   received on the `watch_routes` stream (no polling — event-driven)
+//! - Accepted vs rejected route count
 
 use std::{
     fmt::Write as _,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
-use pathvector_client::{DaemonClient, PathvectorClient};
-use tokio::time::sleep;
+use futures::StreamExt as _;
+use pathvector_client::{
+    DaemonClient, PathvectorClient,
+    types::RouteEventType,
+};
+use tokio::time::timeout;
 
 mod mrt;
 mod speaker;
@@ -64,17 +67,17 @@ struct Args {
     #[arg(long, default_value = "10.0.0.1")]
     router_id: Ipv4Addr,
 
-    /// pathvectord gRPC address for convergence polling
+    /// pathvectord gRPC address for the `watch_routes` stream
     #[arg(long, default_value = "http://127.0.0.1:51200")]
     grpc: String,
 
-    /// Maximum time to wait for the RIB to converge after announcement completes
+    /// How long to wait with no new route events before declaring convergence
+    #[arg(long, default_value = "1000")]
+    idle_ms: u64,
+
+    /// Hard timeout in seconds — abort if convergence never happens
     #[arg(long, default_value = "120")]
     timeout_secs: u64,
-
-    /// Print progress every N prefixes during announcement
-    #[arg(long, default_value = "100000")]
-    progress_every: u64,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -92,14 +95,13 @@ async fn main() {
 #[allow(clippy::too_many_lines)]
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. Parse MRT file ─────────────────────────────────────────────────────
-    let mrt_path = args.mrt.display().to_string();
-    println!("Parsing MRT dump: {mrt_path}");
+    println!("Parsing MRT dump: {}", args.mrt.display());
 
-    let parse_start = std::time::Instant::now();
+    let parse_start = Instant::now();
     let entries = read_mrt(&args.mrt)?;
     let parse_elapsed = parse_start.elapsed();
 
-    println!("  Prefixes: {}", fmt_count(entries.len() as u64));
+    println!("  Prefixes:   {}", fmt_count(entries.len() as u64));
     println!("  Parse time: {:.1}s", parse_elapsed.as_secs_f64());
     println!();
 
@@ -107,124 +109,133 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("MRT file contains no IPv4 unicast entries".into());
     }
 
-    // ── 2. Establish BGP session ──────────────────────────────────────────────
+    // ── 2. Open watch_routes stream before announcing ─────────────────────────
+    // We open the stream first so no Announced events are missed between the
+    // end of the announcement and when we start listening.
+    println!("Connecting to gRPC at {}...", args.grpc);
+
+    let mut client = PathvectorClient::connect(args.grpc.clone())
+        .map_err(|e| format!("gRPC connect failed: {e}"))?;
+
+    let mut route_stream = client
+        .watch_routes(None)
+        .await
+        .map_err(|e| format!("watch_routes failed: {e}"))?;
+
+    // Drain the initial snapshot — the RIB should be empty since no peer has
+    // connected yet, so this exits immediately on EndInitial.
+    loop {
+        match route_stream.next().await {
+            Some(Ok(ev)) if ev.event_type == RouteEventType::EndInitial => break,
+            Some(Ok(_)) => {}  // Current events (empty RIB → none expected)
+            Some(Err(e)) => return Err(format!("stream error during snapshot: {e}").into()),
+            None => return Err("watch_routes stream closed before EndInitial".into()),
+        }
+    }
+    println!("  Stream open, snapshot drained");
+    println!();
+
+    // ── 3. Establish BGP session ──────────────────────────────────────────────
     println!(
-        "Connecting to {} as AS{} (router-id {})",
+        "Connecting to BGP peer {} as AS{} (router-id {})",
         args.peer, args.my_as, args.router_id
     );
     let mut spkr = BgpSpeaker::connect(args.peer, args.my_as, args.router_id).await?;
     println!("  Session established");
     println!();
 
-    // ── 3. Announce all prefixes ──────────────────────────────────────────────
+    // ── 4. Announce all prefixes ──────────────────────────────────────────────
     println!("Announcing {} prefixes...", fmt_count(entries.len() as u64));
+    let announce_start = Instant::now();
     let result = spkr.announce(&entries).await?;
+    let announce_elapsed = announce_start.elapsed();
 
     println!(
-        "  Done: {} prefixes in {} UPDATE messages ({:.1}s)",
+        "  Done: {} prefixes, {} UPDATE messages, {:.2}s ({}/s)",
         fmt_count(result.prefixes_sent),
         fmt_count(result.updates_sent),
-        result.elapsed.as_secs_f64(),
+        announce_elapsed.as_secs_f64(),
+        fmt_count(prefixes_per_sec(result.prefixes_sent, announce_elapsed)),
     );
     println!();
 
-    // ── 4. Poll pathvectord gRPC for convergence ──────────────────────────────
-    println!("Polling pathvectord gRPC at {} for convergence...", args.grpc);
+    // ── 5. Count Announced events until idle ──────────────────────────────────
+    // The watch_routes stream fires one Announced event per best-route
+    // accepted into the Loc-RIB.  We count them until no new event arrives
+    // within `idle_ms` milliseconds — that is convergence.
+    println!("Waiting for RIB convergence via watch_routes stream...");
 
-    let grpc_start = std::time::Instant::now();
-    let timeout = Duration::from_secs(args.timeout_secs);
+    let idle = Duration::from_millis(args.idle_ms);
+    let hard_deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
 
-    let mut client = PathvectorClient::connect(args.grpc.clone())
-        .map_err(|e| format!("failed to connect to gRPC at {}: {e}", args.grpc))?;
+    let mut rib_count: u64 = 0;
+    let mut last_progress_report: u64 = 0;
+    let convergence_start = Instant::now();
 
-    let expected = result.prefixes_sent;
-
-    // Probe once to detect whether list_routes is usable at this table size.
-    // For >~26k routes the response exceeds the 4 MB gRPC default limit and
-    // list_routes returns an error.  In that case we fall back to a fixed wait
-    // and report only the announcement metrics.
-    let probe = query_prefix_count(&mut client).await;
-    let rib_count = if let Some(count) = probe {
-        // list_routes works — poll until stable.
-        let mut last_count = count;
-        let mut stable_for: u64 = 0;
-        println!("  {}", fmt_count(count));
-
-        loop {
-            if grpc_start.elapsed() > timeout {
-                return Err(format!(
-                    "timed out after {}s waiting for convergence \
-                     (last count: {}, expected: {})",
-                    args.timeout_secs,
-                    fmt_count(last_count),
-                    fmt_count(expected),
-                )
-                .into());
-            }
-
-            sleep(Duration::from_millis(500)).await;
-            let count = query_prefix_count(&mut client).await.unwrap_or(last_count);
-
-            if count == last_count {
-                stable_for += 1;
-            } else {
-                println!("  {}", fmt_count(count));
-                last_count = count;
-                stable_for = 0;
-            }
-
-            // Stable for 3 consecutive polls (3 × 500ms = 1.5s of no change).
-            if stable_for >= 3 && count > 0 {
-                break;
-            }
+    loop {
+        let remaining = hard_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out after {}s — last RIB count: {}",
+                args.timeout_secs,
+                fmt_count(rib_count),
+            )
+            .into());
         }
-        Some(last_count)
-    } else {
-        // list_routes hit the gRPC message-size limit — table is too large to
-        // count via this API.  Wait 2 s for RIB processing to finish, then
-        // report without a verified prefix count.
-        println!(
-            "  (table too large for list_routes — \
-             waiting 2s for RIB processing then reporting)"
-        );
-        sleep(Duration::from_secs(2)).await;
-        None
-    };
 
-    let total_elapsed = grpc_start.elapsed() + result.elapsed;
+        match timeout(idle.min(remaining), route_stream.next()).await {
+            Ok(Some(Ok(ev))) => match ev.event_type {
+                RouteEventType::Announced => {
+                    rib_count += 1;
+                    // Print progress every 100k routes.
+                    if rib_count - last_progress_report >= 100_000 {
+                        println!("  {} routes accepted", fmt_count(rib_count));
+                        last_progress_report = rib_count;
+                    }
+                }
+                RouteEventType::Withdrawn => {
+                    rib_count = rib_count.saturating_sub(1);
+                }
+                _ => {}
+            },
+            Ok(Some(Err(e))) => return Err(format!("stream error: {e}").into()),
+            Ok(None) => break,          // stream closed cleanly
+            Err(_idle_timeout) => break, // no new event for idle_ms → converged
+        }
+    }
 
+    let convergence_elapsed = convergence_start.elapsed();
+    let total_elapsed = announce_elapsed + convergence_elapsed;
+
+    // ── 6. Report ─────────────────────────────────────────────────────────────
     println!();
     println!("── Results ──────────────────────────────────────────────────────");
     println!(
-        "  Announcement:   {:.2}s ({} prefixes, {}/s)",
-        result.elapsed.as_secs_f64(),
+        "  Announcement:   {:.2}s  ({} prefixes, {}/s)",
+        announce_elapsed.as_secs_f64(),
         fmt_count(result.prefixes_sent),
-        fmt_count(prefixes_per_sec(result.prefixes_sent, result.elapsed)),
+        fmt_count(prefixes_per_sec(result.prefixes_sent, announce_elapsed)),
     );
     println!(
-        "  Convergence:    ~{:.2}s (announcement + ~2s RIB processing)",
-        total_elapsed.as_secs_f64()
+        "  RIB convergence:{:.2}s  (time from first UPDATE to last Announced event)",
+        convergence_elapsed.as_secs_f64(),
+    );
+    println!(
+        "  Total:          {:.2}s",
+        total_elapsed.as_secs_f64(),
     );
     println!("  Unique attr sets: {}", fmt_count(result.unique_attr_sets as u64));
+    println!(
+        "  Accepted:  {} / {} sent",
+        fmt_count(rib_count),
+        fmt_count(result.prefixes_sent),
+    );
 
-    if let Some(count) = rib_count {
-        println!(
-            "  Final RIB count: {} / {} expected",
-            fmt_count(count),
-            fmt_count(expected)
-        );
-        if count < expected {
-            let rejected = expected - count;
-            #[allow(clippy::cast_precision_loss)]
-            let pct = rejected as f64 / expected as f64 * 100.0;
-            println!("  Rejected routes: {} ({:.1}%)", fmt_count(rejected), pct);
-        }
-    } else {
-        println!(
-            "  Final RIB count: (not measurable — list_routes exceeds 4 MB gRPC limit at {} prefixes)",
-            fmt_count(expected)
-        );
-        println!("  Note: implement list_routes pagination to enable convergence verification");
+    if rib_count < result.prefixes_sent {
+        let rejected = result.prefixes_sent - rib_count;
+        #[allow(clippy::cast_precision_loss)]
+        let pct = rejected as f64 / result.prefixes_sent as f64 * 100.0;
+        println!("  Rejected:  {} ({:.1}%)", fmt_count(rejected), pct);
     }
 
     println!("─────────────────────────────────────────────────────────────────");
@@ -240,33 +251,17 @@ fn read_mrt(path: &PathBuf) -> Result<Vec<RibEntry>, Box<dyn std::error::Error>>
     let file = std::fs::File::open(path)?;
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if ext == "gz" {
-        let decoder = flate2::read::GzDecoder::new(file);
-        Ok(mrt::parse(decoder)?)
+        Ok(mrt::parse(flate2::read::GzDecoder::new(file))?)
     } else {
         Ok(mrt::parse(std::io::BufReader::new(file))?)
     }
 }
 
-/// Query the total IPv4 unicast prefix count via gRPC.
-///
-/// Returns `None` when `list_routes` fails (typically because the response
-/// exceeds the 4 MB gRPC message limit for tables larger than ~26k routes).
-async fn query_prefix_count(client: &mut PathvectorClient) -> Option<u64> {
-    client
-        .list_routes(None)
-        .await
-        .ok()
-        .map(|routes| routes.len() as u64)
-}
-
-/// Compute prefixes-per-second as a u64, avoiding f64 precision lint on the call site.
+/// Compute prefixes-per-second as a u64.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn prefixes_per_sec(count: u64, elapsed: Duration) -> u64 {
     let secs = elapsed.as_secs_f64();
-    if secs == 0.0 {
-        return 0;
-    }
-    (count as f64 / secs) as u64
+    if secs == 0.0 { 0 } else { (count as f64 / secs) as u64 }
 }
 
 /// Format a large number with thousands separators.
