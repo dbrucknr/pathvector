@@ -182,6 +182,15 @@ e2e-down:
 e2e-logs:
     docker compose -f e2e/docker-compose.yml logs -f
 
+# ── Stress ────────────────────────────────────────────────────────────────────
+
+# Run the full-table stress harness (Stage 1 — no Docker required).
+# Builds pathvectord and the stress binary, then originates 10k / 100k / 500k
+# routes and reports convergence time, peak RSS, and error count per phase.
+stress:
+    cargo build -p pathvectord -p pathvector-stress
+    cargo run -p pathvector-stress --bin stress
+
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
 # Compile all fuzz targets (no fuzzing — fast compile check)

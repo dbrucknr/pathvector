@@ -1658,6 +1658,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathvector-stress"
+version = "0.1.0"
+dependencies = [
+ "pathvector-client",
+ "tokio",
+]
+
+[[package]]
 name = "pathvector-sys"
 version = "0.1.0"
 dependencies = [

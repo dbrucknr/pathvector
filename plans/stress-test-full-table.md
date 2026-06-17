@@ -18,8 +18,13 @@ OOMs, and incorrect best-path results before touching real BGP wire traffic.
 **Metric:** does pathvectord stay up, memory stable, route count matches injected count?
 
 Open questions to resolve here:
-- Does `list_routes` time out or OOM at 500k? If so, add a count-only gRPC query
-  before the comparison benchmark.
+- **`list_routes` hits the 4 MB gRPC message limit at ~26k routes** (confirmed
+  2026-06-17). The response body for 100k routes exceeds the default tonic limit.
+  Needs either: (a) a `CountRoutes` RPC, (b) server-side pagination on
+  `ListRoutes`, or (c) a `WatchRoutes` snapshot count. The stress harness works
+  around this by trusting `originate_routes`' synchronous return value as the
+  count; but `list_routes` is unusable at scale and must be fixed before the
+  gRPC API can be called production-grade.
 - Does `LocRib` rehash at scale cause latency spikes visible in hold-timer health?
 - Are there any `unwrap()` / `expect()` panics hiding in low-frequency RIB paths?
 
@@ -61,6 +66,23 @@ Run the same Stage 2 scenario against GoBGP 4.x and BIRD 2.x on identical
 hardware with equivalent config (one eBGP peer, accept-all import policy).
 
 Present results in the three-size / Takeaway table format. Hardware: Apple M2 Max.
+
+## Stage 1 baseline (2026-06-17, M2 Max, release binary)
+
+| Phase | Routes | Time (s) | Peak RSS | Final RSS | ERRORs |
+|---|---|---|---|---|---|
+| 10k  | 10,000  | 0.04 | 30.3 MB  | 30.3 MB  | 0 |
+| 100k | 100,000 | 0.28 | 236.7 MB | 236.7 MB | 0 |
+| 500k | 500,000 | 1.24 | 1.3 GB   | 1.3 GB   | 0 |
+
+Throughput: ~400k routes/sec via gRPC origination.  
+Memory: ~2.6 KB/route — linear scaling, no obvious bloat.  
+Extrapolated full table (~950k routes): ~2.5 GB RSS.
+
+**Memory gap vs GoBGP**: GoBGP holds a full table in ~500–800 MB. The likely
+causes are HashMap-backed RIB structures and full attribute clones per route
+rather than interned/shared attributes. Worth profiling before the Stage 3
+comparison.
 
 ## Success criteria
 

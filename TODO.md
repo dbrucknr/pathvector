@@ -259,6 +259,8 @@ Not yet started. Key work items:
 
 - **AS 0 not rejected in gRPC originate/peer handlers** (`pathvectord/src/grpc.rs`) — RFC 7607 reserves AS 0; it MUST NOT appear in AS_PATH or be used as a peer ASN. The gRPC handlers accept AS 0 without validation. Fix: add a guard in `originate_route` and peer-configuration handlers rejecting AS 0 with `Status::invalid_argument`.
 
+- **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Fix options: (a) add a `CountRoutes` RPC returning only the route count, (b) add server-side cursor pagination to `ListRoutes`, or (c) use the existing `WatchRoutes` stream for large snapshots. Option (a) is the smallest change; option (b) is the most correct for a public API.
+
 - **Duplicate `originate_route` silently overwrites** (`pathvectord/src/grpc.rs`, `daemon.rs`) — calling `originate_route` twice for the same prefix silently replaces the first entry via `HashMap::insert`. Reasonable behavior but undocumented in the API and has no test coverage. Add a test and document the upsert semantics in the proto comments.
 
 - **Dynamic peer reconfiguration (runtime config)** — the daemon reads its
@@ -447,6 +449,22 @@ Any function that can fail should say so in its return type. Conduct a systemati
 - Integration test isolation — `tests/transport.rs` binds real loopback TCP sockets; these tests are excellent for correctness but will be slow and port-conflict-prone on shared CI runners; consider a `#[cfg(not(ci))]` guard or dedicated test binary with a randomised port range
 
 ### Performance
+
+#### Memory audit (deferred until Stage 2 stress test)
+
+Baseline from Stage 1 synthetic stress (2026-06-17): ~2.6 KB per route, ~1.3 GB
+RSS at 500k routes. Extrapolated full table (~950k routes): ~2.5 GB — workable on
+developer hardware but likely 3–5× higher than GoBGP (~500–800 MB at full table).
+
+Do not audit against synthetic routes. Audit after Stage 2 MRT replay, which
+provides real attribute diversity (varied AS paths, community sets, aggregators)
+that will shift per-route cost in ways synthetic uniform routes cannot predict.
+Likely suspects once profiling data is available:
+
+- `HashMap`-backed `AdjRibIn` / `AdjRibOut` — one allocation per route entry
+- Full attribute clone per route rather than interned / `Arc`-shared attributes
+- `Vec<Asn>` in `AsPath` not interned across routes sharing the same path
+- No attribute compression (many real routes share identical AS paths)
 
 #### Known architectural concerns
 

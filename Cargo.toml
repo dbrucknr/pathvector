@@ -10,6 +10,7 @@ members = [
     "pathvector",
     "e2e",
     "pathvector-sys",
+    "pathvector-stress",
 ]
 resolver = "3"
 
