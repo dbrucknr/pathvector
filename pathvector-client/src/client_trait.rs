@@ -563,24 +563,26 @@ impl DaemonClient for PathvectorClient {
     }
 
     async fn add_peer(&mut self, params: AddPeerParams) -> Result<(), ClientError> {
-        let import_action = params
-            .import_default
-            .map_or(PolicyAction::Unspecified as i32, |accept| {
-                if accept {
-                    PolicyAction::Accept as i32
-                } else {
-                    PolicyAction::Reject as i32
-                }
-            });
-        let export_action = params
-            .export_default
-            .map_or(PolicyAction::Unspecified as i32, |accept| {
-                if accept {
-                    PolicyAction::Accept as i32
-                } else {
-                    PolicyAction::Reject as i32
-                }
-            });
+        let import_action =
+            params
+                .import_default
+                .map_or(PolicyAction::Unspecified as i32, |accept| {
+                    if accept {
+                        PolicyAction::Accept as i32
+                    } else {
+                        PolicyAction::Reject as i32
+                    }
+                });
+        let export_action =
+            params
+                .export_default
+                .map_or(PolicyAction::Unspecified as i32, |accept| {
+                    if accept {
+                        PolicyAction::Accept as i32
+                    } else {
+                        PolicyAction::Reject as i32
+                    }
+                });
         self.peers
             .add_peer(AddPeerRequest {
                 address: params.address.to_string(),

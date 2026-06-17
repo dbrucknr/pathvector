@@ -98,7 +98,12 @@ pub fn select_best_with_oracle<'a, A: IpAddress, S: std::hash::BuildHasher>(
     // Step 1: exclude routes with unreachable next-hops.
     let reachable: Vec<_> = candidates
         .iter()
-        .filter(|(_, route)| route.next_hop.as_ref().is_none_or(|nh| oracle.is_reachable(nh)))
+        .filter(|(_, route)| {
+            route
+                .next_hop
+                .as_ref()
+                .is_none_or(|nh| oracle.is_reachable(nh))
+        })
         .collect();
 
     if reachable.is_empty() {

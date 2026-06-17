@@ -399,8 +399,10 @@ impl DaemonState {
             AdjRibOut::new(peer_id, pt)
         };
 
-        self.adj_ribs_in.insert(peer.address, AdjRibIn::new(peer_id));
-        self.adj_ribs_in_v6.insert(peer.address, AdjRibIn::new(peer_id));
+        self.adj_ribs_in
+            .insert(peer.address, AdjRibIn::new(peer_id));
+        self.adj_ribs_in_v6
+            .insert(peer.address, AdjRibIn::new(peer_id));
         self.adj_ribs_out.insert(peer.address, adj_out.clone());
         self.adj_ribs_out_v6
             .insert(peer.address, AdjRibOut::new(peer_id, pt));
@@ -1873,10 +1875,7 @@ async fn run_command_processor<H, F>(
                     .insert(IpAddr::V4(peer.address), handle.incoming_sender());
 
                 // Register all per-peer RIB / policy state.
-                state
-                    .write()
-                    .await
-                    .add_peer(&peer, update_sender);
+                state.write().await.add_peer(&peer, update_sender);
 
                 // Forward session events to the main event channel.
                 let peer_addr = peer.address;
@@ -1911,10 +1910,7 @@ async fn run_command_processor<H, F>(
                 }
 
                 // Stop accepting new inbound connections from this peer.
-                incoming_senders
-                    .write()
-                    .await
-                    .remove(&IpAddr::V4(peer_ip));
+                incoming_senders.write().await.remove(&IpAddr::V4(peer_ip));
 
                 // Send Cease NOTIFICATION; the session will emit Terminated which
                 // triggers full state cleanup in the event loop.
@@ -1981,8 +1977,7 @@ where
     let incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     // md5_passwords: shared with the listener for TCP MD5SIG setup.
-    let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
     let local_capabilities = vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
@@ -8363,7 +8358,10 @@ mod event_loop_tests {
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
         let (update_tx, _update_rx) = mpsc::channel(8);
 
-        let added = state.write().await.add_peer(&peer_cfg(peer_ip, 65099), update_tx);
+        let added = state
+            .write()
+            .await
+            .add_peer(&peer_cfg(peer_ip, 65099), update_tx);
 
         assert!(added, "first add_peer must return true");
         let s = state.read().await;
@@ -8513,7 +8511,10 @@ mod event_loop_tests {
             vec![],
         ));
 
-        cmd_tx.send(DaemonCommand::RemovePeer(peer_ip)).await.unwrap();
+        cmd_tx
+            .send(DaemonCommand::RemovePeer(peer_ip))
+            .await
+            .unwrap();
         drop(cmd_tx);
         // Drop our own event_tx so the event loop terminates after draining.
         drop(event_tx);
@@ -9059,10 +9060,15 @@ mod run_with_tests {
         let mut cfg = make_config(&[(peer_ip, 65002)]);
         cfg.peers[0].md5_password = Some("s3cr3t".to_string());
 
-        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
+            build_daemon(&cfg, spawn_fn).await;
 
         assert_eq!(
-            md5_passwords.read().await.get(&IpAddr::V4(peer_ip)).map(String::as_str),
+            md5_passwords
+                .read()
+                .await
+                .get(&IpAddr::V4(peer_ip))
+                .map(String::as_str),
             Some("s3cr3t"),
             "MD5 password must be present in the listener key map"
         );
@@ -9075,7 +9081,8 @@ mod run_with_tests {
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_ip, 65002)]); // md5_password = None
 
-        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
+            build_daemon(&cfg, spawn_fn).await;
 
         assert!(
             md5_passwords.read().await.is_empty(),
@@ -9095,7 +9102,8 @@ mod run_with_tests {
         cfg.peers[0].md5_password = Some("key-for-a".to_string());
         // peer_b has no password
 
-        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) = build_daemon(&cfg, spawn_fn).await;
+        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
+            build_daemon(&cfg, spawn_fn).await;
         let md5 = md5_passwords.read().await;
 
         assert_eq!(

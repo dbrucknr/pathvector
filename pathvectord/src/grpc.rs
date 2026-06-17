@@ -45,10 +45,9 @@ use proto::{
     ListOriginatedRoutesResponse, ListPeersRequest, ListPeersResponse, ListRoutesRequest,
     ListRoutesResponse, OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest,
     OriginateRoutesResponse, PeerEvent, PeerEventType, PeerState, PolicyAction, RemovePeerRequest,
-    RemovePeerResponse, Route, RouteEvent, RouteEventType, RouteResponse,
-    SetExportDefaultRequest, SetExportDefaultResponse, SetImportDefaultRequest,
-    SetImportDefaultResponse, WatchPeersRequest, WatchRoutesRequest,
-    WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse,
+    RemovePeerResponse, Route, RouteEvent, RouteEventType, RouteResponse, SetExportDefaultRequest,
+    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse, WatchPeersRequest,
+    WatchRoutesRequest, WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse,
     WithdrawOriginatedRoutesRequest, WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
@@ -1175,8 +1174,8 @@ mod tests {
     use proto::{
         AddPeerRequest, AddPeerResponse, GetBestRouteRequest, GetPeerRequest,
         ListCandidatesRequest, ListOriginatedRoutesRequest, ListPeersRequest, ListRoutesRequest,
-        OriginateRouteRequest, OriginateRoutesRequest, RemovePeerRequest,
-        SetExportDefaultRequest, SetImportDefaultRequest, WatchPeersRequest, WatchRoutesRequest,
+        OriginateRouteRequest, OriginateRoutesRequest, RemovePeerRequest, SetExportDefaultRequest,
+        SetImportDefaultRequest, WatchPeersRequest, WatchRoutesRequest,
         WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
         origination_service_server::OriginationService, peer_service_server::PeerService,
         policy_service_server::PolicyService, rib_service_server::RibService,
@@ -1436,7 +1435,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_peers_empty_state() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
             .await
@@ -1449,7 +1451,10 @@ mod tests {
         let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
             .await
@@ -1473,7 +1478,10 @@ mod tests {
             .await
             .on_established(addr, PeerType::External, 65002, 90, &[], None);
 
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
             .await
@@ -1493,7 +1501,10 @@ mod tests {
     async fn test_get_peer_idle() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
 
         let resp = svc
             .get_peer(Request::new(GetPeerRequest {
@@ -1510,7 +1521,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_peer_not_found_returns_not_found_status() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
 
         let err = svc
             .get_peer(Request::new(GetPeerRequest {
@@ -1524,7 +1538,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_peer_invalid_address_returns_invalid_argument() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
 
         let err = svc
             .get_peer(Request::new(GetPeerRequest {
@@ -1540,7 +1557,10 @@ mod tests {
     #[tokio::test]
     async fn test_add_peer_invalid_address() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
                 address: "not-an-ip".into(),
@@ -1555,7 +1575,10 @@ mod tests {
     #[tokio::test]
     async fn test_add_peer_rejects_as_zero() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
                 address: "10.0.0.2".into(),
@@ -1571,7 +1594,10 @@ mod tests {
     #[tokio::test]
     async fn test_add_peer_rejects_as_trans() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
                 address: "10.0.0.2".into(),
@@ -1604,7 +1630,10 @@ mod tests {
         let DaemonCommand::AddPeer(cfg) = cmd else {
             panic!("expected AddPeer command")
         };
-        assert_eq!(cfg.address, "10.0.0.2".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            cfg.address,
+            "10.0.0.2".parse::<std::net::Ipv4Addr>().unwrap()
+        );
         assert_eq!(cfg.remote_as, 65002);
         assert_eq!(cfg.port, 179, "port 0 must default to 179");
     }
@@ -1612,7 +1641,10 @@ mod tests {
     #[tokio::test]
     async fn test_remove_peer_invalid_address() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let err = svc
             .remove_peer(Request::new(RemovePeerRequest {
                 address: "bad".into(),
@@ -1625,7 +1657,10 @@ mod tests {
     #[tokio::test]
     async fn test_remove_peer_not_found() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let err = svc
             .remove_peer(Request::new(RemovePeerRequest {
                 address: "10.0.0.2".into(),
@@ -3002,7 +3037,10 @@ mod tests {
     #[tokio::test]
     async fn test_watch_peers_empty_state_yields_end_initial() {
         let state = arc_state(65001, &[]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
             .await
@@ -3020,7 +3058,10 @@ mod tests {
     async fn test_watch_peers_with_peer_yields_current_then_end_initial() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
-        let svc = PeerServiceImpl { state, cmd_tx: noop_cmd_tx() };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+        };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
             .await
