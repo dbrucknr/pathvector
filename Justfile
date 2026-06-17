@@ -223,6 +223,9 @@ mrt mrt_file='':
         exit 1
     fi
     cargo build --release -p pathvectord -p pathvector-mrt
+    # Kill any leftover pathvectord holding port 1179 or 51200 from a previous run.
+    pkill -x pathvectord 2>/dev/null || true
+    sleep 0.3
     echo "Starting pathvectord on port 1179..."
     ./target/release/pathvectord e2e/fixtures/mrt-pathvectord.toml &
     PVDPID=$!
