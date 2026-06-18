@@ -428,8 +428,12 @@ impl DaemonState {
         self.adj_ribs_in_v6
             .insert(peer.address, AdjRibIn::new(peer_id));
         self.adj_ribs_out.insert(peer.address, adj_out.clone());
-        self.adj_ribs_out_v6
-            .insert(peer.address, AdjRibOut::new(peer_id, pt));
+        let adj_out_v6 = if is_rr && pt == PeerType::Internal {
+            AdjRibOut::new_reflecting(peer_id, pt)
+        } else {
+            AdjRibOut::new(peer_id, pt)
+        };
+        self.adj_ribs_out_v6.insert(peer.address, adj_out_v6);
         self.peer_config_types.insert(peer.address, pt);
         self.import_policies.insert(
             peer.address,
@@ -667,8 +671,15 @@ impl DaemonState {
         }
         // Reset v6 RIBs so a re-established session starts clean.
         self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
-        self.adj_ribs_out_v6
-            .insert(peer_ip, AdjRibOut::new(peer_id, peer_type));
+        let adj_out_v6 = {
+            let is_rr = !self.rib.rr_clients.is_empty();
+            if is_rr && peer_type == PeerType::Internal {
+                AdjRibOut::new_reflecting(peer_id, peer_type)
+            } else {
+                AdjRibOut::new(peer_id, peer_type)
+            }
+        };
+        self.adj_ribs_out_v6.insert(peer_ip, adj_out_v6);
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
@@ -769,12 +780,27 @@ impl DaemonState {
             && !all_nlris_v6.is_empty()
             && let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip)
         {
+            let loc_rib_v6 = &self.rib.loc_rib_v6;
             let decisions_v6: Vec<PrefixDecisionV6> = all_nlris_v6
                 .into_iter()
                 .map(|nlri| {
+                    // RFC 4456 §8 split-horizon: same rule as IPv4 — block
+                    // non-client iBGP → non-client iBGP in the initial dump.
+                    if is_rr
+                        && peer_type == PeerType::Internal
+                        && let Some(src) = loc_rib_v6.best_peer(&nlri)
+                        && let IpAddr::V4(src_ip) = src.ip()
+                    {
+                        let src_is_client = rr_clients.contains(&src_ip);
+                        let src_is_ibgp =
+                            peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                        if src_is_ibgp && !src_is_client && !dest_is_client {
+                            return PrefixDecisionV6::NoChange;
+                        }
+                    }
                     propagate_prefix_v6(
                         nlri,
-                        &self.rib.loc_rib_v6,
+                        loc_rib_v6,
                         adj_rib_out_v6,
                         peer_type,
                         local_as,
@@ -872,7 +898,12 @@ impl DaemonState {
             };
         }
         if let Some(aro) = self.adj_ribs_out_v6.get_mut(&peer_ip) {
-            *aro = AdjRibOut::new(peer_id, cfg_pt);
+            let is_rr = !self.rib.rr_clients.is_empty();
+            *aro = if is_rr && cfg_pt == PeerType::Internal {
+                AdjRibOut::new_reflecting(peer_id, cfg_pt)
+            } else {
+                AdjRibOut::new(peer_id, cfg_pt)
+            };
         }
 
         // Tell all other established peers about the best-path changes caused
@@ -1422,6 +1453,7 @@ impl DaemonState {
             .copied()
             .filter(|ip| self.ipv6_capable_peers.contains(ip))
             .collect();
+        let is_rr = !self.rib.rr_clients.is_empty();
         let local_as = self.rib.local_as;
         let local_ipv6 = self.rib.local_ipv6;
         for peer_ip in established_peers {
@@ -1444,12 +1476,30 @@ impl DaemonState {
                 tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping v6 propagation");
                 continue;
             };
+            let rr_clients = &self.rib.rr_clients;
+            let peer_types = &self.rib.peer_types;
+            let loc_rib_v6 = &self.rib.loc_rib_v6;
+            let dest_is_client = rr_clients.contains(&peer_ip);
             let decisions: Vec<PrefixDecisionV6> = nlris
                 .iter()
                 .map(|&nlri| {
+                    // RFC 4456 §8 split-horizon: block non-client iBGP →
+                    // non-client iBGP for IPv6 routes (same rule as IPv4).
+                    if is_rr
+                        && peer_type == PeerType::Internal
+                        && let Some(src) = loc_rib_v6.best_peer(&nlri)
+                        && let IpAddr::V4(src_ip) = src.ip()
+                    {
+                        let src_is_client = rr_clients.contains(&src_ip);
+                        let src_is_ibgp =
+                            peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                        if src_is_ibgp && !src_is_client && !dest_is_client {
+                            return PrefixDecisionV6::NoChange;
+                        }
+                    }
                     propagate_prefix_v6(
                         nlri,
-                        &self.rib.loc_rib_v6,
+                        loc_rib_v6,
                         adj_rib_out_v6,
                         peer_type,
                         local_as,
@@ -7848,6 +7898,125 @@ mod tests {
         assert!(
             has_cluster,
             "CLUSTER_LIST must contain cluster_id when reflecting non-client iBGP route to client"
+        );
+    }
+
+    // ── RFC 4456 §8 IPv6 route paths ─────────────────────────────────────────
+
+    fn nlri_v6_rr(s: &str) -> Nlri<Ipv6Addr> {
+        s.parse().unwrap()
+    }
+
+    fn route_v6_ibgp(prefix: &str) -> Route<Ipv6Addr> {
+        use pathvector_types::{AsPath, Origin};
+        RouteBuilder::new(nlri_v6_rr(prefix), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::Internal)
+            .build()
+    }
+
+    // Inject a v6 route from `src_peer` into loc_rib_v6 and mark `src_peer` as
+    // the iBGP source so split-horizon has a peer to look up.
+    fn inject_v6_route(state: &mut DaemonState, src_peer: Ipv4Addr, prefix: &str) {
+        let peer_id = PeerId::new(IpAddr::V4(src_peer));
+        let route = route_v6_ibgp(prefix);
+        state.rib_insert_v6(peer_id, route);
+        Arc::make_mut(&mut state.rib)
+            .peer_types
+            .insert(src_peer, PeerType::Internal);
+    }
+
+    // RFC 4456 §8: adj_ribs_out_v6 must use new_reflecting for all iBGP peers
+    // when the daemon acts as an RR (set during add_peer, not just at startup).
+    #[test]
+    fn test_rr_v6_adj_rib_out_is_reflecting_for_ibgp_peer() {
+        let cluster_id: u32 = 5;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let non_client: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        let (state, _receivers) = make_rr_state(65001, cluster_id, &[client], &[non_client]);
+
+        let client_aro_v6 = state.adj_ribs_out_v6.get(&client).unwrap();
+        assert!(
+            client_aro_v6.reflects(),
+            "adj_ribs_out_v6 for RR client must use reflecting mode"
+        );
+        let nc_aro_v6 = state.adj_ribs_out_v6.get(&non_client).unwrap();
+        assert!(
+            nc_aro_v6.reflects(),
+            "adj_ribs_out_v6 for non-client iBGP peer must use reflecting mode when acting as RR"
+        );
+    }
+
+    // RFC 4456 §8: adj_ribs_out_v6 is reset to new_reflecting on reconnect.
+    #[test]
+    fn test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect() {
+        let cluster_id: u32 = 5;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _receivers) = make_rr_state(65001, cluster_id, &[client], &[]);
+
+        // Simulate a session teardown and re-establish.
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        let aro_v6 = state.adj_ribs_out_v6.get(&client).unwrap();
+        assert!(
+            aro_v6.reflects(),
+            "adj_ribs_out_v6 must be reflecting after reconnect when acting as RR"
+        );
+    }
+
+    // RFC 4456 §8: propagate_to_all_peers_v6 must block non-client → non-client.
+    #[test]
+    fn test_rr_v6_split_horizon_blocks_non_client_to_non_client() {
+        let cluster_id: u32 = 3;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let nc1: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        let nc2: Ipv4Addr = "10.0.0.11".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[nc1, nc2]);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(nc1, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(nc2, PeerType::Internal, 65001, 90, &[], None);
+
+        // Mark nc1 and nc2 as IPv6-capable so propagate_to_all_peers_v6 includes them.
+        state.ipv6_capable_peers.insert(nc1);
+        state.ipv6_capable_peers.insert(nc2);
+        state.ipv6_capable_peers.insert(client);
+
+        // Inject a v6 route sourced from nc1 (non-client iBGP).
+        inject_v6_route(&mut state, nc1, "2001:db8::/32");
+        state.propagate_to_all_peers_v6(&[nlri_v6_rr("2001:db8::/32")]);
+
+        // nc2 (non-client iBGP) must NOT receive the route.
+        assert!(
+            receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
+            "non-client iBGP → non-client iBGP must be blocked for IPv6 routes (RFC 4456 §8)"
+        );
+        // client MUST receive the route.
+        assert!(
+            receivers.get_mut(&client).unwrap().try_recv().is_ok(),
+            "non-client iBGP → client must be allowed for IPv6 routes (RFC 4456 §8)"
+        );
+    }
+
+    // RFC 4456 §8: on_established full-table dump must apply split-horizon for v6.
+    #[test]
+    fn test_rr_v6_established_dump_applies_split_horizon() {
+        let cluster_id: u32 = 3;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let nc1: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        let nc2: Ipv4Addr = "10.0.0.11".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[nc1, nc2]);
+
+        // nc1 connects and we add a v6 route sourced from nc1.
+        state.on_established(nc1, PeerType::Internal, 65001, 90, &[], None);
+        inject_v6_route(&mut state, nc1, "2001:db8:1::/48");
+
+        // nc2 now connects — full-table dump should NOT send the nc1 route to nc2.
+        // Pass MultiProtocol IPv6 capability so the v6 dump fires.
+        let caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(nc2, PeerType::Internal, 65001, 90, &caps, None);
+
+        assert!(
+            receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
+            "v6 full-table dump must not send non-client iBGP routes to another non-client (RFC 4456 §8)"
         );
     }
 }
