@@ -8,19 +8,21 @@
 //! pathvector [--address <url>] <COMMAND>
 //!
 //! Commands:
-//!   peer list                                         List all configured peers
-//!   peer get <ADDRESS>                                Show detailed state for one peer
-//!   route list [--peer <ADDRESS>]                     List all best routes (optional peer filter)
-//!   route best <PREFIX>                               Best route for a CIDR prefix
-//!   route candidates <PREFIX>                         All candidate routes for a prefix
-//!   route originate <PREFIX> --next-hop <IP> [opts]   Inject a locally originated route
-//!   route withdraw <PREFIX>                           Withdraw a locally originated route
-//!   route list-originated                             List all locally originated routes
-//!   policy set-import <ADDR> <DECISION>               Change import-policy default (no session reset)
-//!   policy set-export <ADDR> <DECISION>               Change export-policy default (no session reset)
-//!   watch routes [--peer <ADDRESS>]                   Stream live Loc-RIB changes to stdout
-//!   watch peers                                       Stream live peer session changes to stdout
-//!   dashboard                                         Live-updating TUI (press q to quit)
+//!   peer list                                              List all configured peers
+//!   peer get <ADDRESS>                                     Show detailed state for one peer
+//!   peer add --address <IP> --remote-as <ASN> [opts]       Add a peer at runtime (no restart)
+//!   peer remove <ADDRESS>                                  Remove a peer at runtime
+//!   route list [--peer <ADDRESS>]                          List all best routes (optional peer filter)
+//!   route best <PREFIX>                                    Best route for a CIDR prefix
+//!   route candidates <PREFIX>                              All candidate routes for a prefix
+//!   route originate <PREFIX> --next-hop <IP> [opts]        Inject a locally originated route
+//!   route withdraw <PREFIX>                                Withdraw a locally originated route
+//!   route list-originated                                  List all locally originated routes
+//!   policy set-import <ADDR> <DECISION>                    Change import-policy default (no session reset)
+//!   policy set-export <ADDR> <DECISION>                    Change export-policy default (no session reset)
+//!   watch routes [--peer <ADDRESS>]                        Stream live Loc-RIB changes to stdout
+//!   watch peers                                            Stream live peer session changes to stdout
+//!   dashboard                                              Live-updating TUI (press q to quit)
 //! ```
 //!
 //! The `--address` flag and `PATHVECTOR_ADDRESS` environment variable both
@@ -36,9 +38,14 @@ use std::net::IpAddr;
 
 use clap::Parser;
 use futures::StreamExt as _;
-use pathvector_client::{PathvectorClient, types::OriginateRouteParams};
+use pathvector_client::{
+    PathvectorClient,
+    types::{AddPeerParams, OriginateRouteParams},
+};
 
-use cli::{Cli, Commands, OriginArg, PeerCommands, PolicyCommands, RouteCommands, WatchCommands};
+use cli::{
+    Cli, Commands, Decision, OriginArg, PeerCommands, PolicyCommands, RouteCommands, WatchCommands,
+};
 use client_trait::DaemonClient;
 use error::CliError;
 
@@ -146,6 +153,40 @@ where
                     })?;
                     let peer_state = client.get_peer(ip).await?;
                     output::print_peer_detail(&peer_state);
+                }
+                PeerCommands::Add {
+                    address,
+                    remote_as,
+                    port,
+                    import_default,
+                    export_default,
+                    md5_password,
+                } => {
+                    let ip: IpAddr = address.parse().map_err(|_| {
+                        pathvector_client::error::ClientError::Rpc(tonic::Status::invalid_argument(
+                            format!("'{address}' is not a valid IP address"),
+                        ))
+                    })?;
+                    client
+                        .add_peer(AddPeerParams {
+                            address: ip,
+                            remote_as,
+                            port,
+                            import_default: import_default.map(Decision::as_bool),
+                            export_default: export_default.map(Decision::as_bool),
+                            md5_password,
+                        })
+                        .await?;
+                    println!("Peer {ip} added.");
+                }
+                PeerCommands::Remove { address } => {
+                    let ip: IpAddr = address.parse().map_err(|_| {
+                        pathvector_client::error::ClientError::Rpc(tonic::Status::invalid_argument(
+                            format!("'{address}' is not a valid IP address"),
+                        ))
+                    })?;
+                    client.remove_peer(ip).await?;
+                    println!("Peer {ip} removed.");
                 }
             }
         }
@@ -415,6 +456,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a valid IP address"));
+    }
+
+    // ── peer add / remove ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn peer_add_minimal() {
+        run_cmd(
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+            ],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_add_with_explicit_policy() {
+        run_cmd(
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+                "--import-default",
+                "accept",
+                "--export-default",
+                "reject",
+            ],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_add_with_all_flags() {
+        run_cmd(
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+                "--port",
+                "1179",
+                "--import-default",
+                "accept",
+                "--export-default",
+                "accept",
+                "--md5-password",
+                "secret",
+            ],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_add_invalid_address() {
+        let err = run_cmd(
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "not-an-ip",
+                "--remote-as",
+                "65003",
+            ],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not a valid IP address"));
+    }
+
+    #[tokio::test]
+    async fn peer_add_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        let err = run_cmd(
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+            ],
+            mock,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no daemon"));
+    }
+
+    #[tokio::test]
+    async fn peer_remove_ok() {
+        run_cmd(
+            &["pv", "peer", "remove", "10.0.0.3"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_remove_invalid_address() {
+        let err = run_cmd(
+            &["pv", "peer", "remove", "not-an-ip"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not a valid IP address"));
+    }
+
+    #[tokio::test]
+    async fn peer_remove_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::not_found("peer not found"),
+        ));
+        let err = run_cmd(&["pv", "peer", "remove", "10.0.0.3"], mock)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("peer not found"));
     }
 
     // ── route list ────────────────────────────────────────────────────────────

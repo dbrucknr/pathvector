@@ -206,7 +206,7 @@ pub(crate) struct DaemonState {
     /// When `Terminated` arrives for a peer in this set, the event loop calls
     /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
     /// resetting it for a reconnect.
-    pending_removal: HashSet<Ipv4Addr>,
+    pub(crate) pending_removal: HashSet<Ipv4Addr>,
     /// Broadcast channel for Loc-RIB events (announced / withdrawn).
     ///
     /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
@@ -324,6 +324,10 @@ impl DaemonState {
 
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
+        // Capacity of 1024 events each.  A receiver that falls >1024 events
+        // behind sees `RecvError::Lagged`; the `watch_peers` gRPC stream handler
+        // defends against this by re-reading the full snapshot on any
+        // `Changed(peer: None)` signal, so no events are permanently lost.
         let (route_tx, _) = broadcast::channel(1024);
         let (peer_tx, _) = broadcast::channel(1024);
 
@@ -771,7 +775,9 @@ impl DaemonState {
     /// any best-path changes caused by the withdrawal to all remaining
     /// established peers.
     #[allow(clippy::similar_names)]
-    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr) {
+    /// `notify` controls whether a `peer_tx` broadcast is sent.  Pass `false`
+    /// when the caller will send a more specific event (e.g. `Removed`) instead.
+    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr, notify: bool) {
         let peer_id = PeerId::from(peer_ip);
 
         // Remove live session state from snapshot.
@@ -835,6 +841,12 @@ impl DaemonState {
 
         // Tell all other established peers about the best-path changes caused
         // by this teardown.
+        //
+        // WARNING: this loop runs synchronously while holding the DaemonState
+        // write lock.  For a peer with a large route table the loop can stall
+        // BGP event processing (including KEEPALIVE handling) for tens of
+        // milliseconds.  A stall warning is emitted below if the loop exceeds
+        // 100 ms.  See TODO.md (dynamic peer gap #5) for the tracking item.
         let other_peers: Vec<Ipv4Addr> = self
             .rib
             .peer_types
@@ -845,6 +857,8 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let propagation_start = std::time::Instant::now();
+        let prefix_count = prev_prefixes.len();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -891,15 +905,29 @@ impl DaemonState {
             self.sync_advertised(other_ip);
         }
 
+        let elapsed = propagation_start.elapsed();
+        if elapsed.as_millis() > 100 {
+            tracing::warn!(
+                peer = %peer_ip,
+                prefixes = prefix_count,
+                elapsed_ms = elapsed.as_millis(),
+                "on_terminated propagation loop held the event-loop lock for > 100 ms; \
+                 KEEPALIVE processing for other sessions was stalled for this duration. \
+                 Consider removing peers with large route tables during maintenance windows."
+            );
+        }
+
         // Emit Withdrawn RouteEvents for every NLRI that lost its best path
         // (or Announced if another peer's route was promoted). Without this,
         // the dashboard shows stale routes after a peer disconnects.
         self.emit_route_events(&prev_prefixes);
 
-        let _ = self.peer_tx.send(proto::PeerEvent {
-            r#type: proto::PeerEventType::Changed as i32,
-            peer: None, // gRPC handler builds PeerState from snapshot
-        });
+        if notify {
+            let _ = self.peer_tx.send(proto::PeerEvent {
+                r#type: proto::PeerEventType::Changed as i32,
+                peer: None, // gRPC handler builds PeerState from snapshot
+            });
+        }
 
         tracing::info!(
             peer = %peer_ip,
@@ -1804,7 +1832,11 @@ where
             Capability::FourByteAsn(local_as),
             Capability::ExtendedMessage,
         ];
-        tokio::spawn(run_command_processor(
+        let peer_store = cfg
+            .sidecar_path
+            .as_ref()
+            .map(|p| Arc::new(config::DynamicPeerStore::new(p.clone())));
+        let proc_handle = tokio::spawn(run_command_processor(
             cmd_rx,
             state_cmd,
             stop_cmd,
@@ -1817,7 +1849,18 @@ where
                 hold_time,
                 local_capabilities: local_caps,
             },
+            peer_store,
         ));
+        // Log a clear error if the command processor panics so operators know
+        // why AddPeer / RemovePeer gRPC calls are failing.
+        tokio::spawn(async move {
+            if let Err(e) = proc_handle.await {
+                tracing::error!(
+                    error = %e,
+                    "command processor task panicked — AddPeer/RemovePeer are unavailable"
+                );
+            }
+        });
     }
 
     run_event_loop(event_rx, state, stop_senders, Some(fib_change_rx)).await;
@@ -1839,6 +1882,7 @@ struct SpawnConfig {
 /// Runs as an independent task alongside the event loop so that peer additions
 /// and removals never block BGP event processing.  All shared state is accessed
 /// via `Arc`-wrapped maps; the BGP event loop itself only sees session events.
+#[allow(clippy::too_many_arguments)]
 async fn run_command_processor<H, F>(
     mut cmd_rx: mpsc::Receiver<DaemonCommand>,
     state: Arc<RwLock<DaemonState>>,
@@ -1847,6 +1891,7 @@ async fn run_command_processor<H, F>(
     event_tx: mpsc::Sender<(Ipv4Addr, SessionEvent)>,
     spawn_fn: F,
     cfg: SpawnConfig,
+    peer_store: Option<Arc<config::DynamicPeerStore>>,
 ) where
     H: SessionHandle + 'static,
     F: Fn(SessionConfig) -> H,
@@ -1854,10 +1899,30 @@ async fn run_command_processor<H, F>(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             DaemonCommand::AddPeer(peer) => {
-                // Idempotency: if the peer already exists do nothing.
-                if state.read().await.adj_ribs_in.contains_key(&peer.address) {
-                    tracing::debug!(peer = %peer.address, "AddPeer: already configured, skipping");
-                    continue;
+                // Idempotency: skip if the peer is already configured.
+                //
+                // Special case: if the peer is present but marked for removal
+                // (`pending_removal`), the teardown hasn't completed yet.  We
+                // still skip the add — the operator must wait for the Terminated
+                // event to clear all per-peer state before re-adding.  A warning
+                // is logged so operators can diagnose a "silent drop" scenario.
+                {
+                    let s = state.read().await;
+                    if s.adj_ribs_in.contains_key(&peer.address) {
+                        if s.pending_removal.contains(&peer.address) {
+                            tracing::warn!(
+                                peer = %peer.address,
+                                "AddPeer: peer teardown is in progress; \
+                                 this AddPeer will be dropped — retry after removal completes"
+                            );
+                        } else {
+                            tracing::debug!(
+                                peer = %peer.address,
+                                "AddPeer: peer already configured, skipping (idempotent)"
+                            );
+                        }
+                        continue;
+                    }
                 }
 
                 let session_cfg = SessionConfig {
@@ -1898,6 +1963,9 @@ async fn run_command_processor<H, F>(
                     }
                 });
 
+                if let Some(store) = &peer_store {
+                    store.upsert(peer.clone()).await;
+                }
                 tracing::info!(peer = %peer.address, remote_as = peer.remote_as, "AddPeer: session started");
             }
 
@@ -1936,7 +2004,9 @@ async fn run_command_processor<H, F>(
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
                 // remove_peer() is called by the event loop.
-
+                if let Some(store) = &peer_store {
+                    store.remove(peer_ip).await;
+                }
                 tracing::info!(peer = %peer_ip, "RemovePeer: session teardown initiated");
             }
         }
@@ -2172,7 +2242,21 @@ pub(crate) async fn run_event_loop(
                     }
                     SessionEvent::Terminated => {
                         let is_removed = s.pending_removal.remove(&peer_ip);
-                        s.on_terminated(peer_ip);
+                        // Capture identity fields while they are still in the
+                        // RIB.  on_terminated clears session-level state
+                        // (peer_types, hold_times, etc.); remove_peer clears
+                        // everything including peer_remote_as.  Both run below.
+                        let removal_identity = if is_removed {
+                            s.rib.peer_remote_as.get(&peer_ip).copied().map(|remote_as| {
+                                (remote_as, s.rib.local_as)
+                            })
+                        } else {
+                            None
+                        };
+                        // For removal, suppress the intermediate Changed(None)
+                        // broadcast — the explicit Removed event below is the
+                        // authoritative notification.
+                        s.on_terminated(peer_ip, !is_removed);
                         if is_removed {
                             // Permanent removal: erase all per-peer state so
                             // the peer no longer appears in gRPC responses and
@@ -2180,6 +2264,21 @@ pub(crate) async fn run_event_loop(
                             // be sent to this session.
                             s.remove_peer(peer_ip);
                             stop_senders.lock().unwrap().remove(&peer_ip);
+                            // Broadcast a Removed event carrying the last-known
+                            // remote_as and local_as so watch_peers subscribers
+                            // can identify the removed peer without re-reading a
+                            // snapshot that no longer contains it.
+                            if let Some((remote_as, local_as)) = removal_identity {
+                                let _ = s.peer_tx.send(proto::PeerEvent {
+                                    r#type: proto::PeerEventType::Removed as i32,
+                                    peer: Some(proto::PeerState {
+                                        address: peer_ip.to_string(),
+                                        remote_as,
+                                        local_as,
+                                        ..Default::default()
+                                    }),
+                                });
+                            }
                         }
                     }
                     SessionEvent::RouteUpdate(msg) => {
@@ -3210,7 +3309,7 @@ mod tests {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[], None);
-        state.on_terminated(peer_ip);
+        state.on_terminated(peer_ip, true);
         assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
 
@@ -3232,7 +3331,7 @@ mod tests {
         );
         assert_eq!(state.rib.loc_rib.len(), 1);
 
-        state.on_terminated(peer_ip);
+        state.on_terminated(peer_ip, true);
         assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
@@ -3263,7 +3362,7 @@ mod tests {
         receivers.get_mut(&peer_b).unwrap().try_recv().ok();
 
         // Terminate peer_a — peer_b must receive a WITHDRAW.
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
 
         let msg = receivers
             .get_mut(&peer_b)
@@ -6870,7 +6969,7 @@ mod tests {
         state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
         state.adj_ribs_out.remove(&peer_b);
 
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
 
         assert!(!state.rib.peer_types.contains_key(&peer_a));
         assert!(state.rib.peer_types.contains_key(&peer_b));
@@ -6887,7 +6986,7 @@ mod tests {
         state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
         state.update_senders.remove(&peer_b);
 
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
 
         assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
@@ -7138,7 +7237,7 @@ mod tests {
 
         // Terminating peer_a iterates established peers; ghost has no policy /
         // rib entries — the error branch logs and continues without panicking.
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
         assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
 
@@ -7740,7 +7839,7 @@ mod stall_tests {
         // We intentionally do NOT drain it — that fill is the one we rely on.
 
         // Terminate peer_a: the withdraw for peer_b's channel will fail (full).
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
         assert!(
             !state.take_stalled_peers().is_empty(),
             "peer_b must be stalled when its channel is full during termination propagation"
@@ -8521,6 +8620,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 local_capabilities: vec![],
             },
+            None,
         ));
 
         cmd_tx
@@ -8574,6 +8674,395 @@ mod event_loop_tests {
         assert!(
             s.rib.peer_remote_as.contains_key(&peer_ip),
             "peer_remote_as must be preserved for reconnect"
+        );
+    }
+
+    /// A second `Terminated` event for a peer that has already been fully
+    /// removed (via `pending_removal`) must be a no-op — it must not panic
+    /// or corrupt any state.
+    ///
+    /// This covers the window where both a natural TCP-disconnect `Terminated`
+    /// and a synthesized `Terminated` from `RemovePeer` arrive for the same
+    /// peer: the first one runs cleanup, the second one finds empty maps and
+    /// returns silently.
+    #[tokio::test]
+    async fn double_terminated_second_is_no_op() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
+
+        state.write().await.pending_removal.insert(peer_ip);
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        // First Terminated — runs cleanup (routes cleared, remove_peer called).
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        // Second Terminated — must be a no-op (maps already gone).
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        // Must complete without panicking.
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        let s = state.read().await;
+        assert!(
+            !s.adj_ribs_in.contains_key(&peer_ip),
+            "peer must be absent after double-Terminated with pending_removal"
+        );
+        assert!(
+            !s.pending_removal.contains(&peer_ip),
+            "pending_removal must be cleared after first Terminated"
+        );
+    }
+
+    /// `AddPeer` while the peer is in `pending_removal` must be silently
+    /// dropped — the spawn function must never be called.
+    ///
+    /// The operator must wait until the Terminated event clears all per-peer
+    /// state before re-adding the peer.
+    #[tokio::test]
+    async fn add_peer_while_pending_removal_is_dropped() {
+        struct NeverSpawned;
+        impl SessionHandle for NeverSpawned {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+        }
+
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
+
+        // Mark the peer as being removed — teardown is in progress.
+        state.write().await.pending_removal.insert(peer_ip);
+
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+
+        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+            cmd_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            incoming,
+            event_tx,
+            // If spawn_fn is called the test panics — AddPeer must be dropped.
+            |_cfg| panic!("spawn_fn must not be called while peer is in pending_removal"),
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: 180,
+                local_capabilities: vec![],
+            },
+            None,
+        ));
+
+        cmd_tx
+            .send(DaemonCommand::AddPeer(peer_cfg(peer_ip, 65099)))
+            .await
+            .unwrap();
+        drop(cmd_tx);
+
+        // Give the command processor a moment to process the command.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Peer must still be in pending_removal — add was dropped.
+        let s = state.read().await;
+        assert!(
+            s.pending_removal.contains(&peer_ip),
+            "pending_removal must still contain the peer after a dropped AddPeer"
+        );
+        // adj_ribs_in must still have the peer (it was there before the add attempt).
+        assert!(
+            s.adj_ribs_in.contains_key(&peer_ip),
+            "adj_ribs_in must be unchanged — no second entry was added"
+        );
+    }
+
+    // ── Removed broadcast correctness ─────────────────────────────────────────
+
+    /// When a peer in `pending_removal` receives `Terminated`, the event loop
+    /// must broadcast exactly **one** `Removed` event on `peer_tx` and it must
+    /// carry the correct `remote_as` and `local_as` captured before the state
+    /// was erased.
+    ///
+    /// This is the critical regression test for the fix that replaced the
+    /// diff-based approach (which emitted `remote_as: 0`) with capturing
+    /// identity fields before `on_terminated` / `remove_peer` run.
+    #[tokio::test]
+    async fn terminated_with_pending_removal_broadcasts_removed_event_with_correct_fields() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let remote_as = 65099_u32;
+        let local_as = 65001_u32;
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, remote_as)], 8);
+
+        // Subscribe BEFORE the event fires so we don't miss the broadcast.
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        state.write().await.pending_removal.insert(peer_ip);
+
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        // Collect all events broadcast during the loop.
+        let mut events = vec![];
+        while let Ok(ev) = peer_rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Exactly one event must have been sent.
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one peer_tx event must fire for a pending_removal Terminated; got {events:?}"
+        );
+
+        let ev = &events[0];
+        assert_eq!(
+            ev.r#type,
+            proto::PeerEventType::Removed as i32,
+            "event type must be Removed"
+        );
+
+        let ps = ev
+            .peer
+            .as_ref()
+            .expect("Removed event must carry a PeerState");
+        assert_eq!(ps.address, peer_ip.to_string(), "address must match");
+        assert_eq!(ps.remote_as, remote_as, "remote_as must not be zeroed");
+        assert_eq!(ps.local_as, local_as, "local_as must not be zeroed");
+    }
+
+    /// When a normal peer (not in `pending_removal`) receives `Terminated`, the
+    /// event loop must broadcast exactly **one** `Changed(peer: None)` event —
+    /// not a `Removed` — so monitoring tools see the peer go Idle rather than
+    /// disappear.
+    ///
+    /// This is a regression guard for the `notify: bool` parameter: the normal
+    /// reconnect path must still send its notification.
+    #[tokio::test]
+    async fn terminated_without_pending_removal_broadcasts_changed_not_removed() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        let mut events = vec![];
+        while let Ok(ev) = peer_rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one peer_tx event must fire for a normal Terminated; got {events:?}"
+        );
+        assert_eq!(
+            events[0].r#type,
+            proto::PeerEventType::Changed as i32,
+            "normal Terminated must emit Changed, not Removed"
+        );
+        assert!(
+            events[0].peer.is_none(),
+            "Changed signal from on_terminated must have peer: None (stream builds payload)"
+        );
+    }
+
+    /// `on_terminated(peer_ip, notify: false)` must not send any broadcast on
+    /// `peer_tx`.  This is a direct unit test of the new parameter — if it is
+    /// ever dropped or inverted, this test will catch the regression.
+    #[tokio::test]
+    async fn on_terminated_notify_false_sends_no_broadcast() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        state.write().await.on_terminated(peer_ip, false);
+
+        // No broadcast must arrive.
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "on_terminated(notify=false) must not send to peer_tx"
+        );
+    }
+
+    /// `on_terminated(peer_ip, notify: true)` must send exactly one
+    /// `Changed(peer: None)` broadcast on `peer_tx`.
+    #[tokio::test]
+    async fn on_terminated_notify_true_sends_changed_broadcast() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        state.write().await.on_terminated(peer_ip, true);
+
+        let ev = peer_rx
+            .try_recv()
+            .expect("on_terminated(notify=true) must send to peer_tx");
+        assert_eq!(
+            ev.r#type,
+            proto::PeerEventType::Changed as i32,
+            "broadcast must be Changed"
+        );
+        assert!(ev.peer.is_none(), "Changed signal must have peer: None");
+        assert!(peer_rx.try_recv().is_err(), "must send exactly one event");
+    }
+
+    // ── incoming_senders race-safety ──────────────────────────────────────────
+
+    /// After `RemovePeer` is processed by `run_command_processor`, the peer's
+    /// entry must be gone from `incoming_senders`.
+    ///
+    /// This proves that new inbound TCP connections from the removed peer are
+    /// rejected by `run_bgp_listener` before `Terminated` even fires — closing
+    /// the reconnect race window.
+    #[tokio::test]
+    async fn remove_peer_clears_incoming_senders() {
+        struct NeverSpawned;
+        impl SessionHandle for NeverSpawned {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+        }
+
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
+
+        // Pre-populate incoming_senders as if AddPeer had already run.
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<SessionCommand>(1);
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> = Arc::new(
+            RwLock::new(HashMap::from([(IpAddr::V4(peer_ip), incoming_tx)])),
+        );
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+            cmd_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::clone(&incoming),
+            event_tx,
+            |_cfg| unreachable!("RemovePeer must not call spawn_fn"),
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: 180,
+                local_capabilities: vec![],
+            },
+            None,
+        ));
+
+        assert!(
+            incoming.read().await.contains_key(&IpAddr::V4(peer_ip)),
+            "pre-condition: incoming_senders must contain the peer before RemovePeer"
+        );
+
+        cmd_tx
+            .send(DaemonCommand::RemovePeer(peer_ip))
+            .await
+            .unwrap();
+
+        // Allow the command processor to run the handler.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !incoming.read().await.contains_key(&IpAddr::V4(peer_ip)),
+            "incoming_senders must not contain the peer after RemovePeer — \
+             new inbound TCP connections must be rejected immediately"
+        );
+    }
+
+    /// `run_bgp_listener` must drop (RST) inbound TCP connections whose source
+    /// address is not in `incoming_senders`.
+    ///
+    /// This proves the other half of the race-safety invariant: even if an
+    /// adversarial or reconnecting peer dials in, the listener drops it without
+    /// forwarding it to any session actor.
+    #[tokio::test]
+    async fn bgp_listener_drops_unlisted_peer() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncReadExt as _;
+
+        // Bind the listener on a random OS-assigned port with an empty
+        // incoming_senders — no peers are known.
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let md5: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Spawn on port 0 so the OS assigns a free port.
+        let listener_sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener_sock.local_addr().unwrap().port();
+        drop(listener_sock);
+
+        let incoming_clone = Arc::clone(&incoming);
+        let md5_clone = Arc::clone(&md5);
+        tokio::spawn(async move {
+            run_bgp_listener(port, incoming_clone, md5_clone).await;
+        });
+
+        // Give the listener a moment to bind.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // Connect from 127.0.0.1 — not present in incoming_senders.
+        let mut conn = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .expect("TCP connect must succeed");
+
+        // The listener drops the stream immediately — we should see EOF (0
+        // bytes read) with no data sent, within a short timeout.
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(tokio::time::Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("read must complete within 2 s — listener must close the connection promptly")
+            .expect("read must not return an OS error");
+
+        assert_eq!(
+            n, 0,
+            "listener must send no data and close the connection for an unlisted peer"
         );
     }
 }
@@ -8725,6 +9214,171 @@ mod prop_tests {
             prop_assert!(result.as_path.contains(Asn::new(local_as)), "local AS must be in the path");
             prop_assert_eq!(result.next_hop, Some(NextHop::V4(bgp_id)), "NEXT_HOP must be rewritten");
             prop_assert!(result.local_pref.is_none(), "LOCAL_PREF must be stripped for eBGP");
+        }
+    }
+}
+
+/// Property tests for the dynamic peer management API.
+///
+/// These tests exercise arbitrary sequences of `add_peer` / `remove_peer` calls
+/// against a `DaemonState` and assert that the state maps remain self-consistent
+/// after every operation — no panics, no dangling keys, no phantom entries.
+#[cfg(test)]
+mod dynamic_peer_prop_tests {
+    use std::{collections::HashMap, net::Ipv4Addr};
+
+    use proptest::prelude::*;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::config;
+
+    fn peer_cfg(address: Ipv4Addr, remote_as: u32) -> config::PeerConfig {
+        config::PeerConfig {
+            address,
+            port: 179,
+            remote_as,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+        }
+    }
+
+    fn fresh_state(peers: &[(Ipv4Addr, u32)]) -> DaemonState {
+        let mut senders = HashMap::new();
+        for &(ip, _) in peers {
+            let (tx, _rx) = mpsc::channel(8);
+            senders.insert(ip, tx);
+        }
+        let cfgs: Vec<config::PeerConfig> = peers.iter().map(|&(a, r)| peer_cfg(a, r)).collect();
+        DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &cfgs,
+            senders,
+            vec![],
+        )
+    }
+
+    /// A `DaemonState` is self-consistent when every key present in
+    /// `adj_ribs_in` also appears in `peer_remote_as`, `adj_ribs_out`,
+    /// `import_policies`, and `export_policies` — and vice-versa.
+    fn assert_consistent(s: &DaemonState, label: &str) {
+        let ribs_in: std::collections::HashSet<_> = s.adj_ribs_in.keys().collect();
+        let remote_as: std::collections::HashSet<_> = s.rib.peer_remote_as.keys().collect();
+        let ribs_out: std::collections::HashSet<_> = s.adj_ribs_out.keys().collect();
+        let import: std::collections::HashSet<_> = s.import_policies.keys().collect();
+        let export: std::collections::HashSet<_> = s.export_policies.keys().collect();
+
+        assert_eq!(
+            ribs_in, remote_as,
+            "{label}: adj_ribs_in keys must equal peer_remote_as keys"
+        );
+        assert_eq!(
+            ribs_in, ribs_out,
+            "{label}: adj_ribs_in keys must equal adj_ribs_out keys"
+        );
+        assert_eq!(
+            ribs_in, import,
+            "{label}: adj_ribs_in keys must equal import_policies keys"
+        );
+        assert_eq!(
+            ribs_in, export,
+            "{label}: adj_ribs_in keys must equal export_policies keys"
+        );
+    }
+
+    /// Arbitrary sequences of add/remove for up to 4 peers must never corrupt
+    /// state.  Uses the last octet of 10.0.0.x as the peer discriminant.
+    #[derive(Clone, Debug)]
+    enum Op {
+        Add(u8), // peer last octet, always remote_as 65000 + octet
+        Remove(u8),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        (1u8..=4u8)
+            .prop_flat_map(|octet| prop_oneof![Just(Op::Add(octet)), Just(Op::Remove(octet)),])
+    }
+
+    proptest! {
+        /// Any sequence of up to 20 add/remove operations must leave
+        /// `DaemonState` self-consistent and must not panic.
+        #[test]
+        fn prop_add_remove_sequence_leaves_state_consistent(
+            ops in prop::collection::vec(op_strategy(), 1..=20)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut state = fresh_state(&[]);
+                assert_consistent(&state, "initial");
+
+                for (i, op) in ops.iter().enumerate() {
+                    match op {
+                        Op::Add(octet) => {
+                            let ip = Ipv4Addr::new(10, 0, 0, *octet);
+                            let remote_as = 65000 + u32::from(*octet);
+                            let (tx, _rx) = mpsc::channel(8);
+                            state.add_peer(&peer_cfg(ip, remote_as), tx);
+                        }
+                        Op::Remove(octet) => {
+                            let ip = Ipv4Addr::new(10, 0, 0, *octet);
+                            state.remove_peer(ip); // may return false — that's fine
+                        }
+                    }
+                    assert_consistent(&state, &format!("after op {i}: {op:?}"));
+                }
+
+                // pending_removal must be empty (we never used it in this test).
+                prop_assert!(
+                    state.pending_removal.is_empty(),
+                    "pending_removal must be empty after direct add/remove ops"
+                );
+                Ok(())
+            }).unwrap();
+        }
+
+        /// `add_peer` followed by `remove_peer` for the same address must leave
+        /// the state as if neither call was made — no phantom entries, no
+        /// dangling keys.
+        #[test]
+        fn prop_add_then_remove_is_identity(octet in 1u8..=4u8) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let ip = Ipv4Addr::new(10, 0, 0, octet);
+                let remote_as = 65000 + u32::from(octet);
+
+                let state_before = fresh_state(&[]);
+                let mut state_after = fresh_state(&[]);
+
+                let (tx, _rx) = mpsc::channel(8);
+                state_after.add_peer(&peer_cfg(ip, remote_as), tx);
+                state_after.remove_peer(ip);
+
+                // Key sets must match: after add+remove, no peer should remain.
+                prop_assert_eq!(
+                    state_after.adj_ribs_in.len(),
+                    state_before.adj_ribs_in.len(),
+                    "adj_ribs_in must be empty after add+remove"
+                );
+                prop_assert_eq!(
+                    state_after.rib.peer_remote_as.len(),
+                    state_before.rib.peer_remote_as.len(),
+                    "peer_remote_as must be empty after add+remove"
+                );
+                assert_consistent(&state_after, "after add+remove");
+                Ok(())
+            }).unwrap();
         }
     }
 }
@@ -8971,6 +9625,7 @@ mod run_with_tests {
                     is_rr_client: false,
                 })
                 .collect(),
+            sidecar_path: None,
         }
     }
 
@@ -9316,6 +9971,103 @@ mod run_with_tests {
         if let Ok(writer) = pathvector_sys::FibWriter::new(254, 20) {
             withdraw_stale_bgp_routes(stale_v4, stale_v6, &writer).await;
         }
+    }
+
+    // ── Dynamic peer persistence (sidecar) ───────────────────────────────────
+
+    /// Simulates a daemon restart: a peer is written to the sidecar, then the
+    /// sidecar is loaded and merged into a fresh config.  `build_daemon` must
+    /// spawn a session for the peer as if it had been statically configured.
+    ///
+    /// This is the integration-level proof that the `main.rs` startup path
+    /// correctly re-hydrates dynamic peers from the sidecar after a restart —
+    /// without requiring a real Docker container restart.
+    #[tokio::test]
+    async fn dynamic_peer_from_sidecar_is_loaded_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("dynamic_peers.toml");
+        let store = config::DynamicPeerStore::new(sidecar_path.clone());
+
+        // Write a peer into the sidecar as if it had been added via add_peer
+        // during a previous run.
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 5);
+        store
+            .upsert(config::PeerConfig {
+                address: peer_ip,
+                port: 179,
+                remote_as: 65099,
+                import_default: None,
+                import_default_v6: None,
+                export_default: None,
+                md5_password: None,
+                is_rr_client: false,
+            })
+            .await;
+
+        // Replicate what main.rs does on startup: load sidecar, merge into cfg.
+        let mut cfg = make_config(&[]);
+        for p in store.load() {
+            if !cfg.peers.iter().any(|x| x.address == p.address) {
+                cfg.peers.push(p);
+            }
+        }
+        cfg.sidecar_path = Some(sidecar_path);
+
+        // Build daemon — the sidecar peer must be treated as a static peer.
+        let (spawn_fn, spawned_peers) = make_mock_spawn();
+        let _ = build_daemon(&cfg, spawn_fn).await;
+
+        let peers = spawned_peers.lock().unwrap();
+        assert_eq!(
+            peers.len(),
+            1,
+            "exactly one session must be spawned for the sidecar peer"
+        );
+        assert!(
+            peers[0].started.load(Ordering::SeqCst),
+            "sidecar peer session must have start() called"
+        );
+    }
+
+    /// A peer in the sidecar must not be duplicated if it also appears in the
+    /// static config — the deduplication in main.rs must prevent a double-add.
+    #[tokio::test]
+    async fn sidecar_peer_already_in_static_config_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("dynamic_peers.toml");
+        let store = config::DynamicPeerStore::new(sidecar_path.clone());
+
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 5);
+        store
+            .upsert(config::PeerConfig {
+                address: peer_ip,
+                port: 179,
+                remote_as: 65099,
+                import_default: None,
+                import_default_v6: None,
+                export_default: None,
+                md5_password: None,
+                is_rr_client: false,
+            })
+            .await;
+
+        // Same peer already in the static config — dedup must skip the sidecar entry.
+        let mut cfg = make_config(&[(peer_ip, 65099)]);
+        for p in store.load() {
+            if !cfg.peers.iter().any(|x| x.address == p.address) {
+                cfg.peers.push(p);
+            }
+        }
+        cfg.sidecar_path = Some(sidecar_path);
+
+        let (spawn_fn, spawned_peers) = make_mock_spawn();
+        let _ = build_daemon(&cfg, spawn_fn).await;
+
+        assert_eq!(
+            spawned_peers.lock().unwrap().len(),
+            1,
+            "peer must not be spawned twice when present in both static config and sidecar"
+        );
     }
 
     #[tokio::test]

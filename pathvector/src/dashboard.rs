@@ -93,6 +93,7 @@ impl DashboardState {
     /// Apply a single event from the `WatchPeers` stream.
     ///
     /// - `Current` / `Changed` — upsert the peer by address.
+    /// - `Removed` — remove the peer with the matching address.
     /// - `EndInitial` — no-op; the snapshot phase is complete.
     /// - `Err` — record the error message in `last_error`.
     pub(crate) fn apply_peer_event(&mut self, event: Result<PeerEvent, ClientError>) {
@@ -107,6 +108,13 @@ impl DashboardState {
                 } else {
                     self.peers.push(p);
                 }
+                self.last_error = None;
+            }
+            Ok(PeerEvent {
+                event_type: PeerEventType::Removed,
+                peer: Some(p),
+            }) => {
+                self.peers.retain(|x| x.address != p.address);
                 self.last_error = None;
             }
             Ok(_) => {}
@@ -588,6 +596,50 @@ mod tests {
         );
         state.apply_peer_event(peer_event(PeerEventType::Current, p));
         assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn apply_peer_removed_deletes_peer() {
+        let mut state = DashboardState::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let p = make_peer(addr, SessionState::Established, Some(PeerType::External));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p.clone()));
+        assert_eq!(state.peers.len(), 1);
+
+        state.apply_peer_event(peer_event(PeerEventType::Removed, p));
+        assert!(state.peers.is_empty());
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn apply_peer_removed_only_deletes_matching_address() {
+        let mut state = DashboardState::new();
+        let addr1 = Ipv4Addr::new(10, 0, 0, 1);
+        let addr2 = Ipv4Addr::new(10, 0, 0, 2);
+        let p1 = make_peer(addr1, SessionState::Established, Some(PeerType::External));
+        let p2 = make_peer(addr2, SessionState::Established, Some(PeerType::External));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p1.clone()));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p2));
+        assert_eq!(state.peers.len(), 2);
+
+        state.apply_peer_event(peer_event(PeerEventType::Removed, p1));
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.peers[0].address, std::net::IpAddr::V4(addr2));
+    }
+
+    #[test]
+    fn apply_peer_removed_unknown_address_is_noop() {
+        let mut state = DashboardState::new();
+        let addr1 = Ipv4Addr::new(10, 0, 0, 1);
+        let addr2 = Ipv4Addr::new(10, 0, 0, 2);
+        let p1 = make_peer(addr1, SessionState::Established, Some(PeerType::External));
+        state.apply_peer_event(peer_event(PeerEventType::Current, p1));
+        assert_eq!(state.peers.len(), 1);
+
+        // Removed event for an address that was never added — no-op.
+        let ghost = make_peer(addr2, SessionState::Idle, None);
+        state.apply_peer_event(peer_event(PeerEventType::Removed, ghost));
+        assert_eq!(state.peers.len(), 1);
     }
 
     // ── apply_route_event ────────────────────────────────────────────────────

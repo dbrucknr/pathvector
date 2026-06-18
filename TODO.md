@@ -260,6 +260,53 @@ Not yet started. Key work items:
 
 ## pathvectord
 
+### Dynamic peer management — known gaps (2026-06-18)
+
+Six gaps identified during a correctness audit of the `AddPeer`/`RemovePeer` feature.
+Items 1, 4, 5, 6 are resolved (2026-06-18). Items 2 and 3 remain open.
+
+~~**1. `add_peer` returns `OK` when the peer is mid-teardown (`pending_removal`)** —
+**Resolved 2026-06-18**: `grpc.rs` `add_peer` handler now checks `pending_removal`
+before sending the command and returns `FAILED_PRECONDITION` if removal is in flight.
+The command processor also logs a warn! and drops the add if the race is lost.~~
+
+**2. Dynamic peers don't survive daemon restart**
+
+Every peer added via `add_peer` lives only in memory. A daemon restart — crash,
+deploy, `systemctl restart` — loses all dynamically-added peers with no record of
+what was configured. The operator must re-add them manually after each restart.
+
+This is the most impactful operational gap. The "Config-file watch + partial reload"
+TODO item is the long-term fix. Documented in `pathvectord/README.md`.
+
+**3. MD5 password on dynamically-added peers doesn't work for inbound connections**
+
+The BGP listener socket is bound once at startup; TCP MD5SIG keys cannot be added to
+an existing listening socket on Linux without rebinding. Dynamically-added peers with
+`md5_password` only work for outbound connections (pathvectord dials them). If the
+remote peer tries to initiate toward us, the listener rejects the TCP handshake because
+no key is installed for that source address.
+
+Fix (full): re-bind the listener socket when a new MD5 peer is added — requires moving
+the listener into a task that can be restarted. Documented in `pathvectord/README.md`.
+
+~~**4. `watch_peers` stream behavior after dynamic add/remove is unverified** —
+**Resolved 2026-06-18**: Traced and fixed. `on_terminated` now suppresses its
+`Changed(None)` broadcast during removal. The event loop captures `remote_as`/`local_as`
+before state is erased, then broadcasts an explicit `Removed(Some(PeerState))` event
+carrying correct identity fields. The stream handler forwards it directly. Dashboard
+`apply_peer_event` handles `Removed` by calling `retain`. Unit tests added for all
+`Removed` cases. E2e `DynamicPeerHarness` + `wait_for_peer_absent` helper added.~~
+
+~~**5. Event loop stall on large-peer removal is unbounded and underdocumented** —
+**Resolved 2026-06-18**: `on_terminated` now records `Instant::now()` before the
+propagation loop and emits `tracing::warn!` if the loop exceeds 100 ms, including
+peer address, prefix count, and elapsed milliseconds.~~
+
+~~**6. No watchdog for `run_command_processor` task panics** —
+**Resolved 2026-06-18**: `run()` now wraps the processor join handle in a second
+`tokio::spawn` that logs `tracing::error!` if the task exits with a panic.~~
+
 ### Remaining
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.

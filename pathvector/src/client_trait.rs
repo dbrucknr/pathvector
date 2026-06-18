@@ -236,6 +236,9 @@ pub(crate) mod tests {
             &mut self,
             _params: pathvector_client::types::AddPeerParams,
         ) -> Result<(), pathvector_client::error::ClientError> {
+            if let Some(e) = self.check_error() {
+                return Err(e);
+            }
             Ok(())
         }
 
@@ -243,6 +246,9 @@ pub(crate) mod tests {
             &mut self,
             _address: std::net::IpAddr,
         ) -> Result<(), pathvector_client::error::ClientError> {
+            if let Some(e) = self.check_error() {
+                return Err(e);
+            }
             Ok(())
         }
     }

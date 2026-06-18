@@ -37,6 +37,7 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 proptest          = { workspace = true }
 pathvector-client = { workspace = true }
+tempfile          = "3"
 
 # pathvectord generates code via tonic_prost_build.  The generated file
 # triggers four pedantic lints (doc_markdown, trivially_copy_pass_by_ref,

@@ -261,6 +261,12 @@ pub enum PeerEventType {
     EndInitial,
     /// A peer's session state changed.
     Changed,
+    /// A peer was removed from the daemon (via `RemovePeer` or config reload).
+    ///
+    /// The `peer` field on the accompanying [`PeerEvent`] carries the last
+    /// known state of the removed peer (address, remote AS, etc.) so consumers
+    /// can identify which peer was removed without maintaining their own index.
+    Removed,
 }
 
 /// A single event on the [`WatchPeers`] stream.
@@ -270,6 +276,13 @@ pub enum PeerEventType {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PeerEvent {
     pub event_type: PeerEventType,
-    /// Present for [`PeerEventType::Current`] and [`PeerEventType::Changed`].
+    /// Present for [`PeerEventType::Current`], [`PeerEventType::Changed`], and
+    /// [`PeerEventType::Removed`].
+    ///
+    /// For `Removed`: `address`, `remote_as`, and `local_as` are populated with
+    /// the last-known values captured before the peer was erased from daemon
+    /// state.  Session-level fields (`session_state`, `hold_time`, `uptime_seconds`,
+    /// prefix counters) are zero — the session was already torn down before the
+    /// removal event fires.
     pub peer: Option<PeerState>,
 }

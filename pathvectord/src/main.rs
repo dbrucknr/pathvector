@@ -23,10 +23,31 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let cfg: config::Config = toml::from_str(&text).unwrap_or_else(|e| {
+    let mut cfg: config::Config = toml::from_str(&text).unwrap_or_else(|e| {
         eprintln!("failed to parse config: {e}");
         std::process::exit(1);
     });
+
+    // Derive the sidecar path from the config file's directory.  Peers added
+    // via `add_peer` are persisted there and re-loaded on every startup.
+    let sidecar_path = std::path::PathBuf::from(&path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("dynamic_peers.toml");
+    let store = config::DynamicPeerStore::new(sidecar_path.clone());
+    let dynamic_peers = store.load();
+    if !dynamic_peers.is_empty() {
+        tracing::info!(
+            count = dynamic_peers.len(),
+            "loaded dynamic peers from sidecar"
+        );
+        for peer in dynamic_peers {
+            if !cfg.peers.iter().any(|p| p.address == peer.address) {
+                cfg.peers.push(peer);
+            }
+        }
+    }
+    cfg.sidecar_path = Some(sidecar_path);
 
     daemon::run(cfg).await;
 }

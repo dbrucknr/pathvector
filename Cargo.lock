@@ -1666,6 +1666,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -1772,6 +1773,7 @@ dependencies = [
  "prost",
  "prost-types",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "toml",
