@@ -1862,6 +1862,93 @@ mod tests {
         );
     }
 
+    // ── soft_reset: RFC 2918 capability guard ────────────────────────────────
+
+    /// `soft_reset` must return `FAILED_PRECONDITION` if the peer did not
+    /// negotiate Route Refresh (RFC 2918 §4: MUST NOT send without capability).
+    #[tokio::test]
+    async fn soft_reset_returns_failed_precondition_when_route_refresh_not_negotiated() {
+        use pathvector_session::message::Capability;
+        let peer_ip: Ipv4Addr = "10.9.0.1".parse().unwrap();
+        let state = arc_state(65001, &[(peer_ip, 65002)]);
+
+        // Mark peer as Established (peer_types populated) but NOT in route_refresh_peers.
+        {
+            let mut s = state.write().await;
+            let rib = Arc::make_mut(&mut s.rib);
+            rib.peer_types.insert(peer_ip, PeerType::External);
+            // route_refresh_peers deliberately NOT populated.
+        }
+
+        let (stop_tx, _stop_rx) = mpsc::channel(4);
+        let stop_senders = Arc::new(Mutex::new(HashMap::from([(peer_ip, stop_tx)])));
+
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+            stop_senders,
+        };
+
+        let req = Request::new(proto::SoftResetRequest {
+            address: peer_ip.to_string(),
+            afi_safi: String::new(),
+        });
+        let status = svc.soft_reset(req).await.unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::FailedPrecondition,
+            "soft_reset must return FAILED_PRECONDITION when RouteRefresh not negotiated"
+        );
+    }
+
+    /// `soft_reset` must succeed and send `SessionCommand::RouteRefresh` when
+    /// the session is established and Route Refresh was negotiated.
+    #[tokio::test]
+    async fn soft_reset_sends_route_refresh_when_capability_negotiated() {
+        use pathvector_session::{
+            message::{Capability, RouteRefreshMessage},
+            transport::SessionCommand,
+        };
+        let peer_ip: Ipv4Addr = "10.9.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(peer_ip, 65002)]);
+
+        // Mark peer as Established AND in route_refresh_peers.
+        {
+            let mut s = state.write().await;
+            let rib = Arc::make_mut(&mut s.rib);
+            rib.peer_types.insert(peer_ip, PeerType::External);
+            s.route_refresh_peers.insert(peer_ip);
+        }
+
+        let (stop_tx, mut stop_rx) = mpsc::channel(4);
+        let stop_senders = Arc::new(Mutex::new(HashMap::from([(peer_ip, stop_tx)])));
+
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx: noop_cmd_tx(),
+            stop_senders,
+        };
+
+        let req = Request::new(proto::SoftResetRequest {
+            address: peer_ip.to_string(),
+            afi_safi: "ipv4".to_string(),
+        });
+        svc.soft_reset(req).await.expect("soft_reset must succeed");
+
+        let cmd = stop_rx.try_recv().expect("RouteRefresh command must be enqueued");
+        match cmd {
+            SessionCommand::RouteRefresh(rr) => {
+                use pathvector_types::AfiSafi;
+                assert_eq!(
+                    rr.afi_safi,
+                    AfiSafi::IPV4_UNICAST,
+                    "RouteRefresh must carry IPV4_UNICAST AFI/SAFI"
+                );
+            }
+            other => panic!("expected RouteRefresh, got {other:?}"),
+        }
+    }
+
     // ── watch_peers: Removed event ────────────────────────────────────────────
 
     /// When the daemon broadcasts an explicit `Removed` event (with `peer: Some`),

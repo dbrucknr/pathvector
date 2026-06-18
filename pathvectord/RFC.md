@@ -174,7 +174,7 @@ payload in `Cease/AdministrativeShutdown` NOTIFICATION during `RemovePeer`.
 |---|---|---|---|
 | `shutdown_message: Option<String>` in `PeerConfig` | `src/config.rs` | ✅ | `test_sidecar_round_trips_all_fields` |
 | `RemovePeer` sends `Cease/AdministrativeShutdown` with encoded reason when configured | `src/daemon.rs` | ✅ | — |
-| `RemovePeer` falls back to bare `Stop` when no message is configured | `src/daemon.rs` | ✅ | `test_remove_peer_sends_stop_to_session` |
+| `RemovePeer` falls back to bare `Stop` when no message is configured | `src/daemon.rs` | ✅ | `remove_peer_without_shutdown_message_sends_stop` |
 
 ---
 

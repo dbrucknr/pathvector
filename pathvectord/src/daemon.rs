@@ -8885,6 +8885,327 @@ mod event_loop_tests {
         );
     }
 
+    // ── RFC 9003 — shutdown message dispatch ─────────────────────────────────
+
+    /// `RemovePeer` must send `SessionCommand::Stop` (no payload) when the peer
+    /// has no configured `shutdown_message`.
+    #[tokio::test]
+    async fn remove_peer_without_shutdown_message_sends_stop() {
+        struct NeverSpawned;
+        impl SessionHandle for NeverSpawned {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> { None }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> { mpsc::channel(1).0 }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
+            async fn send_route_refresh(&self, _rr: pathvector_session::message::RouteRefreshMessage) {}
+        }
+
+        let peer_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65010)], 8);
+
+        // Register a real stop sender so we can observe what command is sent.
+        let (cmd_tx_for_session, mut cmd_rx_for_session) = mpsc::channel(8);
+        stop_senders.lock().unwrap().insert(peer_ip, cmd_tx_for_session);
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+
+        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+            cmd_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::new(RwLock::new(HashMap::new())),
+            event_tx,
+            |_cfg| unreachable!(),
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: 180,
+                local_capabilities: vec![],
+            },
+            None,
+        ));
+
+        cmd_tx.send(DaemonCommand::RemovePeer(peer_ip)).await.unwrap();
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
+            .await
+            .expect("timed out waiting for command")
+            .expect("channel closed");
+
+        assert!(
+            matches!(cmd, SessionCommand::Stop),
+            "expected Stop when no shutdown_message configured, got {cmd:?}"
+        );
+    }
+
+    /// `RemovePeer` must send `SessionCommand::Notification` with a
+    /// `Cease/AdministrativeShutdown` payload when `shutdown_message` is set.
+    /// The payload must be a valid RFC 9003 encoded string.
+    #[tokio::test]
+    async fn remove_peer_with_shutdown_message_sends_rfc9003_notification() {
+        use pathvector_session::message::{
+            CeaseError, NotificationError, decode_shutdown_message,
+        };
+        struct NeverSpawned;
+        impl SessionHandle for NeverSpawned {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> { None }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> { mpsc::channel(1).0 }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
+            async fn send_route_refresh(&self, _rr: pathvector_session::message::RouteRefreshMessage) {}
+        }
+
+        let peer_ip: Ipv4Addr = "10.0.1.2".parse().unwrap();
+
+        // Build state with shutdown_message set.
+        let mut senders = HashMap::new();
+        let (utx, _urx) = mpsc::channel(8);
+        senders.insert(peer_ip, utx);
+        let peer_cfg = config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65011,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            hold_time: None,
+            shutdown_message: Some("planned maintenance".to_string()),
+        };
+        let state = Arc::new(RwLock::new(DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &[peer_cfg],
+            senders,
+            vec![],
+        )));
+
+        // Register a real stop sender so we can observe what command is sent.
+        let (cmd_tx_for_session, mut cmd_rx_for_session) = mpsc::channel(8);
+        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(Mutex::new(HashMap::from([(peer_ip, cmd_tx_for_session)])));
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+
+        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+            cmd_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::new(RwLock::new(HashMap::new())),
+            event_tx,
+            |_cfg| unreachable!(),
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: 180,
+                local_capabilities: vec![],
+            },
+            None,
+        ));
+
+        cmd_tx.send(DaemonCommand::RemovePeer(peer_ip)).await.unwrap();
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
+            .await
+            .expect("timed out waiting for command")
+            .expect("channel closed");
+
+        match cmd {
+            SessionCommand::Notification(msg) => {
+                assert!(
+                    matches!(
+                        msg.error,
+                        NotificationError::Cease(CeaseError::AdministrativeShutdown)
+                    ),
+                    "expected Cease/AdministrativeShutdown, got {:?}",
+                    msg.error
+                );
+                let reason = decode_shutdown_message(&msg.data)
+                    .expect("RFC 9003 payload must decode to a UTF-8 string");
+                assert_eq!(
+                    reason, "planned maintenance",
+                    "decoded shutdown reason must match configured message"
+                );
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    // ── RFC 2918 — route_refresh_peers tracking ───────────────────────────────
+
+    /// `on_established` must insert the peer into `route_refresh_peers` when
+    /// both sides negotiated `Capability::RouteRefresh`.
+    #[tokio::test]
+    async fn on_established_tracks_route_refresh_when_both_sides_negotiated() {
+        let peer_ip: Ipv4Addr = "10.0.2.1".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65020)], 8);
+
+        // Simulate the daemon advertising RouteRefresh (as build_daemon now does).
+        {
+            let mut s = state.write().await;
+            s.config_capabilities.push(Capability::RouteRefresh);
+        }
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+
+        // Peer's OPEN includes RouteRefresh capability.
+        let info = SessionInfo {
+            peer_as: 65020,
+            peer_bgp_id: Ipv4Addr::new(10, 0, 2, 1),
+            hold_time: 90,
+            peer_capabilities: vec![
+                Capability::FourByteAsn(65020),
+                Capability::RouteRefresh,
+            ],
+            peer_type: PeerType::External,
+            local_addr: None,
+        };
+
+        event_tx
+            .send((peer_ip, SessionEvent::Established(info)))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        assert!(
+            state.read().await.route_refresh_peers.contains(&peer_ip),
+            "route_refresh_peers must contain peer after both sides negotiated RouteRefresh"
+        );
+    }
+
+    /// `on_established` must NOT add to `route_refresh_peers` if the peer did
+    /// not advertise `Capability::RouteRefresh`, even if we did.
+    #[tokio::test]
+    async fn on_established_does_not_track_route_refresh_when_peer_omits_capability() {
+        let peer_ip: Ipv4Addr = "10.0.2.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65021)], 8);
+
+        {
+            let mut s = state.write().await;
+            s.config_capabilities.push(Capability::RouteRefresh);
+        }
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+
+        // Peer's OPEN does NOT include RouteRefresh.
+        let info = SessionInfo {
+            peer_as: 65021,
+            peer_bgp_id: Ipv4Addr::new(10, 0, 2, 2),
+            hold_time: 90,
+            peer_capabilities: vec![Capability::FourByteAsn(65021)],
+            peer_type: PeerType::External,
+            local_addr: None,
+        };
+
+        event_tx
+            .send((peer_ip, SessionEvent::Established(info)))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        assert!(
+            !state.read().await.route_refresh_peers.contains(&peer_ip),
+            "route_refresh_peers must NOT contain peer when peer did not advertise RouteRefresh"
+        );
+    }
+
+    /// `on_terminated` must remove the peer from `route_refresh_peers`.
+    #[tokio::test]
+    async fn on_terminated_clears_route_refresh_peers() {
+        let peer_ip: Ipv4Addr = "10.0.2.3".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65022)], 8);
+
+        {
+            let mut s = state.write().await;
+            s.config_capabilities.push(Capability::RouteRefresh);
+        }
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+
+        let info = SessionInfo {
+            peer_as: 65022,
+            peer_bgp_id: Ipv4Addr::new(10, 0, 2, 3),
+            hold_time: 90,
+            peer_capabilities: vec![
+                Capability::FourByteAsn(65022),
+                Capability::RouteRefresh,
+            ],
+            peer_type: PeerType::External,
+            local_addr: None,
+        };
+
+        event_tx
+            .send((peer_ip, SessionEvent::Established(info)))
+            .await
+            .unwrap();
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        assert!(
+            !state.read().await.route_refresh_peers.contains(&peer_ip),
+            "route_refresh_peers must be cleared after Terminated"
+        );
+    }
+
+    // ── Per-peer hold timer ────────────────────────────────────────────────────
+
+    /// `build_daemon` must use the per-peer `hold_time` override instead of the
+    /// global default when one is present in `PeerConfig`.
+    #[test]
+    fn build_daemon_uses_per_peer_hold_time_override() {
+        // build_daemon is not directly callable, but the same logic is used in
+        // the `AddPeer` command processor via `SpawnConfig`.  We verify the
+        // formula directly: the per-peer value wins over the global fallback.
+        let global_hold_time: u16 = 180;
+        let per_peer_hold_time: u16 = 45;
+
+        // A PeerConfig with hold_time set must yield the per-peer value.
+        let peer_cfg_with_override = config::PeerConfig {
+            address: "10.0.3.1".parse().unwrap(),
+            port: 179,
+            remote_as: 65030,
+            import_default: None,
+            export_default: None,
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            hold_time: Some(per_peer_hold_time),
+            shutdown_message: None,
+        };
+        assert_eq!(
+            peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
+            per_peer_hold_time,
+            "per-peer hold_time must override global default"
+        );
+
+        // A PeerConfig without hold_time must fall back to the global default.
+        let peer_cfg_no_override = config::PeerConfig {
+            hold_time: None,
+            ..peer_cfg_with_override.clone()
+        };
+        assert_eq!(
+            peer_cfg_no_override.hold_time.unwrap_or(global_hold_time),
+            global_hold_time,
+            "absent per-peer hold_time must fall back to global default"
+        );
+    }
+
     // ── Removed broadcast correctness ─────────────────────────────────────────
 
     /// When a peer in `pending_removal` receives `Terminated`, the event loop

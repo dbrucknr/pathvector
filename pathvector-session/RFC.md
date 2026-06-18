@@ -87,6 +87,9 @@ the attribute, when to reset the session.
 | Capability code 2 advertised in OPEN | `src/message/` | ✅ | `test_capability_route_refresh_in_open` |
 | ROUTE-REFRESH message (type 5) encode/decode with AFI + reserved + SAFI | `src/message/route_refresh.rs` | ✅ | `test_route_refresh_roundtrip` |
 | Outbound ROUTE-REFRESH send via `SessionCommand::RouteRefresh` | `src/transport/mod.rs` | ✅ | — |
+| `Capability::RouteRefresh` advertised in local OPEN | `pathvectord/src/daemon.rs` | ✅ | — |
+| `route_refresh_peers` populated only when both sides negotiated | `pathvectord/src/daemon.rs` | ✅ | `on_established_tracks_route_refresh_when_both_sides_negotiated`, `on_established_does_not_track_route_refresh_when_peer_omits_capability` |
+| `SoftReset` returns `FAILED_PRECONDITION` if capability not negotiated (RFC 2918 §4) | `pathvectord/src/grpc.rs` | ✅ | `soft_reset_returns_failed_precondition_when_route_refresh_not_negotiated` |
 
 ---
 
