@@ -85,6 +85,35 @@ fn config_peer_type(local_as: u32, remote_as: u32) -> PeerType {
     }
 }
 
+/// Creates a matched pair of `AdjRibOut` tables (IPv4 + IPv6) for one peer.
+///
+/// Both tables are created with identical reflecting/non-reflecting mode so they
+/// can never diverge. When acting as a route reflector (`is_rr = true`) and the
+/// peer is iBGP, both tables use [`AdjRibOut::new_reflecting`]; otherwise both
+/// use [`AdjRibOut::new`].
+///
+/// All sites that construct outbound RIBs for a peer MUST use this function
+/// instead of calling `AdjRibOut::new` / `new_reflecting` directly. This is the
+/// single enforcement point for RFC 4456 §8 outbound-table invariant:
+/// `adj_ribs_out[p].reflects() == adj_ribs_out_v6[p].reflects()` for every peer.
+fn make_adj_ribs_out_pair(
+    peer_id: PeerId,
+    peer_type: PeerType,
+    is_rr: bool,
+) -> (AdjRibOut<Ipv4Addr>, AdjRibOut<Ipv6Addr>) {
+    if is_rr && peer_type == PeerType::Internal {
+        (
+            AdjRibOut::new_reflecting(peer_id, peer_type),
+            AdjRibOut::new_reflecting(peer_id, peer_type),
+        )
+    } else {
+        (
+            AdjRibOut::new(peer_id, peer_type),
+            AdjRibOut::new(peer_id, peer_type),
+        )
+    }
+}
+
 /// Immutable-ish snapshot of the read-heavy routing state.
 ///
 /// Stored inside `DaemonState` as an `Arc<RibSnapshot>`. The event loop
@@ -309,31 +338,17 @@ impl DaemonState {
             .map(|p| (p.address, config_peer_type(local_as, p.remote_as)))
             .collect();
 
-        let adj_ribs_out = peers
-            .iter()
-            .map(|p| {
+        let (adj_ribs_out, adj_ribs_out_v6) = {
+            let mut v4 = HashMap::new();
+            let mut v6 = HashMap::new();
+            for p in peers {
                 let pt = config_peer_type(local_as, p.remote_as);
-                let rib = if is_rr && pt == PeerType::Internal {
-                    AdjRibOut::new_reflecting(PeerId::from(p.address), pt)
-                } else {
-                    AdjRibOut::new(PeerId::from(p.address), pt)
-                };
-                (p.address, rib)
-            })
-            .collect();
-
-        let adj_ribs_out_v6 = peers
-            .iter()
-            .map(|p| {
-                let pt = config_peer_type(local_as, p.remote_as);
-                let rib = if is_rr && pt == PeerType::Internal {
-                    AdjRibOut::new_reflecting(PeerId::from(p.address), pt)
-                } else {
-                    AdjRibOut::new(PeerId::from(p.address), pt)
-                };
-                (p.address, rib)
-            })
-            .collect();
+                let (aro_v4, aro_v6) = make_adj_ribs_out_pair(PeerId::from(p.address), pt, is_rr);
+                v4.insert(p.address, aro_v4);
+                v6.insert(p.address, aro_v6);
+            }
+            (v4, v6)
+        };
 
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
@@ -417,22 +432,13 @@ impl DaemonState {
         let peer_id = PeerId::from(peer.address);
 
         let is_rr = !self.rib.rr_clients.is_empty();
-        let adj_out = if is_rr && pt == PeerType::Internal {
-            AdjRibOut::new_reflecting(peer_id, pt)
-        } else {
-            AdjRibOut::new(peer_id, pt)
-        };
+        let (adj_out, adj_out_v6) = make_adj_ribs_out_pair(peer_id, pt, is_rr);
 
         self.adj_ribs_in
             .insert(peer.address, AdjRibIn::new(peer_id));
         self.adj_ribs_in_v6
             .insert(peer.address, AdjRibIn::new(peer_id));
-        self.adj_ribs_out.insert(peer.address, adj_out.clone());
-        let adj_out_v6 = if is_rr && pt == PeerType::Internal {
-            AdjRibOut::new_reflecting(peer_id, pt)
-        } else {
-            AdjRibOut::new(peer_id, pt)
-        };
+        self.adj_ribs_out.insert(peer.address, adj_out);
         self.adj_ribs_out_v6.insert(peer.address, adj_out_v6);
         self.peer_config_types.insert(peer.address, pt);
         self.import_policies.insert(
@@ -661,25 +667,14 @@ impl DaemonState {
         };
         self.negotiated_max_len.insert(peer_ip, max_len);
 
+        let is_rr = !self.rib.rr_clients.is_empty();
+        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(peer_id, peer_type, is_rr);
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
-            let is_rr = !self.rib.rr_clients.is_empty();
-            *aro = if is_rr && peer_type == PeerType::Internal {
-                AdjRibOut::new_reflecting(peer_id, peer_type)
-            } else {
-                AdjRibOut::new(peer_id, peer_type)
-            };
+            *aro = new_aro;
         }
         // Reset v6 RIBs so a re-established session starts clean.
         self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
-        let adj_out_v6 = {
-            let is_rr = !self.rib.rr_clients.is_empty();
-            if is_rr && peer_type == PeerType::Internal {
-                AdjRibOut::new_reflecting(peer_id, peer_type)
-            } else {
-                AdjRibOut::new(peer_id, peer_type)
-            }
-        };
-        self.adj_ribs_out_v6.insert(peer_ip, adj_out_v6);
+        self.adj_ribs_out_v6.insert(peer_ip, new_aro_v6);
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
@@ -889,21 +884,13 @@ impl DaemonState {
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
+        let is_rr = !self.rib.rr_clients.is_empty();
+        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(peer_id, cfg_pt, is_rr);
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
-            let is_rr = !self.rib.rr_clients.is_empty();
-            *aro = if is_rr && cfg_pt == PeerType::Internal {
-                AdjRibOut::new_reflecting(peer_id, cfg_pt)
-            } else {
-                AdjRibOut::new(peer_id, cfg_pt)
-            };
+            *aro = new_aro;
         }
         if let Some(aro) = self.adj_ribs_out_v6.get_mut(&peer_ip) {
-            let is_rr = !self.rib.rr_clients.is_empty();
-            *aro = if is_rr && cfg_pt == PeerType::Internal {
-                AdjRibOut::new_reflecting(peer_id, cfg_pt)
-            } else {
-                AdjRibOut::new(peer_id, cfg_pt)
-            };
+            *aro = new_aro_v6;
         }
 
         // Tell all other established peers about the best-path changes caused
@@ -8018,6 +8005,85 @@ mod tests {
             receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
             "v6 full-table dump must not send non-client iBGP routes to another non-client (RFC 4456 §8)"
         );
+    }
+
+    // ── Invariant: adj_ribs_out and adj_ribs_out_v6 always agree on reflects() ─
+
+    /// Asserts the RFC 4456 reflecting-parity invariant for every peer in `state`:
+    /// `adj_ribs_out[p].reflects() == adj_ribs_out_v6[p].reflects()`.
+    ///
+    /// Call this after any operation that creates or resets outbound RIBs.
+    fn assert_reflects_parity(state: &DaemonState) {
+        for (peer_ip, aro_v4) in &state.adj_ribs_out {
+            if let Some(aro_v6) = state.adj_ribs_out_v6.get(peer_ip) {
+                assert_eq!(
+                    aro_v4.reflects(),
+                    aro_v6.reflects(),
+                    "peer {peer_ip}: adj_ribs_out.reflects()={} but adj_ribs_out_v6.reflects()={} — \
+                     IPv4 and IPv6 outbound tables must always have matching reflecting mode (RFC 4456 §8)",
+                    aro_v4.reflects(),
+                    aro_v6.reflects(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invariant_reflects_parity_after_new() {
+        let cluster_id = 1;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let nc: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        let (state, _) = make_rr_state(65001, cluster_id, &[client], &[nc]);
+        assert_reflects_parity(&state);
+    }
+
+    #[test]
+    fn invariant_reflects_parity_after_on_established() {
+        let cluster_id = 1;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let nc: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        let (mut state, _) = make_rr_state(65001, cluster_id, &[client], &[nc]);
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        assert_reflects_parity(&state);
+        state.on_established(nc, PeerType::Internal, 65001, 90, &[], None);
+        assert_reflects_parity(&state);
+    }
+
+    #[test]
+    fn invariant_reflects_parity_after_peer_down_and_reconnect() {
+        let cluster_id = 1;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_rr_state(65001, cluster_id, &[client], &[]);
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        assert_reflects_parity(&state);
+        // Simulate teardown then re-establish (on_terminated resets AdjRibOut)
+        state.on_terminated(client, false);
+        // on_established rebuilds the tables for the next session
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        assert_reflects_parity(&state);
+    }
+
+    #[test]
+    fn invariant_reflects_parity_after_add_peer() {
+        let cluster_id = 1;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_rr_state(65001, cluster_id, &[client], &[]);
+        // Dynamically add a new iBGP peer (same AS = iBGP)
+        let new_peer = config::PeerConfig {
+            address: "10.0.0.99".parse().unwrap(),
+            port: 179,
+            remote_as: 65001,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        state.add_peer(&new_peer, tx);
+        assert_reflects_parity(&state);
     }
 }
 
