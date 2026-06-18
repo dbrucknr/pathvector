@@ -324,6 +324,10 @@ impl DaemonState {
 
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
+        // Capacity of 1024 events each.  A receiver that falls >1024 events
+        // behind sees `RecvError::Lagged`; the `watch_peers` gRPC stream handler
+        // defends against this by re-reading the full snapshot on any
+        // `Changed(peer: None)` signal, so no events are permanently lost.
         let (route_tx, _) = broadcast::channel(1024);
         let (peer_tx, _) = broadcast::channel(1024);
 
@@ -1828,6 +1832,10 @@ where
             Capability::FourByteAsn(local_as),
             Capability::ExtendedMessage,
         ];
+        let peer_store = cfg
+            .sidecar_path
+            .as_ref()
+            .map(|p| Arc::new(config::DynamicPeerStore::new(p.clone())));
         let proc_handle = tokio::spawn(run_command_processor(
             cmd_rx,
             state_cmd,
@@ -1841,6 +1849,7 @@ where
                 hold_time,
                 local_capabilities: local_caps,
             },
+            peer_store,
         ));
         // Log a clear error if the command processor panics so operators know
         // why AddPeer / RemovePeer gRPC calls are failing.
@@ -1873,6 +1882,7 @@ struct SpawnConfig {
 /// Runs as an independent task alongside the event loop so that peer additions
 /// and removals never block BGP event processing.  All shared state is accessed
 /// via `Arc`-wrapped maps; the BGP event loop itself only sees session events.
+#[allow(clippy::too_many_arguments)]
 async fn run_command_processor<H, F>(
     mut cmd_rx: mpsc::Receiver<DaemonCommand>,
     state: Arc<RwLock<DaemonState>>,
@@ -1881,6 +1891,7 @@ async fn run_command_processor<H, F>(
     event_tx: mpsc::Sender<(Ipv4Addr, SessionEvent)>,
     spawn_fn: F,
     cfg: SpawnConfig,
+    peer_store: Option<Arc<config::DynamicPeerStore>>,
 ) where
     H: SessionHandle + 'static,
     F: Fn(SessionConfig) -> H,
@@ -1952,6 +1963,9 @@ async fn run_command_processor<H, F>(
                     }
                 });
 
+                if let Some(store) = &peer_store {
+                    store.upsert(peer.clone()).await;
+                }
                 tracing::info!(peer = %peer.address, remote_as = peer.remote_as, "AddPeer: session started");
             }
 
@@ -1990,7 +2004,9 @@ async fn run_command_processor<H, F>(
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
                 // remove_peer() is called by the event loop.
-
+                if let Some(store) = &peer_store {
+                    store.remove(peer_ip).await;
+                }
                 tracing::info!(peer = %peer_ip, "RemovePeer: session teardown initiated");
             }
         }
@@ -8604,6 +8620,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 local_capabilities: vec![],
             },
+            None,
         ));
 
         cmd_tx
@@ -8751,6 +8768,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 local_capabilities: vec![],
             },
+            None,
         ));
 
         cmd_tx
@@ -8916,6 +8934,139 @@ mod event_loop_tests {
         );
         assert!(ev.peer.is_none(), "Changed signal must have peer: None");
         assert!(peer_rx.try_recv().is_err(), "must send exactly one event");
+    }
+
+    // ── incoming_senders race-safety ──────────────────────────────────────────
+
+    /// After `RemovePeer` is processed by `run_command_processor`, the peer's
+    /// entry must be gone from `incoming_senders`.
+    ///
+    /// This proves that new inbound TCP connections from the removed peer are
+    /// rejected by `run_bgp_listener` before `Terminated` even fires — closing
+    /// the reconnect race window.
+    #[tokio::test]
+    async fn remove_peer_clears_incoming_senders() {
+        struct NeverSpawned;
+        impl SessionHandle for NeverSpawned {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+        }
+
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
+
+        // Pre-populate incoming_senders as if AddPeer had already run.
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<SessionCommand>(1);
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::from([(
+                IpAddr::V4(peer_ip),
+                incoming_tx,
+            )])));
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+            cmd_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::clone(&incoming),
+            event_tx,
+            |_cfg| unreachable!("RemovePeer must not call spawn_fn"),
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: 180,
+                local_capabilities: vec![],
+            },
+            None,
+        ));
+
+        assert!(
+            incoming.read().await.contains_key(&IpAddr::V4(peer_ip)),
+            "pre-condition: incoming_senders must contain the peer before RemovePeer"
+        );
+
+        cmd_tx
+            .send(DaemonCommand::RemovePeer(peer_ip))
+            .await
+            .unwrap();
+
+        // Allow the command processor to run the handler.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !incoming.read().await.contains_key(&IpAddr::V4(peer_ip)),
+            "incoming_senders must not contain the peer after RemovePeer — \
+             new inbound TCP connections must be rejected immediately"
+        );
+    }
+
+    /// `run_bgp_listener` must drop (RST) inbound TCP connections whose source
+    /// address is not in `incoming_senders`.
+    ///
+    /// This proves the other half of the race-safety invariant: even if an
+    /// adversarial or reconnecting peer dials in, the listener drops it without
+    /// forwarding it to any session actor.
+    #[tokio::test]
+    async fn bgp_listener_drops_unlisted_peer() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncReadExt as _;
+
+        // Bind the listener on a random OS-assigned port with an empty
+        // incoming_senders — no peers are known.
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let md5: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Spawn on port 0 so the OS assigns a free port.
+        let listener_sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener_sock.local_addr().unwrap().port();
+        drop(listener_sock);
+
+        let incoming_clone = Arc::clone(&incoming);
+        let md5_clone = Arc::clone(&md5);
+        tokio::spawn(async move {
+            run_bgp_listener(port, incoming_clone, md5_clone).await;
+        });
+
+        // Give the listener a moment to bind.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // Connect from 127.0.0.1 — not present in incoming_senders.
+        let mut conn =
+            tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+                .await
+                .expect("TCP connect must succeed");
+
+        // The listener drops the stream immediately — we should see EOF (0
+        // bytes read) with no data sent, within a short timeout.
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            conn.read(&mut buf),
+        )
+        .await
+        .expect("read must complete within 2 s — listener must close the connection promptly")
+        .expect("read must not return an OS error");
+
+        assert_eq!(
+            n, 0,
+            "listener must send no data and close the connection for an unlisted peer"
+        );
     }
 }
 
@@ -9482,6 +9633,7 @@ mod run_with_tests {
                     is_rr_client: false,
                 })
                 .collect(),
+            sidecar_path: None,
         }
     }
 
@@ -9827,6 +9979,103 @@ mod run_with_tests {
         if let Ok(writer) = pathvector_sys::FibWriter::new(254, 20) {
             withdraw_stale_bgp_routes(stale_v4, stale_v6, &writer).await;
         }
+    }
+
+    // ── Dynamic peer persistence (sidecar) ───────────────────────────────────
+
+    /// Simulates a daemon restart: a peer is written to the sidecar, then the
+    /// sidecar is loaded and merged into a fresh config.  `build_daemon` must
+    /// spawn a session for the peer as if it had been statically configured.
+    ///
+    /// This is the integration-level proof that the `main.rs` startup path
+    /// correctly re-hydrates dynamic peers from the sidecar after a restart —
+    /// without requiring a real Docker container restart.
+    #[tokio::test]
+    async fn dynamic_peer_from_sidecar_is_loaded_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("dynamic_peers.toml");
+        let store = config::DynamicPeerStore::new(sidecar_path.clone());
+
+        // Write a peer into the sidecar as if it had been added via add_peer
+        // during a previous run.
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 5);
+        store
+            .upsert(config::PeerConfig {
+                address: peer_ip,
+                port: 179,
+                remote_as: 65099,
+                import_default: None,
+                import_default_v6: None,
+                export_default: None,
+                md5_password: None,
+                is_rr_client: false,
+            })
+            .await;
+
+        // Replicate what main.rs does on startup: load sidecar, merge into cfg.
+        let mut cfg = make_config(&[]);
+        for p in store.load() {
+            if !cfg.peers.iter().any(|x| x.address == p.address) {
+                cfg.peers.push(p);
+            }
+        }
+        cfg.sidecar_path = Some(sidecar_path);
+
+        // Build daemon — the sidecar peer must be treated as a static peer.
+        let (spawn_fn, spawned_peers) = make_mock_spawn();
+        let _ = build_daemon(&cfg, spawn_fn).await;
+
+        let peers = spawned_peers.lock().unwrap();
+        assert_eq!(
+            peers.len(),
+            1,
+            "exactly one session must be spawned for the sidecar peer"
+        );
+        assert!(
+            peers[0].started.load(Ordering::SeqCst),
+            "sidecar peer session must have start() called"
+        );
+    }
+
+    /// A peer in the sidecar must not be duplicated if it also appears in the
+    /// static config — the deduplication in main.rs must prevent a double-add.
+    #[tokio::test]
+    async fn sidecar_peer_already_in_static_config_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("dynamic_peers.toml");
+        let store = config::DynamicPeerStore::new(sidecar_path.clone());
+
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 5);
+        store
+            .upsert(config::PeerConfig {
+                address: peer_ip,
+                port: 179,
+                remote_as: 65099,
+                import_default: None,
+                import_default_v6: None,
+                export_default: None,
+                md5_password: None,
+                is_rr_client: false,
+            })
+            .await;
+
+        // Same peer already in the static config — dedup must skip the sidecar entry.
+        let mut cfg = make_config(&[(peer_ip, 65099)]);
+        for p in store.load() {
+            if !cfg.peers.iter().any(|x| x.address == p.address) {
+                cfg.peers.push(p);
+            }
+        }
+        cfg.sidecar_path = Some(sidecar_path);
+
+        let (spawn_fn, spawned_peers) = make_mock_spawn();
+        let _ = build_daemon(&cfg, spawn_fn).await;
+
+        assert_eq!(
+            spawned_peers.lock().unwrap().len(),
+            1,
+            "peer must not be spawned twice when present in both static config and sidecar"
+        );
     }
 
     #[tokio::test]

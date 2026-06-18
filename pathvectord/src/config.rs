@@ -1,7 +1,10 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
+};
 
 use pathvector_policy::DefaultAction;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level daemon configuration.
 ///
@@ -23,6 +26,11 @@ pub struct Config {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// Path to the dynamic-peer sidecar file.  Not present in TOML — set by
+    /// the caller (e.g. `main`) after parsing so the daemon can persist peers
+    /// added via `add_peer` across restarts.
+    #[serde(skip)]
+    pub sidecar_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -135,7 +143,7 @@ fn default_bgp_listen_port() -> u16 {
 /// remote_as      = 65001
 /// import_default = "accept"   # explicit opt-in for an eBGP peer
 /// ```
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ImportDefault {
     /// Accept routes that matched no term.
@@ -165,7 +173,7 @@ impl From<ImportDefault> for DefaultAction {
 /// remote_as      = 65002
 /// export_default = "accept"   # explicit opt-in for an eBGP peer
 /// ```
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportDefault {
     /// Re-advertise routes that matched no term.
@@ -183,7 +191,7 @@ impl From<ExportDefault> for DefaultAction {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PeerConfig {
     pub address: Ipv4Addr,
     #[serde(default = "default_bgp_port")]
@@ -253,6 +261,215 @@ pub struct PeerConfig {
 
 fn default_bgp_port() -> u16 {
     179
+}
+
+// ── Dynamic peer persistence ──────────────────────────────────────────────────
+
+/// Internal sidecar file format — a flat list of peer configs.
+#[derive(Serialize, Deserialize, Default)]
+struct SidecarFile {
+    #[serde(default)]
+    peers: Vec<PeerConfig>,
+}
+
+/// Persists dynamically-added peers to a TOML sidecar file so they survive
+/// daemon restarts.
+///
+/// The sidecar lives next to the static config file (or at an explicit path)
+/// and uses the same `[[peers]]` format, making it easy to inspect or edit
+/// manually.  Writes are atomic: the new content is written to a `.tmp` file
+/// then `rename`d over the target, so a crash mid-write never corrupts the
+/// sidecar.
+pub struct DynamicPeerStore {
+    path: PathBuf,
+}
+
+impl DynamicPeerStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Load all persisted dynamic peers.  Returns an empty vec if the sidecar
+    /// does not exist yet (first run).
+    pub fn load(&self) -> Vec<PeerConfig> {
+        Self::load_sync(&self.path)
+    }
+
+    /// Upsert a peer into the sidecar (replace by address if already present).
+    pub async fn upsert(&self, peer: PeerConfig) {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut peers = Self::load_sync(&path);
+            peers.retain(|p| p.address != peer.address);
+            peers.push(peer);
+            Self::write_sync(&path, &peers);
+        })
+        .await
+        .ok();
+    }
+
+    /// Remove a peer from the sidecar by address.
+    pub async fn remove(&self, address: Ipv4Addr) {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut peers = Self::load_sync(&path);
+            peers.retain(|p| p.address != address);
+            Self::write_sync(&path, &peers);
+        })
+        .await
+        .ok();
+    }
+
+    fn load_sync(path: &Path) -> Vec<PeerConfig> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<SidecarFile>(&text)
+                .unwrap_or_default()
+                .peers,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "failed to read dynamic peer sidecar: {e}");
+                vec![]
+            }
+        }
+    }
+
+    fn write_sync(path: &Path, peers: &[PeerConfig]) {
+        let sidecar = SidecarFile {
+            peers: peers.to_vec(),
+        };
+        let text = match toml::to_string(&sidecar) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("failed to serialise dynamic peers: {e}");
+                return;
+            }
+        };
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, text.as_bytes())
+            .and_then(|()| std::fs::rename(&tmp, path))
+        {
+            tracing::warn!(path = %path.display(), "failed to persist dynamic peers: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    fn peer(octet: u8, remote_as: u32) -> PeerConfig {
+        PeerConfig {
+            address: Ipv4Addr::new(10, 0, 0, octet),
+            port: 179,
+            remote_as,
+            import_default: None,
+            import_default_v6: None,
+            export_default: None,
+            md5_password: None,
+            is_rr_client: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn load_returns_empty_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
+        assert!(store.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_persists_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
+
+        store.upsert(peer(1, 65001)).await;
+
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].address, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(loaded[0].remote_as, 65001);
+    }
+
+    #[tokio::test]
+    async fn upsert_is_idempotent_by_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
+
+        store.upsert(peer(1, 65001)).await;
+        store.upsert(peer(1, 65002)).await; // same address, different AS
+
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 1, "upsert must replace, not append");
+        assert_eq!(loaded[0].remote_as, 65002, "latest value must win");
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
+
+        store.upsert(peer(1, 65001)).await;
+        store.upsert(peer(2, 65002)).await;
+        store.remove(Ipv4Addr::new(10, 0, 0, 1)).await;
+
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].address, Ipv4Addr::new(10, 0, 0, 2));
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_address_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
+
+        store.upsert(peer(1, 65001)).await;
+        store.remove(Ipv4Addr::new(10, 0, 0, 99)).await; // not in sidecar
+
+        assert_eq!(store.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sidecar_round_trips_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
+
+        let full_peer = PeerConfig {
+            address: "10.0.0.1".parse().unwrap(),
+            port: 1179,
+            remote_as: 65001,
+            import_default: Some(ImportDefault::Accept),
+            import_default_v6: Some(ImportDefault::Reject),
+            export_default: Some(ExportDefault::Accept),
+            md5_password: Some("s3cr3t".into()),
+            is_rr_client: true,
+        };
+        store.upsert(full_peer.clone()).await;
+
+        let loaded = store.load();
+        let got = &loaded[0];
+        assert_eq!(got.port, 1179);
+        assert!(matches!(got.import_default, Some(ImportDefault::Accept)));
+        assert!(matches!(got.import_default_v6, Some(ImportDefault::Reject)));
+        assert!(matches!(got.export_default, Some(ExportDefault::Accept)));
+        assert_eq!(got.md5_password.as_deref(), Some("s3cr3t"));
+        assert!(got.is_rr_client);
+    }
+
+    #[tokio::test]
+    async fn write_is_atomic_tmp_file_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_peers.toml");
+        let store = DynamicPeerStore::new(path.clone());
+
+        store.upsert(peer(1, 65001)).await;
+
+        // After a successful write, no .tmp file should remain.
+        let tmp = path.with_extension("tmp");
+        assert!(!tmp.exists(), ".tmp file must be cleaned up after atomic rename");
+        assert!(path.exists(), "sidecar file must exist after upsert");
+    }
 }
 
 #[cfg(test)]
