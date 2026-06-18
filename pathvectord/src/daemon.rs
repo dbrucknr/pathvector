@@ -9233,6 +9233,102 @@ mod event_loop_tests {
         );
     }
 
+    /// `run_command_processor` must wire the per-peer `hold_time` override into
+    /// the `SessionConfig` it passes to `spawn_fn`.  This verifies the wiring
+    /// at the call site in `run_command_processor`, not just the formula.
+    #[tokio::test]
+    async fn add_peer_wires_per_peer_hold_time_into_session_config() {
+        use std::sync::Mutex as StdMutex;
+
+        // A minimal SessionHandle that records the SessionConfig it was built with.
+        struct CaptureHandle;
+        impl SessionHandle for CaptureHandle {
+            async fn start(&self) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            async fn send_route_refresh(
+                &self,
+                _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
+            }
+        }
+
+        let global_hold_time: u16 = 180;
+        let per_peer_hold_time: u16 = 45;
+        let peer_ip: Ipv4Addr = "10.0.5.1".parse().unwrap();
+
+        // Start with no pre-configured peers so AddPeer isn't treated as idempotent.
+        let (state, _rxs, stop_senders) = make_state(&[], 8);
+
+        let captured: Arc<StdMutex<Option<SessionConfig>>> = Arc::new(StdMutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+
+        tokio::spawn(run_command_processor::<CaptureHandle, _>(
+            cmd_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::new(RwLock::new(HashMap::new())),
+            event_tx,
+            move |cfg| {
+                *captured_clone.lock().unwrap() = Some(cfg);
+                CaptureHandle
+            },
+            SpawnConfig {
+                local_as: 65001,
+                local_bgp_id: "1.2.3.4".parse().unwrap(),
+                hold_time: global_hold_time,
+                local_capabilities: vec![],
+            },
+            None,
+        ));
+
+        let peer_cfg = config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65050,
+            import_default: None,
+            export_default: None,
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            hold_time: Some(per_peer_hold_time),
+            shutdown_message: None,
+        };
+
+        cmd_tx
+            .send(DaemonCommand::AddPeer(peer_cfg))
+            .await
+            .unwrap();
+        drop(cmd_tx);
+
+        // Give the command processor a moment to call spawn_fn.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let session_cfg = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spawn_fn was never called — AddPeer did not trigger session spawn");
+
+        assert_eq!(
+            session_cfg.hold_time, per_peer_hold_time,
+            "run_command_processor must forward per-peer hold_time into SessionConfig"
+        );
+    }
+
     // ── Removed broadcast correctness ─────────────────────────────────────────
 
     /// When a peer in `pending_removal` receives `Terminated`, the event loop

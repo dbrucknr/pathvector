@@ -63,6 +63,9 @@
 //!     fn remove_peer(&mut self, _: IpAddr) -> impl Future<Output = Result<(), ClientError>> + Send {
 //!         async { Ok(()) }
 //!     }
+//!     fn soft_reset(&mut self, _: IpAddr, _: &str) -> impl Future<Output = Result<(), ClientError>> + Send {
+//!         async { Ok(()) }
+//!     }
 //! }
 //! ```
 
@@ -77,7 +80,7 @@ use crate::{
         AddPeerRequest, GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest,
         ListOriginatedRoutesRequest, ListPeersRequest, ListRoutesRequest, OriginateRouteRequest,
         OriginateRoutesRequest, PolicyAction, RemovePeerRequest, SetExportDefaultRequest,
-        SetImportDefaultRequest, WatchPeersRequest, WatchRoutesRequest,
+        SetImportDefaultRequest, SoftResetRequest, WatchPeersRequest, WatchRoutesRequest,
         WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
     },
     types::{AddPeerParams, OriginateRouteParams, PeerEvent, PeerState, Route, RouteEvent},
@@ -249,6 +252,21 @@ pub trait DaemonClient {
     fn remove_peer(
         &mut self,
         address: IpAddr,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+
+    /// Send a ROUTE-REFRESH to the peer for the given address family (RFC 2918).
+    ///
+    /// `afi_safi` is `"ipv4"` or `"ipv6"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with `NOT_FOUND` if the peer is not
+    /// configured, `FAILED_PRECONDITION` if the session is not Established or
+    /// if the peer did not negotiate the Route Refresh capability.
+    fn soft_reset(
+        &mut self,
+        address: IpAddr,
+        afi_safi: &str,
     ) -> impl Future<Output = Result<(), ClientError>> + Send;
 }
 
@@ -604,6 +622,16 @@ impl DaemonClient for PathvectorClient {
             .await?;
         Ok(())
     }
+
+    async fn soft_reset(&mut self, address: IpAddr, afi_safi: &str) -> Result<(), ClientError> {
+        self.peers
+            .soft_reset(SoftResetRequest {
+                address: address.to_string(),
+                afi_safi: afi_safi.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -703,6 +731,10 @@ mod tests {
         }
 
         async fn remove_peer(&mut self, _: IpAddr) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn soft_reset(&mut self, _: IpAddr, _: &str) -> Result<(), ClientError> {
             Ok(())
         }
     }

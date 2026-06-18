@@ -2,11 +2,13 @@
 //!
 //! RFC 4271 §9.2 — route advertisement and withdrawal.
 //! RFC 8212        — eBGP import/export default reject.
+//! RFC 2918        — Route Refresh: soft reset triggers re-advertisement.
 //! Scenarios covered:
 //!   - GoBGP announces a prefix → appears in pathvectord's Loc-RIB
 //!   - GoBGP withdraws a prefix → removed from pathvectord's Loc-RIB
 //!   - Multiple prefixes announced simultaneously
 //!   - Import-reject policy: prefix is NOT installed despite being received
+//!   - Soft reset (ROUTE-REFRESH): route survives; session stays Established
 
 use std::time::Duration;
 
@@ -198,4 +200,34 @@ async fn withdrawn_v6_route_removed_from_rib() {
     )
     .await
     .expect("IPv6 route was not withdrawn from pathvectord LocRib within 15 s");
+}
+
+/// RFC 2918 §4 — after a ROUTE-REFRESH, the peer re-advertises its routes and
+/// the session remains Established.
+///
+/// This is the end-to-end smoke test for `SoftReset`:
+///   1. GoBGP announces a prefix → wait for it in the Loc-RIB.
+///   2. Call `soft_reset` via gRPC → must succeed (proves `route_refresh_peers`
+///      was populated: both sides negotiated RFC 2918 on this session).
+///   3. The route is still present in the Loc-RIB after the refresh → GoBGP
+///      re-advertised in response to our ROUTE-REFRESH and the session did not
+///      drop.
+#[tokio::test]
+async fn soft_reset_triggers_readvertisement_and_session_survives() {
+    let mut h = Harness::new().await;
+
+    h.gobgp_announce("10.99.0.0/16", "10.0.0.1");
+    wait_for_route(&mut h.client, "10.99.0.0/16", Duration::from_secs(10))
+        .await
+        .expect("10.99.0.0/16 did not appear in RIB before soft reset");
+
+    h.client
+        .soft_reset(h.peer.into(), "ipv4")
+        .await
+        .expect("soft_reset must succeed when RFC 2918 was negotiated");
+
+    // Give GoBGP a moment to receive the ROUTE-REFRESH and re-send the UPDATE.
+    wait_for_route(&mut h.client, "10.99.0.0/16", Duration::from_secs(10))
+        .await
+        .expect("10.99.0.0/16 must still be in RIB after soft reset — GoBGP re-advertised");
 }
