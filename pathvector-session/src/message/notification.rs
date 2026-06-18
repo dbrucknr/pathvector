@@ -279,10 +279,12 @@ impl CeaseError {
 ///
 /// Wire format: one length byte followed by the UTF-8 string bytes.
 /// The string is silently truncated to 128 bytes if longer.
+#[must_use]
 pub fn encode_shutdown_message(msg: &str) -> Vec<u8> {
     let bytes = msg.as_bytes();
     let len = bytes.len().min(128);
     let mut out = Vec::with_capacity(1 + len);
+    #[allow(clippy::cast_possible_truncation)]
     out.push(len as u8);
     out.extend_from_slice(&bytes[..len]);
     out
@@ -292,6 +294,7 @@ pub fn encode_shutdown_message(msg: &str) -> Vec<u8> {
 ///
 /// Returns `None` if the data is empty, the length byte is out of range, or the
 /// bytes are not valid UTF-8.
+#[must_use]
 pub fn decode_shutdown_message(data: &[u8]) -> Option<String> {
     let (&len, rest) = data.split_first()?;
     let end = (len as usize).min(rest.len());

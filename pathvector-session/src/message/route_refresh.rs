@@ -64,6 +64,7 @@ pub struct RouteRefreshMessage {
 
 impl RouteRefreshMessage {
     /// Create a standard RFC 2918 ROUTE-REFRESH request.
+    #[must_use]
     pub fn new(afi_safi: AfiSafi) -> Self {
         Self {
             afi_safi,

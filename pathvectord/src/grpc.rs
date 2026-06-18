@@ -1864,7 +1864,6 @@ mod tests {
     /// negotiate Route Refresh (RFC 2918 §4: MUST NOT send without capability).
     #[tokio::test]
     async fn soft_reset_returns_failed_precondition_when_route_refresh_not_negotiated() {
-        use pathvector_session::message::Capability;
         let peer_ip: Ipv4Addr = "10.9.0.1".parse().unwrap();
         let state = arc_state(65001, &[(peer_ip, 65002)]);
 
@@ -1901,10 +1900,7 @@ mod tests {
     /// the session is established and Route Refresh was negotiated.
     #[tokio::test]
     async fn soft_reset_sends_route_refresh_when_capability_negotiated() {
-        use pathvector_session::{
-            message::{Capability, RouteRefreshMessage},
-            transport::SessionCommand,
-        };
+        use pathvector_session::transport::SessionCommand;
         let peer_ip: Ipv4Addr = "10.9.0.2".parse().unwrap();
         let state = arc_state(65001, &[(peer_ip, 65002)]);
 

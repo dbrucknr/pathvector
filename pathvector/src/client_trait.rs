@@ -251,6 +251,17 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+
+        async fn soft_reset(
+            &mut self,
+            _address: std::net::IpAddr,
+            _afi_safi: &str,
+        ) -> Result<(), pathvector_client::error::ClientError> {
+            if let Some(e) = self.check_error() {
+                return Err(e);
+            }
+            Ok(())
+        }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────

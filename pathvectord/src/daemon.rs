@@ -8917,11 +8917,11 @@ mod event_loop_tests {
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65010)], 8);
 
         // Register a real stop sender so we can observe what command is sent.
-        let (cmd_tx_for_session, mut cmd_rx_for_session) = mpsc::channel(8);
+        let (session_stop_tx, mut session_stop_rx) = mpsc::channel(8);
         stop_senders
             .lock()
             .unwrap()
-            .insert(peer_ip, cmd_tx_for_session);
+            .insert(peer_ip, session_stop_tx);
 
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -8947,11 +8947,10 @@ mod event_loop_tests {
             .await
             .unwrap();
 
-        let cmd =
-            tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
-                .await
-                .expect("timed out waiting for command")
-                .expect("channel closed");
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), session_stop_rx.recv())
+            .await
+            .expect("timed out waiting for command")
+            .expect("channel closed");
 
         assert!(
             matches!(cmd, SessionCommand::Stop),
@@ -9016,9 +9015,9 @@ mod event_loop_tests {
         )));
 
         // Register a real stop sender so we can observe what command is sent.
-        let (cmd_tx_for_session, mut cmd_rx_for_session) = mpsc::channel(8);
+        let (session_stop_tx, mut session_stop_rx) = mpsc::channel(8);
         let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
-            Arc::new(Mutex::new(HashMap::from([(peer_ip, cmd_tx_for_session)])));
+            Arc::new(Mutex::new(HashMap::from([(peer_ip, session_stop_tx)])));
 
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -9044,11 +9043,10 @@ mod event_loop_tests {
             .await
             .unwrap();
 
-        let cmd =
-            tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
-                .await
-                .expect("timed out waiting for command")
-                .expect("channel closed");
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), session_stop_rx.recv())
+            .await
+            .expect("timed out waiting for command")
+            .expect("channel closed");
 
         match cmd {
             SessionCommand::Notification(msg) => {
