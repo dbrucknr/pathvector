@@ -241,6 +241,15 @@ daemon. Other sessions are never interrupted.
 `AddPeer` is idempotent — calling it for an already-configured peer is a no-op.
 `RemovePeer` returns `NOT_FOUND` if the address is not a configured peer.
 
+**Side effects of `RemovePeer`:** the daemon clears the peer's Adj-RIB-In, re-runs
+best-path selection for every affected prefix, updates the kernel FIB (`RTPROT_BGP`
+routes replaced or deleted immediately — live traffic is affected), and sends BGP
+WITHDRAW or best-path-change UPDATEs to every other established peer. This all happens
+synchronously in the event loop before `RemovePeer` returns, so removing a peer with
+a large route table (e.g. a full-table eBGP session) will cause a brief stall in BGP
+event processing. See [`pathvector-client/README.md`](../pathvector-client/README.md)
+for the full breakdown.
+
 ### PeerState fields
 
 | Field | Description |

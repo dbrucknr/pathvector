@@ -189,6 +189,44 @@ returns an error with `NOT_FOUND` if the address is not a configured peer.
 - `Some(true)` — accept all routes / advertise all best routes by default
 - `Some(false)` — reject all routes / advertise nothing by default
 
+### Side effects of `remove_peer`
+
+`remove_peer` is not a lightweight call. Understanding what the daemon does on removal
+is important for operators running it in production.
+
+**RIB changes — happen synchronously before `remove_peer` returns:**
+
+1. **Adj-RIB-In cleared** — all routes learned from this peer are removed from the
+   per-peer receive table.
+2. **Loc-RIB updated** — best-path re-selection runs for every prefix the peer was
+   contributing to. Prefixes where this peer held the winning path either fall back
+   to another peer's route or disappear from the Loc-RIB entirely.
+3. **Adj-RIB-Out cleared** — the outbound table for this peer is discarded (no
+   session exists to send WITHDRAWs to).
+
+**Propagation to other peers:**
+
+4. **BGP UPDATEs sent to all remaining established peers** — for every prefix that
+   changed best-path (or was withdrawn entirely), every other established peer
+   receives a WITHDRAW or a new best-path announcement. A peer with 100k accepted
+   routes triggers 100k outbound UPDATE decisions across all remaining sessions.
+5. **MRAI applies** — outbound propagation goes through the normal Update-Send
+   Process; eBGP MRAI suppression (30-second window) is respected.
+
+**Kernel FIB (Linux only):**
+
+6. **`RTPROT_BGP` routes updated** — kernel routes forwarded via the removed peer's
+   next-hops are either replaced immediately (if another peer wins that prefix) or
+   deleted. This affects live traffic forwarding with no grace period.
+
+**Event loop contention:**
+
+The full re-propagation loop runs inside `on_terminated`, which holds the daemon's
+event loop for the duration. For a peer with a large route table this is a
+multi-millisecond stall during which no other BGP events (including KEEPALIVE
+processing for other sessions) are handled. This is a known architectural constraint
+documented in TODO.md.
+
 ---
 
 ## Testing with `DaemonClient`

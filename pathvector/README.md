@@ -140,6 +140,14 @@ pathvector peer remove 10.0.0.3
 
 Returns an error if the address is not a configured peer.
 
+> **Note:** removal triggers immediate RIB re-convergence. All routes learned from
+> this peer are withdrawn from the Loc-RIB, best-path re-selection runs for every
+> affected prefix, kernel FIB routes are updated synchronously, and every other
+> established peer receives the resulting BGP UPDATEs. For a peer with a large route
+> table this causes a brief stall in BGP event processing. See
+> [pathvector-client/README.md](../pathvector-client/README.md) for the full
+> side-effect breakdown.
+
 ---
 
 ### `route list [--peer <ADDRESS>]`
