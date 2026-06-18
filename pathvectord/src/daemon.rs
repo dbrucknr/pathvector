@@ -998,22 +998,48 @@ impl DaemonState {
             .unwrap_or(PeerType::External);
 
         // Route reflection inbound processing (RFC 4456 §8).
-        if self.rib.rr_clients.contains(&peer_ip) {
+        //
+        // When acting as an RR and the source peer is iBGP (client or
+        // non-client), we must:
+        //   1. Perform loop detection on the ORIGINAL wire message.
+        //   2. Inject ORIGINATOR_ID (if absent) and prepend CLUSTER_LIST.
+        //
+        // Loop detection must happen before injection so that cluster_id is
+        // not detected in a CLUSTER_LIST that we just prepended ourselves.
+        let is_rr = !self.rib.rr_clients.is_empty();
+        if is_rr && peer_type == PeerType::Internal {
             let cluster_id = self.rib.cluster_id;
-            // Loop detection: discard the entire UPDATE if our cluster_id
-            // already appears in CLUSTER_LIST.
-            let has_loop = msg.attributes.iter().any(
-                |a| matches!(a, PathAttribute::ClusterList(list) if list.contains(&cluster_id)),
-            );
-            if has_loop {
+            let local_bgp_id = self.rib.local_bgp_id;
+
+            // RFC 4456 §8: discard if ORIGINATOR_ID == our own BGP ID.
+            // This means the route originated from one of our clients and has
+            // been reflected back to us by another RR in the same cluster.
+            let originator_loop = msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::OriginatorId(id) if *id == local_bgp_id));
+            if originator_loop {
                 tracing::debug!(
                     peer = %peer_ip,
-                    cluster_id,
-                    "RR loop detected in CLUSTER_LIST — discarding UPDATE"
+                    "RR loop: ORIGINATOR_ID matches local BGP ID — discarding UPDATE (RFC 4456)"
                 );
                 return None;
             }
-            // Set ORIGINATOR_ID if not already present.
+
+            // RFC 4456 §8: discard if our cluster_id is already in CLUSTER_LIST.
+            let cluster_loop = msg.attributes.iter().any(
+                |a| matches!(a, PathAttribute::ClusterList(list) if list.contains(&cluster_id)),
+            );
+            if cluster_loop {
+                tracing::debug!(
+                    peer = %peer_ip,
+                    cluster_id,
+                    "RR loop: cluster_id in CLUSTER_LIST — discarding UPDATE (RFC 4456)"
+                );
+                return None;
+            }
+
+            // RFC 4456 §8: set ORIGINATOR_ID to the peer's BGP ID if absent.
             if !msg
                 .attributes
                 .iter()
@@ -1027,7 +1053,8 @@ impl DaemonState {
                     .unwrap_or(peer_ip);
                 msg.attributes.push(PathAttribute::OriginatorId(bgp_id));
             }
-            // Prepend our cluster_id to CLUSTER_LIST.
+
+            // RFC 4456 §8: prepend our cluster_id to CLUSTER_LIST.
             if let Some(PathAttribute::ClusterList(list)) = msg
                 .attributes
                 .iter_mut()
@@ -7707,6 +7734,120 @@ mod tests {
         assert!(
             has_cluster,
             "reflected route must carry cluster_id in CLUSTER_LIST"
+        );
+    }
+
+    // RFC 4456 §8: discard when ORIGINATOR_ID == local BGP ID.
+    #[test]
+    fn test_rr_originator_id_loop_detection_discards_update() {
+        let cluster_id: u32 = 7;
+        let local_bgp_id: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client, other], &[]);
+        Arc::make_mut(&mut state.rib).local_bgp_id = local_bgp_id;
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(other, PeerType::Internal, 65001, 90, &[], None);
+
+        // UPDATE carries ORIGINATOR_ID equal to our own BGP ID — routing loop.
+        let looped = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 1, 1)),
+                PathAttribute::OriginatorId(local_bgp_id),
+            ],
+            announced: vec![nlri("192.0.3.0/24")],
+        };
+        state.on_route_update(client, looped);
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "route with ORIGINATOR_ID == local BGP ID must be discarded (RFC 4456 §8)"
+        );
+        assert!(
+            receivers.get_mut(&other).unwrap().try_recv().is_err(),
+            "looped route must not be propagated to other peers"
+        );
+    }
+
+    // RFC 4456 §8: CLUSTER_LIST loop detection applies to non-client iBGP peers too.
+    #[test]
+    fn test_rr_cluster_list_loop_detection_applies_to_non_client_ibgp() {
+        let cluster_id: u32 = 55;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let non_client: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        // non_client is iBGP but not in the rr_clients set
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[non_client]);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(non_client, PeerType::Internal, 65001, 90, &[], None);
+
+        // UPDATE from the non-client iBGP peer, already carrying our cluster_id.
+        let looped = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 1, 1)),
+                PathAttribute::ClusterList(vec![cluster_id]),
+            ],
+            announced: vec![nlri("10.99.0.0/24")],
+        };
+        state.on_route_update(non_client, looped);
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "CLUSTER_LIST loop detection must apply to non-client iBGP peers (RFC 4456 §8)"
+        );
+        assert!(
+            receivers.get_mut(&client).unwrap().try_recv().is_err(),
+            "looped route from non-client must not be reflected to client"
+        );
+    }
+
+    // RFC 4456 §8: non-client iBGP → client reflection injects correct attributes.
+    #[test]
+    fn test_rr_non_client_ibgp_to_client_injects_rr_attrs() {
+        let cluster_id: u32 = 11;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let non_client: Ipv4Addr = "10.0.0.10".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[non_client]);
+
+        Arc::make_mut(&mut state.rib)
+            .peer_bgp_ids
+            .insert(non_client, non_client);
+
+        state.on_established(client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(non_client, PeerType::Internal, 65001, 90, &[], None);
+
+        state.on_route_update(non_client, update_announce("172.16.0.0/24"));
+
+        let msg = receivers
+            .get_mut(&client)
+            .unwrap()
+            .try_recv()
+            .expect("reflected UPDATE expected from non-client → client");
+
+        let has_originator = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::OriginatorId(id) if *id == non_client));
+        assert!(
+            has_originator,
+            "ORIGINATOR_ID must be set when reflecting non-client iBGP route to client"
+        );
+        let has_cluster = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::ClusterList(list) if list.contains(&cluster_id)));
+        assert!(
+            has_cluster,
+            "CLUSTER_LIST must contain cluster_id when reflecting non-client iBGP route to client"
         );
     }
 }
