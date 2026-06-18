@@ -85,6 +85,53 @@ pub enum PeerCommands {
         #[arg(value_name = "ADDRESS")]
         peer: String,
     },
+
+    /// Add a new BGP peer at runtime without restarting the daemon.
+    ///
+    /// The BGP session starts immediately. Other established sessions are
+    /// unaffected. Calling add for an already-configured peer is a no-op.
+    ///
+    /// Import and export policy default to RFC 8212 behaviour when omitted:
+    /// reject-by-default for eBGP peers, accept-by-default for iBGP peers.
+    Add {
+        /// Peer IPv4 address in dotted-decimal notation.
+        #[arg(long, value_name = "ADDRESS")]
+        address: String,
+
+        /// Remote AS number. AS 0 and AS 23456 (`AS_TRANS`) are rejected.
+        #[arg(long, value_name = "ASN")]
+        remote_as: u32,
+
+        /// TCP port to dial (default: 179).
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+
+        /// Import-policy default action.
+        ///
+        /// Omit to use RFC 8212 defaults (reject for eBGP, accept for iBGP).
+        #[arg(long, value_name = "accept|reject")]
+        import_default: Option<Decision>,
+
+        /// Export-policy default action.
+        ///
+        /// Omit to use RFC 8212 defaults (reject for eBGP, accept for iBGP).
+        #[arg(long, value_name = "accept|reject")]
+        export_default: Option<Decision>,
+
+        /// RFC 2385 TCP MD5 authentication password.
+        #[arg(long, value_name = "PASSWORD")]
+        md5_password: Option<String>,
+    },
+
+    /// Remove a BGP peer at runtime without restarting the daemon.
+    ///
+    /// All routes learned from this peer are withdrawn from the Loc-RIB before
+    /// state is cleaned up. Other established sessions are unaffected.
+    Remove {
+        /// Peer IPv4 address in dotted-decimal notation.
+        #[arg(value_name = "ADDRESS")]
+        address: String,
+    },
 }
 
 // ── route subcommands ─────────────────────────────────────────────────────────
@@ -254,6 +301,65 @@ mod tests {
             "list",
         ]);
         assert_eq!(cli.address, "http://10.0.0.1:9090");
+    }
+
+    #[test]
+    fn peer_add_minimal_parses() {
+        let cli = Cli::parse_from([
+            "pathvector", "peer", "add", "--address", "10.0.0.3", "--remote-as", "65003",
+        ]);
+        if let Commands::Peer {
+            command: PeerCommands::Add { address, remote_as, port, import_default, export_default, md5_password },
+        } = cli.command
+        {
+            assert_eq!(address, "10.0.0.3");
+            assert_eq!(remote_as, 65003);
+            assert!(port.is_none());
+            assert!(import_default.is_none(), "omitted import_default must be None (RFC 8212)");
+            assert!(export_default.is_none(), "omitted export_default must be None (RFC 8212)");
+            assert!(md5_password.is_none());
+        } else {
+            panic!("expected peer add");
+        }
+    }
+
+    #[test]
+    fn peer_add_all_flags_parses() {
+        let cli = Cli::parse_from([
+            "pathvector", "peer", "add",
+            "--address", "10.0.0.3",
+            "--remote-as", "65003",
+            "--port", "1179",
+            "--import-default", "accept",
+            "--export-default", "reject",
+            "--md5-password", "s3cr3t",
+        ]);
+        if let Commands::Peer {
+            command: PeerCommands::Add { address, remote_as, port, import_default, export_default, md5_password },
+        } = cli.command
+        {
+            assert_eq!(address, "10.0.0.3");
+            assert_eq!(remote_as, 65003);
+            assert_eq!(port, Some(1179));
+            assert_eq!(import_default, Some(Decision::Accept));
+            assert_eq!(export_default, Some(Decision::Reject));
+            assert_eq!(md5_password.as_deref(), Some("s3cr3t"));
+        } else {
+            panic!("expected peer add");
+        }
+    }
+
+    #[test]
+    fn peer_remove_parses() {
+        let cli = Cli::parse_from(["pathvector", "peer", "remove", "10.0.0.3"]);
+        if let Commands::Peer {
+            command: PeerCommands::Remove { address },
+        } = cli.command
+        {
+            assert_eq!(address, "10.0.0.3");
+        } else {
+            panic!("expected peer remove");
+        }
     }
 
     #[test]
