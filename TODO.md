@@ -235,7 +235,7 @@ What remains as optional future work:
 
 ### Remaining
 
-- **RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641) — RFC 7606 §1 states the speaker SHOULD send NOTIFICATION for well-known mandatory attribute errors. Current implementation applies TreatAsWithdraw silently without notifying the peer. Low priority (SHOULD, not MUST), but a known deviation.
+- **RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641) — RFC 7606 §1 states the speaker SHOULD send NOTIFICATION for well-known mandatory attribute errors. All `MUST` requirements are implemented and verified (see `pathvector-session/RFC.md`). The remaining deviation: `TreatAsWithdraw` is applied silently without notifying the peer. Low priority (`SHOULD`, not `MUST`).
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 - NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during the GR window without tearing down the restart; extends RFC 4724; depends on Graceful Restart FSM
