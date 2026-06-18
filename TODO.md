@@ -235,16 +235,23 @@ What remains as optional future work:
 
 ### Remaining
 
-- **RFC 7606 NOTIFICATION for well-known mandatory errors** (`pathvector-session/src/transport/mod.rs`, ~line 641) — RFC 7606 §1 states the speaker SHOULD send NOTIFICATION for well-known mandatory attribute errors. All `MUST` requirements are implemented and verified (see `pathvector-session/RFC.md`). The remaining deviation: `TreatAsWithdraw` is applied silently without notifying the peer. Low priority (`SHOULD`, not `MUST`).
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
 - NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during the GR window without tearing down the restart; extends RFC 4724; depends on Graceful Restart FSM
-- Enhanced Route Refresh (RFC 7313) — adds `ORF_BEGIN` / `ORF_END` markers so the receiver knows when a full re-advertisement is complete; extends RFC 2918; currently codec-only
-- Extended admin shutdown communication (RFC 9003) — extends CEASE NOTIFICATION (RFC 4486) with a UTF-8 freetext reason string (max 128 bytes); small addition on top of existing CEASE infrastructure
 - BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
-- Per-peer hold timer and keepalive interval — currently held in `SessionConfig` at a fixed value; should be configurable per peer in `PeerConfig` with a global fallback in `[daemon]`
-- Outbound ROUTE-REFRESH trigger — send a `ROUTE-REFRESH` message to a peer to request their full table re-advertisement (protocol-level inbound soft reset); currently soft reset is API-driven only; requires RFC 2918 capability negotiation guard (already present)
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
+
+~~**Enhanced Route Refresh codec (RFC 7313)** — adds `BeginRefresh` / `EndRefresh` subtypes so the receiver knows when a full re-advertisement is complete; extends RFC 2918.~~
+~~**Resolved 2026-06-18**: `RouteRefreshSubtype` enum added to `pathvector-session`. The previously reserved byte in the ROUTE-REFRESH wire format is now decoded as `Refresh` (0), `BeginRefresh` (1), or `EndRefresh` (2). Encode/decode updated; 4 new codec tests added.~~
+
+~~**Extended admin shutdown communication (RFC 9003)** — extends CEASE NOTIFICATION (RFC 4486) with a UTF-8 freetext reason string (max 128 bytes).~~
+~~**Resolved 2026-06-18**: `encode_shutdown_message` / `decode_shutdown_message` added to `pathvector-session::message::notification`. `pathvectord` reads `shutdown_message: Option<String>` from `PeerConfig`; `RemovePeer` sends `Cease/AdministrativeShutdown` with the encoded payload instead of a bare `Stop` command. 6 new unit tests.~~
+
+~~**Per-peer hold timer** — configurable per peer in `PeerConfig` with a global fallback in `[daemon]`.~~
+~~**Resolved 2026-06-18**: `PeerConfig.hold_time: Option<u16>` added. `build_daemon` and the `AddPeer` command processor both fall back to `DaemonConfig.hold_time` when the per-peer value is absent.~~
+
+~~**Outbound ROUTE-REFRESH trigger** — send a `ROUTE-REFRESH` message to a peer to request their full table re-advertisement.~~
+~~**Resolved 2026-06-18**: `SessionCommand::RouteRefresh(RouteRefreshMessage)` variant added. `SessionHandle::send_route_refresh` wired through `SpawnedSessionHandle`. `SoftReset` gRPC RPC added to `PeerService`; `PeerServiceImpl::soft_reset` sends a `RouteRefresh` command to the target peer's session actor.~~
 
 ---
 

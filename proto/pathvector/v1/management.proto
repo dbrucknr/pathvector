@@ -131,6 +131,17 @@ service PeerService {
   ///   INVALID_ARGUMENT — address is not a valid IPv4 address
   ///   NOT_FOUND        — address is not a configured peer
   rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
+
+  /// Sends a ROUTE-REFRESH request to the peer for the given address family
+  /// (RFC 2918), asking it to re-advertise all routes without resetting the
+  /// session.  This is the BGP inbound soft-reset operation.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address, or afi_safi
+  ///                      is not a recognised address family
+  ///   NOT_FOUND        — address is not a configured peer
+  ///   FAILED_PRECONDITION — session is not currently established
+  rpc SoftReset(SoftResetRequest) returns (SoftResetResponse);
 }
 
 message ListPeersRequest {}
@@ -219,6 +230,15 @@ message RemovePeerRequest {
 }
 
 message RemovePeerResponse {}
+
+message SoftResetRequest {
+  /// Dotted-decimal IPv4 address of the peer to soft-reset.
+  string address = 1;
+  /// Address family to refresh.  "ipv4" (default) or "ipv6".
+  string afi_safi = 2;
+}
+
+message SoftResetResponse {}
 
 // ── RIB service ───────────────────────────────────────────────────────────────
 

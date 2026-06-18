@@ -257,6 +257,34 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub is_rr_client: bool,
+    /// Per-peer BGP hold time in seconds, overriding `daemon.hold_time`.
+    ///
+    /// When omitted the peer inherits the daemon-level `hold_time` (default 90 s).
+    /// Setting `0` disables the hold timer for this peer (keepalives are still
+    /// sent but expiry is not checked). Must be ≥ 3 or exactly 0.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address   = "10.0.0.2"
+    /// remote_as = 65001
+    /// hold_time = 30
+    /// ```
+    #[serde(default)]
+    pub hold_time: Option<u16>,
+    /// UTF-8 reason string sent in the CEASE/AdministrativeShutdown NOTIFICATION
+    /// when this peer is administratively removed (RFC 9003).
+    ///
+    /// Truncated to 128 bytes at the wire layer per RFC 9003 §2.
+    /// When omitted the CEASE carries no diagnostic payload.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address          = "10.0.0.2"
+    /// remote_as        = 65001
+    /// shutdown_message = "going down for maintenance"
+    /// ```
+    #[serde(default)]
+    pub shutdown_message: Option<String>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -371,6 +399,8 @@ mod sidecar_tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }
     }
 
@@ -446,6 +476,8 @@ mod sidecar_tests {
             export_default: Some(ExportDefault::Accept),
             md5_password: Some("s3cr3t".into()),
             is_rr_client: true,
+            hold_time: Some(60),
+            shutdown_message: Some("planned maintenance".into()),
         };
         store.upsert(full_peer.clone()).await;
 
@@ -457,6 +489,8 @@ mod sidecar_tests {
         assert!(matches!(got.export_default, Some(ExportDefault::Accept)));
         assert_eq!(got.md5_password.as_deref(), Some("s3cr3t"));
         assert!(got.is_rr_client);
+        assert_eq!(got.hold_time, Some(60));
+        assert_eq!(got.shutdown_message.as_deref(), Some("planned maintenance"));
     }
 
     #[tokio::test]

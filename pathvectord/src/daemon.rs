@@ -17,8 +17,9 @@ use pathvector_rib::{
 };
 use pathvector_session::{
     message::{
-        Capability, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri, NotificationError,
-        NotificationMessage, PathAttribute, Prefix, UpdateMessage, UpdateMsgError,
+        Capability, CeaseError, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri,
+        NotificationError, NotificationMessage, PathAttribute, Prefix, UpdateMessage,
+        UpdateMsgError, encode_shutdown_message,
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
@@ -180,6 +181,12 @@ pub(crate) struct DaemonState {
     /// AS_PATH is sent unchanged to these peers. For absent peers, AS_PATH is
     /// downgraded (4-byte ASNs replaced with AS_TRANS) and AS4_PATH is added.
     pub(crate) four_byte_peers: HashSet<Ipv4Addr>,
+    /// Peers that negotiated RFC 2918 `RouteRefresh` capability.
+    ///
+    /// `SoftReset` (gRPC) may only send a ROUTE-REFRESH message to peers in
+    /// this set. RFC 2918 §4: a router MUST NOT send ROUTE-REFRESH without
+    /// having received the corresponding capability from the peer.
+    pub(crate) route_refresh_peers: HashSet<Ipv4Addr>,
     /// RFC 4271 §9.2.1.1: Minimum Route Advertisement Interval.
     ///
     /// Tracks when each prefix was last announced to each eBGP peer so that
@@ -207,6 +214,12 @@ pub(crate) struct DaemonState {
     /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
     /// resetting it for a reconnect.
     pub(crate) pending_removal: HashSet<Ipv4Addr>,
+    /// RFC 9003 shutdown reason strings, keyed by peer address.
+    ///
+    /// Populated when a peer is added (static or dynamic) and has a
+    /// `shutdown_message` configured. Used by `RemovePeer` to send a
+    /// CEASE/AdministrativeShutdown NOTIFICATION with the reason attached.
+    pub(crate) shutdown_messages: HashMap<Ipv4Addr, String>,
     /// Broadcast channel for Loc-RIB events (announced / withdrawn).
     ///
     /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
@@ -324,6 +337,11 @@ impl DaemonState {
 
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
+        let shutdown_messages: HashMap<Ipv4Addr, String> = peers
+            .iter()
+            .filter_map(|p| p.shutdown_message.as_ref().map(|m| (p.address, m.clone())))
+            .collect();
+
         // Capacity of 1024 events each.  A receiver that falls >1024 events
         // behind sees `RecvError::Lagged`; the `watch_peers` gRPC stream handler
         // defends against this by re-reading the full snapshot on any
@@ -366,10 +384,12 @@ impl DaemonState {
             negotiated_max_len: HashMap::new(),
             ipv6_capable_peers: HashSet::new(),
             four_byte_peers: HashSet::new(),
+            route_refresh_peers: HashSet::new(),
             mrai_last_sent: HashMap::new(),
             mrai_pending: HashMap::new(),
             stalled_peers: Vec::new(),
             pending_removal: HashSet::new(),
+            shutdown_messages,
             route_tx,
             peer_tx,
             fib_manager: None,
@@ -425,6 +445,9 @@ impl DaemonState {
             Policy::new(resolve_export_default(peer.export_default, is_ebgp)),
         );
         self.update_senders.insert(peer.address, update_sender);
+        if let Some(msg) = peer.shutdown_message.clone() {
+            self.shutdown_messages.insert(peer.address, msg);
+        }
         Arc::make_mut(&mut self.rib)
             .peer_remote_as
             .insert(peer.address, peer.remote_as);
@@ -452,8 +475,10 @@ impl DaemonState {
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
         self.four_byte_peers.remove(&peer_ip);
+        self.route_refresh_peers.remove(&peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
+        self.shutdown_messages.remove(&peer_ip);
         let rib = Arc::make_mut(&mut self.rib);
         rib.peer_remote_as.remove(&peer_ip);
         rib.peer_types.remove(&peer_ip);
@@ -715,6 +740,16 @@ impl DaemonState {
             self.four_byte_peers.remove(&peer_ip);
         }
 
+        // RFC 2918: track whether this peer negotiated Route Refresh.
+        // Both sides must advertise the capability for ROUTE-REFRESH to be valid.
+        let peer_route_refresh = peer_capabilities.contains(&Capability::RouteRefresh)
+            && self.config_capabilities.contains(&Capability::RouteRefresh);
+        if peer_route_refresh {
+            self.route_refresh_peers.insert(peer_ip);
+        } else {
+            self.route_refresh_peers.remove(&peer_ip);
+        }
+
         if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
             self.stalled_peers.push(peer_ip);
         }
@@ -794,6 +829,7 @@ impl DaemonState {
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
         self.four_byte_peers.remove(&peer_ip);
+        self.route_refresh_peers.remove(&peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
 
@@ -1808,8 +1844,9 @@ where
 
     // Spawn the gRPC management API server alongside the BGP event loop.
     let grpc_state = Arc::clone(&state);
+    let grpc_stop_senders = Arc::clone(&stop_senders);
     tokio::spawn(async move {
-        grpc::serve(grpc_state, grpc_port, cmd_tx).await;
+        grpc::serve(grpc_state, grpc_port, cmd_tx, grpc_stop_senders).await;
     });
 
     // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
@@ -1928,7 +1965,7 @@ async fn run_command_processor<H, F>(
                 let session_cfg = SessionConfig {
                     local_as: cfg.local_as,
                     local_bgp_id: cfg.local_bgp_id,
-                    hold_time: cfg.hold_time,
+                    hold_time: peer.hold_time.unwrap_or(cfg.hold_time),
                     capabilities: cfg.local_capabilities.clone(),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
@@ -1992,9 +2029,21 @@ async fn run_command_processor<H, F>(
 
                 // Send Cease NOTIFICATION; the session will emit Terminated which
                 // triggers full state cleanup in the event loop.
+                //
+                // If the peer has a configured shutdown_message (RFC 9003), encode it
+                // into the CEASE/AdministrativeShutdown payload instead of bare Stop.
+                let shutdown_reason = state.read().await.shutdown_messages.get(&peer_ip).cloned();
                 let stop_tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
                 if let Some(tx) = stop_tx {
-                    let _ = tx.send(SessionCommand::Stop).await;
+                    if let Some(reason) = shutdown_reason {
+                        let cmd = SessionCommand::Notification(NotificationMessage {
+                            error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+                            data: encode_shutdown_message(&reason),
+                        });
+                        let _ = tx.send(cmd).await;
+                    } else {
+                        let _ = tx.send(SessionCommand::Stop).await;
+                    }
                 } else {
                     // No live session actor (peer is idle / between reconnects and the
                     // stop sender was dropped).  Synthesize Terminated directly so the
@@ -2062,6 +2111,7 @@ where
     let local_capabilities = vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
         Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
+        Capability::RouteRefresh,
         Capability::FourByteAsn(local_as),
         Capability::ExtendedMessage,
     ];
@@ -2070,7 +2120,7 @@ where
         let session_cfg = SessionConfig {
             local_as,
             local_bgp_id,
-            hold_time: cfg.daemon.hold_time,
+            hold_time: peer.hold_time.unwrap_or(cfg.daemon.hold_time),
             capabilities: local_capabilities.clone(),
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
@@ -2935,6 +2985,8 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -3057,6 +3109,8 @@ mod tests {
             md5_password: None,
             export_default: None,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -3271,6 +3325,8 @@ mod tests {
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }];
         let mut state = DaemonState::new(
             65001,
@@ -4288,6 +4344,8 @@ mod tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -4329,6 +4387,8 @@ mod tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -7445,6 +7505,8 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: true,
+                hold_time: None,
+                shutdown_message: None,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
                 address,
@@ -7455,6 +7517,8 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             }))
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -7702,6 +7766,8 @@ mod stall_tests {
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             })
             .collect();
         let state = DaemonState::new(
@@ -7789,6 +7855,8 @@ mod stall_tests {
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -7799,6 +7867,8 @@ mod stall_tests {
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -7905,6 +7975,8 @@ mod stall_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -7915,6 +7987,8 @@ mod stall_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -8138,6 +8212,8 @@ mod event_loop_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             })
             .collect();
 
@@ -8268,6 +8344,8 @@ mod event_loop_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -8278,6 +8356,8 @@ mod event_loop_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -8458,6 +8538,8 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }
     }
 
@@ -8587,6 +8669,11 @@ mod event_loop_tests {
             }
             fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
                 mpsc::channel(1).0
+            }
+            async fn send_route_refresh(
+                &self,
+                _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
             }
         }
 
@@ -8740,6 +8827,11 @@ mod event_loop_tests {
             }
             fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
                 mpsc::channel(1).0
+            }
+            async fn send_route_refresh(
+                &self,
+                _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
             }
         }
 
@@ -8963,6 +9055,11 @@ mod event_loop_tests {
             }
             fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
                 mpsc::channel(1).0
+            }
+            async fn send_route_refresh(
+                &self,
+                _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
             }
         }
 
@@ -9243,6 +9340,8 @@ mod dynamic_peer_prop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         }
     }
 
@@ -9562,6 +9661,12 @@ mod run_with_tests {
         fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
             self.stop_tx.clone()
         }
+
+        async fn send_route_refresh(
+            &self,
+            _rr: pathvector_session::message::RouteRefreshMessage,
+        ) {
+        }
     }
 
     /// Test-side view of a spawned mock session.
@@ -9623,6 +9728,8 @@ mod run_with_tests {
                     import_default_v6: None,
                     md5_password: None,
                     is_rr_client: false,
+                    hold_time: None,
+                    shutdown_message: None,
                 })
                 .collect(),
             sidecar_path: None,
@@ -10001,6 +10108,8 @@ mod run_with_tests {
                 export_default: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             })
             .await;
 
@@ -10048,6 +10157,8 @@ mod run_with_tests {
                 export_default: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             })
             .await;
 

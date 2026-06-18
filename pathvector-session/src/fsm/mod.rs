@@ -1735,9 +1735,7 @@ mod tests {
         let (mut fsm, _) = establish(default_config());
 
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::RouteRefresh(
-            crate::message::RouteRefreshMessage {
-                afi_safi: pathvector_types::AfiSafi::IPV4_UNICAST,
-            },
+            crate::message::RouteRefreshMessage::new(pathvector_types::AfiSafi::IPV4_UNICAST),
         )));
 
         assert_eq!(fsm.state(), State::Idle);
@@ -1773,9 +1771,7 @@ mod tests {
         assert_eq!(fsm.state(), State::Established);
 
         let out = fsm.process(FsmInput::MessageReceived(BgpMessage::RouteRefresh(
-            crate::message::RouteRefreshMessage {
-                afi_safi: pathvector_types::AfiSafi::IPV4_UNICAST,
-            },
+            crate::message::RouteRefreshMessage::new(pathvector_types::AfiSafi::IPV4_UNICAST),
         )));
 
         assert_eq!(fsm.state(), State::Established, "session must stay up");

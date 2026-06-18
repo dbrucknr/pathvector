@@ -14,8 +14,9 @@
 //! **write** lock because it mutates import/export policy maps and re-evaluates
 //! RIB state.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
 
@@ -24,6 +25,12 @@ use pathvector_rib::PeerId;
 use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType};
 
 use tokio::sync::mpsc;
+
+use pathvector_session::{
+    message::RouteRefreshMessage,
+    transport::SessionCommand,
+};
+use pathvector_types::AfiSafi;
 
 use crate::{DaemonState, RibSnapshot, daemon::DaemonCommand};
 
@@ -46,7 +53,8 @@ use proto::{
     ListRoutesResponse, OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest,
     OriginateRoutesResponse, PeerEvent, PeerEventType, PeerState, PolicyAction, RemovePeerRequest,
     RemovePeerResponse, Route, RouteEvent, RouteEventType, RouteResponse, SetExportDefaultRequest,
-    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse, WatchPeersRequest,
+    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse,
+    SoftResetRequest, SoftResetResponse, WatchPeersRequest,
     WatchRoutesRequest, WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse,
     WithdrawOriginatedRoutesRequest, WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
@@ -230,6 +238,8 @@ struct PeerServiceImpl {
     state: Arc<tokio::sync::RwLock<DaemonState>>,
     /// Channel to the command processor for AddPeer / RemovePeer at runtime.
     cmd_tx: mpsc::Sender<DaemonCommand>,
+    /// Per-peer command senders, used by SoftReset to send ROUTE-REFRESH.
+    stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
 }
 
 /// Build a `PeerState` proto message from daemon state for `addr`.
@@ -485,6 +495,8 @@ impl PeerService for PeerServiceImpl {
             import_default_v6: None,
             md5_password,
             is_rr_client: false,
+            hold_time: None,
+            shutdown_message: None,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -538,6 +550,66 @@ impl PeerService for PeerServiceImpl {
             .map_err(|_| Status::internal("daemon command channel closed"))?;
 
         Ok(Response::new(RemovePeerResponse {}))
+    }
+
+    async fn soft_reset(
+        &self,
+        request: Request<SoftResetRequest>,
+    ) -> Result<Response<SoftResetResponse>, Status> {
+        let req = request.into_inner();
+
+        let addr: Ipv4Addr = req
+            .address
+            .parse()
+            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+
+        let afi_safi = match req.afi_safi.as_str() {
+            "" | "ipv4" => AfiSafi::IPV4_UNICAST,
+            "ipv6" => AfiSafi::IPV6_UNICAST,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown afi_safi '{other}': use 'ipv4' or 'ipv6'"
+                )));
+            }
+        };
+
+        // Verify peer exists, session is established, and Route Refresh was
+        // negotiated (RFC 2918 §4: MUST NOT send without capability from peer).
+        {
+            let s = self.state.read().await;
+            let snap = s.snapshot();
+            if !snap.peer_remote_as.contains_key(&addr) {
+                return Err(Status::not_found(format!("peer {addr} is not configured")));
+            }
+            if !snap.peer_types.contains_key(&addr) {
+                return Err(Status::failed_precondition(format!(
+                    "peer {addr} session is not established"
+                )));
+            }
+            if !s.route_refresh_peers.contains(&addr) {
+                return Err(Status::failed_precondition(format!(
+                    "peer {addr} did not negotiate Route Refresh capability (RFC 2918)"
+                )));
+            }
+        }
+
+        let tx = self
+            .stop_senders
+            .lock()
+            .unwrap()
+            .get(&addr)
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("peer {addr} session is not established"))
+            })?;
+
+        tx.send(SessionCommand::RouteRefresh(RouteRefreshMessage::new(
+            afi_safi,
+        )))
+        .await
+        .map_err(|_| Status::internal("session command channel closed"))?;
+
+        Ok(Response::new(SoftResetResponse {}))
     }
 }
 
@@ -1120,6 +1192,7 @@ pub(crate) async fn serve(
     state: Arc<tokio::sync::RwLock<DaemonState>>,
     port: u16,
     cmd_tx: mpsc::Sender<DaemonCommand>,
+    stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
 ) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
@@ -1128,6 +1201,7 @@ pub(crate) async fn serve(
     let peer_svc = PeerServiceServer::new(PeerServiceImpl {
         state: Arc::clone(&state),
         cmd_tx,
+        stop_senders,
     });
     let rib_svc = RibServiceServer::new(RibServiceImpl {
         state: Arc::clone(&state),
@@ -1168,7 +1242,7 @@ pub(crate) async fn serve(
 mod tests {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use pathvector_rib::{PeerId, RouteBuilder};
     use pathvector_types::{
@@ -1177,6 +1251,8 @@ mod tests {
     };
     use tokio::sync::{RwLock, mpsc};
     use tonic::Request;
+
+    use pathvector_session::transport::SessionCommand;
 
     use super::{
         OriginationServiceImpl, PeerServiceImpl, PolicyServiceImpl, RibServiceImpl,
@@ -1192,6 +1268,11 @@ mod tests {
     fn noop_cmd_tx() -> mpsc::Sender<crate::daemon::DaemonCommand> {
         let (tx, _rx) = mpsc::channel(1);
         tx
+    }
+
+    fn noop_stop_senders(
+    ) -> Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     use crate::{
@@ -1226,6 +1307,8 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                hold_time: None,
+                shutdown_message: None,
             })
             .collect();
         DaemonState::new(
@@ -1466,6 +1549,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
@@ -1482,6 +1566,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
@@ -1509,6 +1594,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let resp = svc
             .list_peers(Request::new(ListPeersRequest {}))
@@ -1532,6 +1618,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
 
         let resp = svc
@@ -1552,6 +1639,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
 
         let err = svc
@@ -1569,6 +1657,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
 
         let err = svc
@@ -1588,6 +1677,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
@@ -1606,6 +1696,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
@@ -1625,6 +1716,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
@@ -1642,7 +1734,11 @@ mod tests {
     async fn test_add_peer_sends_command_on_valid_request() {
         let state = arc_state(65001, &[]);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-        let svc = PeerServiceImpl { state, cmd_tx };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx,
+            stop_senders: noop_stop_senders(),
+        };
         let resp = svc
             .add_peer(Request::new(AddPeerRequest {
                 address: "10.0.0.2".into(),
@@ -1672,6 +1768,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let err = svc
             .remove_peer(Request::new(RemovePeerRequest {
@@ -1688,6 +1785,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let err = svc
             .remove_peer(Request::new(RemovePeerRequest {
@@ -1703,7 +1801,11 @@ mod tests {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-        let svc = PeerServiceImpl { state, cmd_tx };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx,
+            stop_senders: noop_stop_senders(),
+        };
         svc.remove_peer(Request::new(RemovePeerRequest {
             address: "10.0.0.2".into(),
         }))
@@ -1728,7 +1830,11 @@ mod tests {
         state.write().await.pending_removal.insert(addr);
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-        let svc = PeerServiceImpl { state, cmd_tx };
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx,
+            stop_senders: noop_stop_senders(),
+        };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
                 address: "10.0.0.2".into(),
@@ -1768,6 +1874,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state: Arc::clone(&state),
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
 
         let resp = svc
@@ -1822,6 +1929,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state: Arc::clone(&state),
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
 
         let resp = svc
@@ -3228,6 +3336,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
@@ -3249,6 +3358,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state,
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
@@ -3273,6 +3383,7 @@ mod tests {
         let svc = PeerServiceImpl {
             state: Arc::clone(&state),
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         };
         let resp = svc
             .watch_peers(Request::new(WatchPeersRequest {}))
@@ -3634,6 +3745,7 @@ mod tests {
         let peer_svc = proto::peer_service_server::PeerServiceServer::new(PeerServiceImpl {
             state: Arc::clone(&state),
             cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
         });
         let origination_svc = proto::origination_service_server::OriginationServiceServer::new(
             OriginationServiceImpl {

@@ -113,6 +113,16 @@ pub trait SessionHandle: Send + 'static {
     /// Clone the command sender for delivering an accepted inbound TCP
     /// connection to this session (RFC 4271 §6.8 collision detection).
     fn incoming_sender(&self) -> mpsc::Sender<SessionCommand>;
+
+    /// Send a ROUTE-REFRESH request to the peer for the given address family
+    /// (RFC 2918). The peer will re-advertise all routes for that AFI/SAFI.
+    ///
+    /// Silently ignored if the session is not currently established or if the
+    /// command channel is full.
+    fn send_route_refresh(
+        &self,
+        rr: crate::message::RouteRefreshMessage,
+    ) -> impl Future<Output = ()> + Send + '_;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -160,6 +170,12 @@ pub enum SessionCommand {
     /// BGP listener.  The session applies RFC 4271 §6.8 collision detection
     /// and either adopts the incoming connection or discards it.
     IncomingConnection(TcpStream),
+    /// Send a ROUTE-REFRESH message to the peer for the given AFI/SAFI (RFC 2918).
+    ///
+    /// Instructs the peer to re-advertise all routes for the address family
+    /// without resetting the session. Silently dropped if the session is not in
+    /// `Established` state or if no transport is available.
+    RouteRefresh(crate::message::RouteRefreshMessage),
 }
 
 /// Events emitted by a session to its caller.
@@ -229,6 +245,10 @@ impl SessionHandle for SpawnedSessionHandle {
 
     fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
         self.cmd_tx.clone()
+    }
+
+    async fn send_route_refresh(&self, rr: crate::message::RouteRefreshMessage) {
+        let _ = self.cmd_tx.send(SessionCommand::RouteRefresh(rr)).await;
     }
 }
 
@@ -416,6 +436,15 @@ impl<T: BgpTransport> Session<T> {
                             return input;
                         }
                         // Won the collision: incoming rejected, outbound continues.
+                    }
+                    Some(SessionCommand::RouteRefresh(rr)) => {
+                        if let Some(t) = &mut self.transport
+                            && t.send(BgpMessage::RouteRefresh(rr)).await.is_err()
+                        {
+                            self.drop_connection();
+                            return FsmInput::TcpFailed;
+                        }
+                        // No FSM transition; loop continues.
                     }
                 },
 

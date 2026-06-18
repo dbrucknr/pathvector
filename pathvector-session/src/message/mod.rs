@@ -11,10 +11,10 @@ pub use error::CodecError;
 pub use header::{MAX_LEN, MAX_LEN_EXTENDED, MessageType};
 pub use notification::{
     CeaseError, MsgHeaderError, NotificationError, NotificationMessage, OpenMsgError,
-    UpdateMsgError,
+    UpdateMsgError, decode_shutdown_message, encode_shutdown_message,
 };
 pub use open::{Capability, GracefulRestartFamily, OpenMessage};
-pub use route_refresh::RouteRefreshMessage;
+pub use route_refresh::{RouteRefreshMessage, RouteRefreshSubtype};
 pub use update::{
     AttributeDecodeError, AttributeErrorPolicy, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
     UpdateMessage, encode_attributes, nlri_encoded_len, nlri_v6_encoded_len,
@@ -332,9 +332,7 @@ mod tests {
 
     #[test]
     fn test_route_refresh_roundtrip() {
-        let msg = BgpMessage::RouteRefresh(RouteRefreshMessage {
-            afi_safi: AfiSafi::IPV6_UNICAST,
-        });
+        let msg = BgpMessage::RouteRefresh(RouteRefreshMessage::new(AfiSafi::IPV6_UNICAST));
         assert_eq!(roundtrip(&msg), msg);
     }
 

@@ -222,7 +222,7 @@ fn arb_bgp_message() -> impl Strategy<Value = BgpMessage> {
                 })
             }),
         arb_afi_safi()
-            .prop_map(|afi_safi| BgpMessage::RouteRefresh(RouteRefreshMessage { afi_safi })),
+            .prop_map(|afi_safi| BgpMessage::RouteRefresh(RouteRefreshMessage::new(afi_safi))),
     ]
 }
 

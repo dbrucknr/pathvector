@@ -124,7 +124,7 @@ fn arb_path_attribute() -> impl Strategy<Value = PathAttribute> {
 proptest! {
     #[test]
     fn prop_route_refresh_roundtrip(afi_safi in arb_afi_safi()) {
-        let msg = BgpMessage::RouteRefresh(RouteRefreshMessage { afi_safi });
+        let msg = BgpMessage::RouteRefresh(RouteRefreshMessage::new(afi_safi));
         prop_assert_eq!(BgpMessage::decode(&msg.encode()).unwrap(), msg);
     }
 

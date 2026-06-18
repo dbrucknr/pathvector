@@ -162,6 +162,22 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 
 ---
 
+## RFC 9003 — Extended BGP Administrative Shutdown Communication (Daemon Integration)
+
+**Owns:** Reading `shutdown_message: Option<String>` from `PeerConfig`; sending the encoded
+payload in `Cease/AdministrativeShutdown` NOTIFICATION during `RemovePeer`.  
+**Boundary:** Wire encoding of the payload (1-byte length + UTF-8, max 128 bytes) lives in
+`pathvector-session::message::notification::encode_shutdown_message`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9003
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `shutdown_message: Option<String>` in `PeerConfig` | `src/config.rs` | ✅ | `test_sidecar_round_trips_all_fields` |
+| `RemovePeer` sends `Cease/AdministrativeShutdown` with encoded reason when configured | `src/daemon.rs` | ✅ | — |
+| `RemovePeer` falls back to bare `Stop` when no message is configured | `src/daemon.rs` | ✅ | `test_remove_peer_sends_stop_to_session` |
+
+---
+
 ## RFC 4271 §8 — Connection Collision Coordination
 
 **Owns:** The FSM-level decision of which session to keep when two peers simultaneously

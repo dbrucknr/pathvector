@@ -79,12 +79,48 @@ the attribute, when to reset the session.
 ## RFC 2918 — Route Refresh Capability for BGP-4
 
 **Owns:** ROUTE-REFRESH message codec and capability advertisement.  
+**Boundary:** RFC 7313 (Enhanced Route Refresh) repurposes the reserved byte as a subtype — owned here.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc2918
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | Capability code 2 advertised in OPEN | `src/message/` | ✅ | `test_capability_route_refresh_in_open` |
-| ROUTE-REFRESH message (type 5) encode/decode with AFI + reserved + SAFI | `src/message/` | ✅ | `test_route_refresh_roundtrip` |
+| ROUTE-REFRESH message (type 5) encode/decode with AFI + reserved + SAFI | `src/message/route_refresh.rs` | ✅ | `test_route_refresh_roundtrip` |
+| Outbound ROUTE-REFRESH send via `SessionCommand::RouteRefresh` | `src/transport/mod.rs` | ✅ | — |
+
+---
+
+## RFC 7313 — Enhanced Route Refresh Capability for BGP-4
+
+**Owns:** `RouteRefreshSubtype` codec — repurposing the reserved byte as `Refresh` (0),
+`BeginRefresh` (1), `EndRefresh` (2) subtypes.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc7313
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Subtype 0 (Refresh) — normal ROUTE-REFRESH | `src/message/route_refresh.rs` | ✅ | `test_route_refresh_subtype_refresh_default`, `prop_route_refresh_roundtrip` |
+| Subtype 1 (BeginRefresh) encode/decode | `src/message/route_refresh.rs` | ✅ | `test_route_refresh_subtype_begin_refresh` |
+| Subtype 2 (EndRefresh) encode/decode | `src/message/route_refresh.rs` | ✅ | `test_route_refresh_subtype_end_refresh` |
+| Unknown subtype preserved (not mapped to error) | `src/message/route_refresh.rs` | ✅ | `test_route_refresh_subtype_unknown` |
+
+---
+
+## RFC 9003 — Extended BGP Administrative Shutdown Communication
+
+**Owns:** Encoding and decoding the UTF-8 shutdown reason string in the CEASE
+NOTIFICATION `data` field.  
+**Boundary:** The `AdministrativeShutdown` subcode and NOTIFICATION framing live in
+RFC 4486 / RFC 4271; this RFC only governs the `data` payload format.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9003
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `data` field: 1-byte length prefix + UTF-8 string, max 128 bytes | `src/message/notification.rs` | ✅ | `test_rfc9003_encode_decode_roundtrip` |
+| Strings longer than 128 bytes truncated on encode | `src/message/notification.rs` | ✅ | `test_rfc9003_message_truncated_to_128_bytes` |
+| Empty `data` returns `None` (not an error) | `src/message/notification.rs` | ✅ | `test_rfc9003_empty_data_returns_none` |
+| Length byte exceeding remaining data handled safely | `src/message/notification.rs` | ✅ | `test_rfc9003_length_byte_exceeds_remaining_data` |
+| `AdministrativeShutdown` NOTIFICATION with reason round-trips | `src/message/notification.rs` | ✅ | `test_rfc9003_shutdown_notification_roundtrips` |
+| `AdministrativeReset` NOTIFICATION with reason round-trips | `src/message/notification.rs` | ✅ | `test_rfc9003_admin_reset_roundtrips` |
 
 ---
 

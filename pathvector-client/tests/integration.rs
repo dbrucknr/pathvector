@@ -123,6 +123,13 @@ impl PeerService for MockPeer {
     ) -> Result<Response<proto::RemovePeerResponse>, Status> {
         Err(Status::not_found("peer not found"))
     }
+
+    async fn soft_reset(
+        &self,
+        _req: Request<proto::SoftResetRequest>,
+    ) -> Result<Response<proto::SoftResetResponse>, Status> {
+        Ok(Response::new(proto::SoftResetResponse {}))
+    }
 }
 
 struct MockPeerWithEvents;
@@ -170,6 +177,13 @@ impl PeerService for MockPeerWithEvents {
         _req: Request<proto::RemovePeerRequest>,
     ) -> Result<Response<proto::RemovePeerResponse>, Status> {
         Err(Status::not_found("peer not found"))
+    }
+
+    async fn soft_reset(
+        &self,
+        _req: Request<proto::SoftResetRequest>,
+    ) -> Result<Response<proto::SoftResetResponse>, Status> {
+        Ok(Response::new(proto::SoftResetResponse {}))
     }
 }
 

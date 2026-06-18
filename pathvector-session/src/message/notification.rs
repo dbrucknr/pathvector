@@ -275,6 +275,29 @@ impl CeaseError {
     }
 }
 
+/// Encode a UTF-8 reason string into a CEASE NOTIFICATION `data` field per RFC 9003 §2.
+///
+/// Wire format: one length byte followed by the UTF-8 string bytes.
+/// The string is silently truncated to 128 bytes if longer.
+pub fn encode_shutdown_message(msg: &str) -> Vec<u8> {
+    let bytes = msg.as_bytes();
+    let len = bytes.len().min(128);
+    let mut out = Vec::with_capacity(1 + len);
+    out.push(len as u8);
+    out.extend_from_slice(&bytes[..len]);
+    out
+}
+
+/// Decode a RFC 9003 shutdown reason from the `data` field of a CEASE NOTIFICATION.
+///
+/// Returns `None` if the data is empty, the length byte is out of range, or the
+/// bytes are not valid UTF-8.
+pub fn decode_shutdown_message(data: &[u8]) -> Option<String> {
+    let (&len, rest) = data.split_first()?;
+    let end = (len as usize).min(rest.len());
+    String::from_utf8(rest[..end].to_vec()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +487,61 @@ mod tests {
             };
             assert_eq!(roundtrip(&msg), msg);
         }
+    }
+
+    // ── RFC 9003 shutdown message helpers ─────────────────────────────────────
+
+    #[test]
+    fn test_rfc9003_encode_decode_roundtrip() {
+        let reason = "going down for maintenance";
+        let data = encode_shutdown_message(reason);
+        assert_eq!(data[0] as usize, reason.len());
+        assert_eq!(decode_shutdown_message(&data).unwrap(), reason);
+    }
+
+    #[test]
+    fn test_rfc9003_message_truncated_to_128_bytes() {
+        let long_msg = "x".repeat(200);
+        let data = encode_shutdown_message(&long_msg);
+        assert_eq!(data[0], 128);
+        assert_eq!(data.len(), 129);
+        let decoded = decode_shutdown_message(&data).unwrap();
+        assert_eq!(decoded.len(), 128);
+    }
+
+    #[test]
+    fn test_rfc9003_empty_data_returns_none() {
+        assert!(decode_shutdown_message(&[]).is_none());
+    }
+
+    #[test]
+    fn test_rfc9003_length_byte_exceeds_remaining_data() {
+        // length byte says 10 bytes but only 3 follow — should clamp gracefully
+        let data = vec![10u8, b'h', b'i', b'!'];
+        let decoded = decode_shutdown_message(&data).unwrap();
+        assert_eq!(decoded, "hi!");
+    }
+
+    #[test]
+    fn test_rfc9003_shutdown_notification_roundtrips() {
+        let reason = "planned maintenance";
+        let msg = NotificationMessage {
+            error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+            data: encode_shutdown_message(reason),
+        };
+        let decoded = roundtrip(&msg);
+        assert_eq!(decoded, msg);
+        assert_eq!(decode_shutdown_message(&decoded.data).unwrap(), reason);
+    }
+
+    #[test]
+    fn test_rfc9003_admin_reset_roundtrips() {
+        let reason = "config reload";
+        let msg = NotificationMessage {
+            error: NotificationError::Cease(CeaseError::AdministrativeReset),
+            data: encode_shutdown_message(reason),
+        };
+        let decoded = roundtrip(&msg);
+        assert_eq!(decode_shutdown_message(&decoded.data).unwrap(), reason);
     }
 }

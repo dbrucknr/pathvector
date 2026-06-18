@@ -6,6 +6,35 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-06-18 (continued)
 
+### [pathvector-session / pathvectord] Per-peer hold timer, RFC 9003 shutdown message, RFC 7313 codec, ROUTE-REFRESH trigger
+
+Four small-to-medium protocol features added across `pathvector-session` and `pathvectord`.
+
+**Per-peer hold timer** — `PeerConfig.hold_time: Option<u16>` added. `build_daemon` and the `AddPeer`
+command processor fall back to `DaemonConfig.hold_time` when the per-peer value is absent, preserving
+existing behaviour for all peers that do not override it.
+
+**RFC 9003 — Extended admin shutdown communication** — `encode_shutdown_message` /
+`decode_shutdown_message` added to `pathvector-session::message::notification`. Wire format: 1-byte
+length prefix + UTF-8 string, max 128 bytes, in the CEASE NOTIFICATION `data` field. `pathvectord`
+reads `shutdown_message: Option<String>` from `PeerConfig`; `RemovePeer` sends
+`Cease/AdministrativeShutdown` with the encoded payload instead of a bare `Stop` command when a
+reason is configured. 6 new unit tests (round-trip, truncation, empty-data, length-overrun,
+NOTIFICATION integration).
+
+**RFC 7313 — Enhanced Route Refresh codec** — `RouteRefreshSubtype` enum added to
+`pathvector-session::message::route_refresh`. The previously reserved byte in the 4-byte ROUTE-REFRESH
+wire format is now decoded as `Refresh` (0), `BeginRefresh` (1), `EndRefresh` (2), or `Unknown(u8)`.
+`RouteRefreshMessage::new(afi_safi)` constructor added (subtype defaults to `Refresh`). Encode/decode
+updated; all existing callers migrated; 4 new codec tests added.
+
+**Outbound ROUTE-REFRESH trigger / `SoftReset` gRPC RPC** — `SessionCommand::RouteRefresh(RouteRefreshMessage)`
+variant added to `pathvector-session::transport`. `SessionHandle::send_route_refresh` trait method
+wired through `SpawnedSessionHandle` → command channel → session actor. `SoftReset` RPC added to
+`PeerService` proto; `PeerServiceImpl::soft_reset` resolves the peer's session actor by IP, parses the
+AFI/SAFI from the request, and sends a `RouteRefresh` command. `pathvector-client/tests/integration.rs`
+updated with the new trait method on all mock implementations.
+
 ### [pathvectord] Dynamic peer loose-end fixes — broadcast safety, race-safety tests, restart persistence
 
 Three correctness and operational gaps closed after the initial audit pass.
