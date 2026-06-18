@@ -4,6 +4,151 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-17
+
+### [pathvectord, pathvector-client] Dynamic peer reconfiguration — AddPeer / RemovePeer gRPC RPCs
+
+Runtime peer management without daemon restart. Operators can now add and remove BGP
+peers over the gRPC management API while other sessions remain unaffected.
+
+**Proto:** `AddPeer` and `RemovePeer` RPCs on `PeerService`; `AddPeerRequest` carries
+address, remote AS, port, import/export default policy (`PolicyAction`), and optional
+RFC 2385 MD5 password. AS 0 and AS 23456 (AS_TRANS, RFC 7607) rejected with
+`INVALID_ARGUMENT`.
+
+**Architecture:** `DaemonCommand` enum bridges the gRPC layer to the event loop without
+leaking generics. A separate `run_command_processor` task handles commands so the event
+loop signature stays stable. `incoming_senders` and `md5_passwords` are
+`Arc<RwLock<HashMap>>` so the BGP listener picks up newly added peers immediately.
+`stop_senders` is `Arc<Mutex<HashMap>>` with a lock-clone-await pattern so the sender
+is never held across an `await`.
+
+**Teardown sequencing:** `pending_removal: HashSet<Ipv4Addr>` in `DaemonState` signals
+the `Terminated` handler to run a full state purge (`remove_peer` — clears all
+per-peer RIB/policy maps) instead of a reconnect-ready reset (`on_terminated`). This
+guarantees routes are withdrawn from the Loc-RIB before peer state is destroyed.
+
+**Liveness fix:** if the session actor has already exited between reconnects (stop sender
+dropped), the command processor synthesizes `SessionEvent::Terminated` directly via
+`event_tx` so the `pending_removal` cleanup still runs.
+
+**`AddPeer` is idempotent** — re-adding an existing peer is a no-op. `RemovePeer` on
+an unknown peer returns `NOT_FOUND`.
+
+**Client:** `AddPeerParams` type + `add_peer` / `remove_peer` on the `DaemonClient`
+trait; `PathvectorClient` implementation; `MockDaemonClient` stubs.
+
+Tests added: `add_peer_inserts_all_state_maps`, `add_peer_is_idempotent`,
+`remove_peer_clears_all_state_maps`, `remove_peer_returns_false_when_not_found`,
+`terminated_with_pending_removal_calls_remove_peer`,
+`terminated_without_pending_removal_keeps_peer_state`,
+`remove_peer_synthesizes_terminated_when_no_stop_sender`,
+`test_add_peer_invalid_address`, `test_add_peer_rejects_as_zero`,
+`test_add_peer_rejects_as_trans`, `test_add_peer_sends_command_on_valid_request`,
+`test_remove_peer_invalid_address`, `test_remove_peer_not_found`,
+`test_remove_peer_sends_command_when_peer_exists`.
+
+### [pathvector-rib] RFC-correct same-AS MED comparison in best-path selection
+
+RFC 4271 §9.1.2.2 requires MED to be compared only between routes from the same neighboring
+AS. The prior implementation compared MED globally, and a partial pairwise fix was
+non-transitive for 3+ routes across multiple ASes — `max_by` produces unspecified results on
+a non-total order.
+
+Correct algorithm (`select_best_with_oracle`):
+1. Group candidates by `AsPath::neighboring_as()` (first ASN in first Sequence segment).
+2. Select the best within each group — all routes share the same `neighboring_as()`, so
+   `prefer()` applies MED correctly.
+3. Compare group winners — different neighboring ASes, so `prefer()` skips MED, guaranteeing
+   a total order.
+
+`AsPath::neighboring_as()` added to `pathvector-types`. Tests: `test_med_ignored_for_different_neighboring_as`,
+`test_med_compared_within_same_neighboring_as`. Proptest: `prop_med_winner_is_insertion_order_independent`
+tries all six insertion orders of a 3-route cross-AS scenario and verifies the same peer
+wins every time — this test would have directly caught the non-transitivity bug.
+
+### [pathvector-rib, pathvectord] RIB memory optimisation — 57% reduction at 500k routes
+
+Six-commit series reducing per-route memory from ~2.6 KB to ~0.57 KB at 500k routes:
+
+1. **`LocRib` structural rewrite** — `best: RouteMap<A, PeerId>` stores the winning peer ID
+   only (route always accessible via candidates lookup); flat `CandidateMap` +
+   `PeerIndex<SmallVec<[PeerId; 4]>>` eliminates ~320 B per-prefix nested HashMap
+   allocation. 500k routes: 1.4 GB → 605 MB.
+
+2. **`AsPath` interning via `Arc<AsPath>`** — routes from the same BGP UPDATE share one
+   `Arc<AsPath>` allocation. `RouteBuilder::with_shared_as_path` used in the UPDATE decode
+   loop. CoW via `Arc::make_mut` in `prepare_outbound` when eBGP prepend is needed.
+   Saves 16 bytes/route struct layout (Vec 24 B → Arc 8 B).
+
+3. **Rare attribute boxing** — 7 attributes present in <5% of routes (`communities`,
+   `large_communities`, `extended_communities`, `cluster_list`, `atomic_aggregate`,
+   `aggregator`, `originator_id`) moved behind `Option<Box<RareAttrs>>`. Absent fields cost
+   8 bytes (null pointer) instead of 96+ bytes of empty Vecs. 500k: 605 MB → 481 MB.
+
+4. **AHash, SmallVec, `u32` timestamp** — `AHashMap`/`AHashSet` replaces `std::HashMap` in
+   `LocRib` (eliminates SipHash overhead on internal keys). `PeerIndex` inner collection
+   changed to `SmallVec<[PeerId; 4]>` (up to 4 peers inline, no heap). `Route::received_at`
+   shrunk from `Instant` (16 B) to `u32` Unix seconds (4 B), saving 12 B/route.
+
+5. **Empty `AsPath` static intern** — `RouteBuilder::new` returns a clone of a
+   process-wide `Arc<AsPath>` for empty paths (originated routes). Eliminates 500k ×
+   40 B heap allocations at scale. 500k: 486 MB → 461 MB.
+
+6. **Extended phases** — stress harness extended from 3 phases (10k/100k/500k) to 6
+   (10k/100k/250k/500k/750k/900k). At 900k routes: pathvectord 515 MB vs GoBGP 792 MB
+   (35% less); convergence 0.26 s vs 0.56 s (2.2× faster). Per-route cost: 0.57 KB
+   (pathvectord) vs 0.88 KB (GoBGP).
+
+### [pathvector-stress] GoBGP 1:1 synthetic benchmark harness
+
+New `pathvector-stress` workspace crate runs both daemons on the same host with identical
+workloads and prints side-by-side convergence time and peak RSS. GoBGP bench phase spawns
+`gobgpd`, calls `StartBgp`, injects routes via `AddPathStream` gRPC, then reads RSS via
+`ps`. `just stress` (debug) / `just stress-release` (optimised, numbers worth recording).
+Includes `pathvector-stress/README.md` with prerequisites, port assignments, and baseline
+numbers.
+
+### [pathvector-mrt] MRT TABLE_DUMP_V2 replay against live pathvectord
+
+New `pathvector-mrt` binary replays real internet routing table dumps:
+- Parses MRT TABLE_DUMP_V2 format (RFC 6396); handles `.mrt` and `.mrt.gz` via `flate2`.
+- Opens a real TCP BGP session to pathvectord (OPEN → KEEPALIVE → Established).
+- Batches NLRIs with identical attribute bytes into single UPDATE messages up to the
+  RFC 4271 4096-byte limit — matching real peer behaviour.
+- Polls `watch_routes` gRPC stream until prefix count stabilises; reports convergence time
+  and final RIB count. `list_all_routes` helper added to `DaemonClient` for paginated reads.
+- Benchmark on M2 Max against RIPE RIS full table (1,133,510 IPv4 prefixes): 343,920
+  prefixes/sec announcement throughput; 3.70 s RIB convergence; 7.00 s end-to-end.
+
+`just mrt ./latest-bview.gz` recipe added. Parser and speaker have 7 unit tests.
+
+### [pathvectord, pathvector-client] Cursor-based pagination for `ListRoutes`
+
+`ListRoutesRequest` gains `page_size` and `page_token` fields. `page_size=0` (default)
+returns all routes for backward compatibility; non-zero enables cursor-based pagination
+sorted by prefix string. `DaemonClient::list_all_routes` issues paginated requests in a
+loop (`PAGE_SIZE=5000`) to work around the 4 MB tonic limit. Test:
+`test_list_routes_pagination_returns_all_routes_across_pages`.
+
+### [pathvectord] gRPC correctness — `originate_route` validation and upsert semantics
+
+`parse_originate_request` now rejects `next_hop = 0.0.0.0` with `INVALID_ARGUMENT` — an
+unspecified address is never a valid BGP forwarding next-hop (RFC 4271 §5.1.3). Test:
+`test_parse_originate_request_rejects_unspecified_next_hop`.
+
+Upsert semantics documented in proto: re-originating the same prefix silently replaces the
+previous route (HashMap::insert). Test: `test_originate_route_upsert_replaces_previous_route`.
+
+### [pathvectord] Documentation — per-crate READMEs overhaul
+
+Full documentation pass producing first-class per-crate READMEs for all 9 crates.
+`pathvectord/README.md` absorbs `DAEMON.md` + `LOCAL_INTEROP.md` with field-by-field config
+explanations and GoBGP/BIRD interop guide. Adds "Behavior on restart" section documenting
+`RTPROT_BGP` stale-route cleanup. `docs/` mdBook and `CLI.md`, `DAEMON.md`, `PERFORMANCE.md`,
+`LOCAL_INTEROP.md` removed; `book.toml` removed. `CONTRIBUTING.md` gains "Which crate do I
+edit?" routing table. `e2e/` renamed to `pathvector-e2e/`, `fuzz/` to `pathvector-fuzz/`.
+
 ## 2026-06-16
 
 ### [pathvectord] RFC 4271 correctness audit — fixes (A, B, H, J)

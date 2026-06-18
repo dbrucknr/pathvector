@@ -108,6 +108,29 @@ service PeerService {
   /// (PEER_EVENT_CURRENT per peer, then PEER_EVENT_END_INITIAL), then streams
   /// live PEER_EVENT_CHANGED events as sessions transition.
   rpc WatchPeers(WatchPeersRequest) returns (stream PeerEvent);
+
+  /// Adds a new BGP peer at runtime without restarting the daemon.
+  ///
+  /// The peer is immediately added to the routing state and a BGP session is
+  /// dialled.  Idempotent: calling AddPeer for an already-configured address
+  /// returns OK without modifying the existing session.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address, remote_as is 0,
+  ///                      or remote_as is 23456 (AS_TRANS, RFC 6793)
+  rpc AddPeer(AddPeerRequest) returns (AddPeerResponse);
+
+  /// Removes a BGP peer at runtime.
+  ///
+  /// The session is torn down with a NOTIFICATION (Cease/Administrative
+  /// Shutdown), all routes received from the peer are withdrawn, and best-path
+  /// is recomputed for every affected prefix.  Remaining peers receive the
+  /// resulting UPDATE messages before the peer entry is removed.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
 }
 
 message ListPeersRequest {}
@@ -164,6 +187,32 @@ message PeerEvent {
 }
 
 message WatchPeersRequest {}
+
+message AddPeerRequest {
+  /// Dotted-decimal IPv4 address of the new peer.
+  string address = 1;
+  /// Remote AS number.  Must not be 0 or 23456 (AS_TRANS).
+  uint32 remote_as = 2;
+  /// TCP port to dial.  0 means the BGP default (179).
+  uint32 port = 3;
+  /// Import-policy default action.  UNSPECIFIED means the RFC 8212 default
+  /// (REJECT for eBGP, ACCEPT for iBGP).
+  PolicyAction import_default = 4;
+  /// Export-policy default action.  UNSPECIFIED means the RFC 8212 default
+  /// (REJECT for eBGP, ACCEPT for iBGP).
+  PolicyAction export_default = 5;
+  /// RFC 2385 TCP MD5 authentication key.  Empty string means no MD5.
+  string md5_password = 6;
+}
+
+message AddPeerResponse {}
+
+message RemovePeerRequest {
+  /// Dotted-decimal IPv4 address of the peer to remove.
+  string address = 1;
+}
+
+message RemovePeerResponse {}
 
 // ── RIB service ───────────────────────────────────────────────────────────────
 

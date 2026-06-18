@@ -82,6 +82,8 @@ async fn list_peers(client: &mut impl DaemonClient) -> Result<Vec<PeerState>, Cl
 | `list_originated_routes()` | All currently originated routes |
 | `watch_routes(peer)` | Stream live RIB changes (snapshot + deltas) |
 | `watch_peers()` | Stream live peer state changes |
+| `add_peer(params)` | Add a peer at runtime without restarting the daemon |
+| `remove_peer(addr)` | Remove a peer and withdraw all its routes from the Loc-RIB |
 
 ---
 
@@ -143,6 +145,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+---
+
+## Dynamic peer management
+
+Add or remove peers at runtime without restarting the daemon. All other sessions
+remain unaffected.
+
+```rust,no_run
+use std::net::{IpAddr, Ipv4Addr};
+use pathvector_client::{DaemonClient, PathvectorClient, types::AddPeerParams};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = PathvectorClient::connect("http://127.0.0.1:50051")?;
+
+    // Add an eBGP peer — sessions starts immediately
+    client.add_peer(AddPeerParams {
+        address:        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+        remote_as:      65003,
+        port:           None,           // defaults to 179
+        import_default: Some(true),     // accept all routes from this peer
+        export_default: Some(true),     // advertise all best routes to this peer
+        md5_password:   None,           // no TCP MD5
+    }).await?;
+
+    println!("Peer added.");
+
+    // Later: remove the peer — routes are withdrawn from the Loc-RIB first
+    client.remove_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))).await?;
+
+    println!("Peer removed.");
+    Ok(())
+}
+```
+
+`add_peer` is idempotent — calling it for an existing peer is a no-op. `remove_peer`
+returns an error with `NOT_FOUND` if the address is not a configured peer.
+
+`import_default` / `export_default`:
+- `None` — RFC 8212 default (reject for eBGP, accept for iBGP)
+- `Some(true)` — accept all routes / advertise all best routes by default
+- `Some(false)` — reject all routes / advertise nothing by default
 
 ---
 

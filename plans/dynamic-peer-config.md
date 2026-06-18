@@ -1,6 +1,14 @@
-# Plan: Dynamic Peer Reconfiguration
+# Plan: Dynamic Peer Reconfiguration — ✅ Completed 2026-06-17
 
-## Motivation
+`AddPeer` and `RemovePeer` gRPC RPCs are implemented and tested. See CHANGELOG.md
+(2026-06-17) for the full implementation summary.
+
+Remaining follow-on: `UpdatePeer` RPC and config-file watch. Both are captured in
+TODO.md under "Dynamic peer reconfiguration".
+
+---
+
+## Motivation (original)
 
 pathvectord currently reads its configuration once at startup. Adding, removing, or
 modifying a peer requires a full daemon restart — which drops all sessions, flushes

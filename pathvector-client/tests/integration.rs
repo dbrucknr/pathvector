@@ -109,6 +109,20 @@ impl PeerService for MockPeer {
         let stream = futures::stream::empty();
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn add_peer(
+        &self,
+        _req: Request<proto::AddPeerRequest>,
+    ) -> Result<Response<proto::AddPeerResponse>, Status> {
+        Ok(Response::new(proto::AddPeerResponse {}))
+    }
+
+    async fn remove_peer(
+        &self,
+        _req: Request<proto::RemovePeerRequest>,
+    ) -> Result<Response<proto::RemovePeerResponse>, Status> {
+        Err(Status::not_found("peer not found"))
+    }
 }
 
 struct MockPeerWithEvents;
@@ -142,6 +156,20 @@ impl PeerService for MockPeerWithEvents {
         };
         let stream = futures::stream::once(async move { Ok(event) });
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn add_peer(
+        &self,
+        _req: Request<proto::AddPeerRequest>,
+    ) -> Result<Response<proto::AddPeerResponse>, Status> {
+        Ok(Response::new(proto::AddPeerResponse {}))
+    }
+
+    async fn remove_peer(
+        &self,
+        _req: Request<proto::RemovePeerRequest>,
+    ) -> Result<Response<proto::RemovePeerResponse>, Status> {
+        Err(Status::not_found("peer not found"))
     }
 }
 

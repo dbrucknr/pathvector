@@ -152,7 +152,7 @@ a reverse proxy in front.
 
 | Service | Methods |
 |---|---|
-| `pathvector.v1.PeerService` | `ListPeers`, `GetPeer` |
+| `pathvector.v1.PeerService` | `ListPeers`, `GetPeer`, `AddPeer`, `RemovePeer` |
 | `pathvector.v1.RibService` | `GetBestRoute`, `ListRoutes`, `ListCandidates` |
 | `pathvector.v1.PolicyService` | `SetImportDefault`, `SetExportDefault` |
 | `pathvector.v1.OriginationService` | `OriginateRoute`, `OriginateRoutes`, `WithdrawOriginatedRoute`, `WithdrawOriginatedRoutes`, `ListOriginatedRoutes` |
@@ -207,7 +207,39 @@ grpcurl -plaintext -d '{"peer": "10.0.0.1", "accept": true}' \
 # Originate a route from pathvectord
 grpcurl -plaintext -d '{"prefix": "203.0.113.0/24", "next_hop": "10.0.0.2"}' \
   localhost:50051 pathvector.v1.OriginationService/OriginateRoute
+
+# Add a peer at runtime (no daemon restart)
+grpcurl -plaintext -d '{
+  "address": "10.0.0.3",
+  "remote_as": 65003,
+  "port": 179,
+  "import_default": "POLICY_ACTION_ACCEPT",
+  "export_default": "POLICY_ACTION_ACCEPT"
+}' localhost:50051 pathvector.v1.PeerService/AddPeer
+
+# Remove a peer at runtime — withdraws all its routes from the Loc-RIB
+grpcurl -plaintext -d '{"address": "10.0.0.3"}' \
+  localhost:50051 pathvector.v1.PeerService/RemovePeer
 ```
+
+#### Dynamic peer management
+
+`AddPeer` and `RemovePeer` allow full peer lifecycle management without restarting the
+daemon. Other sessions are never interrupted.
+
+`AddPeer` fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `address` | ✓ | IPv4 address of the new peer |
+| `remote_as` | ✓ | Remote AS number. AS 0 and AS 23456 (AS_TRANS) are rejected. |
+| `port` | — | TCP port; defaults to 179 |
+| `import_default` | — | `POLICY_ACTION_ACCEPT` or `POLICY_ACTION_REJECT`; defaults to RFC 8212 (reject for eBGP, accept for iBGP) |
+| `export_default` | — | Same semantics as `import_default` |
+| `md5_password` | — | RFC 2385 TCP MD5 authentication key; omit for no MD5 |
+
+`AddPeer` is idempotent — calling it for an already-configured peer is a no-op.
+`RemovePeer` returns `NOT_FOUND` if the address is not a configured peer.
 
 ### PeerState fields
 
@@ -435,6 +467,21 @@ GoBGP:
 | IPv6 route origination via CLI | `route originate` only accepts IPv4; IPv6 origination works via gRPC directly |
 | RFC 7606 revised error handling | Malformed path attributes reset the session instead of being treated as withdrawals |
 | BGP port binding | Binding port 179 requires root or `CAP_NET_BIND_SERVICE`; use port 1179 in development |
+
+---
+
+## Behavior on restart
+
+When pathvectord starts, it removes all kernel routes it installed in a previous run
+(`RTPROT_BGP` protocol tag) before the BGP event loop begins. This prevents stale routes
+from being forwarded during the reconvergence window. The cleanup is logged at startup:
+
+```
+INFO removing stale BGP routes v4=42 v6=0
+```
+
+This is equivalent to BIRD's default `krt` protocol behavior. RFC 4724 graceful restart
+(holding stale routes across a planned restart) is not yet implemented.
 
 ---
 

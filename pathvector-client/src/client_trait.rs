@@ -57,6 +57,12 @@
 //!     fn watch_peers(&mut self) -> impl Future<Output = Result<pathvector_client::BoxStream<pathvector_client::types::PeerEvent>, ClientError>> + Send {
 //!         async { Ok(Box::pin(futures::stream::empty()) as pathvector_client::BoxStream<_>) }
 //!     }
+//!     fn add_peer(&mut self, _: pathvector_client::types::AddPeerParams) -> impl Future<Output = Result<(), ClientError>> + Send {
+//!         async { Ok(()) }
+//!     }
+//!     fn remove_peer(&mut self, _: IpAddr) -> impl Future<Output = Result<(), ClientError>> + Send {
+//!         async { Ok(()) }
+//!     }
 //! }
 //! ```
 
@@ -68,12 +74,13 @@ use crate::{
     BoxStream, PathvectorClient,
     error::ClientError,
     proto::{
-        GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest, ListOriginatedRoutesRequest,
-        ListPeersRequest, ListRoutesRequest, OriginateRouteRequest, OriginateRoutesRequest,
-        PolicyAction, SetExportDefaultRequest, SetImportDefaultRequest, WatchPeersRequest,
-        WatchRoutesRequest, WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
+        AddPeerRequest, GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest,
+        ListOriginatedRoutesRequest, ListPeersRequest, ListRoutesRequest, OriginateRouteRequest,
+        OriginateRoutesRequest, PolicyAction, RemovePeerRequest, SetExportDefaultRequest,
+        SetImportDefaultRequest, WatchPeersRequest, WatchRoutesRequest,
+        WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
     },
-    types::{OriginateRouteParams, PeerEvent, PeerState, Route, RouteEvent},
+    types::{AddPeerParams, OriginateRouteParams, PeerEvent, PeerState, Route, RouteEvent},
 };
 
 /// Abstracts the seven gRPC calls used to manage a running `pathvectord` daemon.
@@ -215,6 +222,34 @@ pub trait DaemonClient {
     fn watch_peers(
         &mut self,
     ) -> impl Future<Output = Result<BoxStream<PeerEvent>, ClientError>> + Send;
+
+    /// Add a new BGP peer at runtime without restarting the daemon.
+    ///
+    /// Idempotent — calling this for an already-configured address returns `Ok(())`
+    /// without modifying the existing session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with `INVALID_ARGUMENT` for a malformed
+    /// address, `remote_as = 0`, or `remote_as = 23456 (AS_TRANS)`.
+    fn add_peer(
+        &mut self,
+        params: AddPeerParams,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+
+    /// Remove a BGP peer at runtime.
+    ///
+    /// Sends a Cease NOTIFICATION to the peer, withdraws all routes received
+    /// from it, and removes it from the daemon's configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with `INVALID_ARGUMENT` for a malformed
+    /// address, or `NOT_FOUND` if the address is not a configured peer.
+    fn remove_peer(
+        &mut self,
+        address: IpAddr,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
 }
 
 // ── Implementation for the real client ───────────────────────────────────────
@@ -526,6 +561,49 @@ impl DaemonClient for PathvectorClient {
             PeerEvent::try_from(event).map_err(ClientError::from)
         })))
     }
+
+    async fn add_peer(&mut self, params: AddPeerParams) -> Result<(), ClientError> {
+        let import_action =
+            params
+                .import_default
+                .map_or(PolicyAction::Unspecified as i32, |accept| {
+                    if accept {
+                        PolicyAction::Accept as i32
+                    } else {
+                        PolicyAction::Reject as i32
+                    }
+                });
+        let export_action =
+            params
+                .export_default
+                .map_or(PolicyAction::Unspecified as i32, |accept| {
+                    if accept {
+                        PolicyAction::Accept as i32
+                    } else {
+                        PolicyAction::Reject as i32
+                    }
+                });
+        self.peers
+            .add_peer(AddPeerRequest {
+                address: params.address.to_string(),
+                remote_as: params.remote_as,
+                port: u32::from(params.port.unwrap_or(0)),
+                import_default: import_action,
+                export_default: export_action,
+                md5_password: params.md5_password.unwrap_or_default(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_peer(&mut self, address: IpAddr) -> Result<(), ClientError> {
+        self.peers
+            .remove_peer(RemovePeerRequest {
+                address: address.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -618,6 +696,14 @@ mod tests {
 
         async fn watch_peers(&mut self) -> Result<BoxStream<PeerEvent>, ClientError> {
             Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn add_peer(&mut self, _: AddPeerParams) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn remove_peer(&mut self, _: IpAddr) -> Result<(), ClientError> {
+            Ok(())
         }
     }
 

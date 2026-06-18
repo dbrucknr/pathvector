@@ -82,9 +82,12 @@ gRPC API, and GoBGP/BIRD interop guide.
 
 ## Performance
 
-Measured by replaying a real RIPE RIS full-table MRT dump (`latest-bview.gz`,
-1.13M IPv4 prefixes) against a live `pathvectord` over a loopback BGP TCP session
-on Apple M2 Max.
+All numbers on Apple M2 Max, release profile.
+
+### MRT replay — real internet table
+
+Replaying a RIPE RIS full-table MRT dump (`latest-bview.gz`, 1.13M IPv4 prefixes)
+against a live `pathvectord` over a loopback BGP TCP session.
 
 | Metric | Result | Context |
 |---|---|---|
@@ -101,6 +104,45 @@ To reproduce:
 ```bash
 curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
 just mrt ./latest-bview.gz
+```
+
+### Head-to-head vs GoBGP — synthetic stress test
+
+`just stress` runs both daemons (debug profile) on the same host with identical workloads.
+`just stress-release` runs both daemons (optimized profile) on the same host with identical workloads — use this for numbers worth recording.
+
+**Convergence time** (lower is better, `just stress-release`):
+
+| Table size | pathvectord | GoBGP | Ratio |
+|---|---|---|---|
+| 10k  | 0.02 s | 0.06 s | **2.2× faster** |
+| 100k | 0.17 s | 0.36 s | **2.1× faster** |
+| 250k | 0.27 s | 0.58 s | **2.1× faster** |
+| 500k | 0.42 s | 0.95 s | **2.3× faster** |
+| 900k | 0.26 s | 0.56 s | **2.2× faster** |
+
+**Peak RSS** (lower is better, `just stress-release`):
+
+- RSS: means resident set size. The amount of physical RAM the process is actually occupying at a given moment
+
+| Table size | pathvectord | GoBGP | Ratio |
+|---|---|---|---|
+| 10k  | 11.8 MB   | 51.7 MB  | **4.4× less** |
+| 100k | 66.8 MB   | 133.2 MB | **2.0× less** |
+| 250k | 240.2 MB  | 258.2 MB | **2.0× less** |
+| 500k | 461.2 MB  | 465.4 MB | ~equal |
+| 900k | 515.2 MB  | 792.4 MB | **35% less** |
+
+Per-route cost at 900k: 0.57 KB (pathvectord) vs 0.88 KB (GoBGP). The RSS plateau
+between 500k and 900k reflects attribute interning — real internet routes share a
+small set of AS paths and community sets, so marginal cost per route falls as the
+table grows.
+
+The numbers above are from `just stress-release`. To reproduce:
+
+```bash
+just stress          # debug build — fast to compile, slower numbers
+just stress-release  # optimized build — numbers worth recording
 ```
 
 ---
@@ -302,7 +344,7 @@ Active development. Crates are not yet published to crates.io.
 | `pathvector-rib` | Stable | Full three-table RIB; best-path steps 2–7, 9–10; LPM forwarding queries |
 | `pathvector-session` | Stable | Full BGP FSM; all five message types; 4-byte ASN; GoBGP-validated |
 | `pathvector-client` | Stable | Typed async Rust client wrapping all gRPC services |
-| `pathvectord` | Active | Full BGP speaker; gRPC management API; GoBGP-validated |
+| `pathvectord` | Active | Full BGP speaker; gRPC management API; dynamic peer add/remove; GoBGP-validated |
 | `pathvector` | Active | CLI: peer/route/policy/origination subcommands; live ratatui dashboard |
 | `pathvector-bmp` | Planned | BMP receiver for passive route monitoring |
 
