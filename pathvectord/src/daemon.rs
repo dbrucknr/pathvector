@@ -8774,6 +8774,149 @@ mod event_loop_tests {
             "adj_ribs_in must be unchanged — no second entry was added"
         );
     }
+
+    // ── Removed broadcast correctness ─────────────────────────────────────────
+
+    /// When a peer in `pending_removal` receives `Terminated`, the event loop
+    /// must broadcast exactly **one** `Removed` event on `peer_tx` and it must
+    /// carry the correct `remote_as` and `local_as` captured before the state
+    /// was erased.
+    ///
+    /// This is the critical regression test for the fix that replaced the
+    /// diff-based approach (which emitted `remote_as: 0`) with capturing
+    /// identity fields before `on_terminated` / `remove_peer` run.
+    #[tokio::test]
+    async fn terminated_with_pending_removal_broadcasts_removed_event_with_correct_fields() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let remote_as = 65099_u32;
+        let local_as = 65001_u32;
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, remote_as)], 8);
+
+        // Subscribe BEFORE the event fires so we don't miss the broadcast.
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        state.write().await.pending_removal.insert(peer_ip);
+
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        // Collect all events broadcast during the loop.
+        let mut events = vec![];
+        while let Ok(ev) = peer_rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Exactly one event must have been sent.
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one peer_tx event must fire for a pending_removal Terminated; got {events:?}"
+        );
+
+        let ev = &events[0];
+        assert_eq!(
+            ev.r#type,
+            proto::PeerEventType::Removed as i32,
+            "event type must be Removed"
+        );
+
+        let ps = ev.peer.as_ref().expect("Removed event must carry a PeerState");
+        assert_eq!(ps.address, peer_ip.to_string(), "address must match");
+        assert_eq!(ps.remote_as, remote_as, "remote_as must not be zeroed");
+        assert_eq!(ps.local_as, local_as, "local_as must not be zeroed");
+    }
+
+    /// When a normal peer (not in `pending_removal`) receives `Terminated`, the
+    /// event loop must broadcast exactly **one** `Changed(peer: None)` event —
+    /// not a `Removed` — so monitoring tools see the peer go Idle rather than
+    /// disappear.
+    ///
+    /// This is a regression guard for the `notify: bool` parameter: the normal
+    /// reconnect path must still send its notification.
+    #[tokio::test]
+    async fn terminated_without_pending_removal_broadcasts_changed_not_removed() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        let mut events = vec![];
+        while let Ok(ev) = peer_rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one peer_tx event must fire for a normal Terminated; got {events:?}"
+        );
+        assert_eq!(
+            events[0].r#type,
+            proto::PeerEventType::Changed as i32,
+            "normal Terminated must emit Changed, not Removed"
+        );
+        assert!(
+            events[0].peer.is_none(),
+            "Changed signal from on_terminated must have peer: None (stream builds payload)"
+        );
+    }
+
+    /// `on_terminated(peer_ip, notify: false)` must not send any broadcast on
+    /// `peer_tx`.  This is a direct unit test of the new parameter — if it is
+    /// ever dropped or inverted, this test will catch the regression.
+    #[tokio::test]
+    async fn on_terminated_notify_false_sends_no_broadcast() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        state.write().await.on_terminated(peer_ip, false);
+
+        // No broadcast must arrive.
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "on_terminated(notify=false) must not send to peer_tx"
+        );
+    }
+
+    /// `on_terminated(peer_ip, notify: true)` must send exactly one
+    /// `Changed(peer: None)` broadcast on `peer_tx`.
+    #[tokio::test]
+    async fn on_terminated_notify_true_sends_changed_broadcast() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
+
+        let mut peer_rx = state.read().await.peer_tx.subscribe();
+
+        state.write().await.on_terminated(peer_ip, true);
+
+        let ev = peer_rx
+            .try_recv()
+            .expect("on_terminated(notify=true) must send to peer_tx");
+        assert_eq!(
+            ev.r#type,
+            proto::PeerEventType::Changed as i32,
+            "broadcast must be Changed"
+        );
+        assert!(ev.peer.is_none(), "Changed signal must have peer: None");
+        assert!(peer_rx.try_recv().is_err(), "must send exactly one event");
+    }
 }
 
 #[cfg(test)]
@@ -8923,6 +9066,176 @@ mod prop_tests {
             prop_assert!(result.as_path.contains(Asn::new(local_as)), "local AS must be in the path");
             prop_assert_eq!(result.next_hop, Some(NextHop::V4(bgp_id)), "NEXT_HOP must be rewritten");
             prop_assert!(result.local_pref.is_none(), "LOCAL_PREF must be stripped for eBGP");
+        }
+    }
+}
+
+/// Property tests for the dynamic peer management API.
+///
+/// These tests exercise arbitrary sequences of `add_peer` / `remove_peer` calls
+/// against a `DaemonState` and assert that the state maps remain self-consistent
+/// after every operation — no panics, no dangling keys, no phantom entries.
+#[cfg(test)]
+mod dynamic_peer_prop_tests {
+    use std::{collections::HashMap, net::Ipv4Addr};
+
+    use proptest::prelude::*;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::config;
+
+    fn peer_cfg(address: Ipv4Addr, remote_as: u32) -> config::PeerConfig {
+        config::PeerConfig {
+            address,
+            port: 179,
+            remote_as,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+        }
+    }
+
+    fn fresh_state(peers: &[(Ipv4Addr, u32)]) -> DaemonState {
+        let mut senders = HashMap::new();
+        for &(ip, _) in peers {
+            let (tx, _rx) = mpsc::channel(8);
+            senders.insert(ip, tx);
+        }
+        let cfgs: Vec<config::PeerConfig> =
+            peers.iter().map(|&(a, r)| peer_cfg(a, r)).collect();
+        DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &cfgs,
+            senders,
+            vec![],
+        )
+    }
+
+    /// A `DaemonState` is self-consistent when every key present in
+    /// `adj_ribs_in` also appears in `peer_remote_as`, `adj_ribs_out`,
+    /// `import_policies`, and `export_policies` — and vice-versa.
+    fn assert_consistent(s: &DaemonState, label: &str) {
+        let ribs_in: std::collections::HashSet<_> = s.adj_ribs_in.keys().collect();
+        let remote_as: std::collections::HashSet<_> = s.rib.peer_remote_as.keys().collect();
+        let ribs_out: std::collections::HashSet<_> = s.adj_ribs_out.keys().collect();
+        let import: std::collections::HashSet<_> = s.import_policies.keys().collect();
+        let export: std::collections::HashSet<_> = s.export_policies.keys().collect();
+
+        assert_eq!(
+            ribs_in, remote_as,
+            "{label}: adj_ribs_in keys must equal peer_remote_as keys"
+        );
+        assert_eq!(
+            ribs_in, ribs_out,
+            "{label}: adj_ribs_in keys must equal adj_ribs_out keys"
+        );
+        assert_eq!(
+            ribs_in, import,
+            "{label}: adj_ribs_in keys must equal import_policies keys"
+        );
+        assert_eq!(
+            ribs_in, export,
+            "{label}: adj_ribs_in keys must equal export_policies keys"
+        );
+    }
+
+    /// Arbitrary sequences of add/remove for up to 4 peers must never corrupt
+    /// state.  Uses the last octet of 10.0.0.x as the peer discriminant.
+    #[derive(Clone, Debug)]
+    enum Op {
+        Add(u8),    // peer last octet, always remote_as 65000 + octet
+        Remove(u8),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        (1u8..=4u8).prop_flat_map(|octet| {
+            prop_oneof![
+                Just(Op::Add(octet)),
+                Just(Op::Remove(octet)),
+            ]
+        })
+    }
+
+    proptest! {
+        /// Any sequence of up to 20 add/remove operations must leave
+        /// `DaemonState` self-consistent and must not panic.
+        #[test]
+        fn prop_add_remove_sequence_leaves_state_consistent(
+            ops in prop::collection::vec(op_strategy(), 1..=20)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut state = fresh_state(&[]);
+                assert_consistent(&state, "initial");
+
+                for (i, op) in ops.iter().enumerate() {
+                    match op {
+                        Op::Add(octet) => {
+                            let ip = Ipv4Addr::new(10, 0, 0, *octet);
+                            let remote_as = 65000 + u32::from(*octet);
+                            let (tx, _rx) = mpsc::channel(8);
+                            state.add_peer(&peer_cfg(ip, remote_as), tx);
+                        }
+                        Op::Remove(octet) => {
+                            let ip = Ipv4Addr::new(10, 0, 0, *octet);
+                            state.remove_peer(ip); // may return false — that's fine
+                        }
+                    }
+                    assert_consistent(&state, &format!("after op {i}: {op:?}"));
+                }
+
+                // pending_removal must be empty (we never used it in this test).
+                prop_assert!(
+                    state.pending_removal.is_empty(),
+                    "pending_removal must be empty after direct add/remove ops"
+                );
+                Ok(())
+            }).unwrap();
+        }
+
+        /// `add_peer` followed by `remove_peer` for the same address must leave
+        /// the state as if neither call was made — no phantom entries, no
+        /// dangling keys.
+        #[test]
+        fn prop_add_then_remove_is_identity(octet in 1u8..=4u8) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let ip = Ipv4Addr::new(10, 0, 0, octet);
+                let remote_as = 65000 + u32::from(octet);
+
+                let state_before = fresh_state(&[]);
+                let mut state_after = fresh_state(&[]);
+
+                let (tx, _rx) = mpsc::channel(8);
+                state_after.add_peer(&peer_cfg(ip, remote_as), tx);
+                state_after.remove_peer(ip);
+
+                // Key sets must match: after add+remove, no peer should remain.
+                prop_assert_eq!(
+                    state_after.adj_ribs_in.len(),
+                    state_before.adj_ribs_in.len(),
+                    "adj_ribs_in must be empty after add+remove"
+                );
+                prop_assert_eq!(
+                    state_after.rib.peer_remote_as.len(),
+                    state_before.rib.peer_remote_as.len(),
+                    "peer_remote_as must be empty after add+remove"
+                );
+                assert_consistent(&state_after, "after add+remove");
+                Ok(())
+            }).unwrap();
         }
     }
 }

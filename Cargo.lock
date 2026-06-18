@@ -1666,6 +1666,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

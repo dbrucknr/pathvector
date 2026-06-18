@@ -1717,6 +1717,169 @@ mod tests {
         assert_eq!(ip, addr);
     }
 
+    /// `add_peer` must return `FAILED_PRECONDITION` when the peer is in
+    /// `pending_removal` — not `OK` with a silently-dropped command.
+    #[tokio::test]
+    async fn test_add_peer_fails_precondition_during_pending_removal() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+
+        // Mark the peer as mid-teardown.
+        state.write().await.pending_removal.insert(addr);
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx,
+        };
+        let err = svc
+            .add_peer(Request::new(AddPeerRequest {
+                address: "10.0.0.2".into(),
+                remote_as: 65002,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "add_peer must return FAILED_PRECONDITION while peer is in pending_removal"
+        );
+        assert!(
+            err.message().contains("removal is in progress"),
+            "error message must mention removal; got: {}",
+            err.message()
+        );
+
+        // No command must have been sent to the channel.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no DaemonCommand must be sent when FAILED_PRECONDITION is returned"
+        );
+    }
+
+    // ── watch_peers: Removed event ────────────────────────────────────────────
+
+    /// When the daemon broadcasts an explicit `Removed` event (with `peer: Some`),
+    /// the `watch_peers` stream must forward it directly to subscribers with the
+    /// correct type and peer payload — no diffing, no re-reading snapshot.
+    #[tokio::test]
+    async fn test_watch_peers_explicit_removed_event_forwarded_directly() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PeerServiceImpl {
+            state: Arc::clone(&state),
+            cmd_tx: noop_cmd_tx(),
+        };
+
+        let resp = svc
+            .watch_peers(Request::new(WatchPeersRequest {}))
+            .await
+            .expect("watch_peers");
+        let mut stream = resp.into_inner();
+
+        // Drain the snapshot (Current + EndInitial).
+        while let Some(Ok(ev)) = stream.next().await {
+            if ev.r#type == proto::PeerEventType::EndInitial as i32 {
+                break;
+            }
+        }
+
+        // Simulate the event loop broadcasting an explicit Removed event with
+        // fully-populated identity fields (as the daemon does after remove_peer).
+        let _ = state.read().await.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Removed as i32,
+            peer: Some(proto::PeerState {
+                address: addr.to_string(),
+                remote_as: 65002,
+                local_as: 65001,
+                ..Default::default()
+            }),
+        });
+
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            ev.r#type,
+            proto::PeerEventType::Removed as i32,
+            "stream must forward Removed event directly"
+        );
+
+        let ps = ev.peer.expect("Removed event must carry a PeerState");
+        assert_eq!(ps.address, "10.0.0.2");
+        assert_eq!(ps.remote_as, 65002, "remote_as must be preserved");
+        assert_eq!(ps.local_as, 65001, "local_as must be preserved");
+
+        drop(state);
+        drop(svc);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// After receiving a `Removed` event, a subsequent `Changed(None)` signal
+    /// must NOT re-emit a Removed for the same peer — the peer is already gone.
+    /// This guards against double-emission if both signals somehow arrive.
+    #[tokio::test]
+    async fn test_watch_peers_changed_after_removed_does_not_re_emit_removed() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let state = arc_state(65001, &[(addr, 65002)]);
+        let svc = PeerServiceImpl {
+            state: Arc::clone(&state),
+            cmd_tx: noop_cmd_tx(),
+        };
+
+        let resp = svc
+            .watch_peers(Request::new(WatchPeersRequest {}))
+            .await
+            .expect("watch_peers");
+        let mut stream = resp.into_inner();
+
+        // Drain snapshot.
+        while let Some(Ok(ev)) = stream.next().await {
+            if ev.r#type == proto::PeerEventType::EndInitial as i32 {
+                break;
+            }
+        }
+
+        // Step 1: broadcast Removed — peer removed from state first.
+        {
+            let mut s = state.write().await;
+            s.remove_peer(addr);
+            let _ = s.peer_tx.send(proto::PeerEvent {
+                r#type: proto::PeerEventType::Removed as i32,
+                peer: Some(proto::PeerState {
+                    address: addr.to_string(),
+                    remote_as: 65002,
+                    local_as: 65001,
+                    ..Default::default()
+                }),
+            });
+        }
+
+        let removed_ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            removed_ev.r#type,
+            proto::PeerEventType::Removed as i32,
+            "first event must be Removed"
+        );
+
+        // Step 2: broadcast a Changed(None) signal — snapshot is now empty.
+        let _ = state.read().await.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None,
+        });
+
+        // The Changed(None) arm re-reads the snapshot (peer already gone) and
+        // emits Changed for each present peer.  With an empty snapshot, no
+        // events are emitted — stream goes quiet until sender closes.
+        drop(state);
+        drop(svc);
+        // Stream must end cleanly without emitting a second Removed.
+        assert!(
+            stream.next().await.is_none(),
+            "no further events must be emitted after empty snapshot Changed(None)"
+        );
+    }
+
     // ── RibService::get_best_route ────────────────────────────────────────────
 
     #[tokio::test]
