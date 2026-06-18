@@ -4,8 +4,8 @@ use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 use proptest::prelude::*;
 
 use crate::{
-    best_path::select_best, oracle::AlwaysReachable, AdjRibIn, AdjRibOut, LocRib, PeerId, Route,
-    RouteBuilder,
+    AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder, best_path::select_best,
+    oracle::AlwaysReachable,
 };
 
 // ── Strategies ───────────────────────────────────────────────────────────────
