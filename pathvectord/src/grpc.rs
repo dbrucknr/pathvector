@@ -26,10 +26,7 @@ use pathvector_types::{AsPathSegment, LocalPref, Med, NextHop, Origin, PeerType}
 
 use tokio::sync::mpsc;
 
-use pathvector_session::{
-    message::RouteRefreshMessage,
-    transport::SessionCommand,
-};
+use pathvector_session::{message::RouteRefreshMessage, transport::SessionCommand};
 use pathvector_types::AfiSafi;
 
 use crate::{DaemonState, RibSnapshot, daemon::DaemonCommand};
@@ -53,10 +50,10 @@ use proto::{
     ListRoutesResponse, OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest,
     OriginateRoutesResponse, PeerEvent, PeerEventType, PeerState, PolicyAction, RemovePeerRequest,
     RemovePeerResponse, Route, RouteEvent, RouteEventType, RouteResponse, SetExportDefaultRequest,
-    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse,
-    SoftResetRequest, SoftResetResponse, WatchPeersRequest,
-    WatchRoutesRequest, WithdrawOriginatedRouteRequest, WithdrawOriginatedRouteResponse,
-    WithdrawOriginatedRoutesRequest, WithdrawOriginatedRoutesResponse,
+    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse, SoftResetRequest,
+    SoftResetResponse, WatchPeersRequest, WatchRoutesRequest, WithdrawOriginatedRouteRequest,
+    WithdrawOriginatedRouteResponse, WithdrawOriginatedRoutesRequest,
+    WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
     policy_service_server::{PolicyService, PolicyServiceServer},
@@ -1270,8 +1267,7 @@ mod tests {
         tx
     }
 
-    fn noop_stop_senders(
-    ) -> Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> {
+    fn noop_stop_senders() -> Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
@@ -1935,7 +1931,9 @@ mod tests {
         });
         svc.soft_reset(req).await.expect("soft_reset must succeed");
 
-        let cmd = stop_rx.try_recv().expect("RouteRefresh command must be enqueued");
+        let cmd = stop_rx
+            .try_recv()
+            .expect("RouteRefresh command must be enqueued");
         match cmd {
             SessionCommand::RouteRefresh(rr) => {
                 use pathvector_types::AfiSafi;

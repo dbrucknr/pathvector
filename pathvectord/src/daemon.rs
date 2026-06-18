@@ -8894,11 +8894,23 @@ mod event_loop_tests {
         struct NeverSpawned;
         impl SessionHandle for NeverSpawned {
             async fn start(&self) {}
-            async fn next_event(&mut self) -> Option<SessionEvent> { None }
-            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> { mpsc::channel(1).0 }
-            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
-            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
-            async fn send_route_refresh(&self, _rr: pathvector_session::message::RouteRefreshMessage) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            async fn send_route_refresh(
+                &self,
+                _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
+            }
         }
 
         let peer_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
@@ -8906,7 +8918,10 @@ mod event_loop_tests {
 
         // Register a real stop sender so we can observe what command is sent.
         let (cmd_tx_for_session, mut cmd_rx_for_session) = mpsc::channel(8);
-        stop_senders.lock().unwrap().insert(peer_ip, cmd_tx_for_session);
+        stop_senders
+            .lock()
+            .unwrap()
+            .insert(peer_ip, cmd_tx_for_session);
 
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -8927,12 +8942,16 @@ mod event_loop_tests {
             None,
         ));
 
-        cmd_tx.send(DaemonCommand::RemovePeer(peer_ip)).await.unwrap();
-
-        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
+        cmd_tx
+            .send(DaemonCommand::RemovePeer(peer_ip))
             .await
-            .expect("timed out waiting for command")
-            .expect("channel closed");
+            .unwrap();
+
+        let cmd =
+            tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
+                .await
+                .expect("timed out waiting for command")
+                .expect("channel closed");
 
         assert!(
             matches!(cmd, SessionCommand::Stop),
@@ -8945,17 +8964,27 @@ mod event_loop_tests {
     /// The payload must be a valid RFC 9003 encoded string.
     #[tokio::test]
     async fn remove_peer_with_shutdown_message_sends_rfc9003_notification() {
-        use pathvector_session::message::{
-            CeaseError, NotificationError, decode_shutdown_message,
-        };
+        use pathvector_session::message::{CeaseError, NotificationError, decode_shutdown_message};
         struct NeverSpawned;
         impl SessionHandle for NeverSpawned {
             async fn start(&self) {}
-            async fn next_event(&mut self) -> Option<SessionEvent> { None }
-            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> { mpsc::channel(1).0 }
-            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
-            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> { mpsc::channel(1).0 }
-            async fn send_route_refresh(&self, _rr: pathvector_session::message::RouteRefreshMessage) {}
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+            fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+                mpsc::channel(1).0
+            }
+            fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+                mpsc::channel(1).0
+            }
+            async fn send_route_refresh(
+                &self,
+                _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
+            }
         }
 
         let peer_ip: Ipv4Addr = "10.0.1.2".parse().unwrap();
@@ -9010,12 +9039,16 @@ mod event_loop_tests {
             None,
         ));
 
-        cmd_tx.send(DaemonCommand::RemovePeer(peer_ip)).await.unwrap();
-
-        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
+        cmd_tx
+            .send(DaemonCommand::RemovePeer(peer_ip))
             .await
-            .expect("timed out waiting for command")
-            .expect("channel closed");
+            .unwrap();
+
+        let cmd =
+            tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx_for_session.recv())
+                .await
+                .expect("timed out waiting for command")
+                .expect("channel closed");
 
         match cmd {
             SessionCommand::Notification(msg) => {
@@ -9060,10 +9093,7 @@ mod event_loop_tests {
             peer_as: 65020,
             peer_bgp_id: Ipv4Addr::new(10, 0, 2, 1),
             hold_time: 90,
-            peer_capabilities: vec![
-                Capability::FourByteAsn(65020),
-                Capability::RouteRefresh,
-            ],
+            peer_capabilities: vec![Capability::FourByteAsn(65020), Capability::RouteRefresh],
             peer_type: PeerType::External,
             local_addr: None,
         };
@@ -9137,10 +9167,7 @@ mod event_loop_tests {
             peer_as: 65022,
             peer_bgp_id: Ipv4Addr::new(10, 0, 2, 3),
             hold_time: 90,
-            peer_capabilities: vec![
-                Capability::FourByteAsn(65022),
-                Capability::RouteRefresh,
-            ],
+            peer_capabilities: vec![Capability::FourByteAsn(65022), Capability::RouteRefresh],
             peer_type: PeerType::External,
             local_addr: None,
         };
@@ -9983,11 +10010,7 @@ mod run_with_tests {
             self.stop_tx.clone()
         }
 
-        async fn send_route_refresh(
-            &self,
-            _rr: pathvector_session::message::RouteRefreshMessage,
-        ) {
-        }
+        async fn send_route_refresh(&self, _rr: pathvector_session::message::RouteRefreshMessage) {}
     }
 
     /// Test-side view of a spawned mock session.
