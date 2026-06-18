@@ -2532,6 +2532,167 @@ impl FrrHarness {
 // and this crate forbids unsafe code.  The `CARGO_TARGET_DIR` override branch
 // is therefore only exercised by the Docker harness itself, not here.
 
+// ── DynamicPeerHarness ────────────────────────────────────────────────────────
+
+/// A test environment where `pathvectord` starts with **no** statically
+/// configured peers and a `gobgpd` container is available for dynamic
+/// peer tests.
+///
+/// Unlike [`Harness`], no BGP session is pre-established — tests call
+/// [`pathvector_client::DaemonClient::add_peer`] themselves and then poll
+/// [`wait_for_established`] to confirm the session came up.
+///
+/// All resources are cleaned up on drop.
+///
+/// # Panics
+///
+/// [`DynamicPeerHarness::new`] panics if Docker is not running or either
+/// image has not been built (`just e2e`).
+pub struct DynamicPeerHarness {
+    _gobgpd: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// IP address that `gobgpd` occupies on the shared Docker bridge network.
+    /// Pass this to `add_peer` as the peer address.
+    pub gobgp_ip: Ipv4Addr,
+    /// Container ID of `gobgpd` — used for `gobgp_announce` / `gobgp_withdraw`.
+    pub gobgpd_id: String,
+    _network: DockerNetwork,
+}
+
+impl DynamicPeerHarness {
+    /// Stand up `gobgpd` (passive, AS 65001) and `pathvectord` (AS 65002)
+    /// with **no** static peer configuration.
+    ///
+    /// Returns immediately once both containers are healthy — no BGP session
+    /// is awaited.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running or either image is missing.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-dynamic-test-{test_id}");
+        let network = DockerNetwork::create(network_name.clone());
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-dynamic-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                gobgpd_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd container for DynamicPeerHarness");
+
+        let gobgpd_id = gobgpd.id().to_owned();
+        let gobgp_ip = container_network_ip(&gobgpd_id, &network_name);
+
+        // pathvectord config with no peers — dynamic adds will add them at runtime.
+        let pathvectord_config = write_daemon_config(&[]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-dynamic-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container for DynamicPeerHarness");
+
+        let client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for DynamicPeerHarness");
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            gobgp_ip,
+            gobgpd_id,
+            _network: network,
+        }
+    }
+
+    /// Announce an IPv4 prefix from the GoBGP container into pathvectord's
+    /// Adj-RIB-In.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn gobgp_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp announce");
+        assert!(status.success(), "gobgp announce {prefix} failed: {status}");
+    }
+
+    /// Withdraw an IPv4 prefix from the GoBGP container's RIB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn gobgp_withdraw(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args(["gobgp", "global", "rib", "del", prefix])
+            .status()
+            .expect("docker exec gobgp withdraw");
+        assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
+    }
+}
+
+/// Polls `list_peers` until the peer with `address` is absent (i.e., not
+/// returned by the daemon), then returns `Ok(())`.
+///
+/// Use this after calling `remove_peer` to confirm teardown completed.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the peer disappears.
+pub async fn wait_for_peer_absent(
+    client: &mut PathvectorClient,
+    address: Ipv4Addr,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for peer {address} to be removed from list_peers"
+            ));
+        }
+        if let Ok(peers) = client.list_peers().await {
+            let target = IpAddr::V4(address);
+            if !peers.iter().any(|p| p.address == target) {
+                return Ok(());
+            }
+        }
+        // gRPC call failed — daemon may be restarting; keep polling.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{daemon_binary, target_dir, workspace_root};

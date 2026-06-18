@@ -240,6 +240,14 @@ daemon. Other sessions are never interrupted.
 
 `AddPeer` is idempotent — calling it for an already-configured peer is a no-op.
 `RemovePeer` returns `NOT_FOUND` if the address is not a configured peer.
+`AddPeer` returns `FAILED_PRECONDITION` if a `RemovePeer` for the same address is still
+in progress; poll `ListPeers` until the peer disappears before retrying.
+
+> **Persistence warning:** peers added via `AddPeer` are held in memory only. A daemon
+> restart (crash, deploy, `systemctl restart`) loses all dynamically-added peers — the
+> daemon starts with only the peers listed in `pathvectord.toml`. Operators running in
+> production should either add dynamic peers to the config file after verifying them, or
+> use the planned config-file watch feature (tracked in TODO.md) once it ships.
 
 **Side effects of `RemovePeer`:** the daemon clears the peer's Adj-RIB-In, re-runs
 best-path selection for every affected prefix, updates the kernel FIB (`RTPROT_BGP`
@@ -466,6 +474,16 @@ GoBGP:
   Sessions always establish regardless of `md5_password`.
 - **IPv6 peers:** not yet implemented. Configuring `md5_password` on an IPv6 peer
   returns an error and the session will not start.
+
+**Dynamic peer limitation:** the BGP listener socket is bound once at daemon startup.
+Adding a peer with `md5_password` via the `AddPeer` gRPC API only installs the MD5 key
+on pathvectord's *outbound* TCP socket (the one used when pathvectord dials the peer).
+The inbound listener socket is not re-keyed, so if the remote peer initiates the TCP
+connection toward pathvectord, the kernel will reject the handshake because no key is
+registered for that source address. Statically configured peers in `pathvectord.toml`
+do not have this limitation — their keys are installed before the listener starts.
+A full fix requires re-binding the listener socket on each MD5-capable peer add, which
+is tracked in TODO.md.
 
 ---
 

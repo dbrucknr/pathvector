@@ -393,6 +393,12 @@ impl PeerService for PeerServiceImpl {
         // shutdown) closes peer_tx and naturally terminates the stream, while
         // still allowing snapshot reads for state-change signals.
         let state_weak = Arc::downgrade(&self.state);
+
+        // Seed the "previous peer set" from the initial snapshot so the first
+        // delta can diff against it to detect removals.
+        let mut prev_addrs: std::collections::HashSet<std::net::Ipv4Addr> =
+            snap.peer_remote_as.keys().copied().collect();
+
         let stream = async_stream::stream! {
             for event in snapshot {
                 yield Ok(event);
@@ -403,14 +409,37 @@ impl PeerService for PeerServiceImpl {
                 match item {
                     Ok(PeerEvent { peer: None, .. }) => {
                         // on_terminated / on_established broadcast a signal
-                        // without the peer payload. Upgrade to read the current
-                        // snapshot and emit one Changed event per configured
-                        // peer so every subscriber gets a consistent view.
+                        // without the peer payload.  Read the current snapshot,
+                        // diff against the previous peer set to find removals,
+                        // then emit Removed for gone peers and Changed for the
+                        // remaining ones.
                         let Some(state) = state_weak.upgrade() else { break };
                         let snap = state.read().await.snapshot();
-                        let mut changed: Vec<PeerEvent> = snap
-                            .peer_remote_as
-                            .keys()
+                        let curr_addrs: std::collections::HashSet<std::net::Ipv4Addr> =
+                            snap.peer_remote_as.keys().copied().collect();
+
+                        // Emit Removed for peers that disappeared.  The peer
+                        // is gone from the snapshot so we can only carry the
+                        // address; the client uses it to identify which peer
+                        // was removed.
+                        let mut removed_addrs: Vec<std::net::Ipv4Addr> = prev_addrs
+                            .difference(&curr_addrs)
+                            .copied()
+                            .collect();
+                        removed_addrs.sort();
+                        for addr in removed_addrs {
+                            yield Ok(PeerEvent {
+                                r#type: PeerEventType::Removed as i32,
+                                peer: Some(proto::PeerState {
+                                    address: addr.to_string(),
+                                    ..Default::default()
+                                }),
+                            });
+                        }
+
+                        // Emit Changed for peers still present.
+                        let mut changed: Vec<PeerEvent> = curr_addrs
+                            .iter()
                             .copied()
                             .filter_map(|addr| build_peer_state(&snap, addr))
                             .map(|ps| PeerEvent {
@@ -424,6 +453,8 @@ impl PeerService for PeerServiceImpl {
                         for e in changed {
                             yield Ok(e);
                         }
+
+                        prev_addrs = curr_addrs;
                     }
                     Ok(event) => yield Ok(event),
                     Err(_lagged) => {
@@ -477,6 +508,25 @@ impl PeerService for PeerServiceImpl {
             md5_password,
             is_rr_client: false,
         };
+
+        // Reject the add if the peer is currently being torn down.  The command
+        // processor drops AddPeer silently when `pending_removal` contains the
+        // address, so returning FAILED_PRECONDITION here gives the caller a
+        // meaningful error rather than a silent OK that never takes effect.
+        //
+        // Note: this is a snapshot-based pre-check; a concurrent RemovePeer that
+        // races after this point will still cause the add to be dropped with a
+        // warn! in the command processor.  Callers should poll list_peers until
+        // the peer is absent before retrying add_peer after a remove.
+        {
+            let s = self.state.read().await;
+            if s.pending_removal.contains(&addr) {
+                return Err(Status::failed_precondition(format!(
+                    "peer {addr} removal is in progress; \
+                     retry add_peer after the peer disappears from list_peers"
+                )));
+            }
+        }
 
         self.cmd_tx
             .send(DaemonCommand::AddPeer(peer))

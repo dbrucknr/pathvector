@@ -306,17 +306,37 @@ mod tests {
     #[test]
     fn peer_add_minimal_parses() {
         let cli = Cli::parse_from([
-            "pathvector", "peer", "add", "--address", "10.0.0.3", "--remote-as", "65003",
+            "pathvector",
+            "peer",
+            "add",
+            "--address",
+            "10.0.0.3",
+            "--remote-as",
+            "65003",
         ]);
         if let Commands::Peer {
-            command: PeerCommands::Add { address, remote_as, port, import_default, export_default, md5_password },
+            command:
+                PeerCommands::Add {
+                    address,
+                    remote_as,
+                    port,
+                    import_default,
+                    export_default,
+                    md5_password,
+                },
         } = cli.command
         {
             assert_eq!(address, "10.0.0.3");
             assert_eq!(remote_as, 65003);
             assert!(port.is_none());
-            assert!(import_default.is_none(), "omitted import_default must be None (RFC 8212)");
-            assert!(export_default.is_none(), "omitted export_default must be None (RFC 8212)");
+            assert!(
+                import_default.is_none(),
+                "omitted import_default must be None (RFC 8212)"
+            );
+            assert!(
+                export_default.is_none(),
+                "omitted export_default must be None (RFC 8212)"
+            );
             assert!(md5_password.is_none());
         } else {
             panic!("expected peer add");
@@ -326,16 +346,32 @@ mod tests {
     #[test]
     fn peer_add_all_flags_parses() {
         let cli = Cli::parse_from([
-            "pathvector", "peer", "add",
-            "--address", "10.0.0.3",
-            "--remote-as", "65003",
-            "--port", "1179",
-            "--import-default", "accept",
-            "--export-default", "reject",
-            "--md5-password", "s3cr3t",
+            "pathvector",
+            "peer",
+            "add",
+            "--address",
+            "10.0.0.3",
+            "--remote-as",
+            "65003",
+            "--port",
+            "1179",
+            "--import-default",
+            "accept",
+            "--export-default",
+            "reject",
+            "--md5-password",
+            "s3cr3t",
         ]);
         if let Commands::Peer {
-            command: PeerCommands::Add { address, remote_as, port, import_default, export_default, md5_password },
+            command:
+                PeerCommands::Add {
+                    address,
+                    remote_as,
+                    port,
+                    import_default,
+                    export_default,
+                    md5_password,
+                },
         } = cli.command
         {
             assert_eq!(address, "10.0.0.3");

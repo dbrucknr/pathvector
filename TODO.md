@@ -260,6 +260,86 @@ Not yet started. Key work items:
 
 ## pathvectord
 
+### Dynamic peer management — known gaps (2026-06-18)
+
+Six gaps identified during a correctness audit of the `AddPeer`/`RemovePeer` feature.
+Listed in priority order.
+
+**1. `add_peer` returns `OK` when the peer is mid-teardown (`pending_removal`)**
+
+When `RemovePeer` is in flight (peer is in `pending_removal` but `Terminated` hasn't
+fired yet), a concurrent `add_peer` gRPC call returns `OK` even though the command
+processor silently drops the add. The gRPC contract says `OK` means the operation
+succeeded. Fix: add a `pending_removal` check to the `add_peer` gRPC handler before
+sending the command — return `FAILED_PRECONDITION("peer removal in progress; retry
+after the peer disappears from list_peers")` instead of firing into the channel.
+
+A `oneshot` response channel threading from `DaemonCommand` back to the gRPC handler
+would make the acknowledgement authoritative (the processor itself confirms the add
+succeeded), but a snapshot-based pre-check is a good interim fix that covers the
+common case with low complexity.
+
+**2. Dynamic peers don't survive daemon restart**
+
+Every peer added via `add_peer` lives only in memory. A daemon restart — crash,
+deploy, `systemctl restart` — loses all dynamically-added peers with no record of
+what was configured. The operator must re-add them manually after each restart.
+
+This is the most impactful operational gap. The "Config-file watch + partial reload"
+TODO item is the long-term fix. Interim: document the limitation prominently in
+`pathvectord/README.md` under the AddPeer description.
+
+**3. MD5 password on dynamically-added peers doesn't work for inbound connections**
+
+The BGP listener socket is bound once at startup; TCP MD5SIG keys cannot be added to
+an existing listening socket on Linux without rebinding. Dynamically-added peers with
+`md5_password` only work for outbound connections (pathvectord dials them). If the
+remote peer tries to initiate toward us, the listener rejects the TCP handshake because
+no key is installed for that source address.
+
+Fix (full): re-bind the listener socket when a new MD5 peer is added — requires
+moving the listener into a task that can be restarted. Fix (documented): note the
+limitation clearly in `pathvectord/README.md` under the `AddPeer` gRPC section and in
+`pathvector-client/README.md` under `add_peer` parameters. The code comment in
+`run_bgp_listener` already exists; the user-facing docs do not.
+
+**4. `watch peers` stream behavior after dynamic add/remove is unverified**
+
+A client with an open `WatchPeers` stream should see a peer appear when it reaches
+`Established` after `add_peer`, and disappear after `remove_peer` triggers cleanup.
+The Established path likely works (session event fires a watcher notification) but the
+removal path — whether `remove_peer` fires a "peer gone" event to open streams — has
+not been traced or tested. If it doesn't, monitoring tools will have stale views.
+
+Fix: trace `remove_peer` → `DaemonState` watch dispatch path; add an e2e test that
+opens `watch_peers`, calls `add_peer`, asserts the stream delivers `Established`, calls
+`remove_peer`, and asserts the stream delivers a "peer removed" event or stream end.
+
+**5. Event loop stall on large-peer removal is unbounded and underdocumented**
+
+The re-propagation loop in `on_terminated` runs while holding the state write lock.
+For a peer with 100k accepted routes and 10 established neighbors this is tens of
+milliseconds — long enough to expire 9-second hold timers. The existing docs mention
+"a brief stall" but understate the severity. Add a warning log when the propagation
+loop takes > 100 ms (use `Instant::now()` before/after the inner loop) so operators
+can detect this in production before it causes cascading hold-timer failures.
+
+**6. No watchdog for `run_command_processor` task panics**
+
+If `run_command_processor` panics (e.g., a poisoned `Mutex`), the task exits silently.
+Every subsequent gRPC `AddPeer`/`RemovePeer` call fails with a channel-send error that
+surfaces as `INTERNAL` to the caller with no distinguishing context. The `tokio::spawn`
+call in `run()` does not log or handle the join handle. Wrap it:
+
+```rust
+let proc_handle = tokio::spawn(run_command_processor(...));
+tokio::spawn(async move {
+    if let Err(e) = proc_handle.await {
+        tracing::error!(error = %e, "command processor task panicked — AddPeer/RemovePeer are now unavailable");
+    }
+});
+```
+
 ### Remaining
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.

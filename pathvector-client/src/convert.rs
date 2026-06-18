@@ -294,6 +294,7 @@ impl TryFrom<i32> for PeerEventType {
             1 => Ok(Self::Current),
             2 => Ok(Self::EndInitial),
             3 => Ok(Self::Changed),
+            4 => Ok(Self::Removed),
             other => Err(ConvertError::UnknownEnumValue("PeerEventType", other)),
         }
     }
@@ -1289,11 +1290,12 @@ mod tests {
             PeerEventType::EndInitial
         );
         assert_eq!(PeerEventType::try_from(3).unwrap(), PeerEventType::Changed);
+        assert_eq!(PeerEventType::try_from(4).unwrap(), PeerEventType::Removed);
     }
 
     #[test]
     fn peer_event_type_unknown_is_error() {
-        for v in [0, 4, 99, -1, i32::MAX] {
+        for v in [0, 5, 99, -1, i32::MAX] {
             assert!(
                 matches!(
                     PeerEventType::try_from(v),
@@ -1302,6 +1304,17 @@ mod tests {
                 "expected Err for PeerEventType discriminant {v}"
             );
         }
+    }
+
+    #[test]
+    fn peer_event_removed_with_peer() {
+        let ev = proto::PeerEvent {
+            r#type: 4, // Removed
+            peer: Some(minimal_proto_peer_state()),
+        };
+        let result = PeerEvent::try_from(ev).unwrap();
+        assert_eq!(result.event_type, PeerEventType::Removed);
+        assert!(result.peer.is_some());
     }
 
     // ── PeerEvent ─────────────────────────────────────────────────────────────

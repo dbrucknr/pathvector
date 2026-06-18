@@ -38,9 +38,14 @@ use std::net::IpAddr;
 
 use clap::Parser;
 use futures::StreamExt as _;
-use pathvector_client::{PathvectorClient, types::{AddPeerParams, OriginateRouteParams}};
+use pathvector_client::{
+    PathvectorClient,
+    types::{AddPeerParams, OriginateRouteParams},
+};
 
-use cli::{Cli, Commands, Decision, OriginArg, PeerCommands, PolicyCommands, RouteCommands, WatchCommands};
+use cli::{
+    Cli, Commands, Decision, OriginArg, PeerCommands, PolicyCommands, RouteCommands, WatchCommands,
+};
 use client_trait::DaemonClient;
 use error::CliError;
 
@@ -458,7 +463,15 @@ mod tests {
     #[tokio::test]
     async fn peer_add_minimal() {
         run_cmd(
-            &["pv", "peer", "add", "--address", "10.0.0.3", "--remote-as", "65003"],
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+            ],
             MockDaemonClient::new(),
         )
         .await
@@ -469,11 +482,17 @@ mod tests {
     async fn peer_add_with_explicit_policy() {
         run_cmd(
             &[
-                "pv", "peer", "add",
-                "--address", "10.0.0.3",
-                "--remote-as", "65003",
-                "--import-default", "accept",
-                "--export-default", "reject",
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+                "--import-default",
+                "accept",
+                "--export-default",
+                "reject",
             ],
             MockDaemonClient::new(),
         )
@@ -485,13 +504,21 @@ mod tests {
     async fn peer_add_with_all_flags() {
         run_cmd(
             &[
-                "pv", "peer", "add",
-                "--address", "10.0.0.3",
-                "--remote-as", "65003",
-                "--port", "1179",
-                "--import-default", "accept",
-                "--export-default", "accept",
-                "--md5-password", "secret",
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+                "--port",
+                "1179",
+                "--import-default",
+                "accept",
+                "--export-default",
+                "accept",
+                "--md5-password",
+                "secret",
             ],
             MockDaemonClient::new(),
         )
@@ -502,7 +529,15 @@ mod tests {
     #[tokio::test]
     async fn peer_add_invalid_address() {
         let err = run_cmd(
-            &["pv", "peer", "add", "--address", "not-an-ip", "--remote-as", "65003"],
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "not-an-ip",
+                "--remote-as",
+                "65003",
+            ],
             MockDaemonClient::new(),
         )
         .await
@@ -517,7 +552,15 @@ mod tests {
             tonic::Status::unavailable("no daemon"),
         ));
         let err = run_cmd(
-            &["pv", "peer", "add", "--address", "10.0.0.3", "--remote-as", "65003"],
+            &[
+                "pv",
+                "peer",
+                "add",
+                "--address",
+                "10.0.0.3",
+                "--remote-as",
+                "65003",
+            ],
             mock,
         )
         .await
@@ -552,12 +595,9 @@ mod tests {
         mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
             tonic::Status::not_found("peer not found"),
         ));
-        let err = run_cmd(
-            &["pv", "peer", "remove", "10.0.0.3"],
-            mock,
-        )
-        .await
-        .unwrap_err();
+        let err = run_cmd(&["pv", "peer", "remove", "10.0.0.3"], mock)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("peer not found"));
     }
 

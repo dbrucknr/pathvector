@@ -177,6 +177,10 @@ enum PeerEventType {
   PEER_EVENT_TYPE_END_INITIAL = 2;
   /// A peer's session state changed.
   PEER_EVENT_TYPE_CHANGED     = 3;
+  /// A peer was removed from the daemon (via RemovePeer or config reload).
+  /// The `peer` field carries the address of the removed peer; all other
+  /// PeerState fields reflect the last known state before removal.
+  PEER_EVENT_TYPE_REMOVED     = 4;
 }
 
 /// A peer state event emitted on the WatchPeers stream.
