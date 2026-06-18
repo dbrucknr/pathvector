@@ -4,6 +4,65 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-18 (continued)
+
+### [pathvectord] Dynamic peer loose-end fixes — broadcast safety, race-safety tests, restart persistence
+
+Three correctness and operational gaps closed after the initial audit pass.
+
+**`peer_tx` broadcast capacity comment:** Added an inline comment at the
+`broadcast::channel(1024)` creation site explaining the bounded capacity,
+`RecvError::Lagged` behavior, and the self-healing guarantee: the `watch_peers`
+stream handler re-reads the full peer snapshot on any `Changed(peer: None)` signal,
+so a lagging receiver catches up without permanent event loss.
+
+**`incoming_senders` race-safety tests (2 new unit tests):**
+- `remove_peer_clears_incoming_senders` — drives `RemovePeer` through the real
+  `run_command_processor` and asserts the peer's entry is gone from `incoming_senders`
+  before `Terminated` fires, proving the reconnect race window is closed at the
+  command-handler level.
+- `bgp_listener_drops_unlisted_peer` — starts the real TCP listener with an empty
+  `incoming_senders` map, connects via loopback, and asserts EOF — the connection is
+  RST'd immediately with no data sent.
+
+**Restart persistence — `DynamicPeerStore` (6 unit tests + 2 integration tests):**
+`config::DynamicPeerStore` writes a TOML sidecar (`dynamic_peers.toml`, same directory
+as the static config) on every `add_peer` and `remove_peer` using atomic
+write-then-rename. `main.rs` loads the sidecar at startup, merges its peers into
+`cfg.peers` (skipping any address already in the static config), and passes the sidecar
+path into `run_command_processor` for write-through. Six unit tests cover: load-absent
+returns empty, upsert persists, upsert is idempotent by address, remove deletes,
+remove-unknown is a no-op, full-field round-trip. Two `run_with_tests` integration
+tests prove the restart path: sidecar peer gets a spawned session; static-config
+duplicate is not spawned twice.
+
+### [pathvector-rib] Criterion benchmark baseline — M2 Max
+
+Three benchmark targets added to `pathvector-rib/benches/`, establishing the
+performance baseline for the RIB and outbound pipeline on Apple M2 Max, 96 GB RAM.
+
+**`select_best`** — RFC 4271 §9.1 best-path decision across N candidates:
+- 2 candidates: **158 ns** (typical iBGP mesh)
+- 10 candidates: **504 ns** (realistic eBGP fan-out)
+- 100 candidates: **2.6 µs** (pathological; O(N) as expected)
+
+**`loc_rib_insert`** — one insert into a pre-populated RIB triggering best-path
+recompute:
+- 10k prefixes: **614 ns** (full internet table range)
+- 100k prefixes: **582 ns** (flat — HashMap lookup dominates, not table size)
+- 500k prefixes: **2.1 µs** (mild L3 cache pressure; still sub-3 µs)
+
+**`outbound_pipeline`** — `prepare_outbound` + `AdjRibOut::insert` per peer for
+one prefix change, measured for minimal (2-hop path, no communities) and dense
+(15-hop, 8 communities) routes:
+- minimal/1 peer: **313 ns** | minimal/10: **1.4 µs** | minimal/50: **6.8 µs**
+- dense/1 peer: **468 ns** | dense/10: **2.8 µs** | dense/50: **13.7 µs**
+
+Per-peer amortised cost is constant (~136 ns/peer minimal, ~274 ns/peer dense);
+community vec allocation accounts for the ~2× dense overhead.
+
+---
+
 ## 2026-06-18
 
 ### [pathvectord, pathvector-client, pathvector] Dynamic peer robustness — correctness audit fixes

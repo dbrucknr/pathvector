@@ -270,14 +270,13 @@ Items 1, 4, 5, 6 are resolved (2026-06-18). Items 2 and 3 remain open.
 before sending the command and returns `FAILED_PRECONDITION` if removal is in flight.
 The command processor also logs a warn! and drops the add if the race is lost.~~
 
-**2. Dynamic peers don't survive daemon restart**
-
-Every peer added via `add_peer` lives only in memory. A daemon restart — crash,
-deploy, `systemctl restart` — loses all dynamically-added peers with no record of
-what was configured. The operator must re-add them manually after each restart.
-
-This is the most impactful operational gap. The "Config-file watch + partial reload"
-TODO item is the long-term fix. Documented in `pathvectord/README.md`.
+~~**2. Dynamic peers don't survive daemon restart** —
+**Resolved 2026-06-18**: `config::DynamicPeerStore` writes a TOML sidecar
+(`dynamic_peers.toml`) next to the config file on every `add_peer`/`remove_peer`
+using atomic write-then-rename. `main.rs` loads the sidecar at startup and merges
+peers into the config before `run_with`. Static-config peers take precedence (no
+duplication). Six unit tests cover sidecar round-trips; two `run_with_tests`
+integration tests prove the restart-loading path.~~
 
 **3. MD5 password on dynamically-added peers doesn't work for inbound connections**
 
@@ -536,19 +535,20 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
 
 #### Per-crate criterion benchmarks
 
-Each crate should have a `benches/` directory with criterion benchmarks. The goal is
-a stable baseline on M2 Max hardware that can detect regressions as the implementation
-evolves. Suggested targets:
+~~`pathvector-rib` — **Resolved 2026-06-18**: Three bench targets shipped:
+`select_best` (2/10/100 candidates), `loc_rib_insert` (10k/100k/500k prefixes),
+`outbound_pipeline` (1/10/50 peers × minimal/dense route). Baseline on M2 Max:
+`select_best/2` 158 ns, `select_best/100` 2.6 µs; `loc_rib_insert` flat at ~600 ns
+across all RIB sizes; `outbound_pipeline/minimal/50` 6.8 µs,
+`outbound_pipeline/dense/50` 13.7 µs.~~
+
+Remaining crates to benchmark:
 
 | Crate | Benchmark | What to measure |
 |---|---|---|
 | `pathvector-types` | `as_path_prepend` | Prepend one AS to paths of length 0, 10, 100 |
 | `pathvector-types` | `community_match` | Match a community against a set of 1, 10, 100 communities |
 | `pathvector-policy` | `policy_evaluate` | Evaluate a policy of 1, 10, 50 terms against a single route |
-| `pathvector-rib` | `loc_rib_insert` | Insert 100 / 1k / 10k routes from a single peer |
-| `pathvector-rib` | `best_path_select` | Run `select_best` over 1, 4, 16, 64 candidates per prefix |
-| `pathvector-rib` | `loc_rib_lpm` | `longest_match` over a 10k-route table (random IPv4 addrs) |
-| `pathvector-rib` | `adj_rib_out_propagate` | `propagate_prefix` for 1k prefixes × 4 peers |
 | `pathvector-session` | `codec_decode_update` | Decode an UPDATE carrying 1 / 100 / 1k NLRIs |
 | `pathvector-session` | `codec_encode_update` | Encode the same UPDATE payloads |
 | `pathvector-session` | `codec_roundtrip` | End-to-end encode → decode for all five message types |
