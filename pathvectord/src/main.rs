@@ -37,7 +37,10 @@ async fn main() {
     let store = config::DynamicPeerStore::new(sidecar_path.clone());
     let dynamic_peers = store.load();
     if !dynamic_peers.is_empty() {
-        tracing::info!(count = dynamic_peers.len(), "loaded dynamic peers from sidecar");
+        tracing::info!(
+            count = dynamic_peers.len(),
+            "loaded dynamic peers from sidecar"
+        );
         for peer in dynamic_peers {
             if !cfg.peers.iter().any(|p| p.address == peer.address) {
                 cfg.peers.push(peer);

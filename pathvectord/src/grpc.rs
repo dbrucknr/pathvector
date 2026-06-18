@@ -1728,10 +1728,7 @@ mod tests {
         state.write().await.pending_removal.insert(addr);
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-        let svc = PeerServiceImpl {
-            state,
-            cmd_tx,
-        };
+        let svc = PeerServiceImpl { state, cmd_tx };
         let err = svc
             .add_peer(Request::new(AddPeerRequest {
                 address: "10.0.0.2".into(),

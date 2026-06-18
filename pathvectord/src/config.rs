@@ -322,9 +322,11 @@ impl DynamicPeerStore {
 
     fn load_sync(path: &Path) -> Vec<PeerConfig> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str::<SidecarFile>(&text)
-                .unwrap_or_default()
-                .peers,
+            Ok(text) => {
+                toml::from_str::<SidecarFile>(&text)
+                    .unwrap_or_default()
+                    .peers
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
             Err(e) => {
                 tracing::warn!(path = %path.display(), "failed to read dynamic peer sidecar: {e}");
@@ -345,8 +347,8 @@ impl DynamicPeerStore {
             }
         };
         let tmp = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, text.as_bytes())
-            .and_then(|()| std::fs::rename(&tmp, path))
+        if let Err(e) =
+            std::fs::write(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, path))
         {
             tracing::warn!(path = %path.display(), "failed to persist dynamic peers: {e}");
         }
@@ -467,7 +469,10 @@ mod sidecar_tests {
 
         // After a successful write, no .tmp file should remain.
         let tmp = path.with_extension("tmp");
-        assert!(!tmp.exists(), ".tmp file must be cleaned up after atomic rename");
+        assert!(
+            !tmp.exists(),
+            ".tmp file must be cleaned up after atomic rename"
+        );
         assert!(path.exists(), "sidecar file must exist after upsert");
     }
 }

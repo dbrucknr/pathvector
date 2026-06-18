@@ -8844,7 +8844,10 @@ mod event_loop_tests {
             "event type must be Removed"
         );
 
-        let ps = ev.peer.as_ref().expect("Removed event must carry a PeerState");
+        let ps = ev
+            .peer
+            .as_ref()
+            .expect("Removed event must carry a PeerState");
         assert_eq!(ps.address, peer_ip.to_string(), "address must match");
         assert_eq!(ps.remote_as, remote_as, "remote_as must not be zeroed");
         assert_eq!(ps.local_as, local_as, "local_as must not be zeroed");
@@ -8968,11 +8971,9 @@ mod event_loop_tests {
 
         // Pre-populate incoming_senders as if AddPeer had already run.
         let (incoming_tx, _incoming_rx) = mpsc::channel::<SessionCommand>(1);
-        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
-            Arc::new(RwLock::new(HashMap::from([(
-                IpAddr::V4(peer_ip),
-                incoming_tx,
-            )])));
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> = Arc::new(
+            RwLock::new(HashMap::from([(IpAddr::V4(peer_ip), incoming_tx)])),
+        );
 
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -9047,21 +9048,17 @@ mod event_loop_tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
         // Connect from 127.0.0.1 — not present in incoming_senders.
-        let mut conn =
-            tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
-                .await
-                .expect("TCP connect must succeed");
+        let mut conn = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .expect("TCP connect must succeed");
 
         // The listener drops the stream immediately — we should see EOF (0
         // bytes read) with no data sent, within a short timeout.
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            conn.read(&mut buf),
-        )
-        .await
-        .expect("read must complete within 2 s — listener must close the connection promptly")
-        .expect("read must not return an OS error");
+        let n = tokio::time::timeout(tokio::time::Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("read must complete within 2 s — listener must close the connection promptly")
+            .expect("read must not return an OS error");
 
         assert_eq!(
             n, 0,
@@ -9255,8 +9252,7 @@ mod dynamic_peer_prop_tests {
             let (tx, _rx) = mpsc::channel(8);
             senders.insert(ip, tx);
         }
-        let cfgs: Vec<config::PeerConfig> =
-            peers.iter().map(|&(a, r)| peer_cfg(a, r)).collect();
+        let cfgs: Vec<config::PeerConfig> = peers.iter().map(|&(a, r)| peer_cfg(a, r)).collect();
         DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -9300,17 +9296,13 @@ mod dynamic_peer_prop_tests {
     /// state.  Uses the last octet of 10.0.0.x as the peer discriminant.
     #[derive(Clone, Debug)]
     enum Op {
-        Add(u8),    // peer last octet, always remote_as 65000 + octet
+        Add(u8), // peer last octet, always remote_as 65000 + octet
         Remove(u8),
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
-        (1u8..=4u8).prop_flat_map(|octet| {
-            prop_oneof![
-                Just(Op::Add(octet)),
-                Just(Op::Remove(octet)),
-            ]
-        })
+        (1u8..=4u8)
+            .prop_flat_map(|octet| prop_oneof![Just(Op::Add(octet)), Just(Op::Remove(octet)),])
     }
 
     proptest! {
