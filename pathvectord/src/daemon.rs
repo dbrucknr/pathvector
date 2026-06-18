@@ -9308,10 +9308,7 @@ mod event_loop_tests {
             shutdown_message: None,
         };
 
-        cmd_tx
-            .send(DaemonCommand::AddPeer(peer_cfg))
-            .await
-            .unwrap();
+        cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
         drop(cmd_tx);
 
         // Give the command processor a moment to call spawn_fn.
