@@ -1,8 +1,8 @@
 # pathvector
 
 The command-line management tool for `pathvectord`. Connects to a running daemon over its
-gRPC management API and provides subcommands for inspecting peers, querying the Loc-RIB,
-changing routing policy at runtime, and displaying a live TUI dashboard.
+gRPC management API and provides subcommands for inspecting peers, adding and removing peers
+at runtime, querying the Loc-RIB, changing routing policy, and displaying a live TUI dashboard.
 
 ---
 
@@ -95,6 +95,50 @@ Advertised: 3 prefix(es)
 ```
 
 Exits with an error if the address is not a configured peer.
+
+---
+
+### `peer add --address <IP> --remote-as <ASN> [opts]`
+
+Add a new BGP peer at runtime. The session starts immediately; other established
+sessions are unaffected. Calling `peer add` for an already-configured peer is a no-op.
+
+```bash
+# Minimal — import/export policy defaults to RFC 8212 (reject for eBGP, accept for iBGP)
+pathvector peer add --address 10.0.0.3 --remote-as 65003
+
+# Explicit policy overrides
+pathvector peer add --address 10.0.0.3 --remote-as 65003 \
+    --import-default accept \
+    --export-default accept
+
+# Non-standard port and TCP MD5 authentication (RFC 2385)
+pathvector peer add --address 10.0.0.3 --remote-as 65003 \
+    --port 1179 \
+    --md5-password "s3cr3t"
+```
+
+| Flag | Required | Description |
+|---|---|---|
+| `--address` | ✓ | Peer IPv4 address |
+| `--remote-as` | ✓ | Remote AS number. AS 0 and AS 23456 (`AS_TRANS`) are rejected. |
+| `--port` | — | TCP port (default: 179) |
+| `--import-default` | — | `accept` or `reject`. Omit for RFC 8212 default. |
+| `--export-default` | — | `accept` or `reject`. Omit for RFC 8212 default. |
+| `--md5-password` | — | RFC 2385 TCP MD5 authentication key |
+
+---
+
+### `peer remove <ADDRESS>`
+
+Remove a peer at runtime. All routes learned from this peer are withdrawn from the
+Loc-RIB before state is cleaned up. Other sessions are unaffected.
+
+```bash
+pathvector peer remove 10.0.0.3
+```
+
+Returns an error if the address is not a configured peer.
 
 ---
 
