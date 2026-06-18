@@ -394,11 +394,6 @@ impl PeerService for PeerServiceImpl {
         // still allowing snapshot reads for state-change signals.
         let state_weak = Arc::downgrade(&self.state);
 
-        // Seed the "previous peer set" from the initial snapshot so the first
-        // delta can diff against it to detect removals.
-        let mut prev_addrs: std::collections::HashSet<std::net::Ipv4Addr> =
-            snap.peer_remote_as.keys().copied().collect();
-
         let stream = async_stream::stream! {
             for event in snapshot {
                 yield Ok(event);
@@ -409,37 +404,16 @@ impl PeerService for PeerServiceImpl {
                 match item {
                     Ok(PeerEvent { peer: None, .. }) => {
                         // on_terminated / on_established broadcast a signal
-                        // without the peer payload.  Read the current snapshot,
-                        // diff against the previous peer set to find removals,
-                        // then emit Removed for gone peers and Changed for the
-                        // remaining ones.
+                        // without the peer payload.  Re-read the snapshot and
+                        // emit one Changed event per configured peer so every
+                        // subscriber gets a consistent view.  Peer removals are
+                        // not detected here — the daemon broadcasts an explicit
+                        // Removed event (with peer: Some) for those.
                         let Some(state) = state_weak.upgrade() else { break };
                         let snap = state.read().await.snapshot();
-                        let curr_addrs: std::collections::HashSet<std::net::Ipv4Addr> =
-                            snap.peer_remote_as.keys().copied().collect();
-
-                        // Emit Removed for peers that disappeared.  The peer
-                        // is gone from the snapshot so we can only carry the
-                        // address; the client uses it to identify which peer
-                        // was removed.
-                        let mut removed_addrs: Vec<std::net::Ipv4Addr> = prev_addrs
-                            .difference(&curr_addrs)
-                            .copied()
-                            .collect();
-                        removed_addrs.sort();
-                        for addr in removed_addrs {
-                            yield Ok(PeerEvent {
-                                r#type: PeerEventType::Removed as i32,
-                                peer: Some(proto::PeerState {
-                                    address: addr.to_string(),
-                                    ..Default::default()
-                                }),
-                            });
-                        }
-
-                        // Emit Changed for peers still present.
-                        let mut changed: Vec<PeerEvent> = curr_addrs
-                            .iter()
+                        let mut changed: Vec<PeerEvent> = snap
+                            .peer_remote_as
+                            .keys()
                             .copied()
                             .filter_map(|addr| build_peer_state(&snap, addr))
                             .map(|ps| PeerEvent {
@@ -453,10 +427,14 @@ impl PeerService for PeerServiceImpl {
                         for e in changed {
                             yield Ok(e);
                         }
-
-                        prev_addrs = curr_addrs;
                     }
-                    Ok(event) => yield Ok(event),
+                    Ok(event) => {
+                        // Direct event — the daemon built the full payload.
+                        // Currently used for Removed (carries last-known
+                        // remote_as / local_as so subscribers can identify
+                        // the peer without re-reading the snapshot).
+                        yield Ok(event);
+                    }
                     Err(_lagged) => {
                         yield Err(Status::data_loss(
                             "watch stream fell behind; reconnect to receive a fresh snapshot",
@@ -3552,7 +3530,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_terminated(peer_ip);
+            s.on_terminated(peer_ip, true);
         }
 
         let mut withdrawn: std::collections::HashSet<String> = std::collections::HashSet::new();

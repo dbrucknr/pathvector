@@ -277,7 +277,12 @@ pub enum PeerEventType {
 pub struct PeerEvent {
     pub event_type: PeerEventType,
     /// Present for [`PeerEventType::Current`], [`PeerEventType::Changed`], and
-    /// [`PeerEventType::Removed`].  The `Removed` case carries the last known
-    /// state of the peer immediately before it was torn down.
+    /// [`PeerEventType::Removed`].
+    ///
+    /// For `Removed`: `address`, `remote_as`, and `local_as` are populated with
+    /// the last-known values captured before the peer was erased from daemon
+    /// state.  Session-level fields (`session_state`, `hold_time`, `uptime_seconds`,
+    /// prefix counters) are zero — the session was already torn down before the
+    /// removal event fires.
     pub peer: Option<PeerState>,
 }

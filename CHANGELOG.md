@@ -4,6 +4,58 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-18
+
+### [pathvectord, pathvector-client, pathvector] Dynamic peer robustness — correctness audit fixes
+
+Six issues identified in a post-implementation audit of the `AddPeer`/`RemovePeer`
+feature. All protocol-observable issues are resolved; two operational limitations
+remain documented in `pathvectord/README.md`.
+
+**`FAILED_PRECONDITION` guard for mid-teardown AddPeer (gap 1):** `grpc.rs` `add_peer`
+handler now reads `pending_removal` before sending the `DaemonCommand`. Returns
+`FAILED_PRECONDITION("peer removal in progress; retry after peer disappears from
+list_peers")` rather than returning `OK` for an add that will be silently dropped.
+The command processor also logs `warn!` and drops the add if the race is lost after
+the pre-check passes.
+
+**Correct `Removed` events on `WatchPeers` (gap 4):** Previously, `watch_peers`
+subscribers received `Removed` events with zeroed `remote_as`/`local_as` because the
+peer state was already erased before the stream handler could read it. Fixed by
+capturing `remote_as` and `local_as` from the RIB *before* `on_terminated` and
+`remove_peer` run, then broadcasting an explicit `proto::PeerEvent { type: Removed,
+peer: Some(PeerState { address, remote_as, local_as, .. }) }` directly from the event
+loop. `on_terminated` now accepts a `notify: bool` parameter — it suppresses its
+intermediate `Changed(None)` broadcast during removal so the stream receives exactly
+one `Removed` event, not a `Changed` followed by a `Removed`. The stream handler
+forwards explicit `Removed` events directly rather than re-deriving them via snapshot
+diffing. `dashboard.rs` `apply_peer_event` handles `Removed` with `retain`. Three new
+unit tests cover `Removed`/partial-removal/unknown-address-no-op cases.
+
+**Propagation stall observability (gap 5):** `on_terminated`'s re-propagation loop
+now wraps its body with `Instant::now()` and emits `tracing::warn!` if the loop holds
+the state write lock for more than 100 ms, including peer address, prefix count, and
+elapsed milliseconds. Operators can now detect large-table removal stalls in production
+before they cause cascading hold-timer failures.
+
+**Command processor panic watchdog (gap 6):** `run()` now wraps the
+`run_command_processor` join handle in a second `tokio::spawn` that logs
+`tracing::error!` if the task exits with a panic, making the failure visible in
+structured logs rather than silently breaking `AddPeer`/`RemovePeer`.
+
+**`DynamicPeerHarness` + `wait_for_peer_absent` (gap 4 verification):** New e2e test
+harness starts `pathvectord` with zero static peers. Four e2e tests: dynamic add
+establishes session, idempotent add is a no-op, remove withdraws routes and removes
+peer, add/remove cycle. `wait_for_peer_absent` polls `list_peers` until the target IP
+disappears.
+
+**Remaining open gaps:** dynamic peers don't survive daemon restart (gap 2); MD5
+passwords on dynamically-added peers don't protect inbound connections because the
+listener socket is bound once at startup (gap 3). Both are documented in
+`pathvectord/README.md`.
+
+---
+
 ## 2026-06-17
 
 ### [pathvectord, pathvector-client] Dynamic peer reconfiguration — AddPeer / RemovePeer gRPC RPCs

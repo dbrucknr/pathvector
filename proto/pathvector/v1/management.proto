@@ -178,8 +178,10 @@ enum PeerEventType {
   /// A peer's session state changed.
   PEER_EVENT_TYPE_CHANGED     = 3;
   /// A peer was removed from the daemon (via RemovePeer or config reload).
-  /// The `peer` field carries the address of the removed peer; all other
-  /// PeerState fields reflect the last known state before removal.
+  /// The `peer` field is always present and carries `address`, `remote_as`,
+  /// and `local_as` captured immediately before the peer was torn down.
+  /// Session-level fields (session_state, hold_time, uptime_seconds, prefix
+  /// counters) are zero — the session was already closed before removal fires.
   PEER_EVENT_TYPE_REMOVED     = 4;
 }
 

@@ -771,7 +771,9 @@ impl DaemonState {
     /// any best-path changes caused by the withdrawal to all remaining
     /// established peers.
     #[allow(clippy::similar_names)]
-    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr) {
+    /// `notify` controls whether a `peer_tx` broadcast is sent.  Pass `false`
+    /// when the caller will send a more specific event (e.g. `Removed`) instead.
+    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr, notify: bool) {
         let peer_id = PeerId::from(peer_ip);
 
         // Remove live session state from snapshot.
@@ -916,10 +918,12 @@ impl DaemonState {
         // the dashboard shows stale routes after a peer disconnects.
         self.emit_route_events(&prev_prefixes);
 
-        let _ = self.peer_tx.send(proto::PeerEvent {
-            r#type: proto::PeerEventType::Changed as i32,
-            peer: None, // gRPC handler builds PeerState from snapshot
-        });
+        if notify {
+            let _ = self.peer_tx.send(proto::PeerEvent {
+                r#type: proto::PeerEventType::Changed as i32,
+                peer: None, // gRPC handler builds PeerState from snapshot
+            });
+        }
 
         tracing::info!(
             peer = %peer_ip,
@@ -2222,7 +2226,21 @@ pub(crate) async fn run_event_loop(
                     }
                     SessionEvent::Terminated => {
                         let is_removed = s.pending_removal.remove(&peer_ip);
-                        s.on_terminated(peer_ip);
+                        // Capture identity fields while they are still in the
+                        // RIB.  on_terminated clears session-level state
+                        // (peer_types, hold_times, etc.); remove_peer clears
+                        // everything including peer_remote_as.  Both run below.
+                        let removal_identity = if is_removed {
+                            s.rib.peer_remote_as.get(&peer_ip).copied().map(|remote_as| {
+                                (remote_as, s.rib.local_as)
+                            })
+                        } else {
+                            None
+                        };
+                        // For removal, suppress the intermediate Changed(None)
+                        // broadcast — the explicit Removed event below is the
+                        // authoritative notification.
+                        s.on_terminated(peer_ip, !is_removed);
                         if is_removed {
                             // Permanent removal: erase all per-peer state so
                             // the peer no longer appears in gRPC responses and
@@ -2230,6 +2248,21 @@ pub(crate) async fn run_event_loop(
                             // be sent to this session.
                             s.remove_peer(peer_ip);
                             stop_senders.lock().unwrap().remove(&peer_ip);
+                            // Broadcast a Removed event carrying the last-known
+                            // remote_as and local_as so watch_peers subscribers
+                            // can identify the removed peer without re-reading a
+                            // snapshot that no longer contains it.
+                            if let Some((remote_as, local_as)) = removal_identity {
+                                let _ = s.peer_tx.send(proto::PeerEvent {
+                                    r#type: proto::PeerEventType::Removed as i32,
+                                    peer: Some(proto::PeerState {
+                                        address: peer_ip.to_string(),
+                                        remote_as,
+                                        local_as,
+                                        ..Default::default()
+                                    }),
+                                });
+                            }
                         }
                     }
                     SessionEvent::RouteUpdate(msg) => {
@@ -3260,7 +3293,7 @@ mod tests {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, PeerType::External, 65002, 90, &[], None);
-        state.on_terminated(peer_ip);
+        state.on_terminated(peer_ip, true);
         assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
 
@@ -3282,7 +3315,7 @@ mod tests {
         );
         assert_eq!(state.rib.loc_rib.len(), 1);
 
-        state.on_terminated(peer_ip);
+        state.on_terminated(peer_ip, true);
         assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
@@ -3313,7 +3346,7 @@ mod tests {
         receivers.get_mut(&peer_b).unwrap().try_recv().ok();
 
         // Terminate peer_a — peer_b must receive a WITHDRAW.
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
 
         let msg = receivers
             .get_mut(&peer_b)
@@ -6920,7 +6953,7 @@ mod tests {
         state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
         state.adj_ribs_out.remove(&peer_b);
 
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
 
         assert!(!state.rib.peer_types.contains_key(&peer_a));
         assert!(state.rib.peer_types.contains_key(&peer_b));
@@ -6937,7 +6970,7 @@ mod tests {
         state.on_established(peer_b, PeerType::External, 65003, 90, &[], None);
         state.update_senders.remove(&peer_b);
 
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
 
         assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
@@ -7188,7 +7221,7 @@ mod tests {
 
         // Terminating peer_a iterates established peers; ghost has no policy /
         // rib entries — the error branch logs and continues without panicking.
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
         assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
 
@@ -7790,7 +7823,7 @@ mod stall_tests {
         // We intentionally do NOT drain it — that fill is the one we rely on.
 
         // Terminate peer_a: the withdraw for peer_b's channel will fail (full).
-        state.on_terminated(peer_a);
+        state.on_terminated(peer_a, true);
         assert!(
             !state.take_stalled_peers().is_empty(),
             "peer_b must be stalled when its channel is full during termination propagation"
