@@ -1662,6 +1662,31 @@ impl DaemonState {
         // propagate_to_all_peers fires PeerEvent::Changed (ADV); fire route
         // events too so the dashboard reflects the Loc-RIB change.
         self.emit_route_events(&nlris);
+
+        // Re-evaluate IPv6 Adj-RIB-In against the same policy change.
+        let nlris_v6: Vec<Nlri<Ipv6Addr>> = self
+            .adj_ribs_in_v6
+            .get(&peer_ip)
+            .map(|a| a.routes().map(|(n, _)| *n).collect())
+            .unwrap_or_default();
+
+        let oracle_v6 = Arc::clone(&self.oracle_v6);
+        let loc_rib_v6 = &mut Arc::make_mut(&mut self.rib).loc_rib_v6;
+        let fib_changes_v6 = reapply_import_policy_v6(
+            PeerId::from(peer_ip),
+            &self.adj_ribs_in_v6[&peer_ip],
+            loc_rib_v6,
+            &self.import_policies_v6[&peer_ip],
+            &*oracle_v6,
+        );
+
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes_v6 {
+                fm.apply_v6(change);
+            }
+        }
+
+        self.propagate_to_all_peers_v6(&nlris_v6);
     }
 
     /// Replaces the export-policy default for `peer_ip` and re-evaluates the
@@ -2523,6 +2548,46 @@ pub(crate) fn reapply_import_policy(
     fib_changes
 }
 
+/// IPv6 counterpart of [`reapply_import_policy`].
+///
+/// Re-evaluates all IPv6 routes stored in `adj_rib_in` against `policy` and
+/// reconciles `loc_rib` with the result.  Called by [`DaemonState::set_import_default`]
+/// so that a policy reload applies to both address families without a session reset.
+pub(crate) fn reapply_import_policy_v6(
+    peer: PeerId,
+    adj_rib_in: &AdjRibIn<Ipv6Addr>,
+    loc_rib: &mut LocRib<Ipv6Addr>,
+    policy: &Policy<Route<Ipv6Addr>>,
+    oracle: &dyn NextHopOracle,
+) -> Vec<BestPathChange<Ipv6Addr>> {
+    let mut fib_changes: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+
+    for (nlri, raw_route) in adj_rib_in.routes() {
+        let mut route = raw_route.clone();
+        match policy.evaluate(&mut route) {
+            Decision::Accept => {
+                fib_changes.push(loc_rib.insert(peer, route, oracle));
+                accepted += 1;
+            }
+            Decision::Reject | Decision::Next => {
+                fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle));
+                rejected += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        peer = %peer,
+        accepted,
+        rejected,
+        rib_size = loc_rib.len(),
+        "soft reconfig v6 complete"
+    );
+    fib_changes
+}
+
 // RFC 4271 §5.1.3 / §9.1.2 — NEXT_HOP validation.
 // Returns false for addresses that are forbidden as next-hops: unspecified,
 // loopback, multicast, and broadcast. The "own address" check (receiving
@@ -3015,6 +3080,10 @@ mod tests {
     }
 
     fn reject_all() -> Policy<Route<Ipv4Addr>> {
+        Policy::new(DefaultAction::Reject)
+    }
+
+    fn reject_all_v6() -> Policy<Route<Ipv6Addr>> {
         Policy::new(DefaultAction::Reject)
     }
 
@@ -5204,6 +5273,92 @@ mod tests {
         assert!(
             rib.best(&nlri("192.168.0.0/16")).is_some(),
             "clean route must remain"
+        );
+    }
+
+    // ── reapply_import_policy_v6 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_reapply_v6_accepts_previously_rejected_route() {
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut fresh_ari(),
+            &mut LocRib::new(),
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &reject_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(rib_v6.is_empty(), "route rejected by initial policy");
+
+        reapply_import_policy_v6(peer(), &ari_v6, &mut rib_v6, &accept_all_v6(), &AlwaysReachable);
+        assert!(
+            rib_v6.best(&nlri_v6("2001:db8::/32")).is_some(),
+            "route must be accepted after policy change"
+        );
+    }
+
+    #[test]
+    fn test_reapply_v6_rejects_previously_accepted_route() {
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6("2001:db8::/32"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+            &mut fresh_ari(),
+            &mut LocRib::new(),
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &accept_all_v6(),
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            None,
+            None,
+        );
+        assert!(rib_v6.best(&nlri_v6("2001:db8::/32")).is_some());
+
+        reapply_import_policy_v6(peer(), &ari_v6, &mut rib_v6, &reject_all_v6(), &AlwaysReachable);
+        assert!(
+            rib_v6.best(&nlri_v6("2001:db8::/32")).is_none(),
+            "route must be withdrawn after policy change"
         );
     }
 

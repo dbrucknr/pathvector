@@ -1914,6 +1914,260 @@ impl TwoPeerHarness {
     }
 }
 
+// ── RrHarness ────────────────────────────────────────────────────────────────
+
+/// Writes the gobgpd config for an **iBGP** peer of a route reflector.
+///
+/// The peer runs in AS 65002 (same as pathvectord) and uses passive-mode so
+/// pathvectord dials it.  `router_id` distinguishes the two GoBGP instances.
+fn write_gobgp_ibgp_config(router_id: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp ibgp config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65002
+  router-id = "{router_id}"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp ibgp config");
+    f
+}
+
+/// Writes the pathvectord config for a route-reflector test.
+///
+/// `client_ip` is configured with `is_rr_client = true`; `non_client_ip` is a
+/// plain iBGP peer (no `is_rr_client`).  Both peers use accept-all import and
+/// export policy so routes flow freely through the reflector.
+fn write_daemon_config_rr(
+    client_ip: Ipv4Addr,
+    non_client_ip: Ipv4Addr,
+    grpc_port: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord rr config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {grpc_port}
+
+[[peers]]
+address        = "{client_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65002
+import_default = "accept"
+export_default = "accept"
+is_rr_client   = true
+
+[[peers]]
+address        = "{non_client_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65002
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord rr config");
+    f
+}
+
+/// A route-reflector test environment.
+///
+/// ```text
+/// GoBGP-client (AS 65002, RR client) ──iBGP──► pathvectord (AS 65002, RR)
+///                                                       │
+///                                              iBGP (non-client)
+///                                                       │
+///                                            GoBGP-non-client (AS 65002)
+/// ```
+///
+/// pathvectord acts as the route reflector.  GoBGP-client has
+/// `is_rr_client = true`; GoBGP-non-client does not.  RFC 4456 §8 requires
+/// that routes received from a client are reflected to all other peers
+/// (both clients and non-clients).
+///
+/// # Panics
+///
+/// [`RrHarness::new`] panics if Docker is not running, any image is missing,
+/// or any BGP session does not reach `Established` within 30 seconds.
+pub struct RrHarness {
+    _gobgpd_client: ContainerAsync<GenericImage>,
+    _gobgpd_non_client: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _client_config: NamedTempFile,
+    _non_client_config: NamedTempFile,
+    _daemon_config: NamedTempFile,
+    /// Container ID of GoBGP-client — use to announce routes.
+    pub client_id: String,
+    /// Container ID of GoBGP-non-client — poll to verify reflected routes.
+    pub non_client_id: String,
+    /// IP of GoBGP-client as seen by pathvectord.
+    pub client_peer: Ipv4Addr,
+    /// IP of GoBGP-non-client as seen by pathvectord.
+    pub non_client_peer: Ipv4Addr,
+    /// pathvectord management client.
+    pub client: PathvectorClient,
+    _network: DockerNetwork,
+}
+
+impl RrHarness {
+    /// Stand up the route-reflector environment and wait for both iBGP sessions.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-test-rr-{test_id}");
+        let network = DockerNetwork::create(network_name.clone());
+
+        // ── GoBGP-client (iBGP RR client) ────────────────────────────────────
+        let client_config = write_gobgp_ibgp_config("1.0.0.1");
+        let client_config_path = client_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd_client = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-rr-client-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                client_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-rr-client container");
+
+        let client_id = gobgpd_client.id().to_owned();
+        let client_addr = container_network_ip(&client_id, &network_name);
+
+        // ── GoBGP-non-client (plain iBGP peer) ───────────────────────────────
+        let non_client_config = write_gobgp_ibgp_config("1.0.0.3");
+        let non_client_config_path = non_client_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd_non_client = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-rr-non-client-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                non_client_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-rr-non-client container");
+
+        let non_client_id = gobgpd_non_client.id().to_owned();
+        let non_client_addr = container_network_ip(&non_client_id, &network_name);
+
+        // ── pathvectord (route reflector) ─────────────────────────────────────
+        let daemon_config =
+            write_daemon_config_rr(client_addr, non_client_addr, PATHVECTORD_GRPC_PORT);
+        let daemon_config_path = daemon_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-rr-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                daemon_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord rr container");
+
+        let mut management =
+            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+                .expect("connect PathvectorClient");
+
+        wait_for_established(&mut management, client_addr, Duration::from_secs(30))
+            .await
+            .expect("iBGP session with rr-client did not reach Established within 30 s");
+        wait_for_established(&mut management, non_client_addr, Duration::from_secs(30))
+            .await
+            .expect("iBGP session with rr-non-client did not reach Established within 30 s");
+
+        Self {
+            _gobgpd_client: gobgpd_client,
+            _gobgpd_non_client: gobgpd_non_client,
+            _pathvectord: pathvectord,
+            _client_config: client_config,
+            _non_client_config: non_client_config,
+            _daemon_config: daemon_config,
+            client_id,
+            non_client_id,
+            client_peer: client_addr,
+            non_client_peer: non_client_addr,
+            client: management,
+            _network: network,
+        }
+    }
+
+    /// Announce a prefix from GoBGP-client (the RR client) into pathvectord.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn client_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.client_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp client announce");
+        assert!(
+            status.success(),
+            "gobgp rr-client announce {prefix} failed: {status}"
+        );
+    }
+
+    /// Announce a prefix from GoBGP-non-client into pathvectord.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn non_client_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.non_client_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp non-client announce");
+        assert!(
+            status.success(),
+            "gobgp rr-non-client announce {prefix} failed: {status}"
+        );
+    }
+}
+
 // ── BirdHarness ──────────────────────────────────────────────────────────────
 
 /// BIRD 2 image built by `just e2e-images` from `e2e/Dockerfile.bird`.
