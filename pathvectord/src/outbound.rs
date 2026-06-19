@@ -141,8 +141,13 @@ pub(crate) fn propagate_prefix(
                     PrefixDecision::NoChange
                 };
             }
-            let mut route =
-                prepare_outbound(best.clone(), peer_type, local_as, local_next_hop, next_hop_self);
+            let mut route = prepare_outbound(
+                best.clone(),
+                peer_type,
+                local_as,
+                local_next_hop,
+                next_hop_self,
+            );
             match export_policy.evaluate(&mut route) {
                 Decision::Accept => match adj_rib_out.insert(route.clone()) {
                     InsertOutcome::Accepted(prev) => {
@@ -1764,8 +1769,15 @@ mod propagate_tests {
 
         // Now propagate with an iBGP-sourced route → AdjRibOut::insert returns
         // Filtered(Some(prev)) because peer_type == Internal on both sides.
-        let decision =
-            propagate_prefix_v6(n, &loc_rib, &mut adj_out, PeerType::Internal, 65001, None, false);
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::Internal,
+            65001,
+            None,
+            false,
+        );
         assert!(
             matches!(decision, PrefixDecisionV6::Withdraw(_)),
             "iBGP split-horizon with evicted route must produce Withdraw"
@@ -1790,8 +1802,15 @@ mod propagate_tests {
         // Empty adj_rib_out for an iBGP peer → Filtered(None).
         let mut adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
 
-        let decision =
-            propagate_prefix_v6(n, &loc_rib, &mut adj_out, PeerType::Internal, 65001, None, false);
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::Internal,
+            65001,
+            None,
+            false,
+        );
         assert!(
             matches!(decision, PrefixDecisionV6::NoChange),
             "iBGP split-horizon with no prior entry must produce NoChange"

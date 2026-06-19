@@ -205,8 +205,7 @@ mod tests {
             .next_hop(NextHop::V6(orig_nh))
             .build();
 
-        let out =
-            prepare_outbound_v6(route, PeerType::Internal, local_as, Some(local_v6), true);
+        let out = prepare_outbound_v6(route, PeerType::Internal, local_as, Some(local_v6), true);
 
         assert_eq!(out.next_hop, Some(NextHop::V6(local_v6)));
         assert_eq!(out.as_path.path_length(), 0, "iBGP must not prepend AS");

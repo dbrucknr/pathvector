@@ -93,8 +93,7 @@ async fn rr_next_hop_self_rewrites_reflected_next_hop() {
     // The non-client must see pathvectord's bridge address as the next-hop,
     // not the original 192.0.2.1 announced by the client.
     assert_eq!(
-        actual_nh,
-        h.pathvectord_addr,
+        actual_nh, h.pathvectord_addr,
         "next_hop_self must rewrite NEXT_HOP to pathvectord's address; got {actual_nh}"
     );
     assert_ne!(

@@ -961,8 +961,7 @@ impl DaemonState {
             let decisions: Vec<PrefixDecision> = prev_prefixes
                 .iter()
                 .map(|&nlri| {
-                    let other_next_hop_self =
-                        self.rib.next_hop_self_peers.contains(&other_ip);
+                    let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
                     let local_next_hop = self
                         .rib
                         .local_addrs
@@ -3276,7 +3275,7 @@ mod tests {
             md5_password: None,
             export_default: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -3546,7 +3545,11 @@ mod tests {
 
         let msg = rx.try_recv().expect("iBGP peer must receive UPDATE");
         let next_hop = msg.attributes.iter().find_map(|a| {
-            if let PathAttribute::NextHop(ip) = a { Some(*ip) } else { None }
+            if let PathAttribute::NextHop(ip) = a {
+                Some(*ip)
+            } else {
+                None
+            }
         });
         assert_eq!(
             next_hop,
@@ -3573,7 +3576,7 @@ mod tests {
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -4593,7 +4596,7 @@ mod tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -4637,7 +4640,7 @@ mod tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -4969,8 +4972,24 @@ mod tests {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &v6_caps, None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &v6_caps, None);
+        state.on_established(
+            peer_a,
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
+        state.on_established(
+            peer_b,
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &v6_caps,
+            None,
+        );
 
         // Peer A announces an IPv6 route via MP_REACH_NLRI.
         state.on_route_update(
@@ -5436,7 +5455,13 @@ mod tests {
         );
         assert!(rib_v6.is_empty(), "route rejected by initial policy");
 
-        reapply_import_policy_v6(peer(), &ari_v6, &mut rib_v6, &accept_all_v6(), &AlwaysReachable);
+        reapply_import_policy_v6(
+            peer(),
+            &ari_v6,
+            &mut rib_v6,
+            &accept_all_v6(),
+            &AlwaysReachable,
+        );
         assert!(
             rib_v6.best(&nlri_v6("2001:db8::/32")).is_some(),
             "route must be accepted after policy change"
@@ -5478,7 +5503,13 @@ mod tests {
         );
         assert!(rib_v6.best(&nlri_v6("2001:db8::/32")).is_some());
 
-        reapply_import_policy_v6(peer(), &ari_v6, &mut rib_v6, &reject_all_v6(), &AlwaysReachable);
+        reapply_import_policy_v6(
+            peer(),
+            &ari_v6,
+            &mut rib_v6,
+            &reject_all_v6(),
+            &AlwaysReachable,
+        );
         assert!(
             rib_v6.best(&nlri_v6("2001:db8::/32")).is_none(),
             "route must be withdrawn after policy change"
@@ -6448,7 +6479,15 @@ mod tests {
         Arc::make_mut(&mut state.rib).rr_clients.insert(client);
 
         // non_client_b establishes and deposits a route.
-        state.on_established(non_client_b, non_client_b, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            non_client_b,
+            non_client_b,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         let src = PeerId::new(IpAddr::V4(non_client_b));
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V4(non_client_b))
@@ -6460,7 +6499,15 @@ mod tests {
         while rxs.get_mut(&non_client_b).unwrap().try_recv().is_ok() {}
 
         // non_client_a establishes — must NOT receive the route from non_client_b.
-        state.on_established(non_client_a, non_client_a, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            non_client_a,
+            non_client_a,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         assert!(
             rxs.get_mut(&non_client_a).unwrap().try_recv().is_err(),
             "non-client must not receive routes from other non-clients during full-table dump (RFC 4456 §8)"
@@ -6478,7 +6525,15 @@ mod tests {
         Arc::make_mut(&mut state.rib).rr_clients.insert(client);
 
         // non_client deposits a route.
-        state.on_established(non_client, non_client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            non_client,
+            non_client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         let src = PeerId::new(IpAddr::V4(non_client));
         let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V4(non_client))
@@ -6508,7 +6563,15 @@ mod tests {
 
         // peer_a negotiated IPv6; peer_b did NOT.
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &v6_caps, None);
+        state.on_established(
+            peer_a,
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
 
         // peer_a announces an IPv6 prefix.
@@ -8101,7 +8164,15 @@ mod tests {
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[non_client]);
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(non_client, non_client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            non_client,
+            non_client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
 
         // UPDATE from the non-client iBGP peer, already carrying our cluster_id.
         let looped = UpdateMessage {
@@ -8140,7 +8211,15 @@ mod tests {
             .insert(non_client, non_client);
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(non_client, non_client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            non_client,
+            non_client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(non_client, update_announce("172.16.0.0/24"));
 
@@ -8358,7 +8437,7 @@ mod tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         };
@@ -9203,7 +9282,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }
@@ -9667,7 +9746,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: Some("planned maintenance".to_string()),
         };
@@ -9877,7 +9956,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
         };
@@ -9970,7 +10049,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
         };
@@ -10449,7 +10528,7 @@ mod dynamic_peer_prop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
-                next_hop_self: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }
@@ -10834,7 +10913,7 @@ mod run_with_tests {
                     import_default_v6: None,
                     md5_password: None,
                     is_rr_client: false,
-                next_hop_self: false,
+                    next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
                 })

@@ -168,6 +168,15 @@ enable (`maximum-paths` knob).
 
 ~~**D. `peer_bgp_ids` reconfiguration race window** — **Resolved 2026-06-19**: `peer_bgp_id: Ipv4Addr` is now a parameter of `on_established` and inserted atomically with `peer_types`, eliminating the split at the call site in `run_event_loop`. The fallback `unwrap_or(peer_ip)` in ORIGINATOR_ID injection cannot materialize because `peer_bgp_ids` is always populated before the peer appears in `peer_types`.~~
 
+**E. Multi-tier RR topology not tested** — existing e2e tests cover a single-reflector
+topology (one RR, one client, one non-client). A two-tier or cascaded-RR topology
+(client → RR1 → RR2 → non-client) exercises different code paths: CLUSTER_LIST must
+accumulate correctly across hops, ORIGINATOR_ID must be preserved (not overwritten) at
+RR2, and loop detection must fire if the route circles back. None of this is tested at
+the wire level today. The unit tests cover the direct attribute-injection cases but not
+the multi-hop invariants. Requires a four-container harness with two pathvectord
+instances or one pathvectord + one GoBGP-as-RR.
+
 ### FIB integration (Netlink / kernel route installation) — remaining gaps
 
 **Remaining gaps:**
