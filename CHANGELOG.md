@@ -4,6 +4,34 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-19 (continued)
+
+### [pathvectord, pathvector-e2e] Route reflector gap fixes and e2e validation
+
+**`reapply_import_policy_v6`** — `set_import_default` previously only re-evaluated
+the IPv4 Adj-RIB-In on policy reload. IPv6 routes were silently left under the old
+policy until the session was torn down. `reapply_import_policy_v6` added (parallel to
+the IPv4 function); `set_import_default` now calls both. Two new unit tests:
+`test_reapply_v6_accepts_previously_rejected_route`,
+`test_reapply_v6_rejects_previously_accepted_route`.
+
+**`RrHarness` — e2e route reflection tests** — `pathvector-e2e` gains a three-container
+RR topology: GoBGP-client (`is_rr_client = true`, AS 65002 iBGP), pathvectord (RR,
+AS 65002), GoBGP-non-client (plain iBGP, AS 65002). Three tests in
+`pathvector-e2e/tests/route_reflector.rs`, all confirmed passing against Docker:
+- `rr_client_route_reflected_to_non_client` — client route crosses iBGP split-horizon
+  via reflection (the core RFC 4456 §8 invariant)
+- `rr_non_client_route_reflected_to_client` — non-client → client path
+- `rr_client_route_visible_in_pathvectord_rib` — reflected route appears in
+  pathvectord's own Loc-RIB via gRPC
+
+**`cluster_id` documentation** — `DaemonConfig::cluster_id` doc comment expanded with
+an explicit multi-cluster warning: distinct `cluster_id` values required per cluster;
+sharing a `cluster_id` across independent clusters causes CLUSTER_LIST loop detection
+to fire incorrectly.
+
+---
+
 ## 2026-06-19
 
 ### [pathvectord, pathvector-rib] RFC 4456 §8 — BGP Route Reflection (full compliance)
