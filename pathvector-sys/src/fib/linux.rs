@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn parse_v4_rejects_non_unicast_route() {
         let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
-        msg.header.kind = RouteType::Blackhole;
+        msg.header.kind = RouteType::BlackHole;
         assert!(parse_v4(&msg, 254).is_none(), "non-unicast route must be filtered");
     }
 
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn parse_v6_rejects_non_unicast_route() {
         let mut msg = igp_v6_msg("2001:db8::", 32, 100, 254);
-        msg.header.kind = RouteType::Blackhole;
+        msg.header.kind = RouteType::BlackHole;
         assert!(parse_v6(&msg, 254).is_none(), "non-unicast IPv6 route must be filtered");
     }
 

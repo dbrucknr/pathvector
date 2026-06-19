@@ -815,4 +815,71 @@ mod tests {
         assert_eq!(asns[0], Asn::TRANS);
         assert_eq!(asns[1], Asn::new(65001));
     }
+
+    #[test]
+    fn downgrade_for_two_byte_peer_preserves_confed_sequence_type() {
+        let path = AsPath::from_segments(vec![AsPathSegment::ConfedSequence(vec![
+            Asn::new(131_072),
+            Asn::new(65001),
+        ])]);
+        let (downgraded, _) = path.downgrade_for_two_byte_peer();
+        assert!(matches!(downgraded.segments()[0], AsPathSegment::ConfedSequence(_)));
+        let asns = downgraded.segments()[0].asns();
+        assert_eq!(asns[0], Asn::TRANS);
+        assert_eq!(asns[1], Asn::new(65001));
+    }
+
+    #[test]
+    fn downgrade_for_two_byte_peer_preserves_confed_set_type() {
+        let path = AsPath::from_segments(vec![AsPathSegment::ConfedSet(vec![
+            Asn::new(200_000),
+            Asn::new(65002),
+        ])]);
+        let (downgraded, _) = path.downgrade_for_two_byte_peer();
+        assert!(matches!(downgraded.segments()[0], AsPathSegment::ConfedSet(_)));
+        let asns = downgraded.segments()[0].asns();
+        assert_eq!(asns[0], Asn::TRANS);
+        assert_eq!(asns[1], Asn::new(65002));
+    }
+
+    // ── neighboring_as (RFC 4271 §9.1 step 6 — MED comparison) ───────────────
+
+    #[test]
+    fn neighboring_as_returns_first_asn_of_first_sequence() {
+        let path = AsPath::from_sequence(vec![Asn::new(65001), Asn::new(65002)]);
+        assert_eq!(path.neighboring_as(), Some(Asn::new(65001)));
+    }
+
+    #[test]
+    fn neighboring_as_empty_path_is_none() {
+        assert_eq!(AsPath::new().neighboring_as(), None);
+    }
+
+    #[test]
+    fn neighboring_as_set_only_path_is_none() {
+        // RFC 4271 §9.1 step 6: MED is only compared between routes from the
+        // same neighboring AS. A Set-only path has no well-defined neighbor.
+        let path = AsPath::from_segments(vec![AsPathSegment::Set(vec![
+            Asn::new(65001),
+            Asn::new(65002),
+        ])]);
+        assert_eq!(path.neighboring_as(), None);
+    }
+
+    #[test]
+    fn neighboring_as_confed_segment_before_sequence_is_skipped() {
+        // Confederation segments precede the regular AS_PATH. neighboring_as
+        // must skip them and return the first ASN of the first Sequence segment.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+            AsPathSegment::Sequence(vec![Asn::new(65001), Asn::new(65002)]),
+        ]);
+        assert_eq!(path.neighboring_as(), Some(Asn::new(65001)));
+    }
+
+    #[test]
+    fn neighboring_as_single_asn_sequence() {
+        let path = AsPath::from_sequence(vec![Asn::new(65099)]);
+        assert_eq!(path.neighboring_as(), Some(Asn::new(65099)));
+    }
 }

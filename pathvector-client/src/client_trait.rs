@@ -945,11 +945,11 @@ mod tests {
             async fn set_export_default(&mut self, _: &str, _: bool) -> Result<(), ClientError> { Ok(()) }
             async fn originate_route(&mut self, _: OriginateRouteParams) -> Result<(), ClientError> { Ok(()) }
             async fn originate_routes(&mut self, r: Vec<OriginateRouteParams>) -> Result<u32, ClientError> {
-                Ok(r.len() as u32)
+                Ok(u32::try_from(r.len()).unwrap_or(u32::MAX))
             }
             async fn withdraw_originated_route(&mut self, _: &str) -> Result<(), ClientError> { Ok(()) }
             async fn withdraw_originated_routes(&mut self, p: Vec<String>) -> Result<u32, ClientError> {
-                Ok(p.len() as u32)
+                Ok(u32::try_from(p.len()).unwrap_or(u32::MAX))
             }
             async fn list_originated_routes(&mut self) -> Result<Vec<Route>, ClientError> { Ok(vec![]) }
             async fn watch_routes(&mut self, _: Option<&str>) -> Result<BoxStream<RouteEvent>, ClientError> {
