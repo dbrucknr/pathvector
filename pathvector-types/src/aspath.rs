@@ -823,7 +823,10 @@ mod tests {
             Asn::new(65001),
         ])]);
         let (downgraded, _) = path.downgrade_for_two_byte_peer();
-        assert!(matches!(downgraded.segments()[0], AsPathSegment::ConfedSequence(_)));
+        assert!(matches!(
+            downgraded.segments()[0],
+            AsPathSegment::ConfedSequence(_)
+        ));
         let asns = downgraded.segments()[0].asns();
         assert_eq!(asns[0], Asn::TRANS);
         assert_eq!(asns[1], Asn::new(65001));
@@ -836,7 +839,10 @@ mod tests {
             Asn::new(65002),
         ])]);
         let (downgraded, _) = path.downgrade_for_two_byte_peer();
-        assert!(matches!(downgraded.segments()[0], AsPathSegment::ConfedSet(_)));
+        assert!(matches!(
+            downgraded.segments()[0],
+            AsPathSegment::ConfedSet(_)
+        ));
         let asns = downgraded.segments()[0].asns();
         assert_eq!(asns[0], Asn::TRANS);
         assert_eq!(asns[1], Asn::new(65002));

@@ -913,7 +913,10 @@ mod tests {
     fn parse_v4_rejects_non_unicast_route() {
         let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
         msg.header.kind = RouteType::BlackHole;
-        assert!(parse_v4(&msg, 254).is_none(), "non-unicast route must be filtered");
+        assert!(
+            parse_v4(&msg, 254).is_none(),
+            "non-unicast route must be filtered"
+        );
     }
 
     #[test]
@@ -944,7 +947,10 @@ mod tests {
     fn parse_v6_rejects_non_unicast_route() {
         let mut msg = igp_v6_msg("2001:db8::", 32, 100, 254);
         msg.header.kind = RouteType::BlackHole;
-        assert!(parse_v6(&msg, 254).is_none(), "non-unicast IPv6 route must be filtered");
+        assert!(
+            parse_v6(&msg, 254).is_none(),
+            "non-unicast IPv6 route must be filtered"
+        );
     }
 
     #[test]
@@ -976,7 +982,10 @@ mod tests {
     #[test]
     fn in_table_zero_matches_any_table() {
         let msg = igp_v4_msg("10.0.0.0", 8, 100, 200);
-        assert!(in_table(&msg, 0), "table 0 must match routes from any table");
+        assert!(
+            in_table(&msg, 0),
+            "table 0 must match routes from any table"
+        );
     }
 
     // ── apply_new — IPv6 path ─────────────────────────────────────────────────
@@ -984,9 +993,16 @@ mod tests {
     #[test]
     fn apply_new_ipv6_route_updates_snapshot() {
         let mut snap = FibSnapshot::new();
-        assert!(apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 50, 254), 254));
+        assert!(apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 50, 254),
+            254
+        ));
         assert_eq!(snap.v6.len(), 1);
-        assert_eq!(snap.v6[0].network, "2001:db8::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            snap.v6[0].network,
+            "2001:db8::".parse::<Ipv6Addr>().unwrap()
+        );
         assert_eq!(snap.v6[0].prefix_len, 32);
         assert_eq!(snap.v6[0].metric, 50);
     }
@@ -996,7 +1012,10 @@ mod tests {
         let mut snap = FibSnapshot::new();
         let msg = igp_v6_msg("2001:db8::", 32, 50, 254);
         apply_new(&mut snap, &msg, 254);
-        assert!(!apply_new(&mut snap, &msg, 254), "identical IPv6 re-insert must not fire change");
+        assert!(
+            !apply_new(&mut snap, &msg, 254),
+            "identical IPv6 re-insert must not fire change"
+        );
         assert_eq!(snap.v6.len(), 1);
     }
 
@@ -1004,14 +1023,22 @@ mod tests {
     fn apply_new_ipv6_metric_change_returns_true() {
         let mut snap = FibSnapshot::new();
         apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 10, 254), 254);
-        assert!(apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 20, 254), 254));
+        assert!(apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 20, 254),
+            254
+        ));
         assert_eq!(snap.v6[0].metric, 20);
     }
 
     #[test]
     fn apply_new_ipv6_bgp_route_returns_false() {
         let mut snap = FibSnapshot::new();
-        assert!(!apply_new(&mut snap, &bgp_v6_msg("2001:db8::", 32, 254), 254));
+        assert!(!apply_new(
+            &mut snap,
+            &bgp_v6_msg("2001:db8::", 32, 254),
+            254
+        ));
         assert!(snap.v6.is_empty());
     }
 
@@ -1021,14 +1048,22 @@ mod tests {
     fn apply_del_ipv6_route_returns_true_when_present() {
         let mut snap = FibSnapshot::new();
         apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 50, 254), 254);
-        assert!(apply_del(&mut snap, &igp_v6_msg("2001:db8::", 32, 0, 254), 254));
+        assert!(apply_del(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 0, 254),
+            254
+        ));
         assert!(snap.v6.is_empty());
     }
 
     #[test]
     fn apply_del_ipv6_route_returns_false_when_absent() {
         let mut snap = FibSnapshot::new();
-        assert!(!apply_del(&mut snap, &igp_v6_msg("2001:db8::", 32, 0, 254), 254));
+        assert!(!apply_del(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 0, 254),
+            254
+        ));
     }
 
     #[test]
@@ -1039,7 +1074,11 @@ mod tests {
             prefix_len: 32,
             metric: 50,
         });
-        assert!(!apply_del(&mut snap, &bgp_v6_msg("2001:db8::", 32, 254), 254));
+        assert!(!apply_del(
+            &mut snap,
+            &bgp_v6_msg("2001:db8::", 32, 254),
+            254
+        ));
         assert_eq!(snap.v6.len(), 1);
     }
 }
