@@ -158,25 +158,13 @@ when their path cost is equal up to and including step 8. Requires a
 `MultiPath` variant in the best-route representation and configuration to
 enable (`maximum-paths` knob).
 
-### Route reflector — known gaps
+### Route reflector — known sub-optimalities
 
-1. **Split-horizon not applied during full-table dump** (`pathvectord/src/daemon.rs`, `on_established`) — when a new peer reaches Established, `on_established` sends the full Loc-RIB without applying RR non-client split-horizon. The check exists in `propagate_to_all_peers` for incremental updates but is absent from the initial dump. A non-client iBGP peer therefore receives routes learned from other non-client iBGP peers in its initial dump. Only affects deployments using route reflection. No test for this path yet.
+~~Items 1, 3, 4, 5, 6 resolved 2026-06-19. Full RFC 4456 §8 compliance implemented and audited.~~
 
-3. **ORIGINATOR_ID loop detection** — RFC 4456 §8 SHOULD: if received `ORIGINATOR_ID` equals
-   our own `bgp_id`, discard the UPDATE. Currently only `CLUSTER_LIST` loop detection is
-   implemented. Low priority (prevents mis-configured self-reflection).
+**A. `best_peer()` called twice per prefix per peer in the propagation loop** — the split-horizon check in `propagate_to_all_peers` calls `loc_rib.best_peer(&nlri)`, and `propagate_prefix` calls it again internally. Both are O(1) HashMap lookups so no measurable overhead today, but the two calls could theoretically disagree if state changed between them. In practice this cannot happen (single-threaded event loop), but it is a latent invariant violation that makes the code harder to reason about. Fix: compute `best_peer` once per nlri before the per-peer loop and pass it in.
 
-4. **CLUSTER_LIST loop detection scope** — The inbound loop check fires only for routes
-   from RR clients. Routes from non-client iBGP peers that carry a `CLUSTER_LIST` (i.e.,
-   already reflected by another RR) should also be loop-checked before entering our Loc-RIB.
-
-5. **eBGP routes not getting reflection attributes** — When an eBGP-learned route is
-   reflected to iBGP clients, it does not receive `ORIGINATOR_ID` / `CLUSTER_LIST`. RFC 4456
-   §8 requires these on all reflected routes, including those learned from eBGP peers.
-
-6. **IPv6 AdjRibOut not RR-aware** — `on_established` and `on_terminated` reset IPv6
-   `AdjRibOut` without calling `new_reflecting`. `propagate_to_all_peers_v6` has no
-   RR split-horizon logic. IPv6 reflection requires the same changes applied to IPv4.
+**B. `peer_bgp_ids` reconfiguration race window** — if a peer is reconfigured from eBGP to iBGP without a daemon restart, `peer_bgp_ids` will not have their BGP router ID until the next `SessionEvent::Established`. In that window, ORIGINATOR_ID would be set to `peer_ip` (the fallback) rather than the actual BGP router ID. Harmless for loop detection correctness but produces an inaccurate ORIGINATOR_ID. In practice peer-type changes always require a session restart, so this is low risk.
 
 ### FIB integration (Netlink / kernel route installation) — remaining gaps
 

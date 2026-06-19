@@ -4,6 +4,58 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-19
+
+### [pathvectord, pathvector-rib] RFC 4456 §8 — BGP Route Reflection (full compliance)
+
+Full implementation of RFC 4456 §8 route reflector semantics, covering inbound
+attribute injection, loop detection, split-horizon enforcement, and IPv4/IPv6 parity.
+
+**Inbound attribute injection** — `on_route_update` now processes RFC 4456 attributes
+for all iBGP peers (clients and non-clients) when acting as an RR. Previously the
+guard was `rr_clients.contains(&peer_ip)` (clients only). The correct scope is
+`is_rr && peer_type == PeerType::Internal` — any iBGP peer can reflect routes.
+
+**ORIGINATOR_ID loop detection** — discards UPDATE if `ORIGINATOR_ID` equals the
+local BGP ID. Detects routes that have looped back through the cluster.
+
+**CLUSTER_LIST loop detection — extended scope** — previously only fired for routes
+from configured clients. Now fires for all iBGP peers, including non-client peers
+that carry a `CLUSTER_LIST` set by another RR.
+
+**Architecture fix** — all RFC 4456 processing (detection + injection) happens on
+the original wire message in `on_route_update`, before `handle_update` stores the
+route. This ordering is required: detecting loops on an already-enriched message
+would produce false positives.
+
+**IPv6 parity** — four IPv6 code paths were missing route-reflector semantics:
+- `add_peer`: `adj_ribs_out_v6` always used `AdjRibOut::new`; fixed to use
+  `new_reflecting` for iBGP peers when acting as an RR.
+- `on_established` early reset: same bug; fixed.
+- `on_established` full-table dump: no split-horizon check for v6; added.
+- `propagate_to_all_peers_v6`: no split-horizon check; added, matching IPv4 path.
+
+**Structural enforcement — `make_adj_ribs_out_pair`** — private helper that creates
+both `adj_ribs_out` and `adj_ribs_out_v6` for a peer in a single call, ensuring
+they can never have divergent `reflects()` state. All four construction sites use it.
+`AdjRibOut::reflects()` accessor added for testability.
+
+**Test coverage** — 13 new unit tests across the RR test block:
+- 3 regression tests for ORIGINATOR_ID loop detection and non-client → client
+  attribute injection (IPv4)
+- 4 regression tests for IPv6 parity (reflecting mode, split-horizon in propagation
+  and full-table dump)
+- 4 invariant tests asserting `adj_ribs_out[p].reflects() == adj_ribs_out_v6[p].reflects()`
+  after every mutation point (`new`, `add_peer`, `on_established`, `on_terminated`)
+- Audit confirmed `reapply_import_policy` is not a bypass: RFC 4456 attributes are
+  stored on the `Route` struct in `AdjRibIn` (set during `handle_update`) and survive
+  the policy-reload cycle intact.
+
+**RFC_REQUIREMENTS.md** — RFC 4456 updated from `⚠️` to `✅`; owner updated to
+include `pathvectord` alongside `pathvector-rib`.
+
+---
+
 ## 2026-06-18 (continued)
 
 ### [pathvector-session / pathvectord] Per-peer hold timer, RFC 9003 shutdown message, RFC 7313 codec, ROUTE-REFRESH trigger
