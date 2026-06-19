@@ -113,6 +113,7 @@ pub(crate) enum PrefixDecision {
 /// attribute transforms, and calls `AdjRibOut::insert` to record the change.
 /// Returns what should be sent without transmitting anything — callers batch
 /// decisions and flush via [`flush_updates`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &impl RibView<Ipv4Addr>,

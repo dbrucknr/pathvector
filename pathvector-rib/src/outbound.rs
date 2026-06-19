@@ -19,7 +19,7 @@ use crate::Route;
 /// When `next_hop_self` is true, iBGP peers also receive `local_next_hop` as
 /// their `NEXT_HOP`.  This is required when a route reflector sits between
 /// iBGP clients that cannot reach the original eBGP next-hop directly.
-/// Has no effect on eBGP peers (NEXT_HOP is always rewritten for eBGP).
+/// Has no effect on eBGP peers (`NEXT_HOP` is always rewritten for eBGP).
 ///
 /// Confederation segment stripping for eBGP is handled separately by
 /// `AdjRibOut::insert`.
@@ -66,10 +66,8 @@ pub fn prepare_outbound_v6(
             route.next_hop = Some(NextHop::V6(addr));
         }
         route.local_pref = None;
-    } else if next_hop_self {
-        if let Some(addr) = local_ipv6 {
-            route.next_hop = Some(NextHop::V6(addr));
-        }
+    } else if next_hop_self && let Some(addr) = local_ipv6 {
+        route.next_hop = Some(NextHop::V6(addr));
     }
     route
 }

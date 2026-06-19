@@ -647,6 +647,7 @@ impl DaemonState {
     /// clean slate, and performs a full-table dump of the current best routes
     /// subject to export policy.
     #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_established(
         &mut self,
         peer_ip: Ipv4Addr,
