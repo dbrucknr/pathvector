@@ -906,4 +906,179 @@ mod tests {
         // The smuggled entry is untouched — apply_del was a no-op for BGP.
         assert_eq!(snap.v4.len(), 1);
     }
+
+    // ── parse_v4 — non-unicast and wrong-table filtering ─────────────────────
+
+    #[test]
+    fn parse_v4_rejects_non_unicast_route() {
+        let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        msg.header.kind = RouteType::BlackHole;
+        assert!(
+            parse_v4(&msg, 254).is_none(),
+            "non-unicast route must be filtered"
+        );
+    }
+
+    #[test]
+    fn parse_v4_rejects_route_in_wrong_table() {
+        assert!(
+            parse_v4(&igp_v4_msg("10.0.0.0", 8, 100, 200), 254).is_none(),
+            "route in table 200 must not appear in table 254 snapshot"
+        );
+    }
+
+    #[test]
+    fn parse_v4_default_route_uses_unspecified_network() {
+        // 0.0.0.0/0 may carry no Destination attribute — parse_v4 must default to UNSPECIFIED.
+        let mut msg = RouteMessage::default();
+        msg.header.address_family = AddressFamily::Inet;
+        msg.header.kind = RouteType::Unicast;
+        msg.header.protocol = RouteProtocol::Ospf;
+        msg.header.destination_prefix_length = 0;
+        msg.header.table = 254;
+        let entry = parse_v4(&msg, 254).expect("default route must be parsed");
+        assert_eq!(entry.network, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(entry.prefix_len, 0);
+    }
+
+    // ── parse_v6 — non-unicast and wrong-table filtering ─────────────────────
+
+    #[test]
+    fn parse_v6_rejects_non_unicast_route() {
+        let mut msg = igp_v6_msg("2001:db8::", 32, 100, 254);
+        msg.header.kind = RouteType::BlackHole;
+        assert!(
+            parse_v6(&msg, 254).is_none(),
+            "non-unicast IPv6 route must be filtered"
+        );
+    }
+
+    #[test]
+    fn parse_v6_rejects_route_in_wrong_table() {
+        assert!(
+            parse_v6(&igp_v6_msg("2001:db8::", 32, 100, 200), 254).is_none(),
+            "IPv6 route in table 200 must not appear in table 254 snapshot"
+        );
+    }
+
+    // ── route_table — RTA_TABLE attribute override ────────────────────────────
+
+    #[test]
+    fn route_table_uses_rta_table_attribute_when_present() {
+        let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        // Table IDs > 255 are stored in RTA_TABLE, not the header byte.
+        msg.attributes.push(RouteAttribute::Table(300));
+        assert_eq!(route_table(&msg), 300);
+    }
+
+    #[test]
+    fn route_table_falls_back_to_header_when_no_attribute() {
+        let msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        assert_eq!(route_table(&msg), 254);
+    }
+
+    // ── in_table — table 0 matches everything ────────────────────────────────
+
+    #[test]
+    fn in_table_zero_matches_any_table() {
+        let msg = igp_v4_msg("10.0.0.0", 8, 100, 200);
+        assert!(
+            in_table(&msg, 0),
+            "table 0 must match routes from any table"
+        );
+    }
+
+    // ── apply_new — IPv6 path ─────────────────────────────────────────────────
+
+    #[test]
+    fn apply_new_ipv6_route_updates_snapshot() {
+        let mut snap = FibSnapshot::new();
+        assert!(apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 50, 254),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 1);
+        assert_eq!(
+            snap.v6[0].network,
+            "2001:db8::".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(snap.v6[0].prefix_len, 32);
+        assert_eq!(snap.v6[0].metric, 50);
+    }
+
+    #[test]
+    fn apply_new_ipv6_duplicate_returns_false() {
+        let mut snap = FibSnapshot::new();
+        let msg = igp_v6_msg("2001:db8::", 32, 50, 254);
+        apply_new(&mut snap, &msg, 254);
+        assert!(
+            !apply_new(&mut snap, &msg, 254),
+            "identical IPv6 re-insert must not fire change"
+        );
+        assert_eq!(snap.v6.len(), 1);
+    }
+
+    #[test]
+    fn apply_new_ipv6_metric_change_returns_true() {
+        let mut snap = FibSnapshot::new();
+        apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 10, 254), 254);
+        assert!(apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 20, 254),
+            254
+        ));
+        assert_eq!(snap.v6[0].metric, 20);
+    }
+
+    #[test]
+    fn apply_new_ipv6_bgp_route_returns_false() {
+        let mut snap = FibSnapshot::new();
+        assert!(!apply_new(
+            &mut snap,
+            &bgp_v6_msg("2001:db8::", 32, 254),
+            254
+        ));
+        assert!(snap.v6.is_empty());
+    }
+
+    // ── apply_del — IPv6 path ─────────────────────────────────────────────────
+
+    #[test]
+    fn apply_del_ipv6_route_returns_true_when_present() {
+        let mut snap = FibSnapshot::new();
+        apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 50, 254), 254);
+        assert!(apply_del(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 0, 254),
+            254
+        ));
+        assert!(snap.v6.is_empty());
+    }
+
+    #[test]
+    fn apply_del_ipv6_route_returns_false_when_absent() {
+        let mut snap = FibSnapshot::new();
+        assert!(!apply_del(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 0, 254),
+            254
+        ));
+    }
+
+    #[test]
+    fn apply_del_ipv6_bgp_route_returns_false() {
+        let mut snap = FibSnapshot::new();
+        snap.v6.push(FibEntry6 {
+            network: "2001:db8::".parse().unwrap(),
+            prefix_len: 32,
+            metric: 50,
+        });
+        assert!(!apply_del(
+            &mut snap,
+            &bgp_v6_msg("2001:db8::", 32, 254),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 1);
+    }
 }

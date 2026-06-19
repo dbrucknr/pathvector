@@ -767,6 +767,7 @@ mod tests {
                 .unwrap(),
             vec![]
         );
+        assert_eq!(c.list_all_routes(None).await.unwrap(), vec![]);
         assert_eq!(c.get_best_route("10.0.0.0/8").await.unwrap(), None);
         assert_eq!(c.list_candidates("10.0.0.0/8").await.unwrap(), vec![]);
         assert!(c.set_import_default("10.0.0.1", true).await.is_ok());
@@ -786,6 +787,31 @@ mod tests {
             2
         );
         assert_eq!(c.list_originated_routes().await.unwrap(), vec![]);
+        assert!(c.watch_routes(None).await.is_ok());
+        assert!(c.watch_routes(Some("10.0.0.1")).await.is_ok());
+        assert!(c.watch_peers().await.is_ok());
+        assert!(
+            c.add_peer(AddPeerParams {
+                address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                remote_as: 65001,
+                port: None,
+                import_default: None,
+                export_default: None,
+                md5_password: None,
+            })
+            .await
+            .is_ok()
+        );
+        assert!(
+            c.remove_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .await
+                .is_ok()
+        );
+        assert!(
+            c.soft_reset(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "ipv4")
+                .await
+                .is_ok()
+        );
 
         let err = c
             .get_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
@@ -863,5 +889,144 @@ mod tests {
             c.list_originated_routes().await,
             Err(ClientError::Rpc(_))
         ));
+        assert!(matches!(
+            c.list_all_routes(None).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.watch_routes(None).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(c.watch_peers().await, Err(ClientError::Rpc(_))));
+        assert!(matches!(
+            c.add_peer(AddPeerParams {
+                address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                remote_as: 65001,
+                port: None,
+                import_default: None,
+                export_default: None,
+                md5_password: None,
+            })
+            .await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.remove_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))).await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.soft_reset(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "ipv4")
+                .await,
+            Err(ClientError::Rpc(_))
+        ));
+    }
+
+    /// `list_all_routes` can be called through the trait bound and accumulates
+    /// results from each call.
+    ///
+    /// The real pagination loop lives in `PathvectorClient::list_all_routes` and
+    /// issues multiple gRPC requests; testing that loop end-to-end requires a mock
+    /// gRPC server and belongs in an integration test.  This test verifies that the
+    /// method is callable through the trait and that a mock implementation that
+    /// tracks call count works correctly — exercising the RPIT bound.
+    #[tokio::test]
+    async fn list_all_routes_callable_through_trait_and_tracks_calls() {
+        use std::sync::{Arc, Mutex};
+
+        struct CountingClient {
+            call_count: Arc<Mutex<u32>>,
+        }
+
+        impl DaemonClient for CountingClient {
+            async fn list_peers(&mut self) -> Result<Vec<PeerState>, ClientError> {
+                Ok(vec![])
+            }
+            async fn get_peer(&mut self, _: IpAddr) -> Result<PeerState, ClientError> {
+                Err(ClientError::Rpc(tonic::Status::not_found("")))
+            }
+            async fn list_routes(&mut self, _: Option<IpAddr>) -> Result<Vec<Route>, ClientError> {
+                Ok(vec![])
+            }
+            async fn list_all_routes(
+                &mut self,
+                _: Option<IpAddr>,
+            ) -> Result<Vec<Route>, ClientError> {
+                *self.call_count.lock().unwrap() += 1;
+                Ok(vec![])
+            }
+            async fn get_best_route(&mut self, _: &str) -> Result<Option<Route>, ClientError> {
+                Ok(None)
+            }
+            async fn list_candidates(&mut self, _: &str) -> Result<Vec<Route>, ClientError> {
+                Ok(vec![])
+            }
+            async fn set_import_default(&mut self, _: &str, _: bool) -> Result<(), ClientError> {
+                Ok(())
+            }
+            async fn set_export_default(&mut self, _: &str, _: bool) -> Result<(), ClientError> {
+                Ok(())
+            }
+            async fn originate_route(
+                &mut self,
+                _: OriginateRouteParams,
+            ) -> Result<(), ClientError> {
+                Ok(())
+            }
+            async fn originate_routes(
+                &mut self,
+                r: Vec<OriginateRouteParams>,
+            ) -> Result<u32, ClientError> {
+                Ok(u32::try_from(r.len()).unwrap_or(u32::MAX))
+            }
+            async fn withdraw_originated_route(&mut self, _: &str) -> Result<(), ClientError> {
+                Ok(())
+            }
+            async fn withdraw_originated_routes(
+                &mut self,
+                p: Vec<String>,
+            ) -> Result<u32, ClientError> {
+                Ok(u32::try_from(p.len()).unwrap_or(u32::MAX))
+            }
+            async fn list_originated_routes(&mut self) -> Result<Vec<Route>, ClientError> {
+                Ok(vec![])
+            }
+            async fn watch_routes(
+                &mut self,
+                _: Option<&str>,
+            ) -> Result<BoxStream<RouteEvent>, ClientError> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            async fn watch_peers(&mut self) -> Result<BoxStream<PeerEvent>, ClientError> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            async fn add_peer(&mut self, _: AddPeerParams) -> Result<(), ClientError> {
+                Ok(())
+            }
+            async fn remove_peer(&mut self, _: IpAddr) -> Result<(), ClientError> {
+                Ok(())
+            }
+            async fn soft_reset(&mut self, _: IpAddr, _: &str) -> Result<(), ClientError> {
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(Mutex::new(0u32));
+        let mut client = CountingClient {
+            call_count: Arc::clone(&call_count),
+        };
+
+        let routes = client.list_all_routes(None).await.unwrap();
+        assert!(routes.is_empty());
+        let routes = client
+            .list_all_routes(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))))
+            .await
+            .unwrap();
+        assert!(routes.is_empty());
+
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            2,
+            "list_all_routes must be called once per invocation"
+        );
     }
 }
