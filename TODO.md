@@ -166,7 +166,7 @@ enable (`maximum-paths` knob).
 
 ~~**C. No e2e test for route reflection** — **Resolved 2026-06-19**: `RrHarness` added to `pathvector-e2e/src/lib.rs` (three-container: GoBGP-client, pathvectord RR, GoBGP-non-client, all AS 65002 iBGP). Three tests in `pathvector-e2e/tests/route_reflector.rs`: `rr_client_route_reflected_to_non_client`, `rr_non_client_route_reflected_to_client`, `rr_client_route_visible_in_pathvectord_rib`.~~
 
-**D. `peer_bgp_ids` reconfiguration race window** — if a peer is reconfigured from eBGP to iBGP without a daemon restart, `peer_bgp_ids` will not have their BGP router ID until the next `SessionEvent::Established`. In that window, ORIGINATOR_ID would be set to `peer_ip` (the fallback) rather than the actual BGP router ID. Harmless for loop detection correctness but produces an inaccurate ORIGINATOR_ID. In practice peer-type changes always require a session restart, so this is low risk.
+~~**D. `peer_bgp_ids` reconfiguration race window** — **Resolved 2026-06-19**: `peer_bgp_id: Ipv4Addr` is now a parameter of `on_established` and inserted atomically with `peer_types`, eliminating the split at the call site in `run_event_loop`. The fallback `unwrap_or(peer_ip)` in ORIGINATOR_ID injection cannot materialize because `peer_bgp_ids` is always populated before the peer appears in `peer_types`.~~
 
 ### FIB integration (Netlink / kernel route installation) — remaining gaps
 

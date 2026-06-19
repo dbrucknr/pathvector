@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use pathvector_e2e::{RrHarness, wait_for_gobgp_rib_entry};
+use pathvector_e2e::{RrHarness, get_gobgp_next_hop, wait_for_gobgp_rib_entry};
 
 /// RFC 4456 §8 — a route announced by an RR client must be reflected to a
 /// non-client iBGP peer.
@@ -66,4 +66,40 @@ async fn rr_client_route_visible_in_pathvectord_rib() {
     pathvector_e2e::wait_for_route(&mut h.client, "10.50.0.0/16", Duration::from_secs(10))
         .await
         .expect("route from RR client did not appear in pathvectord Loc-RIB within 10 s");
+}
+
+/// `next_hop_self` — when enabled, pathvectord must rewrite NEXT_HOP to its
+/// own address before reflecting an iBGP route to the non-client peer.
+///
+/// Without `next_hop_self`, the non-client would receive the original next-hop
+/// announced by the client (e.g. `192.0.2.1`), which the non-client may not
+/// be able to reach.  With `next_hop_self`, it receives pathvectord's address
+/// instead.
+#[tokio::test]
+async fn rr_next_hop_self_rewrites_reflected_next_hop() {
+    let h = RrHarness::new_with_next_hop_self().await;
+
+    // Client announces with an unreachable next-hop — something the non-client
+    // definitely cannot reach directly.
+    h.client_announce("10.150.0.0/16", "192.0.2.1");
+
+    wait_for_gobgp_rib_entry(&h.non_client_id, "10.150.0.0/16", Duration::from_secs(15))
+        .await
+        .expect("route was not reflected to non-client within 15 s");
+
+    let actual_nh = get_gobgp_next_hop(&h.non_client_id, "10.150.0.0/16")
+        .expect("could not read next-hop from non-client GoBGP RIB");
+
+    // The non-client must see pathvectord's bridge address as the next-hop,
+    // not the original 192.0.2.1 announced by the client.
+    assert_eq!(
+        actual_nh,
+        h.pathvectord_addr,
+        "next_hop_self must rewrite NEXT_HOP to pathvectord's address; got {actual_nh}"
+    );
+    assert_ne!(
+        actual_nh,
+        "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap(),
+        "original client next-hop must not reach the non-client"
+    );
 }

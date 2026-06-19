@@ -4,6 +4,27 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-19 (continued, 3)
+
+### [pathvectord, pathvector-e2e] `next_hop_self` e2e test + `peer_bgp_ids` race window fix
+
+**`next_hop_self` e2e test** — `rr_next_hop_self_rewrites_reflected_next_hop` added to
+`pathvector-e2e/tests/route_reflector.rs`. Spins up the three-container RR topology with
+`next_hop_self = true` on both peers, announces a route from the client with an
+unreachable next-hop (`192.0.2.1`), then verifies via `gobgp global rib` that the
+non-client received pathvectord's bridge address as NEXT_HOP — confirming the rewrite
+happened at the wire level. `get_gobgp_next_hop` added to `pathvector-e2e/src/lib.rs`.
+`RrHarness::new_with_next_hop_self` added for the NHS topology.
+`RrHarness.pathvectord_addr` exposed so tests can assert the exact expected NEXT_HOP.
+
+**`peer_bgp_ids` race window closed** — `on_established` now accepts
+`peer_bgp_id: Ipv4Addr` as an explicit parameter and inserts it into
+`rib.peer_bgp_ids` atomically with `rib.peer_types`. The caller (`run_event_loop`)
+no longer inserts it separately. This eliminates a latent window where the ORIGINATOR_ID
+injection code (which falls back to `peer_ip`) could have observed an absent entry.
+
+---
+
 ## 2026-06-19 (continued, 2)
 
 ### [pathvectord, pathvector-rib] `next_hop_self` + `best_peer()` double-call fix

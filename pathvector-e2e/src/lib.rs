@@ -2027,6 +2027,9 @@ pub struct RrHarness {
     pub client_peer: Ipv4Addr,
     /// IP of GoBGP-non-client as seen by pathvectord.
     pub non_client_peer: Ipv4Addr,
+    /// IP of pathvectord on the Docker bridge — what peers see as pathvectord's
+    /// address. This is the value that `next_hop_self` rewrites NEXT_HOP to.
+    pub pathvectord_addr: Ipv4Addr,
     /// pathvectord management client.
     pub client: PathvectorClient,
     _network: DockerNetwork,
@@ -2102,6 +2105,9 @@ impl RrHarness {
             .await
             .expect("start pathvectord rr container");
 
+        let pathvectord_id = pathvectord.id().to_owned();
+        let pathvectord_addr = container_network_ip(&pathvectord_id, &network_name);
+
         let mut management =
             PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
                 .expect("connect PathvectorClient");
@@ -2124,6 +2130,7 @@ impl RrHarness {
             non_client_id,
             client_peer: client_addr,
             non_client_peer: non_client_addr,
+            pathvectord_addr,
             client: management,
             _network: network,
         }
@@ -2165,6 +2172,171 @@ impl RrHarness {
             status.success(),
             "gobgp rr-non-client announce {prefix} failed: {status}"
         );
+    }
+}
+
+/// Returns the NEXT_HOP address that GoBGP stored for `prefix` in its global
+/// RIB, or `None` if the prefix is absent or the output cannot be parsed.
+///
+/// Uses `gobgp global rib` inside the container, which prints one route per
+/// line: `*> <prefix> <next-hop> …`.  The next-hop is the second field on the
+/// prefix line, which is exactly what was written in the received UPDATE's
+/// NEXT_HOP attribute.
+#[must_use]
+pub fn get_gobgp_next_hop(container_id: &str, prefix: &str) -> Option<std::net::Ipv4Addr> {
+    let out = Command::new("docker")
+        .args(["exec", container_id, "gobgp", "global", "rib"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        // Lines look like: `*> 10.100.0.0/16        172.16.0.1     …`
+        if line.contains(prefix) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // fields[0] = "*>", fields[1] = prefix, fields[2] = next-hop
+            if fields.len() >= 3 {
+                return fields[2].parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn write_daemon_config_rr_nhs(
+    client_ip: Ipv4Addr,
+    non_client_ip: Ipv4Addr,
+    grpc_port: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord rr nhs config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {grpc_port}
+
+[[peers]]
+address        = "{client_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65002
+import_default = "accept"
+export_default = "accept"
+is_rr_client   = true
+next_hop_self  = true
+
+[[peers]]
+address        = "{non_client_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65002
+import_default = "accept"
+export_default = "accept"
+next_hop_self  = true
+"#
+    )
+    .expect("write pathvectord rr nhs config");
+    f
+}
+
+impl RrHarness {
+    /// Same as [`RrHarness::new`] but with `next_hop_self = true` on both
+    /// peers.  Use this when testing that pathvectord rewrites NEXT_HOP to its
+    /// own address before reflecting routes to iBGP peers.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_with_next_hop_self() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-test-rr-nhs-{test_id}");
+        let network = DockerNetwork::create(network_name.clone());
+
+        let client_config = write_gobgp_ibgp_config("1.0.0.1");
+        let client_config_path = client_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd_client = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-rr-nhs-client-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                client_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-rr-nhs-client container");
+
+        let client_id = gobgpd_client.id().to_owned();
+        let client_addr = container_network_ip(&client_id, &network_name);
+
+        let non_client_config = write_gobgp_ibgp_config("1.0.0.3");
+        let non_client_config_path = non_client_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd_non_client = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-rr-nhs-non-client-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                non_client_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-rr-nhs-non-client container");
+
+        let non_client_id = gobgpd_non_client.id().to_owned();
+        let non_client_addr = container_network_ip(&non_client_id, &network_name);
+
+        let daemon_config =
+            write_daemon_config_rr_nhs(client_addr, non_client_addr, PATHVECTORD_GRPC_PORT);
+        let daemon_config_path = daemon_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-rr-nhs-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                daemon_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord rr-nhs container");
+
+        let pathvectord_id = pathvectord.id().to_owned();
+        let pathvectord_addr = container_network_ip(&pathvectord_id, &network_name);
+
+        let mut management =
+            PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+                .expect("connect PathvectorClient");
+
+        wait_for_established(&mut management, client_addr, Duration::from_secs(30))
+            .await
+            .expect("iBGP session with rr-nhs-client did not reach Established within 30 s");
+        wait_for_established(&mut management, non_client_addr, Duration::from_secs(30))
+            .await
+            .expect("iBGP session with rr-nhs-non-client did not reach Established within 30 s");
+
+        Self {
+            _gobgpd_client: gobgpd_client,
+            _gobgpd_non_client: gobgpd_non_client,
+            _pathvectord: pathvectord,
+            _client_config: client_config,
+            _non_client_config: non_client_config,
+            _daemon_config: daemon_config,
+            client_id,
+            non_client_id,
+            client_peer: client_addr,
+            non_client_peer: non_client_addr,
+            pathvectord_addr,
+            client: management,
+            _network: network,
+        }
     }
 }
 
