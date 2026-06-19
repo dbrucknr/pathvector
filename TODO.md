@@ -158,25 +158,24 @@ when their path cost is equal up to and including step 8. Requires a
 `MultiPath` variant in the best-route representation and configuration to
 enable (`maximum-paths` knob).
 
-### Route reflector — known gaps
+### Route reflector — known sub-optimalities
 
-1. **Split-horizon not applied during full-table dump** (`pathvectord/src/daemon.rs`, `on_established`) — when a new peer reaches Established, `on_established` sends the full Loc-RIB without applying RR non-client split-horizon. The check exists in `propagate_to_all_peers` for incremental updates but is absent from the initial dump. A non-client iBGP peer therefore receives routes learned from other non-client iBGP peers in its initial dump. Only affects deployments using route reflection. No test for this path yet.
+~~Items 1, 3, 4, 5, 6 resolved 2026-06-19. Full RFC 4456 §8 compliance implemented and audited.~~
 
-3. **ORIGINATOR_ID loop detection** — RFC 4456 §8 SHOULD: if received `ORIGINATOR_ID` equals
-   our own `bgp_id`, discard the UPDATE. Currently only `CLUSTER_LIST` loop detection is
-   implemented. Low priority (prevents mis-configured self-reflection).
+~~**A. `best_peer()` called twice per prefix per peer in the propagation loop** — **Resolved 2026-06-19**: `best_peer` is now computed once at the top of `propagate_prefix` and `propagate_prefix_v6`, eliminating the second internal call. The split-horizon check in the daemon closures still calls `best_peer` for RR topology filtering, but the function-internal redundant call is gone.~~
 
-4. **CLUSTER_LIST loop detection scope** — The inbound loop check fires only for routes
-   from RR clients. Routes from non-client iBGP peers that carry a `CLUSTER_LIST` (i.e.,
-   already reflected by another RR) should also be loop-checked before entering our Loc-RIB.
+~~**C. No e2e test for route reflection** — **Resolved 2026-06-19**: `RrHarness` added to `pathvector-e2e/src/lib.rs` (three-container: GoBGP-client, pathvectord RR, GoBGP-non-client, all AS 65002 iBGP). Three tests in `pathvector-e2e/tests/route_reflector.rs`: `rr_client_route_reflected_to_non_client`, `rr_non_client_route_reflected_to_client`, `rr_client_route_visible_in_pathvectord_rib`.~~
 
-5. **eBGP routes not getting reflection attributes** — When an eBGP-learned route is
-   reflected to iBGP clients, it does not receive `ORIGINATOR_ID` / `CLUSTER_LIST`. RFC 4456
-   §8 requires these on all reflected routes, including those learned from eBGP peers.
+~~**D. `peer_bgp_ids` reconfiguration race window** — **Resolved 2026-06-19**: `peer_bgp_id: Ipv4Addr` is now a parameter of `on_established` and inserted atomically with `peer_types`, eliminating the split at the call site in `run_event_loop`. The fallback `unwrap_or(peer_ip)` in ORIGINATOR_ID injection cannot materialize because `peer_bgp_ids` is always populated before the peer appears in `peer_types`.~~
 
-6. **IPv6 AdjRibOut not RR-aware** — `on_established` and `on_terminated` reset IPv6
-   `AdjRibOut` without calling `new_reflecting`. `propagate_to_all_peers_v6` has no
-   RR split-horizon logic. IPv6 reflection requires the same changes applied to IPv4.
+**E. Multi-tier RR topology not tested** — existing e2e tests cover a single-reflector
+topology (one RR, one client, one non-client). A two-tier or cascaded-RR topology
+(client → RR1 → RR2 → non-client) exercises different code paths: CLUSTER_LIST must
+accumulate correctly across hops, ORIGINATOR_ID must be preserved (not overwritten) at
+RR2, and loop detection must fire if the route circles back. None of this is tested at
+the wire level today. The unit tests cover the direct attribute-injection cases but not
+the multi-hop invariants. Requires a four-container harness with two pathvectord
+instances or one pathvectord + one GoBGP-as-RR.
 
 ### FIB integration (Netlink / kernel route installation) — remaining gaps
 
@@ -346,10 +345,7 @@ peer address, prefix count, and elapsed milliseconds.~~
   Maps cleanly to a `[[peer_groups]]` TOML table and a `peer_group: Option<String>`
   field on `PeerConfig`.
 
-- **Next-hop self** — force `NEXT_HOP` to the local router's address on iBGP
-  re-advertisements. Essential when a route reflector sits between iBGP clients that
-  cannot reach the original eBGP next-hop directly. Configurable per peer:
-  `next_hop_self = true` in `PeerConfig`; applied in `prepare_outbound`.
+~~**Next-hop self** — **Resolved 2026-06-19**: `next_hop_self: bool` added to `PeerConfig`; `RibSnapshot.next_hop_self_peers: HashSet<Ipv4Addr>` stores enabled peers; `prepare_outbound`/`prepare_outbound_v6` rewrite NEXT_HOP for iBGP peers with this flag set; all propagation paths (`propagate_to_all_peers`, `propagate_to_all_peers_v6`, `on_established`, `on_terminated`, `set_export_default`) pass `next_hop_self` per peer. Unit test `test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop` added.~~
 
 - **AS path regex in policy** — match routes by AS path pattern
   (`^65001 ` for routes originated by AS 65001, `_65002_` for transit through AS 65002).
@@ -365,6 +361,10 @@ peer address, prefix count, and elapsed milliseconds.~~
 
 - **IPv6 import policy per-AFI config** — currently IPv6 import policy is accept-all;
   per-AFI policy config (per-peer `import_default_v6`) is deferred.
+
+~~**`reapply_import_policy` has no IPv6 counterpart** — **Resolved 2026-06-19**: `reapply_import_policy_v6` added to `pathvectord/src/daemon.rs`; `set_import_default` now calls both the v4 and v6 variants so a policy reload applies to all address families without a session reset. Two unit tests added: `test_reapply_v6_accepts_previously_rejected_route`, `test_reapply_v6_rejects_previously_accepted_route`.~~
+
+~~**`cluster_id` configuration guidance** — **Resolved 2026-06-19**: `DaemonConfig::cluster_id` doc comment expanded in `pathvectord/src/config.rs` with an explicit "multi-cluster deployments" warning: distinct `cluster_id` values are required per cluster, otherwise CLUSTER_LIST loop detection fires incorrectly across clusters.~~ Without explicit configuration, loop detection via CLUSTER_LIST will behave unexpectedly if clusters share a `cluster_id`. Document in `pathvectord/README.md` with an explicit "if you run multiple RR clusters, set distinct `cluster_id` values" callout alongside the `is_route_reflector` config example.
 
 ---
 

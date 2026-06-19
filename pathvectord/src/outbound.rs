@@ -113,6 +113,7 @@ pub(crate) enum PrefixDecision {
 /// attribute transforms, and calls `AdjRibOut::insert` to record the change.
 /// Returns what should be sent without transmitting anything — callers batch
 /// decisions and flush via [`flush_updates`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &impl RibView<Ipv4Addr>,
@@ -121,7 +122,12 @@ pub(crate) fn propagate_prefix(
     peer_type: PeerType,
     local_as: u32,
     local_next_hop: Ipv4Addr,
+    next_hop_self: bool,
 ) -> PrefixDecision {
+    // Compute best_peer once; callers that already looked it up for split-horizon
+    // checks pass the same call, but the real savings is removing the internal
+    // second call that used to exist here.
+    let best_peer = loc_rib.best_peer(&nlri);
     match loc_rib.best(&nlri) {
         Some(best) => {
             // Never re-advertise a route back to the peer it was learned from.
@@ -129,14 +135,20 @@ pub(crate) fn propagate_prefix(
             // iBGP case is also enforced by AdjRibOut::insert, but catching it
             // here avoids unnecessary prepare_outbound work and keeps eviction
             // logic consistent.
-            if loc_rib.best_peer(&nlri) == Some(adj_rib_out.peer()) {
+            if best_peer == Some(adj_rib_out.peer()) {
                 return if adj_rib_out.withdraw(&nlri).is_some() {
                     PrefixDecision::Withdraw(nlri)
                 } else {
                     PrefixDecision::NoChange
                 };
             }
-            let mut route = prepare_outbound(best.clone(), peer_type, local_as, local_next_hop);
+            let mut route = prepare_outbound(
+                best.clone(),
+                peer_type,
+                local_as,
+                local_next_hop,
+                next_hop_self,
+            );
             match export_policy.evaluate(&mut route) {
                 Decision::Accept => match adj_rib_out.insert(route.clone()) {
                     InsertOutcome::Accepted(prev) => {
@@ -309,22 +321,25 @@ pub(crate) fn propagate_prefix_v6(
     peer_type: PeerType,
     local_as: u32,
     local_ipv6: Option<Ipv6Addr>,
+    next_hop_self: bool,
 ) -> PrefixDecisionV6 {
     // For eBGP with no local IPv6 address configured, we can't rewrite the
     // next-hop, so don't announce — but do withdraw if we previously did.
     let can_announce = peer_type != PeerType::External || local_ipv6.is_some();
 
+    let best_peer = loc_rib.best_peer(&nlri);
     match loc_rib.best(&nlri) {
         Some(best) if can_announce => {
             // Never re-advertise a route back to the peer it was learned from.
-            if loc_rib.best_peer(&nlri) == Some(adj_rib_out.peer()) {
+            if best_peer == Some(adj_rib_out.peer()) {
                 return if adj_rib_out.withdraw(&nlri).is_some() {
                     PrefixDecisionV6::Withdraw(nlri)
                 } else {
                     PrefixDecisionV6::NoChange
                 };
             }
-            let route = prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6);
+            let route =
+                prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6, next_hop_self);
             match adj_rib_out.insert(route.clone()) {
                 InsertOutcome::Accepted(prev) => {
                     if prev.as_ref() == Some(&route) {
@@ -1648,6 +1663,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
+            false,
         );
         assert!(
             matches!(decision, PrefixDecision::Withdraw(_)),
@@ -1675,6 +1691,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
         );
         assert!(
             matches!(decision, PrefixDecisionV6::Withdraw(_)),
@@ -1701,6 +1718,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
         );
 
         // Second call with same best route: NoChange.
@@ -1711,6 +1729,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
         );
         assert!(
             matches!(decision, PrefixDecisionV6::NoChange),
@@ -1751,8 +1770,15 @@ mod propagate_tests {
 
         // Now propagate with an iBGP-sourced route → AdjRibOut::insert returns
         // Filtered(Some(prev)) because peer_type == Internal on both sides.
-        let decision =
-            propagate_prefix_v6(n, &loc_rib, &mut adj_out, PeerType::Internal, 65001, None);
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::Internal,
+            65001,
+            None,
+            false,
+        );
         assert!(
             matches!(decision, PrefixDecisionV6::Withdraw(_)),
             "iBGP split-horizon with evicted route must produce Withdraw"
@@ -1777,8 +1803,15 @@ mod propagate_tests {
         // Empty adj_rib_out for an iBGP peer → Filtered(None).
         let mut adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
 
-        let decision =
-            propagate_prefix_v6(n, &loc_rib, &mut adj_out, PeerType::Internal, 65001, None);
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            PeerType::Internal,
+            65001,
+            None,
+            false,
+        );
         assert!(
             matches!(decision, PrefixDecisionV6::NoChange),
             "iBGP split-horizon with no prior entry must produce NoChange"

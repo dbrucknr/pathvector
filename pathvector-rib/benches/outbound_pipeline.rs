@@ -68,7 +68,13 @@ fn build_peers(n: usize) -> Vec<AdjRibOut<Ipv4Addr>> {
 
 fn run_pipeline(route: &Route<Ipv4Addr>, peers: &mut [AdjRibOut<Ipv4Addr>]) {
     for adj in peers.iter_mut() {
-        let outbound = prepare_outbound(route.clone(), adj.peer_type(), LOCAL_AS, LOCAL_BGP_ID);
+        let outbound = prepare_outbound(
+            route.clone(),
+            adj.peer_type(),
+            LOCAL_AS,
+            LOCAL_BGP_ID,
+            false,
+        );
         adj.insert(outbound);
     }
 }

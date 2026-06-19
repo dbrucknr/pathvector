@@ -108,6 +108,12 @@ impl<A: IpAddress> AdjRibOut<A> {
         }
     }
 
+    /// Returns `true` if this table was created in RR reflecting mode.
+    #[must_use]
+    pub fn reflects(&self) -> bool {
+        self.reflects
+    }
+
     /// Returns the peer this outbound table belongs to.
     #[must_use]
     pub fn peer(&self) -> PeerId {

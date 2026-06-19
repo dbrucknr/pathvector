@@ -4,6 +4,139 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-19 (continued, 3)
+
+### [pathvectord, pathvector-e2e] `next_hop_self` e2e test + `peer_bgp_ids` race window fix
+
+**`next_hop_self` e2e test** — `rr_next_hop_self_rewrites_reflected_next_hop` added to
+`pathvector-e2e/tests/route_reflector.rs`. Spins up the three-container RR topology with
+`next_hop_self = true` on both peers, announces a route from the client with an
+unreachable next-hop (`192.0.2.1`), then verifies via `gobgp global rib` that the
+non-client received pathvectord's bridge address as NEXT_HOP — confirming the rewrite
+happened at the wire level. `get_gobgp_next_hop` added to `pathvector-e2e/src/lib.rs`.
+`RrHarness::new_with_next_hop_self` added for the NHS topology.
+`RrHarness.pathvectord_addr` exposed so tests can assert the exact expected NEXT_HOP.
+
+**`peer_bgp_ids` race window closed** — `on_established` now accepts
+`peer_bgp_id: Ipv4Addr` as an explicit parameter and inserts it into
+`rib.peer_bgp_ids` atomically with `rib.peer_types`. The caller (`run_event_loop`)
+no longer inserts it separately. This eliminates a latent window where the ORIGINATOR_ID
+injection code (which falls back to `peer_ip`) could have observed an absent entry.
+
+---
+
+## 2026-06-19 (continued, 2)
+
+### [pathvectord, pathvector-rib] `next_hop_self` + `best_peer()` double-call fix
+
+**`next_hop_self`** — forces NEXT_HOP to the local router address on iBGP
+re-advertisements. Required when the route reflector is an eBGP border router and
+clients can't reach the original eBGP next-hop directly.
+
+- `PeerConfig::next_hop_self: bool` field added (`pathvectord/src/config.rs`)
+- `RibSnapshot::next_hop_self_peers: HashSet<Ipv4Addr>` populated at startup and
+  maintained through `add_peer` / `remove_peer`
+- `prepare_outbound` and `prepare_outbound_v6` now accept `next_hop_self: bool`; for
+  iBGP peers with the flag set, NEXT_HOP is rewritten to `local_next_hop`/`local_ipv6`
+  (has no effect on eBGP peers — their NEXT_HOP is always rewritten)
+- All propagation paths (`propagate_to_all_peers`, `propagate_to_all_peers_v6`,
+  `on_established`, `on_terminated`, `set_export_default`) look up `next_hop_self` per
+  peer and pass it through
+- Unit test: `test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop`
+  (builds a full `DaemonState`, inserts an eBGP-learned route, and verifies the iBGP
+  UPDATE carries the session local address rather than the original next-hop)
+- 4 lower-level tests in `pathvector-rib/src/outbound.rs` covering all four cases
+  (IPv4/IPv6 × `next_hop_self` true/false)
+
+**`best_peer()` double-call eliminated** — `propagate_prefix` and `propagate_prefix_v6`
+previously called `loc_rib.best_peer(&nlri)` internally for split-horizon checking, and
+the daemon's RR split-horizon closure called it again for the same nlri. Both are O(1)
+HashMap lookups so no measurable overhead, but the two calls could theoretically observe
+inconsistent state in a concurrent design. The internal call is now computed once at the
+top of each function and reused, eliminating the duplication.
+
+---
+
+## 2026-06-19 (continued)
+
+### [pathvectord, pathvector-e2e] Route reflector gap fixes and e2e validation
+
+**`reapply_import_policy_v6`** — `set_import_default` previously only re-evaluated
+the IPv4 Adj-RIB-In on policy reload. IPv6 routes were silently left under the old
+policy until the session was torn down. `reapply_import_policy_v6` added (parallel to
+the IPv4 function); `set_import_default` now calls both. Two new unit tests:
+`test_reapply_v6_accepts_previously_rejected_route`,
+`test_reapply_v6_rejects_previously_accepted_route`.
+
+**`RrHarness` — e2e route reflection tests** — `pathvector-e2e` gains a three-container
+RR topology: GoBGP-client (`is_rr_client = true`, AS 65002 iBGP), pathvectord (RR,
+AS 65002), GoBGP-non-client (plain iBGP, AS 65002). Three tests in
+`pathvector-e2e/tests/route_reflector.rs`, all confirmed passing against Docker:
+- `rr_client_route_reflected_to_non_client` — client route crosses iBGP split-horizon
+  via reflection (the core RFC 4456 §8 invariant)
+- `rr_non_client_route_reflected_to_client` — non-client → client path
+- `rr_client_route_visible_in_pathvectord_rib` — reflected route appears in
+  pathvectord's own Loc-RIB via gRPC
+
+**`cluster_id` documentation** — `DaemonConfig::cluster_id` doc comment expanded with
+an explicit multi-cluster warning: distinct `cluster_id` values required per cluster;
+sharing a `cluster_id` across independent clusters causes CLUSTER_LIST loop detection
+to fire incorrectly.
+
+---
+
+## 2026-06-19
+
+### [pathvectord, pathvector-rib] RFC 4456 §8 — BGP Route Reflection (full compliance)
+
+Full implementation of RFC 4456 §8 route reflector semantics, covering inbound
+attribute injection, loop detection, split-horizon enforcement, and IPv4/IPv6 parity.
+
+**Inbound attribute injection** — `on_route_update` now processes RFC 4456 attributes
+for all iBGP peers (clients and non-clients) when acting as an RR. Previously the
+guard was `rr_clients.contains(&peer_ip)` (clients only). The correct scope is
+`is_rr && peer_type == PeerType::Internal` — any iBGP peer can reflect routes.
+
+**ORIGINATOR_ID loop detection** — discards UPDATE if `ORIGINATOR_ID` equals the
+local BGP ID. Detects routes that have looped back through the cluster.
+
+**CLUSTER_LIST loop detection — extended scope** — previously only fired for routes
+from configured clients. Now fires for all iBGP peers, including non-client peers
+that carry a `CLUSTER_LIST` set by another RR.
+
+**Architecture fix** — all RFC 4456 processing (detection + injection) happens on
+the original wire message in `on_route_update`, before `handle_update` stores the
+route. This ordering is required: detecting loops on an already-enriched message
+would produce false positives.
+
+**IPv6 parity** — four IPv6 code paths were missing route-reflector semantics:
+- `add_peer`: `adj_ribs_out_v6` always used `AdjRibOut::new`; fixed to use
+  `new_reflecting` for iBGP peers when acting as an RR.
+- `on_established` early reset: same bug; fixed.
+- `on_established` full-table dump: no split-horizon check for v6; added.
+- `propagate_to_all_peers_v6`: no split-horizon check; added, matching IPv4 path.
+
+**Structural enforcement — `make_adj_ribs_out_pair`** — private helper that creates
+both `adj_ribs_out` and `adj_ribs_out_v6` for a peer in a single call, ensuring
+they can never have divergent `reflects()` state. All four construction sites use it.
+`AdjRibOut::reflects()` accessor added for testability.
+
+**Test coverage** — 13 new unit tests across the RR test block:
+- 3 regression tests for ORIGINATOR_ID loop detection and non-client → client
+  attribute injection (IPv4)
+- 4 regression tests for IPv6 parity (reflecting mode, split-horizon in propagation
+  and full-table dump)
+- 4 invariant tests asserting `adj_ribs_out[p].reflects() == adj_ribs_out_v6[p].reflects()`
+  after every mutation point (`new`, `add_peer`, `on_established`, `on_terminated`)
+- Audit confirmed `reapply_import_policy` is not a bypass: RFC 4456 attributes are
+  stored on the `Route` struct in `AdjRibIn` (set during `handle_update`) and survive
+  the policy-reload cycle intact.
+
+**RFC_REQUIREMENTS.md** — RFC 4456 updated from `⚠️` to `✅`; owner updated to
+include `pathvectord` alongside `pathvector-rib`.
+
+---
+
 ## 2026-06-18 (continued)
 
 ### [pathvector-session / pathvectord] Per-peer hold timer, RFC 9003 shutdown message, RFC 7313 codec, ROUTE-REFRESH trigger

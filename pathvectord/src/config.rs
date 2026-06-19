@@ -75,11 +75,20 @@ pub struct DaemonConfig {
     /// reflected route and used for loop detection. When omitted, defaults to
     /// the 32-bit representation of `bgp_id`.
     ///
+    /// **Multi-cluster deployments:** if you run more than one independent RR
+    /// cluster in the same AS, each cluster MUST have a distinct `cluster_id`.
+    /// Without explicit configuration every cluster's `cluster_id` equals its
+    /// RR's BGP ID — if two RRs share a BGP ID (unusual but possible), or if
+    /// you rely on CLUSTER_LIST loop detection across clusters, set this field
+    /// explicitly to a unique value per cluster. Using the same `cluster_id` in
+    /// multiple clusters causes CLUSTER_LIST loop detection to fire incorrectly,
+    /// dropping routes that should be accepted.
+    ///
     /// ```toml
     /// [daemon]
     /// local_as   = 65001
     /// bgp_id     = "10.0.0.1"
-    /// cluster_id = 1
+    /// cluster_id = 1    # must be unique per cluster in multi-cluster setups
     /// ```
     #[serde(default)]
     pub cluster_id: Option<u32>,
@@ -257,6 +266,21 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub is_rr_client: bool,
+    /// Force the NEXT_HOP attribute to the local router address when
+    /// advertising routes to this peer over iBGP.
+    ///
+    /// Required when the route reflector is also an eBGP border router and
+    /// its iBGP clients cannot reach the eBGP next-hop directly.  Has no
+    /// effect on eBGP peers (NEXT_HOP is always rewritten for eBGP).
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address       = "10.0.0.2"
+    /// remote_as     = 65001
+    /// next_hop_self = true
+    /// ```
+    #[serde(default)]
+    pub next_hop_self: bool,
     /// Per-peer BGP hold time in seconds, overriding `daemon.hold_time`.
     ///
     /// When omitted the peer inherits the daemon-level `hold_time` (default 90 s).
@@ -399,6 +423,7 @@ mod sidecar_tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }
@@ -476,6 +501,7 @@ mod sidecar_tests {
             export_default: Some(ExportDefault::Accept),
             md5_password: Some("s3cr3t".into()),
             is_rr_client: true,
+            next_hop_self: false,
             hold_time: Some(60),
             shutdown_message: Some("planned maintenance".into()),
         };
