@@ -4,6 +4,38 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-19 (continued, 2)
+
+### [pathvectord, pathvector-rib] `next_hop_self` + `best_peer()` double-call fix
+
+**`next_hop_self`** — forces NEXT_HOP to the local router address on iBGP
+re-advertisements. Required when the route reflector is an eBGP border router and
+clients can't reach the original eBGP next-hop directly.
+
+- `PeerConfig::next_hop_self: bool` field added (`pathvectord/src/config.rs`)
+- `RibSnapshot::next_hop_self_peers: HashSet<Ipv4Addr>` populated at startup and
+  maintained through `add_peer` / `remove_peer`
+- `prepare_outbound` and `prepare_outbound_v6` now accept `next_hop_self: bool`; for
+  iBGP peers with the flag set, NEXT_HOP is rewritten to `local_next_hop`/`local_ipv6`
+  (has no effect on eBGP peers — their NEXT_HOP is always rewritten)
+- All propagation paths (`propagate_to_all_peers`, `propagate_to_all_peers_v6`,
+  `on_established`, `on_terminated`, `set_export_default`) look up `next_hop_self` per
+  peer and pass it through
+- Unit test: `test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop`
+  (builds a full `DaemonState`, inserts an eBGP-learned route, and verifies the iBGP
+  UPDATE carries the session local address rather than the original next-hop)
+- 4 lower-level tests in `pathvector-rib/src/outbound.rs` covering all four cases
+  (IPv4/IPv6 × `next_hop_self` true/false)
+
+**`best_peer()` double-call eliminated** — `propagate_prefix` and `propagate_prefix_v6`
+previously called `loc_rib.best_peer(&nlri)` internally for split-horizon checking, and
+the daemon's RR split-horizon closure called it again for the same nlri. Both are O(1)
+HashMap lookups so no measurable overhead, but the two calls could theoretically observe
+inconsistent state in a concurrent design. The internal call is now computed once at the
+top of each function and reused, eliminating the duplication.
+
+---
+
 ## 2026-06-19 (continued)
 
 ### [pathvectord, pathvector-e2e] Route reflector gap fixes and e2e validation

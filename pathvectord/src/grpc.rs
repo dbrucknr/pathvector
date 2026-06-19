@@ -492,6 +492,7 @@ impl PeerService for PeerServiceImpl {
             import_default_v6: None,
             md5_password,
             is_rr_client: false,
+            next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         };
@@ -1303,6 +1304,7 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })

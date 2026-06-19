@@ -162,7 +162,7 @@ enable (`maximum-paths` knob).
 
 ~~Items 1, 3, 4, 5, 6 resolved 2026-06-19. Full RFC 4456 §8 compliance implemented and audited.~~
 
-**A. `best_peer()` called twice per prefix per peer in the propagation loop** — the split-horizon check in `propagate_to_all_peers` calls `loc_rib.best_peer(&nlri)`, and `propagate_prefix` calls it again internally. Both are O(1) HashMap lookups so no measurable overhead today, but the two calls could theoretically disagree if state changed between them. In practice this cannot happen (single-threaded event loop), but it is a latent invariant violation that makes the code harder to reason about. Fix: compute `best_peer` once per nlri before the per-peer loop and pass it in.
+~~**A. `best_peer()` called twice per prefix per peer in the propagation loop** — **Resolved 2026-06-19**: `best_peer` is now computed once at the top of `propagate_prefix` and `propagate_prefix_v6`, eliminating the second internal call. The split-horizon check in the daemon closures still calls `best_peer` for RR topology filtering, but the function-internal redundant call is gone.~~
 
 ~~**C. No e2e test for route reflection** — **Resolved 2026-06-19**: `RrHarness` added to `pathvector-e2e/src/lib.rs` (three-container: GoBGP-client, pathvectord RR, GoBGP-non-client, all AS 65002 iBGP). Three tests in `pathvector-e2e/tests/route_reflector.rs`: `rr_client_route_reflected_to_non_client`, `rr_non_client_route_reflected_to_client`, `rr_client_route_visible_in_pathvectord_rib`.~~
 
@@ -336,10 +336,7 @@ peer address, prefix count, and elapsed milliseconds.~~
   Maps cleanly to a `[[peer_groups]]` TOML table and a `peer_group: Option<String>`
   field on `PeerConfig`.
 
-- **Next-hop self** — force `NEXT_HOP` to the local router's address on iBGP
-  re-advertisements. Essential when a route reflector sits between iBGP clients that
-  cannot reach the original eBGP next-hop directly. Configurable per peer:
-  `next_hop_self = true` in `PeerConfig`; applied in `prepare_outbound`.
+~~**Next-hop self** — **Resolved 2026-06-19**: `next_hop_self: bool` added to `PeerConfig`; `RibSnapshot.next_hop_self_peers: HashSet<Ipv4Addr>` stores enabled peers; `prepare_outbound`/`prepare_outbound_v6` rewrite NEXT_HOP for iBGP peers with this flag set; all propagation paths (`propagate_to_all_peers`, `propagate_to_all_peers_v6`, `on_established`, `on_terminated`, `set_export_default`) pass `next_hop_self` per peer. Unit test `test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop` added.~~
 
 - **AS path regex in policy** — match routes by AS path pattern
   (`^65001 ` for routes originated by AS 65001, `_65002_` for transit through AS 65002).

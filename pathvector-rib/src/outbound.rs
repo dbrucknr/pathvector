@@ -16,19 +16,27 @@ use crate::Route;
 ///   address, not the BGP router ID.
 /// - Strip `LOCAL_PREF` (RFC 4271 §5.1.5 — must not be sent to eBGP peers)
 ///
-/// iBGP peers receive the route unmodified; confederation segment stripping
-/// for eBGP is handled separately by `AdjRibOut::insert`.
+/// When `next_hop_self` is true, iBGP peers also receive `local_next_hop` as
+/// their `NEXT_HOP`.  This is required when a route reflector sits between
+/// iBGP clients that cannot reach the original eBGP next-hop directly.
+/// Has no effect on eBGP peers (NEXT_HOP is always rewritten for eBGP).
+///
+/// Confederation segment stripping for eBGP is handled separately by
+/// `AdjRibOut::insert`.
 #[must_use]
 pub fn prepare_outbound(
     mut route: Route<Ipv4Addr>,
     peer_type: PeerType,
     local_as: u32,
     local_next_hop: Ipv4Addr,
+    next_hop_self: bool,
 ) -> Route<Ipv4Addr> {
     if peer_type == PeerType::External {
         Arc::make_mut(&mut route.as_path).prepend(Asn::new(local_as));
         route.next_hop = Some(NextHop::V4(local_next_hop));
         route.local_pref = None;
+    } else if next_hop_self {
+        route.next_hop = Some(NextHop::V4(local_next_hop));
     }
     route
 }
@@ -40,15 +48,17 @@ pub fn prepare_outbound(
 /// - Rewrite `NEXT_HOP` to `local_ipv6` (RFC 4760 §4.3)
 /// - Strip `LOCAL_PREF` (RFC 4271 §5.1.5)
 ///
-/// When `local_ipv6` is `None` the route is returned as-is (caller is
-/// responsible for only calling this on iBGP peers in that case, or for
-/// suppressing the route outbound).
+/// When `next_hop_self` is true, iBGP peers also receive `local_ipv6` as their
+/// `NEXT_HOP` (if `local_ipv6` is configured). When `local_ipv6` is `None` the
+/// route is returned as-is for iBGP; callers are responsible for suppressing the
+/// route outbound if the peer cannot reach the original next-hop.
 #[must_use]
 pub fn prepare_outbound_v6(
     mut route: Route<Ipv6Addr>,
     peer_type: PeerType,
     local_as: u32,
     local_ipv6: Option<Ipv6Addr>,
+    next_hop_self: bool,
 ) -> Route<Ipv6Addr> {
     if peer_type == PeerType::External {
         Arc::make_mut(&mut route.as_path).prepend(Asn::new(local_as));
@@ -56,6 +66,10 @@ pub fn prepare_outbound_v6(
             route.next_hop = Some(NextHop::V6(addr));
         }
         route.local_pref = None;
+    } else if next_hop_self {
+        if let Some(addr) = local_ipv6 {
+            route.next_hop = Some(NextHop::V6(addr));
+        }
     }
     route
 }
@@ -78,7 +92,7 @@ mod tests {
             .local_pref(LocalPref::new(100))
             .build();
 
-        let out = prepare_outbound(route, PeerType::External, local_as, local_next_hop);
+        let out = prepare_outbound(route, PeerType::External, local_as, local_next_hop, false);
 
         assert_eq!(out.as_path.path_length(), 1);
         assert_eq!(out.next_hop, Some(NextHop::V4(local_next_hop)));
@@ -94,7 +108,7 @@ mod tests {
             .local_pref(lp)
             .build();
 
-        let out = prepare_outbound(route, PeerType::Internal, local_as, local_next_hop);
+        let out = prepare_outbound(route, PeerType::Internal, local_as, local_next_hop, false);
 
         assert_eq!(out.as_path.path_length(), 0);
         assert!(out.next_hop.is_none());
@@ -114,7 +128,7 @@ mod tests {
             .next_hop(NextHop::V6("2001:db8::9".parse().unwrap()))
             .build();
 
-        let out = prepare_outbound_v6(route, PeerType::External, local_as, Some(local_v6));
+        let out = prepare_outbound_v6(route, PeerType::External, local_as, Some(local_v6), false);
 
         assert_eq!(out.as_path.path_length(), 1);
         assert_eq!(out.next_hop, Some(NextHop::V6(local_v6)));
@@ -131,7 +145,7 @@ mod tests {
             .next_hop(NextHop::V6(orig_nh))
             .build();
 
-        let out = prepare_outbound_v6(route, PeerType::Internal, local_as, None);
+        let out = prepare_outbound_v6(route, PeerType::Internal, local_as, None, false);
 
         assert_eq!(out.as_path.path_length(), 0);
         assert_eq!(out.next_hop, Some(NextHop::V6(orig_nh)));
@@ -146,10 +160,69 @@ mod tests {
             .next_hop(NextHop::V6(orig_nh))
             .build();
 
-        let out = prepare_outbound_v6(route, PeerType::External, local_as, None);
+        let out = prepare_outbound_v6(route, PeerType::External, local_as, None, false);
 
         // AS_PATH is still prepended; NEXT_HOP is left as-is.
         assert_eq!(out.as_path.path_length(), 1);
+        assert_eq!(out.next_hop, Some(NextHop::V6(orig_nh)));
+    }
+
+    #[test]
+    fn test_prepare_outbound_next_hop_self_rewrites_ibgp_next_hop() {
+        let local_as = 65000_u32;
+        let local_next_hop = Ipv4Addr::new(10, 0, 0, 2);
+        let orig_nh = Ipv4Addr::new(192, 0, 2, 1);
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(orig_nh))
+            .build();
+
+        let out = prepare_outbound(route, PeerType::Internal, local_as, local_next_hop, true);
+
+        assert_eq!(out.next_hop, Some(NextHop::V4(local_next_hop)));
+        assert_eq!(out.as_path.path_length(), 0, "iBGP must not prepend AS");
+    }
+
+    #[test]
+    fn test_prepare_outbound_next_hop_self_false_leaves_ibgp_unchanged() {
+        let local_as = 65000_u32;
+        let local_next_hop = Ipv4Addr::new(10, 0, 0, 2);
+        let orig_nh = Ipv4Addr::new(192, 0, 2, 1);
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(orig_nh))
+            .build();
+
+        let out = prepare_outbound(route, PeerType::Internal, local_as, local_next_hop, false);
+
+        assert_eq!(out.next_hop, Some(NextHop::V4(orig_nh)));
+    }
+
+    #[test]
+    fn test_prepare_outbound_v6_next_hop_self_rewrites_ibgp_next_hop() {
+        let local_as = 65000_u32;
+        let local_v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let orig_nh: Ipv6Addr = "2001:db8::9".parse().unwrap();
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6(orig_nh))
+            .build();
+
+        let out =
+            prepare_outbound_v6(route, PeerType::Internal, local_as, Some(local_v6), true);
+
+        assert_eq!(out.next_hop, Some(NextHop::V6(local_v6)));
+        assert_eq!(out.as_path.path_length(), 0, "iBGP must not prepend AS");
+    }
+
+    #[test]
+    fn test_prepare_outbound_v6_next_hop_self_no_local_ipv6_no_rewrite() {
+        let local_as = 65000_u32;
+        let orig_nh: Ipv6Addr = "2001:db8::9".parse().unwrap();
+        let route = RouteBuilder::new(nlri6("2001:db8::/32"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6(orig_nh))
+            .build();
+
+        // next_hop_self=true but no local_ipv6 — cannot rewrite, route is unchanged
+        let out = prepare_outbound_v6(route, PeerType::Internal, local_as, None, true);
+
         assert_eq!(out.next_hop, Some(NextHop::V6(orig_nh)));
     }
 }

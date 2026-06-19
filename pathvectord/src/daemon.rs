@@ -154,6 +154,12 @@ pub(crate) struct RibSnapshot {
     /// Used as the eBGP NEXT_HOP (RFC 4271 §5.1.3) instead of `local_bgp_id`
     /// so the NEXT_HOP is the interface address reachable by the peer.
     pub(crate) local_addrs: HashMap<Ipv4Addr, Ipv4Addr>,
+    /// Peers configured with `next_hop_self = true`.
+    ///
+    /// When a peer is in this set, `NEXT_HOP` is rewritten to the local
+    /// session address before the route is forwarded, even for iBGP peers.
+    /// Immutable after startup.
+    pub(crate) next_hop_self_peers: HashSet<Ipv4Addr>,
     /// Set of configured Route Reflector clients (RFC 4456).
     ///
     /// Empty when this daemon is not acting as a Route Reflector.
@@ -285,6 +291,11 @@ impl DaemonState {
             .filter(|p| p.is_rr_client && p.remote_as == local_as)
             .map(|p| p.address)
             .collect();
+        let next_hop_self_peers: HashSet<Ipv4Addr> = peers
+            .iter()
+            .filter(|p| p.next_hop_self)
+            .map(|p| p.address)
+            .collect();
         let cluster_id = cluster_id.unwrap_or_else(|| u32::from_be_bytes(local_bgp_id.octets()));
         let is_rr = !rr_clients.is_empty();
         let import_policies = peers
@@ -379,6 +390,7 @@ impl DaemonState {
             prefixes_received: HashMap::new(),
             prefixes_advertised: HashMap::new(),
             local_addrs: HashMap::new(),
+            next_hop_self_peers,
             rr_clients,
             cluster_id,
             peer_bgp_ids: HashMap::new(),
@@ -458,9 +470,11 @@ impl DaemonState {
         if let Some(msg) = peer.shutdown_message.clone() {
             self.shutdown_messages.insert(peer.address, msg);
         }
-        Arc::make_mut(&mut self.rib)
-            .peer_remote_as
-            .insert(peer.address, peer.remote_as);
+        let rib = Arc::make_mut(&mut self.rib);
+        rib.peer_remote_as.insert(peer.address, peer.remote_as);
+        if peer.next_hop_self {
+            rib.next_hop_self_peers.insert(peer.address);
+        }
         true
     }
 
@@ -498,6 +512,7 @@ impl DaemonState {
         rib.prefixes_advertised.remove(&peer_ip);
         rib.local_addrs.remove(&peer_ip);
         rib.peer_bgp_ids.remove(&peer_ip);
+        rib.next_hop_self_peers.remove(&peer_ip);
         true
     }
 
@@ -699,6 +714,7 @@ impl DaemonState {
         let local_bgp_id = self.rib.local_bgp_id;
         let local_next_hop = local_addr.unwrap_or(local_bgp_id);
         let local_ipv6 = self.rib.local_ipv6;
+        let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
 
         // RFC 4456 §8 split-horizon: when acting as an RR, a non-client iBGP
         // peer must not receive routes learned from other non-client iBGP peers
@@ -732,6 +748,7 @@ impl DaemonState {
                     peer_type,
                     local_as,
                     local_next_hop,
+                    next_hop_self,
                 )
             })
             .collect();
@@ -800,6 +817,7 @@ impl DaemonState {
                         peer_type,
                         local_as,
                         local_ipv6,
+                        next_hop_self,
                     )
                 })
                 .collect();
@@ -941,6 +959,14 @@ impl DaemonState {
             let decisions: Vec<PrefixDecision> = prev_prefixes
                 .iter()
                 .map(|&nlri| {
+                    let other_next_hop_self =
+                        self.rib.next_hop_self_peers.contains(&other_ip);
+                    let local_next_hop = self
+                        .rib
+                        .local_addrs
+                        .get(&other_ip)
+                        .copied()
+                        .unwrap_or(local_bgp_id);
                     propagate_prefix(
                         nlri,
                         &self.rib.loc_rib,
@@ -948,7 +974,8 @@ impl DaemonState {
                         export_policy,
                         other_type,
                         local_as,
-                        local_bgp_id,
+                        local_next_hop,
+                        other_next_hop_self,
                     )
                 })
                 .collect();
@@ -1269,6 +1296,7 @@ impl DaemonState {
             let peer_types = &self.rib.peer_types;
             let loc_rib = &self.rib.loc_rib;
             let dest_is_client = rr_clients.contains(&peer_ip);
+            let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
             let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
@@ -1297,6 +1325,7 @@ impl DaemonState {
                         peer_type,
                         local_as,
                         local_next_hop,
+                        next_hop_self,
                     )
                 })
                 .collect();
@@ -1467,6 +1496,7 @@ impl DaemonState {
             let peer_types = &self.rib.peer_types;
             let loc_rib_v6 = &self.rib.loc_rib_v6;
             let dest_is_client = rr_clients.contains(&peer_ip);
+            let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
             let decisions: Vec<PrefixDecisionV6> = nlris
                 .iter()
                 .map(|&nlri| {
@@ -1491,6 +1521,7 @@ impl DaemonState {
                         peer_type,
                         local_as,
                         local_ipv6,
+                        next_hop_self,
                     )
                 })
                 .collect();
@@ -1737,6 +1768,7 @@ impl DaemonState {
             return;
         };
 
+        let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
         let decisions: Vec<PrefixDecision> = nlris
             .into_iter()
             .map(|nlri| {
@@ -1748,6 +1780,7 @@ impl DaemonState {
                     peer_type,
                     local_as,
                     local_bgp_id,
+                    next_hop_self,
                 )
             })
             .collect();
@@ -3118,6 +3151,7 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })
@@ -3242,6 +3276,7 @@ mod tests {
             md5_password: None,
             export_default: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -3445,6 +3480,83 @@ mod tests {
         );
     }
 
+    /// When `next_hop_self = true`, an iBGP peer must receive NEXT_HOP rewritten
+    /// to the local router address rather than the original eBGP next-hop.
+    #[test]
+    fn test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop() {
+        use pathvector_session::message::PathAttribute;
+
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let local_bgp_id: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let session_local_addr: Ipv4Addr = "172.16.0.1".parse().unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let peer_configs = vec![config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65001, // iBGP — same AS
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: true,
+            hold_time: None,
+            shutdown_message: None,
+        }];
+        let mut senders = HashMap::new();
+        senders.insert(peer_ip, tx);
+        let mut state = DaemonState::new(
+            65001,
+            local_bgp_id,
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+
+        state.on_established(
+            peer_ip,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            Some(session_local_addr),
+        );
+        // Drain the full-table dump (empty rib).
+        while rx.try_recv().is_ok() {}
+
+        // Insert a route learned from an eBGP peer with a remote next-hop.
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse().unwrap()));
+        let ebgp_next_hop: Ipv4Addr = "203.0.113.1".parse().unwrap();
+        let route = RouteBuilder::new(
+            nlri("192.0.2.0/24"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65099)]),
+        )
+        .next_hop(NextHop::V4(ebgp_next_hop))
+        .peer_type(PeerType::External)
+        .build();
+        state.rib_insert_v4(src, route);
+        state.propagate_to_all_peers(&[nlri("192.0.2.0/24")]);
+
+        let msg = rx.try_recv().expect("iBGP peer must receive UPDATE");
+        let next_hop = msg.attributes.iter().find_map(|a| {
+            if let PathAttribute::NextHop(ip) = a { Some(*ip) } else { None }
+        });
+        assert_eq!(
+            next_hop,
+            Some(session_local_addr),
+            "next_hop_self must rewrite iBGP NEXT_HOP to the local session address"
+        );
+        assert_ne!(
+            next_hop,
+            Some(ebgp_next_hop),
+            "original eBGP next-hop must not be forwarded to iBGP clients"
+        );
+    }
+
     #[test]
     fn test_on_established_export_reject_sends_nothing() {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
@@ -3458,6 +3570,7 @@ mod tests {
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Reject),
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -4477,6 +4590,7 @@ mod tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -4520,6 +4634,7 @@ mod tests {
             export_default: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }];
@@ -4696,6 +4811,7 @@ mod tests {
             PeerType::Internal,
             65001,
             None, // no local_ipv6 — OK for iBGP
+            false,
         );
 
         assert!(
@@ -4722,6 +4838,7 @@ mod tests {
             PeerType::External,
             65001,
             Some(local_v6),
+            false,
         );
 
         match decision {
@@ -4753,6 +4870,7 @@ mod tests {
             PeerType::External,
             65001,
             None, // no local_ipv6 — eBGP must NOT announce
+            false,
         );
 
         assert!(
@@ -4779,6 +4897,7 @@ mod tests {
             PeerType::Internal,
             65001,
             None,
+            false,
         );
 
         // Now withdraw from loc_rib_v6 and propagate again.
@@ -4790,6 +4909,7 @@ mod tests {
             PeerType::Internal,
             65001,
             None,
+            false,
         );
 
         assert!(
@@ -5395,7 +5515,7 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ebgp_prepends_local_as() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
-        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id());
+        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id(), false);
         assert_eq!(out.as_path.path_length(), 2);
         assert!(out.as_path.contains(Asn::new(65001)));
         assert!(out.as_path.contains(Asn::new(65002)));
@@ -5404,14 +5524,14 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ebgp_rewrites_next_hop() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
-        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id());
+        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id(), false);
         assert_eq!(out.next_hop, Some(NextHop::V4(bgp_id())));
     }
 
     #[test]
     fn test_prepare_outbound_ebgp_strips_local_pref() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
-        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id());
+        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id(), false);
         assert!(
             out.local_pref.is_none(),
             "LOCAL_PREF must be stripped for eBGP"
@@ -5421,7 +5541,7 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ibgp_preserves_attributes() {
         let route = ibgp_route("10.0.0.0/8");
-        let out = prepare_outbound(route.clone(), PeerType::Internal, 65001, bgp_id());
+        let out = prepare_outbound(route.clone(), PeerType::Internal, 65001, bgp_id(), false);
         assert_eq!(out.as_path.path_length(), route.as_path.path_length());
         assert_eq!(out.local_pref, route.local_pref);
         assert_eq!(out.next_hop, route.next_hop);
@@ -6455,7 +6575,7 @@ mod tests {
         bgp_id: Ipv4Addr,
         tx: &mpsc::Sender<UpdateMessage>,
     ) -> bool {
-        let decision = propagate_prefix(nlri, rib, aro, policy, peer_type, local_as, bgp_id);
+        let decision = propagate_prefix(nlri, rib, aro, policy, peer_type, local_as, bgp_id, false);
         flush_updates(vec![decision], MAX_LEN, tx, peer_type, true)
     }
 
@@ -7724,6 +7844,7 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: true,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })
@@ -7736,6 +7857,7 @@ mod tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             }))
@@ -8233,6 +8355,7 @@ mod tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         };
@@ -8297,6 +8420,7 @@ mod stall_tests {
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })
@@ -8386,6 +8510,7 @@ mod stall_tests {
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             },
@@ -8398,6 +8523,7 @@ mod stall_tests {
                 import_default: Some(config::ImportDefault::Accept),
                 export_default: Some(config::ExportDefault::Accept),
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             },
@@ -8506,6 +8632,7 @@ mod stall_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             },
@@ -8518,6 +8645,7 @@ mod stall_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             },
@@ -8743,6 +8871,7 @@ mod event_loop_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })
@@ -8875,6 +9004,7 @@ mod event_loop_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             },
@@ -8887,6 +9017,7 @@ mod event_loop_tests {
                 import_default_v6: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             },
@@ -9069,6 +9200,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }
@@ -9532,6 +9664,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: Some("planned maintenance".to_string()),
         };
@@ -9741,6 +9874,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
         };
@@ -9833,6 +9967,7 @@ mod event_loop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
         };
@@ -10256,6 +10391,7 @@ mod prop_tests {
                 PeerType::Internal,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
+                false,
             );
 
             prop_assert_eq!(result.as_path, route.as_path, "AS_PATH must be unchanged for iBGP");
@@ -10271,7 +10407,7 @@ mod prop_tests {
             let route = base_route("10.0.0.0/8");
             let original_path_len = route.as_path.path_length();
 
-            let result = prepare_outbound(route, PeerType::External, local_as, bgp_id);
+            let result = prepare_outbound(route, PeerType::External, local_as, bgp_id, false);
 
             prop_assert_eq!(
                 result.as_path.path_length(),
@@ -10310,6 +10446,7 @@ mod dynamic_peer_prop_tests {
             import_default_v6: None,
             md5_password: None,
             is_rr_client: false,
+                next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
         }
@@ -10694,6 +10831,7 @@ mod run_with_tests {
                     import_default_v6: None,
                     md5_password: None,
                     is_rr_client: false,
+                next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
                 })
@@ -11074,6 +11212,7 @@ mod run_with_tests {
                 export_default: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })
@@ -11123,6 +11262,7 @@ mod run_with_tests {
                 export_default: None,
                 md5_password: None,
                 is_rr_client: false,
+                next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
             })
