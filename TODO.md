@@ -312,6 +312,21 @@ peer address, prefix count, and elapsed milliseconds.~~
 **Resolved 2026-06-18**: `run()` now wraps the processor join handle in a second
 `tokio::spawn` that logs `tracing::error!` if the task exits with a panic.~~
 
+### API ergonomics
+
+**Bare IP address as host route in gRPC prefix fields** — the gRPC API currently
+requires explicit CIDR notation for all prefix fields (e.g. `192.0.2.1/32`). Submitting
+a bare IP address (`192.0.2.1`) returns `invalid_argument: 'x' is not valid CIDR
+notation`. Most BGP CLIs (BIRD, GoBGP, FRR) silently accept a bare IP and coerce it to
+a `/32` (IPv4) or `/128` (IPv6) host route.
+
+Open question: is strict CIDR the right contract for an API (explicit is less surprising
+for programmatic callers) or should we match CLI convention for operator ergonomics?
+
+If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` in
+`pathvectord/src/grpc.rs` — try CIDR parse first, fall back to bare `IpAddr` + `/32` or
+`/128`. The proto field comment and client docs would need to reflect the relaxed rule.
+
 ### Remaining
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
