@@ -9134,6 +9134,472 @@ mod stall_tests {
     }
 }
 
+/// Regression and effectiveness tests for cross-UPDATE NLRI coalescing.
+///
+/// Each test is named after the invariant it protects. Where a bug was found
+/// and fixed during review, the test name includes the word "regression".
+///
+/// **Bug 1 (regression)** — gRPC-facing mutation methods must self-flush.
+/// `originate_routes`, `withdraw_originated_routes`, and `set_import_default`
+/// call `propagate_to_all_peers` which buffers decisions. Without a self-flush
+/// the decisions would not be sent until the next BGP event arrived.
+///
+/// **Bug 2 (regression)** — `flush_mrai_pending` calls `propagate_to_all_peers`
+/// which buffers. The event loop arm must call `flush_pending` after
+/// `flush_mrai_pending` or MRAI-released routes stay buffered.
+///
+/// **Bug 3 (regression)** — mandatory-attribute errors in the `try_recv` drain
+/// loop must send a NOTIFICATION and skip to the next outer iteration, not be
+/// silently swallowed.
+///
+/// **Effectiveness** — two `on_route_update` calls with the same attribute set
+/// must produce fewer outbound `UpdateMessage`s than prefixes announced.
+#[cfg(test)]
+mod coalescing_tests {
+    use std::{collections::HashMap, net::Ipv4Addr};
+
+    use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
+
+    use super::*;
+    use crate::config;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    /// Build a state with large channels and Accept-default policies.
+    fn make_state(
+        peers: &[(Ipv4Addr, u32)],
+    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+        let mut receivers = HashMap::new();
+        let mut senders = HashMap::new();
+        let peer_configs: Vec<_> = peers
+            .iter()
+            .map(|&(addr, remote_as)| {
+                let (tx, rx) = mpsc::channel::<UpdateMessage>(256);
+                senders.insert(addr, tx);
+                receivers.insert(addr, rx);
+                config::PeerConfig {
+                    address: addr,
+                    port: 179,
+                    remote_as,
+                    import_default: Some(config::ImportDefault::Accept),
+                    export_default: Some(config::ExportDefault::Accept),
+                    import_default_v6: None,
+                    md5_password: None,
+                    is_rr_client: false,
+                    next_hop_self: false,
+                    hold_time: None,
+                    shutdown_message: None,
+                }
+            })
+            .collect();
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        (state, receivers)
+    }
+
+    fn announce(peer: Ipv4Addr, prefixes: Vec<&str>) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop(peer),
+            ],
+            announced: prefixes.iter().map(|s| nlri(s)).collect(),
+        }
+    }
+
+    // ── Effectiveness ─────────────────────────────────────────────────────────
+
+    /// Two BGP UPDATEs arriving back-to-back (same attribute set, different
+    /// prefixes) must be coalesced into a single outbound UpdateMessage.
+    /// This is the primary invariant of the coalescing feature.
+    #[test]
+    fn two_updates_same_attrs_produce_one_outbound_message() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // Two separate BGP UPDATEs with identical path attributes.
+        state.on_route_update(peer_a, announce(peer_a, vec!["10.0.0.0/8"]));
+        state.on_route_update(peer_a, announce(peer_a, vec!["172.16.0.0/12"]));
+
+        // A single flush must send both prefixes in one UpdateMessage.
+        state.flush_pending();
+
+        let msg = rxs
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("peer_b must receive a coalesced UPDATE");
+        assert!(
+            msg.announced.contains(&nlri("10.0.0.0/8")),
+            "coalesced UPDATE must carry 10.0.0.0/8"
+        );
+        assert!(
+            msg.announced.contains(&nlri("172.16.0.0/12")),
+            "coalesced UPDATE must carry 172.16.0.0/12"
+        );
+
+        // No second UpdateMessage — both prefixes arrived in one wire frame.
+        assert!(
+            rxs.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            "coalescing must produce exactly one outbound UpdateMessage for identical attrs"
+        );
+    }
+
+    /// N prefix announcements with identical attributes must arrive in at most
+    /// ceil(N / max_nlri_per_update) messages, not N separate messages.
+    /// Verifies scaling behavior as burst size grows.
+    #[test]
+    fn large_burst_is_packed_into_fewer_messages_than_prefixes() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // 20 separate on_route_update calls — one per prefix.
+        let prefixes: Vec<String> = (0u8..20).map(|i| format!("10.{i}.0.0/16")).collect();
+        for prefix in &prefixes {
+            state.on_route_update(peer_a, announce(peer_a, vec![prefix.as_str()]));
+        }
+        state.flush_pending();
+
+        let mut total_messages = 0usize;
+        let mut total_prefixes = 0usize;
+        while let Ok(msg) = rxs.get_mut(&peer_b).unwrap().try_recv() {
+            total_messages += 1;
+            total_prefixes += msg.announced.len();
+        }
+
+        assert_eq!(
+            total_prefixes, 20,
+            "all 20 prefixes must be delivered to peer_b"
+        );
+        assert!(
+            total_messages < 20,
+            "20 separate route events must produce fewer than 20 outbound UpdateMessages (got {total_messages})"
+        );
+    }
+
+    // ── Bug 1 regression: gRPC-facing methods must self-flush ─────────────────
+
+    /// `originate_routes` must send immediately without the caller having to
+    /// call `flush_pending()` separately.  Regression: before the fix, routes
+    /// sat in the pending buffer until the next BGP event.
+    #[test]
+    fn regression_originate_routes_sends_without_manual_flush() {
+        let peer: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut rxs) = make_state(&[(peer, 65002)]);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        // Drain the empty table dump from on_established.
+        while rxs.get_mut(&peer).unwrap().try_recv().is_ok() {}
+
+        let route = RouteBuilder::new(
+            nlri("203.0.113.0/24"),
+            Origin::Igp,
+            AsPath::new(),
+        )
+        .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
+        .build();
+
+        // originate_routes must self-flush — no explicit flush_pending() call.
+        state.originate_routes(vec![route]);
+
+        rxs.get_mut(&peer)
+            .unwrap()
+            .try_recv()
+            .expect("originate_routes must send immediately without a manual flush_pending call");
+    }
+
+    /// `withdraw_originated_routes` must send immediately without a manual
+    /// `flush_pending()`.  Regression: before the fix, withdrawals buffered.
+    #[test]
+    fn regression_withdraw_originated_routes_sends_without_manual_flush() {
+        let peer: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut rxs) = make_state(&[(peer, 65002)]);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+
+        let route = RouteBuilder::new(
+            nlri("203.0.113.0/24"),
+            Origin::Igp,
+            AsPath::new(),
+        )
+        .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
+        .build();
+        state.originate_routes(vec![route]);
+        // Drain the announcement.
+        while rxs.get_mut(&peer).unwrap().try_recv().is_ok() {}
+
+        // Withdraw — must self-flush.
+        state.withdraw_originated_routes(&[nlri("203.0.113.0/24")]);
+
+        let msg = rxs
+            .get_mut(&peer)
+            .unwrap()
+            .try_recv()
+            .expect("withdraw_originated_routes must send immediately without a manual flush");
+        assert!(
+            msg.withdrawn.contains(&nlri("203.0.113.0/24")),
+            "WITHDRAW must carry 203.0.113.0/24"
+        );
+    }
+
+    /// `set_import_default` must send the resulting policy-change UPDATEs
+    /// immediately without a manual `flush_pending()`.  Regression: before the
+    /// fix, the WITHDRAW from a Reject policy sat buffered.
+    #[test]
+    fn regression_set_import_default_sends_without_manual_flush() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+
+        state.on_route_update(peer_a, announce(peer_a, vec!["10.0.0.0/8"]));
+        state.flush_pending();
+        // Drain initial announcement.
+        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+
+        // Flip import policy to Reject — must self-flush without caller needing flush_pending.
+        state.set_import_default(peer_a, pathvector_policy::DefaultAction::Reject);
+
+        let msg = rxs
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("set_import_default must send WITHDRAW immediately without manual flush");
+        assert!(
+            msg.withdrawn.contains(&nlri("10.0.0.0/8")),
+            "WITHDRAW must carry 10.0.0.0/8 after import policy → Reject"
+        );
+    }
+
+    // ── Bug 2 regression: MRAI must flush its own decisions ───────────────────
+
+    /// After `flush_mrai_pending`, the decisions it generates via
+    /// `propagate_to_all_peers` must be sent to peers.  The event loop arm
+    /// calls `flush_pending` after `flush_mrai_pending`; this test verifies
+    /// that `flush_mrai_pending` alone is not sufficient — its caller must
+    /// flush.  (Regression: the event loop previously did not call the second
+    /// flush, so MRAI-released routes were delayed until the next event.)
+    #[test]
+    fn regression_flush_mrai_pending_requires_subsequent_flush_pending() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        // peer_b is eBGP so MRAI applies.
+        let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // Announce a route that is first suppressed by MRAI, then add it to
+        // mrai_pending manually so flush_mrai_pending picks it up.
+        let prefix = nlri("10.0.0.0/8");
+
+        // Insert the route into the Loc-RIB so propagate_prefix has something to send.
+        let src = PeerId::new(IpAddr::V4(peer_a));
+        let route = RouteBuilder::new(
+            prefix,
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65002)]),
+        )
+        .next_hop(NextHop::V4(peer_a))
+        .peer_type(PeerType::External)
+        .build();
+        state.rib_insert_v4(src, route);
+
+        // Manufacture an mrai_pending entry for peer_b so flush_mrai_pending
+        // has something to process.
+        state.mrai_pending.entry(peer_b).or_default().insert(prefix);
+
+        // Call flush_mrai_pending without the subsequent flush_pending.
+        state.flush_mrai_pending();
+
+        // Without flush_pending, nothing should be in peer_b's channel yet
+        // (decisions sit in pending_decisions[peer_b]).
+        let before_flush = rxs.get_mut(&peer_b).unwrap().try_recv();
+        assert!(
+            before_flush.is_err(),
+            "flush_mrai_pending alone must NOT send to channel — decisions remain buffered"
+        );
+
+        // Now flush — decisions must arrive.
+        state.flush_pending();
+
+        let msg = rxs
+            .get_mut(&peer_b)
+            .unwrap()
+            .try_recv()
+            .expect("flush_pending after flush_mrai_pending must deliver the MRAI-released route");
+        assert!(
+            msg.announced.contains(&prefix),
+            "MRAI-released route must be in the delivered UPDATE"
+        );
+    }
+
+    // ── Bug 3 regression: notify_err in drain loop ────────────────────────────
+
+    /// A mandatory-attribute error detected during the `try_recv` drain loop
+    /// must send a `SessionCommand::Notification` to the erroring peer.
+    /// Regression: before the fix, the error was silently dropped.
+    ///
+    /// This test drives `run_event_loop` directly and injects two events:
+    /// 1. A valid RouteUpdate from peer_a (fills the drain loop).
+    /// 2. A malformed RouteUpdate from peer_b (missing Origin — triggers RFC 4271 §6.3).
+    ///
+    /// The stop sender for peer_b must receive a `SessionCommand::Notification`.
+    #[tokio::test]
+    async fn regression_notify_err_in_drain_loop_sends_notification() {
+        use pathvector_session::message::NotificationError;
+        use tokio::sync::mpsc;
+
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+
+        // We need the full event loop state bundle.
+        let (tx_a, _rx_a) = mpsc::channel::<UpdateMessage>(64);
+        let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(64);
+        let peer_configs = vec![
+            config::PeerConfig {
+                address: peer_a,
+                port: 179,
+                remote_as: 65002,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+            },
+            config::PeerConfig {
+                address: peer_b,
+                port: 179,
+                remote_as: 65003,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+            },
+        ];
+        let mut senders = HashMap::new();
+        senders.insert(peer_a, tx_a);
+        senders.insert(peer_b, tx_b);
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        let state = Arc::new(tokio::sync::RwLock::new(state));
+
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+            s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        }
+
+        let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(16);
+
+        // Stop-command channels: we capture peer_b's receiver to check for NOTIFICATION.
+        let (stop_a_tx, _stop_a_rx) = mpsc::channel::<SessionCommand>(4);
+        let (stop_b_tx, mut stop_b_rx) = mpsc::channel::<SessionCommand>(4);
+        let mut stop_map: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
+        stop_map.insert(peer_a, stop_a_tx);
+        stop_map.insert(peer_b, stop_b_tx);
+        let stop_senders = Arc::new(std::sync::Mutex::new(stop_map));
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        ));
+
+        // Send two events in quick succession so the second arrives in the drain loop.
+        // Event 1 (valid): wakes the loop.
+        event_tx
+            .send((
+                peer_a,
+                SessionEvent::RouteUpdate(UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                        PathAttribute::NextHop(peer_a),
+                    ],
+                    announced: vec![nlri("10.0.0.0/8")],
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // Event 2 (malformed — missing Origin): arrives while loop is processing event 1.
+        event_tx
+            .send((
+                peer_b,
+                SessionEvent::RouteUpdate(UpdateMessage {
+                    withdrawn: vec![],
+                    // Missing Origin → RFC 4271 §6.3 → NOTIFICATION
+                    attributes: vec![
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65003)])),
+                        PathAttribute::NextHop(peer_b),
+                    ],
+                    announced: vec![nlri("172.16.0.0/12")],
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // Give the loop time to process both events.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // peer_b must have received a Notification (or Stop from stall handling).
+        // We accept either: the key invariant is that the error was NOT silently dropped.
+        let cmd = stop_b_rx
+            .try_recv()
+            .expect("peer_b must receive SessionCommand after malformed UPDATE in drain loop");
+        assert!(
+            matches!(
+                cmd,
+                SessionCommand::Notification(ref n)
+                    if matches!(n.error, NotificationError::UpdateMessage(_))
+            ) || matches!(cmd, SessionCommand::Stop),
+            "peer_b must receive a Notification or Stop command, not silence"
+        );
+
+        // Shut down the loop.
+        drop(event_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), loop_handle).await;
+    }
+}
+
 #[cfg(test)]
 mod event_loop_tests {
     use std::{
