@@ -93,7 +93,7 @@ impl<A: IpAddress> PrefixListCondition<A> {
 
 impl<A: IpAddress + Send + Sync, R: BgpRoute<Addr = A>> Condition<R> for PrefixListCondition<A> {
     fn matches(&self, route: &R) -> bool {
-        self.set.contains_ip(route.nlri().prefix().masked().ip())
+        self.set.contains_range(route.nlri().prefix().masked().to_range())
     }
 }
 
@@ -559,6 +559,27 @@ mod tests {
         // More-specific route: 10.1.0.0/24 — network address IS in the /24
         let exact = TestRoute::new("10.1.0.0/24");
         assert!(condition.matches(&exact));
+    }
+
+    #[test]
+    fn test_prefix_list_condition_less_specific_does_not_match_when_network_addr_coincides() {
+        // A /8 route should NOT match a prefix-list that only contains a /16,
+        // even when both share the same network address (10.0.0.0).
+        //
+        // The current contains_ip check returns true because 10.0.0.0 falls
+        // inside the /16 range (10.0.0.0 – 10.0.255.255), producing a false
+        // positive. The correct test is whether the route's entire address range
+        // is covered by the set.
+        use ipnetx::{ipset::IpSetBuilder, prefix::IpPrefix};
+        use std::net::Ipv4Addr;
+
+        let mut builder = IpSetBuilder::<Ipv4Addr>::new();
+        builder.add_prefix(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 0), 16).unwrap());
+        let condition = PrefixListCondition::new(builder.build());
+
+        // 10.0.0.0/8 is less specific than the /16 entry — must not match.
+        let less_specific = TestRoute::new("10.0.0.0/8");
+        assert!(!condition.matches(&less_specific));
     }
 
     #[test]
