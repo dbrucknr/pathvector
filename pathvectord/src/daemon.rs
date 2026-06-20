@@ -1556,7 +1556,10 @@ impl DaemonState {
 
         for peer_ip in peers {
             let decisions = self.pending_decisions.remove(&peer_ip).unwrap_or_default();
-            let decisions_v6 = self.pending_decisions_v6.remove(&peer_ip).unwrap_or_default();
+            let decisions_v6 = self
+                .pending_decisions_v6
+                .remove(&peer_ip)
+                .unwrap_or_default();
 
             if decisions.is_empty() && decisions_v6.is_empty() {
                 continue;
@@ -9170,7 +9173,10 @@ mod coalescing_tests {
     /// Build a state with large channels and Accept-default policies.
     fn make_state(
         peers: &[(Ipv4Addr, u32)],
-    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+    ) -> (
+        DaemonState,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+    ) {
         let mut receivers = HashMap::new();
         let mut senders = HashMap::new();
         let peer_configs: Vec<_> = peers
@@ -9206,7 +9212,7 @@ mod coalescing_tests {
         (state, receivers)
     }
 
-    fn announce(peer: Ipv4Addr, prefixes: Vec<&str>) -> UpdateMessage {
+    fn announce(peer: Ipv4Addr, prefixes: &[&str]) -> UpdateMessage {
         UpdateMessage {
             withdrawn: vec![],
             attributes: vec![
@@ -9233,8 +9239,8 @@ mod coalescing_tests {
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
 
         // Two separate BGP UPDATEs with identical path attributes.
-        state.on_route_update(peer_a, announce(peer_a, vec!["10.0.0.0/8"]));
-        state.on_route_update(peer_a, announce(peer_a, vec!["172.16.0.0/12"]));
+        state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
+        state.on_route_update(peer_a, announce(peer_a, &["172.16.0.0/12"]));
 
         // A single flush must send both prefixes in one UpdateMessage.
         state.flush_pending();
@@ -9275,7 +9281,7 @@ mod coalescing_tests {
         // 20 separate on_route_update calls — one per prefix.
         let prefixes: Vec<String> = (0u8..20).map(|i| format!("10.{i}.0.0/16")).collect();
         for prefix in &prefixes {
-            state.on_route_update(peer_a, announce(peer_a, vec![prefix.as_str()]));
+            state.on_route_update(peer_a, announce(peer_a, &[prefix.as_str()]));
         }
         state.flush_pending();
 
@@ -9309,13 +9315,9 @@ mod coalescing_tests {
         // Drain the empty table dump from on_established.
         while rxs.get_mut(&peer).unwrap().try_recv().is_ok() {}
 
-        let route = RouteBuilder::new(
-            nlri("203.0.113.0/24"),
-            Origin::Igp,
-            AsPath::new(),
-        )
-        .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
-        .build();
+        let route = RouteBuilder::new(nlri("203.0.113.0/24"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
+            .build();
 
         // originate_routes must self-flush — no explicit flush_pending() call.
         state.originate_routes(vec![route]);
@@ -9334,13 +9336,9 @@ mod coalescing_tests {
         let (mut state, mut rxs) = make_state(&[(peer, 65002)]);
         state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
 
-        let route = RouteBuilder::new(
-            nlri("203.0.113.0/24"),
-            Origin::Igp,
-            AsPath::new(),
-        )
-        .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
-        .build();
+        let route = RouteBuilder::new(nlri("203.0.113.0/24"), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
+            .build();
         state.originate_routes(vec![route]);
         // Drain the announcement.
         while rxs.get_mut(&peer).unwrap().try_recv().is_ok() {}
@@ -9371,7 +9369,7 @@ mod coalescing_tests {
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
 
-        state.on_route_update(peer_a, announce(peer_a, vec!["10.0.0.0/8"]));
+        state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
         state.flush_pending();
         // Drain initial announcement.
         while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
@@ -9442,11 +9440,10 @@ mod coalescing_tests {
         // Now flush — decisions must arrive.
         state.flush_pending();
 
-        let msg = rxs
-            .get_mut(&peer_b)
-            .unwrap()
-            .try_recv()
-            .expect("flush_pending after flush_mrai_pending must deliver the MRAI-released route");
+        let msg =
+            rxs.get_mut(&peer_b).unwrap().try_recv().expect(
+                "flush_pending after flush_mrai_pending must deliver the MRAI-released route",
+            );
         assert!(
             msg.announced.contains(&prefix),
             "MRAI-released route must be in the delivered UPDATE"
@@ -9597,6 +9594,183 @@ mod coalescing_tests {
         // Shut down the loop.
         drop(event_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), loop_handle).await;
+    }
+
+    // ── Event-loop drain coalescing ───────────────────────────────────────────
+
+    /// Drives `run_event_loop` directly and sends N route events in rapid
+    /// succession BEFORE yielding.  All N events land in the channel before the
+    /// loop wakes up, so events 2-N are processed by the `try_recv` drain and
+    /// flushed together with event 1 in a single `flush_pending` call.
+    ///
+    /// This is the only test that exercises the real `try_recv` drain path.
+    /// The unit-level effectiveness tests (`two_updates_same_attrs_*`) call
+    /// `flush_pending` manually and never touch the event loop at all.
+    #[tokio::test]
+    async fn event_loop_drain_coalesces_rapid_burst() {
+        use std::{sync::Mutex, time::Duration};
+        use tokio::sync::mpsc as tmp;
+
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+
+        let (tx_a, _rx_a) = tmp::channel::<UpdateMessage>(64);
+        let (tx_b, mut rx_b) = tmp::channel::<UpdateMessage>(64);
+
+        let peer_configs = vec![
+            config::PeerConfig {
+                address: peer_a,
+                port: 179,
+                remote_as: 65002,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+            },
+            config::PeerConfig {
+                address: peer_b,
+                port: 179,
+                remote_as: 65003,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+            },
+        ];
+        let mut update_senders = HashMap::new();
+        update_senders.insert(peer_a, tx_a);
+        update_senders.insert(peer_b, tx_b);
+
+        let state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            update_senders,
+            vec![],
+        );
+        let state = Arc::new(RwLock::new(state));
+
+        {
+            let mut s = state.write().await;
+            s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+            s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        }
+
+        let (event_tx, event_rx) = tmp::channel::<(Ipv4Addr, SessionEvent)>(64);
+        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, tmp::Sender<SessionCommand>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        ));
+
+        // Send all 10 events before yielding.  Each uses a distinct prefix but
+        // identical path attributes, so all decisions will share an attribute
+        // set and `flush_updates` can pack them into one UpdateMessage.
+        // Because all sends complete synchronously (channel has capacity),
+        // all 10 events are in the channel buffer before the event loop runs.
+        let prefixes: Vec<String> = (0u8..10).map(|i| format!("10.{i}.0.0/16")).collect();
+        for prefix in &prefixes {
+            let nlri_parsed: Nlri<Ipv4Addr> = prefix.parse().unwrap();
+            event_tx
+                .send((
+                    peer_a,
+                    SessionEvent::RouteUpdate(UpdateMessage {
+                        withdrawn: vec![],
+                        attributes: vec![
+                            PathAttribute::Origin(Origin::Igp),
+                            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                            PathAttribute::NextHop(peer_a),
+                        ],
+                        announced: vec![nlri_parsed],
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Yield long enough for the event loop to drain all 10 events and flush.
+        // 100ms >> any realistic scheduler latency; MRAI timer fires every 15s
+        // so it will not interfere.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut total_messages = 0usize;
+        let mut total_prefixes = 0usize;
+        while let Ok(msg) = rx_b.try_recv() {
+            total_messages += 1;
+            total_prefixes += msg.announced.len();
+        }
+
+        assert_eq!(
+            total_prefixes, 10,
+            "all 10 prefixes must arrive at peer_b"
+        );
+        assert!(
+            total_messages < 10,
+            "10 rapid-fire route events must be coalesced into fewer than 10 \
+             UpdateMessages by the try_recv drain (got {total_messages} messages \
+             for {total_prefixes} prefixes)"
+        );
+
+        drop(event_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), loop_handle).await;
+    }
+
+    /// Verifies that buffered `pending_decisions` are not lost or reordered
+    /// when `set_export_default` is called while the state lock is not held by
+    /// the event loop.
+    ///
+    /// The scenario: (1) import a route so it sits in pending_decisions, (2)
+    /// call set_export_default for the receiving peer (Accept), (3) flush.
+    /// Both the original route and the export-policy-driven dump must arrive.
+    #[test]
+    fn set_export_default_does_not_lose_pending_decisions() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
+
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+
+        // Announce a route and buffer it (do NOT call flush_pending yet).
+        state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
+
+        // `pending_decisions[peer_b]` now has one entry.  Call set_export_default
+        // (which writes directly to the channel, bypassing the pending buffer).
+        // In production this is always serialized by the write lock — the event
+        // loop always flushes before releasing — but we simulate the direct call
+        // here to verify the buffer is not corrupted.
+        state.set_export_default(peer_b, pathvector_policy::DefaultAction::Accept);
+
+        // set_export_default fires first (direct channel write), then flush_pending
+        // sends the buffered decision.  Peer_b must receive both.
+        state.flush_pending();
+
+        let mut received_prefixes = std::collections::HashSet::new();
+        while let Ok(msg) = rxs.get_mut(&peer_b).unwrap().try_recv() {
+            for nlri in msg.announced {
+                received_prefixes.insert(nlri);
+            }
+        }
+
+        assert!(
+            received_prefixes.contains(&nlri("10.0.0.0/8")),
+            "10.0.0.0/8 must reach peer_b despite set_export_default being called \
+             while it was in the pending buffer"
+        );
     }
 }
 
