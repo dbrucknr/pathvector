@@ -565,6 +565,32 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    path attributes into a single UPDATE. Batching reduces TCP segment count and framing
    overhead, which matters most during full-table dumps to newly established peers.
 
+3. **Inbound convergence time audit** — NLRI batching improves the outbound path
+   (announcement throughput), but RIB convergence time is dominated by the inbound path:
+   parsing incoming UPDATEs, inserting into AdjRibIn, running best-path, and updating
+   LocRib. Batching alone will not close the gap with BIRD on convergence. BIRD's
+   primary convergence advantage comes from:
+
+   - **Attribute hash-consing (rta deduplication)** — BIRD stores one canonical `rta`
+     struct per unique attribute set and reference-counts it. Identical AS paths across
+     thousands of routes share one allocation. Our `Route` struct clones `Vec<Asn>` on
+     every insert. Adding interning at the `AsPath` level in `pathvector-types` would
+     reduce allocation pressure on the inbound hot path.
+   - **Filter bytecode** — BIRD compiles policy filters to a bytecode VM rather than
+     evaluating a tree of conditions. Policy evaluation on the inbound path currently
+     walks the `Vec<Box<dyn EvaluateTerm>>` chain for every route. At 1M+ routes this
+     adds up.
+   - **Per-prefix lock granularity** — BIRD updates prefixes concurrently; our event
+     loop holds a single `RwLock<DaemonState>` for the entire duration of each UPDATE.
+
+   Recommended audit order:
+   1. Profile `on_route_update` under MRT load to identify the dominant cost (allocation
+      vs. best-path vs. policy eval vs. lock contention).
+   2. Prototype `AsPath` interning — an `Arc<Vec<Asn>>` or a global intern table — and
+      measure impact on `loc_rib_insert` criterion benchmark.
+   3. Evaluate per-prefix or per-peer lock granularity as a follow-on if profiling shows
+      lock contention is meaningful.
+
 3. **Full-table dump on peer establishment holds the write lock** — `on_established`
    iterates the entire `LocRib` and calls `propagate_prefix` for every best route before
    releasing the write lock. At ~950k routes this is a multi-millisecond stall that blocks
