@@ -49,6 +49,7 @@ criterion  = { version = "0.8.2", features = ["html_reports"] }
 ahash      = "0.8"
 smallvec   = { version = "1", features = ["union"] }
 libc       = "0.2"
+tikv-jemallocator = "0.6"
 tonic            = { version = "0.14", features = ["transport"] }
 tonic-prost      = "0.14"
 tonic-reflection = "0.14"
