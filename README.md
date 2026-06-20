@@ -145,6 +145,39 @@ just stress          # debug build — fast to compile, slower numbers
 just stress-release  # optimized build — numbers worth recording
 ```
 
+### Allocator
+
+`pathvectord` and all criterion bench binaries use [jemalloc](https://github.com/jemalloc/jemalloc)
+as the global allocator via [`tikv-jemallocator`](https://crates.io/crates/tikv-jemallocator).
+
+BGP control-plane work is allocation-heavy: every route update clones AS paths, community
+vectors, and NLRI structs. jemalloc's thread-local magazine caches and aggressive
+memory-return behavior reduce fragmentation compared to the system allocator (glibc malloc
+on Linux, libmalloc on macOS), which matters for a long-running daemon processing millions
+of route events.
+
+Measured improvement vs system allocator on M2 Max (criterion, release profile):
+
+| Benchmark | System alloc | jemalloc | Delta |
+|---|---|---|---|
+| `loc_rib_insert/10k` | 610 ns | 459 ns | −25% |
+| `loc_rib_insert/100k` | 615 ns | 465 ns | −24% |
+| `loc_rib_insert/500k` | 1.94 µs | 1.56 µs | −20% |
+| `outbound_pipeline/minimal/1` | 274 ns | 174 ns | −37% |
+| `outbound_pipeline/dense/1` | 441 ns | 258 ns | −41% |
+| `outbound_pipeline/minimal/10` | 1.35 µs | 917 ns | −32% |
+| `outbound_pipeline/dense/10` | 2.61 µs | 1.31 µs | −50% |
+| `outbound_pipeline/minimal/50` | 6.70 µs | 4.62 µs | −31% |
+| `outbound_pipeline/dense/50` | 13.12 µs | 6.17 µs | −53% |
+| `select_best/2` | 158 ns | 97 ns | −39% |
+| `select_best/10` | 505 ns | 359 ns | −29% |
+| `select_best/100` | 2.66 µs | 2.42 µs | −9% |
+
+The outbound pipeline benefits most because each peer advertisement clones the full
+attribute set — more allocations per iteration means more leverage from a faster allocator.
+`select_best/100` is the floor case: at 100 candidates the comparison work dominates
+and allocator choice matters less.
+
 ---
 
 ## Crate family
