@@ -574,6 +574,22 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    2.88s after this change (M2 Max, 1.13M prefixes), confirming that batching the flush
    reduces lock round-trips rather than worsening contention.
 
+   **Remaining test coverage risks (2026-06-20):**
+
+   - `event_loop_drain_coalesces_rapid_burst` relies on a 100ms sleep to give
+     the event loop time to process all 10 events before the assertion runs.
+     This is timing-dependent and not deterministic. To make it robust, use
+     Tokio's `time::pause()` + `time::advance()` to control the scheduler, or
+     replace the sleep with a channel-based done signal from within the loop.
+
+   - No wire-level UPDATE count measurement exists at the e2e layer. The
+     `TwoPeerHarness` tests verify that all prefixes arrive at the sink, but
+     they cannot assert that those prefixes arrived in fewer UPDATE messages
+     than were announced. To close this gap: add a counter to `DaemonState`
+     (`outbound_update_count: AtomicUsize`) gated behind `#[cfg(test)]`, or
+     extend the MRT harness to accept a second peer and count inbound BGP
+     UPDATEs at that peer's TCP stream.
+
 3. **Inbound convergence time audit** — NLRI batching improves the outbound path
    (announcement throughput), but RIB convergence time is dominated by the inbound path:
    parsing incoming UPDATEs, inserting into AdjRibIn, running best-path, and updating
