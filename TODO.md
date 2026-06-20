@@ -569,6 +569,11 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    (`originate_routes`, `withdraw_originated_routes`, `set_import_default`) self-flush to
    preserve immediate delivery semantics outside the event loop.
 
+   The `try_recv` drain holds the write lock for up to 256 events (channel capacity), but
+   MRT benchmarks show no measurable starvation: RIB convergence improved from 4.46s to
+   2.88s after this change (M2 Max, 1.13M prefixes), confirming that batching the flush
+   reduces lock round-trips rather than worsening contention.
+
 3. **Inbound convergence time audit** — NLRI batching improves the outbound path
    (announcement throughput), but RIB convergence time is dominated by the inbound path:
    parsing incoming UPDATEs, inserting into AdjRibIn, running best-path, and updating
