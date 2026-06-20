@@ -312,6 +312,22 @@ peer address, prefix count, and elapsed milliseconds.~~
 **Resolved 2026-06-18**: `run()` now wraps the processor join handle in a second
 `tokio::spawn` that logs `tracing::error!` if the task exits with a panic.~~
 
+### MRT convergence detection
+
+**Use watch_routes quiescence instead of snapshot polling** — `just mrt` currently
+detects convergence by polling full RIB snapshots and waiting for two identical counts.
+This adds ~1–2s of artificial latency to the convergence number and introduces noise
+across runs.
+
+The `watch_routes` gRPC streaming endpoint pushes individual route events as they are
+installed. Convergence can be detected by quiescence: start a timer on the last received
+event; if no new event arrives within a threshold (e.g. 200ms), declare convergence
+complete. This gives a much tighter, more accurate measurement.
+
+Fix location: `pathvector-mrt/src/main.rs` — replace the snapshot-polling loop with a
+`watch_routes` stream consumer + quiescence timer. The threshold should be configurable
+via a CLI flag (`--quiescence-ms`, default 200).
+
 ### API ergonomics
 
 **Bare IP address as host route in gRPC prefix fields** — the gRPC API currently

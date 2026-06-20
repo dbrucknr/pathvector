@@ -1288,9 +1288,9 @@ dependencies = [
 
 [[package]]
 name = "ipnetx"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66a41eaf30def4acb80956c4fad7f2593821496fb1985bb91356752a8a055be2"
+checksum = "50d6743467d5a35b780780bee8efdc46478ca2892f5563db20342a93d8c93dd3"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -2182,9 +2182,9 @@ dependencies = [
 
 [[package]]
 name = "routemap"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "615d1007b953e09751dc34c7d3c1446a5351c6416b049ef3f75f622fa1ec3dfc"
+checksum = "a7764e61350b2789b402d59415cbd887cc0561364a9fc5dd753c43343f4fa205"
 dependencies = [
  "ipnetx",
 ]

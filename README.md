@@ -115,26 +115,28 @@ just mrt ./latest-bview.gz
 
 | Table size | pathvectord | GoBGP | Ratio |
 |---|---|---|---|
-| 10k  | 0.02 s | 0.06 s | **2.2× faster** |
-| 100k | 0.17 s | 0.36 s | **2.1× faster** |
-| 250k | 0.27 s | 0.58 s | **2.1× faster** |
-| 500k | 0.42 s | 0.95 s | **2.3× faster** |
-| 900k | 0.26 s | 0.56 s | **2.2× faster** |
+| 10k  | 0.03 s | 0.05 s | **1.7× faster** |
+| 100k | 0.16 s | 0.36 s | **2.3× faster** |
+| 250k | 0.27 s | 0.59 s | **2.2× faster** |
+| 500k | 0.46 s | 0.93 s | **2.0× faster** |
+| 750k | 0.42 s | 0.90 s | **2.1× faster** |
+| 900k | 0.27 s | 0.54 s | **2.0× faster** |
 
 **Peak RSS** (lower is better, `just stress-release`):
 
-- RSS: means resident set size. The amount of physical RAM the process is actually occupying at a given moment
+RSS (resident set size) is the physical RAM the process actually occupies at a given moment.
 
 | Table size | pathvectord | GoBGP | Ratio |
 |---|---|---|---|
-| 10k  | 11.8 MB   | 51.7 MB  | **4.4× less** |
-| 100k | 66.8 MB   | 133.2 MB | **2.0× less** |
-| 250k | 240.2 MB  | 258.2 MB | **2.0× less** |
-| 500k | 461.2 MB  | 465.4 MB | ~equal |
-| 900k | 515.2 MB  | 792.4 MB | **35% less** |
+| 10k  | 15.6 MB  | 51.1 MB  | **3.3× less** |
+| 100k | 48.8 MB  | 122.0 MB | **2.5× less** |
+| 250k | 144.5 MB | 252.9 MB | **1.7× less** |
+| 500k | 279.1 MB | 468.7 MB | **1.7× less** |
+| 750k | 313.5 MB | 691.0 MB | **2.2× less** |
+| 900k | 334.2 MB | 823.6 MB | **2.5× less** |
 
-Per-route cost at 900k: 0.57 KB (pathvectord) vs 0.88 KB (GoBGP). The RSS plateau
-between 500k and 900k reflects attribute interning — real internet routes share a
+Per-route cost at 900k: 0.37 KB (pathvectord) vs 0.91 KB (GoBGP). The RSS plateau
+between 750k and 900k reflects attribute interning — real internet routes share a
 small set of AS paths and community sets, so marginal cost per route falls as the
 table grows.
 
