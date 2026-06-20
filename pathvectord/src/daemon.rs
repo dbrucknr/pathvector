@@ -9714,10 +9714,7 @@ mod coalescing_tests {
             total_prefixes += msg.announced.len();
         }
 
-        assert_eq!(
-            total_prefixes, 10,
-            "all 10 prefixes must arrive at peer_b"
-        );
+        assert_eq!(total_prefixes, 10, "all 10 prefixes must arrive at peer_b");
         assert!(
             total_messages < 10,
             "10 rapid-fire route events must be coalesced into fewer than 10 \
