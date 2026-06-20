@@ -18,8 +18,8 @@
 //! ## What it measures
 //!
 //! - BGP announcement throughput (prefixes/second into pathvectord)
-//! - RIB convergence time: from first UPDATE sent to when two consecutive
-//!   `watch_routes` snapshots report the same route count (stable RIB)
+//! - RIB convergence time: from first UPDATE sent to when the route count
+//!   has been stable for `--idle-ms` (default 200 ms) with no further change
 //! - Accepted vs rejected route count
 
 use std::{
