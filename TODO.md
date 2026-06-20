@@ -312,21 +312,27 @@ peer address, prefix count, and elapsed milliseconds.~~
 **Resolved 2026-06-18**: `run()` now wraps the processor join handle in a second
 `tokio::spawn` that logs `tracing::error!` if the task exits with a panic.~~
 
+### watch_routes broadcast channel — guaranteed delivery
+
+The `watch_routes` gRPC stream is backed by a broadcast channel. Slow consumers that
+fall behind the channel buffer are disconnected with a "watch stream fell behind; reconnect"
+error. The BGP control plane is unaffected — this is management-API only — but it means
+`watch_routes` cannot be used for guaranteed-delivery use cases (audit logs, secondary RIB
+sync, compliance recording).
+
+If guaranteed delivery is needed: replace the broadcast channel with a persistent queue
+(e.g. bounded mpsc with back-pressure) and a snapshot + delta replay protocol so reconnecting
+clients can resume from a known position. Alternatively, document the limitation clearly
+and recommend clients use the snapshot endpoint (`list_routes`) for durable reads.
+
 ### MRT convergence detection
 
-**Use watch_routes quiescence instead of snapshot polling** — `just mrt` currently
-detects convergence by polling full RIB snapshots and waiting for two identical counts.
-This adds ~1–2s of artificial latency to the convergence number and introduces noise
-across runs.
-
-The `watch_routes` gRPC streaming endpoint pushes individual route events as they are
-installed. Convergence can be detected by quiescence: start a timer on the last received
-event; if no new event arrives within a threshold (e.g. 200ms), declare convergence
-complete. This gives a much tighter, more accurate measurement.
-
-Fix location: `pathvector-mrt/src/main.rs` — replace the snapshot-polling loop with a
-`watch_routes` stream consumer + quiescence timer. The threshold should be configurable
-via a CLI flag (`--quiescence-ms`, default 200).
+~~**Use watch_routes quiescence instead of snapshot polling**~~ — **Resolved 2026-06-20**:
+`pathvector-mrt` now polls snapshots every 50ms and declares convergence based on
+time-since-last-change rather than two identical consecutive counts. The delta stream
+approach was attempted but the broadcast channel drops slow consumers at 1M+ event/s
+flood rates. The snapshot approach at 50ms intervals gives adequate accuracy (~200ms
+window) without the reconnect-on-lag problem.
 
 ### API ergonomics
 

@@ -31,8 +31,8 @@ use std::{
 
 use clap::Parser;
 use futures::StreamExt as _;
-use pathvector_client::{DaemonClient, PathvectorClient, types::RouteEventType};
 use tokio::time::sleep;
+use pathvector_client::{DaemonClient, PathvectorClient, types::RouteEventType};
 
 mod mrt;
 mod speaker;
@@ -68,8 +68,9 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:51200")]
     grpc: String,
 
-    /// How long to wait with no new route events before declaring convergence
-    #[arg(long, default_value = "1000")]
+    /// Quiescence window in ms — declare convergence when no new route events
+    /// arrive for this long after the last one
+    #[arg(long, default_value = "200")]
     idle_ms: u64,
 
     /// Hard timeout in seconds — abort if convergence never happens
@@ -139,21 +140,20 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // ── 5. Poll snapshots until RIB stabilises ────────────────────────────────
-    // We open a fresh watch_routes stream after each poll interval and count
-    // the Current events in the snapshot (before EndInitial).  When two
-    // consecutive snapshots agree the RIB has converged.
-    //
-    // This avoids the broadcast-channel lag problem: individual Announced
-    // delta events are never observed; only the point-in-time snapshot is
-    // used, which has no size limit.
+    // Open a fresh watch_routes stream each poll cycle and count Current events
+    // before EndInitial. Convergence is declared when the count has been stable
+    // for at least idle_ms — measured from the last time the count changed,
+    // not from when two consecutive polls agreed. This gives tighter timing
+    // than waiting for two identical polls with a fixed sleep between them.
     println!("Waiting for RIB convergence (snapshot polling)...");
 
-    let poll_interval = Duration::from_millis(args.idle_ms);
+    let quiescence = Duration::from_millis(args.idle_ms);
+    let poll_interval = Duration::from_millis(50);
     let hard_deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
-
-    let mut prev_count: Option<u64> = None;
-    let mut rib_count: u64 = 0;
     let convergence_start = Instant::now();
+
+    let mut rib_count: u64 = 0;
+    let mut last_change: Option<Instant> = None;
 
     loop {
         if Instant::now() >= hard_deadline {
@@ -165,7 +165,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
 
-        // Open a fresh stream and count the snapshot.
         let mut client = PathvectorClient::connect(args.grpc.clone())
             .map_err(|e| format!("gRPC reconnect failed: {e}"))?;
         let mut stream = client
@@ -184,13 +183,18 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        rib_count = snap_count;
-        println!("  snapshot: {} routes", fmt_count(rib_count));
-
-        if prev_count == Some(rib_count) {
-            break; // stable
+        if snap_count != rib_count {
+            rib_count = snap_count;
+            last_change = Some(Instant::now());
+            println!("  snapshot: {} routes", fmt_count(rib_count));
         }
-        prev_count = Some(rib_count);
+
+        if let Some(t) = last_change {
+            if t.elapsed() >= quiescence {
+                break;
+            }
+        }
+
         sleep(poll_interval).await;
     }
 
