@@ -92,12 +92,12 @@ against a live `pathvectord` over a loopback BGP TCP session.
 | Metric | Result | Context |
 |---|---|---|
 | Prefixes announced | 1,133,510 | Full internet routing table |
-| Announcement time | 2.17 s | Wall-clock from first to last UPDATE sent |
-| **Announcement throughput** | **522,592 prefixes/sec** | Faster than BIRD 2.x (~100–300k/sec, written in C) |
+| Announcement time | 2.22 s | Wall-clock from first to last UPDATE sent |
+| **Announcement throughput** | **511,487 prefixes/sec** | Faster than BIRD 2.x (~100–300k/sec, written in C) |
 | Unique path-attribute sets | 168,840 | Attribute deduplication reduces UPDATE message count by ~99% |
-| **RIB convergence time** | **4.29 s** | Between BIRD (~2–5s) and GoBGP (~15–30s) |
+| **RIB convergence time** | **4.46 s** | Between BIRD (~2–5s) and GoBGP (~15–30s) |
 | Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 | 95 rejected: MRT records multiple peer views per prefix |
-| **Total (announce + converge)** | **6.45 s** | End-to-end benchmark time |
+| **Total (announce + converge)** | **6.68 s** | End-to-end benchmark time |
 
 To reproduce:
 
