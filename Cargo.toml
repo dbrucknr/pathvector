@@ -40,8 +40,8 @@ bytes      = "1"
 async-stream = "0.3"
 futures      = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-ipnetx     = "0.2.2"
-routemap   = "0.1.3"
+ipnetx     = "0.3.0"
+routemap   = "0.1.4"
 tokio      = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 proptest   = "1"
@@ -49,6 +49,7 @@ criterion  = { version = "0.8.2", features = ["html_reports"] }
 ahash      = "0.8"
 smallvec   = { version = "1", features = ["union"] }
 libc       = "0.2"
+tikv-jemallocator = "0.6"
 tonic            = { version = "0.14", features = ["transport"] }
 tonic-prost      = "0.14"
 tonic-reflection = "0.14"

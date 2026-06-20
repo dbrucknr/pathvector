@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::{IpAddr, Ipv4Addr};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};

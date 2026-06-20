@@ -5,6 +5,9 @@ mod grpc;
 mod outbound;
 mod proto;
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub(crate) use daemon::{DaemonState, LOCAL_ORIGIN_PEER, RibSnapshot};
 
 #[tokio::main]

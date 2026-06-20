@@ -20,8 +20,9 @@ ahash             = { workspace = true }
 smallvec          = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-proptest  = { workspace = true }
+criterion         = { workspace = true }
+proptest          = { workspace = true }
+tikv-jemallocator = { workspace = true }
 
 [[bench]]
 name    = "select_best"

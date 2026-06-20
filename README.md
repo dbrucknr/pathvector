@@ -92,12 +92,12 @@ against a live `pathvectord` over a loopback BGP TCP session.
 | Metric | Result | Context |
 |---|---|---|
 | Prefixes announced | 1,133,510 | Full internet routing table |
-| Announcement time | 3.30 s | Wall-clock from first to last UPDATE sent |
-| **Announcement throughput** | **343,920 prefixes/sec** | On par with BIRD 2.x (~100–300k/sec, written in C) |
+| Announcement time | 2.22 s | Wall-clock from first to last UPDATE sent |
+| **Announcement throughput** | **511,487 prefixes/sec** | Faster than BIRD 2.x (~100–300k/sec, written in C) |
 | Unique path-attribute sets | 168,840 | Attribute deduplication reduces UPDATE message count by ~99% |
-| **RIB convergence time** | **3.70 s** | Between BIRD (~2–5s) and GoBGP (~15–30s) |
+| **RIB convergence time** | **4.46 s** | Between BIRD (~2–5s) and GoBGP (~15–30s) |
 | Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 | 95 rejected: MRT records multiple peer views per prefix |
-| **Total (announce + converge)** | **7.00 s** | End-to-end benchmark time |
+| **Total (announce + converge)** | **6.68 s** | End-to-end benchmark time |
 
 To reproduce:
 
@@ -115,26 +115,28 @@ just mrt ./latest-bview.gz
 
 | Table size | pathvectord | GoBGP | Ratio |
 |---|---|---|---|
-| 10k  | 0.02 s | 0.06 s | **2.2× faster** |
-| 100k | 0.17 s | 0.36 s | **2.1× faster** |
-| 250k | 0.27 s | 0.58 s | **2.1× faster** |
-| 500k | 0.42 s | 0.95 s | **2.3× faster** |
-| 900k | 0.26 s | 0.56 s | **2.2× faster** |
+| 10k  | 0.03 s | 0.05 s | **1.7× faster** |
+| 100k | 0.16 s | 0.36 s | **2.3× faster** |
+| 250k | 0.27 s | 0.59 s | **2.2× faster** |
+| 500k | 0.46 s | 0.93 s | **2.0× faster** |
+| 750k | 0.42 s | 0.90 s | **2.1× faster** |
+| 900k | 0.27 s | 0.54 s | **2.0× faster** |
 
 **Peak RSS** (lower is better, `just stress-release`):
 
-- RSS: means resident set size. The amount of physical RAM the process is actually occupying at a given moment
+RSS (resident set size) is the physical RAM the process actually occupies at a given moment.
 
 | Table size | pathvectord | GoBGP | Ratio |
 |---|---|---|---|
-| 10k  | 11.8 MB   | 51.7 MB  | **4.4× less** |
-| 100k | 66.8 MB   | 133.2 MB | **2.0× less** |
-| 250k | 240.2 MB  | 258.2 MB | **2.0× less** |
-| 500k | 461.2 MB  | 465.4 MB | ~equal |
-| 900k | 515.2 MB  | 792.4 MB | **35% less** |
+| 10k  | 15.6 MB  | 51.1 MB  | **3.3× less** |
+| 100k | 48.8 MB  | 122.0 MB | **2.5× less** |
+| 250k | 144.5 MB | 252.9 MB | **1.7× less** |
+| 500k | 279.1 MB | 468.7 MB | **1.7× less** |
+| 750k | 313.5 MB | 691.0 MB | **2.2× less** |
+| 900k | 334.2 MB | 823.6 MB | **2.5× less** |
 
-Per-route cost at 900k: 0.57 KB (pathvectord) vs 0.88 KB (GoBGP). The RSS plateau
-between 500k and 900k reflects attribute interning — real internet routes share a
+Per-route cost at 900k: 0.37 KB (pathvectord) vs 0.91 KB (GoBGP). The RSS plateau
+between 750k and 900k reflects attribute interning — real internet routes share a
 small set of AS paths and community sets, so marginal cost per route falls as the
 table grows.
 
@@ -144,6 +146,39 @@ The numbers above are from `just stress-release`. To reproduce:
 just stress          # debug build — fast to compile, slower numbers
 just stress-release  # optimized build — numbers worth recording
 ```
+
+### Allocator
+
+`pathvectord` and all criterion bench binaries use [jemalloc](https://github.com/jemalloc/jemalloc)
+as the global allocator via [`tikv-jemallocator`](https://crates.io/crates/tikv-jemallocator).
+
+BGP control-plane work is allocation-heavy: every route update clones AS paths, community
+vectors, and NLRI structs. jemalloc's thread-local magazine caches and aggressive
+memory-return behavior reduce fragmentation compared to the system allocator (glibc malloc
+on Linux, libmalloc on macOS), which matters for a long-running daemon processing millions
+of route events.
+
+Measured improvement vs system allocator on M2 Max (criterion, release profile):
+
+| Benchmark | System alloc | jemalloc | Delta |
+|---|---|---|---|
+| `loc_rib_insert/10k` | 610 ns | 459 ns | −25% |
+| `loc_rib_insert/100k` | 615 ns | 465 ns | −24% |
+| `loc_rib_insert/500k` | 1.94 µs | 1.56 µs | −20% |
+| `outbound_pipeline/minimal/1` | 274 ns | 174 ns | −37% |
+| `outbound_pipeline/dense/1` | 441 ns | 258 ns | −41% |
+| `outbound_pipeline/minimal/10` | 1.35 µs | 917 ns | −32% |
+| `outbound_pipeline/dense/10` | 2.61 µs | 1.31 µs | −50% |
+| `outbound_pipeline/minimal/50` | 6.70 µs | 4.62 µs | −31% |
+| `outbound_pipeline/dense/50` | 13.12 µs | 6.17 µs | −53% |
+| `select_best/2` | 158 ns | 97 ns | −39% |
+| `select_best/10` | 505 ns | 359 ns | −29% |
+| `select_best/100` | 2.66 µs | 2.42 µs | −9% |
+
+The outbound pipeline benefits most because each peer advertisement clones the full
+attribute set — more allocations per iteration means more leverage from a faster allocator.
+`select_best/100` is the floor case: at 100 candidates the comparison work dominates
+and allocator choice matters less.
 
 ---
 
