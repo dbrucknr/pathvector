@@ -560,10 +560,14 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    `DaemonState` by address family or introducing a per-peer processing pipeline would fix
    this, but requires significant ownership rework.
 
-2. **No NLRI batching in outbound UPDATEs** — each affected prefix generates its own
-   `UpdateMessage` and wire frame. RFC 4271 allows packing multiple NLRIs with identical
-   path attributes into a single UPDATE. Batching reduces TCP segment count and framing
-   overhead, which matters most during full-table dumps to newly established peers.
+2. ~~**No NLRI batching in outbound UPDATEs**~~ — **Resolved (2026-06-20)** on `nlri-batching`
+   branch. `DaemonState` now accumulates `PrefixDecision`s in per-peer buffers; the event
+   loop drains the event channel with `try_recv` after each initial `recv`, then calls
+   `flush_pending` once at quiescence. Routes sharing the same attribute set are packed into
+   a single `UpdateMessage` by `flush_updates`. The event loop's `fib_changed` and MRAI timer
+   arms also call `flush_pending` after their propagation pass. gRPC-facing mutation methods
+   (`originate_routes`, `withdraw_originated_routes`, `set_import_default`) self-flush to
+   preserve immediate delivery semantics outside the event loop.
 
 3. **Inbound convergence time audit** — NLRI batching improves the outbound path
    (announcement throughput), but RIB convergence time is dominated by the inbound path:

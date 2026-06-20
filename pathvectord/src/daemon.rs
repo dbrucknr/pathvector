@@ -1626,6 +1626,7 @@ impl DaemonState {
             });
         }
         self.propagate_to_all_peers(&nlris);
+        self.flush_pending();
     }
 
     /// Injects a single IPv6 route into `loc_rib_v6` and propagates it.
@@ -1656,6 +1657,7 @@ impl DaemonState {
             });
         }
         self.propagate_to_all_peers_v6(&nlris);
+        self.flush_pending();
     }
 
     /// Withdraws a single locally originated route.
@@ -1681,6 +1683,7 @@ impl DaemonState {
             });
         }
         self.propagate_to_all_peers(nlris);
+        self.flush_pending();
     }
 
     /// Withdraws a single locally originated IPv6 route.
@@ -1706,6 +1709,7 @@ impl DaemonState {
             });
         }
         self.propagate_to_all_peers_v6(nlris);
+        self.flush_pending();
     }
 
     /// Replaces the import-policy default for `peer_ip` and re-evaluates the
@@ -1778,6 +1782,7 @@ impl DaemonState {
         }
 
         self.propagate_to_all_peers_v6(&nlris_v6);
+        self.flush_pending();
     }
 
     /// Replaces the export-policy default for `peer_ip` and re-evaluates the
@@ -2443,7 +2448,7 @@ pub(crate) async fn run_event_loop(
     let mut mrai_timer = tokio::time::interval(MRAI / 2);
     mrai_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    loop {
+    'outer: loop {
         // `std::future::pending()` for the None branch ensures the select arm
         // is compiled in but never resolves, keeping the loop alive on the
         // BGP event path alone.
@@ -2582,10 +2587,26 @@ pub(crate) async fn run_event_loop(
                             }
                         }
                         SessionEvent::RouteUpdate(msg) => {
-                            // Suppress per-event notification errors during
-                            // batch drain — each session independently
-                            // re-notifies if needed on the next event.
-                            let _ = s.on_route_update(extra_ip, msg);
+                            // RFC 4271 §6.3: mandatory-attribute error
+                            // detected during drain — flush other peers'
+                            // decisions then send NOTIFICATION before
+                            // tearing down this session.
+                            if let Some(err) = s.on_route_update(extra_ip, msg) {
+                                s.flush_pending();
+                                let notify_stalled = s.take_stalled_peers();
+                                drop(s);
+                                let tx = stop_senders.lock().unwrap().get(&extra_ip).cloned();
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(SessionCommand::Notification(err)).await;
+                                }
+                                for peer in notify_stalled {
+                                    let tx = stop_senders.lock().unwrap().get(&peer).cloned();
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(SessionCommand::Stop).await;
+                                    }
+                                }
+                                continue 'outer;
+                            }
                         }
                     }
                 }
@@ -2636,6 +2657,9 @@ pub(crate) async fn run_event_loop(
                 s.flush_pending();
                 if s.has_mrai_pending() {
                     s.flush_mrai_pending();
+                    // flush_mrai_pending calls propagate_to_all_peers which
+                    // buffers; drain those decisions now.
+                    s.flush_pending();
                     let stalled = s.take_stalled_peers();
                     drop(s);
                     for peer in stalled {
