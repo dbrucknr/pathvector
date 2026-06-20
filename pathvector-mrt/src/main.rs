@@ -189,10 +189,8 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("  snapshot: {} routes", fmt_count(rib_count));
         }
 
-        if let Some(t) = last_change {
-            if t.elapsed() >= quiescence {
-                break;
-            }
+        if last_change.is_some_and(|t| t.elapsed() >= quiescence) {
+            break;
         }
 
         sleep(poll_interval).await;
