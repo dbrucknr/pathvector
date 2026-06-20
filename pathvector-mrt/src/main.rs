@@ -31,8 +31,8 @@ use std::{
 
 use clap::Parser;
 use futures::StreamExt as _;
-use tokio::time::sleep;
 use pathvector_client::{DaemonClient, PathvectorClient, types::RouteEventType};
+use tokio::time::sleep;
 
 mod mrt;
 mod speaker;

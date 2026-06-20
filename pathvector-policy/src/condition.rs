@@ -93,7 +93,8 @@ impl<A: IpAddress> PrefixListCondition<A> {
 
 impl<A: IpAddress + Send + Sync, R: BgpRoute<Addr = A>> Condition<R> for PrefixListCondition<A> {
     fn matches(&self, route: &R) -> bool {
-        self.set.contains_range(route.nlri().prefix().masked().to_range())
+        self.set
+            .contains_range(route.nlri().prefix().masked().to_range())
     }
 }
 
