@@ -86,7 +86,7 @@ lint-linux:
         -w /workspace \
         -e CARGO_TARGET_DIR=/target \
         rust:1.88-slim \
-        sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null \
+        sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler make >/dev/null \
             && rustup component add clippy 2>/dev/null \
             && cargo clippy --workspace --all-targets -- -D warnings \
                 -A clippy::similar_names"
