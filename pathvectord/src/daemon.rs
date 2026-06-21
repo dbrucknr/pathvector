@@ -2099,22 +2099,7 @@ where
         let state_cmd = Arc::clone(&state);
         let stop_cmd = Arc::clone(&stop_senders);
         let incoming_cmd = Arc::clone(&incoming_senders);
-        let local_caps = vec![
-            Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
-            Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
-            Capability::FourByteAsn(local_as),
-            Capability::ExtendedMessage,
-            // RFC 4724 §3: advertise GracefulRestart so peers (e.g. GoBGP) send
-            // End-of-RIB markers after their initial dump.  restart_time = 0 and
-            // no families means "I support the EOR signalling protocol but do not
-            // preserve forwarding state across restarts." The stale-route timer is
-            // deferred; EOR receive-side detection is fully implemented.
-            Capability::GracefulRestart {
-                restart_flags: 0,
-                restart_time: 0,
-                families: vec![],
-            },
-        ];
+        let local_caps = build_local_capabilities(local_as);
         let peer_store = cfg
             .sidecar_path
             .as_ref()
@@ -2158,6 +2143,29 @@ struct SpawnConfig {
     local_bgp_id: Ipv4Addr,
     hold_time: u16,
     local_capabilities: Vec<Capability>,
+}
+
+/// Returns the capability set advertised in every OPEN message pathvectord sends.
+///
+/// Called from both peer registration paths (static config and runtime AddPeer)
+/// so they always advertise identical capabilities.
+fn build_local_capabilities(local_as: u32) -> Vec<Capability> {
+    vec![
+        Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+        Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
+        Capability::RouteRefresh,
+        Capability::FourByteAsn(local_as),
+        Capability::ExtendedMessage,
+        // RFC 4724 §3: advertise GracefulRestart so peers send End-of-RIB
+        // markers after their initial dump.  restart_time = 0 and no families
+        // means "I support EOR signalling but do not preserve forwarding state
+        // across restarts."  The stale-route timer is deferred.
+        Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 0,
+            families: vec![],
+        },
+    ]
 }
 
 /// Processes [`DaemonCommand`]s from the gRPC layer.
@@ -2354,22 +2362,7 @@ where
     // md5_passwords: shared with the listener for TCP MD5SIG setup.
     let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    let local_capabilities = vec![
-        Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
-        Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
-        Capability::RouteRefresh,
-        Capability::FourByteAsn(local_as),
-        Capability::ExtendedMessage,
-        // RFC 4724 §3: advertise GracefulRestart so peers send End-of-RIB
-        // markers after their initial dump.  restart_time = 0 and no families
-        // means "I support EOR signalling but do not preserve forwarding state
-        // across restarts."  The stale-route timer is deferred.
-        Capability::GracefulRestart {
-            restart_flags: 0,
-            restart_time: 0,
-            families: vec![],
-        },
-    ];
+    let local_capabilities = build_local_capabilities(local_as);
 
     for peer in &cfg.peers {
         let session_cfg = SessionConfig {
