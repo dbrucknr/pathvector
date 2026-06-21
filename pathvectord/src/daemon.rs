@@ -2044,6 +2044,7 @@ where
     H: SessionHandle + 'static,
     F: Fn(SessionConfig) -> H + Clone + Send + Sync + 'static,
 {
+    let daemon_start = std::time::Instant::now();
     let grpc_port = cfg.daemon.grpc_port;
     let bgp_port = cfg.daemon.bgp_port;
     let fib_table = cfg.daemon.fib_table;
@@ -2138,7 +2139,6 @@ where
         let state_cmd = Arc::clone(&state);
         let stop_cmd = Arc::clone(&stop_senders);
         let incoming_cmd = Arc::clone(&incoming_senders);
-        let local_caps = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, cfg.daemon.restarting);
         let peer_store = cfg
             .sidecar_path
             .as_ref()
@@ -2154,7 +2154,9 @@ where
                 local_as,
                 local_bgp_id,
                 hold_time,
-                local_capabilities: local_caps,
+                graceful_restart_time: cfg.daemon.graceful_restart_time,
+                configured_restarting: cfg.daemon.restarting,
+                startup_instant: daemon_start,  // R-bit expires after graceful_restart_time secs
             },
             peer_store,
         ));
@@ -2181,7 +2183,33 @@ struct SpawnConfig {
     local_as: u32,
     local_bgp_id: Ipv4Addr,
     hold_time: u16,
-    local_capabilities: Vec<Capability>,
+    /// RFC 4724: parameters for computing per-session capabilities.
+    ///
+    /// Capabilities are rebuilt at each session spawn (rather than once at
+    /// startup) so that the R-bit correctly reflects the elapsed restart window:
+    /// R=1 only while `startup_instant.elapsed() < graceful_restart_time`.
+    graceful_restart_time: u16,
+    /// Whether the operator configured `restarting = true` in `[daemon]`.
+    /// The actual R-bit in each OPEN is gated on this AND elapsed time.
+    configured_restarting: bool,
+    /// Instant the daemon process started; used to expire the R-bit window.
+    startup_instant: std::time::Instant,
+}
+
+impl SpawnConfig {
+    /// Build the capability list for a session being spawned right now.
+    ///
+    /// The R-bit is set only if the operator configured `restarting = true`
+    /// AND the restart window (`graceful_restart_time` seconds) has not yet
+    /// elapsed since daemon startup.  Once the window expires, R=0 — RFC 4724
+    /// §3 requires the restarting speaker to clear the R-bit after completion.
+    fn capabilities(&self) -> Vec<Capability> {
+        let in_window = self.configured_restarting
+            && self.graceful_restart_time > 0
+            && self.startup_instant.elapsed()
+                < std::time::Duration::from_secs(u64::from(self.graceful_restart_time));
+        build_local_capabilities(self.local_as, self.graceful_restart_time, in_window)
+    }
 }
 
 /// Returns the capability set advertised in every OPEN message pathvectord sends.
@@ -2203,26 +2231,30 @@ fn build_local_capabilities(
     // so peers hold our routes during our restart window.  When 0, advertise an
     // empty family list — peers still send EOR markers but withdraw our routes
     // immediately on session loss.
+    // RFC 4724 §3: Restart State (R) bit is the high bit of restart_flags.
+    // Set when we are the restarting speaker within the restart window so peers
+    // know to stop their stale-route timers when our session re-establishes.
+    // Only meaningful when graceful_restart_time > 0.
+    let restart_flags: u8 = if restarting && graceful_restart_time > 0 { 0x08 } else { 0x00 };
+    // RFC 4724 §3: F-bit (forwarding_preserved) indicates our FIB is intact.
+    // When we are restarting (R=1), run_with() has just deleted stale RTPROT_BGP
+    // routes, so our FIB is NOT intact — F must be false.
+    // When we are stable (R=0), kernel routes survive session loss, so F=true.
+    let forwarding_preserved = !restarting || graceful_restart_time == 0;
     let gr_families = if graceful_restart_time > 0 {
         vec![
             GracefulRestartFamily {
                 afi_safi: AfiSafi::IPV4_UNICAST,
-                forwarding_preserved: true,
+                forwarding_preserved,
             },
             GracefulRestartFamily {
                 afi_safi: AfiSafi::IPV6_UNICAST,
-                forwarding_preserved: true,
+                forwarding_preserved,
             },
         ]
     } else {
         vec![]
     };
-    // RFC 4724 §3: Restart State (R) bit is the high bit of restart_flags.
-    // Set when we are the restarting speaker within the restart window so peers
-    // know to stop their stale-route timers when our session re-establishes.
-    // Only meaningful when graceful_restart_time > 0 — without a GR window there
-    // is nothing to signal to the peer.
-    let restart_flags: u8 = if restarting && graceful_restart_time > 0 { 0x08 } else { 0x00 };
     vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
         Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
@@ -2289,7 +2321,7 @@ async fn run_command_processor<H, F>(
                     local_as: cfg.local_as,
                     local_bgp_id: cfg.local_bgp_id,
                     hold_time: peer.hold_time.unwrap_or(cfg.hold_time),
-                    capabilities: cfg.local_capabilities.clone(),
+                    capabilities: cfg.capabilities(),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
                     peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
@@ -2431,14 +2463,25 @@ where
     // md5_passwords: shared with the listener for TCP MD5SIG setup.
     let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    let local_capabilities = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, cfg.daemon.restarting);
+    // Capture startup instant here; used to expire the R-bit window per-session.
+    let startup_instant = std::time::Instant::now();
 
     for peer in &cfg.peers {
+        // Recompute capabilities for each session so the R-bit correctly reflects
+        // elapsed time since startup (RFC 4724 §3: R-bit must be cleared after restart).
+        let capabilities = build_local_capabilities(
+            local_as,
+            cfg.daemon.graceful_restart_time,
+            cfg.daemon.restarting
+                && cfg.daemon.graceful_restart_time > 0
+                && startup_instant.elapsed()
+                    < std::time::Duration::from_secs(u64::from(cfg.daemon.graceful_restart_time)),
+        );
         let session_cfg = SessionConfig {
             local_as,
             local_bgp_id,
             hold_time: peer.hold_time.unwrap_or(cfg.daemon.hold_time),
-            capabilities: local_capabilities.clone(),
+            capabilities,
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
@@ -2478,6 +2521,12 @@ where
     // processor can forward events from dynamically added sessions.  The
     // channel closes when every forwarding task exits AND this clone is dropped.
 
+    // Build a reference capability set for DaemonState.config_capabilities.
+    // This is used to check whether we advertise GR (for the "peer doesn't
+    // support GR" warning in on_established) — not for per-session OPENs.
+    // The R-bit is not relevant here; we use restarting=false.
+    let config_capabilities =
+        build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, false);
     let state = Arc::new(RwLock::new(DaemonState::new(
         local_as,
         local_bgp_id,
@@ -2485,7 +2534,7 @@ where
         cfg.daemon.cluster_id,
         &cfg.peers,
         update_senders,
-        local_capabilities,
+        config_capabilities,
     )));
 
     (
@@ -2622,6 +2671,28 @@ pub(crate) async fn run_event_loop(
                         // broadcast — the explicit Removed event below is the
                         // authoritative notification.
                         s.on_terminated(peer_ip, !is_removed);
+                        // RFC 4724 §3: refresh the session's capability set so
+                        // the next OPEN reflects the current R-bit state. The
+                        // restart window may have expired since the original OPEN
+                        // was sent; we always push R=0 on reconnect — if we were
+                        // still restarting the first connection would have cleared
+                        // the window, so subsequent reconnects must not set R.
+                        let caps_refresh: Option<(mpsc::Sender<SessionCommand>, Vec<Capability>)> =
+                            if is_removed {
+                                None
+                            } else {
+                                let gr_time = s.config_capabilities.iter().find_map(|c| {
+                                    if let Capability::GracefulRestart { restart_time, .. } = c {
+                                        Some(*restart_time)
+                                    } else {
+                                        None
+                                    }
+                                }).unwrap_or(0);
+                                let fresh_caps =
+                                    build_local_capabilities(s.rib.local_as, gr_time, false);
+                                stop_senders.lock().unwrap().get(&peer_ip).cloned()
+                                    .map(|tx| (tx, fresh_caps))
+                            };
                         if is_removed {
                             // Permanent removal: erase all per-peer state so
                             // the peer no longer appears in gRPC responses and
@@ -2645,6 +2716,14 @@ pub(crate) async fn run_event_loop(
                                 });
                             }
                         }
+                        // Drop the write guard before awaiting so we don't hold the
+                        // lock while the channel send blocks, then skip the coalescing
+                        // loop (no pending_decisions were touched in Terminated path).
+                        drop(s);
+                        if let Some((tx, caps)) = caps_refresh {
+                            let _ = tx.send(SessionCommand::SetCapabilities(caps)).await;
+                        }
+                        continue;
                     }
                     SessionEvent::RouteUpdate(msg) => {
                         let notify_err = s.on_route_update(peer_ip, msg);
@@ -10730,6 +10809,11 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
+            async fn set_capabilities(
+                &self,
+                _caps: Vec<pathvector_session::message::Capability>,
+            ) {
+            }
         }
 
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
@@ -10760,7 +10844,9 @@ mod event_loop_tests {
                 local_as: 65001,
                 local_bgp_id: "1.2.3.4".parse().unwrap(),
                 hold_time: 180,
-                local_capabilities: vec![],
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                startup_instant: std::time::Instant::now(),
             },
             None,
         ));
@@ -10888,6 +10974,11 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
+            async fn set_capabilities(
+                &self,
+                _caps: Vec<pathvector_session::message::Capability>,
+            ) {
+            }
         }
 
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
@@ -10913,7 +11004,9 @@ mod event_loop_tests {
                 local_as: 65001,
                 local_bgp_id: "1.2.3.4".parse().unwrap(),
                 hold_time: 180,
-                local_capabilities: vec![],
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                startup_instant: std::time::Instant::now(),
             },
             None,
         ));
@@ -10966,6 +11059,11 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
+            async fn set_capabilities(
+                &self,
+                _caps: Vec<pathvector_session::message::Capability>,
+            ) {
+            }
         }
 
         let peer_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
@@ -10992,7 +11090,9 @@ mod event_loop_tests {
                 local_as: 65001,
                 local_bgp_id: "1.2.3.4".parse().unwrap(),
                 hold_time: 180,
-                local_capabilities: vec![],
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                startup_instant: std::time::Instant::now(),
             },
             None,
         ));
@@ -11037,6 +11137,11 @@ mod event_loop_tests {
             async fn send_route_refresh(
                 &self,
                 _rr: pathvector_session::message::RouteRefreshMessage,
+            ) {
+            }
+            async fn set_capabilities(
+                &self,
+                _caps: Vec<pathvector_session::message::Capability>,
             ) {
             }
         }
@@ -11089,7 +11194,9 @@ mod event_loop_tests {
                 local_as: 65001,
                 local_bgp_id: "1.2.3.4".parse().unwrap(),
                 hold_time: 180,
-                local_capabilities: vec![],
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                startup_instant: std::time::Instant::now(),
             },
             None,
         ));
@@ -11316,6 +11423,11 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
+            async fn set_capabilities(
+                &self,
+                _caps: Vec<pathvector_session::message::Capability>,
+            ) {
+            }
         }
 
         let global_hold_time: u16 = 180;
@@ -11345,7 +11457,9 @@ mod event_loop_tests {
                 local_as: 65001,
                 local_bgp_id: "1.2.3.4".parse().unwrap(),
                 hold_time: global_hold_time,
-                local_capabilities: vec![],
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                startup_instant: std::time::Instant::now(),
             },
             None,
         ));
@@ -11558,6 +11672,11 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
+            async fn set_capabilities(
+                &self,
+                _caps: Vec<pathvector_session::message::Capability>,
+            ) {
+            }
         }
 
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
@@ -11585,7 +11704,9 @@ mod event_loop_tests {
                 local_as: 65001,
                 local_bgp_id: "1.2.3.4".parse().unwrap(),
                 hold_time: 180,
-                local_capabilities: vec![],
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                startup_instant: std::time::Instant::now(),
             },
             None,
         ));
@@ -12162,6 +12283,8 @@ mod run_with_tests {
         }
 
         async fn send_route_refresh(&self, _rr: pathvector_session::message::RouteRefreshMessage) {}
+
+        async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
     }
 
     /// Test-side view of a spawned mock session.
@@ -12896,6 +13019,34 @@ mod test_build_local_capabilities {
         assert_eq!(time, 4095, "restart_time must be clamped to RFC 4724 maximum of 4095");
     }
 
+    /// RFC 4724 §3: when restarting, F-bit must be false — our FIB was deleted on
+    /// startup before reconvergence.
+    #[test]
+    fn test_build_local_capabilities_f_bit_false_when_restarting() {
+        let caps = build_local_capabilities(65001, 120, true);
+        let (_, _, families) = find_gr(&caps).expect("GracefulRestart must be present");
+        for fam in &families {
+            assert!(
+                !fam.forwarding_preserved,
+                "forwarding_preserved must be false while restarting — FIB was wiped on startup"
+            );
+        }
+    }
+
+    /// RFC 4724 §3: when stable (not restarting), F-bit must be true — kernel
+    /// routes survive session loss on Linux.
+    #[test]
+    fn test_build_local_capabilities_f_bit_true_when_stable() {
+        let caps = build_local_capabilities(65001, 120, false);
+        let (_, _, families) = find_gr(&caps).expect("GracefulRestart must be present");
+        for fam in &families {
+            assert!(
+                fam.forwarding_preserved,
+                "forwarding_preserved must be true when not restarting — kernel FIB is intact"
+            );
+        }
+    }
+
     /// RFC 4724 §3: when `restarting = true`, the R-bit (0x08 in restart_flags)
     /// must be set so peers know to stop their stale-route timers on re-establishment.
     #[test]
@@ -12921,6 +13072,45 @@ mod test_build_local_capabilities {
         let caps = build_local_capabilities(65001, 0, true);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(flags & 0x08, 0x00, "R-bit must not be set when graceful_restart_time = 0");
+    }
+
+    fn spawn_cfg(gr_time: u16, configured_restarting: bool, age: std::time::Duration) -> SpawnConfig {
+        SpawnConfig {
+            local_as: 65001,
+            local_bgp_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            hold_time: 90,
+            graceful_restart_time: gr_time,
+            configured_restarting,
+            startup_instant: std::time::Instant::now() - age,
+        }
+    }
+
+    /// Within the restart window, SpawnConfig::capabilities() must set R=1.
+    #[test]
+    fn spawn_config_r_bit_set_within_restart_window() {
+        let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(10));
+        let caps = cfg.capabilities();
+        let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
+        assert_eq!(flags & 0x08, 0x08, "R-bit must be set while within the 120 s restart window");
+    }
+
+    /// After the restart window expires, SpawnConfig::capabilities() must clear R=0.
+    #[test]
+    fn spawn_config_r_bit_cleared_after_restart_window() {
+        // Simulate 130 s elapsed for a 120 s window.
+        let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(130));
+        let caps = cfg.capabilities();
+        let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
+        assert_eq!(flags & 0x08, 0x00, "R-bit must be cleared after the 120 s restart window expires");
+    }
+
+    /// configured_restarting=false must always yield R=0, regardless of elapsed time.
+    #[test]
+    fn spawn_config_r_bit_not_set_when_not_configured_restarting() {
+        let cfg = spawn_cfg(120, false, std::time::Duration::from_secs(5));
+        let caps = cfg.capabilities();
+        let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
+        assert_eq!(flags & 0x08, 0x00, "R-bit must not be set when configured_restarting=false");
     }
 }
 
@@ -12993,6 +13183,34 @@ mod test_gr_peer_capability {
             !gr_capable_peers.contains_key(&peer()),
             "peer with restart_time = 0 must not be in gr_capable_peers; \
              prior session value must be cleared"
+        );
+    }
+
+    /// RFC 4724 §3: a peer MUST NOT send more than one GracefulRestart capability,
+    /// but if it does we must not panic and must use the first one (find_map semantics).
+    #[test]
+    fn duplicate_gr_capabilities_do_not_panic_and_first_wins() {
+        let caps = vec![gr_cap(90), gr_cap(300)];
+        let t = extract_gr_time(&caps);
+        assert_eq!(
+            t,
+            Some(90),
+            "first GracefulRestart capability must win when duplicates are present"
+        );
+    }
+
+    /// find_map skips GR capabilities with restart_time=0 (they don't indicate GR
+    /// capability — RFC 4724 §3: restart_time=0 means EOR-only). If a peer sends
+    /// restart_time=0 followed by restart_time=120 (malformed but defensive), the
+    /// first non-zero value wins.
+    #[test]
+    fn zero_gr_then_nonzero_gr_uses_first_nonzero() {
+        let caps = vec![gr_cap(0), gr_cap(120)];
+        let t = extract_gr_time(&caps);
+        assert_eq!(
+            t,
+            Some(120),
+            "first non-zero restart_time must be used; restart_time=0 is EOR-only and skipped"
         );
     }
 

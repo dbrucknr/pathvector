@@ -121,10 +121,22 @@ preservation (helper role — telling peers to hold our routes on restart).
 | EOR state exposed via management API (`eor_ipv4_received`, `eor_ipv6_received`) | `src/grpc.rs`, `proto/` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded`, `eor_ipv4_received_persists_after_route_churn` |
 | GracefulRestart capability advertised so peers send EOR | `src/daemon.rs` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded` |
 | §3 helper role: advertise `restart_time > 0` + forwarding-preserved families when `graceful_restart_time` is configured | `src/daemon.rs`, `src/config.rs` | ✅ | `test_build_local_capabilities_gr_enabled`, `test_build_local_capabilities_gr_disabled`, `test_build_local_capabilities_gr_clamps_at_4095` |
+| §3 helper role: F-bit false when we are the restarting speaker (FIB was wiped on startup) | `src/daemon.rs` | ✅ | `test_build_local_capabilities_f_bit_false_when_restarting`, `test_build_local_capabilities_f_bit_true_when_stable` |
 | §3 helper role: F-bit correctly encoded in OPEN wire bytes | `pathvector-session/src/message/open.rs` | ✅ | `test_gr_family_forwarding_preserved_roundtrip` |
+| §3 R-bit set only within the restart window (`startup_instant.elapsed() < graceful_restart_time`) | `src/daemon.rs` — `SpawnConfig::capabilities()` | ✅ | `spawn_config_r_bit_set_within_restart_window`, `spawn_config_r_bit_cleared_after_restart_window` |
+| §3 R-bit not set when `graceful_restart_time = 0` | `src/daemon.rs` | ✅ | `test_build_local_capabilities_r_bit_ignored_when_gr_disabled` |
+| §3 peer's restart_time extracted from peer OPEN and stored in `gr_capable_peers` | `src/daemon.rs` | ✅ | `gr_capable_peer_is_recorded_on_established`, `gr_eor_only_peer_not_recorded` |
+| §3 duplicate GR capabilities from peer handled without panic (first non-zero wins) | `src/daemon.rs` | ✅ | `duplicate_gr_capabilities_do_not_panic_and_first_wins`, `zero_gr_then_nonzero_gr_uses_first_nonzero` |
+| §3 SHOULD — suppress GR capability advertisement if peer's restart_time = 0 | `src/daemon.rs` | ⚠️ | SHOULD only; we log a warning but still advertise — deferred to Phase 2 |
+| GR capability roundtrip codec fidelity (arbitrary flags, time, families) | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_roundtrips` (proptest) |
+| GR capability decoder: truncated input returns error, does not panic | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_truncated_input_does_not_panic` (proptest) |
+| GR capability decoder: trailing family bytes are dropped, not an error | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_trailing_bytes_ignored` (proptest) |
+| e2e: GoBGP holds routes during our restart window (blackhole use case) | `pathvector-e2e/tests/session.rs` | ✅ | `gr_helper_gobgp_holds_routes_during_restart_window` |
+| e2e: peer GR restart_time visible via management API | `pathvector-e2e/tests/session.rs` | ✅ | `gr_capability_negotiated_peer_gr_restart_time_reflects_config` |
 
 **Deferred (Phase 2):** §4.2 speaker role — stale-route retention when a peer restarts
 (`TerminationReason`, `gr_deadlines`, `stale_nlri_v4/v6`, deadline timer in event loop).
+§3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently logged as warning).
 
 ---
 

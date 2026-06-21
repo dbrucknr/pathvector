@@ -123,6 +123,16 @@ pub trait SessionHandle: Send + 'static {
         &self,
         rr: crate::message::RouteRefreshMessage,
     ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Push a fresh capability set to be used in the next OPEN message.
+    ///
+    /// Should be called immediately after a session terminates so the next
+    /// reconnect attempt sends the updated capabilities. Has no effect if the
+    /// session is currently established (the OPEN has already been sent).
+    fn set_capabilities(
+        &self,
+        caps: Vec<crate::message::Capability>,
+    ) -> impl Future<Output = ()> + Send + '_;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -176,6 +186,16 @@ pub enum SessionCommand {
     /// without resetting the session. Silently dropped if the session is not in
     /// `Established` state or if no transport is available.
     RouteRefresh(crate::message::RouteRefreshMessage),
+    /// Replace the local capability set used in the next OPEN message.
+    ///
+    /// This must be sent before the session reconnects (i.e. before the
+    /// `ConnectRetry` timer fires). The primary use-case is expiring the RFC 4724
+    /// Restart State (R) bit after the graceful-restart window closes: the
+    /// daemon sends `SetCapabilities` when it handles `SessionEvent::Terminated`
+    /// so the next OPEN reflects the current restart state.
+    ///
+    /// Has no effect if the session is already in `Established` state.
+    SetCapabilities(Vec<crate::message::Capability>),
 }
 
 /// Events emitted by a session to its caller.
@@ -249,6 +269,10 @@ impl SessionHandle for SpawnedSessionHandle {
 
     async fn send_route_refresh(&self, rr: crate::message::RouteRefreshMessage) {
         let _ = self.cmd_tx.send(SessionCommand::RouteRefresh(rr)).await;
+    }
+
+    async fn set_capabilities(&self, caps: Vec<crate::message::Capability>) {
+        let _ = self.cmd_tx.send(SessionCommand::SetCapabilities(caps)).await;
     }
 }
 
@@ -443,6 +467,15 @@ impl<T: BgpTransport> Session<T> {
                         {
                             self.drop_connection();
                             return FsmInput::TcpFailed;
+                        }
+                        // No FSM transition; loop continues.
+                    }
+                    Some(SessionCommand::SetCapabilities(caps)) => {
+                        // Update the capability set used in the next OPEN message.
+                        // Has no effect if we are already Established — the OPEN
+                        // for the current session has already been sent.
+                        if !self.fsm.is_established() {
+                            self.fsm.set_capabilities(caps);
                         }
                         // No FSM transition; loop continues.
                     }
@@ -1477,6 +1510,39 @@ mod tests {
         assert!(result.withdrawn.is_empty());
         assert!(result.attributes.is_empty());
         assert!(result.announced.is_empty());
+    }
+
+    /// `SetCapabilities` while not Established updates the FSM's capability set.
+    /// We test through `Fsm::set_capabilities` / `Fsm::capabilities_for_test`
+    /// since `make_open` is private and the mock transport cannot reconnect.
+    #[test]
+    fn test_set_capabilities_updates_fsm_config() {
+        use crate::fsm::{Fsm, FsmConfig};
+        use crate::message::Capability;
+
+        let initial = vec![Capability::FourByteAsn(65001)];
+        let mut fsm = Fsm::new(FsmConfig {
+            local_as: 65001,
+            local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+            hold_time: 90,
+            capabilities: initial.clone(),
+            required_capabilities: vec![],
+            peer_as: Some(65002),
+        });
+
+        assert!(!fsm.is_established(), "FSM must start non-Established");
+        assert_eq!(fsm.local_capabilities(), &initial, "initial caps must match config");
+
+        let updated = vec![
+            Capability::FourByteAsn(65001),
+            Capability::ExtendedMessage,
+        ];
+        fsm.set_capabilities(updated.clone());
+
+        assert_eq!(
+            fsm.local_capabilities(), &updated,
+            "set_capabilities must update the FSM's local capability set"
+        );
     }
 
     /// `SpawnedSessionHandle::stop` sends `SessionCommand::Stop` and the session
