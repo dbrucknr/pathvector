@@ -4,6 +4,46 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-20
+
+### [pathvectord] Cross-UPDATE NLRI coalescing in outbound pipeline
+
+Implements RFC 4271 §9.2: "the speaker SHOULD try to combine as many feasible routes as
+possible in the UPDATE messages."
+
+**Mechanism** — `DaemonState` now accumulates outbound `PrefixDecision`s in per-peer
+`pending_decisions` / `pending_decisions_v6` buffers instead of calling `flush_updates`
+immediately on each `on_route_update`. The event loop drains all immediately-available
+events via `try_recv` after each initial `recv`, then calls `flush_pending` once when the
+channel goes quiet. `flush_updates` sees the combined set of decisions across all buffered
+route updates and packs NLRIs sharing the same attribute set into single UPDATE messages.
+
+**Correctness fixes applied during review:**
+- gRPC-facing mutation methods (`originate_routes`, `withdraw_originated_routes`,
+  `set_import_default`) self-flush via `flush_pending()` at the end of each method, so
+  routes originated or policies changed via gRPC are sent immediately without waiting for
+  the next BGP event.
+- The MRAI timer arm now calls `flush_pending()` after `flush_mrai_pending()` because
+  `flush_mrai_pending` calls `propagate_to_all_peers` which buffers; without the second
+  flush, MRAI-released routes would be delayed until the next event loop iteration.
+- `on_fib_change` propagation is flushed in the `fib_changed` event loop arm.
+- Mandatory attribute errors detected in the batch-drain loop (RFC 4271 §6.3) are now
+  handled correctly: `flush_pending` is called for other peers, then `SessionCommand::Notification`
+  is sent to the erroring peer before resuming the outer event loop.
+- Peer termination (`on_terminated` and `remove_peer`) clears both `pending_decisions` and
+  `pending_decisions_v6` so terminated sessions never receive stale decisions.
+
+**Tests added:**
+- `flush_pending_coalesces_multi_update_burst` — two `on_route_update` calls with identical
+  attributes produce a single outbound UPDATE message for the receiving peer (not two).
+- `flush_pending_clears_on_terminated` — buffered decisions for a terminated peer are
+  discarded and not sent.
+
+All 443 existing tests updated to call `flush_pending()` where they previously relied on
+immediate channel writes.
+
+---
+
 ## 2026-06-19 (continued, 3)
 
 ### [pathvectord, pathvector-e2e] `next_hop_self` e2e test + `peer_bgp_ids` race window fix

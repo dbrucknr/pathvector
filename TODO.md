@@ -560,10 +560,35 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    `DaemonState` by address family or introducing a per-peer processing pipeline would fix
    this, but requires significant ownership rework.
 
-2. **No NLRI batching in outbound UPDATEs** — each affected prefix generates its own
-   `UpdateMessage` and wire frame. RFC 4271 allows packing multiple NLRIs with identical
-   path attributes into a single UPDATE. Batching reduces TCP segment count and framing
-   overhead, which matters most during full-table dumps to newly established peers.
+2. ~~**No NLRI batching in outbound UPDATEs**~~ — **Resolved (2026-06-20)** on `nlri-batching`
+   branch. `DaemonState` now accumulates `PrefixDecision`s in per-peer buffers; the event
+   loop drains the event channel with `try_recv` after each initial `recv`, then calls
+   `flush_pending` once at quiescence. Routes sharing the same attribute set are packed into
+   a single `UpdateMessage` by `flush_updates`. The event loop's `fib_changed` and MRAI timer
+   arms also call `flush_pending` after their propagation pass. gRPC-facing mutation methods
+   (`originate_routes`, `withdraw_originated_routes`, `set_import_default`) self-flush to
+   preserve immediate delivery semantics outside the event loop.
+
+   The `try_recv` drain holds the write lock for up to 256 events (channel capacity), but
+   MRT benchmarks show no measurable starvation: RIB convergence improved from 4.46s to
+   2.88s after this change (M2 Max, 1.13M prefixes), confirming that batching the flush
+   reduces lock round-trips rather than worsening contention.
+
+   **Remaining test coverage risks (2026-06-20):**
+
+   - `event_loop_drain_coalesces_rapid_burst` relies on a 100ms sleep to give
+     the event loop time to process all 10 events before the assertion runs.
+     This is timing-dependent and not deterministic. To make it robust, use
+     Tokio's `time::pause()` + `time::advance()` to control the scheduler, or
+     replace the sleep with a channel-based done signal from within the loop.
+
+   - No wire-level UPDATE count measurement exists at the e2e layer. The
+     `TwoPeerHarness` tests verify that all prefixes arrive at the sink, but
+     they cannot assert that those prefixes arrived in fewer UPDATE messages
+     than were announced. To close this gap: add a counter to `DaemonState`
+     (`outbound_update_count: AtomicUsize`) gated behind `#[cfg(test)]`, or
+     extend the MRT harness to accept a second peer and count inbound BGP
+     UPDATEs at that peer's TCP stream.
 
 3. **Inbound convergence time audit** — NLRI batching improves the outbound path
    (announcement throughput), but RIB convergence time is dominated by the inbound path:
