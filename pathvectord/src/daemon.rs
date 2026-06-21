@@ -813,7 +813,11 @@ impl DaemonState {
         // participate in the GR restart window (capability present for EOR only).
         let peer_gr_time = peer_capabilities.iter().find_map(|c| {
             if let Capability::GracefulRestart { restart_time, .. } = c {
-                if *restart_time > 0 { Some(*restart_time) } else { None }
+                if *restart_time > 0 {
+                    Some(*restart_time)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -887,9 +891,9 @@ impl DaemonState {
 
         // RFC 4724: update gr_capable_peers from the peer's advertised capability.
         // Done here after update_tx is fully consumed to avoid borrow conflicts.
-        let we_advertise_gr: bool = self.config_capabilities.iter().any(|c| {
-            matches!(c, Capability::GracefulRestart { restart_time, .. } if *restart_time > 0)
-        });
+        let we_advertise_gr: bool = self.config_capabilities.iter().any(
+            |c| matches!(c, Capability::GracefulRestart { restart_time, .. } if *restart_time > 0),
+        );
         {
             let rib = self.rib_mut();
             if let Some(t) = peer_gr_time {
@@ -2156,7 +2160,7 @@ where
                 hold_time,
                 graceful_restart_time: cfg.daemon.graceful_restart_time,
                 configured_restarting: cfg.daemon.restarting,
-                startup_instant: daemon_start,  // R-bit expires after graceful_restart_time secs
+                startup_instant: daemon_start, // R-bit expires after graceful_restart_time secs
             },
             peer_store,
         ));
@@ -2235,7 +2239,11 @@ fn build_local_capabilities(
     // Set when we are the restarting speaker within the restart window so peers
     // know to stop their stale-route timers when our session re-establishes.
     // Only meaningful when graceful_restart_time > 0.
-    let restart_flags: u8 = if restarting && graceful_restart_time > 0 { 0x08 } else { 0x00 };
+    let restart_flags: u8 = if restarting && graceful_restart_time > 0 {
+        0x08
+    } else {
+        0x00
+    };
     // RFC 4724 §3: F-bit (forwarding_preserved) indicates our FIB is intact.
     // When we are restarting (R=1), run_with() has just deleted stale RTPROT_BGP
     // routes, so our FIB is NOT intact — F must be false.
@@ -10809,11 +10817,7 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
-            async fn set_capabilities(
-                &self,
-                _caps: Vec<pathvector_session::message::Capability>,
-            ) {
-            }
+            async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
@@ -10974,11 +10978,7 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
-            async fn set_capabilities(
-                &self,
-                _caps: Vec<pathvector_session::message::Capability>,
-            ) {
-            }
+            async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
@@ -11059,11 +11059,7 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
-            async fn set_capabilities(
-                &self,
-                _caps: Vec<pathvector_session::message::Capability>,
-            ) {
-            }
+            async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
         let peer_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
@@ -11139,11 +11135,7 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
-            async fn set_capabilities(
-                &self,
-                _caps: Vec<pathvector_session::message::Capability>,
-            ) {
-            }
+            async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
         let peer_ip: Ipv4Addr = "10.0.1.2".parse().unwrap();
@@ -11423,11 +11415,7 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
-            async fn set_capabilities(
-                &self,
-                _caps: Vec<pathvector_session::message::Capability>,
-            ) {
-            }
+            async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
         let global_hold_time: u16 = 180;
@@ -11672,11 +11660,7 @@ mod event_loop_tests {
                 _rr: pathvector_session::message::RouteRefreshMessage,
             ) {
             }
-            async fn set_capabilities(
-                &self,
-                _caps: Vec<pathvector_session::message::Capability>,
-            ) {
-            }
+            async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
         let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
@@ -12991,7 +12975,8 @@ mod test_build_local_capabilities {
     #[test]
     fn test_build_local_capabilities_gr_disabled() {
         let caps = build_local_capabilities(65001, 0, false);
-        let (flags, time, families) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        let (flags, time, families) =
+            find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(flags, 0);
         assert_eq!(time, 0, "restart_time must be 0 when GR is disabled");
         assert!(families.is_empty(), "no families when restart_time = 0");
@@ -13000,23 +12985,37 @@ mod test_build_local_capabilities {
     #[test]
     fn test_build_local_capabilities_gr_enabled() {
         let caps = build_local_capabilities(65001, 120, false);
-        let (flags, time, families) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        let (flags, time, families) =
+            find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(flags, 0, "R-bit must not be set on normal startup");
         assert_eq!(time, 120);
         assert_eq!(families.len(), 2);
-        let v4 = families.iter().find(|f| f.afi_safi == AfiSafi::IPV4_UNICAST)
+        let v4 = families
+            .iter()
+            .find(|f| f.afi_safi == AfiSafi::IPV4_UNICAST)
             .expect("IPv4 unicast family must be present");
-        assert!(v4.forwarding_preserved, "IPv4 must have forwarding_preserved=true");
-        let v6 = families.iter().find(|f| f.afi_safi == AfiSafi::IPV6_UNICAST)
+        assert!(
+            v4.forwarding_preserved,
+            "IPv4 must have forwarding_preserved=true"
+        );
+        let v6 = families
+            .iter()
+            .find(|f| f.afi_safi == AfiSafi::IPV6_UNICAST)
             .expect("IPv6 unicast family must be present");
-        assert!(v6.forwarding_preserved, "IPv6 must have forwarding_preserved=true");
+        assert!(
+            v6.forwarding_preserved,
+            "IPv6 must have forwarding_preserved=true"
+        );
     }
 
     #[test]
     fn test_build_local_capabilities_gr_clamps_at_4095() {
         let caps = build_local_capabilities(65001, u16::MAX, false);
         let (_, time, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
-        assert_eq!(time, 4095, "restart_time must be clamped to RFC 4724 maximum of 4095");
+        assert_eq!(
+            time, 4095,
+            "restart_time must be clamped to RFC 4724 maximum of 4095"
+        );
     }
 
     /// RFC 4724 §3: when restarting, F-bit must be false — our FIB was deleted on
@@ -13053,7 +13052,11 @@ mod test_build_local_capabilities {
     fn test_build_local_capabilities_r_bit_set_when_restarting() {
         let caps = build_local_capabilities(65001, 120, true);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
-        assert_eq!(flags & 0x08, 0x08, "R-bit must be set when restarting = true");
+        assert_eq!(
+            flags & 0x08,
+            0x08,
+            "R-bit must be set when restarting = true"
+        );
     }
 
     /// RFC 4724 §3: when `restarting = false` (normal startup), the R-bit must
@@ -13062,7 +13065,11 @@ mod test_build_local_capabilities {
     fn test_build_local_capabilities_r_bit_clear_on_normal_startup() {
         let caps = build_local_capabilities(65001, 120, false);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
-        assert_eq!(flags & 0x08, 0x00, "R-bit must not be set on normal startup");
+        assert_eq!(
+            flags & 0x08,
+            0x00,
+            "R-bit must not be set on normal startup"
+        );
     }
 
     /// RFC 4724 §3: R-bit must be ignored (stay 0x00) when `graceful_restart_time = 0`
@@ -13071,10 +13078,18 @@ mod test_build_local_capabilities {
     fn test_build_local_capabilities_r_bit_ignored_when_gr_disabled() {
         let caps = build_local_capabilities(65001, 0, true);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
-        assert_eq!(flags & 0x08, 0x00, "R-bit must not be set when graceful_restart_time = 0");
+        assert_eq!(
+            flags & 0x08,
+            0x00,
+            "R-bit must not be set when graceful_restart_time = 0"
+        );
     }
 
-    fn spawn_cfg(gr_time: u16, configured_restarting: bool, age: std::time::Duration) -> SpawnConfig {
+    fn spawn_cfg(
+        gr_time: u16,
+        configured_restarting: bool,
+        age: std::time::Duration,
+    ) -> SpawnConfig {
         SpawnConfig {
             local_as: 65001,
             local_bgp_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
@@ -13091,7 +13106,11 @@ mod test_build_local_capabilities {
         let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(10));
         let caps = cfg.capabilities();
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
-        assert_eq!(flags & 0x08, 0x08, "R-bit must be set while within the 120 s restart window");
+        assert_eq!(
+            flags & 0x08,
+            0x08,
+            "R-bit must be set while within the 120 s restart window"
+        );
     }
 
     /// After the restart window expires, SpawnConfig::capabilities() must clear R=0.
@@ -13101,7 +13120,11 @@ mod test_build_local_capabilities {
         let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(130));
         let caps = cfg.capabilities();
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
-        assert_eq!(flags & 0x08, 0x00, "R-bit must be cleared after the 120 s restart window expires");
+        assert_eq!(
+            flags & 0x08,
+            0x00,
+            "R-bit must be cleared after the 120 s restart window expires"
+        );
     }
 
     /// configured_restarting=false must always yield R=0, regardless of elapsed time.
@@ -13110,7 +13133,11 @@ mod test_build_local_capabilities {
         let cfg = spawn_cfg(120, false, std::time::Duration::from_secs(5));
         let caps = cfg.capabilities();
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
-        assert_eq!(flags & 0x08, 0x00, "R-bit must not be set when configured_restarting=false");
+        assert_eq!(
+            flags & 0x08,
+            0x00,
+            "R-bit must not be set when configured_restarting=false"
+        );
     }
 }
 
@@ -13142,7 +13169,11 @@ mod test_gr_peer_capability {
     fn extract_gr_time(caps: &[Capability]) -> Option<u16> {
         caps.iter().find_map(|c| {
             if let Capability::GracefulRestart { restart_time, .. } = c {
-                if *restart_time > 0 { Some(*restart_time) } else { None }
+                if *restart_time > 0 {
+                    Some(*restart_time)
+                } else {
+                    None
+                }
             } else {
                 None
             }

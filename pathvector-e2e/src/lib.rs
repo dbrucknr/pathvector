@@ -1456,10 +1456,7 @@ impl Harness {
     ///
     /// See the struct-level documentation.
     pub async fn new_gr_restarting(restart_secs: u16) -> Self {
-        Self::new_inner(move |peers| {
-            write_daemon_config_gr_restarting(peers, restart_secs)
-        })
-        .await
+        Self::new_inner(move |peers| write_daemon_config_gr_restarting(peers, restart_secs)).await
     }
 
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
@@ -1544,8 +1541,7 @@ impl Harness {
 
         // Discover pathvectord's container IP so tests can reference it as a
         // GoBGP neighbor address (GoBGP keys its neighbor table by source IP).
-        let pathvectord_ip =
-            container_network_ip(&pathvectord_container_id, &network_name);
+        let pathvectord_ip = container_network_ip(&pathvectord_container_id, &network_name);
 
         Self {
             _gobgpd: gobgpd,
@@ -1624,8 +1620,7 @@ impl Harness {
             .expect("BGP session did not reach Established within 30 s");
 
         let pathvectord_container_id = pathvectord.id().to_owned();
-        let pathvectord_ip =
-            container_network_ip(&pathvectord_container_id, &network_name);
+        let pathvectord_ip = container_network_ip(&pathvectord_container_id, &network_name);
 
         Self {
             _gobgpd: gobgpd,

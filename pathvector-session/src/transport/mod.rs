@@ -272,7 +272,10 @@ impl SessionHandle for SpawnedSessionHandle {
     }
 
     async fn set_capabilities(&self, caps: Vec<crate::message::Capability>) {
-        let _ = self.cmd_tx.send(SessionCommand::SetCapabilities(caps)).await;
+        let _ = self
+            .cmd_tx
+            .send(SessionCommand::SetCapabilities(caps))
+            .await;
     }
 }
 
@@ -1531,16 +1534,18 @@ mod tests {
         });
 
         assert!(!fsm.is_established(), "FSM must start non-Established");
-        assert_eq!(fsm.local_capabilities(), &initial, "initial caps must match config");
+        assert_eq!(
+            fsm.local_capabilities(),
+            &initial,
+            "initial caps must match config"
+        );
 
-        let updated = vec![
-            Capability::FourByteAsn(65001),
-            Capability::ExtendedMessage,
-        ];
+        let updated = vec![Capability::FourByteAsn(65001), Capability::ExtendedMessage];
         fsm.set_capabilities(updated.clone());
 
         assert_eq!(
-            fsm.local_capabilities(), &updated,
+            fsm.local_capabilities(),
+            &updated,
             "set_capabilities must update the FSM's local capability set"
         );
     }

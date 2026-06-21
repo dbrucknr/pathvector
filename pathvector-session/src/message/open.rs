@@ -569,8 +569,11 @@ mod tests {
         };
 
         let roundtripped = roundtrip(&open);
-        let Capability::GracefulRestart { restart_time, families, .. } =
-            &roundtripped.capabilities[0]
+        let Capability::GracefulRestart {
+            restart_time,
+            families,
+            ..
+        } = &roundtripped.capabilities[0]
         else {
             panic!("expected GracefulRestart capability");
         };
@@ -731,10 +734,10 @@ mod tests {
     fn build_open_bytes(opt_params: &[u8]) -> Vec<u8> {
         let opt_len = opt_params.len() as u8;
         let mut v = Vec::new();
-        v.push(4);       // version
+        v.push(4); // version
         v.extend_from_slice(&65001u16.to_be_bytes()); // my_as
-        v.extend_from_slice(&90u16.to_be_bytes());    // hold_time
-        v.extend_from_slice(&[10, 0, 0, 1]);          // bgp_id
+        v.extend_from_slice(&90u16.to_be_bytes()); // hold_time
+        v.extend_from_slice(&[10, 0, 0, 1]); // bgp_id
         v.push(opt_len);
         v.extend_from_slice(opt_params);
         v

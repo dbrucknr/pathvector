@@ -386,9 +386,7 @@ async fn gr_helper_gobgp_holds_routes_during_restart_window() {
     // We wait up to restart_time + 10 s for GoBGP to clean up.
     wait_for_gobgp_rib_withdrawn(&h.gobgpd_id, "192.0.2.0/24", Duration::from_secs(45))
         .await
-        .expect(
-            "GoBGP must withdraw 192.0.2.0/24 after the 30 s GR restart window expires",
-        );
+        .expect("GoBGP must withdraw 192.0.2.0/24 after the 30 s GR restart window expires");
 }
 
 /// RFC 4724 §3 — Without `graceful_restart_time` (default 0), GoBGP must
@@ -447,7 +445,14 @@ async fn gr_r_bit_set_in_open_when_restarting() {
     // Query GoBGP's neighbor state to confirm GR capability was negotiated.
     let gobgp_peer_addr = h.pathvectord_ip.to_string();
     let out = Command::new("docker")
-        .args(["exec", &h.gobgpd_id, "gobgp", "neighbor", &gobgp_peer_addr, "-j"])
+        .args([
+            "exec",
+            &h.gobgpd_id,
+            "gobgp",
+            "neighbor",
+            &gobgp_peer_addr,
+            "-j",
+        ])
         .output()
         .expect("gobgp neighbor -j");
     let json = String::from_utf8_lossy(&out.stdout);
@@ -478,7 +483,14 @@ async fn gr_r_bit_not_set_in_open_when_not_restarting() {
 
     let gobgp_peer_addr = h.pathvectord_ip.to_string();
     let out = Command::new("docker")
-        .args(["exec", &h.gobgpd_id, "gobgp", "neighbor", &gobgp_peer_addr, "-j"])
+        .args([
+            "exec",
+            &h.gobgpd_id,
+            "gobgp",
+            "neighbor",
+            &gobgp_peer_addr,
+            "-j",
+        ])
         .output()
         .expect("gobgp neighbor -j");
     let json = String::from_utf8_lossy(&out.stdout);
