@@ -3603,7 +3603,15 @@ mod tests {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &v6_caps, None);
+        state.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
 
         // IPv4 EOR: minimum-length UPDATE.
         let ipv4_eor = receivers
@@ -6820,9 +6828,10 @@ mod tests {
         let mut route_received = false;
         while let Ok(m) = rx.try_recv() {
             let has_announced_nlri = !m.announced.is_empty();
-            let has_mp_reach = m.attributes.iter().any(
-                |a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()),
-            );
+            let has_mp_reach = m
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()));
             if has_announced_nlri || has_mp_reach {
                 route_received = true;
             }
@@ -8723,9 +8732,10 @@ mod tests {
         let mut route_received = false;
         while let Ok(m) = rx.try_recv() {
             let has_announced_nlri = !m.announced.is_empty();
-            let has_mp_reach = m.attributes.iter().any(
-                |a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()),
-            );
+            let has_mp_reach = m
+                .attributes
+                .iter()
+                .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()));
             if has_announced_nlri || has_mp_reach {
                 route_received = true;
             }
@@ -9267,7 +9277,11 @@ mod stall_tests {
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
         state.rib_insert_v4(
             src,
-            base_route("10.0.0.0/8", "10.0.0.9".parse().unwrap(), PeerType::External),
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
         );
 
         // The dump fills the single slot; EOR try_send fails → stall.
@@ -9296,11 +9310,23 @@ mod stall_tests {
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
         state.rib_insert_v4(
             src,
-            base_route("10.0.0.0/8", "10.0.0.9".parse().unwrap(), PeerType::External),
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
         );
 
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &v6_caps, None);
+        state.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
 
         assert!(
             state.stalled_peers.contains(&peer_ip),
@@ -9321,11 +9347,23 @@ mod stall_tests {
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
         state.rib_insert_v4(
             src,
-            base_route("10.0.0.0/8", "10.0.0.9".parse().unwrap(), PeerType::External),
+            base_route(
+                "10.0.0.0/8",
+                "10.0.0.9".parse().unwrap(),
+                PeerType::External,
+            ),
         );
 
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &v6_caps, None);
+        state.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
 
         assert!(
             !state.stalled_peers.contains(&peer_ip),
@@ -12340,10 +12378,11 @@ mod run_with_tests {
             let (update_tx, update_rx) = mpsc::channel(8);
             let (stop_tx, stop_rx) = mpsc::channel(8);
             let started = Arc::new(AtomicBool::new(false));
-            peers_clone
-                .lock()
-                .unwrap()
-                .push(MockPeerWithStop { event_tx, stop_rx, _update_rx: update_rx });
+            peers_clone.lock().unwrap().push(MockPeerWithStop {
+                event_tx,
+                stop_rx,
+                _update_rx: update_rx,
+            });
             MockSessionHandle {
                 event_rx,
                 update_tx,
@@ -12666,10 +12705,7 @@ mod eor_receive_tests {
 
         state.on_route_update(PEER_IP, ipv4_eor());
 
-        let ari_len = state
-            .adj_ribs_in
-            .get(&PEER_IP)
-            .map_or(0, |ari| ari.len());
+        let ari_len = state.adj_ribs_in.get(&PEER_IP).map_or(0, |ari| ari.len());
         assert_eq!(ari_len, 0, "EOR must not insert a route into Adj-RIB-In");
     }
 

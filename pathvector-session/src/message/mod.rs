@@ -364,8 +364,8 @@ mod tests {
     fn test_ipv6_eor_roundtrip() {
         // RFC 4724 §2: for non-IPv4 families the EOR is an UPDATE carrying
         // an empty MP_UNREACH_NLRI for the relevant <AFI, SAFI>.
-        use pathvector_types::AfiSafi;
         use crate::message::MpUnreachNlri;
+        use pathvector_types::AfiSafi;
         let eor = BgpMessage::Update(UpdateMessage {
             withdrawn: vec![],
             attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
@@ -385,8 +385,8 @@ mod tests {
     fn test_ipv6_eor_has_no_ipv4_content() {
         // The IPv6 EOR must not carry any IPv4 withdrawn or announced NLRIs —
         // only the MP_UNREACH_NLRI path attribute.
-        use pathvector_types::AfiSafi;
         use crate::message::MpUnreachNlri;
+        use pathvector_types::AfiSafi;
         let eor = BgpMessage::Update(UpdateMessage {
             withdrawn: vec![],
             attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
@@ -398,9 +398,19 @@ mod tests {
         .encode();
         let decoded = BgpMessage::decode(&eor).unwrap();
         if let BgpMessage::Update(u) = decoded {
-            assert!(u.withdrawn.is_empty(), "IPv6 EOR must have no IPv4 withdrawn NLRIs");
-            assert!(u.announced.is_empty(), "IPv6 EOR must have no IPv4 announced NLRIs");
-            assert_eq!(u.attributes.len(), 1, "IPv6 EOR must carry exactly one path attribute");
+            assert!(
+                u.withdrawn.is_empty(),
+                "IPv6 EOR must have no IPv4 withdrawn NLRIs"
+            );
+            assert!(
+                u.announced.is_empty(),
+                "IPv6 EOR must have no IPv4 announced NLRIs"
+            );
+            assert_eq!(
+                u.attributes.len(),
+                1,
+                "IPv6 EOR must carry exactly one path attribute"
+            );
             assert!(
                 matches!(
                     &u.attributes[0],
