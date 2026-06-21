@@ -9207,6 +9207,88 @@ mod stall_tests {
         );
     }
 
+    // ── EOR stall regressions ─────────────────────────────────────────────────
+
+    /// If the channel is full exactly when the IPv4 EOR would be sent (the dump
+    /// itself succeeded), the peer must be stalled and eventually stopped.
+    ///
+    /// Scenario: capacity-1 channel, one route in the Loc-RIB.  The dump
+    /// consumes the sole slot.  The IPv4 EOR `try_send` then fails, which must
+    /// push `peer_ip` onto `stalled_peers`.
+    #[test]
+    fn eor_stall_when_channel_full_after_dump() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _receivers) = make_capped(&[(peer_ip, 1)], 1);
+
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.rib_insert_v4(
+            src,
+            base_route("10.0.0.0/8", "10.0.0.9".parse().unwrap(), PeerType::External),
+        );
+
+        // The dump fills the single slot; EOR try_send fails → stall.
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        assert!(
+            state.stalled_peers.contains(&peer_ip),
+            "peer must be stalled when the channel is full at EOR time"
+        );
+    }
+
+    /// If the IPv4 EOR succeeds but the channel is then full for the IPv6 EOR,
+    /// the peer must still be stalled.
+    ///
+    /// Scenario: capacity-2 channel, one route in the Loc-RIB, peer supports
+    /// IPv6.  Slot 1 = the IPv4 dump UPDATE.  Slot 2 = the IPv4 EOR.  The
+    /// IPv6 EOR `try_send` has no slot and fails → stall.
+    #[test]
+    fn eor_stall_when_ipv6_eor_fails_after_ipv4_eor_succeeds() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        // Capacity 2: slot 1 = IPv4 dump, slot 2 = IPv4 EOR.
+        // The IPv6 EOR has no slot and must trigger the stall path.
+        let (mut state, _receivers) = make_capped(&[(peer_ip, 2)], 2);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.rib_insert_v4(
+            src,
+            base_route("10.0.0.0/8", "10.0.0.9".parse().unwrap(), PeerType::External),
+        );
+
+        let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &v6_caps, None);
+
+        assert!(
+            state.stalled_peers.contains(&peer_ip),
+            "peer must be stalled when IPv6 EOR cannot be sent after successful IPv4 EOR"
+        );
+    }
+
+    /// When the channel has enough capacity for the dump AND both EORs, the
+    /// peer must NOT be stalled.  This is the happy-path complement to the two
+    /// stall tests above.
+    #[test]
+    fn eor_no_stall_when_channel_has_capacity_for_dump_and_eors() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        // Capacity 3: slot 1 = IPv4 dump, slot 2 = IPv4 EOR, slot 3 = IPv6 EOR.
+        let (mut state, _receivers) = make_capped(&[(peer_ip, 3)], 3);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
+        state.rib_insert_v4(
+            src,
+            base_route("10.0.0.0/8", "10.0.0.9".parse().unwrap(), PeerType::External),
+        );
+
+        let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &v6_caps, None);
+
+        assert!(
+            !state.stalled_peers.contains(&peer_ip),
+            "peer must not be stalled when the channel has room for the dump and both EORs"
+        );
+    }
+
     // ── set_export_default propagation loop ───────────────────────────────────
 
     #[test]

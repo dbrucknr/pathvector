@@ -1,10 +1,12 @@
 //! End-to-end tests for BGP session lifecycle.
 //!
 //! RFC 4271 §8 — BGP finite state machine.
+//! RFC 4724 §2 — End-of-RIB marker acceptance.
 //! Scenarios covered:
 //!   - Session reaches Established (OPEN + KEEPALIVE exchange)
 //!   - Peer state fields are populated correctly after establishment
 //!   - list_peers returns the correct peer
+//!   - Session stays Established after the EOR marker is sent (GoBGP did not reject it)
 
 use std::time::Duration;
 
@@ -130,5 +132,65 @@ async fn wait_for_route_withdrawn_respects_deadline() {
     assert!(
         result.unwrap().is_err(),
         "wait_for_route_withdrawn should return Err on deadline, not Ok"
+    );
+}
+
+// ── RFC 4724 §2 — End-of-RIB acceptance ──────────────────────────────────────
+//
+// Strategy: GoBGP sends a NOTIFICATION and drops the session if it receives a
+// malformed UPDATE (including a malformed EOR).  These tests verify that the
+// session stays Established several seconds after it was first reached — strong
+// evidence that GoBGP accepted our EOR without resetting.
+
+/// RFC 4724 §2 — An empty-RIB EOR (minimum-length UPDATE, 23 bytes) must be
+/// accepted by GoBGP without causing a NOTIFICATION or session reset.
+///
+/// This is the simplest EOR scenario: pathvectord has nothing to dump, so the
+/// first and only message after KEEPALIVE is the IPv4 EOR.
+#[tokio::test]
+async fn eor_on_empty_rib_does_not_cause_session_reset() {
+    let mut h = Harness::new().await;
+
+    // Harness::new() already waited for Established.  Wait an additional 3 s
+    // and re-check — if GoBGP rejected the EOR it would have sent a
+    // NOTIFICATION and the session would have dropped by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let peer = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+    assert_eq!(
+        peer.session_state,
+        pathvector_client::types::SessionState::Established,
+        "session must remain Established after the IPv4 EOR — GoBGP rejected it (NOTIFICATION)"
+    );
+}
+
+/// RFC 4724 §2 — A non-empty-RIB full-table dump followed by an EOR must
+/// be accepted by GoBGP without causing a session reset.
+///
+/// GoBGP pre-announces a route so that pathvectord's Adj-RIB-Out is non-empty.
+/// After the dump and EOR, the route must be visible in pathvectord's Loc-RIB
+/// AND the session must still be Established.
+#[tokio::test]
+async fn eor_after_full_table_dump_does_not_cause_session_reset() {
+    let mut h = Harness::new().await;
+
+    // Pre-announce a route so the dump sends at least one UPDATE before the EOR.
+    h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
+
+    // Wait for pathvectord to receive the route — this confirms the session is
+    // active and the dump UPDATE was accepted.
+    wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("10.0.0.0/8 did not appear in pathvectord's Loc-RIB within 10 s");
+
+    // Wait another 3 s then verify Established — gives GoBGP time to process
+    // and potentially reject a malformed EOR.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let peer = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+    assert_eq!(
+        peer.session_state,
+        pathvector_client::types::SessionState::Established,
+        "session must remain Established after a full-table dump + EOR — GoBGP rejected the EOR"
     );
 }
