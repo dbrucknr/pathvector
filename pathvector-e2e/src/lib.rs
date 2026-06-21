@@ -570,6 +570,49 @@ pub fn write_gobgp_config_md5(pathvectord_ip: &str, key: &str) -> NamedTempFile 
     f
 }
 
+/// Writes a pathvectord config with `graceful_restart_time` set.
+///
+/// Identical to [`write_daemon_config`] but adds `graceful_restart_time` to the
+/// `[daemon]` stanza so pathvectord advertises the GracefulRestart capability with
+/// forwarding-preserved families.  Used to verify that upstream peers hold our
+/// routes during the restart window (RFC 4724 §3 helper role).
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_gr(peers: &[(Ipv4Addr, u32)], restart_time: u16) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord GR config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+"#
+    )
+    .expect("write pathvectord GR config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord GR peer config");
+    }
+    f
+}
+
 /// Writes a pathvectord config with TCP MD5 authentication on every peer.
 ///
 /// Identical to `write_daemon_config` but adds `md5_password = "<key>"`
@@ -1338,11 +1381,27 @@ impl Harness {
         Self::new_inner(write_daemon_config_no_policy).await
     }
 
+    /// Stand up pathvectord with `graceful_restart_time` set.
+    ///
+    /// Identical to [`Self::new`] except pathvectord advertises the
+    /// GracefulRestart capability with `restart_time = restart_secs` and both
+    /// IPv4/IPv6 unicast families marked `forwarding_preserved`.
+    ///
+    /// Use this harness for RFC 4724 §3 helper-role tests that verify the
+    /// upstream peer holds our routes during a restart window.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr(restart_secs: u16) -> Self {
+        Self::new_inner(move |peers| write_daemon_config_gr(peers, restart_secs)).await
+    }
+
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
     ///
-    /// `make_cfg` is the config-writing function that produces the pathvectord
-    /// TOML.  The caller chooses the policy variant.
-    async fn new_inner(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+    /// `make_cfg` is the config-writing function (or closure) that produces the
+    /// pathvectord TOML.  The caller chooses the policy / feature variant.
+    async fn new_inner(make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
@@ -1434,7 +1493,7 @@ impl Harness {
     /// Like [`new_inner`] but creates the Docker network with `--ipv6` so that
     /// containers receive link-local IPv6 addresses.  Required for tests that
     /// use `gobgp_link_local_v6()` as a BGP next-hop.
-    async fn new_inner_v6(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+    async fn new_inner_v6(make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
