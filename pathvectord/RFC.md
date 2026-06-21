@@ -114,9 +114,13 @@ registry lives in `pathvector-types`.
 | IPv4 EOR (minimum-length UPDATE) sent after full-table dump | `src/outbound.rs`, `src/daemon.rs` | ✅ | `test_on_established_empty_rib_sends_eor_only`, `test_on_established_sends_full_table_dump` |
 | IPv6 EOR (empty MP_UNREACH_NLRI for IPv6 unicast) sent for v6-capable peers | `src/outbound.rs`, `src/daemon.rs` | ✅ | `test_on_established_ipv6_capable_peer_receives_both_eors` |
 | EOR skipped when channel stalls (session will be torn down) | `src/daemon.rs` | ✅ | stall handling path in `on_established` |
-| EOR receive-side: detect peer EOR and act on it | — | ❌ | — |
+| EOR receive-side: detect peer IPv4 EOR (empty UPDATE) and record it | `src/daemon.rs` | ✅ | `test_ipv4_eor_received_is_recorded`, `eor_ipv4_received_from_gobgp_is_recorded` |
+| EOR receive-side: detect peer IPv6 EOR (empty MP_UNREACH_NLRI) and record it | `src/daemon.rs` | ✅ | `test_ipv6_eor_received_is_recorded` |
+| EOR receive state cleared on session termination / re-establishment | `src/daemon.rs` | ✅ | `test_eor_state_cleared_on_termination`, `test_eor_state_cleared_on_re_establish` |
+| EOR state exposed via management API (`eor_ipv4_received`, `eor_ipv6_received`) | `src/grpc.rs`, `proto/` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded`, `eor_ipv4_received_persists_after_route_churn` |
+| GracefulRestart capability advertised so peers send EOR (RFC 4724 §3) | `src/daemon.rs` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded` |
 
-**Deferred:** EOR receive-side (detecting when a peer sends us EOR, updating convergence state) requires changes to `pathvector-session` FSM and `on_route_update` in the daemon.
+**Deferred:** Stale-route timer (RFC 4724 §4.2 — hold stale routes during restart window, then diff-and-prune) and FSM-level graceful restart detection.
 
 ---
 

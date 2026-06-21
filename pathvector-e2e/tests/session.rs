@@ -135,12 +135,14 @@ async fn wait_for_route_withdrawn_respects_deadline() {
     );
 }
 
-// ── RFC 4724 §2 — End-of-RIB acceptance ──────────────────────────────────────
+// ── RFC 4724 §2 — End-of-RIB send and receive ────────────────────────────────
 //
-// Strategy: GoBGP sends a NOTIFICATION and drops the session if it receives a
-// malformed UPDATE (including a malformed EOR).  These tests verify that the
-// session stays Established several seconds after it was first reached — strong
-// evidence that GoBGP accepted our EOR without resetting.
+// Send-side strategy: GoBGP sends a NOTIFICATION and drops the session if it
+// receives a malformed UPDATE (including a malformed EOR). Tests verify the
+// session stays Established after we send our EOR.
+//
+// Receive-side strategy: GoBGP also sends an EOR to us after its initial table
+// dump. Tests verify pathvectord records the EOR and exposes it via PeerState.
 
 /// RFC 4724 §2 — An empty-RIB EOR (minimum-length UPDATE, 23 bytes) must be
 /// accepted by GoBGP without causing a NOTIFICATION or session reset.
@@ -192,5 +194,71 @@ async fn eor_after_full_table_dump_does_not_cause_session_reset() {
         peer.session_state,
         pathvector_client::types::SessionState::Established,
         "session must remain Established after a full-table dump + EOR — GoBGP rejected the EOR"
+    );
+}
+
+/// RFC 4724 §2 receive-side — GoBGP sends us an IPv4 EOR after establishing
+/// the session.  pathvectord must detect it and expose `eor_ipv4_received = true`
+/// in the management API.
+///
+/// GoBGP sends its EOR very quickly after Established (its RIB is empty at
+/// session start), so we just need to allow a short settling window.
+#[tokio::test]
+async fn eor_ipv4_received_from_gobgp_is_recorded() {
+    let mut h = Harness::new().await;
+
+    // Give GoBGP a moment to send its EOR after the session reaches Established.
+    // GoBGP sends EOR immediately after its initial dump (which is empty here),
+    // so 2 s is more than enough; Established was already confirmed by Harness::new().
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let peer_state = loop {
+        let p = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+        if p.eor_ipv4_received {
+            break p;
+        }
+        if std::time::Instant::now() > deadline {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    assert!(
+        peer_state.eor_ipv4_received,
+        "pathvectord must record GoBGP's IPv4 EOR in PeerState (RFC 4724 §2 receive-side)"
+    );
+}
+
+/// RFC 4724 §2 receive-side — After a route is announced by GoBGP and then
+/// withdrawn, GoBGP still sends an EOR (it sent it right after Established).
+/// This verifies that receiving routes before or after the EOR does not
+/// corrupt the recorded EOR state.
+#[tokio::test]
+async fn eor_ipv4_received_persists_after_route_churn() {
+    let mut h = Harness::new().await;
+
+    // Announce then immediately withdraw so the daemon processes real UPDATEs.
+    h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
+    wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("route must appear before withdrawal test");
+    h.gobgp_withdraw("10.0.0.0/8");
+
+    // Poll for the EOR flag — it should have been set at Established time and
+    // must remain set through the route churn.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let peer_state = loop {
+        let p = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+        if p.eor_ipv4_received {
+            break p;
+        }
+        if std::time::Instant::now() > deadline {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    assert!(
+        peer_state.eor_ipv4_received,
+        "eor_ipv4_received must remain set after route announce/withdraw churn"
     );
 }

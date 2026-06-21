@@ -217,6 +217,8 @@ impl TryFrom<proto::PeerState> for PeerState {
             prefixes_received: p.prefixes_received,
             prefixes_accepted: p.prefixes_accepted,
             prefixes_advertised: p.prefixes_advertised,
+            eor_ipv4_received: p.eor_ipv4_received,
+            eor_ipv6_received: p.eor_ipv6_received,
         })
     }
 }

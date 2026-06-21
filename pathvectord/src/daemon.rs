@@ -175,6 +175,11 @@ pub(crate) struct RibSnapshot {
     /// Used to set `ORIGINATOR_ID` when reflecting routes from a client (RFC 4456
     /// §8). Populated on `Established`; removed on `Terminated`.
     pub(crate) peer_bgp_ids: HashMap<Ipv4Addr, Ipv4Addr>,
+    /// Peers that have sent us an IPv4 End-of-RIB marker (RFC 4724 §2).
+    /// Cleared on session termination. Used to signal initial sync complete.
+    pub(crate) eor_received: HashSet<Ipv4Addr>,
+    /// Peers that have sent us an IPv6 unicast EOR marker (RFC 4724 §2).
+    pub(crate) eor_received_v6: HashSet<Ipv4Addr>,
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -403,6 +408,8 @@ impl DaemonState {
             rr_clients,
             cluster_id,
             peer_bgp_ids: HashMap::new(),
+            eor_received: HashSet::new(),
+            eor_received_v6: HashSet::new(),
         });
 
         Self {
@@ -676,6 +683,9 @@ impl DaemonState {
         // Update snapshot fields.
         {
             let rib = self.rib_mut();
+            // Clear any stale EOR state from a previous session (RFC 4724 §2).
+            rib.eor_received.remove(&peer_ip);
+            rib.eor_received_v6.remove(&peer_ip);
             rib.peer_types.insert(peer_ip, peer_type);
             rib.peer_bgp_ids.insert(peer_ip, peer_bgp_id);
             rib.established_at
@@ -894,6 +904,8 @@ impl DaemonState {
             rib.prefixes_advertised.remove(&peer_ip);
             rib.local_addrs.remove(&peer_ip);
             rib.peer_bgp_ids.remove(&peer_ip);
+            rib.eor_received.remove(&peer_ip);
+            rib.eor_received_v6.remove(&peer_ip);
         }
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
@@ -1065,6 +1077,26 @@ impl DaemonState {
             attrs = msg.attributes.len(),
             "on_route_update called"
         );
+        // RFC 4724 §2 — detect End-of-RIB markers before any other processing.
+        // IPv4 EOR: minimum-length UPDATE (all fields empty).
+        if msg.withdrawn.is_empty() && msg.attributes.is_empty() && msg.announced.is_empty() {
+            tracing::info!(peer = %peer_ip, "received IPv4 End-of-RIB marker (RFC 4724 §2)");
+            Arc::make_mut(&mut self.rib).eor_received.insert(peer_ip);
+            return None;
+        }
+        // IPv6 EOR: UPDATE with only an empty MP_UNREACH_NLRI for IPv6 unicast.
+        if msg.withdrawn.is_empty()
+            && msg.announced.is_empty()
+            && matches!(
+                msg.attributes.as_slice(),
+                [PathAttribute::MpUnreachNlri(m)] if m.afi_safi == AfiSafi::IPV6_UNICAST && m.prefixes.is_empty()
+            )
+        {
+            tracing::info!(peer = %peer_ip, "received IPv6 unicast End-of-RIB marker (RFC 4724 §2)");
+            Arc::make_mut(&mut self.rib).eor_received_v6.insert(peer_ip);
+            return None;
+        }
+
         let peer_id = PeerId::from(peer_ip);
         let peer_type = self
             .rib
@@ -2072,6 +2104,16 @@ where
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
             Capability::FourByteAsn(local_as),
             Capability::ExtendedMessage,
+            // RFC 4724 §3: advertise GracefulRestart so peers (e.g. GoBGP) send
+            // End-of-RIB markers after their initial dump.  restart_time = 0 and
+            // no families means "I support the EOR signalling protocol but do not
+            // preserve forwarding state across restarts." The stale-route timer is
+            // deferred; EOR receive-side detection is fully implemented.
+            Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 0,
+                families: vec![],
+            },
         ];
         let peer_store = cfg
             .sidecar_path
@@ -2318,6 +2360,15 @@ where
         Capability::RouteRefresh,
         Capability::FourByteAsn(local_as),
         Capability::ExtendedMessage,
+        // RFC 4724 §3: advertise GracefulRestart so peers send End-of-RIB
+        // markers after their initial dump.  restart_time = 0 and no families
+        // means "I support EOR signalling but do not preserve forwarding state
+        // across restarts."  The stale-route timer is deferred.
+        Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 0,
+            families: vec![],
+        },
     ];
 
     for peer in &cfg.peers {
@@ -3287,7 +3338,7 @@ mod tests {
 
     /// Builds a `DaemonState` with explicit accept-all policies for every peer.
     /// Returns the state and a map of receivers for asserting on outbound messages.
-    fn make_state(
+    pub(super) fn make_state(
         local_as: u32,
         peers: &[(Ipv4Addr, u32)],
     ) -> (
@@ -12545,5 +12596,145 @@ mod run_with_tests {
         if let Ok(writer) = pathvector_sys::FibWriter::new(254, 20) {
             withdraw_stale_bgp_routes(routes_v4, routes_v6, &writer).await;
         }
+    }
+}
+
+// ── RFC 4724 §2 End-of-RIB receive-side detection tests ──────────────────────
+
+#[cfg(test)]
+mod eor_receive_tests {
+    use std::net::Ipv4Addr;
+
+    use pathvector_session::message::{MpUnreachNlri, PathAttribute, UpdateMessage};
+    use pathvector_types::{AfiSafi, PeerType};
+
+    use super::tests::make_state;
+
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER_AS: u32 = 65002;
+    const LOCAL_AS: u32 = 65001;
+
+    fn establish_peer(state: &mut super::DaemonState) {
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+    }
+
+    fn ipv4_eor() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        }
+    }
+
+    fn ipv6_eor() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                prefixes: vec![],
+            })],
+            announced: vec![],
+        }
+    }
+
+    // Test 1: IPv4 EOR is detected and state is recorded.
+    #[test]
+    fn test_ipv4_eor_received_is_recorded() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        establish_peer(&mut state);
+
+        let result = state.on_route_update(PEER_IP, ipv4_eor());
+        assert!(result.is_none(), "EOR must not return a NOTIFICATION");
+        assert!(
+            state.rib.eor_received.contains(&PEER_IP),
+            "eor_received must contain peer after IPv4 EOR"
+        );
+    }
+
+    // Test 2: IPv6 EOR is detected and state is recorded.
+    #[test]
+    fn test_ipv6_eor_received_is_recorded() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        establish_peer(&mut state);
+
+        let result = state.on_route_update(PEER_IP, ipv6_eor());
+        assert!(result.is_none(), "EOR must not return a NOTIFICATION");
+        assert!(
+            state.rib.eor_received_v6.contains(&PEER_IP),
+            "eor_received_v6 must contain peer after IPv6 EOR"
+        );
+    }
+
+    // Test 3: IPv4 EOR must return early and not insert into Adj-RIB-In.
+    #[test]
+    fn test_ipv4_eor_does_not_insert_route() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        establish_peer(&mut state);
+
+        state.on_route_update(PEER_IP, ipv4_eor());
+
+        let ari_len = state
+            .adj_ribs_in
+            .get(&PEER_IP)
+            .map_or(0, |ari| ari.len());
+        assert_eq!(ari_len, 0, "EOR must not insert a route into Adj-RIB-In");
+    }
+
+    // Test 4: EOR state is cleared when the session terminates.
+    #[test]
+    fn test_eor_state_cleared_on_termination() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        establish_peer(&mut state);
+        state.on_route_update(PEER_IP, ipv4_eor());
+        assert!(state.rib.eor_received.contains(&PEER_IP));
+
+        state.on_terminated(PEER_IP, false);
+
+        assert!(
+            !state.rib.eor_received.contains(&PEER_IP),
+            "eor_received must be cleared after session termination"
+        );
+    }
+
+    // Test 5: An UPDATE with attributes (but no NLRIs) is not an EOR.
+    #[test]
+    fn test_update_with_attributes_is_not_eor() {
+        use pathvector_types::{AsPath, Origin};
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        establish_peer(&mut state);
+
+        // Build an UPDATE that has attributes but no NLRI — NOT an IPv4 EOR.
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::new()),
+                PathAttribute::NextHop("10.0.0.2".parse().unwrap()),
+            ],
+            announced: vec![],
+        };
+        state.on_route_update(PEER_IP, msg);
+
+        assert!(
+            !state.rib.eor_received.contains(&PEER_IP),
+            "UPDATE with attributes must not be recorded as IPv4 EOR"
+        );
+    }
+
+    // Test 6: Stale EOR state from a previous session is cleared on re-establish.
+    #[test]
+    fn test_eor_state_cleared_on_re_establish() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        establish_peer(&mut state);
+        state.on_route_update(PEER_IP, ipv4_eor());
+        assert!(state.rib.eor_received.contains(&PEER_IP));
+
+        // Simulate reconnect without explicit termination by calling on_established again.
+        establish_peer(&mut state);
+
+        assert!(
+            !state.rib.eor_received.contains(&PEER_IP),
+            "eor_received must be cleared on session re-establishment"
+        );
     }
 }

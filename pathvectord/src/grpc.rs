@@ -299,6 +299,8 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
         prefixes_received,
         prefixes_accepted,
         prefixes_advertised,
+        eor_ipv4_received: snap.eor_received.contains(&addr),
+        eor_ipv6_received: snap.eor_received_v6.contains(&addr),
     })
 }
 

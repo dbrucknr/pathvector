@@ -286,6 +286,13 @@ pub fn write_gobgp_config() -> NamedTempFile {
   [peer-groups.transport.config]
     passive-mode = true
 
+  # RFC 4724: enable graceful restart so GoBGP sends End-of-RIB markers
+  # after its initial table dump.  pathvectord parses but defers the stale-
+  # route timer; enabling this on GoBGP's side is harmless for all tests.
+  [peer-groups.graceful-restart.config]
+    enabled      = true
+    restart-time = 120
+
   [[peer-groups.afi-safis]]
     [peer-groups.afi-safis.config]
       afi-safi-name = "ipv4-unicast"
