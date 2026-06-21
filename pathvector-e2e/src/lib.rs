@@ -613,6 +613,52 @@ export_default = "accept"
     f
 }
 
+/// Writes a pathvectord config with `graceful_restart_time` and `restarting = true`.
+///
+/// Identical to [`write_daemon_config_gr`] but also sets `restarting = true` so
+/// pathvectord sets the RFC 4724 §3 Restart State (R) bit in the initial OPEN.
+/// Used to verify that the R-bit is encoded and visible to the peer.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_gr_restarting(
+    peers: &[(Ipv4Addr, u32)],
+    restart_time: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord GR restarting config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+restarting            = true
+"#
+    )
+    .expect("write pathvectord GR restarting config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord GR restarting peer config");
+    }
+    f
+}
+
 /// Writes a pathvectord config with TCP MD5 authentication on every peer.
 ///
 /// Identical to `write_daemon_config` but adds `md5_password = "<key>"`
@@ -1321,6 +1367,10 @@ pub struct Harness {
     /// IP address that gobgpd appears as to pathvectord (its container IP on
     /// the shared Docker network).  Used in tests that assert `route.peer_address`.
     pub peer: Ipv4Addr,
+    /// IP address that pathvectord appears as to gobgpd (its container IP on
+    /// the shared Docker network).  Used to query `gobgp neighbor <addr>` from
+    /// inside the gobgpd container.
+    pub pathvectord_ip: Ipv4Addr,
     // Dropped LAST so the network outlives the containers using it.
     _network: DockerNetwork,
 }
@@ -1395,6 +1445,21 @@ impl Harness {
     /// See the struct-level documentation.
     pub async fn new_gr(restart_secs: u16) -> Self {
         Self::new_inner(move |peers| write_daemon_config_gr(peers, restart_secs)).await
+    }
+
+    /// Stand up pathvectord with `graceful_restart_time` set and `restarting = true`.
+    ///
+    /// Like [`Self::new_gr`] but also sets the RFC 4724 §3 Restart State (R) bit
+    /// in the initial OPEN.  Use this to verify that GoBGP observes R=1 from us.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr_restarting(restart_secs: u16) -> Self {
+        Self::new_inner(move |peers| {
+            write_daemon_config_gr_restarting(peers, restart_secs)
+        })
+        .await
     }
 
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
@@ -1477,6 +1542,11 @@ impl Harness {
 
         let pathvectord_container_id = pathvectord.id().to_owned();
 
+        // Discover pathvectord's container IP so tests can reference it as a
+        // GoBGP neighbor address (GoBGP keys its neighbor table by source IP).
+        let pathvectord_ip =
+            container_network_ip(&pathvectord_container_id, &network_name);
+
         Self {
             _gobgpd: gobgpd,
             _pathvectord: pathvectord,
@@ -1486,6 +1556,7 @@ impl Harness {
             _pathvectord_config: pathvectord_config,
             client,
             peer: gobgpd_ip,
+            pathvectord_ip,
             _network: network,
         }
     }
@@ -1553,6 +1624,8 @@ impl Harness {
             .expect("BGP session did not reach Established within 30 s");
 
         let pathvectord_container_id = pathvectord.id().to_owned();
+        let pathvectord_ip =
+            container_network_ip(&pathvectord_container_id, &network_name);
 
         Self {
             _gobgpd: gobgpd,
@@ -1563,6 +1636,7 @@ impl Harness {
             _pathvectord_config: pathvectord_config,
             client,
             peer: gobgpd_ip,
+            pathvectord_ip,
             _network: network,
         }
     }
