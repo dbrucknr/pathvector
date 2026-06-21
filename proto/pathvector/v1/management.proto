@@ -177,6 +177,13 @@ message PeerState {
   uint32 prefixes_accepted = 9;
   /// Routes currently being advertised to this peer (Adj-RIB-Out size).
   uint32 prefixes_advertised = 10;
+  /// True once we have received the peer's End-of-RIB marker for IPv4 unicast
+  /// (RFC 4724 §2). False before the initial table sync is complete or if the
+  /// session is not Established.
+  bool eor_ipv4_received = 11;
+  /// True once we have received the peer's End-of-RIB marker for IPv6 unicast
+  /// (RFC 4724 §2).
+  bool eor_ipv6_received = 12;
 }
 
 /// Event type for WatchPeers stream.

@@ -123,6 +123,13 @@ pub struct PeerState {
     pub prefixes_accepted: u32,
     /// Routes currently being advertised to this peer (Adj-RIB-Out size).
     pub prefixes_advertised: u32,
+    /// True once we have received the peer's End-of-RIB marker for IPv4 unicast
+    /// (RFC 4724 §2). False before the initial table sync is complete or if the
+    /// session is not Established.
+    pub eor_ipv4_received: bool,
+    /// True once we have received the peer's End-of-RIB marker for IPv6 unicast
+    /// (RFC 4724 §2).
+    pub eor_ipv6_received: bool,
 }
 
 /// A single BGP route with all path attributes.

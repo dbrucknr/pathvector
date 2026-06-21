@@ -1,10 +1,12 @@
 //! End-to-end tests for BGP session lifecycle.
 //!
 //! RFC 4271 §8 — BGP finite state machine.
+//! RFC 4724 §2 — End-of-RIB marker acceptance.
 //! Scenarios covered:
 //!   - Session reaches Established (OPEN + KEEPALIVE exchange)
 //!   - Peer state fields are populated correctly after establishment
 //!   - list_peers returns the correct peer
+//!   - Session stays Established after the EOR marker is sent (GoBGP did not reject it)
 
 use std::time::Duration;
 
@@ -130,5 +132,133 @@ async fn wait_for_route_withdrawn_respects_deadline() {
     assert!(
         result.unwrap().is_err(),
         "wait_for_route_withdrawn should return Err on deadline, not Ok"
+    );
+}
+
+// ── RFC 4724 §2 — End-of-RIB send and receive ────────────────────────────────
+//
+// Send-side strategy: GoBGP sends a NOTIFICATION and drops the session if it
+// receives a malformed UPDATE (including a malformed EOR). Tests verify the
+// session stays Established after we send our EOR.
+//
+// Receive-side strategy: GoBGP also sends an EOR to us after its initial table
+// dump. Tests verify pathvectord records the EOR and exposes it via PeerState.
+
+/// RFC 4724 §2 — An empty-RIB EOR (minimum-length UPDATE, 23 bytes) must be
+/// accepted by GoBGP without causing a NOTIFICATION or session reset.
+///
+/// This is the simplest EOR scenario: pathvectord has nothing to dump, so the
+/// first and only message after KEEPALIVE is the IPv4 EOR.
+#[tokio::test]
+async fn eor_on_empty_rib_does_not_cause_session_reset() {
+    let h = Harness::new().await;
+
+    // Harness::new() already waited for Established.  Wait an additional 3 s
+    // and re-check — if GoBGP rejected the EOR it would have sent a
+    // NOTIFICATION and the session would have dropped by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let peer = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+    assert_eq!(
+        peer.session_state,
+        pathvector_client::types::SessionState::Established,
+        "session must remain Established after the IPv4 EOR — GoBGP rejected it (NOTIFICATION)"
+    );
+}
+
+/// RFC 4724 §2 — A non-empty-RIB full-table dump followed by an EOR must
+/// be accepted by GoBGP without causing a session reset.
+///
+/// GoBGP pre-announces a route so that pathvectord's Adj-RIB-Out is non-empty.
+/// After the dump and EOR, the route must be visible in pathvectord's Loc-RIB
+/// AND the session must still be Established.
+#[tokio::test]
+async fn eor_after_full_table_dump_does_not_cause_session_reset() {
+    let mut h = Harness::new().await;
+
+    // Pre-announce a route so the dump sends at least one UPDATE before the EOR.
+    h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
+
+    // Wait for pathvectord to receive the route — this confirms the session is
+    // active and the dump UPDATE was accepted.
+    wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("10.0.0.0/8 did not appear in pathvectord's Loc-RIB within 10 s");
+
+    // Wait another 3 s then verify Established — gives GoBGP time to process
+    // and potentially reject a malformed EOR.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let peer = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+    assert_eq!(
+        peer.session_state,
+        pathvector_client::types::SessionState::Established,
+        "session must remain Established after a full-table dump + EOR — GoBGP rejected the EOR"
+    );
+}
+
+/// RFC 4724 §2 receive-side — GoBGP sends us an IPv4 EOR after establishing
+/// the session.  pathvectord must detect it and expose `eor_ipv4_received = true`
+/// in the management API.
+///
+/// GoBGP sends its EOR very quickly after Established (its RIB is empty at
+/// session start), so we just need to allow a short settling window.
+#[tokio::test]
+async fn eor_ipv4_received_from_gobgp_is_recorded() {
+    let h = Harness::new().await;
+
+    // Give GoBGP a moment to send its EOR after the session reaches Established.
+    // GoBGP sends EOR immediately after its initial dump (which is empty here),
+    // so 2 s is more than enough; Established was already confirmed by Harness::new().
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let peer_state = loop {
+        let p = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+        if p.eor_ipv4_received {
+            break p;
+        }
+        if std::time::Instant::now() > deadline {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    assert!(
+        peer_state.eor_ipv4_received,
+        "pathvectord must record GoBGP's IPv4 EOR in PeerState (RFC 4724 §2 receive-side)"
+    );
+}
+
+/// RFC 4724 §2 receive-side — After a route is announced by GoBGP and then
+/// withdrawn, GoBGP still sends an EOR (it sent it right after Established).
+/// This verifies that receiving routes before or after the EOR does not
+/// corrupt the recorded EOR state.
+#[tokio::test]
+async fn eor_ipv4_received_persists_after_route_churn() {
+    let mut h = Harness::new().await;
+
+    // Announce then immediately withdraw so the daemon processes real UPDATEs.
+    h.gobgp_announce("10.0.0.0/8", "10.0.0.1");
+    wait_for_route(&mut h.client, "10.0.0.0/8", Duration::from_secs(10))
+        .await
+        .expect("route must appear before withdrawal test");
+    h.gobgp_withdraw("10.0.0.0/8");
+
+    // Poll for the EOR flag — it should have been set at Established time and
+    // must remain set through the route churn.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let peer_state = loop {
+        let p = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+        if p.eor_ipv4_received {
+            break p;
+        }
+        if std::time::Instant::now() > deadline {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    assert!(
+        peer_state.eor_ipv4_received,
+        "eor_ipv4_received must remain set after route announce/withdraw churn"
     );
 }

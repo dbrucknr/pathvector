@@ -321,6 +321,109 @@ mod tests {
         assert_eq!(roundtrip(&msg), msg);
     }
 
+    // ── EOR wire encoding ─────────────────────────────────────────────────────
+    //
+    // RFC 4724 §2: the IPv4 End-of-RIB marker is a minimum-length UPDATE (23
+    // bytes).  The IPv6 EOR is an UPDATE carrying an empty MP_UNREACH_NLRI for
+    // IPv6 unicast.  We verify both the byte-count and the roundtrip so that a
+    // codec change can't silently produce a malformed EOR that would cause the
+    // remote peer to send a NOTIFICATION.
+
+    #[test]
+    fn test_ipv4_eor_encodes_to_23_bytes() {
+        // RFC 4271 §4.3: minimum UPDATE = 19-byte header + 2-byte withdrawn_len
+        // + 2-byte total_attr_len = 23 bytes.  An all-empty UPDATE IS that
+        // minimum; a receiver MUST treat it as End-of-RIB per RFC 4724 §2.
+        let eor = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        });
+        assert_eq!(
+            eor.encode().len(),
+            23,
+            "IPv4 EOR must be the minimum-length UPDATE (23 bytes per RFC 4271 §4.3)"
+        );
+    }
+
+    #[test]
+    fn test_ipv4_eor_roundtrip() {
+        let eor = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        });
+        assert_eq!(
+            roundtrip(&eor),
+            eor,
+            "IPv4 EOR must survive encode→decode unchanged"
+        );
+    }
+
+    #[test]
+    fn test_ipv6_eor_roundtrip() {
+        // RFC 4724 §2: for non-IPv4 families the EOR is an UPDATE carrying
+        // an empty MP_UNREACH_NLRI for the relevant <AFI, SAFI>.
+        use crate::message::MpUnreachNlri;
+        use pathvector_types::AfiSafi;
+        let eor = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                prefixes: vec![],
+            })],
+            announced: vec![],
+        });
+        assert_eq!(
+            roundtrip(&eor),
+            eor,
+            "IPv6 EOR must survive encode→decode unchanged"
+        );
+    }
+
+    #[test]
+    fn test_ipv6_eor_has_no_ipv4_content() {
+        // The IPv6 EOR must not carry any IPv4 withdrawn or announced NLRIs —
+        // only the MP_UNREACH_NLRI path attribute.
+        use crate::message::MpUnreachNlri;
+        use pathvector_types::AfiSafi;
+        let eor = BgpMessage::Update(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                prefixes: vec![],
+            })],
+            announced: vec![],
+        })
+        .encode();
+        let decoded = BgpMessage::decode(&eor).unwrap();
+        if let BgpMessage::Update(u) = decoded {
+            assert!(
+                u.withdrawn.is_empty(),
+                "IPv6 EOR must have no IPv4 withdrawn NLRIs"
+            );
+            assert!(
+                u.announced.is_empty(),
+                "IPv6 EOR must have no IPv4 announced NLRIs"
+            );
+            assert_eq!(
+                u.attributes.len(),
+                1,
+                "IPv6 EOR must carry exactly one path attribute"
+            );
+            assert!(
+                matches!(
+                    &u.attributes[0],
+                    PathAttribute::MpUnreachNlri(m) if m.afi_safi == AfiSafi::IPV6_UNICAST && m.prefixes.is_empty()
+                ),
+                "IPv6 EOR attribute must be empty MP_UNREACH_NLRI for IPv6 unicast: {:?}",
+                u.attributes[0]
+            );
+        } else {
+            panic!("decoded message is not an UPDATE: {decoded:?}");
+        }
+    }
+
     #[test]
     fn test_notification_roundtrip() {
         let msg = BgpMessage::Notification(NotificationMessage {

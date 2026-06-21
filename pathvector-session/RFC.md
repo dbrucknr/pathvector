@@ -202,10 +202,10 @@ The FSM restart behavior is deferred.
 | GracefulRestart capability (code 64) parsed from OPEN | `src/message/` | ✅ | `test_capability_graceful_restart_parsed` |
 | Capability forwarded to `SessionInfo` for upper layers | `src/fsm/mod.rs` | ✅ | `test_session_info_carries_graceful_restart` |
 | Stale timer: retain routes for restart-time seconds during restart | `src/fsm/mod.rs` | ❌ | — |
-| EOR (End-of-RIB) marker: empty UPDATE sent after RIB dump | `src/message/` | ❌ | — |
+| EOR (End-of-RIB) marker: empty UPDATE sent after RIB dump | — | ✅ | Owned by `pathvectord` — see `pathvectord/RFC.md` |
 
-**Deferred:** FSM restart behavior (detecting peer restart, activating stale timer, sending
-EOR) requires coordination with `pathvector-rib` and is deferred.
+**Deferred:** FSM restart behavior (detecting peer restart, activating stale timer) requires
+coordination with `pathvector-rib` and is deferred. EOR send-side is implemented in `pathvectord`.
 
 ---
 

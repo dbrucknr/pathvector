@@ -4,6 +4,24 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-06-21
+
+### [pathvectord] End-of-RIB marker (RFC 4724 §2)
+
+After each full-table dump on session establishment, `on_established` now sends:
+- An **IPv4 EOR** — a minimum-length UPDATE (empty withdrawn, empty attributes, empty announced) — to all peers
+- An **IPv6 EOR** — an UPDATE carrying an empty `MP_UNREACH_NLRI` for IPv6 unicast — to peers that negotiated the IPv6 Multiprotocol capability
+
+EOR is skipped (and the session is stalled) if the channel is full during the dump.
+
+**Implementation:** `send_eor_ipv4` and `send_eor_ipv6` in `outbound.rs`; wired into `on_established` in `daemon.rs` with stall-guard.
+
+**Test coverage:** 3 new dedicated tests — `test_on_established_empty_rib_sends_eor_only`, `test_on_established_sends_full_table_dump` (extended to verify EOR follows dump), `test_on_established_ipv6_capable_peer_receives_both_eors`. Existing test suite updated to drain EOR messages that now appear in setup phase.
+
+**Deferred:** EOR receive-side (detecting peer EOR to signal convergence) requires session-layer changes.
+
+---
+
 ## 2026-06-20
 
 ### [pathvectord] Cross-UPDATE NLRI coalescing in outbound pipeline
