@@ -361,6 +361,8 @@ mod tests {
             prefixes_received: 0,
             prefixes_accepted: 0,
             prefixes_advertised: 0,
+            eor_ipv4_received: false,
+            eor_ipv6_received: false,
         }
     }
 

@@ -51,6 +51,8 @@ fn proto_peer() -> ProtoPeerState {
         prefixes_received: 10,
         prefixes_accepted: 8,
         prefixes_advertised: 5,
+        eor_ipv4_received: false,
+        eor_ipv6_received: false,
     }
 }
 

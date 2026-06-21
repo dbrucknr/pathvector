@@ -151,7 +151,7 @@ async fn wait_for_route_withdrawn_respects_deadline() {
 /// first and only message after KEEPALIVE is the IPv4 EOR.
 #[tokio::test]
 async fn eor_on_empty_rib_does_not_cause_session_reset() {
-    let mut h = Harness::new().await;
+    let h = Harness::new().await;
 
     // Harness::new() already waited for Established.  Wait an additional 3 s
     // and re-check — if GoBGP rejected the EOR it would have sent a
@@ -205,7 +205,7 @@ async fn eor_after_full_table_dump_does_not_cause_session_reset() {
 /// session start), so we just need to allow a short settling window.
 #[tokio::test]
 async fn eor_ipv4_received_from_gobgp_is_recorded() {
-    let mut h = Harness::new().await;
+    let h = Harness::new().await;
 
     // Give GoBGP a moment to send its EOR after the session reaches Established.
     // GoBGP sends EOR immediately after its initial dump (which is empty here),

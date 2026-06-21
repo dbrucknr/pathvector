@@ -858,12 +858,11 @@ impl DaemonState {
         // RFC 4724 §2: send End-of-RIB marker after the full-table dump so
         // the peer knows the initial Adj-RIB-Out snapshot is complete.
         // Skip if the channel stalled — the session will be torn down anyway.
-        if !stalled {
-            if !send_eor_ipv4(update_tx) {
-                self.stalled_peers.push(peer_ip);
-            } else if peer_supports_ipv6 && !send_eor_ipv6(update_tx) {
-                self.stalled_peers.push(peer_ip);
-            }
+        if !stalled
+            && (!send_eor_ipv4(update_tx)
+                || (peer_supports_ipv6 && !send_eor_ipv6(update_tx)))
+        {
+            self.stalled_peers.push(peer_ip);
         }
 
         self.sync_advertised(peer_ip);
@@ -10307,8 +10306,8 @@ mod event_loop_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
 
         // Give peer_b a channel of capacity 1 so it stalls during propagation.
-        let (update_tx_a, _update_rx_a) = mpsc::channel::<UpdateMessage>(64);
-        let (update_tx_b, mut update_rx_b) = mpsc::channel::<UpdateMessage>(1);
+        let (update_tx_a, _) = mpsc::channel::<UpdateMessage>(64);
+        let (stall_tx, mut stall_drain) = mpsc::channel::<UpdateMessage>(1);
         let (sess_stop_a, _sess_stop_rx_a) = mpsc::channel::<SessionCommand>(8);
         let (sess_stop_b, mut cmd_rx_b) = mpsc::channel::<SessionCommand>(8);
 
@@ -10342,7 +10341,7 @@ mod event_loop_tests {
         ];
         let mut update_senders = HashMap::new();
         update_senders.insert(peer_a, update_tx_a);
-        update_senders.insert(peer_b, update_tx_b);
+        update_senders.insert(peer_b, stall_tx);
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -10366,7 +10365,7 @@ mod event_loop_tests {
 
         // Drain the EOR marker that on_established sent to peer_b (RFC 4724 §2)
         // so the capacity-1 channel is empty before we pre-fill it below.
-        while update_rx_b.try_recv().is_ok() {}
+        while stall_drain.try_recv().is_ok() {}
 
         // Pre-fill peer_b's cap-1 UPDATE channel so the propagation try_send fails.
         {
@@ -12364,7 +12363,7 @@ mod run_with_tests {
         stop_rx: mpsc::Receiver<SessionCommand>,
         /// Keep the update receiver alive so `try_send` on the update channel
         /// does not fail with `TrySendError::Closed` when the EOR is sent.
-        _update_rx: mpsc::Receiver<UpdateMessage>,
+        update_rx: mpsc::Receiver<UpdateMessage>,
     }
 
     fn make_mock_spawn_capturing_stop() -> (
@@ -12381,7 +12380,7 @@ mod run_with_tests {
             peers_clone.lock().unwrap().push(MockPeerWithStop {
                 event_tx,
                 stop_rx,
-                _update_rx: update_rx,
+                update_rx,
             });
             MockSessionHandle {
                 event_rx,
@@ -12431,7 +12430,7 @@ mod run_with_tests {
         let (event_tx, stop_rx, _update_rx) = {
             let mut guard = peers.lock().unwrap();
             let p = guard.pop().expect("one peer spawned");
-            (p.event_tx, p.stop_rx, p._update_rx)
+            (p.event_tx, p.stop_rx, p.update_rx)
         };
 
         // Establish the session so the daemon has peer state.
@@ -12705,7 +12704,7 @@ mod eor_receive_tests {
 
         state.on_route_update(PEER_IP, ipv4_eor());
 
-        let ari_len = state.adj_ribs_in.get(&PEER_IP).map_or(0, |ari| ari.len());
+        let ari_len = state.adj_ribs_in.get(&PEER_IP).map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(ari_len, 0, "EOR must not insert a route into Adj-RIB-In");
     }
 
