@@ -17,9 +17,9 @@ use pathvector_rib::{
 };
 use pathvector_session::{
     message::{
-        Capability, CeaseError, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri, MpUnreachNlri,
-        NotificationError, NotificationMessage, PathAttribute, Prefix, UpdateMessage,
-        UpdateMsgError, encode_shutdown_message,
+        Capability, CeaseError, GracefulRestartFamily, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri,
+        MpUnreachNlri, NotificationError, NotificationMessage, PathAttribute, Prefix,
+        UpdateMessage, UpdateMsgError, encode_shutdown_message,
     },
     transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
 };
@@ -2097,7 +2097,7 @@ where
         let state_cmd = Arc::clone(&state);
         let stop_cmd = Arc::clone(&stop_senders);
         let incoming_cmd = Arc::clone(&incoming_senders);
-        let local_caps = build_local_capabilities(local_as);
+        let local_caps = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time);
         let peer_store = cfg
             .sidecar_path
             .as_ref()
@@ -2147,21 +2147,35 @@ struct SpawnConfig {
 ///
 /// Called from both peer registration paths (static config and runtime AddPeer)
 /// so they always advertise identical capabilities.
-fn build_local_capabilities(local_as: u32) -> Vec<Capability> {
+fn build_local_capabilities(local_as: u32, graceful_restart_time: u16) -> Vec<Capability> {
+    // RFC 4724 §3: when restart_time > 0, advertise forwarding-preserved families
+    // so peers hold our routes during our restart window.  When 0, advertise an
+    // empty family list — peers still send EOR markers but withdraw our routes
+    // immediately on session loss.
+    let gr_families = if graceful_restart_time > 0 {
+        vec![
+            GracefulRestartFamily {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                forwarding_preserved: true,
+            },
+            GracefulRestartFamily {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                forwarding_preserved: true,
+            },
+        ]
+    } else {
+        vec![]
+    };
     vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
         Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         Capability::RouteRefresh,
         Capability::FourByteAsn(local_as),
         Capability::ExtendedMessage,
-        // RFC 4724 §3: advertise GracefulRestart so peers send End-of-RIB
-        // markers after their initial dump.  restart_time = 0 and no families
-        // means "I support EOR signalling but do not preserve forwarding state
-        // across restarts."  The stale-route timer is deferred.
         Capability::GracefulRestart {
             restart_flags: 0,
-            restart_time: 0,
-            families: vec![],
+            restart_time: graceful_restart_time.min(4095),
+            families: gr_families,
         },
     ]
 }
@@ -2360,7 +2374,7 @@ where
     // md5_passwords: shared with the listener for TCP MD5SIG setup.
     let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    let local_capabilities = build_local_capabilities(local_as);
+    let local_capabilities = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time);
 
     for peer in &cfg.peers {
         let session_cfg = SessionConfig {
@@ -12140,6 +12154,7 @@ mod run_with_tests {
                 cluster_id: None,
                 fib_table: 254,
                 fib_metric: 20,
+                graceful_restart_time: 0,
             },
             peers: peer_ips
                 .iter()
@@ -12766,5 +12781,60 @@ mod eor_receive_tests {
             !state.rib.eor_received.contains(&PEER_IP),
             "eor_received must be cleared on session re-establishment"
         );
+    }
+}
+
+// ── build_local_capabilities — RFC 4724 §3 graceful restart advertisement ────
+
+#[cfg(test)]
+mod test_build_local_capabilities {
+    use super::*;
+    use pathvector_session::message::{Capability, GracefulRestartFamily};
+    use pathvector_types::AfiSafi;
+
+    fn find_gr(caps: &[Capability]) -> Option<(u8, u16, Vec<GracefulRestartFamily>)> {
+        caps.iter().find_map(|c| {
+            if let Capability::GracefulRestart {
+                restart_flags,
+                restart_time,
+                families,
+            } = c
+            {
+                Some((*restart_flags, *restart_time, families.clone()))
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn test_build_local_capabilities_gr_disabled() {
+        let caps = build_local_capabilities(65001, 0);
+        let (flags, time, families) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        assert_eq!(flags, 0);
+        assert_eq!(time, 0, "restart_time must be 0 when GR is disabled");
+        assert!(families.is_empty(), "no families when restart_time = 0");
+    }
+
+    #[test]
+    fn test_build_local_capabilities_gr_enabled() {
+        let caps = build_local_capabilities(65001, 120);
+        let (flags, time, families) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        assert_eq!(flags, 0, "R-bit must not be set on normal startup");
+        assert_eq!(time, 120);
+        assert_eq!(families.len(), 2);
+        let v4 = families.iter().find(|f| f.afi_safi == AfiSafi::IPV4_UNICAST)
+            .expect("IPv4 unicast family must be present");
+        assert!(v4.forwarding_preserved, "IPv4 must have forwarding_preserved=true");
+        let v6 = families.iter().find(|f| f.afi_safi == AfiSafi::IPV6_UNICAST)
+            .expect("IPv6 unicast family must be present");
+        assert!(v6.forwarding_preserved, "IPv6 must have forwarding_preserved=true");
+    }
+
+    #[test]
+    fn test_build_local_capabilities_gr_clamps_at_4095() {
+        let caps = build_local_capabilities(65001, u16::MAX);
+        let (_, time, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        assert_eq!(time, 4095, "restart_time must be clamped to RFC 4724 maximum of 4095");
     }
 }

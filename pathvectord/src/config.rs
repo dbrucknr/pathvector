@@ -118,6 +118,30 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default = "default_fib_metric")]
     pub fib_metric: u32,
+    /// RFC 4724 §3: how long (in seconds) peers should hold our routes if our
+    /// BGP session drops unexpectedly.
+    ///
+    /// When non-zero, pathvectord advertises the GracefulRestart capability with
+    /// this restart time and marks IPv4/IPv6 unicast families as
+    /// `forwarding_preserved`. The upstream peer will retain our routes for up to
+    /// this many seconds after an unclean session loss, giving pathvectord time to
+    /// reconnect and re-announce without causing a route flap.
+    ///
+    /// Set to `0` (the default) to disable forwarding-state advertisement.  Peers
+    /// will still receive the GracefulRestart capability (required for EOR
+    /// signalling) but will withdraw our routes immediately on session loss.
+    ///
+    /// The RFC 4724 maximum encodable value is 4095 seconds; larger values are
+    /// silently clamped. Recommended range for DDoS blackhole use: 120–300.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as              = 65001
+    /// bgp_id                = "10.0.0.1"
+    /// graceful_restart_time = 120
+    /// ```
+    #[serde(default)]
+    pub graceful_restart_time: u16,
 }
 
 fn default_fib_table() -> u32 {

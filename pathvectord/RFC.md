@@ -103,10 +103,11 @@ registry lives in `pathvector-types`.
 
 ---
 
-## RFC 4724 §2 — End-of-RIB Marker (Send Side)
+## RFC 4724 §2/§3 — End-of-RIB Marker + Graceful Restart Helper Role
 
-**Owns:** Sending the EOR marker after the initial full-table dump on session establishment.  
-**Boundary:** Stale-route timer and FSM restart detection are deferred (owned by `pathvector-session`).  
+**Owns:** EOR send/receive; GracefulRestart capability advertisement including forwarding-state
+preservation (helper role — telling peers to hold our routes on restart).  
+**Boundary:** Stale-route timer (speaker role) and FSM restart detection deferred to Phase 2.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724
 
 | Requirement | File | Status | Verified by |
@@ -118,9 +119,12 @@ registry lives in `pathvector-types`.
 | EOR receive-side: detect peer IPv6 EOR (empty MP_UNREACH_NLRI) and record it | `src/daemon.rs` | ✅ | `test_ipv6_eor_received_is_recorded` |
 | EOR receive state cleared on session termination / re-establishment | `src/daemon.rs` | ✅ | `test_eor_state_cleared_on_termination`, `test_eor_state_cleared_on_re_establish` |
 | EOR state exposed via management API (`eor_ipv4_received`, `eor_ipv6_received`) | `src/grpc.rs`, `proto/` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded`, `eor_ipv4_received_persists_after_route_churn` |
-| GracefulRestart capability advertised so peers send EOR (RFC 4724 §3) | `src/daemon.rs` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded` |
+| GracefulRestart capability advertised so peers send EOR | `src/daemon.rs` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded` |
+| §3 helper role: advertise `restart_time > 0` + forwarding-preserved families when `graceful_restart_time` is configured | `src/daemon.rs`, `src/config.rs` | ✅ | `test_build_local_capabilities_gr_enabled`, `test_build_local_capabilities_gr_disabled`, `test_build_local_capabilities_gr_clamps_at_4095` |
+| §3 helper role: F-bit correctly encoded in OPEN wire bytes | `pathvector-session/src/message/open.rs` | ✅ | `test_gr_family_forwarding_preserved_roundtrip` |
 
-**Deferred:** Stale-route timer (RFC 4724 §4.2 — hold stale routes during restart window, then diff-and-prune) and FSM-level graceful restart detection.
+**Deferred (Phase 2):** §4.2 speaker role — stale-route retention when a peer restarts
+(`TerminationReason`, `gr_deadlines`, `stale_nlri_v4/v6`, deadline timer in event loop).
 
 ---
 

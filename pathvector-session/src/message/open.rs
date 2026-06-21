@@ -537,4 +537,53 @@ mod tests {
         let roundtripped = roundtrip(&open);
         assert_eq!(roundtripped.capabilities, vec![Capability::ExtendedMessage]);
     }
+
+    /// RFC 4724 §3: the F-bit (`forwarding_preserved`) must survive an encode/decode
+    /// roundtrip.  If it were dropped, the peer would not hold our routes on restart
+    /// even though `restart_time > 0` — a silent protocol failure.
+    #[test]
+    fn test_gr_family_forwarding_preserved_roundtrip() {
+        use pathvector_types::AfiSafi;
+
+        let cap = Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 120,
+            families: vec![
+                GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    forwarding_preserved: true,
+                },
+                GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    forwarding_preserved: false,
+                },
+            ],
+        };
+
+        let open = OpenMessage {
+            version: 4,
+            my_as: 65001,
+            hold_time: 90,
+            bgp_id: "1.2.3.4".parse().unwrap(),
+            capabilities: vec![cap],
+        };
+
+        let roundtripped = roundtrip(&open);
+        let Capability::GracefulRestart { restart_time, families, .. } =
+            &roundtripped.capabilities[0]
+        else {
+            panic!("expected GracefulRestart capability");
+        };
+
+        assert_eq!(*restart_time, 120);
+        assert_eq!(families.len(), 2);
+        assert!(
+            families[0].forwarding_preserved,
+            "IPv4 F-bit must survive encode/decode roundtrip"
+        );
+        assert!(
+            !families[1].forwarding_preserved,
+            "IPv6 F-bit (false) must survive encode/decode roundtrip"
+        );
+    }
 }
