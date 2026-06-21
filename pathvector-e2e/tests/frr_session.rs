@@ -88,7 +88,13 @@ async fn frr_gr_r_bit_set_in_open_when_restarting() {
     // FRR 8.4.x: `show bgp neighbors <addr> json`
     // gracefulRestartInfo.rBit = true iff peer sent R=1 in its OPEN.
     let out = Command::new("docker")
-        .args(["exec", &h.frr_id, "vtysh", "-c", &format!("show bgp neighbors {pv_ip} json")])
+        .args([
+            "exec",
+            &h.frr_id,
+            "vtysh",
+            "-c",
+            &format!("show bgp neighbors {pv_ip} json"),
+        ])
         .output()
         .expect("vtysh show bgp neighbors json");
     let json = String::from_utf8_lossy(&out.stdout);
