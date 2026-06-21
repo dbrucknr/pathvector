@@ -133,7 +133,13 @@ async fn frr_gr_r_bit_cleared_after_restart_window_expires() {
 
     // Phase 1: confirm rBit=true on the initial OPEN.
     let out = Command::new("docker")
-        .args(["exec", &h.frr_id, "vtysh", "-c", &format!("show bgp neighbors {pv_ip} json")])
+        .args([
+            "exec",
+            &h.frr_id,
+            "vtysh",
+            "-c",
+            &format!("show bgp neighbors {pv_ip} json"),
+        ])
         .output()
         .expect("vtysh show bgp neighbors json (initial)");
     let json = String::from_utf8_lossy(&out.stdout);
@@ -148,7 +154,13 @@ async fn frr_gr_r_bit_cleared_after_restart_window_expires() {
     // Phase 3: reset the session from FRR's side.  FRR sends NOTIFICATION+CEASE;
     // pathvectord receives it, fires Terminated, pushes SetCapabilities(R=0).
     Command::new("docker")
-        .args(["exec", &h.frr_id, "vtysh", "-c", &format!("clear bgp {pv_ip}")])
+        .args([
+            "exec",
+            &h.frr_id,
+            "vtysh",
+            "-c",
+            &format!("clear bgp {pv_ip}"),
+        ])
         .status()
         .expect("clear bgp session");
 
@@ -164,7 +176,13 @@ async fn frr_gr_r_bit_cleared_after_restart_window_expires() {
 
     // Phase 5: rBit must be false — the window had expired before reconnect.
     let out = Command::new("docker")
-        .args(["exec", &h.frr_id, "vtysh", "-c", &format!("show bgp neighbors {pv_ip} json")])
+        .args([
+            "exec",
+            &h.frr_id,
+            "vtysh",
+            "-c",
+            &format!("show bgp neighbors {pv_ip} json"),
+        ])
         .output()
         .expect("vtysh show bgp neighbors json (after reconnect)");
     let json = String::from_utf8_lossy(&out.stdout);
