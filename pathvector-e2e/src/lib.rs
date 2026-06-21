@@ -572,7 +572,7 @@ pub fn write_gobgp_config_md5(pathvectord_ip: &str, key: &str) -> NamedTempFile 
 
 /// Writes a pathvectord config with `graceful_restart_time` set.
 ///
-/// Identical to [`write_daemon_config`] but adds `graceful_restart_time` to the
+/// Identical to `write_daemon_config` but adds `graceful_restart_time` to the
 /// `[daemon]` stanza so pathvectord advertises the GracefulRestart capability with
 /// forwarding-preserved families.  Used to verify that upstream peers hold our
 /// routes during the restart window (RFC 4724 §3 helper role).
