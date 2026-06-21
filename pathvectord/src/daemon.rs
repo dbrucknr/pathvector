@@ -859,8 +859,7 @@ impl DaemonState {
         // the peer knows the initial Adj-RIB-Out snapshot is complete.
         // Skip if the channel stalled — the session will be torn down anyway.
         if !stalled
-            && (!send_eor_ipv4(update_tx)
-                || (peer_supports_ipv6 && !send_eor_ipv6(update_tx)))
+            && (!send_eor_ipv4(update_tx) || (peer_supports_ipv6 && !send_eor_ipv6(update_tx)))
         {
             self.stalled_peers.push(peer_ip);
         }
@@ -12704,7 +12703,10 @@ mod eor_receive_tests {
 
         state.on_route_update(PEER_IP, ipv4_eor());
 
-        let ari_len = state.adj_ribs_in.get(&PEER_IP).map_or(0, pathvector_rib::AdjRibIn::len);
+        let ari_len = state
+            .adj_ribs_in
+            .get(&PEER_IP)
+            .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(ari_len, 0, "EOR must not insert a route into Adj-RIB-In");
     }
 
