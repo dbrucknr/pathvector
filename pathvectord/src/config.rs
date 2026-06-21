@@ -142,6 +142,27 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub graceful_restart_time: u16,
+    /// RFC 4724 §3: set the Restart State (R) bit in OPEN messages to signal
+    /// that this daemon is the restarting speaker.
+    ///
+    /// Set this to `true` when restarting pathvectord during an active BGP
+    /// session (e.g., during a planned upgrade or after a crash) so that peers
+    /// stop their stale-route timers immediately when the session re-establishes.
+    /// Leave `false` (the default) on normal first-time startup.
+    ///
+    /// Ignored when `graceful_restart_time = 0`.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as              = 65001
+    /// bgp_id                = "10.0.0.1"
+    /// graceful_restart_time = 120
+    /// restarting            = true   # set only when restarting; remove after
+    /// ```
+    #[serde(default)]
+    pub restarting: bool,
 }
 
 fn default_fib_table() -> u32 {

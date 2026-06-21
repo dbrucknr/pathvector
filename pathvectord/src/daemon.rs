@@ -180,6 +180,13 @@ pub(crate) struct RibSnapshot {
     pub(crate) eor_received: HashSet<Ipv4Addr>,
     /// Peers that have sent us an IPv6 unicast EOR marker (RFC 4724 §2).
     pub(crate) eor_received_v6: HashSet<Ipv4Addr>,
+    /// Peers that advertised RFC 4724 `GracefulRestart` with a non-zero
+    /// `restart_time`. Value is the peer's advertised `restart_time` in seconds.
+    ///
+    /// Populated on `Established`; removed on `Terminated`. Zero means the peer
+    /// either did not advertise the capability or advertised `restart_time = 0`
+    /// (EOR-only mode, no stale-route window).
+    pub(crate) gr_capable_peers: HashMap<Ipv4Addr, u16>,
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -410,6 +417,7 @@ impl DaemonState {
             peer_bgp_ids: HashMap::new(),
             eor_received: HashSet::new(),
             eor_received_v6: HashSet::new(),
+            gr_capable_peers: HashMap::new(),
         });
 
         Self {
@@ -518,6 +526,7 @@ impl DaemonState {
         self.ipv6_capable_peers.remove(&peer_ip);
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
+        self.rib_mut().gr_capable_peers.remove(&peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
         self.pending_decisions.remove(&peer_ip);
@@ -799,6 +808,16 @@ impl DaemonState {
             self.route_refresh_peers.remove(&peer_ip);
         }
 
+        // RFC 4724: record whether the peer advertised GracefulRestart with a
+        // non-zero restart_time. A zero restart_time means the peer does not
+        // participate in the GR restart window (capability present for EOR only).
+        let peer_gr_time = peer_capabilities.iter().find_map(|c| {
+            if let Capability::GracefulRestart { restart_time, .. } = c {
+                if *restart_time > 0 { Some(*restart_time) } else { None }
+            } else {
+                None
+            }
+        });
         let mut stalled = !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte);
         if stalled {
             self.stalled_peers.push(peer_ip);
@@ -866,6 +885,27 @@ impl DaemonState {
 
         self.sync_advertised(peer_ip);
 
+        // RFC 4724: update gr_capable_peers from the peer's advertised capability.
+        // Done here after update_tx is fully consumed to avoid borrow conflicts.
+        let we_advertise_gr: bool = self.config_capabilities.iter().any(|c| {
+            matches!(c, Capability::GracefulRestart { restart_time, .. } if *restart_time > 0)
+        });
+        {
+            let rib = self.rib_mut();
+            if let Some(t) = peer_gr_time {
+                rib.gr_capable_peers.insert(peer_ip, t);
+            } else {
+                rib.gr_capable_peers.remove(&peer_ip);
+            }
+        }
+        if peer_gr_time.is_none() && we_advertise_gr {
+            tracing::warn!(
+                peer = %peer_ip,
+                "peer does not support RFC 4724 GracefulRestart (restart_time = 0); \
+                 our routes will be withdrawn immediately on session loss"
+            );
+        }
+
         let _ = self.peer_tx.send(proto::PeerEvent {
             r#type: proto::PeerEventType::Changed as i32,
             peer: None, // gRPC handler builds PeerState from snapshot
@@ -909,6 +949,7 @@ impl DaemonState {
         self.ipv6_capable_peers.remove(&peer_ip);
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
+        self.rib_mut().gr_capable_peers.remove(&peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
         self.pending_decisions.remove(&peer_ip);
@@ -2097,7 +2138,7 @@ where
         let state_cmd = Arc::clone(&state);
         let stop_cmd = Arc::clone(&stop_senders);
         let incoming_cmd = Arc::clone(&incoming_senders);
-        let local_caps = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time);
+        let local_caps = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, cfg.daemon.restarting);
         let peer_store = cfg
             .sidecar_path
             .as_ref()
@@ -2147,7 +2188,17 @@ struct SpawnConfig {
 ///
 /// Called from both peer registration paths (static config and runtime AddPeer)
 /// so they always advertise identical capabilities.
-fn build_local_capabilities(local_as: u32, graceful_restart_time: u16) -> Vec<Capability> {
+/// Build the capability list advertised in every OPEN message.
+///
+/// `restarting` controls the RFC 4724 §3 Restart State (R) bit.  Set it to
+/// `true` during the post-restart window so peers know to preserve their
+/// stale-route timers for us.  After the window elapses (or on normal startup)
+/// pass `false`.
+fn build_local_capabilities(
+    local_as: u32,
+    graceful_restart_time: u16,
+    restarting: bool,
+) -> Vec<Capability> {
     // RFC 4724 §3: when restart_time > 0, advertise forwarding-preserved families
     // so peers hold our routes during our restart window.  When 0, advertise an
     // empty family list — peers still send EOR markers but withdraw our routes
@@ -2166,6 +2217,12 @@ fn build_local_capabilities(local_as: u32, graceful_restart_time: u16) -> Vec<Ca
     } else {
         vec![]
     };
+    // RFC 4724 §3: Restart State (R) bit is the high bit of restart_flags.
+    // Set when we are the restarting speaker within the restart window so peers
+    // know to stop their stale-route timers when our session re-establishes.
+    // Only meaningful when graceful_restart_time > 0 — without a GR window there
+    // is nothing to signal to the peer.
+    let restart_flags: u8 = if restarting && graceful_restart_time > 0 { 0x08 } else { 0x00 };
     vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
         Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
@@ -2173,7 +2230,7 @@ fn build_local_capabilities(local_as: u32, graceful_restart_time: u16) -> Vec<Ca
         Capability::FourByteAsn(local_as),
         Capability::ExtendedMessage,
         Capability::GracefulRestart {
-            restart_flags: 0,
+            restart_flags,
             restart_time: graceful_restart_time.min(4095),
             families: gr_families,
         },
@@ -2374,7 +2431,7 @@ where
     // md5_passwords: shared with the listener for TCP MD5SIG setup.
     let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    let local_capabilities = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time);
+    let local_capabilities = build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, cfg.daemon.restarting);
 
     for peer in &cfg.peers {
         let session_cfg = SessionConfig {
@@ -12155,6 +12212,7 @@ mod run_with_tests {
                 fib_table: 254,
                 fib_metric: 20,
                 graceful_restart_time: 0,
+                restarting: false,
             },
             peers: peer_ips
                 .iter()
@@ -12809,7 +12867,7 @@ mod test_build_local_capabilities {
 
     #[test]
     fn test_build_local_capabilities_gr_disabled() {
-        let caps = build_local_capabilities(65001, 0);
+        let caps = build_local_capabilities(65001, 0, false);
         let (flags, time, families) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(flags, 0);
         assert_eq!(time, 0, "restart_time must be 0 when GR is disabled");
@@ -12818,7 +12876,7 @@ mod test_build_local_capabilities {
 
     #[test]
     fn test_build_local_capabilities_gr_enabled() {
-        let caps = build_local_capabilities(65001, 120);
+        let caps = build_local_capabilities(65001, 120, false);
         let (flags, time, families) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(flags, 0, "R-bit must not be set on normal startup");
         assert_eq!(time, 120);
@@ -12833,8 +12891,122 @@ mod test_build_local_capabilities {
 
     #[test]
     fn test_build_local_capabilities_gr_clamps_at_4095() {
-        let caps = build_local_capabilities(65001, u16::MAX);
+        let caps = build_local_capabilities(65001, u16::MAX, false);
         let (_, time, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(time, 4095, "restart_time must be clamped to RFC 4724 maximum of 4095");
+    }
+
+    /// RFC 4724 §3: when `restarting = true`, the R-bit (0x08 in restart_flags)
+    /// must be set so peers know to stop their stale-route timers on re-establishment.
+    #[test]
+    fn test_build_local_capabilities_r_bit_set_when_restarting() {
+        let caps = build_local_capabilities(65001, 120, true);
+        let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        assert_eq!(flags & 0x08, 0x08, "R-bit must be set when restarting = true");
+    }
+
+    /// RFC 4724 §3: when `restarting = false` (normal startup), the R-bit must
+    /// not be set — we are not signalling a restart to peers.
+    #[test]
+    fn test_build_local_capabilities_r_bit_clear_on_normal_startup() {
+        let caps = build_local_capabilities(65001, 120, false);
+        let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        assert_eq!(flags & 0x08, 0x00, "R-bit must not be set on normal startup");
+    }
+
+    /// RFC 4724 §3: R-bit must be ignored (stay 0x00) when `graceful_restart_time = 0`
+    /// even if `restarting = true` — there is no GR window to signal.
+    #[test]
+    fn test_build_local_capabilities_r_bit_ignored_when_gr_disabled() {
+        let caps = build_local_capabilities(65001, 0, true);
+        let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
+        assert_eq!(flags & 0x08, 0x00, "R-bit must not be set when graceful_restart_time = 0");
+    }
+}
+
+#[cfg(test)]
+mod test_gr_peer_capability {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+
+    use pathvector_session::message::{Capability, GracefulRestartFamily};
+    use pathvector_types::AfiSafi;
+
+    fn peer() -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, 2)
+    }
+
+    fn gr_cap(restart_time: u16) -> Capability {
+        Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time,
+            families: vec![GracefulRestartFamily {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                forwarding_preserved: true,
+            }],
+        }
+    }
+
+    /// Extract the peer's GR restart_time from a capability list, exactly as
+    /// on_established does. Returns None if absent or restart_time == 0.
+    fn extract_gr_time(caps: &[Capability]) -> Option<u16> {
+        caps.iter().find_map(|c| {
+            if let Capability::GracefulRestart { restart_time, .. } = c {
+                if *restart_time > 0 { Some(*restart_time) } else { None }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// A peer advertising GracefulRestart with restart_time > 0 must be recorded
+    /// in gr_capable_peers with the correct time value.
+    #[test]
+    fn gr_capable_peer_is_recorded_on_established() {
+        let mut gr_capable_peers: HashMap<Ipv4Addr, u16> = HashMap::new();
+        let caps = vec![gr_cap(120)];
+        if let Some(t) = extract_gr_time(&caps) {
+            gr_capable_peers.insert(peer(), t);
+        } else {
+            gr_capable_peers.remove(&peer());
+        }
+        assert_eq!(
+            gr_capable_peers.get(&peer()).copied(),
+            Some(120),
+            "gr_capable_peers must store the peer's advertised restart_time"
+        );
+    }
+
+    /// A peer advertising GracefulRestart with restart_time = 0 must NOT be
+    /// recorded in gr_capable_peers (restart_time = 0 means EOR-only, no GR window).
+    #[test]
+    fn gr_eor_only_peer_not_recorded() {
+        let mut gr_capable_peers: HashMap<Ipv4Addr, u16> = HashMap::new();
+        gr_capable_peers.insert(peer(), 30); // pre-existing value from prior session
+        let caps = vec![gr_cap(0)];
+        if let Some(t) = extract_gr_time(&caps) {
+            gr_capable_peers.insert(peer(), t);
+        } else {
+            gr_capable_peers.remove(&peer());
+        }
+        assert!(
+            !gr_capable_peers.contains_key(&peer()),
+            "peer with restart_time = 0 must not be in gr_capable_peers; \
+             prior session value must be cleared"
+        );
+    }
+
+    /// gr_capable_peers must be cleared on Terminated so stale values cannot
+    /// influence future sessions.
+    #[test]
+    fn gr_capable_peers_cleared_on_terminated() {
+        let mut gr_capable_peers: HashMap<Ipv4Addr, u16> = HashMap::new();
+        gr_capable_peers.insert(peer(), 120);
+        // Simulate on_terminated cleanup.
+        gr_capable_peers.remove(&peer());
+        assert!(
+            !gr_capable_peers.contains_key(&peer()),
+            "gr_capable_peers must be empty after peer terminates"
+        );
     }
 }

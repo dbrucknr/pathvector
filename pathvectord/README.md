@@ -98,6 +98,7 @@ remote_as = 65001
 | `hold_time` | `u16` | `90` | Proposed hold timer in seconds. Negotiated down to the peer's value if lower |
 | `grpc_port` | `u16` | `50051` | TCP port for the gRPC management API, bound on all interfaces |
 | `graceful_restart_time` | `u16` | `0` | Seconds peers should hold our routes after an unclean session loss (RFC 4724 §3). `0` disables forwarding-state advertisement — peers withdraw our routes immediately. See [Graceful Restart](#graceful-restart-rfc-4724) |
+| `restarting` | `bool` | `false` | Set to `true` when restarting pathvectord mid-session to signal the RFC 4724 Restart State (R) bit, so peers stop their stale-route timers as soon as the session re-establishes. Remove after restart. Ignored when `graceful_restart_time = 0` |
 
 ### `[[peers]]` fields
 
@@ -504,13 +505,16 @@ is tracked in TODO.md.
 ### Helper role — preventing route flaps when pathvectord restarts
 
 Configure `graceful_restart_time` to tell upstream peers how long to hold your routes
-if your BGP session drops unexpectedly:
+if your BGP session drops unexpectedly. When restarting pathvectord intentionally, also
+set `restarting = true` so peers stop their stale timers as soon as the session comes
+back up (remove it after the restart):
 
 ```toml
 [daemon]
 local_as              = 65001
 bgp_id                = "10.0.0.1"
 graceful_restart_time = 120   # seconds
+restarting            = true  # RFC 4724 R-bit — remove after restart completes
 ```
 
 With this set, pathvectord advertises the RFC 4724 GracefulRestart capability in its

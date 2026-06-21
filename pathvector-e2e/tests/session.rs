@@ -289,6 +289,40 @@ async fn eor_ipv4_received_persists_after_route_churn() {
 // These tests verify the end-to-end protocol behavior — that the capability
 // we advertise in OPEN actually causes GoBGP to retain our routes.
 
+/// RFC 4724 §3 — After a GR-configured session reaches Established, the
+/// management API must report the peer's `peer_gr_restart_time` matching our
+/// configured `restart_time`.
+///
+/// This closes the loop between "we encode the capability" (unit-tested) and
+/// "GoBGP parsed and reflected it back so we know negotiation succeeded".
+#[tokio::test]
+async fn gr_capability_negotiated_peer_gr_restart_time_reflects_config() {
+    let h = Harness::new_gr(30).await;
+
+    // Harness::new_gr already confirmed Established. Poll PeerState for the
+    // peer_gr_restart_time field — it is set during on_established, which runs
+    // synchronously with session establishment, so it should be available
+    // immediately, but we allow a short window for any async lag.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let peer_state = loop {
+        let p = h.client.clone().get_peer(h.peer.into()).await.unwrap();
+        if p.peer_gr_restart_time > 0 {
+            break p;
+        }
+        if std::time::Instant::now() > deadline {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    assert_eq!(
+        peer_state.peer_gr_restart_time, 30,
+        "peer_gr_restart_time must equal the configured graceful_restart_time (30 s); \
+         this confirms GoBGP parsed our GracefulRestart capability and reflected its \
+         own restart_time back in its OPEN"
+    );
+}
+
 /// RFC 4724 §3 — When `graceful_restart_time` is configured, GoBGP must keep
 /// our originated routes in its RIB during the restart window after an unclean
 /// session loss.
@@ -323,21 +357,30 @@ async fn gr_helper_gobgp_holds_routes_during_restart_window() {
         .status()
         .expect("docker stop pathvectord");
 
-    // Immediately after the container stops, GoBGP should still have the route
-    // as a stale entry — the restart window is 30 s and we just triggered the drop.
-    // Poll for up to 5 s to allow GoBGP to process the TCP close; the route must
-    // remain present throughout.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let out = Command::new("docker")
-        .args(["exec", &h.gobgpd_id, "gobgp", "global", "rib"])
-        .output()
-        .expect("gobgp global rib");
-    let rib_text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        rib_text.contains("192.0.2.0/24"),
-        "GoBGP must retain 192.0.2.0/24 as a stale route during the GR restart window \
-         (restart_time = 30 s); actual RIB:\n{rib_text}"
-    );
+    // Poll GoBGP's RIB for up to 20 s — the route must remain present throughout
+    // the restart window.  We check repeatedly rather than sleeping once so the
+    // test fails fast if GoBGP incorrectly withdraws the route early.
+    //
+    // Note: we are asserting the INVARIANT "route is still present" for the full
+    // poll window, not just at a single point in time.  Any disappearance is a
+    // failure.
+    let stale_check_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = Command::new("docker")
+            .args(["exec", &h.gobgpd_id, "gobgp", "global", "rib"])
+            .output()
+            .expect("gobgp global rib");
+        let rib_text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            rib_text.contains("192.0.2.0/24"),
+            "GoBGP withdrew 192.0.2.0/24 before the 30 s GR restart window expired; \
+             actual RIB:\n{rib_text}"
+        );
+        if std::time::Instant::now() >= stale_check_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // After the restart window expires, GoBGP must withdraw the stale route.
     // We wait up to restart_time + 10 s for GoBGP to clean up.

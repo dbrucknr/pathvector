@@ -219,6 +219,7 @@ impl TryFrom<proto::PeerState> for PeerState {
             prefixes_advertised: p.prefixes_advertised,
             eor_ipv4_received: p.eor_ipv4_received,
             eor_ipv6_received: p.eor_ipv6_received,
+            peer_gr_restart_time: p.peer_gr_restart_time,
         })
     }
 }
@@ -363,6 +364,7 @@ mod tests {
             prefixes_advertised: 0,
             eor_ipv4_received: false,
             eor_ipv6_received: false,
+            peer_gr_restart_time: 0,
         }
     }
 

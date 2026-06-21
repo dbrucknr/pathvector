@@ -394,6 +394,7 @@ mod tests {
             prefixes_advertised: 3,
             eor_ipv4_received: false,
             eor_ipv6_received: false,
+            peer_gr_restart_time: 0,
         }
     }
 
