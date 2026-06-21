@@ -103,6 +103,23 @@ registry lives in `pathvector-types`.
 
 ---
 
+## RFC 4724 §2 — End-of-RIB Marker (Send Side)
+
+**Owns:** Sending the EOR marker after the initial full-table dump on session establishment.  
+**Boundary:** Stale-route timer and FSM restart detection are deferred (owned by `pathvector-session`).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| IPv4 EOR (minimum-length UPDATE) sent after full-table dump | `src/outbound.rs`, `src/daemon.rs` | ✅ | `test_on_established_empty_rib_sends_eor_only`, `test_on_established_sends_full_table_dump` |
+| IPv6 EOR (empty MP_UNREACH_NLRI for IPv6 unicast) sent for v6-capable peers | `src/outbound.rs`, `src/daemon.rs` | ✅ | `test_on_established_ipv6_capable_peer_receives_both_eors` |
+| EOR skipped when channel stalls (session will be torn down) | `src/daemon.rs` | ✅ | stall handling path in `on_established` |
+| EOR receive-side: detect peer EOR and act on it | — | ❌ | — |
+
+**Deferred:** EOR receive-side (detecting when a peer sends us EOR, updating convergence state) requires changes to `pathvector-session` FSM and `on_route_update` in the daemon.
+
+---
+
 ## RFC 7999 — BLACKHOLE Community (Discard Action)
 
 **Owns:** The discard action: when a received UPDATE contains BLACKHOLE community

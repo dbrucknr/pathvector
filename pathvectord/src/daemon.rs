@@ -28,7 +28,7 @@ use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::outbound::{
     PrefixDecision, PrefixDecisionV6, flush_updates, flush_updates_v6, propagate_prefix,
-    propagate_prefix_v6,
+    propagate_prefix_v6, send_eor_ipv4, send_eor_ipv6,
 };
 use crate::{config, fib, grpc, proto};
 
@@ -789,7 +789,8 @@ impl DaemonState {
             self.route_refresh_peers.remove(&peer_ip);
         }
 
-        if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
+        let mut stalled = !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte);
+        if stalled {
             self.stalled_peers.push(peer_ip);
         }
 
@@ -804,7 +805,8 @@ impl DaemonState {
         } else {
             self.ipv6_capable_peers.remove(&peer_ip);
         }
-        if peer_supports_ipv6
+        if !stalled
+            && peer_supports_ipv6
             && !all_nlris_v6.is_empty()
             && let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip)
         {
@@ -838,6 +840,18 @@ impl DaemonState {
                 })
                 .collect();
             if !flush_updates_v6(decisions_v6, max_len, update_tx, peer_type, peer_four_byte) {
+                stalled = true;
+                self.stalled_peers.push(peer_ip);
+            }
+        }
+
+        // RFC 4724 §2: send End-of-RIB marker after the full-table dump so
+        // the peer knows the initial Adj-RIB-Out snapshot is complete.
+        // Skip if the channel stalled — the session will be torn down anyway.
+        if !stalled {
+            if !send_eor_ipv4(update_tx) {
+                self.stalled_peers.push(peer_ip);
+            } else if peer_supports_ipv6 && !send_eor_ipv6(update_tx) {
                 self.stalled_peers.push(peer_ip);
             }
         }
@@ -3316,6 +3330,18 @@ mod tests {
         (state, receivers)
     }
 
+    /// Drain all messages currently queued in every receiver.
+    ///
+    /// Call this after `on_established` in tests that don't care about the
+    /// EOR marker the session setup now sends (RFC 4724 §2).  Tests that
+    /// specifically verify the EOR shape should NOT call this helper — they
+    /// should assert on the message content directly.
+    fn drain_all(receivers: &mut HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+        for rx in receivers.values_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+    }
+
     // ── config_peer_type ─────────────────────────────────────────────────────
 
     #[test]
@@ -3464,13 +3490,25 @@ mod tests {
     }
 
     #[test]
-    fn test_on_established_empty_rib_sends_nothing() {
+    fn test_on_established_empty_rib_sends_eor_only() {
+        // RFC 4724 §2: the EOR MUST be sent even when the Adj-RIB-Out is
+        // empty so the peer knows the initial sync window is closed.
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        let eor = receivers
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("on_established must send an IPv4 EOR even for an empty RIB (RFC 4724 §2)");
+        assert!(
+            eor.withdrawn.is_empty() && eor.attributes.is_empty() && eor.announced.is_empty(),
+            "IPv4 EOR must be a minimum-length UPDATE (RFC 4724 §2): {eor:?}"
+        );
         assert!(
             receivers.get_mut(&peer_ip).unwrap().try_recv().is_err(),
-            "empty RIB should produce no messages on establish"
+            "no further messages after the EOR for a peer with no IPv6 capability"
         );
     }
 
@@ -3499,6 +3537,65 @@ mod tests {
             .try_recv()
             .expect("should have queued a full-table dump UPDATE");
         assert_eq!(msg.announced, vec![nlri("10.0.0.0/8")]);
+
+        // EOR must immediately follow the dump (RFC 4724 §2).
+        let eor = receivers
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("IPv4 EOR must follow the full-table dump");
+        assert!(
+            eor.withdrawn.is_empty() && eor.attributes.is_empty() && eor.announced.is_empty(),
+            "EOR must be a minimum-length UPDATE: {eor:?}"
+        );
+    }
+
+    /// RFC 4724 §2: an IPv6-capable peer must receive both the IPv4 EOR and the
+    /// IPv6 EOR (empty MP_UNREACH_NLRI for IPv6 unicast) after the full-table dump.
+    #[test]
+    fn test_on_established_ipv6_capable_peer_receives_both_eors() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &v6_caps, None);
+
+        // IPv4 EOR: minimum-length UPDATE.
+        let ipv4_eor = receivers
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("must receive IPv4 EOR");
+        assert!(
+            ipv4_eor.withdrawn.is_empty()
+                && ipv4_eor.attributes.is_empty()
+                && ipv4_eor.announced.is_empty(),
+            "IPv4 EOR must be a minimum-length UPDATE: {ipv4_eor:?}"
+        );
+
+        // IPv6 EOR: UPDATE with empty MP_UNREACH_NLRI for IPv6 unicast.
+        let ipv6_eor = receivers
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("must receive IPv6 EOR after IPv4 EOR");
+        assert!(
+            ipv6_eor.withdrawn.is_empty() && ipv6_eor.announced.is_empty(),
+            "IPv6 EOR must have no IPv4 withdrawn/announced: {ipv6_eor:?}"
+        );
+        assert!(
+            matches!(
+                ipv6_eor.attributes.as_slice(),
+                [PathAttribute::MpUnreachNlri(m)] if m.afi_safi == AfiSafi::IPV6_UNICAST && m.prefixes.is_empty()
+            ),
+            "IPv6 EOR must carry empty MP_UNREACH_NLRI for IPv6 unicast: {ipv6_eor:?}"
+        );
+
+        assert!(
+            receivers.get_mut(&peer_ip).unwrap().try_recv().is_err(),
+            "no further messages after both EORs"
+        );
     }
 
     /// RFC 4271 §5.1.3 regression: eBGP NEXT_HOP in the full-table dump must
@@ -3873,6 +3970,7 @@ mod tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        drain_all(&mut receivers);
 
         // Announce a route from peer_a with an explicit next-hop.
         state.on_route_update(
@@ -3975,6 +4073,7 @@ mod tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        drain_all(&mut receivers);
 
         // FIB change fires with empty RIB — should be a no-op.
         state.on_fib_change();
@@ -4014,6 +4113,7 @@ mod tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        drain_all(&mut receivers);
 
         state.on_route_update(
             peer_a,
@@ -4545,6 +4645,7 @@ mod tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        drain_all(&mut rxs);
 
         // Peer A announces 10.0.0.0/8 via traditional field.
         state.on_route_update(
@@ -5147,6 +5248,7 @@ mod tests {
             &v6_caps,
             None,
         );
+        drain_all(&mut rxs);
 
         // Peer A announces an IPv6 route via MP_REACH_NLRI.
         state.on_route_update(
@@ -6667,8 +6769,22 @@ mod tests {
             &[],
             None,
         );
+        // Drain all EOR markers (RFC 4724 §2) from on_established, then verify no
+        // actual route UPDATE was sent. EORs are either empty UpdateMessages (IPv4)
+        // or UpdateMessages with empty MP_UNREACH_NLRI (IPv6, RFC 4724 §2).
+        let rx = rxs.get_mut(&non_client_a).unwrap();
+        let mut route_received = false;
+        while let Ok(m) = rx.try_recv() {
+            let has_announced_nlri = !m.announced.is_empty();
+            let has_mp_reach = m.attributes.iter().any(
+                |a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()),
+            );
+            if has_announced_nlri || has_mp_reach {
+                route_received = true;
+            }
+        }
         assert!(
-            rxs.get_mut(&non_client_a).unwrap().try_recv().is_err(),
+            !route_received,
             "non-client must not receive routes from other non-clients during full-table dump (RFC 4456 §8)"
         );
     }
@@ -6751,7 +6867,9 @@ mod tests {
             },
         );
 
-        // peer_b (no IPv6 capability) must receive nothing.
+        // peer_b (no IPv6 capability) gets an IPv4 EOR from on_established
+        // but must not receive any MP_REACH_NLRI — drain the EOR first.
+        rxs.get_mut(&peer_b).unwrap().try_recv().ok(); // IPv4 EOR
         assert!(
             rxs.get_mut(&peer_b).unwrap().try_recv().is_err(),
             "peer without IPv6 capability must not receive MP_REACH_NLRI (RFC 4760)"
@@ -6779,6 +6897,16 @@ mod tests {
         // Establish without IPv6 capability.
         state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
 
+        // Must receive exactly one message: the IPv4 EOR. No IPv6 dump, no IPv6 EOR.
+        let eor = rxs
+            .get_mut(&peer_ip)
+            .unwrap()
+            .try_recv()
+            .expect("must receive IPv4 EOR even for non-IPv6-capable peer");
+        assert!(
+            eor.withdrawn.is_empty() && eor.attributes.is_empty() && eor.announced.is_empty(),
+            "only the IPv4 EOR should arrive — got: {eor:?}"
+        );
         assert!(
             rxs.get_mut(&peer_ip).unwrap().try_recv().is_err(),
             "full-table IPv6 dump must not be sent to peers without IPv6 capability (RFC 4760)"
@@ -8126,6 +8254,7 @@ mod tests {
 
         state.on_established(client_a, client_a, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(client_b, client_b, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         // Client A sends a route; it should be reflected to Client B
         state.on_route_update(client_a, update_announce("192.0.2.0/24"));
@@ -8153,6 +8282,7 @@ mod tests {
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(nc, nc, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         state.on_route_update(client, update_announce("192.0.2.0/24"));
         state.flush_pending();
@@ -8173,6 +8303,7 @@ mod tests {
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(nc, nc, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         // Non-client iBGP sends a route; it should be reflected to the client
         state.on_route_update(nc, update_announce("192.0.2.0/24"));
@@ -8196,6 +8327,7 @@ mod tests {
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(nc1, nc1, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(nc2, nc2, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         // Non-client nc1 sends a route; nc2 must NOT receive it
         state.on_route_update(nc1, update_announce("192.0.2.0/24"));
@@ -8222,6 +8354,7 @@ mod tests {
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(other, other, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         // UPDATE from client containing our own cluster_id in CLUSTER_LIST
         let looped = UpdateMessage {
@@ -8258,6 +8391,7 @@ mod tests {
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(other, other, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         state.on_route_update(client, update_announce("192.0.2.0/24"));
         state.flush_pending();
@@ -8299,6 +8433,7 @@ mod tests {
 
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(other, other, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         // UPDATE carries ORIGINATOR_ID equal to our own BGP ID — routing loop.
         let looped = UpdateMessage {
@@ -8343,6 +8478,7 @@ mod tests {
             &[],
             None,
         );
+        drain_all(&mut receivers);
 
         // UPDATE from the non-client iBGP peer, already carrying our cluster_id.
         let looped = UpdateMessage {
@@ -8390,6 +8526,7 @@ mod tests {
             &[],
             None,
         );
+        drain_all(&mut receivers);
 
         state.on_route_update(non_client, update_announce("172.16.0.0/24"));
         state.flush_pending();
@@ -8491,6 +8628,7 @@ mod tests {
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(nc1, nc1, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(nc2, nc2, PeerType::Internal, 65001, 90, &[], None);
+        drain_all(&mut receivers);
 
         // Mark nc1 and nc2 as IPv6-capable so propagate_to_all_peers_v6 includes them.
         state.ipv6_capable_peers.insert(nc1);
@@ -8532,8 +8670,24 @@ mod tests {
         let caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(nc2, nc2, PeerType::Internal, 65001, 90, &caps, None);
 
+        // on_established sends an IPv4 EOR (empty UpdateMessage) and for v6-capable
+        // peers an IPv6 EOR (UpdateMessage with empty MP_UNREACH_NLRI, RFC 4724 §2).
+        // Drain both EOR markers, then verify no actual route UPDATE arrived.
+        // A route UPDATE would carry non-empty `announced` or non-empty prefixes in
+        // MP_REACH_NLRI; a pure EOR has only empty MP_UNREACH_NLRI (or nothing).
+        let rx = receivers.get_mut(&nc2).unwrap();
+        let mut route_received = false;
+        while let Ok(m) = rx.try_recv() {
+            let has_announced_nlri = !m.announced.is_empty();
+            let has_mp_reach = m.attributes.iter().any(
+                |a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()),
+            );
+            if has_announced_nlri || has_mp_reach {
+                route_received = true;
+            }
+        }
         assert!(
-            receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
+            !route_received,
             "v6 full-table dump must not send non-client iBGP routes to another non-client (RFC 4456 §8)"
         );
     }
@@ -8960,6 +9114,8 @@ mod stall_tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        while receivers.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
+        while receivers.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
 
         // Two separate on_route_update calls — simulating two BGP UPDATEs
         // arriving back-to-back from peer_a, each with a different prefix but
@@ -9021,6 +9177,8 @@ mod stall_tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        while receivers.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
+        while receivers.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
 
         // Announce a route from peer_a (buffered into peer_b's pending buffer).
         state.on_route_update(
@@ -9237,6 +9395,8 @@ mod coalescing_tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        while rxs.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
 
         // Two separate BGP UPDATEs with identical path attributes.
         state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
@@ -9405,6 +9565,8 @@ mod coalescing_tests {
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        while rxs.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
 
         // Announce a route that is first suppressed by MRAI, then add it to
         // mrai_pending manually so flush_mrai_pending picks it up.
@@ -9982,7 +10144,7 @@ mod event_loop_tests {
 
         // Give peer_b a channel of capacity 1 so it stalls during propagation.
         let (update_tx_a, _update_rx_a) = mpsc::channel::<UpdateMessage>(64);
-        let (update_tx_b, _update_rx_b) = mpsc::channel::<UpdateMessage>(1);
+        let (update_tx_b, mut update_rx_b) = mpsc::channel::<UpdateMessage>(1);
         let (sess_stop_a, _sess_stop_rx_a) = mpsc::channel::<SessionCommand>(8);
         let (sess_stop_b, mut cmd_rx_b) = mpsc::channel::<SessionCommand>(8);
 
@@ -10037,6 +10199,10 @@ mod event_loop_tests {
             s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
             s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
         }
+
+        // Drain the EOR marker that on_established sent to peer_b (RFC 4724 §2)
+        // so the capacity-1 channel is empty before we pre-fill it below.
+        while update_rx_b.try_recv().is_ok() {}
 
         // Pre-fill peer_b's cap-1 UPDATE channel so the propagation try_send fails.
         {
@@ -10113,8 +10279,8 @@ mod event_loop_tests {
             );
             s.flush_pending();
         }
-        // Drain initial propagation.
-        rxs.get_mut(&peer_b).unwrap().try_recv().ok();
+        // Drain EOR marker and initial route propagation.
+        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
 
         // Simulate next-hop going down.
         oracle.0.store(false, Ordering::Relaxed);
@@ -12032,6 +12198,9 @@ mod run_with_tests {
     struct MockPeerWithStop {
         event_tx: mpsc::Sender<SessionEvent>,
         stop_rx: mpsc::Receiver<SessionCommand>,
+        /// Keep the update receiver alive so `try_send` on the update channel
+        /// does not fail with `TrySendError::Closed` when the EOR is sent.
+        _update_rx: mpsc::Receiver<UpdateMessage>,
     }
 
     fn make_mock_spawn_capturing_stop() -> (
@@ -12042,13 +12211,13 @@ mod run_with_tests {
         let peers_clone = Arc::clone(&peers);
         let spawn_fn = move |_cfg: SessionConfig| {
             let (event_tx, event_rx) = mpsc::channel(8);
-            let (update_tx, _update_rx) = mpsc::channel(8);
+            let (update_tx, update_rx) = mpsc::channel(8);
             let (stop_tx, stop_rx) = mpsc::channel(8);
             let started = Arc::new(AtomicBool::new(false));
             peers_clone
                 .lock()
                 .unwrap()
-                .push(MockPeerWithStop { event_tx, stop_rx });
+                .push(MockPeerWithStop { event_tx, stop_rx, _update_rx: update_rx });
             MockSessionHandle {
                 event_rx,
                 update_tx,
@@ -12094,10 +12263,10 @@ mod run_with_tests {
         // Allow the spawned task to start.
         tokio::task::yield_now().await;
 
-        let (event_tx, stop_rx) = {
+        let (event_tx, stop_rx, _update_rx) = {
             let mut guard = peers.lock().unwrap();
             let p = guard.pop().expect("one peer spawned");
-            (p.event_tx, p.stop_rx)
+            (p.event_tx, p.stop_rx, p._update_rx)
         };
 
         // Establish the session so the daemon has peer state.

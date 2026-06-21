@@ -481,6 +481,47 @@ pub(crate) fn send_mp_unreach_v6(
         .is_ok()
 }
 
+/// Sends an IPv4 unicast End-of-RIB marker to `update_tx`.
+///
+/// RFC 4724 §2: the EOR for IPv4 unicast is a minimum-length UPDATE — no
+/// withdrawn routes, no path attributes, no NLRI (23 octets on the wire).
+/// It MUST be sent after the initial full-table dump is complete so the peer
+/// knows the Adj-RIB-Out snapshot is consistent and can begin best-path
+/// selection against it.
+///
+/// Returns `false` if the channel is full (peer stalled).
+pub(crate) fn send_eor_ipv4(update_tx: &mpsc::Sender<UpdateMessage>) -> bool {
+    update_tx
+        .try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        })
+        .is_ok()
+}
+
+/// Sends an IPv6 unicast End-of-RIB marker to `update_tx`.
+///
+/// RFC 4724 §2: for address families other than IPv4 unicast, the EOR is an
+/// UPDATE carrying an empty `MP_UNREACH_NLRI` attribute for the relevant
+/// `<AFI, SAFI>`.  MUST be sent after the IPv6 full-table dump (or
+/// immediately on session establishment when the Loc-RIB-v6 is empty) to
+/// any peer that negotiated the IPv6 unicast Multi-Protocol capability.
+///
+/// Returns `false` if the channel is full (peer stalled).
+pub(crate) fn send_eor_ipv6(update_tx: &mpsc::Sender<UpdateMessage>) -> bool {
+    update_tx
+        .try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                prefixes: vec![],
+            })],
+            announced: vec![],
+        })
+        .is_ok()
+}
+
 /// Builds the path-attribute list for an outbound IPv6 route.
 ///
 /// `peer_type` controls attribute stripping — same rules as [`route_to_attributes`]:
