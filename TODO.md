@@ -414,8 +414,7 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 
 - `serde` feature: `Serialize`/`Deserialize` derives are gated but not yet
   implemented on the domain types (blocked on deciding JSON schema conventions)
-- Policy introspection RPC (`ListTerms`, `EvalRoute`) — blocked on
-  `reapply_import_policy` being wired to export propagation in `pathvectord`
+- Policy introspection RPC (`ListTerms`, `EvalRoute`) — `reapply_import_policy` is now wired to export propagation (done 2026-06-09); the RPC itself is not yet implemented
 
 ---
 
@@ -426,8 +425,7 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 Three targeted changes that improve testability or robustness without over-engineering.
 Priority order matches the payoff-to-cost ratio.
 
-1. **`RibSnapshot` split** — primarily a performance fix (see Performance item below),
-   but also decouples gRPC reads from the event loop entirely.
+~~**1. `RibSnapshot` split** — **Resolved 2026-06-11**: `DaemonState` now holds `rib: Arc<RibSnapshot>`. gRPC handlers call `snapshot()` to clone the Arc (O(1) atomic increment) and release the outer lock before iterating, eliminating gRPC/event-loop read contention.~~
 
 2. **`Clock` trait for timer injection** (`pathvector-session`) — the `ConnectRetry` and
    `HoldTimer` timers are currently wired to `tokio::time` directly. A two-impl trait
@@ -443,9 +441,7 @@ Priority order matches the payoff-to-cost ratio.
    }
    ```
 
-3. **`RibView` trait for `propagate_prefix`** (`pathvectord`) — already done for IPv4;
-   ensure IPv6 path uses the same abstraction. Useful before best-path selection grows
-   more complex (ECMP, route reflector client preference, etc.).
+3. **`RibView` trait for `propagate_prefix_v6`** (`pathvectord`) — `propagate_prefix` (IPv4) already uses `&impl RibView<Ipv4Addr>`; `propagate_prefix_v6` still takes `&LocRib<Ipv6Addr>` (concrete type). Mirror the IPv4 abstraction so the IPv6 path is equally testable. Useful before best-path selection grows more complex (ECMP, route reflector client preference, etc.).
 
 ### Internal documentation on hard algorithms
 
@@ -456,7 +452,7 @@ RFC in their head to understand the code. Priority targets:
 - **Best-path selection** (`pathvector-rib/src/best_path.rs`) — annotate each
   step with the RFC 4271 §9.1 section it implements and why the tie-breaking
   order is what it is
-- **RIB eviction on `Terminated`** (`pathvectord/src/main.rs`, `on_terminated`)
+- **RIB eviction on `Terminated`** (`pathvectord/src/daemon.rs`, `on_terminated`)
   — explain the snapshot-before-withdraw pattern and why order matters
 - **FSM state transitions** (`pathvector-session/src/fsm/`) — a table or
   diagram mapping each `(State, Input) → (State, Vec<Output>)` transition,
