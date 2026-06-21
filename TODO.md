@@ -55,15 +55,16 @@ integration rather than direct unit tests.
   consistency invariant "every prefix in `AdjRibOut` is also in `LocRib`" would close this.
 
 **Layer 3 — Integration / session tests**
-- `pathvectord` unit tests (200+ in `main.rs`) drive the full `run_event_loop` via
+- `pathvectord` unit tests (460+ across `daemon.rs` and `outbound.rs`) drive the full `run_event_loop` via
   `MockSessionHandle` — verify FSM transitions, import/export policy, route propagation,
   origination, stall detection, BLACKHOLE handling, RFC 8212 defaults, and more.
 - `pathvector-session` FSM proptests drive the session state machine with random event
   sequences, verifying no unexpected state is reachable.
 
 **Layer 4 — End-to-end tests** (Docker, GoBGP)
-- 35 tests across `e2e/tests/` covering: session establishment, route import/export,
-  policy enforcement, origination, withdrawal, and multi-peer topologies.
+- 74 tests across `e2e/tests/` covering: session establishment, route import/export,
+  policy enforcement, origination, withdrawal, multi-peer topologies, route reflection,
+  dynamic peers, and EOR markers.
 - Tests use the full stack: `pathvectord` binary inside a container, GoBGP as the peer,
   `PathvectorClient` gRPC API for assertions.
 - BIRD and FRR interoperability both done (2026-06-14). See Tier 3 items 7 and 8.
@@ -401,7 +402,9 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 
 ~~**`reapply_import_policy` has no IPv6 counterpart** — **Resolved 2026-06-19**: `reapply_import_policy_v6` added to `pathvectord/src/daemon.rs`; `set_import_default` now calls both the v4 and v6 variants so a policy reload applies to all address families without a session reset. Two unit tests added: `test_reapply_v6_accepts_previously_rejected_route`, `test_reapply_v6_rejects_previously_accepted_route`.~~
 
-~~**`cluster_id` configuration guidance** — **Resolved 2026-06-19**: `DaemonConfig::cluster_id` doc comment expanded in `pathvectord/src/config.rs` with an explicit "multi-cluster deployments" warning: distinct `cluster_id` values are required per cluster, otherwise CLUSTER_LIST loop detection fires incorrectly across clusters.~~ Without explicit configuration, loop detection via CLUSTER_LIST will behave unexpectedly if clusters share a `cluster_id`. Document in `pathvectord/README.md` with an explicit "if you run multiple RR clusters, set distinct `cluster_id` values" callout alongside the `is_route_reflector` config example.
+~~**`cluster_id` configuration guidance** — **Resolved 2026-06-19**: `DaemonConfig::cluster_id` doc comment expanded in `pathvectord/src/config.rs` with an explicit "multi-cluster deployments" warning: distinct `cluster_id` values are required per cluster, otherwise CLUSTER_LIST loop detection fires incorrectly across clusters.~~
+
+**Remaining:** Add a callout to `pathvectord/README.md` alongside the `is_route_reflector` config example: "if you run multiple RR clusters, set distinct `cluster_id` values per cluster — sharing a `cluster_id` across clusters causes CLUSTER_LIST loop detection to fire incorrectly."
 
 ---
 

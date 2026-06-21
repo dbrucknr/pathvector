@@ -6,19 +6,29 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-06-21
 
-### [pathvectord] End-of-RIB marker (RFC 4724 §2)
+### [pathvectord] End-of-RIB marker — full RFC 4724 §2/§3 implementation (send + receive)
 
-After each full-table dump on session establishment, `on_established` now sends:
+**Send side** — after each full-table dump on session establishment, `on_established` now sends:
 - An **IPv4 EOR** — a minimum-length UPDATE (empty withdrawn, empty attributes, empty announced) — to all peers
 - An **IPv6 EOR** — an UPDATE carrying an empty `MP_UNREACH_NLRI` for IPv6 unicast — to peers that negotiated the IPv6 Multiprotocol capability
 
 EOR is skipped (and the session is stalled) if the channel is full during the dump.
 
-**Implementation:** `send_eor_ipv4` and `send_eor_ipv6` in `outbound.rs`; wired into `on_established` in `daemon.rs` with stall-guard.
+**Receive side** — `on_route_update` detects EOR markers from peers before any route processing:
+- IPv4 EOR: all-empty UPDATE (no withdrawn, no attributes, no announced NLRIs)
+- IPv6 EOR: UPDATE with a single empty `MP_UNREACH_NLRI { afi_safi: IPV6_UNICAST }`
 
-**Test coverage:** 3 new dedicated tests — `test_on_established_empty_rib_sends_eor_only`, `test_on_established_sends_full_table_dump` (extended to verify EOR follows dump), `test_on_established_ipv6_capable_peer_receives_both_eors`. Existing test suite updated to drain EOR messages that now appear in setup phase.
+Detected EOR markers are recorded per-peer in `RibSnapshot` (`eor_received` / `eor_received_v6` `HashSet`s) and exposed via two new `PeerState` fields in the management API: `eor_ipv4_received` and `eor_ipv6_received`. State is cleared on session termination and re-establishment.
 
-**Deferred:** EOR receive-side (detecting peer EOR to signal convergence) requires session-layer changes.
+**GracefulRestart capability (RFC 4724 §3)** — pathvectord now advertises `Capability::GracefulRestart { restart_flags: 0, restart_time: 0, families: [] }` in OPEN messages. Without this, peers such as GoBGP 4.6.0 withhold EOR markers (they only send EOR when graceful restart is bilaterally negotiated). `build_local_capabilities(local_as)` was extracted to consolidate the two previously divergent capability lists (static-config peers and gRPC `AddPeer` peers) into a single source of truth; this also fixed a pre-existing bug where the dynamic-peer path was missing `RouteRefresh`.
+
+**Wire encoding** — confirmed: IPv4 EOR encodes to exactly 23 bytes (RFC 4271 §4.3 minimum UPDATE length); IPv6 EOR survives codec roundtrip. Four wire-level tests added to `pathvector-session`.
+
+**Test coverage:**
+- 9 unit tests in `pathvectord`: `test_ipv4_eor_received_is_recorded`, `test_ipv6_eor_received_is_recorded`, `test_ipv4_eor_does_not_insert_route`, `test_eor_state_cleared_on_termination`, `test_update_with_attributes_is_not_eor`, `test_eor_state_cleared_on_re_establish`, plus 3 stall-path tests
+- 4 e2e tests against GoBGP 4.6.0: `eor_on_empty_rib_does_not_cause_session_reset`, `eor_after_full_table_dump_does_not_cause_session_reset`, `eor_ipv4_received_from_gobgp_is_recorded`, `eor_ipv4_received_persists_after_route_churn`
+
+**Deferred:** Stale-route timer (RFC 4724 §4.2) and FSM-level graceful restart restart-state signaling.
 
 ---
 
