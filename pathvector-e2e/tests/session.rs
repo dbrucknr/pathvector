@@ -315,11 +315,13 @@ async fn gr_capability_negotiated_peer_gr_restart_time_reflects_config() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
+    // GoBGP is configured with restart-time = 120 in write_gobgp_config(), so it
+    // sends restart_time=120 in its own OPEN when GR is negotiated.  The value
+    // here is GoBGP's own advertisement, not a reflection of our 30 s.
     assert_eq!(
-        peer_state.peer_gr_restart_time, 30,
-        "peer_gr_restart_time must equal the configured graceful_restart_time (30 s); \
-         this confirms GoBGP parsed our GracefulRestart capability and reflected its \
-         own restart_time back in its OPEN"
+        peer_state.peer_gr_restart_time, 120,
+        "peer_gr_restart_time must be GoBGP's configured restart_time (120 s); \
+         confirms pathvectord parsed GoBGP's GracefulRestart capability and stored it"
     );
 }
 

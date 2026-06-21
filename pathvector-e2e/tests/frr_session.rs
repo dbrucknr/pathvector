@@ -7,6 +7,9 @@
 //! gives confidence that pathvectord's handshake is broadly correct.
 //!
 //! RFC 4271 §8 — BGP finite state machine.
+//! RFC 4724 §3 — Restart State (R) bit verification.
+
+use std::process::Command;
 
 use pathvector_client::{
     DaemonClient,
@@ -61,5 +64,39 @@ async fn frr_list_peers_includes_frr_peer() {
         peers[0].session_state,
         SessionState::Established,
         "FRR peer must be Established"
+    );
+}
+
+// ── RFC 4724 §3 — Restart State (R) bit ──────────────────────────────────────
+
+/// RFC 4724 §3 — When `restarting = true` is set, pathvectord must set the
+/// Restart State (R) bit in its GracefulRestart capability OPEN parameter.
+///
+/// FRR 8.4.x exposes the received R-bit in `show bgp neighbors <addr> json`
+/// as `gracefulRestartInfo.rBit`, making it the most direct external proof
+/// that the R-bit encoding is correct.  (GoBGP's `peer_restarting` field is
+/// only set transiently and is cleared before polling is practical.)
+///
+/// This test passes `restarting = true` + `graceful_restart_time = 120` to
+/// pathvectord, starts it against an FRR peer configured with
+/// `neighbor X graceful-restart`, and asserts FRR sees `rBit: true`.
+#[tokio::test]
+async fn frr_gr_r_bit_set_in_open_when_restarting() {
+    let h = FrrHarness::new_gr_restarting(120).await;
+    let pv_ip = h.pathvectord_ip.to_string();
+
+    // FRR 8.4.x: `show bgp neighbors <addr> json`
+    // gracefulRestartInfo.rBit = true iff peer sent R=1 in its OPEN.
+    let out = Command::new("docker")
+        .args(["exec", &h.frr_id, "vtysh", "-c", &format!("show bgp neighbors {pv_ip} json")])
+        .output()
+        .expect("vtysh show bgp neighbors json");
+    let json = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        json.contains(r#""rBit": true"#) || json.contains(r#""rBit":true"#),
+        "FRR must see rBit=true in gracefulRestartInfo when pathvectord sends R=1 in OPEN \
+         (restarting=true, graceful_restart_time=120);\n\
+         actual gracefulRestartInfo from FRR:\n{json}"
     );
 }

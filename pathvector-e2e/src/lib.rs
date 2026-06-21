@@ -2841,6 +2841,42 @@ pub fn frr_pathvectord_ip(test_id: u32) -> String {
     format!("172.31.{third}.20")
 }
 
+/// Writes a minimal FRR bgpd config with Graceful Restart enabled.
+///
+/// Identical to [`write_frr_config`] but adds `neighbor X graceful-restart` so
+/// that FRR actively parses and exposes the peer's GR capability state, including
+/// the Restart State (R) bit, via `show bgp neighbors`.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_frr_config_gr(pathvectord_ip: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp frr GR config");
+    write!(
+        f,
+        "
+frr defaults traditional
+
+router bgp 65001
+ bgp router-id 1.0.0.1
+ no bgp ebgp-requires-policy
+ no bgp network import-check
+ neighbor {pathvectord_ip} remote-as 65002
+ neighbor {pathvectord_ip} passive
+ neighbor {pathvectord_ip} graceful-restart
+ !
+ address-family ipv4 unicast
+  neighbor {pathvectord_ip} activate
+  neighbor {pathvectord_ip} next-hop-self
+ exit-address-family
+exit
+"
+    )
+    .expect("write frr GR config");
+    f
+}
+
 /// Writes a minimal FRR bgpd config.
 ///
 /// `routes`: prefixes FRR announces to pathvectord via `network` statements.
@@ -2980,6 +3016,42 @@ export_default = "accept"
     f
 }
 
+fn write_daemon_config_frr_gr_restarting(
+    peers: &[(Ipv4Addr, u32)],
+    restart_time: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord frr GR restarting config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+restarting            = true
+"#
+    )
+    .expect("write pathvectord frr GR restarting config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord frr GR restarting peer config");
+    }
+    f
+}
+
 /// A fully-wired test environment: isolated Docker network + FRR container +
 /// `pathvectord` container + connected [`PathvectorClient`], with the BGP
 /// session already `Established`.
@@ -3005,6 +3077,86 @@ impl FrrHarness {
     /// Stand up the environment with no pre-announced routes.
     pub async fn new() -> Self {
         Self::with_routes(&[]).await
+    }
+
+    /// Stand up pathvectord with `graceful_restart_time` set and `restarting = true`,
+    /// against an FRR peer configured with `neighbor X graceful-restart`.
+    ///
+    /// FRR will actively parse pathvectord's GracefulRestart capability (including the
+    /// Restart State R-bit) and expose it via `show bgp neighbors <addr>`.
+    /// Use this harness to verify the R-bit reaches FRR correctly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, the images are missing, or the session does
+    /// not reach `Established` within 30 s.
+    pub async fn new_gr_restarting(restart_secs: u16) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-frr-gr-test-{test_id}");
+
+        let subnet = frr_test_subnet(test_id);
+        let frr_ip_str = frr_peer_ip(test_id);
+        let pv_ip_str = frr_pathvectord_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let frr_config = write_frr_config_gr(&pv_ip_str);
+        let frr_config_path = frr_config.path().to_str().unwrap().to_owned();
+
+        let frr = docker_start_with_caps(
+            &format!("frr-gr-{test_id}"),
+            FRR_IMAGE,
+            &network_name,
+            Some(&frr_ip_str),
+            true,
+            true,
+            &frr_config_path,
+            "/etc/frr/frr.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&frr.0, Duration::from_secs(60));
+
+        let pathvectord_config = {
+            let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+            write_daemon_config_frr_gr_restarting(&[(frr_ip, 65001)], restart_secs)
+        };
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start(
+            &format!("pathvectord-frr-gr-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pv_ip_str),
+            false,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for FrrHarness::new_gr_restarting");
+
+        let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+        wait_for_established(&mut client, frr_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session with FRR (GR restarting) did not reach Established within 30 s");
+
+        let container_id = frr.0.clone();
+        FrrHarness {
+            _frr: frr,
+            _pathvectord: pathvectord,
+            _frr_config: frr_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            frr_id: container_id,
+            frr_ip,
+            pathvectord_ip: pv_ip_str.parse().unwrap(),
+            _network: network,
+        }
     }
 
     /// Stand up the environment with FRR pre-announcing `routes` to pathvectord.
