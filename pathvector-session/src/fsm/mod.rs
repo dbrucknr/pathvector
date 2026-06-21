@@ -210,6 +210,7 @@ impl Fsm {
     }
 
     /// Current local capability set (for tests and diagnostics).
+    #[cfg(test)]
     pub(crate) fn local_capabilities(&self) -> &[crate::message::Capability] {
         &self.config.capabilities
     }

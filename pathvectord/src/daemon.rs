@@ -13096,7 +13096,7 @@ mod test_build_local_capabilities {
             hold_time: 90,
             graceful_restart_time: gr_time,
             configured_restarting,
-            startup_instant: std::time::Instant::now() - age,
+            startup_instant: std::time::Instant::now().checked_sub(age).unwrap(),
         }
     }
 

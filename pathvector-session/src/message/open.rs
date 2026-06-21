@@ -676,7 +676,8 @@ mod tests {
             //   param_type=2, param_len, cap_code=64, cap_len=2, <payload bytes>
             let payload: Vec<u8> = vec![0x00u8, 0x78u8][..truncate_to].to_vec();
             let cap_len = 2u8; // claims 2 bytes even if truncated
-            let param_len = 2 + payload.len() as u8; // cap_code + cap_len + payload
+            #[allow(clippy::cast_possible_truncation)]
+            let param_len = 2 + payload.len() as u8; // cap_code + cap_len + payload; len ≤ 2
             let mut opt_params: Vec<u8> = vec![0x02, param_len, 64, cap_len];
             opt_params.extend_from_slice(&payload);
 
@@ -705,10 +706,9 @@ mod tests {
                     if i % 2 == 0 { 0x80 } else { 0x00 }, // F-bit alternates
                 ]);
             }
-            for _ in 0..trailing {
-                cap_payload.push(0xFF);
-            }
-            let cap_len = cap_payload.len() as u8;
+            cap_payload.extend(std::iter::repeat_n(0xFF, trailing as usize));
+            #[allow(clippy::cast_possible_truncation)]
+            let cap_len = cap_payload.len() as u8; // ≤ 2 + 4*4 + 3 = 21, fits u8
             let param_len = 2 + cap_len; // cap_code + cap_len + payload
             let mut opt_params: Vec<u8> = vec![0x02, param_len, 64, cap_len];
             opt_params.extend_from_slice(&cap_payload);
@@ -718,13 +718,16 @@ mod tests {
             let result = OpenMessage::decode(&mut cur);
             prop_assert!(result.is_ok(),
                 "trailing family bytes must not cause decode error: {result:?}");
-            if let Ok(msg) = result {
-                if let Some(Capability::GracefulRestart { families, .. }) =
-                    msg.capabilities.iter().find(|c| matches!(c, Capability::GracefulRestart { .. }))
-                {
-                    prop_assert_eq!(families.len(), n_families,
-                        "trailing bytes must not create phantom families");
-                }
+            if let Ok(msg) = result
+                && let Some(Capability::GracefulRestart { families, .. }) = msg
+                    .capabilities
+                    .iter()
+                    .find(|c| matches!(c, Capability::GracefulRestart { .. }))
+            {
+                prop_assert_eq!(
+                    families.len(), n_families,
+                    "trailing bytes must not create phantom families"
+                );
             }
         }
     }
@@ -732,7 +735,8 @@ mod tests {
     /// Build a raw BGP OPEN message body (after the 19-byte BGP header) with
     /// custom optional-parameters bytes, for use in proptest codec tests.
     fn build_open_bytes(opt_params: &[u8]) -> Vec<u8> {
-        let opt_len = opt_params.len() as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        let opt_len = opt_params.len() as u8; // test inputs are always small
         let mut v = Vec::new();
         v.push(4); // version
         v.extend_from_slice(&65001u16.to_be_bytes()); // my_as
