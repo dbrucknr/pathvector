@@ -311,6 +311,56 @@ pub fn write_gobgp_config() -> NamedTempFile {
     f
 }
 
+/// Like [`write_gobgp_config`] but with a configurable `restart-time`.
+///
+/// Use a short `restart_secs` (e.g. `10`) for Phase 2 tests so the GR window
+/// expires quickly without waiting the full 120 s default.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_with_restart_time(restart_secs: u16) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  [peer-groups.graceful-restart.config]
+    enabled      = true
+    restart-time = {restart_secs}
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp config");
+    f
+}
+
 /// Writes the gobgpd config for a **route-source** container (AS 65003).
 ///
 /// This is used in two-peer outbound tests: the source announces prefixes to
@@ -1459,11 +1509,38 @@ impl Harness {
         Self::new_inner(move |peers| write_daemon_config_gr_restarting(peers, restart_secs)).await
     }
 
+    /// Stand up pathvectord with a GoBGP peer whose GR `restart-time` is set
+    /// to `peer_restart_secs`.
+    ///
+    /// Pathvectord does **not** need its own `graceful_restart_time` configured
+    /// for Phase 2 to work — only the peer's advertised capability matters.
+    /// Use a short value (e.g. 10) so GR windows expire quickly in tests.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr_peer(peer_restart_secs: u16) -> Self {
+        Self::new_inner_with_gobgp_config(
+            move || write_gobgp_config_with_restart_time(peer_restart_secs),
+            write_daemon_config,
+        )
+        .await
+    }
+
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
     ///
     /// `make_cfg` is the config-writing function (or closure) that produces the
     /// pathvectord TOML.  The caller chooses the policy / feature variant.
     async fn new_inner(make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+        Self::new_inner_with_gobgp_config(write_gobgp_config, make_cfg).await
+    }
+
+    /// Like [`new_inner`] but also accepts a `gobgpd_cfg_fn` for tests that
+    /// need a non-default GoBGP configuration (e.g. a custom restart-time).
+    async fn new_inner_with_gobgp_config(
+        gobgpd_cfg_fn: impl Fn() -> NamedTempFile,
+        make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile,
+    ) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
@@ -1473,7 +1550,7 @@ impl Harness {
         let network = DockerNetwork::create(network_name.clone());
 
         // Write gobgpd config.
-        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config = gobgpd_cfg_fn();
         let gobgpd_config_path = gobgpd_config
             .path()
             .to_str()
