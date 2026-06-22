@@ -3117,10 +3117,7 @@ async fn run_command_processor<H, F>(
                     // Operator-initiated removal with no live session — use
                     // Clean so on_terminated does not open a GR window.
                     let _ = event_tx
-                        .send((
-                            peer_ip,
-                            SessionEvent::Terminated(TerminationReason::Clean),
-                        ))
+                        .send((peer_ip, SessionEvent::Terminated(TerminationReason::Clean)))
                         .await;
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
