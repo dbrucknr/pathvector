@@ -354,6 +354,20 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub shutdown_message: Option<String>,
+    /// RFC 4271 §8.1 ConnectRetry timer in seconds.
+    ///
+    /// How long to wait before retrying a failed TCP connection to this peer.
+    /// Defaults to 120 s per the RFC recommendation. Reduce for
+    /// latency-sensitive deployments or test environments.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address             = "10.0.0.2"
+    /// remote_as           = 65001
+    /// connect_retry_time  = 5
+    /// ```
+    #[serde(default)]
+    pub connect_retry_time: Option<u16>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -471,6 +485,7 @@ mod sidecar_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+            connect_retry_time: None,
         }
     }
 
@@ -549,6 +564,7 @@ mod sidecar_tests {
             next_hop_self: false,
             hold_time: Some(60),
             shutdown_message: Some("planned maintenance".into()),
+            connect_retry_time: Some(5),
         };
         store.upsert(full_peer.clone()).await;
 

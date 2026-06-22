@@ -17,7 +17,7 @@ use pathvector_session::message::{
     UpdateMessage,
 };
 use pathvector_session::transport::{
-    SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
+    DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -42,6 +42,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         peer_as: Some(65002),
         peer_addr,
         md5_password: None,
+        connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
 
@@ -235,6 +236,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         peer_as: Some(65002),
         peer_addr,
         md5_password: None,
+        connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
 

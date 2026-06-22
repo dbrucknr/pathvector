@@ -11,7 +11,7 @@
 
 use std::{process::Command, time::Duration};
 
-use pathvector_e2e::{Harness, wait_for_route, wait_for_route_withdrawn};
+use pathvector_e2e::{Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn};
 
 /// RFC 4724 §4.2 — when a GR-capable peer disconnects via unclean TCP
 /// failure (SIGKILL, no NOTIFICATION), pathvectord must retain the peer's
@@ -58,6 +58,73 @@ async fn gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry() {
     wait_for_route_withdrawn(&mut h.client, "203.0.113.0/24", Duration::from_secs(20))
         .await
         .expect("203.0.113.0/24 was not withdrawn after the 10 s GR restart window expired");
+}
+
+/// RFC 4724 §4.2 — after a peer restarts and re-announces only a subset of its
+/// routes, pathvectord must prune the stale routes that were never refreshed
+/// once it receives the peer's End-of-RIB marker.
+///
+/// Sequence:
+/// 1. GoBGP announces R1 (203.0.113.0/24) and R2 (203.0.113.1/32).
+/// 2. GoBGP is disconnected from the Docker network — TCP drops, GR window opens.
+/// 3. R2 is withdrawn from GoBGP's in-memory RIB via `docker exec gobgp global rib del`.
+/// 4. GoBGP is reconnected with the same IP; pathvectord re-dials and re-establishes.
+/// 5. GoBGP re-announces only R1 and sends End-of-RIB.
+/// 6. pathvectord must retain R1 and prune R2 (never refreshed).
+///
+/// This test requires pathvectord to use a short `connect_retry_time` (2 s) so it
+/// reconnects quickly after the network is restored.  The GoBGP container keeps
+/// running throughout; only its network attachment is temporarily removed.
+#[tokio::test]
+async fn gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer() {
+    let mut h = Harness::new_gr_peer_fast_retry(10).await;
+
+    h.gobgp_announce("203.0.113.0/24", "10.0.0.1"); // R1
+    h.gobgp_announce("203.0.113.1/32", "10.0.0.1"); // R2
+    wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(10))
+        .await
+        .expect("R1 (203.0.113.0/24) did not appear in Loc-RIB within 10 s");
+    wait_for_route(&mut h.client, "203.0.113.1/32", Duration::from_secs(10))
+        .await
+        .expect("R2 (203.0.113.1/32) did not appear in Loc-RIB within 10 s");
+
+    // Disconnect GoBGP from the Docker network — TCP drops, GR window opens.
+    // The GoBGP process keeps running; its in-memory RIB is intact.
+    h.disconnect_gobgp();
+
+    // Confirm both routes are still held (GR window is open).
+    wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(5))
+        .await
+        .expect("R1 was flushed immediately after network disconnect; expected GR window");
+    wait_for_route(&mut h.client, "203.0.113.1/32", Duration::from_secs(5))
+        .await
+        .expect("R2 was flushed immediately after network disconnect; expected GR window");
+
+    // Remove R2 from GoBGP's RIB while it has no network — docker exec still works.
+    // When GoBGP re-establishes it will re-announce only R1, then send EOR.
+    h.gobgp_withdraw("203.0.113.1/32");
+
+    // Reconnect GoBGP with the same IP so pathvectord can re-dial it.
+    h.reconnect_gobgp();
+
+    // Wait for the session to re-establish.  pathvectord retries every 2 s
+    // (connect_retry_time), so this should complete within 10 s.
+    wait_for_established(&mut h.client, h.peer, Duration::from_secs(15))
+        .await
+        .expect("BGP session did not re-establish within 15 s after network reconnect");
+
+    // R1 was re-announced by GoBGP — it must still be present.
+    wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(10))
+        .await
+        .expect("R1 (203.0.113.0/24) was not present after session re-established");
+
+    // R2 was never re-announced — EOR must have triggered its removal.
+    wait_for_route_withdrawn(&mut h.client, "203.0.113.1/32", Duration::from_secs(15))
+        .await
+        .expect(
+            "R2 (203.0.113.1/32) was not pruned after EOR; \
+             pathvectord should have removed all stale routes not refreshed before EOR",
+        );
 }
 
 /// RFC 4724 §4.2 — a clean peer termination (BGP NOTIFICATION) must flush

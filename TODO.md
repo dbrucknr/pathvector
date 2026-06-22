@@ -354,23 +354,15 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 
 ### Graceful Restart — known gaps (2026-06-22)
 
-RFC 4724 Phase 1 and Phase 2 are fully implemented. Two known gaps remain.
+RFC 4724 Phase 1 and Phase 2 are fully implemented. One known gap remains.
 
-**1. EOR-prune e2e test missing**
+~~**1. EOR-prune e2e test missing**~~  
+~~*Resolved 2026-06-22* — `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` in~~
+~~`pathvector-e2e/tests/graceful_restart_phase2.rs` uses `docker network disconnect/connect --ip`~~
+~~to simulate a partial-RIB restart without changing the GoBGP container IP.  pathvectord~~
+~~`connect_retry_time` is now configurable (default 120 s, set to 2 s in test harness).~~
 
-The sequence "peer disconnects uncleanly → pathvectord holds stale routes → peer
-restarts and re-announces a subset → EOR received → un-refreshed routes pruned" is
-covered by unit tests in `daemon.rs` but has never run against a real peer.
-The two e2e tests in `graceful_restart_phase2.rs` cover the window-held and
-window-expired cases; the restart-and-partial-re-announce path is not exercised.
-
-Blocker: the e2e harness starts GoBGP in a container; container restart changes
-its IP, so pathvectord's peer config no longer matches. Fix options:
-- Assign a static container IP via `docker network connect --ip` in the test
-- Kill the gobgpd process inside the container without stopping the container
-  (requires `--init` in the Dockerfile so gobgpd is not PID 1)
-
-**2. `mark_stale_and_repropagate` performance at full-table scale**
+**1. `mark_stale_and_repropagate` performance at full-table scale**
 
 When a GR-capable peer disconnects, `mark_stale_and_repropagate` iterates every
 NLRI from that peer and calls `rib_mut()` in a loop (repeated `Arc::make_mut`).

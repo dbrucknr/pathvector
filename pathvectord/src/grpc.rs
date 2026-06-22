@@ -501,6 +501,7 @@ impl PeerService for PeerServiceImpl {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+            connect_retry_time: None,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -1313,6 +1314,7 @@ mod tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .collect();
         DaemonState::new(

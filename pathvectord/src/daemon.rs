@@ -22,7 +22,8 @@ use pathvector_session::{
         UpdateMessage, UpdateMsgError, encode_shutdown_message,
     },
     transport::{
-        self, SessionCommand, SessionConfig, SessionEvent, SessionHandle, TerminationReason,
+        self, DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent,
+        SessionHandle, TerminationReason,
     },
 };
 use pathvector_types::{AfiSafi, AsPath, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
@@ -3036,6 +3037,10 @@ async fn run_command_processor<H, F>(
                     peer_as: Some(peer.remote_as),
                     peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
                     md5_password: peer.md5_password.clone(),
+                    connect_retry_time: peer.connect_retry_time.map_or(
+                        DEFAULT_CONNECT_RETRY_TIME,
+                        |s| std::time::Duration::from_secs(u64::from(s)),
+                    ),
                 };
 
                 let mut handle = spawn_fn(session_cfg);
@@ -3200,6 +3205,10 @@ where
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
             md5_password: peer.md5_password.clone(),
+            connect_retry_time: peer.connect_retry_time.map_or(
+                DEFAULT_CONNECT_RETRY_TIME,
+                |s| std::time::Duration::from_secs(u64::from(s)),
+            ),
         };
 
         let mut handle = spawn_fn(session_cfg);
@@ -4261,6 +4270,7 @@ mod tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -4398,6 +4408,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -4704,6 +4715,7 @@ mod tests {
             next_hop_self: true,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(peer_ip, tx);
@@ -4780,6 +4792,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }];
         let mut state = DaemonState::new(
             65001,
@@ -5811,6 +5824,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -5855,6 +5869,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -9161,6 +9176,7 @@ mod tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
                 address,
@@ -9174,6 +9190,7 @@ mod tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             }))
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -9722,6 +9739,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         };
         let (tx, _rx) = mpsc::channel(64);
         state.add_peer(&new_peer, tx);
@@ -9787,6 +9805,7 @@ mod stall_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .collect();
         let state = DaemonState::new(
@@ -9877,6 +9896,7 @@ mod stall_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -9890,6 +9910,7 @@ mod stall_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -9998,6 +10019,7 @@ mod stall_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -10011,6 +10033,7 @@ mod stall_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -10421,6 +10444,7 @@ mod coalescing_tests {
                     next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
+                connect_retry_time: None,
                 }
             })
             .collect();
@@ -10713,6 +10737,7 @@ mod coalescing_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -10726,6 +10751,7 @@ mod coalescing_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -10858,6 +10884,7 @@ mod coalescing_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -10871,6 +10898,7 @@ mod coalescing_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -11094,6 +11122,7 @@ mod event_loop_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .collect();
 
@@ -11230,6 +11259,7 @@ mod event_loop_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -11243,6 +11273,7 @@ mod event_loop_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -11431,6 +11462,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }
     }
 
@@ -11917,6 +11949,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: Some("planned maintenance".to_string()),
+            connect_retry_time: None,
         };
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
@@ -12132,6 +12165,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
+                connect_retry_time: None,
         };
         assert_eq!(
             peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
@@ -12228,6 +12262,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
+                connect_retry_time: None,
         };
 
         cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
@@ -12722,6 +12757,7 @@ mod dynamic_peer_prop_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+                connect_retry_time: None,
         }
     }
 
@@ -13111,6 +13147,7 @@ mod run_with_tests {
                     next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
+                connect_retry_time: None,
                 })
                 .collect(),
             sidecar_path: None,
@@ -13499,6 +13536,7 @@ mod run_with_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .await;
 
@@ -13549,6 +13587,7 @@ mod run_with_tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .await;
 
@@ -14091,6 +14130,7 @@ mod test_gr_phase2 {
                     next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
+                connect_retry_time: None,
                 }
             })
             .collect();

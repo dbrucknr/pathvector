@@ -137,6 +137,9 @@ pub trait SessionHandle: Send + 'static {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// RFC 4271 §8.1 recommended default `ConnectRetry` interval.
+pub const DEFAULT_CONNECT_RETRY_TIME: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Configuration for a BGP session.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -144,6 +147,10 @@ pub struct SessionConfig {
     pub local_bgp_id: Ipv4Addr,
     /// Proposed hold time in seconds (`0` to disable; otherwise ≥ 3).
     pub hold_time: u16,
+    /// RFC 4271 §8.1 `ConnectRetry` timer interval.  Use
+    /// [`DEFAULT_CONNECT_RETRY_TIME`] for the RFC-recommended 120 s default.
+    /// Set lower in tests or latency-sensitive deployments.
+    pub connect_retry_time: std::time::Duration,
     /// Capabilities advertised in the OPEN message.
     pub capabilities: Vec<Capability>,
     /// Capabilities the peer MUST advertise. If absent, the session is rejected
@@ -707,8 +714,8 @@ impl<T: BgpTransport> Session<T> {
                 FsmOutput::StopKeepaliveTimer => {
                     self.keepalive_deadline = None;
                 }
-                FsmOutput::StartConnectRetryTimer(d) => {
-                    self.retry_deadline = Some(Instant::now() + d);
+                FsmOutput::StartConnectRetryTimer(_) => {
+                    self.retry_deadline = Some(Instant::now() + self.config.connect_retry_time);
                 }
                 FsmOutput::StopConnectRetryTimer => {
                     self.retry_deadline = None;
@@ -888,8 +895,9 @@ mod tests {
     use std::net::Ipv4Addr as StdIpv4Addr;
 
     use super::{
-        BgpTransport, FramedBgpTransport, SessionCommand, SessionConfig, SessionEvent,
-        SessionHandle, SpawnedSessionHandle, TerminationReason, spawn_with,
+        BgpTransport, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand,
+        SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason,
+        spawn_with,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
@@ -963,6 +971,7 @@ mod tests {
             // peer_addr is unused when a transport is injected via spawn_with.
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             md5_password: None,
+            connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
         }
     }
 

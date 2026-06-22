@@ -663,6 +663,52 @@ export_default = "accept"
     f
 }
 
+/// Writes a pathvectord config with `connect_retry_time` set per-peer.
+///
+/// Identical to [`write_daemon_config`] except each peer has a
+/// `connect_retry_time` override.  Use a short value (e.g. `2`) in tests that
+/// kill and restart a peer and need pathvectord to reconnect quickly rather
+/// than waiting the RFC-default 120 s.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_fast_retry(
+    peers: &[(Ipv4Addr, u32)],
+    connect_retry_secs: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord fast-retry config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord fast-retry config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address             = "{ip}"
+port                = {GOBGPD_BGP_PORT}
+remote_as           = {remote_as}
+import_default      = "accept"
+export_default      = "accept"
+connect_retry_time  = {connect_retry_secs}
+"#
+        )
+        .expect("write pathvectord fast-retry peer config");
+    }
+    f
+}
+
 /// Writes a pathvectord config with `graceful_restart_time` and `restarting = true`.
 ///
 /// Identical to [`write_daemon_config_gr`] but also sets `restarting = true` so
@@ -1421,6 +1467,10 @@ pub struct Harness {
     /// the shared Docker network).  Used to query `gobgp neighbor <addr>` from
     /// inside the gobgpd container.
     pub pathvectord_ip: Ipv4Addr,
+    /// Name of the isolated Docker bridge network for this test.  Exposed so
+    /// tests can call `docker network disconnect/connect` to simulate link
+    /// failures without stopping containers.
+    pub network_name: String,
     // Dropped LAST so the network outlives the containers using it.
     _network: DockerNetwork,
 }
@@ -1527,6 +1577,65 @@ impl Harness {
         .await
     }
 
+    /// Like [`Self::new_gr_peer`] but pathvectord is also configured with a
+    /// short `connect_retry_time` so it reconnects quickly after the peer
+    /// disappears, rather than waiting the RFC-default 120 s.
+    ///
+    /// Use this for EOR-prune tests that simulate a peer restart: disconnect
+    /// the peer from the network, mutate its RIB, reconnect, and wait for
+    /// pathvectord to re-establish and process the EOR.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr_peer_fast_retry(peer_restart_secs: u16) -> Self {
+        Self::new_inner_with_gobgp_config(
+            move || write_gobgp_config_with_restart_time(peer_restart_secs),
+            move |peers| write_daemon_config_fast_retry(peers, 2),
+        )
+        .await
+    }
+
+    /// Disconnect the GoBGP container from the test network without stopping it.
+    ///
+    /// The TCP connection drops immediately, triggering an unclean termination
+    /// in pathvectord.  The GoBGP process keeps running; its in-memory RIB is
+    /// intact.  Call [`Self::reconnect_gobgp`] to restore network access with
+    /// the same IP so pathvectord can reconnect.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network disconnect` fails.
+    pub fn disconnect_gobgp(&self) {
+        let status = Command::new("docker")
+            .args(["network", "disconnect", &self.network_name, &self.gobgpd_id])
+            .status()
+            .expect("docker network disconnect gobgpd");
+        assert!(status.success(), "docker network disconnect failed: {status}");
+    }
+
+    /// Reconnect the GoBGP container to the test network with its original IP.
+    ///
+    /// Must be called after [`Self::disconnect_gobgp`].  Uses `--ip` to
+    /// restore the same address, so pathvectord's peer config still matches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network connect` fails.
+    pub fn reconnect_gobgp(&self) {
+        let status = Command::new("docker")
+            .args([
+                "network", "connect",
+                "--ip", &self.peer.to_string(),
+                &self.network_name,
+                &self.gobgpd_id,
+            ])
+            .status()
+            .expect("docker network connect gobgpd");
+        assert!(status.success(), "docker network connect failed: {status}");
+    }
+
+
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
     ///
     /// `make_cfg` is the config-writing function (or closure) that produces the
@@ -1630,6 +1739,7 @@ impl Harness {
             client,
             peer: gobgpd_ip,
             pathvectord_ip,
+            network_name,
             _network: network,
         }
     }
@@ -1709,6 +1819,7 @@ impl Harness {
             client,
             peer: gobgpd_ip,
             pathvectord_ip,
+            network_name,
             _network: network,
         }
     }
