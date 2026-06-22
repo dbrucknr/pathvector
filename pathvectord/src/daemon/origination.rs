@@ -119,3 +119,85 @@ impl DaemonState {
         self.flush_pending();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use pathvector_rib::BestPathChange;
+    use pathvector_types::{AsPath, NextHop, Nlri, Origin};
+
+    use super::*;
+    use crate::daemon::tests::{make_state, with_recording_fib};
+
+    const LOCAL_AS: u32 = 65001;
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER_AS: u32 = 65002;
+
+    fn route_v6(prefix: &str) -> Route<Ipv6Addr> {
+        let nlri: Nlri<Ipv6Addr> = prefix.parse().unwrap();
+        RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build()
+    }
+
+    fn route_v4(prefix: &str) -> Route<Ipv4Addr> {
+        let nlri: Nlri<Ipv4Addr> = prefix.parse().unwrap();
+        RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4("192.0.2.1".parse().unwrap()))
+            .build()
+    }
+
+    /// `originate_routes_v6` must notify the FIB manager when one is set.
+    #[test]
+    fn originate_v6_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+
+        state.originate_route_v6(route_v6("2001:db8::/32"));
+
+        let changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            changes.iter().any(|c| matches!(c, BestPathChange::Announced(..))),
+            "originate_route_v6 must push an Announced FIB change"
+        );
+    }
+
+    /// `withdraw_originated_routes` must notify the FIB manager for each withdrawn NLRI.
+    #[test]
+    fn withdraw_v4_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        state.originate_route(route_v4("10.0.0.0/8"));
+        fib.v4.lock().unwrap().clear();
+
+        state.withdraw_originated_route(nlri);
+
+        let changes = fib.v4.lock().unwrap().clone();
+        assert!(
+            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "withdraw_originated_route must push a Withdrawn FIB change"
+        );
+    }
+
+    /// `withdraw_originated_routes_v6` must notify the FIB manager for each withdrawn NLRI.
+    #[test]
+    fn withdraw_v6_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+
+        state.originate_route_v6(route_v6("2001:db8::/32"));
+        fib.v6.lock().unwrap().clear();
+
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        state.withdraw_originated_route_v6(nlri);
+
+        let changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "withdraw_originated_route_v6 must push a Withdrawn FIB change"
+        );
+    }
+}

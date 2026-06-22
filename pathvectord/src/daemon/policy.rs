@@ -140,3 +140,85 @@ impl DaemonState {
         self.sync_advertised(peer_ip);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use pathvector_policy::DefaultAction;
+    use pathvector_rib::BestPathChange;
+    use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
+
+    use crate::daemon::tests::{make_state, with_recording_fib};
+    use pathvector_session::message::{PathAttribute, UpdateMessage};
+
+    const LOCAL_AS: u32 = 65001;
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER_AS: u32 = 65002;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn announce(prefix: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(PEER_AS)])),
+                PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+            ],
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    /// `set_import_default` on an unknown peer must be silently ignored.
+    #[test]
+    fn set_import_default_unknown_peer_is_noop() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let unknown: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        // Must not panic or alter state.
+        state.set_import_default(unknown, DefaultAction::Accept);
+    }
+
+    /// `set_export_default` on an unknown peer must be silently ignored.
+    #[test]
+    fn set_export_default_unknown_peer_is_noop() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let unknown: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        state.set_export_default(unknown, DefaultAction::Accept);
+    }
+
+    /// `set_export_default` before `on_established` (peer not yet in `rib.peer_types`)
+    /// must store the new policy without attempting to propagate (no crash, no output).
+    #[test]
+    fn set_export_default_not_established_is_stored_silently() {
+        let (mut state, mut rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        // Peer exists in export_policies (added by make_state) but is NOT established.
+        state.set_export_default(PEER_IP, DefaultAction::Reject);
+        // No UPDATE must be sent.
+        assert!(rxs.get_mut(&PEER_IP).unwrap().try_recv().is_err());
+    }
+
+    /// Changing import policy to Reject when a route is present must trigger a FIB
+    /// Withdrawn call (covers the `if let Some(fm)` branch in `set_import_default`).
+    #[test]
+    fn set_import_default_reject_notifies_fib_manager() {
+        let (mut state, mut rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        while rxs.get_mut(&PEER_IP).unwrap().try_recv().is_ok() {}
+
+        state.on_route_update(PEER_IP, announce("10.0.0.0/8"));
+        fib.v4.lock().unwrap().clear();
+
+        state.set_import_default(PEER_IP, DefaultAction::Reject);
+
+        let changes = fib.v4.lock().unwrap().clone();
+        assert!(
+            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "set_import_default(Reject) must push a Withdrawn FIB change for the evicted route"
+        );
+    }
+}
