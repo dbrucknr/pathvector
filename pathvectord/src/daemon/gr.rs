@@ -52,21 +52,26 @@ impl GracefulRestartState {
 
     /// Drain all peers whose deadline has passed.  Returns their addresses.
     pub(crate) fn drain_expired(&mut self, now: Instant) -> Vec<Ipv4Addr> {
-        let expired: Vec<Ipv4Addr> = self
-            .deadlines
-            .iter()
-            .filter(|(_, d)| **d <= now)
-            .map(|(ip, _)| *ip)
-            .collect();
-        for ip in &expired {
-            self.deadlines.remove(ip);
-        }
+        let mut expired = Vec::new();
+        self.deadlines.retain(|ip, &mut d| {
+            if d <= now {
+                expired.push(*ip);
+                false
+            } else {
+                true
+            }
+        });
         expired
     }
 }
 
 impl DaemonState {
-    pub(super) fn mark_stale_and_repropagate(&mut self, peer_ip: Ipv4Addr, do_v4: bool, do_v6: bool) {
+    pub(super) fn mark_stale_and_repropagate(
+        &mut self,
+        peer_ip: Ipv4Addr,
+        do_v4: bool,
+        do_v6: bool,
+    ) {
         let stale_peer = PeerId::from(peer_ip);
 
         // v4 ─────────────────────────────────────────────────────────────────
@@ -360,7 +365,11 @@ impl DaemonState {
     }
 
     /// IPv6 counterpart of `prune_stale_nlri` — same semantics for IPv6 NLRIs.
-    pub(super) fn prune_stale_nlri_v6(&mut self, peer_ip: Ipv4Addr, stale: &HashSet<Nlri<Ipv6Addr>>) {
+    pub(super) fn prune_stale_nlri_v6(
+        &mut self,
+        peer_ip: Ipv4Addr,
+        stale: &HashSet<Nlri<Ipv6Addr>>,
+    ) {
         let stale_peer = PeerId::from(peer_ip);
 
         if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
@@ -555,5 +564,5 @@ impl DaemonState {
             r#type: proto::PeerEventType::Changed as i32,
             peer: None,
         });
-}
+    }
 }
