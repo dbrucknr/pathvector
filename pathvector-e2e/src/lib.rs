@@ -1611,7 +1611,10 @@ impl Harness {
             .args(["network", "disconnect", &self.network_name, &self.gobgpd_id])
             .status()
             .expect("docker network disconnect gobgpd");
-        assert!(status.success(), "docker network disconnect failed: {status}");
+        assert!(
+            status.success(),
+            "docker network disconnect failed: {status}"
+        );
     }
 
     /// Reconnect the GoBGP container to the test network with its original IP.
@@ -1625,8 +1628,10 @@ impl Harness {
     pub fn reconnect_gobgp(&self) {
         let status = Command::new("docker")
             .args([
-                "network", "connect",
-                "--ip", &self.peer.to_string(),
+                "network",
+                "connect",
+                "--ip",
+                &self.peer.to_string(),
                 &self.network_name,
                 &self.gobgpd_id,
             ])
@@ -1634,7 +1639,6 @@ impl Harness {
             .expect("docker network connect gobgpd");
         assert!(status.success(), "docker network connect failed: {status}");
     }
-
 
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
     ///

@@ -3037,10 +3037,11 @@ async fn run_command_processor<H, F>(
                     peer_as: Some(peer.remote_as),
                     peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
                     md5_password: peer.md5_password.clone(),
-                    connect_retry_time: peer.connect_retry_time.map_or(
-                        DEFAULT_CONNECT_RETRY_TIME,
-                        |s| std::time::Duration::from_secs(u64::from(s)),
-                    ),
+                    connect_retry_time: peer
+                        .connect_retry_time
+                        .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
+                            std::time::Duration::from_secs(u64::from(s))
+                        }),
                 };
 
                 let mut handle = spawn_fn(session_cfg);
@@ -3205,10 +3206,11 @@ where
             peer_as: Some(peer.remote_as),
             peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
             md5_password: peer.md5_password.clone(),
-            connect_retry_time: peer.connect_retry_time.map_or(
-                DEFAULT_CONNECT_RETRY_TIME,
-                |s| std::time::Duration::from_secs(u64::from(s)),
-            ),
+            connect_retry_time: peer
+                .connect_retry_time
+                .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
+                    std::time::Duration::from_secs(u64::from(s))
+                }),
         };
 
         let mut handle = spawn_fn(session_cfg);
@@ -4408,7 +4410,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -4715,7 +4717,7 @@ mod tests {
             next_hop_self: true,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(peer_ip, tx);
@@ -4792,7 +4794,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }];
         let mut state = DaemonState::new(
             65001,
@@ -5824,7 +5826,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -5869,7 +5871,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -9739,7 +9741,7 @@ mod tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         };
         let (tx, _rx) = mpsc::channel(64);
         state.add_peer(&new_peer, tx);
@@ -10444,7 +10446,7 @@ mod coalescing_tests {
                     next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
-                connect_retry_time: None,
+                    connect_retry_time: None,
                 }
             })
             .collect();
@@ -11462,7 +11464,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }
     }
 
@@ -12165,7 +12167,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         };
         assert_eq!(
             peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
@@ -12262,7 +12264,7 @@ mod event_loop_tests {
             next_hop_self: false,
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         };
 
         cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
@@ -12757,7 +12759,7 @@ mod dynamic_peer_prop_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
-                connect_retry_time: None,
+            connect_retry_time: None,
         }
     }
 
@@ -13147,7 +13149,7 @@ mod run_with_tests {
                     next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
-                connect_retry_time: None,
+                    connect_retry_time: None,
                 })
                 .collect(),
             sidecar_path: None,
@@ -14130,7 +14132,7 @@ mod test_gr_phase2 {
                     next_hop_self: false,
                     hold_time: None,
                     shutdown_message: None,
-                connect_retry_time: None,
+                    connect_retry_time: None,
                 }
             })
             .collect();
