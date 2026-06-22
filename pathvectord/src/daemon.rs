@@ -21,7 +21,7 @@ use pathvector_session::{
         MpUnreachNlri, NotificationError, NotificationMessage, PathAttribute, Prefix,
         UpdateMessage, UpdateMsgError, encode_shutdown_message,
     },
-    transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle},
+    transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle, TerminationReason},
 };
 use pathvector_types::{AfiSafi, AsPath, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
@@ -270,6 +270,27 @@ pub(crate) struct DaemonState {
     /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
     /// resetting it for a reconnect.
     pub(crate) pending_removal: HashSet<Ipv4Addr>,
+    /// RFC 4724 §4.2 — active Graceful Restart windows, keyed by peer address.
+    ///
+    /// Present while pathvectord is holding stale routes from a peer that
+    /// disconnected uncleanly.  Mapped to the `Instant` at which the window
+    /// expires.  On expiry the stale routes are flushed exactly as they would
+    /// be in a normal `on_terminated`.  On re-establishment the entry is
+    /// cancelled and normal EOR-based pruning takes over.
+    pub(crate) gr_deadlines: HashMap<Ipv4Addr, Instant>,
+    /// NLRIs that were in AdjRibIn when a GR peer re-established.
+    ///
+    /// Set in `on_established` when `gr_deadlines` had an entry for the peer.
+    /// Routes that are NOT refreshed by the peer before its EOR are stale and
+    /// must be withdrawn when the EOR arrives.  Cleared on EOR or on deadline
+    /// expiry (whichever comes first).
+    pub(crate) gr_stale_nlri: HashMap<Ipv4Addr, HashSet<Nlri<Ipv4Addr>>>,
+    /// IPv6 counterpart of `gr_stale_nlri` — same lifecycle, v6 NLRIs only.
+    pub(crate) gr_stale_nlri_v6: HashMap<Ipv4Addr, HashSet<Nlri<Ipv6Addr>>>,
+    /// Per-family GR info from the most-recent peer OPEN.  Retained across
+    /// termination so `on_terminated` knows which families the peer supports
+    /// GR for.  Cleared when the peer is removed.
+    pub(crate) gr_peer_families: HashMap<Ipv4Addr, Vec<GracefulRestartFamily>>,
     /// RFC 9003 shutdown reason strings, keyed by peer address.
     ///
     /// Populated when a peer is added (static or dynamic) and has a
@@ -442,6 +463,10 @@ impl DaemonState {
             pending_decisions: HashMap::new(),
             pending_decisions_v6: HashMap::new(),
             pending_removal: HashSet::new(),
+            gr_deadlines: HashMap::new(),
+            gr_stale_nlri: HashMap::new(),
+            gr_stale_nlri_v6: HashMap::new(),
+            gr_peer_families: HashMap::new(),
             shutdown_messages,
             route_tx,
             peer_tx,
@@ -527,6 +552,10 @@ impl DaemonState {
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
         self.rib_mut().gr_capable_peers.remove(&peer_ip);
+        self.gr_peer_families.remove(&peer_ip);
+        self.gr_stale_nlri.remove(&peer_ip);
+        self.gr_stale_nlri_v6.remove(&peer_ip);
+        self.gr_deadlines.remove(&peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
         self.pending_decisions.remove(&peer_ip);
@@ -689,6 +718,52 @@ impl DaemonState {
     ) {
         let peer_id = PeerId::from(peer_ip);
 
+        // RFC 4724 §4.2 — GR re-establishment: if we were holding stale routes
+        // from this peer, cancel the deadline.  The peer will re-advertise its
+        // full table; EOR receipt triggers `prune_stale_nlri` below.
+        let was_in_gr = self.gr_deadlines.remove(&peer_ip).is_some();
+        // Determine which families the peer supports GR for (from prior session).
+        let gr_v4 = was_in_gr
+            && self
+                .gr_peer_families
+                .get(&peer_ip)
+                .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
+        let gr_v6 = was_in_gr
+            && self
+                .gr_peer_families
+                .get(&peer_ip)
+                .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
+        if was_in_gr {
+            // Snapshot which NLRIs were held stale.  Any that aren't refreshed
+            // by the peer before its EOR will be withdrawn in on_route_update.
+            if gr_v4 {
+                let stale_now: HashSet<Nlri<Ipv4Addr>> = self
+                    .adj_ribs_in
+                    .get(&peer_ip)
+                    .map(|ari| ari.routes().map(|(nlri, _)| *nlri).collect())
+                    .unwrap_or_default();
+                if !stale_now.is_empty() {
+                    self.gr_stale_nlri.insert(peer_ip, stale_now);
+                }
+            }
+            if gr_v6 {
+                let stale_now_v6: HashSet<Nlri<Ipv6Addr>> = self
+                    .adj_ribs_in_v6
+                    .get(&peer_ip)
+                    .map(|ari| ari.routes().map(|(nlri, _)| *nlri).collect())
+                    .unwrap_or_default();
+                if !stale_now_v6.is_empty() {
+                    self.gr_stale_nlri_v6.insert(peer_ip, stale_now_v6);
+                }
+            }
+            tracing::info!(
+                peer = %peer_ip,
+                stale_v4 = self.gr_stale_nlri.get(&peer_ip).map_or(0, HashSet::len),
+                stale_v6 = self.gr_stale_nlri_v6.get(&peer_ip).map_or(0, HashSet::len),
+                "peer re-established within GR window — stale routes kept until EOR"
+            );
+        }
+
         // Update snapshot fields.
         {
             let rib = self.rib_mut();
@@ -722,8 +797,11 @@ impl DaemonState {
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = new_aro;
         }
-        // Reset v6 RIBs so a re-established session starts clean.
-        self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
+        // Reset v6 AdjRibIn only when NOT holding stale v6 routes for this peer.
+        // In GR re-establishment with v6, the stale routes stay until EOR prune.
+        if !gr_v6 {
+            self.adj_ribs_in_v6.insert(peer_ip, AdjRibIn::new(peer_id));
+        }
         self.adj_ribs_out_v6.insert(peer_ip, new_aro_v6);
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
@@ -811,17 +889,18 @@ impl DaemonState {
         // RFC 4724: record whether the peer advertised GracefulRestart with a
         // non-zero restart_time. A zero restart_time means the peer does not
         // participate in the GR restart window (capability present for EOR only).
-        let peer_gr_time = peer_capabilities.iter().find_map(|c| {
-            if let Capability::GracefulRestart { restart_time, .. } = c {
-                if *restart_time > 0 {
-                    Some(*restart_time)
+        let (peer_gr_time, peer_gr_families): (Option<u16>, Vec<GracefulRestartFamily>) =
+            peer_capabilities.iter().find_map(|c| {
+                if let Capability::GracefulRestart { restart_time, families, .. } = c {
+                    if *restart_time > 0 {
+                        Some((*restart_time, families.clone()))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
-            }
-        });
+            }).map_or((None, vec![]), |(t, f)| (Some(t), f));
         let mut stalled = !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte);
         if stalled {
             self.stalled_peers.push(peer_ip);
@@ -902,6 +981,11 @@ impl DaemonState {
                 rib.gr_capable_peers.remove(&peer_ip);
             }
         }
+        if peer_gr_time.is_some() {
+            self.gr_peer_families.insert(peer_ip, peer_gr_families);
+        } else {
+            self.gr_peer_families.remove(&peer_ip);
+        }
         if peer_gr_time.is_none() && we_advertise_gr {
             tracing::warn!(
                 peer = %peer_ip,
@@ -933,8 +1017,21 @@ impl DaemonState {
     #[allow(clippy::similar_names)]
     /// `notify` controls whether a `peer_tx` broadcast is sent.  Pass `false`
     /// when the caller will send a more specific event (e.g. `Removed`) instead.
-    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr, notify: bool) {
+    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr, reason: TerminationReason, notify: bool) {
         let peer_id = PeerId::from(peer_ip);
+
+        // RFC 4724 §4.2 — if the peer disconnected uncleanly AND previously
+        // advertised a non-zero restart_time, enter GR helper mode: keep the
+        // peer's routes in AdjRibIn and LocRib for up to restart_time seconds.
+        let gr_restart_time = self
+            .rib
+            .gr_capable_peers
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(0);
+        let enter_gr = reason == TerminationReason::Unclean
+            && gr_restart_time > 0
+            && !self.pending_removal.contains(&peer_ip);
 
         // Remove live session state from snapshot.
         {
@@ -958,6 +1055,40 @@ impl DaemonState {
         self.mrai_pending.remove(&peer_ip);
         self.pending_decisions.remove(&peer_ip);
         self.pending_decisions_v6.remove(&peer_ip);
+
+        if enter_gr {
+            // RFC 4724 §4.2 — only retain routes for families the peer
+            // included in its GracefulRestart capability.
+            let families = self.gr_peer_families.get(&peer_ip);
+            let gr_v4 = families
+                .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
+            let gr_v6 = families
+                .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
+
+            // Flush routes for families NOT covered by the peer's GR capability.
+            if !gr_v4 && let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) { ari.clear(); }
+            if !gr_v6 && let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) { ari.clear(); }
+
+            // GR helper path — retain covered routes; arm deadline timer.
+            let deadline = Instant::now()
+                + std::time::Duration::from_secs(u64::from(gr_restart_time));
+            self.gr_deadlines.insert(peer_ip, deadline);
+            tracing::info!(
+                peer = %peer_ip,
+                restart_time = gr_restart_time,
+                gr_v4,
+                gr_v6,
+                "session terminated uncleanly — entering GR helper mode, \
+                 stale routes retained for up to {gr_restart_time} s"
+            );
+            if notify {
+                let _ = self.peer_tx.send(proto::PeerEvent {
+                    r#type: proto::PeerEventType::Changed as i32,
+                    peer: None,
+                });
+            }
+            return;
+        }
 
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
@@ -1103,6 +1234,285 @@ impl DaemonState {
         );
     }
 
+    /// Withdraw a set of NLRIs held as stale during a peer's GR window.
+    ///
+    /// Called either on EOR receipt (peer re-established and re-advertised its
+    /// full table) or on GR deadline expiry (peer did not re-establish in time).
+    /// Withdraws each NLRI from AdjRibIn and LocRib, then propagates the
+    /// resulting best-path changes to all established peers.
+    fn prune_stale_nlri(&mut self, peer_ip: Ipv4Addr, stale: &HashSet<Nlri<Ipv4Addr>>) {
+        let stale_peer = PeerId::from(peer_ip);
+
+        if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
+            for nlri in stale {
+                ari.withdraw(nlri);
+            }
+        }
+
+        let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
+            self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
+
+        let oracle = Arc::clone(&self.oracle_v4);
+        let fib_changes: Vec<_> = stale
+            .iter()
+            .map(|nlri| self.rib_mut().loc_rib.withdraw(&stale_peer, nlri, &*oracle))
+            .collect();
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes {
+                fm.apply_v4(change);
+            }
+        }
+
+        let other_peers: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
+
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
+        for other_ip in other_peers {
+            let other_type = self
+                .rib
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else {
+                continue;
+            };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                continue;
+            };
+            let local_next_hop = self
+                .rib
+                .local_addrs
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(local_bgp_id);
+            let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            let decisions: Vec<PrefixDecision> = stale
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.rib.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        other_type,
+                        local_as,
+                        local_next_hop,
+                        other_next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+                self.stalled_peers.push(other_ip);
+            }
+            self.sync_advertised(other_ip);
+        }
+        self.emit_route_events(&prev_prefixes);
+    }
+
+    /// IPv6 counterpart of `prune_stale_nlri` — same semantics for IPv6 NLRIs.
+    fn prune_stale_nlri_v6(&mut self, peer_ip: Ipv4Addr, stale: &HashSet<Nlri<Ipv6Addr>>) {
+        let stale_peer = PeerId::from(peer_ip);
+
+        if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
+            for nlri in stale {
+                ari.withdraw(nlri);
+            }
+        }
+
+        let oracle = Arc::clone(&self.oracle_v6);
+        let fib_changes: Vec<_> = stale
+            .iter()
+            .map(|nlri| self.rib_mut().loc_rib_v6.withdraw(&stale_peer, nlri, &*oracle))
+            .collect();
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes {
+                fm.apply_v6(change);
+            }
+        }
+
+        let other_peers: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
+
+        let local_as = self.rib.local_as;
+        let local_ipv6 = self.rib.local_ipv6;
+        for other_ip in other_peers {
+            let other_type = self
+                .rib
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            if !self.ipv6_capable_peers.contains(&other_ip) {
+                continue;
+            }
+            let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                continue;
+            };
+            let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            let decisions_v6: Vec<PrefixDecisionV6> = stale
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix_v6(
+                        nlri,
+                        &self.rib.loc_rib_v6,
+                        adj_rib_out_v6,
+                        other_type,
+                        local_as,
+                        local_ipv6,
+                        other_next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates_v6(decisions_v6, max_len, update_tx, other_type, other_four_byte) {
+                self.stalled_peers.push(other_ip);
+            }
+            self.sync_advertised(other_ip);
+        }
+    }
+
+    /// Flush stale routes held during GR deadline expiry.
+    ///
+    /// Called from the event loop when a peer's GR window expires without
+    /// re-establishment.  Equivalent to a clean `on_terminated` flush for
+    /// just the stale NLRIs.
+    pub(crate) fn on_gr_deadline_expired(&mut self, peer_ip: Ipv4Addr) {
+        let expired_peer = PeerId::from(peer_ip);
+        tracing::warn!(
+            peer = %peer_ip,
+            "GR restart window expired — flushing stale routes"
+        );
+        // Remove any stale tracking (re-establishment was not attempted).
+        self.gr_stale_nlri.remove(&peer_ip);
+        self.gr_stale_nlri_v6.remove(&peer_ip);
+        // Clear AdjRibIn and flush LocRib exactly as on_terminated does.
+        if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
+            ari.clear();
+        }
+        if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
+            ari.clear();
+        }
+        let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
+            self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
+        let fib_changes_v4 = self.rib_withdraw_peer_v4(&expired_peer);
+        let fib_changes_v6 = self.rib_withdraw_peer_v6(&expired_peer);
+        if let Some(fm) = &self.fib_manager {
+            for change in fib_changes_v4 {
+                fm.apply_v4(change);
+            }
+            for change in fib_changes_v6 {
+                fm.apply_v6(change);
+            }
+        }
+        // Reset AdjRibOut for a clean reconnect.
+        let cfg_pt = self
+            .peer_config_types
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(PeerType::External);
+        let is_rr = !self.rib.rr_clients.is_empty();
+        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(expired_peer, cfg_pt, is_rr);
+        if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
+            *aro = new_aro;
+        }
+        if let Some(aro) = self.adj_ribs_out_v6.get_mut(&peer_ip) {
+            *aro = new_aro_v6;
+        }
+        // Propagate to established peers.
+        let other_peers: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
+        for other_ip in other_peers {
+            let other_type = self
+                .rib
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else {
+                continue;
+            };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                continue;
+            };
+            let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
+            let local_next_hop = self
+                .rib
+                .local_addrs
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(local_bgp_id);
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            let decisions: Vec<PrefixDecision> = prev_prefixes
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.rib.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        other_type,
+                        local_as,
+                        local_next_hop,
+                        other_next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+                self.stalled_peers.push(other_ip);
+            }
+            self.sync_advertised(other_ip);
+        }
+        self.emit_route_events(&prev_prefixes);
+        let _ = self.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Changed as i32,
+            peer: None,
+        });
+    }
+
     /// Called when a BGP UPDATE message arrives from an established peer.
     ///
     /// Applies import policy, updates the RIB, and propagates best-path changes
@@ -1125,6 +1535,21 @@ impl DaemonState {
         if msg.withdrawn.is_empty() && msg.attributes.is_empty() && msg.announced.is_empty() {
             tracing::info!(peer = %peer_ip, "received IPv4 End-of-RIB marker (RFC 4724 §2)");
             Arc::make_mut(&mut self.rib).eor_received.insert(peer_ip);
+            // RFC 4724 §4.2 — EOR ends the GR re-establishment window.  Any
+            // NLRIs still in the stale set were not refreshed by the peer and
+            // must be withdrawn now.
+            if let Some(stale) = self.gr_stale_nlri.remove(&peer_ip) {
+                let count = stale.len();
+                if count > 0 {
+                    tracing::info!(
+                        peer = %peer_ip,
+                        withdrawn = count,
+                        "EOR received after GR re-establishment — withdrawing \
+                         {count} stale NLRI(s) not refreshed by peer"
+                    );
+                    self.prune_stale_nlri(peer_ip, &stale);
+                }
+            }
             return None;
         }
         // IPv6 EOR: UPDATE with only an empty MP_UNREACH_NLRI for IPv6 unicast.
@@ -1137,6 +1562,18 @@ impl DaemonState {
         {
             tracing::info!(peer = %peer_ip, "received IPv6 unicast End-of-RIB marker (RFC 4724 §2)");
             Arc::make_mut(&mut self.rib).eor_received_v6.insert(peer_ip);
+            if let Some(stale) = self.gr_stale_nlri_v6.remove(&peer_ip) {
+                let count = stale.len();
+                if count > 0 {
+                    tracing::info!(
+                        peer = %peer_ip,
+                        withdrawn = count,
+                        "IPv6 EOR received after GR re-establishment — withdrawing \
+                         {count} stale IPv6 NLRI(s) not refreshed by peer"
+                    );
+                    self.prune_stale_nlri_v6(peer_ip, &stale);
+                }
+            }
             return None;
         }
 
@@ -1302,6 +1739,28 @@ impl DaemonState {
             .adj_ribs_in_v6
             .get_mut(&peer_ip)
             .unwrap_or(&mut scratch_v6);
+
+        // RFC 4724 §4.2 — during GR re-establishment, any NLRI the peer
+        // re-announces is no longer stale.  Remove it from the tracking sets so
+        // it is not withdrawn when EOR arrives.
+        if let Some(stale) = self.gr_stale_nlri.get_mut(&peer_ip) {
+            for nlri in &msg.announced {
+                stale.remove(nlri);
+            }
+        }
+        if let Some(stale_v6) = self.gr_stale_nlri_v6.get_mut(&peer_ip) {
+            for attr in &msg.attributes {
+                if let PathAttribute::MpReachNlri(m) = attr
+                    && m.afi_safi == AfiSafi::IPV6_UNICAST
+                {
+                    for p in &m.prefixes {
+                        if let Prefix::V6(nlri) = p {
+                            stale_v6.remove(nlri);
+                        }
+                    }
+                }
+            }
+        }
 
         // Split mutable borrows across distinct struct fields explicitly so the
         // borrow checker can verify they don't alias.
@@ -2412,7 +2871,7 @@ async fn run_command_processor<H, F>(
                     // stop sender was dropped).  Synthesize Terminated directly so the
                     // event loop still performs the pending_removal cleanup path —
                     // otherwise the peer would be stuck in pending_removal forever.
-                    let _ = event_tx.send((peer_ip, SessionEvent::Terminated)).await;
+                    let _ = event_tx.send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean))).await;
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
                 // remove_peer() is called by the event loop.
@@ -2662,7 +3121,7 @@ pub(crate) async fn run_event_loop(
                             info.local_addr,
                         );
                     }
-                    SessionEvent::Terminated => {
+                    SessionEvent::Terminated(termination_reason) => {
                         let is_removed = s.pending_removal.remove(&peer_ip);
                         // Capture identity fields while they are still in the
                         // RIB.  on_terminated clears session-level state
@@ -2678,7 +3137,7 @@ pub(crate) async fn run_event_loop(
                         // For removal, suppress the intermediate Changed(None)
                         // broadcast — the explicit Removed event below is the
                         // authoritative notification.
-                        s.on_terminated(peer_ip, !is_removed);
+                        s.on_terminated(peer_ip, termination_reason, !is_removed);
                         // RFC 4724 §3: refresh the session's capability set so
                         // the next OPEN reflects the current R-bit state. The
                         // restart window may have expired since the original OPEN
@@ -2777,7 +3236,7 @@ pub(crate) async fn run_event_loop(
                                 info.local_addr,
                             );
                         }
-                        SessionEvent::Terminated => {
+                        SessionEvent::Terminated(termination_reason) => {
                             let is_removed = s.pending_removal.remove(&extra_ip);
                             let removal_identity = if is_removed {
                                 s.rib.peer_remote_as.get(&extra_ip).copied().map(|remote_as| {
@@ -2786,7 +3245,7 @@ pub(crate) async fn run_event_loop(
                             } else {
                                 None
                             };
-                            s.on_terminated(extra_ip, !is_removed);
+                            s.on_terminated(extra_ip, termination_reason, !is_removed);
                             if is_removed {
                                 s.remove_peer(extra_ip);
                                 stop_senders.lock().unwrap().remove(&extra_ip);
@@ -2863,6 +3322,46 @@ pub(crate) async fn run_event_loop(
                     let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                     if let Some(tx) = tx {
                         let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                }
+            }
+
+            // RFC 4724 §4.2 — GR deadline timer.  Fire whenever the earliest
+            // active deadline is reached.  If there are no active GR windows the
+            // future is `pending()` so this branch never wakes the select.
+            () = async {
+                let earliest = state.read().await.gr_deadlines.values().copied().min();
+                match earliest {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None    => std::future::pending::<()>().await,
+                }
+            } => {
+                let now = Instant::now();
+                let expired: Vec<Ipv4Addr> = {
+                    let s = state.read().await;
+                    s.gr_deadlines
+                        .iter()
+                        .filter(|(_, d)| **d <= now)
+                        .map(|(&ip, _)| ip)
+                        .collect()
+                };
+                if !expired.is_empty() {
+                    let mut s = state.write().await;
+                    for peer_ip in expired {
+                        s.gr_deadlines.remove(&peer_ip);
+                        s.on_gr_deadline_expired(peer_ip);
+                    }
+                    let stalled = s.take_stalled_peers();
+                    drop(s);
+                    for peer in stalled {
+                        tracing::error!(
+                            peer = %peer,
+                            "closing session: outbound UPDATE channel overflowed during GR deadline flush"
+                        );
+                        let tx = stop_senders.lock().unwrap().get(&peer).cloned();
+                        if let Some(tx) = tx {
+                            let _ = tx.send(SessionCommand::Stop).await;
+                        }
                     }
                 }
             }
@@ -4072,7 +4571,7 @@ mod tests {
         let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
-        state.on_terminated(peer_ip, true);
+        state.on_terminated(peer_ip, TerminationReason::Unclean, true);
         assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
 
@@ -4094,7 +4593,7 @@ mod tests {
         );
         assert_eq!(state.rib.loc_rib.len(), 1);
 
-        state.on_terminated(peer_ip, true);
+        state.on_terminated(peer_ip, TerminationReason::Unclean, true);
         assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
@@ -4125,7 +4624,7 @@ mod tests {
         receivers.get_mut(&peer_b).unwrap().try_recv().ok();
 
         // Terminate peer_a — peer_b must receive a WITHDRAW.
-        state.on_terminated(peer_a, true);
+        state.on_terminated(peer_a, TerminationReason::Unclean, true);
 
         let msg = receivers
             .get_mut(&peer_b)
@@ -7936,7 +8435,7 @@ mod tests {
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
         state.adj_ribs_out.remove(&peer_b);
 
-        state.on_terminated(peer_a, true);
+        state.on_terminated(peer_a, TerminationReason::Unclean, true);
 
         assert!(!state.rib.peer_types.contains_key(&peer_a));
         assert!(state.rib.peer_types.contains_key(&peer_b));
@@ -7953,7 +8452,7 @@ mod tests {
         state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
         state.update_senders.remove(&peer_b);
 
-        state.on_terminated(peer_a, true);
+        state.on_terminated(peer_a, TerminationReason::Unclean, true);
 
         assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
@@ -8204,7 +8703,7 @@ mod tests {
 
         // Terminating peer_a iterates established peers; ghost has no policy /
         // rib entries — the error branch logs and continues without panicking.
-        state.on_terminated(peer_a, true);
+        state.on_terminated(peer_a, TerminationReason::Unclean, true);
         assert!(!state.rib.peer_types.contains_key(&peer_a));
     }
 
@@ -8952,7 +9451,7 @@ mod tests {
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         assert_reflects_parity(&state);
         // Simulate teardown then re-establish (on_terminated resets AdjRibOut)
-        state.on_terminated(client, false);
+        state.on_terminated(client, TerminationReason::Unclean, false);
         // on_established rebuilds the tables for the next session
         state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         assert_reflects_parity(&state);
@@ -9181,7 +9680,7 @@ mod stall_tests {
         state.flush_pending();
 
         // Terminate peer_a: the withdraw for peer_b's channel will fail (full).
-        state.on_terminated(peer_a, true);
+        state.on_terminated(peer_a, TerminationReason::Unclean, true);
         assert!(
             !state.take_stalled_peers().is_empty(),
             "peer_b must be stalled when its channel is full during termination propagation"
@@ -9405,7 +9904,7 @@ mod stall_tests {
         );
 
         // Before flushing, terminate peer_b — its buffer must be cleared.
-        state.on_terminated(peer_b, false);
+        state.on_terminated(peer_b, TerminationReason::Unclean, false);
 
         // Flush pending: peer_b has no update_sender now, so nothing is sent.
         state.flush_pending();
@@ -10267,7 +10766,7 @@ mod event_loop_tests {
     use pathvector_rib::oracle::NextHopOracle;
     use pathvector_session::fsm::SessionInfo;
     use pathvector_session::message::{Capability, UpdateMessage};
-    use pathvector_session::transport::{SessionCommand, SessionEvent};
+    use pathvector_session::transport::{SessionCommand, SessionEvent, TerminationReason};
     use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
     use tokio::sync::mpsc;
 
@@ -10402,7 +10901,7 @@ mod event_loop_tests {
 
         let (event_tx, event_rx) = mpsc::channel(8);
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -10767,7 +11266,7 @@ mod event_loop_tests {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -10891,7 +11390,7 @@ mod event_loop_tests {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -10927,12 +11426,12 @@ mod event_loop_tests {
         let (event_tx, event_rx) = mpsc::channel(8);
         // First Terminated — runs cleanup (routes cleared, remove_peer called).
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         // Second Terminated — must be a no-op (maps already gone).
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -11330,7 +11829,7 @@ mod event_loop_tests {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -11508,7 +12007,7 @@ mod event_loop_tests {
 
         let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -11560,7 +12059,7 @@ mod event_loop_tests {
 
         let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
-            .send((peer_ip, SessionEvent::Terminated))
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
             .await
             .unwrap();
         drop(event_tx);
@@ -11598,7 +12097,7 @@ mod event_loop_tests {
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
 
-        state.write().await.on_terminated(peer_ip, false);
+        state.write().await.on_terminated(peer_ip, TerminationReason::Unclean, false);
 
         // No broadcast must arrive.
         assert!(
@@ -11616,7 +12115,7 @@ mod event_loop_tests {
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
 
-        state.write().await.on_terminated(peer_ip, true);
+        state.write().await.on_terminated(peer_ip, TerminationReason::Unclean, true);
 
         let ev = peer_rx
             .try_recv()
@@ -12225,7 +12724,7 @@ mod run_with_tests {
 
     use pathvector_session::message::UpdateMessage;
     use pathvector_session::transport::{
-        SessionCommand, SessionConfig, SessionEvent, SessionHandle,
+        SessionCommand, SessionConfig, SessionEvent, SessionHandle, TerminationReason,
     };
     use tokio::sync::mpsc;
 
@@ -12391,11 +12890,14 @@ mod run_with_tests {
         let (_state, mut event_rx, _event_tx, _stop, _, _) = build_daemon(&cfg, spawn_fn).await;
 
         let event_tx = peers.lock().unwrap()[0].event_tx.clone();
-        event_tx.send(SessionEvent::Terminated).await.unwrap();
+        event_tx
+            .send(SessionEvent::Terminated(TerminationReason::Unclean))
+            .await
+            .unwrap();
 
         let (ip, event) = event_rx.recv().await.unwrap();
         assert_eq!(ip, peer_a);
-        assert!(matches!(event, SessionEvent::Terminated));
+        assert!(matches!(event, SessionEvent::Terminated(_)));
     }
 
     /// The returned `DaemonState` has an update-sender entry for every
@@ -12816,6 +13318,8 @@ mod eor_receive_tests {
     use std::net::Ipv4Addr;
 
     use pathvector_session::message::{MpUnreachNlri, PathAttribute, UpdateMessage};
+    use pathvector_session::transport::TerminationReason;
+
     use pathvector_types::{AfiSafi, PeerType};
 
     use super::tests::make_state;
@@ -12898,7 +13402,7 @@ mod eor_receive_tests {
         state.on_route_update(PEER_IP, ipv4_eor());
         assert!(state.rib.eor_received.contains(&PEER_IP));
 
-        state.on_terminated(PEER_IP, false);
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, false);
 
         assert!(
             !state.rib.eor_received.contains(&PEER_IP),
@@ -13256,6 +13760,241 @@ mod test_gr_peer_capability {
         assert!(
             !gr_capable_peers.contains_key(&peer()),
             "gr_capable_peers must be empty after peer terminates"
+        );
+    }
+}
+
+// ── RFC 4724 Phase 2: helper-role (hold peer stale routes) ───────────────────
+
+#[cfg(test)]
+mod test_gr_phase2 {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+
+    use pathvector_session::message::{
+        Capability, GracefulRestartFamily, PathAttribute, UpdateMessage,
+    };
+    use pathvector_session::transport::TerminationReason;
+    use pathvector_types::{AfiSafi, AsPath, Asn, Nlri, Origin, PeerType};
+
+    use super::*;
+    use crate::config;
+
+    const LOCAL_AS: u32 = 65001;
+    const PEER_AS: u32 = 65002;
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn make_state_gr(
+        peers: &[(Ipv4Addr, u32)],
+    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+        let mut receivers = HashMap::new();
+        let mut senders = HashMap::new();
+        let peer_configs: Vec<_> = peers
+            .iter()
+            .map(|&(addr, remote_as)| {
+                let (tx, rx) = mpsc::channel::<UpdateMessage>(256);
+                senders.insert(addr, tx);
+                receivers.insert(addr, rx);
+                config::PeerConfig {
+                    address: addr,
+                    port: 179,
+                    remote_as,
+                    import_default: Some(config::ImportDefault::Accept),
+                    export_default: Some(config::ExportDefault::Accept),
+                    import_default_v6: None,
+                    md5_password: None,
+                    is_rr_client: false,
+                    next_hop_self: false,
+                    hold_time: None,
+                    shutdown_message: None,
+                }
+            })
+            .collect();
+        let state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        (state, receivers)
+    }
+
+    fn announce(prefixes: &[&str]) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(PEER_AS)])),
+                PathAttribute::NextHop(PEER_IP),
+            ],
+            announced: prefixes.iter().map(|s| nlri(s)).collect(),
+        }
+    }
+
+    fn establish_with_gr(state: &mut DaemonState, restart_time: u16) {
+        let caps = gr_caps(restart_time);
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &caps, None);
+    }
+
+    fn ipv4_eor() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        }
+    }
+
+    fn gr_cap(restart_time: u16) -> Capability {
+        Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time,
+            families: vec![GracefulRestartFamily {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                forwarding_preserved: false,
+            }],
+        }
+    }
+
+    fn gr_caps(restart_time: u16) -> Vec<Capability> {
+        vec![
+            Capability::FourByteAsn(PEER_AS),
+            gr_cap(restart_time),
+        ]
+    }
+
+    /// RFC 4724 §4.2 — unclean termination of a GR-capable peer must retain
+    /// routes in AdjRibIn / LocRib rather than flushing them.
+    #[test]
+    fn unclean_termination_of_gr_peer_retains_routes() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        assert_eq!(state.rib.loc_rib.len(), 1, "route must be in LocRib before termination");
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        assert!(
+            state.adj_ribs_in[&PEER_IP].get(&nlri("10.0.0.0/8")).is_some(),
+            "AdjRibIn route must be retained during GR window"
+        );
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "LocRib route must be retained during GR window"
+        );
+        assert!(
+            state.gr_deadlines.contains_key(&PEER_IP),
+            "gr_deadlines must be armed for the peer"
+        );
+    }
+
+    /// RFC 4724 §4.2 — clean termination (NOTIFICATION received) must flush
+    /// routes immediately regardless of GR capability.
+    #[test]
+    fn clean_termination_flushes_immediately() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.on_terminated(PEER_IP, TerminationReason::Clean, true);
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "LocRib must be flushed immediately on clean termination"
+        );
+        assert!(
+            !state.gr_deadlines.contains_key(&PEER_IP),
+            "gr_deadlines must not be armed on clean termination"
+        );
+    }
+
+    /// A peer that did not advertise GR (or advertised restart_time=0) must
+    /// have its routes flushed immediately even on unclean termination.
+    #[test]
+    fn non_gr_peer_always_flushes_on_unclean_termination() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "LocRib must be flushed for a non-GR peer even on unclean termination"
+        );
+        assert!(
+            !state.gr_deadlines.contains_key(&PEER_IP),
+            "gr_deadlines must not be armed for a non-GR peer"
+        );
+    }
+
+    /// RFC 4724 §4.2 — routes not re-announced before EOR must be pruned.
+    /// Routes that ARE re-announced must be kept.
+    #[test]
+    fn eor_prunes_stale_routes_not_refreshed_by_peer() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 120);
+        // Announce two routes.
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        assert_eq!(state.rib.loc_rib.len(), 2);
+
+        // Simulate unclean disconnect (GR window opens).
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        assert_eq!(state.rib.loc_rib.len(), 2, "routes retained during GR window");
+
+        // Simulate re-establishment.
+        establish_with_gr(&mut state, 120);
+
+        // Peer re-announces only 10.0.0.0/8.
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        // EOR arrives — 192.168.0.0/24 was not re-announced, must be pruned.
+        state.on_route_update(PEER_IP, ipv4_eor());
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "only the re-announced route must remain after EOR prune"
+        );
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some(),
+            "re-announced route must survive"
+        );
+        assert!(
+            state.rib.loc_rib.best(&nlri("192.168.0.0/24")).is_none(),
+            "stale route not refreshed by peer must be pruned on EOR"
+        );
+    }
+
+    /// GR deadline expiry must flush all stale routes exactly as a normal
+    /// on_terminated flush would.
+    #[test]
+    fn gr_deadline_expiry_flushes_stale_routes() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        assert_eq!(state.rib.loc_rib.len(), 1, "route retained during GR window");
+        assert!(state.gr_deadlines.contains_key(&PEER_IP));
+
+        // Simulate deadline expiry.
+        state.gr_deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "routes must be flushed after GR deadline expiry"
         );
     }
 }

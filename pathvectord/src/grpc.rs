@@ -1256,7 +1256,7 @@ mod tests {
     use tokio::sync::{RwLock, mpsc};
     use tonic::Request;
 
-    use pathvector_session::transport::SessionCommand;
+    use pathvector_session::transport::{SessionCommand, TerminationReason};
 
     use super::{
         OriginationServiceImpl, PeerServiceImpl, PolicyServiceImpl, RibServiceImpl,
@@ -3892,7 +3892,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_terminated(peer_ip, true);
+            s.on_terminated(peer_ip, TerminationReason::Unclean, true);
         }
 
         let mut withdrawn: std::collections::HashSet<String> = std::collections::HashSet::new();

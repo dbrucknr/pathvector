@@ -198,13 +198,28 @@ pub enum SessionCommand {
     SetCapabilities(Vec<crate::message::Capability>),
 }
 
+/// Why a BGP session was torn down.
+///
+/// Used by the daemon to decide whether to retain stale routes from the peer
+/// during the peer's Graceful Restart window (RFC 4724 §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationReason {
+    /// TCP failure or hold-timer expiry — no NOTIFICATION was received from
+    /// the peer before the session dropped.  RFC 4724 §4.2: the helper MAY
+    /// retain stale routes from a GR-capable peer for up to `restart_time`.
+    Unclean,
+    /// The peer sent a NOTIFICATION before the connection closed.  RFC 4724
+    /// §4.2: the helper MUST NOT retain stale routes in this case.
+    Clean,
+}
+
 /// Events emitted by a session to its caller.
 #[derive(Debug)]
 pub enum SessionEvent {
     /// The session reached Established. Contains negotiated parameters.
     Established(SessionInfo),
     /// The session was torn down (after previously being Established).
-    Terminated,
+    Terminated(TerminationReason),
     /// An UPDATE message was received; forward to the RIB layer.
     RouteUpdate(UpdateMessage),
 }
@@ -322,6 +337,7 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
         local_addr: None,
         update_rx,
+        termination_reason: TerminationReason::Unclean,
     };
 
     tokio::spawn(session.run());
@@ -372,6 +388,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         connect_factory: None,
         local_addr: None,
         update_rx,
+        termination_reason: TerminationReason::Unclean,
     };
 
     tokio::spawn(session.run());
@@ -414,15 +431,30 @@ struct Session<T: BgpTransport> {
     local_addr: Option<Ipv4Addr>,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
+    // Reason for the most recent (or current) session termination.  Set just
+    // before calling fsm.process() so execute() can carry it in the event.
+    termination_reason: TerminationReason,
 }
 
 impl<T: BgpTransport> Session<T> {
     async fn run(mut self) {
         loop {
             let input = self.wait_for_input().await;
+            // Track why the session is terminating so SessionEvent::Terminated
+            // carries the right reason.  Only relevant when Established; the
+            // FSM only emits SessionTerminated from that state.
+            if self.fsm.is_established() {
+                self.termination_reason = match &input {
+                    FsmInput::MessageReceived(BgpMessage::Notification(_)) => {
+                        TerminationReason::Clean
+                    }
+                    _ => TerminationReason::Unclean,
+                };
+            }
             let outputs = self.fsm.process(input);
             if !self.execute(outputs).await {
                 // A TCP send failed; feed TcpFailed back into the FSM.
+                // Reason stays Unclean — we never received a Notification.
                 let recovery = self.fsm.process(FsmInput::TcpFailed);
                 self.execute(recovery).await;
             }
@@ -697,7 +729,10 @@ impl<T: BgpTransport> Session<T> {
                     let _ = self.event_tx.send(SessionEvent::Established(info)).await;
                 }
                 FsmOutput::SessionTerminated => {
-                    let _ = self.event_tx.send(SessionEvent::Terminated).await;
+                    let _ = self
+                        .event_tx
+                        .send(SessionEvent::Terminated(self.termination_reason))
+                        .await;
                 }
                 FsmOutput::RouteUpdate(update) => {
                     let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
@@ -853,7 +888,7 @@ mod tests {
 
     use super::{
         BgpTransport, FramedBgpTransport, SessionCommand, SessionConfig, SessionEvent,
-        SessionHandle, SpawnedSessionHandle, spawn_with,
+        SessionHandle, SpawnedSessionHandle, TerminationReason, spawn_with,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
@@ -990,7 +1025,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "expected RouteUpdate")]
     fn test_expect_route_update_panics_on_wrong_variant() {
-        expect_route_update(SessionEvent::Terminated);
+        expect_route_update(SessionEvent::Terminated(TerminationReason::Unclean));
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1050,7 +1085,7 @@ mod tests {
             .expect("timed out waiting for Terminated")
             .expect("session exited unexpectedly");
         assert!(
-            matches!(event, SessionEvent::Terminated),
+            matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after UPDATE write failure, got {event:?}"
         );
     }
@@ -1078,7 +1113,7 @@ mod tests {
             .expect("timed out waiting for event after Stop")
             .expect("session exited without emitting an event");
         assert!(
-            matches!(event, SessionEvent::Terminated),
+            matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after Stop command, got {event:?}"
         );
     }
@@ -1142,7 +1177,7 @@ mod tests {
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
         let result = tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
         assert!(
-            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
+            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated(_))),
             "session must not terminate after a treat-as-withdraw malformed UPDATE"
         );
     }
@@ -1204,7 +1239,7 @@ mod tests {
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
         let result = tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
         assert!(
-            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
+            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated(_))),
             "session must not terminate after an attribute-discard malformed UPDATE"
         );
     }
@@ -1566,7 +1601,7 @@ mod tests {
             .expect("timed out waiting for Terminated after stop()")
             .expect("session exited without emitting Terminated");
         assert!(
-            matches!(event, SessionEvent::Terminated),
+            matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after stop(), got {event:?}"
         );
     }

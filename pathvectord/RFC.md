@@ -103,11 +103,12 @@ registry lives in `pathvector-types`.
 
 ---
 
-## RFC 4724 §2/§3 — End-of-RIB Marker + Graceful Restart Helper Role
+## RFC 4724 — End-of-RIB Marker, Graceful Restart Helper + Speaker Roles
 
-**Owns:** EOR send/receive; GracefulRestart capability advertisement including forwarding-state
-preservation (helper role — telling peers to hold our routes on restart).  
-**Boundary:** Stale-route timer (speaker role) and FSM restart detection deferred to Phase 2.  
+**Owns:** EOR send/receive; GracefulRestart capability advertisement (helper role); stale-route
+retention when a connected peer restarts uncleanly (speaker role).  
+**Boundary:** FSM restart detection (R-bit) is in `pathvector-session`; the daemon owns the
+per-family retention decision, deadline timer, and EOR-triggered prune.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724
 
 | Requirement | File | Status | Verified by |
@@ -133,10 +134,20 @@ preservation (helper role — telling peers to hold our routes on restart).
 | GR capability decoder: trailing family bytes are dropped, not an error | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_trailing_bytes_ignored` (proptest) |
 | e2e: GoBGP holds routes during our restart window (blackhole use case) | `pathvector-e2e/tests/session.rs` | ✅ | `gr_helper_gobgp_holds_routes_during_restart_window` |
 | e2e: peer GR restart_time visible via management API | `pathvector-e2e/tests/session.rs` | ✅ | `gr_capability_negotiated_peer_gr_restart_time_reflects_config` |
+| §4.2 MUST: unclean termination of GR-capable peer retains routes in AdjRibIn/LocRib | `src/daemon.rs` | ✅ | `unclean_termination_of_gr_peer_retains_routes` |
+| §4.2 MUST: NOTIFICATION-driven termination flushes routes immediately | `src/daemon.rs` | ✅ | `clean_termination_flushes_immediately` |
+| §4.2 MUST: non-GR peer routes always flushed on unclean termination | `src/daemon.rs` | ✅ | `non_gr_peer_always_flushes_on_unclean_termination` |
+| §4.2 MUST: per-family GR — only families listed in peer OPEN are retained | `src/daemon.rs` | ✅ | per-family `gr_v4`/`gr_v6` check in `on_terminated` |
+| §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
+| §4.2 IPv6 EOR triggers pruning of stale IPv6 NLRIs | `src/daemon.rs` | ✅ | `prune_stale_nlri_v6` + IPv6 EOR branch |
+| §4.2 MUST: GR window expiry without re-establishment flushes all stale routes | `src/daemon.rs` | ✅ | `gr_deadline_expiry_flushes_stale_routes` |
+| §4.2 SHOULD: stale route marking (de-preference via modified attribute) | `src/daemon.rs` | ❌ | Deferred — requires Route struct extension in pathvector-rib |
 
-**Deferred (Phase 2):** §4.2 speaker role — stale-route retention when a peer restarts
-(`TerminationReason`, `gr_deadlines`, `stale_nlri_v4/v6`, deadline timer in event loop).
-§3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently logged as warning).
+**Deferred:** §4.2 SHOULD stale-route marking: retained routes should be tagged with a reduced
+LOCAL_PREF or STALE community so they are de-preferred against fresh routes from other peers.
+This requires adding a `stale: bool` flag to `Route<A>` in pathvector-rib and wiring it into
+best-path selection. §3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently
+logged as warning).
 
 ---
 
