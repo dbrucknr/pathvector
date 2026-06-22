@@ -354,7 +354,8 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 
 ### Graceful Restart — known gaps (2026-06-22)
 
-RFC 4724 Phase 1 and Phase 2 are fully implemented. One known gap remains.
+RFC 4724 Phase 1 and Phase 2 are fully implemented and e2e verified against GoBGP.
+The following gaps remain, ordered by priority.
 
 ~~**1. EOR-prune e2e test missing**~~  
 ~~*Resolved 2026-06-22* — `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` in~~
@@ -371,16 +372,65 @@ negligible. For a full-table iBGP peer (~800k prefixes) this loop would be
 noticeable — potentially hundreds of milliseconds under the write lock, causing
 hold-timer pressure on other peers.
 
-No action needed for the current use case. If the deployment ever includes
-full-table peers, profile this path first and consider batching the LocRib
-re-insertions outside the write lock.
+The right fix if full-table peers are ever needed: replace eager `Arc::make_mut`
+marking with a generation-counter or stale-epoch approach — routes are considered
+stale if their epoch < the current GR epoch for that peer, computed lazily at
+best-path selection time rather than eagerly on disconnect.
 
-**3. RFC 4724 §3 SHOULD: suppress GR capability when peer restart_time = 0**
+**2. RFC 4724 §4.2: re-termination during an open GR window needs a unit test**
+
+If a peer disconnects uncleanly *again* while its GR window is already open (e.g.
+two rapid TCP failures), `on_terminated` is called a second time. Because
+`gr_deadlines` is a `HashMap`, the re-insert resets the deadline to
+`now + restart_time`, which is the correct RFC behaviour. However this path has no
+dedicated unit test. Add `gr_re_termination_during_window_resets_deadline` to
+confirm the deadline is refreshed and routes remain held (not double-flushed).
+
+Special case: if the second termination is `Clean` (peer sends NOTIFICATION inside
+the window), the current branching correctly flushes immediately. Verify this
+sub-case too.
+
+**3. EOR-prune e2e test timing margin**
+
+`gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` uses a 15 s
+`wait_for_established` timeout with a 2 s `connect_retry_time`. On a fast machine
+this is comfortable (first retry fires ≤2 s after reconnect, BGP exchange adds
+~1 s), but on a loaded CI runner the margin is tighter than ideal. If this test
+shows intermittent failures in CI, increase `connect_retry_time` to 3 s and the
+timeout to 20 s.
+
+**4. `PeerConfig` struct literal proliferation**
+
+Adding `connect_retry_time: Option<u16>` required inserting `connect_retry_time: None`
+into 30+ test struct literals via sed. Every future optional field on `PeerConfig`
+will cost the same. Consider introducing a `peer_config(addr, remote_as)` test
+helper (in `daemon.rs` test module) that fills sensible defaults, so call sites
+only specify the fields under test. `Ipv4Addr` not implementing `Default` blocks
+a derive — the helper is the right answer.
+
+**5. GR deadline timer re-polls on every event loop iteration**
+
+The `tokio::select!` branch for deadline expiry calls
+`state.gr_deadlines.values().copied().min()` on every poll. When the map is empty
+(steady state) this is a no-op iteration and resolves to `pending()`. For a large
+number of simultaneous GR windows (unlikely in production) this becomes a tighter
+loop than necessary. If needed, cache the next deadline as `Option<Instant>` on
+`DaemonState` and invalidate it only on GR window insert/remove.
+
+**6. RFC 4724 §3 SHOULD: suppress GR capability when peer restart_time = 0**
 
 When the peer's OPEN carries a GracefulRestart capability with `restart_time = 0`,
 pathvectord currently logs a warning but still advertises its own GR capability.
 RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
 overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
+
+**7. `daemon.rs` GR logic should move to a dedicated module**
+
+The GR-related functions (`mark_stale_and_repropagate`, `prune_stale_routes_v4/v6`,
+the deadline timer branch) are correct but embedded in a 14k-line file. When
+splitting the daemon becomes worthwhile, extract these into
+`pathvectord/src/graceful_restart.rs` with `DaemonState` as a parameter. No
+behaviour change — purely a maintainability improvement.
 
 ### Remaining
 
