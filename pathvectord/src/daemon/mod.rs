@@ -11501,7 +11501,9 @@ mod test_gr_phase2 {
     #[test]
     fn drain_expired_removes_past_deadlines_leaves_future() {
         let mut gr = GracefulRestartState::new();
-        let past = Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap();
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
         let future = Instant::now() + std::time::Duration::from_secs(300);
         let expired_ip = Ipv4Addr::new(10, 0, 0, 1);
         let live_ip = Ipv4Addr::new(10, 0, 0, 2);

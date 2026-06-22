@@ -911,7 +911,9 @@ mod tests {
 
     use pathvector_policy::DefaultAction;
     use pathvector_rib::BestPathChange;
-    use pathvector_session::message::{Capability, MpReachNlri, PathAttribute, Prefix, UpdateMessage};
+    use pathvector_session::message::{
+        Capability, MpReachNlri, PathAttribute, Prefix, UpdateMessage,
+    };
     use pathvector_session::transport::TerminationReason;
     use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Nlri, Origin, PeerType};
 
