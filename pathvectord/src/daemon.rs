@@ -1081,6 +1081,11 @@ impl DaemonState {
                 "session terminated uncleanly — entering GR helper mode, \
                  stale routes retained for up to {gr_restart_time} s"
             );
+
+            // RFC 4724 §4.2 SHOULD: mark retained routes as stale so fresh
+            // routes from other peers immediately win best-path selection.
+            self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6);
+
             if notify {
                 let _ = self.peer_tx.send(proto::PeerEvent {
                     r#type: proto::PeerEventType::Changed as i32,
@@ -1232,6 +1237,159 @@ impl DaemonState {
             rib_size = self.rib.loc_rib.len(),
             "session terminated"
         );
+    }
+
+    /// RFC 4724 §4.2 SHOULD — marks all routes from a GR-entering peer as stale
+    /// and re-inserts them into LocRib so that best-path selection immediately
+    /// de-prefers them in favour of fresh routes from other peers.
+    fn mark_stale_and_repropagate(&mut self, peer_ip: Ipv4Addr, do_v4: bool, do_v6: bool) {
+        let stale_peer = PeerId::from(peer_ip);
+
+        // v4 ─────────────────────────────────────────────────────────────────
+        if do_v4 {
+            let stale_v4: Vec<_> = self
+                .adj_ribs_in
+                .get_mut(&peer_ip)
+                .map(AdjRibIn::mark_all_stale)
+                .unwrap_or_default();
+
+            if !stale_v4.is_empty() {
+                let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
+                    self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
+                let oracle = Arc::clone(&self.oracle_v4);
+                let fib_changes: Vec<_> = stale_v4
+                    .into_iter()
+                    .map(|route| self.rib_mut().loc_rib.insert(stale_peer, route, &*oracle))
+                    .collect();
+                if let Some(fm) = &self.fib_manager {
+                    for change in fib_changes {
+                        fm.apply_v4(change);
+                    }
+                }
+                self.repropagate_after_stale_mark_v4(peer_ip, &prev_prefixes);
+                self.emit_route_events(&prev_prefixes);
+            }
+        }
+
+        // v6 ─────────────────────────────────────────────────────────────────
+        if do_v6 {
+            let stale_v6: Vec<_> = self
+                .adj_ribs_in_v6
+                .get_mut(&peer_ip)
+                .map(AdjRibIn::mark_all_stale)
+                .unwrap_or_default();
+
+            if !stale_v6.is_empty() {
+                let oracle = Arc::clone(&self.oracle_v6);
+                let fib_changes_v6: Vec<_> = stale_v6
+                    .into_iter()
+                    .map(|route| self.rib_mut().loc_rib_v6.insert(stale_peer, route, &*oracle))
+                    .collect();
+                if let Some(fm) = &self.fib_manager {
+                    for change in fib_changes_v6 {
+                        fm.apply_v6(change);
+                    }
+                }
+                self.repropagate_after_stale_mark_v6(peer_ip);
+            }
+        }
+    }
+
+    /// Propagates v4 best-path changes caused by stale marking to other peers.
+    fn repropagate_after_stale_mark_v4(
+        &mut self,
+        peer_ip: Ipv4Addr,
+        prev_prefixes: &[Nlri<Ipv4Addr>],
+    ) {
+        let affected: Vec<Nlri<Ipv4Addr>> = self
+            .rib
+            .loc_rib
+            .best_routes()
+            .filter_map(|(n, _)| {
+                if prev_prefixes.contains(&n) { Some(n) } else { None }
+            })
+            .chain(
+                prev_prefixes
+                    .iter()
+                    .copied()
+                    .filter(|n| self.rib.loc_rib.best(n).is_none()),
+            )
+            .collect();
+
+        let other_peers: Vec<Ipv4Addr> =
+            self.rib.peer_types.keys().copied().filter(|&ip| ip != peer_ip).collect();
+        let local_as = self.rib.local_as;
+        let local_bgp_id = self.rib.local_bgp_id;
+        for other_ip in other_peers {
+            let other_type = self
+                .rib.peer_types.get(&other_ip).copied().unwrap_or(PeerType::External);
+            let max_len = self.negotiated_max_len.get(&other_ip).copied().unwrap_or(MAX_LEN);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else { continue };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else { continue };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else { continue };
+            let local_next_hop = self
+                .rib.local_addrs.get(&other_ip).copied().unwrap_or(local_bgp_id);
+            let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            let decisions: Vec<PrefixDecision> = affected
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.rib.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        other_type,
+                        local_as,
+                        local_next_hop,
+                        other_next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+                self.stalled_peers.push(other_ip);
+            }
+            self.sync_advertised(other_ip);
+        }
+    }
+
+    /// Propagates v6 best-path changes caused by stale marking to other peers.
+    fn repropagate_after_stale_mark_v6(&mut self, peer_ip: Ipv4Addr) {
+        let affected: Vec<Nlri<Ipv6Addr>> =
+            self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
+
+        let other_peers: Vec<Ipv4Addr> =
+            self.rib.peer_types.keys().copied().filter(|&ip| ip != peer_ip).collect();
+        let local_as = self.rib.local_as;
+        let local_ipv6 = self.rib.local_ipv6;
+        for other_ip in other_peers {
+            if !self.ipv6_capable_peers.contains(&other_ip) { continue; }
+            let other_type = self
+                .rib.peer_types.get(&other_ip).copied().unwrap_or(PeerType::External);
+            let max_len = self.negotiated_max_len.get(&other_ip).copied().unwrap_or(MAX_LEN);
+            let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else { continue };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else { continue };
+            let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            let decisions_v6: Vec<PrefixDecisionV6> = affected
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix_v6(
+                        nlri,
+                        &self.rib.loc_rib_v6,
+                        adj_rib_out_v6,
+                        other_type,
+                        local_as,
+                        local_ipv6,
+                        other_next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates_v6(decisions_v6, max_len, update_tx, other_type, other_four_byte) {
+                self.stalled_peers.push(other_ip);
+            }
+            self.sync_advertised(other_ip);
+        }
     }
 
     /// Withdraw a set of NLRIs held as stale during a peer's GR window.
@@ -13997,4 +14155,47 @@ mod test_gr_phase2 {
             "routes must be flushed after GR deadline expiry"
         );
     }
+
+    /// RFC 4724 §4.2 SHOULD — on unclean termination routes must be marked
+    /// stale in LocRib so a fresh route from a second peer immediately wins
+    /// best-path selection.
+    #[test]
+    fn stale_marking_lets_fresh_peer_win_immediately() {
+        const PEER2_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
+        const PEER2_AS: u32 = 65003;
+
+        let (mut state, _rxs) =
+            make_state_gr(&[(PEER_IP, PEER_AS), (PEER2_IP, PEER2_AS)]);
+
+        // Establish both peers (only PEER_IP supports GR).
+        establish_with_gr(&mut state, 120);
+        state.on_established(PEER2_IP, PEER2_IP, PeerType::External, PEER2_AS, 90, &[], None);
+
+        // Both peers announce the same prefix; PEER_IP wins (lower IP address tie-breaker).
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        // Same attributes as PEER_IP — tie-breaker (lower peer IP) decides winner.
+        state.on_route_update(PEER2_IP, announce(&["10.0.0.0/8"]));
+
+        let winner_before = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
+        assert!(winner_before.is_some(), "must have a best path before termination");
+
+        // PEER_IP disconnects uncleanly — its route is marked stale.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        // PEER2's fresh route must now be the best path.
+        let best_after = state.rib.loc_rib.best(&nlri("10.0.0.0/8"));
+        assert!(best_after.is_some(), "route must still be present (held stale)");
+        assert!(
+            !best_after.unwrap().stale,
+            "winning route must be the non-stale route from PEER2"
+        );
+
+        let winner_after = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
+        assert_eq!(
+            winner_after.map(PeerId::ip),
+            Some(std::net::IpAddr::V4(PEER2_IP)),
+            "PEER2 must be the winning peer after PEER_IP's routes are marked stale"
+        );
+    }
 }
+

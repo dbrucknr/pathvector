@@ -141,13 +141,10 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
 | §4.2 IPv6 EOR triggers pruning of stale IPv6 NLRIs | `src/daemon.rs` | ✅ | `prune_stale_nlri_v6` + IPv6 EOR branch |
 | §4.2 MUST: GR window expiry without re-establishment flushes all stale routes | `src/daemon.rs` | ✅ | `gr_deadline_expiry_flushes_stale_routes` |
-| §4.2 SHOULD: stale route marking (de-preference via modified attribute) | `src/daemon.rs` | ❌ | Deferred — requires Route struct extension in pathvector-rib |
+| §4.2 SHOULD: stale route marking — retained routes de-preferred in best-path so a fresh peer wins immediately | `src/daemon.rs`, `pathvector-rib/src/best_path.rs`, `pathvector-rib/src/adj_rib_in.rs` | ✅ | `stale_marking_lets_fresh_peer_win_immediately`, `stale_loses_to_non_stale_before_all_other_criteria` |
 
-**Deferred:** §4.2 SHOULD stale-route marking: retained routes should be tagged with a reduced
-LOCAL_PREF or STALE community so they are de-preferred against fresh routes from other peers.
-This requires adding a `stale: bool` flag to `Route<A>` in pathvector-rib and wiring it into
-best-path selection. §3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently
-logged as warning).
+**Deferred:** §3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently logged
+as warning only). All §4.2 requirements now implemented.
 
 ---
 

@@ -153,6 +153,15 @@ fn prefer<A: IpAddress>(
     b: &Route<A>,
     oracle: &dyn NextHopOracle,
 ) -> Ordering {
+    // Step 0 (RFC 4724 §4.2): non-stale beats stale before all other criteria.
+    // Mirrors FRR's BGP_PATH_STALE and BIRD's RS_STALE handling: a fresh route
+    // from any peer immediately wins over a GR-retained stale route.
+    match (a.stale, b.stale) {
+        (false, true) => return Ordering::Greater,
+        (true, false) => return Ordering::Less,
+        _ => {}
+    }
+
     // Step 2: Highest LOCAL_PREF (missing treated as the conventional default of 100).
     let lp = a
         .local_pref
@@ -932,6 +941,48 @@ mod tests {
         candidates.insert(peer(2), new_ebgp);
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(2)); // eBGP wins at step 3/7 before step 9 fires
+    }
+
+    /// RFC 4724 §4.2 — a non-stale route beats a stale route regardless of
+    /// all other attributes (higher `LOCAL_PREF`, shorter AS path, etc.).
+    #[test]
+    fn stale_loses_to_non_stale_before_all_other_criteria() {
+        // Stale peer has every other advantage: higher LOCAL_PREF (300 vs 100),
+        // shorter AS path (0 vs 2), better origin (IGP vs Incomplete).
+        let mut stale = basic(Origin::Igp, 0, Some(300), None);
+        stale.stale = true;
+        let fresh = basic(Origin::Incomplete, 2, Some(100), None);
+
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), stale);
+        candidates.insert(peer(2), fresh);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2), "fresh route must win over stale regardless of attributes");
+    }
+
+    /// A stale route wins when it is the only candidate — it still provides
+    /// reachability until the GR window expires or the peer re-announces.
+    #[test]
+    fn stale_route_wins_when_only_candidate() {
+        let mut only = basic(Origin::Igp, 1, Some(100), None);
+        only.stale = true;
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), only);
+        assert!(select_best(&candidates).is_some(), "stale-only RIB must still yield a winner");
+    }
+
+    /// Two stale candidates fall through to normal criteria (`LOCAL_PREF` wins).
+    #[test]
+    fn two_stale_routes_compared_normally() {
+        let mut high_lp = basic(Origin::Igp, 1, Some(200), None);
+        high_lp.stale = true;
+        let mut low_lp = basic(Origin::Igp, 1, Some(100), None);
+        low_lp.stale = true;
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), high_lp);
+        candidates.insert(peer(2), low_lp);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(1), "among stale routes, higher LOCAL_PREF still wins");
     }
 }
 
