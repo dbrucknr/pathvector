@@ -37,13 +37,16 @@ async fn gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry() {
         .expect("203.0.113.0/24 did not appear in Loc-RIB within 10 s");
 
     // Kill GoBGP with SIGKILL — no BGP NOTIFICATION is sent.
+    // `docker kill` sends SIGKILL unconditionally (unlike `docker stop --time=0`
+    // which is deprecated on newer Docker versions and may send SIGTERM instead,
+    // causing GoBGP to send a CEASE NOTIFICATION before exiting).
     // The kernel closes the TCP socket with a RST, which pathvectord sees as
     // an unclean termination.  Because GoBGP advertised restart_time=10,
     // pathvectord must open a 10 s GR window and keep the route.
     Command::new("docker")
-        .args(["stop", "--time=0", &h.gobgpd_id])
+        .args(["kill", &h.gobgpd_id])
         .status()
-        .expect("docker stop --time=0 (SIGKILL) gobgpd");
+        .expect("docker kill (SIGKILL) gobgpd");
 
     // Route must still be present immediately after the kill.
     wait_for_route(&mut h.client, "203.0.113.0/24", Duration::from_secs(5))

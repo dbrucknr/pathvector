@@ -1658,9 +1658,12 @@ impl Harness {
         let grpc_host_port = alloc_grpc_port();
 
         // Create an isolated network for this test so containers from
-        // different tests don't interfere.
+        // different tests don't interfere.  Use an explicit subnet so that
+        // `docker network connect --ip` works (Docker requires a user-configured
+        // subnet for static IP assignment).
         let network_name = format!("pathvector-test-{test_id}");
-        let network = DockerNetwork::create(network_name.clone());
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
         // Write gobgpd config.
         let gobgpd_config = gobgpd_cfg_fn();
