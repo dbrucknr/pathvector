@@ -377,18 +377,11 @@ marking with a generation-counter or stale-epoch approach — routes are conside
 stale if their epoch < the current GR epoch for that peer, computed lazily at
 best-path selection time rather than eagerly on disconnect.
 
-**2. RFC 4724 §4.2: re-termination during an open GR window needs a unit test**
-
-If a peer disconnects uncleanly *again* while its GR window is already open (e.g.
-two rapid TCP failures), `on_terminated` is called a second time. Because
-`gr_deadlines` is a `HashMap`, the re-insert resets the deadline to
-`now + restart_time`, which is the correct RFC behaviour. However this path has no
-dedicated unit test. Add `gr_re_termination_during_window_resets_deadline` to
-confirm the deadline is refreshed and routes remain held (not double-flushed).
-
-Special case: if the second termination is `Clean` (peer sends NOTIFICATION inside
-the window), the current branching correctly flushes immediately. Verify this
-sub-case too.
+~~**2. RFC 4724 §4.2: re-termination during an open GR window needs a unit test**~~  
+~~*Resolved 2026-06-22* — `gr_re_termination_during_window_resets_deadline_and_holds_routes`~~
+~~confirms deadline is refreshed and routes are not double-flushed on a second unclean~~
+~~disconnect. `gr_clean_termination_during_window_flushes_immediately` confirms a~~
+~~NOTIFICATION received inside a GR window overrides the window and flushes immediately.~~
 
 **3. EOR-prune e2e test timing margin**
 

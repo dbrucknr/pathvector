@@ -14339,6 +14339,77 @@ mod test_gr_phase2 {
         );
     }
 
+    /// RFC 4724 §4.2 — if a peer disconnects uncleanly *again* while its GR
+    /// window is already open, the deadline must be reset to `now + restart_time`
+    /// and routes must continue to be held.  They must not be double-flushed.
+    #[test]
+    fn gr_re_termination_during_window_resets_deadline_and_holds_routes() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 30);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        // First unclean disconnect — opens GR window.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        let first_deadline = *state
+            .gr_deadlines
+            .get(&PEER_IP)
+            .expect("deadline must be set after first unclean disconnect");
+
+        // Re-establish, then disconnect again without re-announcing anything.
+        establish_with_gr(&mut state, 30);
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        let second_deadline = *state
+            .gr_deadlines
+            .get(&PEER_IP)
+            .expect("deadline must still be set after second unclean disconnect");
+
+        // The window is reset — second deadline must be >= the first.
+        assert!(
+            second_deadline >= first_deadline,
+            "re-termination must reset the GR deadline, not leave a stale earlier one"
+        );
+
+        // Routes must still be held — no double-flush.
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "routes must be retained after re-termination during GR window"
+        );
+        assert!(
+            state.gr_deadlines.contains_key(&PEER_IP),
+            "gr_deadlines must remain armed after re-termination"
+        );
+    }
+
+    /// RFC 4724 §4.2 — if a peer sends a NOTIFICATION (clean termination)
+    /// while its GR window is already open, routes must be flushed immediately.
+    /// The GR window must not prevent a clean teardown from taking effect.
+    #[test]
+    fn gr_clean_termination_during_window_flushes_immediately() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 30);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        // First disconnect is unclean — GR window opens.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        assert_eq!(state.rib.loc_rib.len(), 1, "route held during GR window");
+        assert!(state.gr_deadlines.contains_key(&PEER_IP));
+
+        // Peer re-establishes then sends a NOTIFICATION (clean).
+        establish_with_gr(&mut state, 30);
+        state.on_terminated(PEER_IP, TerminationReason::Clean, true);
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "clean termination during GR window must flush routes immediately"
+        );
+        assert!(
+            !state.gr_deadlines.contains_key(&PEER_IP),
+            "gr_deadlines must be cleared on clean termination"
+        );
+    }
+
     /// RFC 4724 §4.2 SHOULD — on unclean termination routes must be marked
     /// stale in LocRib so a fresh route from a second peer immediately wins
     /// best-path selection.
