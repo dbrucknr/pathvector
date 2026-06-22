@@ -236,8 +236,10 @@ What remains as optional future work:
 ### Remaining
 
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-- Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
-- NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during the GR window without tearing down the restart; extends RFC 4724; depends on Graceful Restart FSM
+- NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during a GR window without tearing down the restart; prevents the helper from flushing routes when it receives a CEASE from a restarting speaker. Extends RFC 4724 Phase 2 (now implemented); depends on no additional session changes beyond what exists today, but requires pathvectord to suppress flush on CEASE if the peer is in an active GR window.
+
+~~**Graceful Restart FSM behaviour (RFC 4724)** — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)~~
+~~**Resolved 2026-06-22**: Full RFC 4724 Phase 1 (speaker/helper role) and Phase 2 (holding peer stale routes) implemented. See `pathvectord/RFC.md` for clause-by-clause status.~~
 - BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
 
@@ -349,6 +351,44 @@ for programmatic callers) or should we match CLI convention for operator ergonom
 If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` in
 `pathvectord/src/grpc.rs` — try CIDR parse first, fall back to bare `IpAddr` + `/32` or
 `/128`. The proto field comment and client docs would need to reflect the relaxed rule.
+
+### Graceful Restart — known gaps (2026-06-22)
+
+RFC 4724 Phase 1 and Phase 2 are fully implemented. Two known gaps remain.
+
+**1. EOR-prune e2e test missing**
+
+The sequence "peer disconnects uncleanly → pathvectord holds stale routes → peer
+restarts and re-announces a subset → EOR received → un-refreshed routes pruned" is
+covered by unit tests in `daemon.rs` but has never run against a real peer.
+The two e2e tests in `graceful_restart_phase2.rs` cover the window-held and
+window-expired cases; the restart-and-partial-re-announce path is not exercised.
+
+Blocker: the e2e harness starts GoBGP in a container; container restart changes
+its IP, so pathvectord's peer config no longer matches. Fix options:
+- Assign a static container IP via `docker network connect --ip` in the test
+- Kill the gobgpd process inside the container without stopping the container
+  (requires `--init` in the Dockerfile so gobgpd is not PID 1)
+
+**2. `mark_stale_and_repropagate` performance at full-table scale**
+
+When a GR-capable peer disconnects, `mark_stale_and_repropagate` iterates every
+NLRI from that peer and calls `rib_mut()` in a loop (repeated `Arc::make_mut`).
+For the DDoS blackhole use case (tens of prefixes, handful of peers) this is
+negligible. For a full-table iBGP peer (~800k prefixes) this loop would be
+noticeable — potentially hundreds of milliseconds under the write lock, causing
+hold-timer pressure on other peers.
+
+No action needed for the current use case. If the deployment ever includes
+full-table peers, profile this path first and consider batching the LocRib
+re-insertions outside the write lock.
+
+**3. RFC 4724 §3 SHOULD: suppress GR capability when peer restart_time = 0**
+
+When the peer's OPEN carries a GracefulRestart capability with `restart_time = 0`,
+pathvectord currently logs a warning but still advertises its own GR capability.
+RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
+overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
 
 ### Remaining
 
