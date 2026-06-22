@@ -95,6 +95,16 @@ pub(crate) enum PendingV6 {
     Withdraw,
 }
 
+/// Abstraction over FIB change application, enabling kernel-free unit testing.
+///
+/// The production implementation is [`FibManager`].  Tests can inject a
+/// `RecordingFib` (defined in the test module) that records calls without
+/// touching the kernel — same pattern as [`pathvector_rib::oracle::NextHopOracle`].
+pub(crate) trait ApplyFibChange: Send + Sync {
+    fn apply_v4(&self, change: BestPathChange<Ipv4Addr>);
+    fn apply_v6(&self, change: BestPathChange<Ipv6Addr>);
+}
+
 /// Serialises FIB mutations from the BGP event loop to a background writer task.
 ///
 /// `apply_v4/v6` are non-blocking: they overwrite the pending entry for the
@@ -139,7 +149,9 @@ impl FibManager {
     pub(crate) fn pending_v6_snapshot(&self) -> HashMap<Nlri<Ipv6Addr>, PendingV6> {
         self.pending_v6.lock().unwrap().clone()
     }
+}
 
+impl ApplyFibChange for FibManager {
     /// Record the desired FIB state for the prefix in `change`.
     ///
     /// For `Announced`: records `Install { gateway }`. For `Withdrawn`: records
@@ -148,7 +160,7 @@ impl FibManager {
     ///
     /// If a pending entry already exists for this NLRI, it is overwritten —
     /// only the latest desired state is retained.
-    pub(crate) fn apply_v4(&self, change: BestPathChange<Ipv4Addr>) {
+    fn apply_v4(&self, change: BestPathChange<Ipv4Addr>) {
         let (nlri, op) = match change {
             BestPathChange::Announced(nlri, route) => {
                 let Some(NextHop::V4(gateway)) = route.next_hop else {
@@ -166,7 +178,7 @@ impl FibManager {
     /// Record the desired FIB state for the IPv6 prefix in `change`.
     ///
     /// Routes with no usable IPv6 global next-hop are silently skipped.
-    pub(crate) fn apply_v6(&self, change: BestPathChange<Ipv6Addr>) {
+    fn apply_v6(&self, change: BestPathChange<Ipv6Addr>) {
         let (nlri, op) = match change {
             BestPathChange::Announced(nlri, route) => {
                 let gateway = match route.next_hop {
@@ -273,7 +285,7 @@ mod tests {
     use pathvector_sys::FibWrite;
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
 
-    use super::{FibManager, PendingV4, PendingV6};
+    use super::{ApplyFibChange, FibManager, PendingV4, PendingV6};
 
     // ── MockFibWriter ─────────────────────────────────────────────────────────
 
