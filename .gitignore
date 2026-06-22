@@ -23,3 +23,4 @@ fuzz/coverage/
 .DS_Store
 .cargo-linux-cache/
 book/
+.claude/

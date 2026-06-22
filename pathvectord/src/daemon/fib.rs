@@ -149,4 +149,3 @@ pub(crate) async fn withdraw_stale_bgp_routes<W: pathvector_sys::FibWrite>(
         }
     }
 }
-

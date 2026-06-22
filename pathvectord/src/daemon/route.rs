@@ -1145,4 +1145,3 @@ pub(super) fn handle_update(
     );
     (fib_changes, fib_changes_v6, None)
 }
-

@@ -95,4 +95,3 @@ pub(super) fn build_local_capabilities(
         },
     ]
 }
-

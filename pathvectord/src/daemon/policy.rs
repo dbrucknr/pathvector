@@ -139,5 +139,4 @@ impl DaemonState {
         }
         self.sync_advertised(peer_ip);
     }
-
 }

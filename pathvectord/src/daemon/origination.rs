@@ -118,5 +118,4 @@ impl DaemonState {
         self.propagate_to_all_peers_v6(nlris);
         self.flush_pending();
     }
-
 }

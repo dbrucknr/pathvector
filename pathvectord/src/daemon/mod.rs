@@ -49,9 +49,9 @@ use capabilities::{SpawnConfig, build_local_capabilities};
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
 use peer::{run_bgp_listener, run_command_processor};
-use route::{reapply_import_policy, reapply_import_policy_v6};
 #[cfg(test)]
 use route::handle_update;
+use route::{reapply_import_policy, reapply_import_policy_v6};
 
 /// Synthetic `PeerId` used as the source for locally originated routes.
 ///
@@ -322,7 +322,6 @@ pub(crate) struct DaemonState {
     oracle_v6: Arc<dyn NextHopOracle + Send + Sync>,
 }
 
-
 impl DaemonState {
     pub(crate) fn new(
         local_as: u32,
@@ -477,9 +476,7 @@ impl DaemonState {
             oracle_v6: Arc::new(AlwaysReachable),
         }
     }
-
 }
-
 
 pub(crate) async fn run(cfg: config::Config) {
     run_with(cfg, transport::spawn).await;
@@ -11221,7 +11218,8 @@ mod test_gr_phase2 {
         // First unclean disconnect — opens GR window.
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
         let first_deadline = *state
-            .gr.deadlines
+            .gr
+            .deadlines
             .get(&PEER_IP)
             .expect("deadline must be set after first unclean disconnect");
 
@@ -11229,7 +11227,8 @@ mod test_gr_phase2 {
         establish_with_gr(&mut state, 30);
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
         let second_deadline = *state
-            .gr.deadlines
+            .gr
+            .deadlines
             .get(&PEER_IP)
             .expect("deadline must still be set after second unclean disconnect");
 

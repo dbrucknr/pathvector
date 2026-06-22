@@ -162,12 +162,14 @@ impl DaemonState {
         // Determine which families the peer supports GR for (from prior session).
         let gr_v4 = was_in_gr
             && self
-                .gr.peer_families
+                .gr
+                .peer_families
                 .get(&peer_ip)
                 .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
         let gr_v6 = was_in_gr
             && self
-                .gr.peer_families
+                .gr
+                .peer_families
                 .get(&peer_ip)
                 .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
         if was_in_gr {
@@ -692,7 +694,6 @@ impl DaemonState {
             "session terminated"
         );
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
