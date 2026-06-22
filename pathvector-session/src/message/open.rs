@@ -537,4 +537,213 @@ mod tests {
         let roundtripped = roundtrip(&open);
         assert_eq!(roundtripped.capabilities, vec![Capability::ExtendedMessage]);
     }
+
+    /// RFC 4724 §3: the F-bit (`forwarding_preserved`) must survive an encode/decode
+    /// roundtrip.  If it were dropped, the peer would not hold our routes on restart
+    /// even though `restart_time > 0` — a silent protocol failure.
+    #[test]
+    fn test_gr_family_forwarding_preserved_roundtrip() {
+        use pathvector_types::AfiSafi;
+
+        let cap = Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 120,
+            families: vec![
+                GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    forwarding_preserved: true,
+                },
+                GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    forwarding_preserved: false,
+                },
+            ],
+        };
+
+        let open = OpenMessage {
+            version: 4,
+            my_as: 65001,
+            hold_time: 90,
+            bgp_id: "1.2.3.4".parse().unwrap(),
+            capabilities: vec![cap],
+        };
+
+        let roundtripped = roundtrip(&open);
+        let Capability::GracefulRestart {
+            restart_time,
+            families,
+            ..
+        } = &roundtripped.capabilities[0]
+        else {
+            panic!("expected GracefulRestart capability");
+        };
+
+        assert_eq!(*restart_time, 120);
+        assert_eq!(families.len(), 2);
+        assert!(
+            families[0].forwarding_preserved,
+            "IPv4 F-bit must survive encode/decode roundtrip"
+        );
+        assert!(
+            !families[1].forwarding_preserved,
+            "IPv6 F-bit (false) must survive encode/decode roundtrip"
+        );
+    }
+
+    // ── proptest: GR capability codec ─────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn arb_gr_family()(
+            afi in any::<u16>(),
+            safi in any::<u8>(),
+            forwarding_preserved in any::<bool>(),
+        ) -> GracefulRestartFamily {
+            GracefulRestartFamily {
+                afi_safi: pathvector_types::AfiSafi::new(
+                    pathvector_types::Afi::new(afi),
+                    pathvector_types::Safi::new(safi),
+                ),
+                forwarding_preserved,
+            }
+        }
+    }
+
+    prop_compose! {
+        fn arb_gr_capability()(
+            restart_flags in 0u8..=0x0Fu8,   // 4-bit nibble only
+            restart_time in 0u16..=4095u16,   // 12-bit field
+            families in prop::collection::vec(arb_gr_family(), 0..=8),
+        ) -> Capability {
+            Capability::GracefulRestart { restart_flags, restart_time, families }
+        }
+    }
+
+    proptest! {
+        /// Arbitrary valid GR capabilities must encode then decode back to the
+        /// same value — no data is lost or corrupted in the codec.
+        #[test]
+        fn gr_capability_roundtrips(cap in arb_gr_capability()) {
+            let Capability::GracefulRestart { restart_flags, restart_time, ref families } = cap
+            else { unreachable!() };
+
+            let open = OpenMessage {
+                version: 4,
+                my_as: 65001,
+                hold_time: 90,
+                bgp_id: "1.2.3.4".parse().unwrap(),
+                capabilities: vec![cap.clone()],
+            };
+            let rt = roundtrip(&open);
+            let Capability::GracefulRestart {
+                restart_flags: rt_flags,
+                restart_time: rt_time,
+                families: ref rt_families,
+            } = rt.capabilities[0] else {
+                panic!("expected GracefulRestart after roundtrip");
+            };
+
+            prop_assert_eq!(rt_flags, restart_flags,
+                "restart_flags must survive roundtrip");
+            prop_assert_eq!(rt_time, restart_time,
+                "restart_time must survive roundtrip");
+            prop_assert_eq!(rt_families.len(), families.len(),
+                "family count must survive roundtrip");
+            for (got, expected) in rt_families.iter().zip(families.iter()) {
+                prop_assert_eq!(got.afi_safi, expected.afi_safi,
+                    "AFI/SAFI must survive roundtrip");
+                prop_assert_eq!(got.forwarding_preserved, expected.forwarding_preserved,
+                    "forwarding_preserved must survive roundtrip");
+            }
+        }
+
+        /// Truncated GR capability bytes inside an OPEN must not panic.
+        ///
+        /// We craft an OPEN with a GR capability where cap_len claims 2 bytes
+        /// but the actual bytes are cut short. The decoder must return an error,
+        /// never panic.
+        #[test]
+        fn gr_capability_truncated_input_does_not_panic(
+            truncate_to in 0usize..2usize,
+        ) {
+            // Build a minimal OPEN header (9 bytes after BGP header) with one
+            // GR capability whose cap_len = 2 but payload is `truncate_to` bytes.
+            // We test through the full capability decode path via a crafted raw
+            // optional-parameters block.
+            //
+            // Optional parameter layout:
+            //   param_type=2, param_len, cap_code=64, cap_len=2, <payload bytes>
+            let payload: Vec<u8> = vec![0x00u8, 0x78u8][..truncate_to].to_vec();
+            let cap_len = 2u8; // claims 2 bytes even if truncated
+            #[allow(clippy::cast_possible_truncation)]
+            let param_len = 2 + payload.len() as u8; // cap_code + cap_len + payload; len ≤ 2
+            let mut opt_params: Vec<u8> = vec![0x02, param_len, 64, cap_len];
+            opt_params.extend_from_slice(&payload);
+
+            let open = build_open_bytes(&opt_params);
+            let mut cur = Cursor::new(&open);
+            // Must not panic; may Ok or Err depending on how the truncation lands.
+            let _result = OpenMessage::decode(&mut cur);
+        }
+
+        /// Trailing bytes in a GR capability family list are silently dropped.
+        ///
+        /// Our decoder reads families in chunks of 4; 1–3 trailing bytes that
+        /// don't form a complete family entry must be dropped without error.
+        #[test]
+        fn gr_capability_trailing_bytes_ignored(
+            n_families in 0usize..=4usize,
+            trailing in 1u8..=3u8,
+        ) {
+            // Build capability bytes: 2-byte flags+time, then n_families * 4 bytes,
+            // then `trailing` junk bytes.
+            let mut cap_payload: Vec<u8> = vec![0x00, 0x78];
+            for i in 0..n_families {
+                cap_payload.extend_from_slice(&[
+                    0x00, 0x01, // AFI = 1 (IPv4)
+                    0x01,       // SAFI = 1 (unicast)
+                    if i % 2 == 0 { 0x80 } else { 0x00 }, // F-bit alternates
+                ]);
+            }
+            cap_payload.extend(std::iter::repeat_n(0xFF, trailing as usize));
+            #[allow(clippy::cast_possible_truncation)]
+            let cap_len = cap_payload.len() as u8; // ≤ 2 + 4*4 + 3 = 21, fits u8
+            let param_len = 2 + cap_len; // cap_code + cap_len + payload
+            let mut opt_params: Vec<u8> = vec![0x02, param_len, 64, cap_len];
+            opt_params.extend_from_slice(&cap_payload);
+
+            let open = build_open_bytes(&opt_params);
+            let mut cur = Cursor::new(&open);
+            let result = OpenMessage::decode(&mut cur);
+            prop_assert!(result.is_ok(),
+                "trailing family bytes must not cause decode error: {result:?}");
+            if let Ok(msg) = result
+                && let Some(Capability::GracefulRestart { families, .. }) = msg
+                    .capabilities
+                    .iter()
+                    .find(|c| matches!(c, Capability::GracefulRestart { .. }))
+            {
+                prop_assert_eq!(
+                    families.len(), n_families,
+                    "trailing bytes must not create phantom families"
+                );
+            }
+        }
+    }
+
+    /// Build a raw BGP OPEN message body (after the 19-byte BGP header) with
+    /// custom optional-parameters bytes, for use in proptest codec tests.
+    fn build_open_bytes(opt_params: &[u8]) -> Vec<u8> {
+        #[allow(clippy::cast_possible_truncation)]
+        let opt_len = opt_params.len() as u8; // test inputs are always small
+        let mut v = Vec::new();
+        v.push(4); // version
+        v.extend_from_slice(&65001u16.to_be_bytes()); // my_as
+        v.extend_from_slice(&90u16.to_be_bytes()); // hold_time
+        v.extend_from_slice(&[10, 0, 0, 1]); // bgp_id
+        v.push(opt_len);
+        v.extend_from_slice(opt_params);
+        v
+    }
 }

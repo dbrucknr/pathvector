@@ -184,6 +184,13 @@ message PeerState {
   /// True once we have received the peer's End-of-RIB marker for IPv6 unicast
   /// (RFC 4724 §2).
   bool eor_ipv6_received = 12;
+  /// The peer's advertised RFC 4724 GracefulRestart `restart_time` in seconds.
+  ///
+  /// Non-zero means the peer supports the GR restart window and will hold
+  /// our routes for this many seconds after an unclean session loss.
+  /// Zero means the peer either did not advertise GracefulRestart or advertised
+  /// `restart_time = 0` (EOR-only mode, no stale-route window).
+  uint32 peer_gr_restart_time = 13;
 }
 
 /// Event type for WatchPeers stream.

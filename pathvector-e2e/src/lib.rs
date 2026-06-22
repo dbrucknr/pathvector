@@ -311,6 +311,56 @@ pub fn write_gobgp_config() -> NamedTempFile {
     f
 }
 
+/// Like [`write_gobgp_config`] but with a configurable `restart-time`.
+///
+/// Use a short `restart_secs` (e.g. `10`) for Phase 2 tests so the GR window
+/// expires quickly without waiting the full 120 s default.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_with_restart_time(restart_secs: u16) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  [peer-groups.graceful-restart.config]
+    enabled      = true
+    restart-time = {restart_secs}
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp config");
+    f
+}
+
 /// Writes the gobgpd config for a **route-source** container (AS 65003).
 ///
 /// This is used in two-peer outbound tests: the source announces prefixes to
@@ -567,6 +617,141 @@ pub fn write_gobgp_config_md5(pathvectord_ip: &str, key: &str) -> NamedTempFile 
 "#
     )
     .expect("write gobgp md5 config");
+    f
+}
+
+/// Writes a pathvectord config with `graceful_restart_time` set.
+///
+/// Identical to `write_daemon_config` but adds `graceful_restart_time` to the
+/// `[daemon]` stanza so pathvectord advertises the GracefulRestart capability with
+/// forwarding-preserved families.  Used to verify that upstream peers hold our
+/// routes during the restart window (RFC 4724 §3 helper role).
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_gr(peers: &[(Ipv4Addr, u32)], restart_time: u16) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord GR config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+"#
+    )
+    .expect("write pathvectord GR config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord GR peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `connect_retry_time` set per-peer.
+///
+/// Identical to `write_daemon_config` except each peer has a
+/// `connect_retry_time` override.  Use a short value (e.g. `2`) in tests that
+/// kill and restart a peer and need pathvectord to reconnect quickly rather
+/// than waiting the RFC-default 120 s.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_fast_retry(
+    peers: &[(Ipv4Addr, u32)],
+    connect_retry_secs: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord fast-retry config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord fast-retry config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address             = "{ip}"
+port                = {GOBGPD_BGP_PORT}
+remote_as           = {remote_as}
+import_default      = "accept"
+export_default      = "accept"
+connect_retry_time  = {connect_retry_secs}
+"#
+        )
+        .expect("write pathvectord fast-retry peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `graceful_restart_time` and `restarting = true`.
+///
+/// Identical to [`write_daemon_config_gr`] but also sets `restarting = true` so
+/// pathvectord sets the RFC 4724 §3 Restart State (R) bit in the initial OPEN.
+/// Used to verify that the R-bit is encoded and visible to the peer.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_gr_restarting(
+    peers: &[(Ipv4Addr, u32)],
+    restart_time: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord GR restarting config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+restarting            = true
+"#
+    )
+    .expect("write pathvectord GR restarting config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord GR restarting peer config");
+    }
     f
 }
 
@@ -1278,6 +1463,14 @@ pub struct Harness {
     /// IP address that gobgpd appears as to pathvectord (its container IP on
     /// the shared Docker network).  Used in tests that assert `route.peer_address`.
     pub peer: Ipv4Addr,
+    /// IP address that pathvectord appears as to gobgpd (its container IP on
+    /// the shared Docker network).  Used to query `gobgp neighbor <addr>` from
+    /// inside the gobgpd container.
+    pub pathvectord_ip: Ipv4Addr,
+    /// Name of the isolated Docker bridge network for this test.  Exposed so
+    /// tests can call `docker network disconnect/connect` to simulate link
+    /// failures without stopping containers.
+    pub network_name: String,
     // Dropped LAST so the network outlives the containers using it.
     _network: DockerNetwork,
 }
@@ -1338,21 +1531,142 @@ impl Harness {
         Self::new_inner(write_daemon_config_no_policy).await
     }
 
+    /// Stand up pathvectord with `graceful_restart_time` set.
+    ///
+    /// Identical to [`Self::new`] except pathvectord advertises the
+    /// GracefulRestart capability with `restart_time = restart_secs` and both
+    /// IPv4/IPv6 unicast families marked `forwarding_preserved`.
+    ///
+    /// Use this harness for RFC 4724 §3 helper-role tests that verify the
+    /// upstream peer holds our routes during a restart window.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr(restart_secs: u16) -> Self {
+        Self::new_inner(move |peers| write_daemon_config_gr(peers, restart_secs)).await
+    }
+
+    /// Stand up pathvectord with `graceful_restart_time` set and `restarting = true`.
+    ///
+    /// Like [`Self::new_gr`] but also sets the RFC 4724 §3 Restart State (R) bit
+    /// in the initial OPEN.  Use this to verify that GoBGP observes R=1 from us.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr_restarting(restart_secs: u16) -> Self {
+        Self::new_inner(move |peers| write_daemon_config_gr_restarting(peers, restart_secs)).await
+    }
+
+    /// Stand up pathvectord with a GoBGP peer whose GR `restart-time` is set
+    /// to `peer_restart_secs`.
+    ///
+    /// Pathvectord does **not** need its own `graceful_restart_time` configured
+    /// for Phase 2 to work — only the peer's advertised capability matters.
+    /// Use a short value (e.g. 10) so GR windows expire quickly in tests.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr_peer(peer_restart_secs: u16) -> Self {
+        Self::new_inner_with_gobgp_config(
+            move || write_gobgp_config_with_restart_time(peer_restart_secs),
+            write_daemon_config,
+        )
+        .await
+    }
+
+    /// Like [`Self::new_gr_peer`] but pathvectord is also configured with a
+    /// short `connect_retry_time` so it reconnects quickly after the peer
+    /// disappears, rather than waiting the RFC-default 120 s.
+    ///
+    /// Use this for EOR-prune tests that simulate a peer restart: disconnect
+    /// the peer from the network, mutate its RIB, reconnect, and wait for
+    /// pathvectord to re-establish and process the EOR.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_gr_peer_fast_retry(peer_restart_secs: u16) -> Self {
+        Self::new_inner_with_gobgp_config(
+            move || write_gobgp_config_with_restart_time(peer_restart_secs),
+            move |peers| write_daemon_config_fast_retry(peers, 2),
+        )
+        .await
+    }
+
+    /// Disconnect the GoBGP container from the test network without stopping it.
+    ///
+    /// The TCP connection drops immediately, triggering an unclean termination
+    /// in pathvectord.  The GoBGP process keeps running; its in-memory RIB is
+    /// intact.  Call [`Self::reconnect_gobgp`] to restore network access with
+    /// the same IP so pathvectord can reconnect.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network disconnect` fails.
+    pub fn disconnect_gobgp(&self) {
+        let status = Command::new("docker")
+            .args(["network", "disconnect", &self.network_name, &self.gobgpd_id])
+            .status()
+            .expect("docker network disconnect gobgpd");
+        assert!(
+            status.success(),
+            "docker network disconnect failed: {status}"
+        );
+    }
+
+    /// Reconnect the GoBGP container to the test network with its original IP.
+    ///
+    /// Must be called after [`Self::disconnect_gobgp`].  Uses `--ip` to
+    /// restore the same address, so pathvectord's peer config still matches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker network connect` fails.
+    pub fn reconnect_gobgp(&self) {
+        let status = Command::new("docker")
+            .args([
+                "network",
+                "connect",
+                "--ip",
+                &self.peer.to_string(),
+                &self.network_name,
+                &self.gobgpd_id,
+            ])
+            .status()
+            .expect("docker network connect gobgpd");
+        assert!(status.success(), "docker network connect failed: {status}");
+    }
+
     /// Internal constructor — spins up one GoBGP + one pathvectord container.
     ///
-    /// `make_cfg` is the config-writing function that produces the pathvectord
-    /// TOML.  The caller chooses the policy variant.
-    async fn new_inner(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+    /// `make_cfg` is the config-writing function (or closure) that produces the
+    /// pathvectord TOML.  The caller chooses the policy / feature variant.
+    async fn new_inner(make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+        Self::new_inner_with_gobgp_config(write_gobgp_config, make_cfg).await
+    }
+
+    /// Like [`new_inner`] but also accepts a `gobgpd_cfg_fn` for tests that
+    /// need a non-default GoBGP configuration (e.g. a custom restart-time).
+    async fn new_inner_with_gobgp_config(
+        gobgpd_cfg_fn: impl Fn() -> NamedTempFile,
+        make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile,
+    ) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
         // Create an isolated network for this test so containers from
-        // different tests don't interfere.
+        // different tests don't interfere.  Use an explicit subnet so that
+        // `docker network connect --ip` works (Docker requires a user-configured
+        // subnet for static IP assignment).
         let network_name = format!("pathvector-test-{test_id}");
-        let network = DockerNetwork::create(network_name.clone());
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
         // Write gobgpd config.
-        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config = gobgpd_cfg_fn();
         let gobgpd_config_path = gobgpd_config
             .path()
             .to_str()
@@ -1418,6 +1732,10 @@ impl Harness {
 
         let pathvectord_container_id = pathvectord.id().to_owned();
 
+        // Discover pathvectord's container IP so tests can reference it as a
+        // GoBGP neighbor address (GoBGP keys its neighbor table by source IP).
+        let pathvectord_ip = container_network_ip(&pathvectord_container_id, &network_name);
+
         Self {
             _gobgpd: gobgpd,
             _pathvectord: pathvectord,
@@ -1427,6 +1745,8 @@ impl Harness {
             _pathvectord_config: pathvectord_config,
             client,
             peer: gobgpd_ip,
+            pathvectord_ip,
+            network_name,
             _network: network,
         }
     }
@@ -1434,7 +1754,7 @@ impl Harness {
     /// Like [`new_inner`] but creates the Docker network with `--ipv6` so that
     /// containers receive link-local IPv6 addresses.  Required for tests that
     /// use `gobgp_link_local_v6()` as a BGP next-hop.
-    async fn new_inner_v6(make_cfg: fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
+    async fn new_inner_v6(make_cfg: impl Fn(&[(Ipv4Addr, u32)]) -> NamedTempFile) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
@@ -1494,6 +1814,7 @@ impl Harness {
             .expect("BGP session did not reach Established within 30 s");
 
         let pathvectord_container_id = pathvectord.id().to_owned();
+        let pathvectord_ip = container_network_ip(&pathvectord_container_id, &network_name);
 
         Self {
             _gobgpd: gobgpd,
@@ -1504,6 +1825,8 @@ impl Harness {
             _pathvectord_config: pathvectord_config,
             client,
             peer: gobgpd_ip,
+            pathvectord_ip,
+            network_name,
             _network: network,
         }
     }
@@ -2713,6 +3036,42 @@ pub fn frr_pathvectord_ip(test_id: u32) -> String {
     format!("172.31.{third}.20")
 }
 
+/// Writes a minimal FRR bgpd config with Graceful Restart enabled.
+///
+/// Identical to [`write_frr_config`] but adds `neighbor X graceful-restart` so
+/// that FRR actively parses and exposes the peer's GR capability state, including
+/// the Restart State (R) bit, via `show bgp neighbors`.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_frr_config_gr(pathvectord_ip: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp frr GR config");
+    write!(
+        f,
+        "
+frr defaults traditional
+
+router bgp 65001
+ bgp router-id 1.0.0.1
+ no bgp ebgp-requires-policy
+ no bgp network import-check
+ neighbor {pathvectord_ip} remote-as 65002
+ neighbor {pathvectord_ip} passive
+ neighbor {pathvectord_ip} graceful-restart
+ !
+ address-family ipv4 unicast
+  neighbor {pathvectord_ip} activate
+  neighbor {pathvectord_ip} next-hop-self
+ exit-address-family
+exit
+"
+    )
+    .expect("write frr GR config");
+    f
+}
+
 /// Writes a minimal FRR bgpd config.
 ///
 /// `routes`: prefixes FRR announces to pathvectord via `network` statements.
@@ -2852,6 +3211,42 @@ export_default = "accept"
     f
 }
 
+fn write_daemon_config_frr_gr_restarting(
+    peers: &[(Ipv4Addr, u32)],
+    restart_time: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord frr GR restarting config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+restarting            = true
+"#
+    )
+    .expect("write pathvectord frr GR restarting config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord frr GR restarting peer config");
+    }
+    f
+}
+
 /// A fully-wired test environment: isolated Docker network + FRR container +
 /// `pathvectord` container + connected [`PathvectorClient`], with the BGP
 /// session already `Established`.
@@ -2877,6 +3272,86 @@ impl FrrHarness {
     /// Stand up the environment with no pre-announced routes.
     pub async fn new() -> Self {
         Self::with_routes(&[]).await
+    }
+
+    /// Stand up pathvectord with `graceful_restart_time` set and `restarting = true`,
+    /// against an FRR peer configured with `neighbor X graceful-restart`.
+    ///
+    /// FRR will actively parse pathvectord's GracefulRestart capability (including the
+    /// Restart State R-bit) and expose it via `show bgp neighbors <addr>`.
+    /// Use this harness to verify the R-bit reaches FRR correctly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, the images are missing, or the session does
+    /// not reach `Established` within 30 s.
+    pub async fn new_gr_restarting(restart_secs: u16) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-frr-gr-test-{test_id}");
+
+        let subnet = frr_test_subnet(test_id);
+        let frr_ip_str = frr_peer_ip(test_id);
+        let pv_ip_str = frr_pathvectord_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let frr_config = write_frr_config_gr(&pv_ip_str);
+        let frr_config_path = frr_config.path().to_str().unwrap().to_owned();
+
+        let frr = docker_start_with_caps(
+            &format!("frr-gr-{test_id}"),
+            FRR_IMAGE,
+            &network_name,
+            Some(&frr_ip_str),
+            true,
+            true,
+            &frr_config_path,
+            "/etc/frr/frr.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&frr.0, Duration::from_secs(60));
+
+        let pathvectord_config = {
+            let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+            write_daemon_config_frr_gr_restarting(&[(frr_ip, 65001)], restart_secs)
+        };
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start(
+            &format!("pathvectord-frr-gr-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pv_ip_str),
+            false,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for FrrHarness::new_gr_restarting");
+
+        let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+        wait_for_established(&mut client, frr_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session with FRR (GR restarting) did not reach Established within 30 s");
+
+        let container_id = frr.0.clone();
+        FrrHarness {
+            _frr: frr,
+            _pathvectord: pathvectord,
+            _frr_config: frr_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            frr_id: container_id,
+            frr_ip,
+            pathvectord_ip: pv_ip_str.parse().unwrap(),
+            _network: network,
+        }
     }
 
     /// Stand up the environment with FRR pre-announcing `routes` to pathvectord.

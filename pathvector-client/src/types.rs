@@ -130,6 +130,12 @@ pub struct PeerState {
     /// True once we have received the peer's End-of-RIB marker for IPv6 unicast
     /// (RFC 4724 §2).
     pub eor_ipv6_received: bool,
+    /// The peer's advertised RFC 4724 GracefulRestart `restart_time` in seconds.
+    ///
+    /// Non-zero means the peer will hold our routes for this many seconds after
+    /// an unclean session loss. Zero means the peer either did not advertise
+    /// GracefulRestart or advertised `restart_time = 0` (EOR-only, no GR window).
+    pub peer_gr_restart_time: u32,
 }
 
 /// A single BGP route with all path attributes.

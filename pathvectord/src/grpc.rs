@@ -301,6 +301,10 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
         prefixes_advertised,
         eor_ipv4_received: snap.eor_received.contains(&addr),
         eor_ipv6_received: snap.eor_received_v6.contains(&addr),
+        peer_gr_restart_time: snap
+            .gr_capable_peers
+            .get(&addr)
+            .map_or(0, |&t| u32::from(t)),
     })
 }
 
@@ -497,6 +501,7 @@ impl PeerService for PeerServiceImpl {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+            connect_retry_time: None,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -1252,7 +1257,7 @@ mod tests {
     use tokio::sync::{RwLock, mpsc};
     use tonic::Request;
 
-    use pathvector_session::transport::SessionCommand;
+    use pathvector_session::transport::{SessionCommand, TerminationReason};
 
     use super::{
         OriginationServiceImpl, PeerServiceImpl, PolicyServiceImpl, RibServiceImpl,
@@ -1309,6 +1314,7 @@ mod tests {
                 next_hop_self: false,
                 hold_time: None,
                 shutdown_message: None,
+                connect_retry_time: None,
             })
             .collect();
         DaemonState::new(
@@ -3888,7 +3894,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_terminated(peer_ip, true);
+            s.on_terminated(peer_ip, TerminationReason::Unclean, true);
         }
 
         let mut withdrawn: std::collections::HashSet<String> = std::collections::HashSet::new();

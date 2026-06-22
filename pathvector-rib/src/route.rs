@@ -103,6 +103,12 @@ pub struct Route<A: IpAddress> {
     /// `None` when all rare attributes are at their default values, saving
     /// ~96 bytes per route (four empty `Vec`s + padding) on the common path.
     pub rare: Option<Box<RareAttrs>>,
+    /// RFC 4724 §4.2 — set when this route is being held during a peer's GR
+    /// restart window.  Stale routes are de-preferred in best-path selection
+    /// (non-stale beats stale before all other criteria), so a fresh alternate
+    /// path from another peer wins immediately.  Cleared when the peer
+    /// re-announces the route during re-establishment.  Never encoded on wire.
+    pub stale: bool,
 }
 
 impl<A: IpAddress> Route<A> {
@@ -389,6 +395,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             peer_type: self.peer_type,
             received_at: self.received_at,
             rare: self.rare,
+            stale: false,
         }
     }
 }

@@ -118,6 +118,51 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default = "default_fib_metric")]
     pub fib_metric: u32,
+    /// RFC 4724 §3: how long (in seconds) peers should hold our routes if our
+    /// BGP session drops unexpectedly.
+    ///
+    /// When non-zero, pathvectord advertises the GracefulRestart capability with
+    /// this restart time and marks IPv4/IPv6 unicast families as
+    /// `forwarding_preserved`. The upstream peer will retain our routes for up to
+    /// this many seconds after an unclean session loss, giving pathvectord time to
+    /// reconnect and re-announce without causing a route flap.
+    ///
+    /// Set to `0` (the default) to disable forwarding-state advertisement.  Peers
+    /// will still receive the GracefulRestart capability (required for EOR
+    /// signalling) but will withdraw our routes immediately on session loss.
+    ///
+    /// The RFC 4724 maximum encodable value is 4095 seconds; larger values are
+    /// silently clamped. Recommended range for DDoS blackhole use: 120–300.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as              = 65001
+    /// bgp_id                = "10.0.0.1"
+    /// graceful_restart_time = 120
+    /// ```
+    #[serde(default)]
+    pub graceful_restart_time: u16,
+    /// RFC 4724 §3: set the Restart State (R) bit in OPEN messages to signal
+    /// that this daemon is the restarting speaker.
+    ///
+    /// Set this to `true` when restarting pathvectord during an active BGP
+    /// session (e.g., during a planned upgrade or after a crash) so that peers
+    /// stop their stale-route timers immediately when the session re-establishes.
+    /// Leave `false` (the default) on normal first-time startup.
+    ///
+    /// Ignored when `graceful_restart_time = 0`.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as              = 65001
+    /// bgp_id                = "10.0.0.1"
+    /// graceful_restart_time = 120
+    /// restarting            = true   # set only when restarting; remove after
+    /// ```
+    #[serde(default)]
+    pub restarting: bool,
 }
 
 fn default_fib_table() -> u32 {
@@ -309,6 +354,20 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub shutdown_message: Option<String>,
+    /// RFC 4271 §8.1 ConnectRetry timer in seconds.
+    ///
+    /// How long to wait before retrying a failed TCP connection to this peer.
+    /// Defaults to 120 s per the RFC recommendation. Reduce for
+    /// latency-sensitive deployments or test environments.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address             = "10.0.0.2"
+    /// remote_as           = 65001
+    /// connect_retry_time  = 5
+    /// ```
+    #[serde(default)]
+    pub connect_retry_time: Option<u16>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -426,6 +485,7 @@ mod sidecar_tests {
             next_hop_self: false,
             hold_time: None,
             shutdown_message: None,
+            connect_retry_time: None,
         }
     }
 
@@ -504,6 +564,7 @@ mod sidecar_tests {
             next_hop_self: false,
             hold_time: Some(60),
             shutdown_message: Some("planned maintenance".into()),
+            connect_retry_time: Some(5),
         };
         store.upsert(full_peer.clone()).await;
 

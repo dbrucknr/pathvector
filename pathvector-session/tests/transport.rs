@@ -17,7 +17,7 @@ use pathvector_session::message::{
     UpdateMessage,
 };
 use pathvector_session::transport::{
-    SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
+    DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -42,6 +42,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         peer_as: Some(65002),
         peer_addr,
         md5_password: None,
+        connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
 
@@ -156,7 +157,7 @@ async fn test_manual_stop_sends_cease_and_emits_terminated() {
         .expect("timed out waiting for Terminated")
         .expect("session exited unexpectedly");
     assert!(
-        matches!(event, SessionEvent::Terminated),
+        matches!(event, SessionEvent::Terminated(_)),
         "expected Terminated, got {event:?}"
     );
 
@@ -190,7 +191,7 @@ async fn test_peer_disconnect_emits_terminated() {
         .expect("timed out waiting for Terminated after peer disconnect")
         .expect("session exited unexpectedly");
     assert!(
-        matches!(event, SessionEvent::Terminated),
+        matches!(event, SessionEvent::Terminated(_)),
         "expected Terminated, got {event:?}"
     );
 }
@@ -235,6 +236,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         peer_as: Some(65002),
         peer_addr,
         md5_password: None,
+        connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
 
@@ -371,7 +373,7 @@ async fn test_hold_timer_fires_terminates_session() {
         .expect("timed out waiting for Terminated")
         .expect("session exited");
     assert!(
-        matches!(event, SessionEvent::Terminated),
+        matches!(event, SessionEvent::Terminated(_)),
         "expected Terminated, got {event:?}"
     );
 
@@ -457,7 +459,7 @@ async fn test_codec_error_emits_terminated() {
         .expect("timed out waiting for Terminated after codec error")
         .expect("session channel closed unexpectedly");
     assert!(
-        matches!(event, SessionEvent::Terminated),
+        matches!(event, SessionEvent::Terminated(_)),
         "expected Terminated after codec error, got {event:?}"
     );
 

@@ -55,15 +55,16 @@ integration rather than direct unit tests.
   consistency invariant "every prefix in `AdjRibOut` is also in `LocRib`" would close this.
 
 **Layer 3 — Integration / session tests**
-- `pathvectord` unit tests (200+ in `main.rs`) drive the full `run_event_loop` via
+- `pathvectord` unit tests (460+ across `daemon.rs` and `outbound.rs`) drive the full `run_event_loop` via
   `MockSessionHandle` — verify FSM transitions, import/export policy, route propagation,
   origination, stall detection, BLACKHOLE handling, RFC 8212 defaults, and more.
 - `pathvector-session` FSM proptests drive the session state machine with random event
   sequences, verifying no unexpected state is reachable.
 
 **Layer 4 — End-to-end tests** (Docker, GoBGP)
-- 35 tests across `e2e/tests/` covering: session establishment, route import/export,
-  policy enforcement, origination, withdrawal, and multi-peer topologies.
+- 74 tests across `e2e/tests/` covering: session establishment, route import/export,
+  policy enforcement, origination, withdrawal, multi-peer topologies, route reflection,
+  dynamic peers, and EOR markers.
 - Tests use the full stack: `pathvectord` binary inside a container, GoBGP as the peer,
   `PathvectorClient` gRPC API for assertions.
 - BIRD and FRR interoperability both done (2026-06-14). See Tier 3 items 7 and 8.
@@ -235,8 +236,10 @@ What remains as optional future work:
 ### Remaining
 
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-- Graceful Restart FSM behaviour (RFC 4724) — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)
-- NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during the GR window without tearing down the restart; extends RFC 4724; depends on Graceful Restart FSM
+- NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during a GR window without tearing down the restart; prevents the helper from flushing routes when it receives a CEASE from a restarting speaker. Extends RFC 4724 Phase 2 (now implemented); depends on no additional session changes beyond what exists today, but requires pathvectord to suppress flush on CEASE if the peer is in an active GR window.
+
+~~**Graceful Restart FSM behaviour (RFC 4724)** — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)~~
+~~**Resolved 2026-06-22**: Full RFC 4724 Phase 1 (speaker/helper role) and Phase 2 (holding peer stale routes) implemented. See `pathvectord/RFC.md` for clause-by-clause status.~~
 - BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
 
@@ -349,6 +352,79 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 `pathvectord/src/grpc.rs` — try CIDR parse first, fall back to bare `IpAddr` + `/32` or
 `/128`. The proto field comment and client docs would need to reflect the relaxed rule.
 
+### Graceful Restart — known gaps (2026-06-22)
+
+RFC 4724 Phase 1 and Phase 2 are fully implemented and e2e verified against GoBGP.
+The following gaps remain, ordered by priority.
+
+~~**1. EOR-prune e2e test missing**~~  
+~~*Resolved 2026-06-22* — `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` in~~
+~~`pathvector-e2e/tests/graceful_restart_phase2.rs` uses `docker network disconnect/connect --ip`~~
+~~to simulate a partial-RIB restart without changing the GoBGP container IP.  pathvectord~~
+~~`connect_retry_time` is now configurable (default 120 s, set to 2 s in test harness).~~
+
+**1. `mark_stale_and_repropagate` performance at full-table scale**
+
+When a GR-capable peer disconnects, `mark_stale_and_repropagate` iterates every
+NLRI from that peer and calls `rib_mut()` in a loop (repeated `Arc::make_mut`).
+For the DDoS blackhole use case (tens of prefixes, handful of peers) this is
+negligible. For a full-table iBGP peer (~800k prefixes) this loop would be
+noticeable — potentially hundreds of milliseconds under the write lock, causing
+hold-timer pressure on other peers.
+
+The right fix if full-table peers are ever needed: replace eager `Arc::make_mut`
+marking with a generation-counter or stale-epoch approach — routes are considered
+stale if their epoch < the current GR epoch for that peer, computed lazily at
+best-path selection time rather than eagerly on disconnect.
+
+~~**2. RFC 4724 §4.2: re-termination during an open GR window needs a unit test**~~  
+~~*Resolved 2026-06-22* — `gr_re_termination_during_window_resets_deadline_and_holds_routes`~~
+~~confirms deadline is refreshed and routes are not double-flushed on a second unclean~~
+~~disconnect. `gr_clean_termination_during_window_flushes_immediately` confirms a~~
+~~NOTIFICATION received inside a GR window overrides the window and flushes immediately.~~
+
+**3. EOR-prune e2e test timing margin**
+
+`gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` uses a 15 s
+`wait_for_established` timeout with a 2 s `connect_retry_time`. On a fast machine
+this is comfortable (first retry fires ≤2 s after reconnect, BGP exchange adds
+~1 s), but on a loaded CI runner the margin is tighter than ideal. If this test
+shows intermittent failures in CI, increase `connect_retry_time` to 3 s and the
+timeout to 20 s.
+
+**4. `PeerConfig` struct literal proliferation**
+
+Adding `connect_retry_time: Option<u16>` required inserting `connect_retry_time: None`
+into 30+ test struct literals via sed. Every future optional field on `PeerConfig`
+will cost the same. Consider introducing a `peer_config(addr, remote_as)` test
+helper (in `daemon.rs` test module) that fills sensible defaults, so call sites
+only specify the fields under test. `Ipv4Addr` not implementing `Default` blocks
+a derive — the helper is the right answer.
+
+**5. GR deadline timer re-polls on every event loop iteration**
+
+The `tokio::select!` branch for deadline expiry calls
+`state.gr_deadlines.values().copied().min()` on every poll. When the map is empty
+(steady state) this is a no-op iteration and resolves to `pending()`. For a large
+number of simultaneous GR windows (unlikely in production) this becomes a tighter
+loop than necessary. If needed, cache the next deadline as `Option<Instant>` on
+`DaemonState` and invalidate it only on GR window insert/remove.
+
+**6. RFC 4724 §3 SHOULD: suppress GR capability when peer restart_time = 0**
+
+When the peer's OPEN carries a GracefulRestart capability with `restart_time = 0`,
+pathvectord currently logs a warning but still advertises its own GR capability.
+RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
+overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
+
+**7. `daemon.rs` GR logic should move to a dedicated module**
+
+The GR-related functions (`mark_stale_and_repropagate`, `prune_stale_routes_v4/v6`,
+the deadline timer branch) are correct but embedded in a 14k-line file. When
+splitting the daemon becomes worthwhile, extract these into
+`pathvectord/src/graceful_restart.rs` with `DaemonState` as a parameter. No
+behaviour change — purely a maintainability improvement.
+
 ### Remaining
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
@@ -401,7 +477,9 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 
 ~~**`reapply_import_policy` has no IPv6 counterpart** — **Resolved 2026-06-19**: `reapply_import_policy_v6` added to `pathvectord/src/daemon.rs`; `set_import_default` now calls both the v4 and v6 variants so a policy reload applies to all address families without a session reset. Two unit tests added: `test_reapply_v6_accepts_previously_rejected_route`, `test_reapply_v6_rejects_previously_accepted_route`.~~
 
-~~**`cluster_id` configuration guidance** — **Resolved 2026-06-19**: `DaemonConfig::cluster_id` doc comment expanded in `pathvectord/src/config.rs` with an explicit "multi-cluster deployments" warning: distinct `cluster_id` values are required per cluster, otherwise CLUSTER_LIST loop detection fires incorrectly across clusters.~~ Without explicit configuration, loop detection via CLUSTER_LIST will behave unexpectedly if clusters share a `cluster_id`. Document in `pathvectord/README.md` with an explicit "if you run multiple RR clusters, set distinct `cluster_id` values" callout alongside the `is_route_reflector` config example.
+~~**`cluster_id` configuration guidance** — **Resolved 2026-06-19**: `DaemonConfig::cluster_id` doc comment expanded in `pathvectord/src/config.rs` with an explicit "multi-cluster deployments" warning: distinct `cluster_id` values are required per cluster, otherwise CLUSTER_LIST loop detection fires incorrectly across clusters.~~
+
+**Remaining:** Add a callout to `pathvectord/README.md` alongside the `is_route_reflector` config example: "if you run multiple RR clusters, set distinct `cluster_id` values per cluster — sharing a `cluster_id` across clusters causes CLUSTER_LIST loop detection to fire incorrectly."
 
 ---
 
@@ -411,8 +489,7 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 
 - `serde` feature: `Serialize`/`Deserialize` derives are gated but not yet
   implemented on the domain types (blocked on deciding JSON schema conventions)
-- Policy introspection RPC (`ListTerms`, `EvalRoute`) — blocked on
-  `reapply_import_policy` being wired to export propagation in `pathvectord`
+- Policy introspection RPC (`ListTerms`, `EvalRoute`) — `reapply_import_policy` is now wired to export propagation (done 2026-06-09); the RPC itself is not yet implemented
 
 ---
 
@@ -423,8 +500,7 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 Three targeted changes that improve testability or robustness without over-engineering.
 Priority order matches the payoff-to-cost ratio.
 
-1. **`RibSnapshot` split** — primarily a performance fix (see Performance item below),
-   but also decouples gRPC reads from the event loop entirely.
+~~**1. `RibSnapshot` split** — **Resolved 2026-06-11**: `DaemonState` now holds `rib: Arc<RibSnapshot>`. gRPC handlers call `snapshot()` to clone the Arc (O(1) atomic increment) and release the outer lock before iterating, eliminating gRPC/event-loop read contention.~~
 
 2. **`Clock` trait for timer injection** (`pathvector-session`) — the `ConnectRetry` and
    `HoldTimer` timers are currently wired to `tokio::time` directly. A two-impl trait
@@ -440,9 +516,7 @@ Priority order matches the payoff-to-cost ratio.
    }
    ```
 
-3. **`RibView` trait for `propagate_prefix`** (`pathvectord`) — already done for IPv4;
-   ensure IPv6 path uses the same abstraction. Useful before best-path selection grows
-   more complex (ECMP, route reflector client preference, etc.).
+3. **`RibView` trait for `propagate_prefix_v6`** (`pathvectord`) — `propagate_prefix` (IPv4) already uses `&impl RibView<Ipv4Addr>`; `propagate_prefix_v6` still takes `&LocRib<Ipv6Addr>` (concrete type). Mirror the IPv4 abstraction so the IPv6 path is equally testable. Useful before best-path selection grows more complex (ECMP, route reflector client preference, etc.).
 
 ### Internal documentation on hard algorithms
 
@@ -453,7 +527,7 @@ RFC in their head to understand the code. Priority targets:
 - **Best-path selection** (`pathvector-rib/src/best_path.rs`) — annotate each
   step with the RFC 4271 §9.1 section it implements and why the tie-breaking
   order is what it is
-- **RIB eviction on `Terminated`** (`pathvectord/src/main.rs`, `on_terminated`)
+- **RIB eviction on `Terminated`** (`pathvectord/src/daemon.rs`, `on_terminated`)
   — explain the snapshot-before-withdraw pattern and why order matters
 - **FSM state transitions** (`pathvector-session/src/fsm/`) — a table or
   diagram mapping each `(State, Input) → (State, Vec<Output>)` transition,

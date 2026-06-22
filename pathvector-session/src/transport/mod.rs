@@ -123,9 +123,22 @@ pub trait SessionHandle: Send + 'static {
         &self,
         rr: crate::message::RouteRefreshMessage,
     ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Push a fresh capability set to be used in the next OPEN message.
+    ///
+    /// Should be called immediately after a session terminates so the next
+    /// reconnect attempt sends the updated capabilities. Has no effect if the
+    /// session is currently established (the OPEN has already been sent).
+    fn set_capabilities(
+        &self,
+        caps: Vec<crate::message::Capability>,
+    ) -> impl Future<Output = ()> + Send + '_;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/// RFC 4271 §8.1 recommended default `ConnectRetry` interval.
+pub const DEFAULT_CONNECT_RETRY_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Configuration for a BGP session.
 #[derive(Debug, Clone)]
@@ -134,6 +147,10 @@ pub struct SessionConfig {
     pub local_bgp_id: Ipv4Addr,
     /// Proposed hold time in seconds (`0` to disable; otherwise ≥ 3).
     pub hold_time: u16,
+    /// RFC 4271 §8.1 `ConnectRetry` timer interval.  Use
+    /// [`DEFAULT_CONNECT_RETRY_TIME`] for the RFC-recommended 120 s default.
+    /// Set lower in tests or latency-sensitive deployments.
+    pub connect_retry_time: std::time::Duration,
     /// Capabilities advertised in the OPEN message.
     pub capabilities: Vec<Capability>,
     /// Capabilities the peer MUST advertise. If absent, the session is rejected
@@ -176,6 +193,31 @@ pub enum SessionCommand {
     /// without resetting the session. Silently dropped if the session is not in
     /// `Established` state or if no transport is available.
     RouteRefresh(crate::message::RouteRefreshMessage),
+    /// Replace the local capability set used in the next OPEN message.
+    ///
+    /// This must be sent before the session reconnects (i.e. before the
+    /// `ConnectRetry` timer fires). The primary use-case is expiring the RFC 4724
+    /// Restart State (R) bit after the graceful-restart window closes: the
+    /// daemon sends `SetCapabilities` when it handles `SessionEvent::Terminated`
+    /// so the next OPEN reflects the current restart state.
+    ///
+    /// Has no effect if the session is already in `Established` state.
+    SetCapabilities(Vec<crate::message::Capability>),
+}
+
+/// Why a BGP session was torn down.
+///
+/// Used by the daemon to decide whether to retain stale routes from the peer
+/// during the peer's Graceful Restart window (RFC 4724 §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationReason {
+    /// TCP failure or hold-timer expiry — no NOTIFICATION was received from
+    /// the peer before the session dropped.  RFC 4724 §4.2: the helper MAY
+    /// retain stale routes from a GR-capable peer for up to `restart_time`.
+    Unclean,
+    /// The peer sent a NOTIFICATION before the connection closed.  RFC 4724
+    /// §4.2: the helper MUST NOT retain stale routes in this case.
+    Clean,
 }
 
 /// Events emitted by a session to its caller.
@@ -184,7 +226,7 @@ pub enum SessionEvent {
     /// The session reached Established. Contains negotiated parameters.
     Established(SessionInfo),
     /// The session was torn down (after previously being Established).
-    Terminated,
+    Terminated(TerminationReason),
     /// An UPDATE message was received; forward to the RIB layer.
     RouteUpdate(UpdateMessage),
 }
@@ -250,6 +292,13 @@ impl SessionHandle for SpawnedSessionHandle {
     async fn send_route_refresh(&self, rr: crate::message::RouteRefreshMessage) {
         let _ = self.cmd_tx.send(SessionCommand::RouteRefresh(rr)).await;
     }
+
+    async fn set_capabilities(&self, caps: Vec<crate::message::Capability>) {
+        let _ = self
+            .cmd_tx
+            .send(SessionCommand::SetCapabilities(caps))
+            .await;
+    }
 }
 
 // ── TCP MD5SIG helpers (RFC 2385) ─────────────────────────────────────────────
@@ -295,6 +344,7 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
         local_addr: None,
         update_rx,
+        termination_reason: TerminationReason::Unclean,
     };
 
     tokio::spawn(session.run());
@@ -345,6 +395,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         connect_factory: None,
         local_addr: None,
         update_rx,
+        termination_reason: TerminationReason::Unclean,
     };
 
     tokio::spawn(session.run());
@@ -387,15 +438,31 @@ struct Session<T: BgpTransport> {
     local_addr: Option<Ipv4Addr>,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
+    // Reason for the most recent (or current) session termination.  Set just
+    // before calling fsm.process() so execute() can carry it in the event.
+    termination_reason: TerminationReason,
 }
 
 impl<T: BgpTransport> Session<T> {
     async fn run(mut self) {
         loop {
             let input = self.wait_for_input().await;
+            // Track why the session is terminating so SessionEvent::Terminated
+            // carries the right reason.  Only relevant when Established; the
+            // FSM only emits SessionTerminated from that state.
+            if self.fsm.is_established() {
+                self.termination_reason = match &input {
+                    // Peer sent NOTIFICATION, or operator-initiated stop/CEASE.
+                    FsmInput::MessageReceived(BgpMessage::Notification(_))
+                    | FsmInput::ManualStop
+                    | FsmInput::NotificationToSend(_) => TerminationReason::Clean,
+                    _ => TerminationReason::Unclean,
+                };
+            }
             let outputs = self.fsm.process(input);
             if !self.execute(outputs).await {
                 // A TCP send failed; feed TcpFailed back into the FSM.
+                // Reason stays Unclean — we never received a Notification.
                 let recovery = self.fsm.process(FsmInput::TcpFailed);
                 self.execute(recovery).await;
             }
@@ -443,6 +510,15 @@ impl<T: BgpTransport> Session<T> {
                         {
                             self.drop_connection();
                             return FsmInput::TcpFailed;
+                        }
+                        // No FSM transition; loop continues.
+                    }
+                    Some(SessionCommand::SetCapabilities(caps)) => {
+                        // Update the capability set used in the next OPEN message.
+                        // Has no effect if we are already Established — the OPEN
+                        // for the current session has already been sent.
+                        if !self.fsm.is_established() {
+                            self.fsm.set_capabilities(caps);
                         }
                         // No FSM transition; loop continues.
                     }
@@ -638,8 +714,8 @@ impl<T: BgpTransport> Session<T> {
                 FsmOutput::StopKeepaliveTimer => {
                     self.keepalive_deadline = None;
                 }
-                FsmOutput::StartConnectRetryTimer(d) => {
-                    self.retry_deadline = Some(Instant::now() + d);
+                FsmOutput::StartConnectRetryTimer(_) => {
+                    self.retry_deadline = Some(Instant::now() + self.config.connect_retry_time);
                 }
                 FsmOutput::StopConnectRetryTimer => {
                     self.retry_deadline = None;
@@ -661,7 +737,10 @@ impl<T: BgpTransport> Session<T> {
                     let _ = self.event_tx.send(SessionEvent::Established(info)).await;
                 }
                 FsmOutput::SessionTerminated => {
-                    let _ = self.event_tx.send(SessionEvent::Terminated).await;
+                    let _ = self
+                        .event_tx
+                        .send(SessionEvent::Terminated(self.termination_reason))
+                        .await;
                 }
                 FsmOutput::RouteUpdate(update) => {
                     let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
@@ -816,8 +895,9 @@ mod tests {
     use std::net::Ipv4Addr as StdIpv4Addr;
 
     use super::{
-        BgpTransport, FramedBgpTransport, SessionCommand, SessionConfig, SessionEvent,
-        SessionHandle, SpawnedSessionHandle, spawn_with,
+        BgpTransport, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand,
+        SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason,
+        spawn_with,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
@@ -891,6 +971,7 @@ mod tests {
             // peer_addr is unused when a transport is injected via spawn_with.
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             md5_password: None,
+            connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
         }
     }
 
@@ -954,7 +1035,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "expected RouteUpdate")]
     fn test_expect_route_update_panics_on_wrong_variant() {
-        expect_route_update(SessionEvent::Terminated);
+        expect_route_update(SessionEvent::Terminated(TerminationReason::Unclean));
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1014,7 +1095,7 @@ mod tests {
             .expect("timed out waiting for Terminated")
             .expect("session exited unexpectedly");
         assert!(
-            matches!(event, SessionEvent::Terminated),
+            matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after UPDATE write failure, got {event:?}"
         );
     }
@@ -1042,7 +1123,7 @@ mod tests {
             .expect("timed out waiting for event after Stop")
             .expect("session exited without emitting an event");
         assert!(
-            matches!(event, SessionEvent::Terminated),
+            matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after Stop command, got {event:?}"
         );
     }
@@ -1106,7 +1187,7 @@ mod tests {
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
         let result = tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
         assert!(
-            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
+            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated(_))),
             "session must not terminate after a treat-as-withdraw malformed UPDATE"
         );
     }
@@ -1168,7 +1249,7 @@ mod tests {
         peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
         let result = tokio::time::timeout(Duration::from_millis(100), handle.next_event()).await;
         assert!(
-            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated)),
+            result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated(_))),
             "session must not terminate after an attribute-discard malformed UPDATE"
         );
     }
@@ -1479,6 +1560,41 @@ mod tests {
         assert!(result.announced.is_empty());
     }
 
+    /// `SetCapabilities` while not Established updates the FSM's capability set.
+    /// We test through `Fsm::set_capabilities` / `Fsm::capabilities_for_test`
+    /// since `make_open` is private and the mock transport cannot reconnect.
+    #[test]
+    fn test_set_capabilities_updates_fsm_config() {
+        use crate::fsm::{Fsm, FsmConfig};
+        use crate::message::Capability;
+
+        let initial = vec![Capability::FourByteAsn(65001)];
+        let mut fsm = Fsm::new(FsmConfig {
+            local_as: 65001,
+            local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+            hold_time: 90,
+            capabilities: initial.clone(),
+            required_capabilities: vec![],
+            peer_as: Some(65002),
+        });
+
+        assert!(!fsm.is_established(), "FSM must start non-Established");
+        assert_eq!(
+            fsm.local_capabilities(),
+            &initial,
+            "initial caps must match config"
+        );
+
+        let updated = vec![Capability::FourByteAsn(65001), Capability::ExtendedMessage];
+        fsm.set_capabilities(updated.clone());
+
+        assert_eq!(
+            fsm.local_capabilities(),
+            &updated,
+            "set_capabilities must update the FSM's local capability set"
+        );
+    }
+
     /// `SpawnedSessionHandle::stop` sends `SessionCommand::Stop` and the session
     /// terminates, emitting `Terminated`.
     #[tokio::test]
@@ -1495,7 +1611,7 @@ mod tests {
             .expect("timed out waiting for Terminated after stop()")
             .expect("session exited without emitting Terminated");
         assert!(
-            matches!(event, SessionEvent::Terminated),
+            matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after stop(), got {event:?}"
         );
     }

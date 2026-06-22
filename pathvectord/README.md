@@ -97,6 +97,8 @@ remote_as = 65001
 | `bgp_id` | `IPv4` | **required** | Router-ID in dotted-decimal. Must not be a loopback address (`127.0.0.0/8`) — real BGP implementations reject loopback BGP IDs (RFC 6286 §2.1) |
 | `hold_time` | `u16` | `90` | Proposed hold timer in seconds. Negotiated down to the peer's value if lower |
 | `grpc_port` | `u16` | `50051` | TCP port for the gRPC management API, bound on all interfaces |
+| `graceful_restart_time` | `u16` | `0` | Seconds peers should hold our routes after an unclean session loss (RFC 4724 §3). `0` disables forwarding-state advertisement — peers withdraw our routes immediately. See [Graceful Restart](#graceful-restart-rfc-4724) |
+| `restarting` | `bool` | `false` | Set to `true` when restarting pathvectord mid-session to signal the RFC 4724 Restart State (R) bit, so peers stop their stale-route timers as soon as the session re-establishes. Remove after restart. Ignored when `graceful_restart_time = 0` |
 
 ### `[[peers]]` fields
 
@@ -113,10 +115,11 @@ remote_as = 65001
 
 ```toml
 [daemon]
-local_as   = 65002
-bgp_id     = "10.0.0.2"
-hold_time  = 90
-grpc_port  = 50051
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 90
+grpc_port             = 50051
+graceful_restart_time = 120   # hold our routes for 120 s on restart
 
 # eBGP peer — RFC 8212 reject-by-default; explicitly opt in
 [[peers]]
@@ -497,18 +500,64 @@ is tracked in TODO.md.
 
 ---
 
-## Behavior on restart
+## Graceful Restart (RFC 4724)
+
+### Helper role — preventing route flaps when pathvectord restarts
+
+Configure `graceful_restart_time` to tell upstream peers how long to hold your routes
+if your BGP session drops unexpectedly. When restarting pathvectord intentionally, also
+set `restarting = true` so peers stop their stale timers as soon as the session comes
+back up (remove it after the restart):
+
+```toml
+[daemon]
+local_as              = 65001
+bgp_id                = "10.0.0.1"
+graceful_restart_time = 120   # seconds
+restarting            = true  # RFC 4724 R-bit — remove after restart completes
+```
+
+With this set, pathvectord advertises the RFC 4724 GracefulRestart capability in its
+OPEN message with `restart_time = 120` and both IPv4 and IPv6 unicast families marked
+`forwarding_preserved`. Peers that support RFC 4724 (GoBGP, BIRD, FRR, most production
+routers) will retain your routes as stale entries for up to 120 seconds rather than
+immediately withdrawing them.
+
+This is particularly important for **BGP blackhole advertisement** (RFC 7999): if
+pathvectord restarts during an active DDoS event, upstream transit peers continue
+null-routing the attacked prefix while pathvectord reconnects.
+
+**When to use:**
+- Any deployment where route flaps during a daemon restart cause observable impact
+- BGP blackhole advertisement where continuity during restarts is operationally critical
+- Anywhere upstream peers support RFC 4724 (virtually all modern BGP implementations)
+
+**Recommended values:** 120–300 seconds. The RFC maximum is 4095; values above 4095 are
+silently clamped. Setting `graceful_restart_time = 0` (the default) disables
+forwarding-state advertisement — peers will receive the GracefulRestart capability
+(required for EOR signalling) but withdraw your routes immediately on session loss.
+
+**Why the kernel routes matter:** on Linux, pathvectord installs routes with protocol tag
+`RTPROT_BGP`. These routes survive a pathvectord crash and continue forwarding traffic
+while the daemon is down. Setting `forwarding_preserved = true` in the capability (which
+`graceful_restart_time > 0` does automatically) accurately reflects this: the data plane
+is intact even though the control plane is restarting.
+
+### Behavior on restart
 
 When pathvectord starts, it removes all kernel routes it installed in a previous run
 (`RTPROT_BGP` protocol tag) before the BGP event loop begins. This prevents stale routes
-from being forwarded during the reconvergence window. The cleanup is logged at startup:
+from persisting indefinitely after an unclean shutdown. The cleanup is logged at startup:
 
 ```
 INFO removing stale BGP routes v4=42 v6=0
 ```
 
-This is equivalent to BIRD's default `krt` protocol behavior. RFC 4724 graceful restart
-(holding stale routes across a planned restart) is not yet implemented.
+> **Note:** stale kernel-route cleanup on startup and the GracefulRestart helper role
+> work together. During the restart window, the kernel routes continue forwarding traffic
+> (`forwarding_preserved = true`). When pathvectord starts, it cleans them up only after
+> new sessions are established and routes are re-installed. Stale-route retention for
+> *peer* restarts (RFC 4724 §4.2 speaker role) is not yet implemented.
 
 ---
 

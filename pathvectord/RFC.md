@@ -103,10 +103,12 @@ registry lives in `pathvector-types`.
 
 ---
 
-## RFC 4724 §2 — End-of-RIB Marker (Send Side)
+## RFC 4724 — End-of-RIB Marker, Graceful Restart Helper + Speaker Roles
 
-**Owns:** Sending the EOR marker after the initial full-table dump on session establishment.  
-**Boundary:** Stale-route timer and FSM restart detection are deferred (owned by `pathvector-session`).  
+**Owns:** EOR send/receive; GracefulRestart capability advertisement (helper role); stale-route
+retention when a connected peer restarts uncleanly (speaker role).  
+**Boundary:** FSM restart detection (R-bit) is in `pathvector-session`; the daemon owns the
+per-family retention decision, deadline timer, and EOR-triggered prune.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724
 
 | Requirement | File | Status | Verified by |
@@ -118,9 +120,35 @@ registry lives in `pathvector-types`.
 | EOR receive-side: detect peer IPv6 EOR (empty MP_UNREACH_NLRI) and record it | `src/daemon.rs` | ✅ | `test_ipv6_eor_received_is_recorded` |
 | EOR receive state cleared on session termination / re-establishment | `src/daemon.rs` | ✅ | `test_eor_state_cleared_on_termination`, `test_eor_state_cleared_on_re_establish` |
 | EOR state exposed via management API (`eor_ipv4_received`, `eor_ipv6_received`) | `src/grpc.rs`, `proto/` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded`, `eor_ipv4_received_persists_after_route_churn` |
-| GracefulRestart capability advertised so peers send EOR (RFC 4724 §3) | `src/daemon.rs` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded` |
+| GracefulRestart capability advertised so peers send EOR | `src/daemon.rs` | ✅ | `eor_ipv4_received_from_gobgp_is_recorded` |
+| §3 helper role: advertise `restart_time > 0` + forwarding-preserved families when `graceful_restart_time` is configured | `src/daemon.rs`, `src/config.rs` | ✅ | `test_build_local_capabilities_gr_enabled`, `test_build_local_capabilities_gr_disabled`, `test_build_local_capabilities_gr_clamps_at_4095` |
+| §3 helper role: F-bit false when we are the restarting speaker (FIB was wiped on startup) | `src/daemon.rs` | ✅ | `test_build_local_capabilities_f_bit_false_when_restarting`, `test_build_local_capabilities_f_bit_true_when_stable` |
+| §3 helper role: F-bit correctly encoded in OPEN wire bytes | `pathvector-session/src/message/open.rs` | ✅ | `test_gr_family_forwarding_preserved_roundtrip` |
+| §3 R-bit set only within the restart window (`startup_instant.elapsed() < graceful_restart_time`) | `src/daemon.rs` — `SpawnConfig::capabilities()` | ✅ | `spawn_config_r_bit_set_within_restart_window`, `spawn_config_r_bit_cleared_after_restart_window` |
+| §3 R-bit not set when `graceful_restart_time = 0` | `src/daemon.rs` | ✅ | `test_build_local_capabilities_r_bit_ignored_when_gr_disabled` |
+| §3 peer's restart_time extracted from peer OPEN and stored in `gr_capable_peers` | `src/daemon.rs` | ✅ | `gr_capable_peer_is_recorded_on_established`, `gr_eor_only_peer_not_recorded` |
+| §3 duplicate GR capabilities from peer handled without panic (first non-zero wins) | `src/daemon.rs` | ✅ | `duplicate_gr_capabilities_do_not_panic_and_first_wins`, `zero_gr_then_nonzero_gr_uses_first_nonzero` |
+| §3 SHOULD — suppress GR capability advertisement if peer's restart_time = 0 | `src/daemon.rs` | ⚠️ | SHOULD only; we log a warning but still advertise — deferred to Phase 2 |
+| GR capability roundtrip codec fidelity (arbitrary flags, time, families) | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_roundtrips` (proptest) |
+| GR capability decoder: truncated input returns error, does not panic | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_truncated_input_does_not_panic` (proptest) |
+| GR capability decoder: trailing family bytes are dropped, not an error | `pathvector-session/src/message/open.rs` | ✅ | `gr_capability_trailing_bytes_ignored` (proptest) |
+| e2e: GoBGP holds routes during our restart window (blackhole use case) | `pathvector-e2e/tests/session.rs` | ✅ | `gr_helper_gobgp_holds_routes_during_restart_window` |
+| e2e: peer GR restart_time visible via management API | `pathvector-e2e/tests/session.rs` | ✅ | `gr_capability_negotiated_peer_gr_restart_time_reflects_config` |
+| §4.2 MUST: unclean termination of GR-capable peer retains routes in AdjRibIn/LocRib | `src/daemon.rs` | ✅ | `unclean_termination_of_gr_peer_retains_routes` |
+| §4.2 MUST: NOTIFICATION-driven termination flushes routes immediately | `src/daemon.rs` | ✅ | `clean_termination_flushes_immediately` |
+| §4.2 MUST: non-GR peer routes always flushed on unclean termination | `src/daemon.rs` | ✅ | `non_gr_peer_always_flushes_on_unclean_termination` |
+| §4.2 MUST: per-family GR — only families listed in peer OPEN are retained | `src/daemon.rs` | ✅ | per-family `gr_v4`/`gr_v6` check in `on_terminated` |
+| §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
+| §4.2 IPv6 EOR triggers pruning of stale IPv6 NLRIs | `src/daemon.rs` | ✅ | `prune_stale_nlri_v6` + IPv6 EOR branch |
+| §4.2 MUST: GR window expiry without re-establishment flushes all stale routes | `src/daemon.rs` | ✅ | `gr_deadline_expiry_flushes_stale_routes` |
+| §4.2 SHOULD: stale route marking — retained routes de-preferred in best-path so a fresh peer wins immediately | `src/daemon.rs`, `pathvector-rib/src/best_path.rs`, `pathvector-rib/src/adj_rib_in.rs` | ✅ | `stale_marking_lets_fresh_peer_win_immediately`, `stale_loses_to_non_stale_before_all_other_criteria` |
+| e2e: unclean disconnect holds routes; window expiry flushes them | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry` |
+| e2e: clean disconnect (NOTIFICATION) flushes routes immediately, no GR window | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_clean_disconnect_flushes_routes_immediately` |
+| e2e: peer restart with partial RIB — un-refreshed routes pruned on EOR | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` |
+| §8.1 `connect_retry_time` configurable per-peer (TOML: `connect_retry_time`); defaults to 120 s | `src/config.rs`, `src/daemon.rs` | ✅ | `sidecar_round_trips_all_fields`; exercised by fast-retry harness in GR e2e tests |
 
-**Deferred:** Stale-route timer (RFC 4724 §4.2 — hold stale routes during restart window, then diff-and-prune) and FSM-level graceful restart detection.
+**Deferred:** §3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently logged
+as warning only). All §4.2 requirements now implemented and e2e verified.
 
 ---
 

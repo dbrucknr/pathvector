@@ -21,7 +21,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 4364 | BGP/MPLS IP VPNs (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 4456 | BGP Route Reflection | pathvector-rib, pathvectord | ✅ | [rib](pathvector-rib/RFC.md#rfc-4456--bgp-route-reflection) · [daemon](pathvectord/RFC.md#rfc-4456--bgp-route-reflection) |
 | RFC 4486 | Cease NOTIFICATION Subcodes | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4486--subcodes-for-bgp-cease-notification-message) |
-| RFC 4724 | Graceful Restart | pathvector-session, pathvector-rib | ⚠️ | [session](pathvector-session/RFC.md#rfc-4724--graceful-restart-mechanism-for-bgp) · [rib](pathvector-rib/RFC.md#rfc-4724--graceful-restart-stale-route-timer-deferred) |
+| RFC 4724 | Graceful Restart | pathvector-session, pathvector-rib, pathvectord | ⚠️ | [session](pathvector-session/RFC.md#rfc-4724--graceful-restart-mechanism-for-bgp) · [rib](pathvector-rib/RFC.md#rfc-4724--graceful-restart-stale-route-timer-deferred) · [daemon](pathvectord/RFC.md#rfc-4724-2--end-of-rib-marker-send-side) |
 | RFC 4760 | Multiprotocol Extensions (AFI/SAFI) | pathvector-types, pathvector-session, pathvectord | ✅ | [types](pathvector-types/RFC.md#rfc-4760--multiprotocol-extensions-for-bgp-4-afisafi-registry) · [session](pathvector-session/RFC.md#rfc-4760--multiprotocol-extensions-for-bgp-4-codec) · [daemon](pathvectord/RFC.md#rfc-4760--multiprotocol-extensions-daemon-processing) |
 | RFC 4761 | VPLS Using BGP (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 5065 | AS Confederations | pathvector-types, pathvector-rib | ✅ | [types](pathvector-types/RFC.md#rfc-5065--as-confederations-for-bgp) · [rib](pathvector-rib/RFC.md#rfc-5065--as-confederations-for-bgp-rib-layer) |
@@ -41,7 +41,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 8205 | BGPsec_PATH | pathvector-types, pathvector-session | ❌ | — |
 | RFC 8212 | Default eBGP Route Propagation | pathvectord | ✅ | [daemon](pathvectord/RFC.md#rfc-8212--default-external-bgp-route-propagation-without-policy) |
 | RFC 8654 | Extended Message Support | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-8654--extended-message-support-for-bgp) |
-| RFC 6396 | MRT Routing Information Export Format | pathvectord | ❌ | — |
+| RFC 6396 | MRT Routing Information Export Format | pathvector-mrt | ⚠️ | Parsing (TABLE_DUMP_V2 replay) implemented; write/export side not started |
 | RFC 6810 | RPKI-to-Router Protocol v0 (RTR) | pathvectord | ❌ | — |
 | RFC 6811 | BGP Prefix Origin Validation (ROV) | pathvectord, pathvector-policy | ❌ | — |
 | RFC 7313 | Enhanced Route Refresh Capability | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-7313--enhanced-route-refresh-capability) |

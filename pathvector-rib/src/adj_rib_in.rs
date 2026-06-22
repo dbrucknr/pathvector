@@ -111,6 +111,23 @@ impl<A: IpAddress> AdjRibIn<A> {
         self.routes.is_empty()
     }
 
+    /// Marks all held routes as RFC 4724 stale and returns clones for
+    /// `LocRib` re-insertion.
+    ///
+    /// Called when a GR-capable peer disconnects uncleanly.  After this call,
+    /// every route in `AdjRibIn` has `stale = true`.  The returned `Vec` of
+    /// stale routes should be re-inserted into `LocRib` so that best-path
+    /// re-evaluation immediately de-prefers them in favour of fresh paths.
+    pub fn mark_all_stale(&mut self) -> Vec<Route<A>> {
+        self.routes
+            .values_mut()
+            .map(|r| {
+                r.stale = true;
+                r.clone()
+            })
+            .collect()
+    }
+
     /// Removes all routes from this table.
     ///
     /// Called when the peer session terminates. The `AdjRibIn` is kept in

@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use proptest::prelude::*;
 
-use super::{SessionConfig, SessionHandle, spawn};
+use super::{DEFAULT_CONNECT_RETRY_TIME, SessionConfig, SessionHandle, spawn};
 
 fn arb_config() -> impl Strategy<Value = SessionConfig> {
     (1u32..=u32::MAX, 0u16..=65535u16, any::<bool>()).prop_map(
@@ -15,6 +15,7 @@ fn arb_config() -> impl Strategy<Value = SessionConfig> {
             peer_as: if has_peer_as { Some(65002) } else { None },
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             md5_password: None,
+            connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
         },
     )
 }
@@ -55,6 +56,7 @@ proptest! {
                 peer_as: None,
                 peer_addr: "127.0.0.1:0".parse().unwrap(),
                 md5_password: None,
+                connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
             });
             handle.start().await;
             handle.stop().await;

@@ -199,6 +199,22 @@ impl Fsm {
         self.state
     }
 
+    #[must_use]
+    pub fn is_established(&self) -> bool {
+        self.state == State::Established
+    }
+
+    /// Replace the local capability set for the next OPEN.
+    pub(crate) fn set_capabilities(&mut self, caps: Vec<crate::message::Capability>) {
+        self.config.capabilities = caps;
+    }
+
+    /// Current local capability set (for tests and diagnostics).
+    #[cfg(test)]
+    pub(crate) fn local_capabilities(&self) -> &[crate::message::Capability] {
+        &self.config.capabilities
+    }
+
     /// BGP Identifier received in the peer's OPEN message.
     ///
     /// `None` until the peer's OPEN has been validated (i.e., before
