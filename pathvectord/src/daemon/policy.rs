@@ -9,6 +9,7 @@ impl DaemonState {
             return;
         }
         self.import_policies.insert(peer_ip, Policy::new(action));
+        self.import_policies_v6.insert(peer_ip, Policy::new(action));
 
         // Collect affected NLRIs before the mutable borrow of loc_rib so the
         // borrow checker does not see two simultaneous borrows of `self`.
@@ -143,14 +144,14 @@ impl DaemonState {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::DefaultAction;
     use pathvector_rib::BestPathChange;
+    use pathvector_session::message::{Capability, PathAttribute, UpdateMessage};
     use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
 
     use crate::daemon::tests::{make_state, with_recording_fib};
-    use pathvector_session::message::{PathAttribute, UpdateMessage};
 
     const LOCAL_AS: u32 = 65001;
     const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -189,6 +190,28 @@ mod tests {
         state.set_export_default(unknown, DefaultAction::Accept);
     }
 
+    /// `set_export_default` when `adj_ribs_out` is missing must return without panic.
+    /// Covers the defensive return at line 115.
+    #[test]
+    fn set_export_default_missing_adj_rib_out_returns_silently() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        state.adj_ribs_out.remove(&PEER_IP);
+        // Must not panic.
+        state.set_export_default(PEER_IP, DefaultAction::Accept);
+    }
+
+    /// `set_export_default` when `update_senders` is missing must return without panic.
+    /// Covers the defensive return at line 118.
+    #[test]
+    fn set_export_default_missing_update_senders_returns_silently() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        state.update_senders.remove(&PEER_IP);
+        // Must not panic.
+        state.set_export_default(PEER_IP, DefaultAction::Accept);
+    }
+
     /// `set_export_default` before `on_established` (peer not yet in `rib.peer_types`)
     /// must store the new policy without attempting to propagate (no crash, no output).
     #[test]
@@ -198,6 +221,59 @@ mod tests {
         state.set_export_default(PEER_IP, DefaultAction::Reject);
         // No UPDATE must be sent.
         assert!(rxs.get_mut(&PEER_IP).unwrap().try_recv().is_err());
+    }
+
+    fn announce_v6(prefix: &str) -> UpdateMessage {
+        use pathvector_session::message::{MpReachNlri, PathAttribute, Prefix};
+        use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin};
+        let nlri_v6: Nlri<Ipv6Addr> = prefix.parse().unwrap();
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(PEER_AS)])),
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                    prefixes: vec![Prefix::V6(nlri_v6)],
+                }),
+            ],
+            announced: vec![],
+        }
+    }
+
+    /// Changing import policy to Reject when a v6 route is present must trigger
+    /// a FIB Withdrawn call via the v6 branch (covers lines 64-65).
+    #[test]
+    fn set_import_default_reject_v6_notifies_fib_manager() {
+        use pathvector_types::{AfiSafi, PeerType};
+        let (mut state, mut rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+
+        let v6_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &v6_caps,
+            None,
+        );
+        while rxs.get_mut(&PEER_IP).unwrap().try_recv().is_ok() {}
+
+        state.on_route_update(PEER_IP, announce_v6("2001:db8::/32"));
+        fib.v6.lock().unwrap().clear();
+
+        state.set_import_default(PEER_IP, DefaultAction::Reject);
+
+        let v6_changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            v6_changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "set_import_default(Reject) must push a v6 Withdrawn FIB change"
+        );
     }
 
     /// Changing import policy to Reject when a route is present must trigger a FIB
@@ -217,7 +293,9 @@ mod tests {
 
         let changes = fib.v4.lock().unwrap().clone();
         assert!(
-            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "set_import_default(Reject) must push a Withdrawn FIB change for the evicted route"
         );
     }

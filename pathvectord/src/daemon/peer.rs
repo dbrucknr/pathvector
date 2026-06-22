@@ -903,3 +903,112 @@ pub(super) async fn run_bgp_listener(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
+
+    use pathvector_policy::DefaultAction;
+    use pathvector_rib::BestPathChange;
+    use pathvector_session::message::{Capability, MpReachNlri, PathAttribute, Prefix, UpdateMessage};
+    use pathvector_session::transport::TerminationReason;
+    use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Nlri, Origin, PeerType};
+
+    use crate::daemon::tests::{make_state, with_recording_fib};
+
+    const LOCAL_AS: u32 = 65001;
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER_AS: u32 = 65002;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn announce(prefix: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(PEER_AS)])),
+                PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+            ],
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    /// On clean termination with a v4 route installed, the FIB manager must receive
+    /// a Withdrawn call. Covers the `if let Some(fm)` branch in `on_terminated`
+    /// for the non-GR path (peer.rs lines 569-576).
+    #[test]
+    fn on_terminated_clean_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce("10.0.0.0/8"));
+        fib.v4.lock().unwrap().clear();
+
+        state.on_terminated(PEER_IP, TerminationReason::Clean, true);
+
+        let changes = fib.v4_changes();
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FIB manager must receive Withdrawn when peer terminates cleanly"
+        );
+    }
+
+    /// On clean termination with a v6 route installed, the FIB manager must also
+    /// receive a v6 Withdrawn call. Covers the v6 loop body in `on_terminated`
+    /// non-GR path (peer.rs lines 573-575).
+    #[test]
+    fn on_terminated_clean_v6_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+        Arc::make_mut(&mut state.rib).local_ipv6 =
+            Some("2001:db8::ff".parse::<Ipv6Addr>().unwrap());
+
+        let v6_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &v6_caps,
+            None,
+        );
+
+        state.set_import_default(PEER_IP, DefaultAction::Accept);
+        let nlri_v6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        state.on_route_update(
+            PEER_IP,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(PEER_AS)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri_v6)],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+        fib.v6.lock().unwrap().clear();
+
+        state.on_terminated(PEER_IP, TerminationReason::Clean, true);
+
+        let v6_changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            v6_changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FIB manager must receive v6 Withdrawn when peer with v6 routes terminates"
+        );
+    }
+}

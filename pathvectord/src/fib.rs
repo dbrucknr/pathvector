@@ -149,7 +149,6 @@ impl FibManager {
     pub(crate) fn pending_v6_snapshot(&self) -> HashMap<Nlri<Ipv6Addr>, PendingV6> {
         self.pending_v6.lock().unwrap().clone()
     }
-
 }
 
 impl ApplyFibChange for FibManager {

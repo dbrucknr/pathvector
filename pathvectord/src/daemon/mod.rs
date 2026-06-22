@@ -1156,8 +1156,8 @@ mod tests {
         (state, receivers)
     }
 
-    use std::sync::Mutex;
     use pathvector_rib::BestPathChange;
+    use std::sync::Mutex;
 
     /// Shared test double: records every `apply_v4/v6` call without touching the
     /// kernel. Inject via `state.fib_manager = Some(Arc::new(RecordingFib::new()))`.
@@ -1167,7 +1167,10 @@ mod tests {
     }
     impl RecordingFib {
         pub(super) fn new() -> Self {
-            Self { v4: Mutex::new(Vec::new()), v6: Mutex::new(Vec::new()) }
+            Self {
+                v4: Mutex::new(Vec::new()),
+                v6: Mutex::new(Vec::new()),
+            }
         }
         pub(super) fn v4_changes(&self) -> Vec<BestPathChange<Ipv4Addr>> {
             self.v4.lock().unwrap().clone()
@@ -1983,8 +1986,102 @@ mod tests {
 
         let changes = fib.v4_changes();
         assert!(
-            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "FIB manager must receive a Withdrawn call when next-hop goes down"
+        );
+    }
+
+    /// When a v6 FIB change evicts a v6 best route, the FIB manager must receive
+    /// a Withdrawn call. Covers the v6 path in `on_fib_change` (daemon/fib.rs).
+    #[test]
+    fn test_on_fib_change_v6_notifies_fib_manager_on_withdraw() {
+        use pathvector_rib::BestPathChange;
+        use pathvector_session::message::{MpReachNlri, PathAttribute, Prefix, UpdateMessage};
+        use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin};
+
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002)]);
+        let fib = with_recording_fib(&mut state);
+
+        let oracle = ToggleOracle::reachable();
+        state.set_oracles(oracle.clone(), oracle.clone());
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+
+        let v6_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(
+            peer_a,
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
+        drain_all(&mut receivers);
+
+        let nlri_v6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let announce_v6 = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                    prefixes: vec![Prefix::V6(nlri_v6)],
+                }),
+            ],
+            announced: vec![],
+        };
+        state.on_route_update(peer_a, announce_v6);
+        fib.v6.lock().unwrap().clear();
+
+        oracle.set(false);
+        state.on_fib_change();
+
+        let v6_changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            v6_changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FIB manager must receive a Withdrawn call for v6 route when oracle goes down"
+        );
+    }
+
+    /// `on_route_update` must notify the FIB manager for routes that change the
+    /// best path. Covers the `if let Some(fm)` branch in daemon/route.rs.
+    #[test]
+    fn test_on_route_update_notifies_fib_manager() {
+        use pathvector_rib::BestPathChange;
+        use pathvector_types::{AsPath, Asn, Origin};
+
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rxs) = make_state(65001, &[(peer_ip, 65002)]);
+        let fib = with_recording_fib(&mut state);
+
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        let changes = fib.v4_changes();
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Announced(..))),
+            "FIB manager must receive Announced when route is installed"
         );
     }
 
@@ -11036,8 +11133,8 @@ mod test_gr_phase2 {
     use pathvector_session::transport::TerminationReason;
     use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Nlri, Origin, PeerType};
 
+    use super::tests::with_recording_fib;
     use super::*;
-    use super::tests::{RecordingFib, with_recording_fib};
     use crate::config;
 
     const LOCAL_AS: u32 = 65001;
@@ -11392,7 +11489,9 @@ mod test_gr_phase2 {
 
         let changes = fib.v4_changes();
         assert!(
-            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "FibManager must receive a Withdrawn change on deadline expiry"
         );
     }
@@ -11402,7 +11501,7 @@ mod test_gr_phase2 {
     #[test]
     fn drain_expired_removes_past_deadlines_leaves_future() {
         let mut gr = GracefulRestartState::new();
-        let past = Instant::now() - std::time::Duration::from_secs(1);
+        let past = Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap();
         let future = Instant::now() + std::time::Duration::from_secs(300);
         let expired_ip = Ipv4Addr::new(10, 0, 0, 1);
         let live_ip = Ipv4Addr::new(10, 0, 0, 2);
@@ -11411,9 +11510,19 @@ mod test_gr_phase2 {
 
         let drained = gr.drain_expired(Instant::now());
 
-        assert_eq!(drained, vec![expired_ip], "only the past deadline must be returned");
-        assert!(!gr.deadlines.contains_key(&expired_ip), "expired entry must be removed");
-        assert!(gr.deadlines.contains_key(&live_ip), "live entry must remain");
+        assert_eq!(
+            drained,
+            vec![expired_ip],
+            "only the past deadline must be returned"
+        );
+        assert!(
+            !gr.deadlines.contains_key(&expired_ip),
+            "expired entry must be removed"
+        );
+        assert!(
+            gr.deadlines.contains_key(&live_ip),
+            "live entry must remain"
+        );
     }
 
     /// When a second established peer has an update_sender, stale-route
@@ -11425,8 +11534,7 @@ mod test_gr_phase2 {
         const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
         const OBS_AS: u32 = 65005;
 
-        let (mut state, mut rxs) =
-            make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
         state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
 
@@ -11454,8 +11562,7 @@ mod test_gr_phase2 {
         const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 6);
         const OBS_AS: u32 = 65006;
 
-        let (mut state, mut rxs) =
-            make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
         state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
 
@@ -11492,8 +11599,7 @@ mod test_gr_phase2 {
         const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 7);
         const OBS_AS: u32 = 65007;
 
-        let (mut state, mut rxs) =
-            make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
         state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
 
@@ -11509,7 +11615,11 @@ mod test_gr_phase2 {
         state.gr.deadlines.remove(&PEER_IP);
         state.on_gr_deadline_expired(PEER_IP);
 
-        assert_eq!(state.rib.loc_rib.len(), 0, "LocRib must be empty after deadline expiry");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            0,
+            "LocRib must be empty after deadline expiry"
+        );
         assert!(
             obs_rx.try_recv().is_ok(),
             "observer must receive a withdrawal UPDATE after deadline expiry"
@@ -11559,7 +11669,15 @@ mod test_gr_phase2 {
 
     fn establish_with_gr_v6(state: &mut DaemonState, restart_time: u16) {
         let caps = gr_caps_v6(restart_time);
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &caps, None);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &caps,
+            None,
+        );
     }
 
     fn ipv6_eor() -> UpdateMessage {
@@ -11582,7 +11700,11 @@ mod test_gr_phase2 {
         establish_with_gr_v6(&mut state, 120);
 
         state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        assert_eq!(state.rib.loc_rib_v6.len(), 1, "v6 route must be in LocRib_v6");
+        assert_eq!(
+            state.rib.loc_rib_v6.len(),
+            1,
+            "v6 route must be in LocRib_v6"
+        );
 
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
 
@@ -11602,7 +11724,10 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
 
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]));
+        state.on_route_update(
+            PEER_IP,
+            announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
+        );
         assert_eq!(state.rib.loc_rib_v6.len(), 2);
 
         // Unclean disconnect, then re-establish.
@@ -11621,11 +11746,19 @@ mod test_gr_phase2 {
             "only the re-announced v6 route must remain after EOR prune"
         );
         assert!(
-            state.rib.loc_rib_v6.best(&nlri_v6("2001:db8:1::/48")).is_some(),
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8:1::/48"))
+                .is_some(),
             "re-announced v6 route must survive"
         );
         assert!(
-            state.rib.loc_rib_v6.best(&nlri_v6("2001:db8:2::/48")).is_none(),
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8:2::/48"))
+                .is_none(),
             "stale v6 route must be pruned on EOR"
         );
     }
@@ -11696,24 +11829,51 @@ mod test_gr_phase2 {
         const OBSERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 4);
         const OBSERVER_AS: u32 = 65004;
 
-        let (mut state, mut rxs) =
-            make_state_gr(&[(PEER_IP, PEER_AS), (COMPETING_IP, COMPETING_AS), (OBSERVER_IP, OBSERVER_AS)]);
+        let (mut state, mut rxs) = make_state_gr(&[
+            (PEER_IP, PEER_AS),
+            (COMPETING_IP, COMPETING_AS),
+            (OBSERVER_IP, OBSERVER_AS),
+        ]);
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
 
         let peer_caps = gr_caps_v6(120);
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &peer_caps, None);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
 
         let competing_caps = vec![
             Capability::FourByteAsn(COMPETING_AS),
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         ];
-        state.on_established(COMPETING_IP, COMPETING_IP, PeerType::External, COMPETING_AS, 90, &competing_caps, None);
+        state.on_established(
+            COMPETING_IP,
+            COMPETING_IP,
+            PeerType::External,
+            COMPETING_AS,
+            90,
+            &competing_caps,
+            None,
+        );
 
         let obs_caps = vec![
             Capability::FourByteAsn(OBSERVER_AS),
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         ];
-        state.on_established(OBSERVER_IP, OBSERVER_IP, PeerType::External, OBSERVER_AS, 90, &obs_caps, None);
+        state.on_established(
+            OBSERVER_IP,
+            OBSERVER_IP,
+            PeerType::External,
+            OBSERVER_AS,
+            90,
+            &obs_caps,
+            None,
+        );
 
         // Both PEER_IP and COMPETING_IP advertise the same v6 prefix.
         state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
@@ -11728,7 +11888,11 @@ mod test_gr_phase2 {
         // Observer should receive an UPDATE (re-announce from COMPETING_IP winning).
         // The exact content depends on best-path: the key invariant is the loop ran.
         assert!(
-            state.rib.loc_rib_v6.best(&nlri_v6("2001:db8::/32")).is_some(),
+            state
+                .rib
+                .loc_rib_v6
+                .best(&nlri_v6("2001:db8::/32"))
+                .is_some(),
             "a best v6 route must still exist from COMPETING_IP"
         );
     }
@@ -11741,26 +11905,52 @@ mod test_gr_phase2 {
         const OBSERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
         const OBSERVER_AS: u32 = 65003;
 
-        let (mut state, mut rxs) =
-            make_state_gr(&[(PEER_IP, PEER_AS), (OBSERVER_IP, OBSERVER_AS)]);
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBSERVER_IP, OBSERVER_AS)]);
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
 
         let peer_caps = gr_caps_v6(120);
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &peer_caps, None);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
 
         let obs_caps = vec![
             Capability::FourByteAsn(OBSERVER_AS),
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         ];
-        state.on_established(OBSERVER_IP, OBSERVER_IP, PeerType::External, OBSERVER_AS, 90, &obs_caps, None);
+        state.on_established(
+            OBSERVER_IP,
+            OBSERVER_IP,
+            PeerType::External,
+            OBSERVER_AS,
+            90,
+            &obs_caps,
+            None,
+        );
 
         // Announce two v6 prefixes.
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]));
+        state.on_route_update(
+            PEER_IP,
+            announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
+        );
         while rxs.get_mut(&OBSERVER_IP).unwrap().try_recv().is_ok() {}
 
         // Unclean disconnect, then re-establish.
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &peer_caps, None);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
         while rxs.get_mut(&OBSERVER_IP).unwrap().try_recv().is_ok() {}
 
         // Peer re-announces only the first prefix, then sends EOR.
@@ -11774,14 +11964,765 @@ mod test_gr_phase2 {
         let has_prune = msgs.iter().any(|m| {
             m.attributes.iter().any(|a| {
                 if let PathAttribute::MpUnreachNlri(u) = a {
-                    u.prefixes.iter().any(|p| {
-                        matches!(p, Prefix::V6(n) if n.to_string().starts_with("2001:db8:2"))
-                    })
+                    u.prefixes.iter().any(
+                        |p| matches!(p, Prefix::V6(n) if n.to_string().starts_with("2001:db8:2")),
+                    )
                 } else {
                     false
                 }
             })
         });
-        assert!(has_prune, "observer must receive WITHDRAW for the stale v6 NLRI after EOR prune");
+        assert!(
+            has_prune,
+            "observer must receive WITHDRAW for the stale v6 NLRI after EOR prune"
+        );
+    }
+
+    /// When `prune_stale_nlri` is called for a peer whose `adj_ribs_in` entry is
+    /// missing, it must skip the adj-rib withdrawal without panicking. Covers the
+    /// `if let Some(ari)` else path in gr.rs line 289.
+    #[test]
+    fn prune_stale_nlri_skips_missing_adj_rib_in() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let stale_set = std::collections::HashSet::from([nlri]);
+
+        // Remove adj_ribs_in so the `if let Some(ari)` branch is skipped.
+        state.adj_ribs_in.remove(&PEER_IP);
+        // Must not panic.
+        state.prune_stale_nlri(PEER_IP, &stale_set);
+    }
+
+    /// When observer's export policy is missing during `prune_stale_nlri`, the
+    /// peer must be skipped. Covers the defensive `continue` at gr.rs line 328.
+    #[test]
+    fn prune_stale_nlri_skips_peer_missing_export_policy() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        establish_with_gr(&mut state, 120);
+
+        // Remove observer's export policy — defensive `continue` must fire.
+        state.export_policies.remove(&OBS_IP);
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let stale_set = std::collections::HashSet::from([nlri]);
+        state.prune_stale_nlri(PEER_IP, &stale_set);
+    }
+
+    /// When the observer's update channel is closed during `prune_stale_nlri`,
+    /// it must be recorded in `stalled_peers`. Covers stall at gr.rs line 360.
+    #[test]
+    fn prune_stale_nlri_stall_records_stalled_peer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        establish_with_gr(&mut state, 120);
+        // Drop observer's receiver so the EOR prune send fails.
+        drop(rxs.remove(&OBS_IP).unwrap());
+
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let stale_set = std::collections::HashSet::from([nlri]);
+        state.prune_stale_nlri(PEER_IP, &stale_set);
+
+        assert!(
+            state.take_stalled_peers().contains(&OBS_IP),
+            "stalled_peers must record observer when prune send fails"
+        );
+    }
+
+    /// When the observer's update channel is closed during GR deadline expiry,
+    /// it must be recorded in `stalled_peers`. Covers stall at gr.rs line 558.
+    #[test]
+    fn deadline_expiry_stall_records_stalled_peer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        // Drop observer's receiver so the deadline expiry send fails.
+        drop(rxs.remove(&OBS_IP).unwrap());
+
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+
+        assert!(
+            state.take_stalled_peers().contains(&OBS_IP),
+            "stalled_peers must record observer when deadline expiry send fails"
+        );
+    }
+
+    /// Unclean termination of a GR-capable peer with no v4 routes must be a no-op
+    /// for the stale-marking loop. Covers the `if !stale_v4.is_empty()` false
+    /// branch in `mark_stale_and_repropagate` (gr.rs line 100).
+    #[test]
+    fn stale_mark_v4_with_no_routes_is_noop() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        establish_with_gr(&mut state, 120);
+        // No routes announced — stale_v4 will be empty.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        assert_eq!(state.rib.loc_rib.len(), 0);
+    }
+
+    /// Unclean termination of a GR-capable v6 peer with no v6 routes must be
+    /// a no-op for the v6 stale-marking loop. Covers the `if !stale_v6.is_empty()`
+    /// false branch in `mark_stale_and_repropagate` (gr.rs line 127).
+    #[test]
+    fn stale_mark_v6_with_no_routes_is_noop() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        // No v6 routes announced — stale_v6 will be empty.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        assert_eq!(state.rib.loc_rib_v6.len(), 0);
+    }
+
+    /// Unclean termination of a GR peer with IPv6 GR family must push v6 FIB
+    /// changes. Covers the `if do_v6 { if let Some(fm) ... }` block in
+    /// `mark_stale_and_repropagate` (gr.rs lines 122-127).
+    #[test]
+    fn stale_marking_v6_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let fib = with_recording_fib(&mut state);
+        establish_with_gr_v6(&mut state, 120);
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        fib.v6.lock().unwrap().clear();
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        let changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            !changes.is_empty(),
+            "FibManager must receive v6 changes when v6 GR peer terminates unclean"
+        );
+    }
+
+    /// When `fib_manager` is set, EOR from a GR-re-established peer must push
+    /// FIB changes for the pruned v4 routes. Covers the `if let Some(fm)` branch
+    /// in `prune_stale_nlri` (gr.rs lines 300-302).
+    #[test]
+    fn eor_prune_v4_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+        establish_with_gr(&mut state, 120);
+
+        // Announce two routes; only one will survive after re-establishment.
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.0.2.0/24"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        establish_with_gr(&mut state, 120);
+        fib.v4.lock().unwrap().clear();
+
+        // Re-announce only the first; EOR prunes the second.
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        let eor = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        };
+        state.on_route_update(PEER_IP, eor);
+
+        let changes = fib.v4_changes();
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FibManager must receive Withdrawn for pruned v4 NLRI after EOR"
+        );
+    }
+
+    /// When `fib_manager` is set, EOR from a GR-re-established v6 peer must push
+    /// FIB changes for the pruned v6 routes. Covers `prune_stale_nlri_v6`
+    /// (gr.rs lines 391-393).
+    #[test]
+    fn eor_prune_v6_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let fib = with_recording_fib(&mut state);
+
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_route_update(
+            PEER_IP,
+            announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
+        );
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        fib.v6.lock().unwrap().clear();
+
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:1::/48"]));
+        state.on_route_update(PEER_IP, ipv6_eor());
+
+        let changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FibManager must receive Withdrawn for pruned v6 NLRI after EOR"
+        );
+    }
+
+    /// An observer that was not established with IPv6 capabilities must be skipped by
+    /// `repropagate_after_stale_mark_v6`. Covers the `if !ipv6_capable_peers.contains`
+    /// branch at gr.rs line 228.
+    #[test]
+    fn repropagate_v6_skips_non_ipv6_observer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        // Observer has NO v6 capability → not in ipv6_capable_peers.
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+
+        // Termination triggers repropagate_after_stale_mark_v6 which must skip OBS_IP.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        // Must not panic; stalled_peers must not include observer.
+        assert!(!state.take_stalled_peers().contains(&OBS_IP));
+    }
+
+    /// When the observer's adj_ribs_out_v6 is missing, repropagate_after_stale_mark_v6
+    /// must skip it. Covers the defensive `continue` at gr.rs line 242.
+    #[test]
+    fn repropagate_v6_skips_observer_missing_adj_rib_out_v6() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+
+        state.adj_ribs_out_v6.remove(&OBS_IP);
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+    }
+
+    /// When the observer's update channel is closed during repropagate_v6,
+    /// it must be recorded in `stalled_peers`. Covers the stall at gr.rs line 270.
+    #[test]
+    fn repropagate_v6_stall_records_stalled_peer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+
+        drop(rxs.remove(&OBS_IP).unwrap());
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        assert!(
+            state.take_stalled_peers().contains(&OBS_IP),
+            "stalled_peers must include observer when v6 repropagate send fails"
+        );
+    }
+
+    /// When `prune_stale_nlri` is called and the observer's adj_ribs_out is missing,
+    /// it must skip without panicking. Covers defensive `continue` at gr.rs line 331.
+    #[test]
+    fn prune_stale_nlri_skips_observer_missing_adj_rib_out() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        establish_with_gr(&mut state, 120);
+
+        state.adj_ribs_out.remove(&OBS_IP);
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        state.prune_stale_nlri(PEER_IP, &std::collections::HashSet::from([nlri]));
+    }
+
+    /// When `prune_stale_nlri_v6` encounters a peer without adj_ribs_in_v6, it must
+    /// skip the adj-rib withdrawal. Covers the `if let Some(ari_v6)` else path at
+    /// gr.rs line 379.
+    #[test]
+    fn prune_stale_nlri_v6_skips_missing_adj_rib_in_v6() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let stale_set = std::collections::HashSet::from([nlri]);
+        // Remove adj_ribs_in_v6 so the `if let Some(ari_v6)` branch is skipped.
+        state.adj_ribs_in_v6.remove(&PEER_IP);
+        state.prune_stale_nlri_v6(PEER_IP, &stale_set);
+    }
+
+    /// When the v6 observer's update channel is closed during prune_stale_nlri_v6,
+    /// it must be recorded in `stalled_peers`. Covers the stall at gr.rs line 450.
+    #[test]
+    fn prune_stale_nlri_v6_stall_records_stalled_peer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(
+            PEER_IP,
+            announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
+        );
+        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        drop(rxs.remove(&OBS_IP).unwrap());
+
+        let nlri: Nlri<Ipv6Addr> = "2001:db8:2::/48".parse().unwrap();
+        let stale_set = std::collections::HashSet::from([nlri]);
+        state.prune_stale_nlri_v6(PEER_IP, &stale_set);
+
+        assert!(
+            state.take_stalled_peers().contains(&OBS_IP),
+            "stalled_peers must include observer when v6 prune send fails"
+        );
+    }
+
+    /// When the observer's adj_ribs_out is missing, repropagate_after_stale_mark_v4
+    /// must skip it. Covers the defensive `continue` at gr.rs line 177.
+    #[test]
+    fn repropagate_v4_skips_observer_missing_adj_rib_out() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.adj_ribs_out.remove(&OBS_IP);
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+    }
+
+    /// When the observer's update_senders is missing, repropagate_after_stale_mark_v4
+    /// must skip it. Covers the defensive `continue` at gr.rs line 180.
+    #[test]
+    fn repropagate_v4_skips_observer_missing_update_senders() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.update_senders.remove(&OBS_IP);
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+    }
+
+    /// When the observer's update_senders is missing in repropagate_after_stale_mark_v6,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 245.
+    #[test]
+    fn repropagate_v6_skips_observer_missing_update_senders() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+
+        state.update_senders.remove(&OBS_IP);
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+    }
+
+    /// When the observer's update_senders is missing in prune_stale_nlri v4,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 334.
+    #[test]
+    fn prune_stale_nlri_skips_observer_missing_update_senders() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        establish_with_gr(&mut state, 120);
+
+        state.update_senders.remove(&OBS_IP);
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        state.prune_stale_nlri(PEER_IP, &std::collections::HashSet::from([nlri]));
+    }
+
+    /// When the observer's export_policy is missing in prune_stale_nlri_v6,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 419.
+    #[test]
+    fn prune_stale_nlri_v6_skips_observer_missing_export_policy() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+
+        state.export_policies.remove(&OBS_IP);
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        state.prune_stale_nlri_v6(PEER_IP, &std::collections::HashSet::from([nlri]));
+    }
+
+    /// When the observer's adj_ribs_out_v6 is missing in prune_stale_nlri_v6,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 422.
+    #[test]
+    fn prune_stale_nlri_v6_skips_observer_missing_adj_rib_out_v6() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+
+        state.adj_ribs_out_v6.remove(&OBS_IP);
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        state.prune_stale_nlri_v6(PEER_IP, &std::collections::HashSet::from([nlri]));
+    }
+
+    /// When the observer's update_senders is missing in prune_stale_nlri_v6,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 425.
+    #[test]
+    fn prune_stale_nlri_v6_skips_observer_missing_update_senders() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+        let obs_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &obs_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+
+        state.update_senders.remove(&OBS_IP);
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        state.prune_stale_nlri_v6(PEER_IP, &std::collections::HashSet::from([nlri]));
+    }
+
+    /// When the observer's export_policy is missing during deadline expiry,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 526.
+    #[test]
+    fn deadline_expiry_skips_observer_missing_export_policy() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        state.export_policies.remove(&OBS_IP);
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+    }
+
+    /// When the observer's adj_ribs_out is missing during deadline expiry,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 529.
+    #[test]
+    fn deadline_expiry_skips_observer_missing_adj_rib_out() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        state.adj_ribs_out.remove(&OBS_IP);
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+    }
+
+    /// When the observer's update_senders is missing during deadline expiry,
+    /// it must be skipped. Covers the defensive `continue` at gr.rs line 532.
+    #[test]
+    fn deadline_expiry_skips_observer_missing_update_senders() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        state.update_senders.remove(&OBS_IP);
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+    }
+
+    /// When the observer's update channel is closed, `repropagate_after_stale_mark_v4`
+    /// must record the peer in `stalled_peers`. Covers the `flush_updates → false` stall
+    /// path in gr.rs line 206.
+    #[test]
+    fn repropagate_v4_stall_path_records_stalled_peer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+
+        // Drop the observer's receiver so the next send fails.
+        drop(rxs.remove(&OBS_IP).unwrap());
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        let stalled = state.take_stalled_peers();
+        assert!(
+            stalled.contains(&OBS_IP),
+            "stalled_peers must include observer when its channel is closed"
+        );
+    }
+
+    /// When the observer peer is missing from `export_policies`, `repropagate_after_stale_mark_v4`
+    /// must skip it without panicking. Covers the defensive `continue` at gr.rs line 174.
+    #[test]
+    fn repropagate_v4_skips_peer_missing_export_policy() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+        const OBS_AS: u32 = 65005;
+
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        establish_with_gr(&mut state, 120);
+        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        // Remove observer's export policy — defensive `continue` must fire.
+        state.export_policies.remove(&OBS_IP);
+        // Must not panic.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+    }
+
+    /// When `fib_manager` is set and the GR deadline expires for a peer with v6
+    /// routes, the FIB manager must receive v6 Withdrawn calls. Covers the v6
+    /// apply loop in `on_gr_deadline_expired` (gr.rs lines 485-487).
+    #[test]
+    fn deadline_expiry_v6_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        let fib = with_recording_fib(&mut state);
+
+        let peer_caps = gr_caps_v6(120);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &peer_caps,
+            None,
+        );
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        fib.v6.lock().unwrap().clear();
+
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+
+        let changes = fib.v6.lock().unwrap().clone();
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FibManager must receive v6 Withdrawn on GR deadline expiry"
+        );
     }
 }

@@ -158,7 +158,9 @@ mod tests {
 
         let changes = fib.v6.lock().unwrap().clone();
         assert!(
-            changes.iter().any(|c| matches!(c, BestPathChange::Announced(..))),
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Announced(..))),
             "originate_route_v6 must push an Announced FIB change"
         );
     }
@@ -177,7 +179,9 @@ mod tests {
 
         let changes = fib.v4.lock().unwrap().clone();
         assert!(
-            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "withdraw_originated_route must push a Withdrawn FIB change"
         );
     }
@@ -196,7 +200,9 @@ mod tests {
 
         let changes = fib.v6.lock().unwrap().clone();
         assert!(
-            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "withdraw_originated_route_v6 must push a Withdrawn FIB change"
         );
     }
