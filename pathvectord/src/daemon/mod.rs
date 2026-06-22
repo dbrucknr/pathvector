@@ -34,6 +34,7 @@ use crate::outbound::{
     propagate_prefix_v6, send_eor_ipv4, send_eor_ipv6,
 };
 use crate::{config, fib as crate_fib, grpc, proto};
+use crate_fib::ApplyFibChange;
 
 mod capabilities;
 mod fib;
@@ -313,7 +314,7 @@ pub(crate) struct DaemonState {
     /// FIB manager: installs / removes kernel routes on best-path changes.
     ///
     /// `None` when no kernel FIB integration is configured (e.g. tests).
-    pub(crate) fib_manager: Option<Arc<crate_fib::FibManager>>,
+    pub(crate) fib_manager: Option<Arc<dyn ApplyFibChange>>,
     /// Next-hop oracle consulted on every IPv4 best-path recompute (RFC 4271 §9.1
     /// steps 1 & 8). Defaults to `AlwaysReachable`; replaced with `DaemonOracle`
     /// once `KernelFib` is initialised at startup.
@@ -10955,7 +10956,9 @@ mod test_gr_peer_capability {
 mod test_gr_phase2 {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Mutex;
 
+    use pathvector_rib::BestPathChange;
     use pathvector_session::message::{
         Capability, GracefulRestartFamily, MpReachNlri, MpUnreachNlri, PathAttribute, Prefix,
         UpdateMessage,
@@ -10965,6 +10968,37 @@ mod test_gr_phase2 {
 
     use super::*;
     use crate::config;
+    use crate_fib::ApplyFibChange;
+
+    /// Test double: records every `apply_v4/v6` call without touching the kernel.
+    /// Inject via `state.fib_manager = Some(Arc::new(RecordingFib::new()))`.
+    struct RecordingFib {
+        v4: Mutex<Vec<BestPathChange<Ipv4Addr>>>,
+        v6: Mutex<Vec<BestPathChange<Ipv6Addr>>>,
+    }
+
+    impl RecordingFib {
+        fn new() -> Self {
+            Self {
+                v4: Mutex::new(Vec::new()),
+                v6: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn v4_changes(&self) -> Vec<BestPathChange<Ipv4Addr>> {
+            self.v4.lock().unwrap().clone()
+        }
+    }
+
+    impl ApplyFibChange for RecordingFib {
+        fn apply_v4(&self, change: BestPathChange<Ipv4Addr>) {
+            self.v4.lock().unwrap().push(change);
+        }
+
+        fn apply_v6(&self, change: BestPathChange<Ipv6Addr>) {
+            self.v6.lock().unwrap().push(change);
+        }
+    }
 
     const LOCAL_AS: u32 = 65001;
     const PEER_AS: u32 = 65002;
@@ -11277,6 +11311,55 @@ mod test_gr_phase2 {
         assert!(
             !state.gr.deadlines.contains_key(&PEER_IP),
             "gr_deadlines must be cleared on clean termination"
+        );
+    }
+
+    fn with_recording_fib(state: &mut DaemonState) -> Arc<RecordingFib> {
+        let fib = Arc::new(RecordingFib::new());
+        state.fib_manager = Some(Arc::clone(&fib) as Arc<dyn ApplyFibChange>);
+        fib
+    }
+
+    /// When `fib_manager` is set, unclean termination must push FIB changes for
+    /// the stale-marked routes (covers the `if let Some(fm)` branch in
+    /// `mark_stale_and_repropagate`).
+    #[test]
+    fn stale_marking_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+        establish_with_gr(&mut state, 120);
+        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+
+        let changes = fib.v4_changes();
+        assert!(
+            !changes.is_empty(),
+            "FibManager must receive at least one change when routes are stale-marked"
+        );
+    }
+
+    /// When `fib_manager` is set, deadline expiry must push FIB withdrawals for
+    /// all stale routes (covers the `if let Some(fm)` branch in
+    /// `on_gr_deadline_expired`).
+    #[test]
+    fn deadline_expiry_notifies_fib_manager() {
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+        establish_with_gr(&mut state, 120);
+        state.on_route_update(PEER_IP, announce(&["192.0.2.0/24"]));
+
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        // Clear stale-mark FIB notifications so we only count the expiry ones.
+        fib.v4.lock().unwrap().clear();
+
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+
+        let changes = fib.v4_changes();
+        assert!(
+            changes.iter().any(|c| matches!(c, BestPathChange::Withdrawn(_))),
+            "FibManager must receive a Withdrawn change on deadline expiry"
         );
     }
 
