@@ -665,7 +665,7 @@ export_default = "accept"
 
 /// Writes a pathvectord config with `connect_retry_time` set per-peer.
 ///
-/// Identical to [`write_daemon_config`] except each peer has a
+/// Identical to `write_daemon_config` except each peer has a
 /// `connect_retry_time` override.  Use a short value (e.g. `2`) in tests that
 /// kill and restart a peer and need pathvectord to reconnect quickly rather
 /// than waiting the RFC-default 120 s.
