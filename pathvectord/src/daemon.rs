@@ -21,7 +21,9 @@ use pathvector_session::{
         MpUnreachNlri, NotificationError, NotificationMessage, PathAttribute, Prefix,
         UpdateMessage, UpdateMsgError, encode_shutdown_message,
     },
-    transport::{self, SessionCommand, SessionConfig, SessionEvent, SessionHandle, TerminationReason},
+    transport::{
+        self, SessionCommand, SessionConfig, SessionEvent, SessionHandle, TerminationReason,
+    },
 };
 use pathvector_types::{AfiSafi, AsPath, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
@@ -890,17 +892,25 @@ impl DaemonState {
         // non-zero restart_time. A zero restart_time means the peer does not
         // participate in the GR restart window (capability present for EOR only).
         let (peer_gr_time, peer_gr_families): (Option<u16>, Vec<GracefulRestartFamily>) =
-            peer_capabilities.iter().find_map(|c| {
-                if let Capability::GracefulRestart { restart_time, families, .. } = c {
-                    if *restart_time > 0 {
-                        Some((*restart_time, families.clone()))
+            peer_capabilities
+                .iter()
+                .find_map(|c| {
+                    if let Capability::GracefulRestart {
+                        restart_time,
+                        families,
+                        ..
+                    } = c
+                    {
+                        if *restart_time > 0 {
+                            Some((*restart_time, families.clone()))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            }).map_or((None, vec![]), |(t, f)| (Some(t), f));
+                })
+                .map_or((None, vec![]), |(t, f)| (Some(t), f));
         let mut stalled = !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte);
         if stalled {
             self.stalled_peers.push(peer_ip);
@@ -1017,7 +1027,12 @@ impl DaemonState {
     #[allow(clippy::similar_names)]
     /// `notify` controls whether a `peer_tx` broadcast is sent.  Pass `false`
     /// when the caller will send a more specific event (e.g. `Removed`) instead.
-    pub(crate) fn on_terminated(&mut self, peer_ip: Ipv4Addr, reason: TerminationReason, notify: bool) {
+    pub(crate) fn on_terminated(
+        &mut self,
+        peer_ip: Ipv4Addr,
+        reason: TerminationReason,
+        notify: bool,
+    ) {
         let peer_id = PeerId::from(peer_ip);
 
         // RFC 4724 §4.2 — if the peer disconnected uncleanly AND previously
@@ -1060,18 +1075,22 @@ impl DaemonState {
             // RFC 4724 §4.2 — only retain routes for families the peer
             // included in its GracefulRestart capability.
             let families = self.gr_peer_families.get(&peer_ip);
-            let gr_v4 = families
-                .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
-            let gr_v6 = families
-                .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
+            let gr_v4 =
+                families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
+            let gr_v6 =
+                families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
 
             // Flush routes for families NOT covered by the peer's GR capability.
-            if !gr_v4 && let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) { ari.clear(); }
-            if !gr_v6 && let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) { ari.clear(); }
+            if !gr_v4 && let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
+                ari.clear();
+            }
+            if !gr_v6 && let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
+                ari.clear();
+            }
 
             // GR helper path — retain covered routes; arm deadline timer.
-            let deadline = Instant::now()
-                + std::time::Duration::from_secs(u64::from(gr_restart_time));
+            let deadline =
+                Instant::now() + std::time::Duration::from_secs(u64::from(gr_restart_time));
             self.gr_deadlines.insert(peer_ip, deadline);
             tracing::info!(
                 peer = %peer_ip,
@@ -1283,7 +1302,11 @@ impl DaemonState {
                 let oracle = Arc::clone(&self.oracle_v6);
                 let fib_changes_v6: Vec<_> = stale_v6
                     .into_iter()
-                    .map(|route| self.rib_mut().loc_rib_v6.insert(stale_peer, route, &*oracle))
+                    .map(|route| {
+                        self.rib_mut()
+                            .loc_rib_v6
+                            .insert(stale_peer, route, &*oracle)
+                    })
                     .collect();
                 if let Some(fm) = &self.fib_manager {
                     for change in fib_changes_v6 {
@@ -1306,7 +1329,11 @@ impl DaemonState {
             .loc_rib
             .best_routes()
             .filter_map(|(n, _)| {
-                if prev_prefixes.contains(&n) { Some(n) } else { None }
+                if prev_prefixes.contains(&n) {
+                    Some(n)
+                } else {
+                    None
+                }
             })
             .chain(
                 prev_prefixes
@@ -1316,19 +1343,42 @@ impl DaemonState {
             )
             .collect();
 
-        let other_peers: Vec<Ipv4Addr> =
-            self.rib.peer_types.keys().copied().filter(|&ip| ip != peer_ip).collect();
+        let other_peers: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
         for other_ip in other_peers {
             let other_type = self
-                .rib.peer_types.get(&other_ip).copied().unwrap_or(PeerType::External);
-            let max_len = self.negotiated_max_len.get(&other_ip).copied().unwrap_or(MAX_LEN);
-            let Some(export_policy) = self.export_policies.get(&other_ip) else { continue };
-            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else { continue };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else { continue };
+                .rib
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            let Some(export_policy) = self.export_policies.get(&other_ip) else {
+                continue;
+            };
+            let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                continue;
+            };
             let local_next_hop = self
-                .rib.local_addrs.get(&other_ip).copied().unwrap_or(local_bgp_id);
+                .rib
+                .local_addrs
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(local_bgp_id);
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
             let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions: Vec<PrefixDecision> = affected
@@ -1358,17 +1408,36 @@ impl DaemonState {
         let affected: Vec<Nlri<Ipv6Addr>> =
             self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
 
-        let other_peers: Vec<Ipv4Addr> =
-            self.rib.peer_types.keys().copied().filter(|&ip| ip != peer_ip).collect();
+        let other_peers: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
         let local_as = self.rib.local_as;
         let local_ipv6 = self.rib.local_ipv6;
         for other_ip in other_peers {
-            if !self.ipv6_capable_peers.contains(&other_ip) { continue; }
+            if !self.ipv6_capable_peers.contains(&other_ip) {
+                continue;
+            }
             let other_type = self
-                .rib.peer_types.get(&other_ip).copied().unwrap_or(PeerType::External);
-            let max_len = self.negotiated_max_len.get(&other_ip).copied().unwrap_or(MAX_LEN);
-            let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else { continue };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else { continue };
+                .rib
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                continue;
+            };
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
             let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions_v6: Vec<PrefixDecisionV6> = affected
@@ -1385,7 +1454,13 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(decisions_v6, max_len, update_tx, other_type, other_four_byte) {
+            if !flush_updates_v6(
+                decisions_v6,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -1496,7 +1571,11 @@ impl DaemonState {
         let oracle = Arc::clone(&self.oracle_v6);
         let fib_changes: Vec<_> = stale
             .iter()
-            .map(|nlri| self.rib_mut().loc_rib_v6.withdraw(&stale_peer, nlri, &*oracle))
+            .map(|nlri| {
+                self.rib_mut()
+                    .loc_rib_v6
+                    .withdraw(&stale_peer, nlri, &*oracle)
+            })
             .collect();
         if let Some(fm) = &self.fib_manager {
             for change in fib_changes {
@@ -1551,7 +1630,13 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(decisions_v6, max_len, update_tx, other_type, other_four_byte) {
+            if !flush_updates_v6(
+                decisions_v6,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -3029,7 +3114,12 @@ async fn run_command_processor<H, F>(
                     // stop sender was dropped).  Synthesize Terminated directly so the
                     // event loop still performs the pending_removal cleanup path —
                     // otherwise the peer would be stuck in pending_removal forever.
-                    let _ = event_tx.send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean))).await;
+                    let _ = event_tx
+                        .send((
+                            peer_ip,
+                            SessionEvent::Terminated(TerminationReason::Unclean),
+                        ))
+                        .await;
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
                 // remove_peer() is called by the event loop.
@@ -11059,7 +11149,10 @@ mod event_loop_tests {
 
         let (event_tx, event_rx) = mpsc::channel(8);
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -11424,7 +11517,10 @@ mod event_loop_tests {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -11548,7 +11644,10 @@ mod event_loop_tests {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -11584,12 +11683,18 @@ mod event_loop_tests {
         let (event_tx, event_rx) = mpsc::channel(8);
         // First Terminated — runs cleanup (routes cleared, remove_peer called).
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         // Second Terminated — must be a no-op (maps already gone).
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -11987,7 +12092,10 @@ mod event_loop_tests {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -12165,7 +12273,10 @@ mod event_loop_tests {
 
         let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -12217,7 +12328,10 @@ mod event_loop_tests {
 
         let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Unclean)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -12255,7 +12369,10 @@ mod event_loop_tests {
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
 
-        state.write().await.on_terminated(peer_ip, TerminationReason::Unclean, false);
+        state
+            .write()
+            .await
+            .on_terminated(peer_ip, TerminationReason::Unclean, false);
 
         // No broadcast must arrive.
         assert!(
@@ -12273,7 +12390,10 @@ mod event_loop_tests {
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
 
-        state.write().await.on_terminated(peer_ip, TerminationReason::Unclean, true);
+        state
+            .write()
+            .await
+            .on_terminated(peer_ip, TerminationReason::Unclean, true);
 
         let ev = peer_rx
             .try_recv()
@@ -13948,7 +14068,10 @@ mod test_gr_phase2 {
 
     fn make_state_gr(
         peers: &[(Ipv4Addr, u32)],
-    ) -> (DaemonState, HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+    ) -> (
+        DaemonState,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+    ) {
         let mut receivers = HashMap::new();
         let mut senders = HashMap::new();
         let peer_configs: Vec<_> = peers
@@ -13998,7 +14121,15 @@ mod test_gr_phase2 {
 
     fn establish_with_gr(state: &mut DaemonState, restart_time: u16) {
         let caps = gr_caps(restart_time);
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &caps, None);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &caps,
+            None,
+        );
     }
 
     fn ipv4_eor() -> UpdateMessage {
@@ -14021,10 +14152,7 @@ mod test_gr_phase2 {
     }
 
     fn gr_caps(restart_time: u16) -> Vec<Capability> {
-        vec![
-            Capability::FourByteAsn(PEER_AS),
-            gr_cap(restart_time),
-        ]
+        vec![Capability::FourByteAsn(PEER_AS), gr_cap(restart_time)]
     }
 
     /// RFC 4724 §4.2 — unclean termination of a GR-capable peer must retain
@@ -14034,12 +14162,18 @@ mod test_gr_phase2 {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
         state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        assert_eq!(state.rib.loc_rib.len(), 1, "route must be in LocRib before termination");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "route must be in LocRib before termination"
+        );
 
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
 
         assert!(
-            state.adj_ribs_in[&PEER_IP].get(&nlri("10.0.0.0/8")).is_some(),
+            state.adj_ribs_in[&PEER_IP]
+                .get(&nlri("10.0.0.0/8"))
+                .is_some(),
             "AdjRibIn route must be retained during GR window"
         );
         assert_eq!(
@@ -14107,7 +14241,11 @@ mod test_gr_phase2 {
 
         // Simulate unclean disconnect (GR window opens).
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
-        assert_eq!(state.rib.loc_rib.len(), 2, "routes retained during GR window");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            2,
+            "routes retained during GR window"
+        );
 
         // Simulate re-establishment.
         establish_with_gr(&mut state, 120);
@@ -14142,7 +14280,11 @@ mod test_gr_phase2 {
         state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
 
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
-        assert_eq!(state.rib.loc_rib.len(), 1, "route retained during GR window");
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "route retained during GR window"
+        );
         assert!(state.gr_deadlines.contains_key(&PEER_IP));
 
         // Simulate deadline expiry.
@@ -14164,12 +14306,19 @@ mod test_gr_phase2 {
         const PEER2_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
         const PEER2_AS: u32 = 65003;
 
-        let (mut state, _rxs) =
-            make_state_gr(&[(PEER_IP, PEER_AS), (PEER2_IP, PEER2_AS)]);
+        let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (PEER2_IP, PEER2_AS)]);
 
         // Establish both peers (only PEER_IP supports GR).
         establish_with_gr(&mut state, 120);
-        state.on_established(PEER2_IP, PEER2_IP, PeerType::External, PEER2_AS, 90, &[], None);
+        state.on_established(
+            PEER2_IP,
+            PEER2_IP,
+            PeerType::External,
+            PEER2_AS,
+            90,
+            &[],
+            None,
+        );
 
         // Both peers announce the same prefix; PEER_IP wins (lower IP address tie-breaker).
         state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
@@ -14177,14 +14326,20 @@ mod test_gr_phase2 {
         state.on_route_update(PEER2_IP, announce(&["10.0.0.0/8"]));
 
         let winner_before = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
-        assert!(winner_before.is_some(), "must have a best path before termination");
+        assert!(
+            winner_before.is_some(),
+            "must have a best path before termination"
+        );
 
         // PEER_IP disconnects uncleanly — its route is marked stale.
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
 
         // PEER2's fresh route must now be the best path.
         let best_after = state.rib.loc_rib.best(&nlri("10.0.0.0/8"));
-        assert!(best_after.is_some(), "route must still be present (held stale)");
+        assert!(
+            best_after.is_some(),
+            "route must still be present (held stale)"
+        );
         assert!(
             !best_after.unwrap().stale,
             "winning route must be the non-stale route from PEER2"
@@ -14198,4 +14353,3 @@ mod test_gr_phase2 {
         );
     }
 }
-

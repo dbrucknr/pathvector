@@ -957,7 +957,11 @@ mod tests {
         candidates.insert(peer(1), stale);
         candidates.insert(peer(2), fresh);
         let (winner, _) = select_best(&candidates).unwrap();
-        assert_eq!(winner, peer(2), "fresh route must win over stale regardless of attributes");
+        assert_eq!(
+            winner,
+            peer(2),
+            "fresh route must win over stale regardless of attributes"
+        );
     }
 
     /// A stale route wins when it is the only candidate — it still provides
@@ -968,7 +972,10 @@ mod tests {
         only.stale = true;
         let mut candidates = HashMap::new();
         candidates.insert(peer(1), only);
-        assert!(select_best(&candidates).is_some(), "stale-only RIB must still yield a winner");
+        assert!(
+            select_best(&candidates).is_some(),
+            "stale-only RIB must still yield a winner"
+        );
     }
 
     /// Two stale candidates fall through to normal criteria (`LOCAL_PREF` wins).
@@ -982,7 +989,11 @@ mod tests {
         candidates.insert(peer(1), high_lp);
         candidates.insert(peer(2), low_lp);
         let (winner, _) = select_best(&candidates).unwrap();
-        assert_eq!(winner, peer(1), "among stale routes, higher LOCAL_PREF still wins");
+        assert_eq!(
+            winner,
+            peer(1),
+            "among stale routes, higher LOCAL_PREF still wins"
+        );
     }
 }
 
