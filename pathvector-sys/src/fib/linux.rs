@@ -127,6 +127,22 @@ impl FibWrite for FibWriter {
     async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> io::Result<()> {
         self.withdraw_v6(dst, prefix_len).await
     }
+
+    async fn install_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+        install_blackhole_v4(&self.handle, dst, prefix_len, self.table, self.metric).await
+    }
+
+    async fn withdraw_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+        withdraw_route_v4(&self.handle, dst, prefix_len, self.table, self.metric).await
+    }
+
+    async fn install_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> io::Result<()> {
+        install_blackhole_v6(&self.handle, dst, prefix_len, self.table, self.metric).await
+    }
+
+    async fn withdraw_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> io::Result<()> {
+        withdraw_route_v6(&self.handle, dst, prefix_len, self.table, self.metric).await
+    }
 }
 
 // ── KernelFib event loop ──────────────────────────────────────────────────────
@@ -568,6 +584,57 @@ async fn install_route_v6(
         .map_err(io::Error::other)
 }
 
+/// Install (or replace) an IPv4 blackhole route tagged `RTPROT_BGP`.
+///
+/// Uses `RTN_BLACKHOLE` — the kernel silently drops all matching packets.
+/// No gateway attribute is set; the route type alone governs forwarding.
+async fn install_blackhole_v4(
+    handle: &rtnetlink::Handle,
+    dst: Ipv4Addr,
+    prefix_len: u8,
+    table: u32,
+    metric: u32,
+) -> io::Result<()> {
+    let mut msg = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(dst, prefix_len)
+        .table_id(table)
+        .priority(metric)
+        .protocol(RouteProtocol::Bgp)
+        .build();
+    msg.header.kind = RouteType::BlackHole;
+    handle
+        .route()
+        .add(msg)
+        .replace()
+        .execute()
+        .await
+        .map_err(io::Error::other)
+}
+
+/// Install (or replace) an IPv6 blackhole route tagged `RTPROT_BGP`.
+async fn install_blackhole_v6(
+    handle: &rtnetlink::Handle,
+    dst: Ipv6Addr,
+    prefix_len: u8,
+    table: u32,
+    metric: u32,
+) -> io::Result<()> {
+    let mut msg = RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(dst, prefix_len)
+        .table_id(table)
+        .priority(metric)
+        .protocol(RouteProtocol::Bgp)
+        .build();
+    msg.header.kind = RouteType::BlackHole;
+    handle
+        .route()
+        .add(msg)
+        .replace()
+        .execute()
+        .await
+        .map_err(io::Error::other)
+}
+
 /// Remove an IPv4 route from the kernel FIB.
 ///
 /// Returns `Ok(())` if the route was deleted **or was already absent**
@@ -743,6 +810,59 @@ mod tests {
             msg.header.protocol,
             RouteProtocol::Bgp,
             "RTM_DELROUTE (v6) must use RTPROT_BGP — the kernel rejects if protocol mismatches the installed route"
+        );
+    }
+
+    // ── install_blackhole_v4/v6 — message shape ───────────────────────────────
+
+    #[test]
+    fn install_blackhole_v4_message_has_blackhole_type_and_bgp_protocol() {
+        let mut msg = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix("192.0.2.0".parse().unwrap(), 24)
+            .table_id(254)
+            .priority(20)
+            .protocol(RouteProtocol::Bgp)
+            .build();
+        msg.header.kind = RouteType::BlackHole;
+        assert_eq!(
+            msg.header.kind,
+            RouteType::BlackHole,
+            "blackhole route must use RTN_BLACKHOLE"
+        );
+        assert_eq!(
+            msg.header.protocol,
+            RouteProtocol::Bgp,
+            "blackhole route must be tagged RTPROT_BGP for correct withdrawal"
+        );
+        // No gateway attribute.
+        assert!(
+            !msg.attributes.iter().any(|a| matches!(a, RouteAttribute::Gateway(_))),
+            "blackhole route must have no gateway"
+        );
+    }
+
+    #[test]
+    fn install_blackhole_v6_message_has_blackhole_type_and_bgp_protocol() {
+        let mut msg = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix("2001:db8::".parse().unwrap(), 32)
+            .table_id(254)
+            .priority(20)
+            .protocol(RouteProtocol::Bgp)
+            .build();
+        msg.header.kind = RouteType::BlackHole;
+        assert_eq!(
+            msg.header.kind,
+            RouteType::BlackHole,
+            "IPv6 blackhole route must use RTN_BLACKHOLE"
+        );
+        assert_eq!(
+            msg.header.protocol,
+            RouteProtocol::Bgp,
+            "IPv6 blackhole route must be tagged RTPROT_BGP"
+        );
+        assert!(
+            !msg.attributes.iter().any(|a| matches!(a, RouteAttribute::Gateway(_))),
+            "IPv6 blackhole route must have no gateway"
         );
     }
 

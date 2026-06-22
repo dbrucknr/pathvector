@@ -85,6 +85,8 @@ impl NextHopOracle for DaemonOracle {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PendingV4 {
     Install { gateway: Ipv4Addr },
+    /// RFC 7999: program a kernel null route (`RTN_BLACKHOLE`) for this prefix.
+    Blackhole,
     Withdraw,
 }
 
@@ -92,6 +94,8 @@ pub(crate) enum PendingV4 {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PendingV6 {
     Install { gateway: Ipv6Addr },
+    /// RFC 7999: program a kernel null route (`RTN_BLACKHOLE`) for this prefix.
+    Blackhole,
     Withdraw,
 }
 
@@ -103,6 +107,14 @@ pub(crate) enum PendingV6 {
 pub(crate) trait ApplyFibChange: Send + Sync {
     fn apply_v4(&self, change: BestPathChange<Ipv4Addr>);
     fn apply_v6(&self, change: BestPathChange<Ipv6Addr>);
+    /// Program a kernel null route for an IPv4 BLACKHOLE prefix (RFC 7999).
+    fn apply_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>);
+    /// Remove the kernel null route for an IPv4 BLACKHOLE prefix.
+    fn withdraw_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>);
+    /// Program a kernel null route for an IPv6 BLACKHOLE prefix (RFC 7999).
+    fn apply_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>);
+    /// Remove the kernel null route for an IPv6 BLACKHOLE prefix.
+    fn withdraw_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>);
 }
 
 /// Serialises FIB mutations from the BGP event loop to a background writer task.
@@ -194,6 +206,26 @@ impl ApplyFibChange for FibManager {
         self.pending_v6.lock().unwrap().insert(nlri, op);
         self.notify.notify_one();
     }
+
+    fn apply_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>) {
+        self.pending_v4.lock().unwrap().insert(nlri, PendingV4::Blackhole);
+        self.notify.notify_one();
+    }
+
+    fn withdraw_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>) {
+        self.pending_v4.lock().unwrap().insert(nlri, PendingV4::Withdraw);
+        self.notify.notify_one();
+    }
+
+    fn apply_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>) {
+        self.pending_v6.lock().unwrap().insert(nlri, PendingV6::Blackhole);
+        self.notify.notify_one();
+    }
+
+    fn withdraw_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>) {
+        self.pending_v6.lock().unwrap().insert(nlri, PendingV6::Withdraw);
+        self.notify.notify_one();
+    }
 }
 
 /// Apply one drained batch to the kernel FIB.
@@ -218,6 +250,14 @@ pub(crate) async fn process_batch<W: FibWrite>(
                     );
                 }
             }
+            PendingV4::Blackhole => {
+                if let Err(e) = writer.install_blackhole_v4(dst, prefix_len).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        "FIB blackhole install failed: {e}"
+                    );
+                }
+            }
             PendingV4::Withdraw => {
                 if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
                     tracing::warn!(
@@ -238,6 +278,14 @@ pub(crate) async fn process_batch<W: FibWrite>(
                         prefix = %format!("{dst}/{prefix_len}"),
                         %gateway,
                         "FIB install (v6) failed: {e}"
+                    );
+                }
+            }
+            PendingV6::Blackhole => {
+                if let Err(e) = writer.install_blackhole_v6(dst, prefix_len).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        "FIB blackhole install (v6) failed: {e}"
                     );
                 }
             }
@@ -295,6 +343,8 @@ mod tests {
         withdrawn_v4: Vec<(Ipv4Addr, u8)>,
         installed_v6: Vec<(Ipv6Addr, u8, Ipv6Addr)>,
         withdrawn_v6: Vec<(Ipv6Addr, u8)>,
+        blackhole_v4: Vec<(Ipv4Addr, u8)>,
+        blackhole_v6: Vec<(Ipv6Addr, u8)>,
     }
 
     /// A `FibWrite` implementation that records every call for inspection.
@@ -387,6 +437,27 @@ mod tests {
                 .push((dst, prefix_len));
             Ok(())
         }
+
+        async fn install_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+            self.calls.lock().unwrap().blackhole_v4.push((dst, prefix_len));
+            Ok(())
+        }
+
+        async fn withdraw_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+            // Reuse withdrawn_v4 for withdraw — distinguish by checking blackhole_v4 absence.
+            self.calls.lock().unwrap().withdrawn_v4.push((dst, prefix_len));
+            Ok(())
+        }
+
+        async fn install_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
+            self.calls.lock().unwrap().blackhole_v6.push((dst, prefix_len));
+            Ok(())
+        }
+
+        async fn withdraw_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
+            self.calls.lock().unwrap().withdrawn_v6.push((dst, prefix_len));
+            Ok(())
+        }
     }
 
     // ── process_batch unit tests ──────────────────────────────────────────────
@@ -453,6 +524,38 @@ mod tests {
         let c = calls.lock().unwrap();
         assert_eq!(c.withdrawn_v6, vec![("2001:db8::".parse().unwrap(), 32)]);
         assert!(c.installed_v6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_blackhole_v4_calls_install_blackhole() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::Blackhole);
+        super::process_batch(&mock, v4, HashMap::new()).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            c.blackhole_v4,
+            vec![("192.0.2.0".parse().unwrap(), 24)],
+            "Blackhole variant must call install_blackhole_v4"
+        );
+        assert!(c.installed_v4.is_empty(), "must not call install_v4");
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_blackhole_v6_calls_install_blackhole() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::Blackhole);
+        super::process_batch(&mock, HashMap::new(), v6).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            c.blackhole_v6,
+            vec![("2001:db8::".parse().unwrap(), 32)],
+            "Blackhole variant must call install_blackhole_v6"
+        );
+        assert!(c.installed_v6.is_empty(), "must not call install_v6");
     }
 
     #[tokio::test]

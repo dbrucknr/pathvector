@@ -120,6 +120,37 @@ pub trait FibWrite {
         dst: Ipv6Addr,
         prefix_len: u8,
     ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Install a kernel blackhole (null) route for an IPv4 prefix (RFC 7999).
+    ///
+    /// Uses `RTN_BLACKHOLE` — the kernel silently drops all matching packets.
+    /// No gateway is needed. `NLM_F_REPLACE` makes this idempotent.
+    fn install_blackhole_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Remove a kernel blackhole route for an IPv4 prefix.
+    fn withdraw_blackhole_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Install a kernel blackhole (null) route for an IPv6 prefix (RFC 7999).
+    fn install_blackhole_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Remove a kernel blackhole route for an IPv6 prefix.
+    fn withdraw_blackhole_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
 }
 
 // ── FibSnapshot ──────────────────────────────────────────────────────────────

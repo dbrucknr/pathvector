@@ -100,6 +100,22 @@ impl FibWrite for FibWriter {
     async fn withdraw_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
         Ok(())
     }
+
+    async fn install_blackhole_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn withdraw_blackhole_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn install_blackhole_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn withdraw_blackhole_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

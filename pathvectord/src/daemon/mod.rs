@@ -1164,12 +1164,16 @@ mod tests {
     pub(super) struct RecordingFib {
         pub(super) v4: Mutex<Vec<BestPathChange<Ipv4Addr>>>,
         pub(super) v6: Mutex<Vec<BestPathChange<Ipv6Addr>>>,
+        pub(super) blackhole_v4: Mutex<Vec<(Nlri<Ipv4Addr>, bool)>>,  // (nlri, announced)
+        pub(super) blackhole_v6: Mutex<Vec<(Nlri<Ipv6Addr>, bool)>>,
     }
     impl RecordingFib {
         pub(super) fn new() -> Self {
             Self {
                 v4: Mutex::new(Vec::new()),
                 v6: Mutex::new(Vec::new()),
+                blackhole_v4: Mutex::new(Vec::new()),
+                blackhole_v6: Mutex::new(Vec::new()),
             }
         }
         pub(super) fn v4_changes(&self) -> Vec<BestPathChange<Ipv4Addr>> {
@@ -1182,6 +1186,18 @@ mod tests {
         }
         fn apply_v6(&self, change: BestPathChange<Ipv6Addr>) {
             self.v6.lock().unwrap().push(change);
+        }
+        fn apply_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>) {
+            self.blackhole_v4.lock().unwrap().push((nlri, true));
+        }
+        fn withdraw_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>) {
+            self.blackhole_v4.lock().unwrap().push((nlri, false));
+        }
+        fn apply_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>) {
+            self.blackhole_v6.lock().unwrap().push((nlri, true));
+        }
+        fn withdraw_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>) {
+            self.blackhole_v6.lock().unwrap().push((nlri, false));
         }
     }
     pub(super) fn with_recording_fib(state: &mut DaemonState) -> Arc<RecordingFib> {
@@ -2446,6 +2462,92 @@ mod tests {
             PeerType::External,
         );
         assert_eq!(rib.len(), 1);
+    }
+
+    // ── RFC 7999 blackhole FIB integration ───────────────────────────────────
+
+    fn blackhole_announce(prefix: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop("192.0.2.1".parse::<Ipv4Addr>().unwrap()),
+                PathAttribute::Communities(vec![Community::BLACKHOLE]),
+            ],
+            announced: vec![prefix.parse().unwrap()],
+        }
+    }
+
+    fn blackhole_withdraw(prefix: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![prefix.parse().unwrap()],
+            attributes: vec![],
+            announced: vec![],
+        }
+    }
+
+    /// A BLACKHOLE-tagged route must trigger `apply_blackhole_v4` on the FIB
+    /// manager so the kernel programs a null route.
+    #[test]
+    fn blackhole_route_programs_kernel_null_route() {
+        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let fib = with_recording_fib(&mut state);
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+
+        let bh = fib.blackhole_v4.lock().unwrap().clone();
+        let announced_nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        assert!(
+            bh.iter().any(|(n, announced)| *n == announced_nlri && *announced),
+            "apply_blackhole_v4 must be called for BLACKHOLE-tagged prefix"
+        );
+    }
+
+    /// A BLACKHOLE-tagged route must NOT enter the LocRib or be advertised
+    /// outbound — only the kernel null route is programmed.
+    #[test]
+    fn blackhole_route_not_in_loc_rib() {
+        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        with_recording_fib(&mut state);
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+
+        // LocRib must remain empty for the blackhole prefix.
+        assert_eq!(
+            Arc::clone(&state.rib).loc_rib.len(),
+            0,
+            "BLACKHOLE route must not enter LocRib"
+        );
+    }
+
+    /// When a previously-announced BLACKHOLE route is withdrawn by the peer,
+    /// `withdraw_blackhole_v4` must be called to remove the kernel null route.
+    #[test]
+    fn blackhole_route_withdrawal_removes_kernel_null_route() {
+        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let fib = with_recording_fib(&mut state);
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        fib.blackhole_v4.lock().unwrap().clear();
+
+        state.on_route_update(peer, blackhole_withdraw("192.0.2.0/24"));
+
+        let bh = fib.blackhole_v4.lock().unwrap().clone();
+        let withdrawn_nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        assert!(
+            bh.iter().any(|(n, announced)| *n == withdrawn_nlri && !announced),
+            "withdraw_blackhole_v4 must be called when BLACKHOLE route is withdrawn"
+        );
     }
 
     // ── MP_UNREACH_NLRI / MP_REACH_NLRI (RFC 4760) ───────────────────────────
@@ -6068,7 +6170,7 @@ mod tests {
         let policy = accept_all();
         let policy_v6: Policy<Route<Ipv6Addr>> =
             Policy::new(pathvector_policy::DefaultAction::Accept);
-        let (_, _, notification) = handle_update(
+        handle_update(
             p,
             msg,
             &mut ari,
@@ -6083,8 +6185,7 @@ mod tests {
             65002,
             None,
             None,
-        );
-        notification
+        ).notification
     }
 
     #[test]
