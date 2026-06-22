@@ -56,6 +56,7 @@ keep.
 | Keepalive timer fires at ⌊hold-time / 3⌋ seconds | `src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time` |
 | NOTIFICATION sent before session close | `src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification`, `test_unacceptable_hold_time_sends_notification` |
 | Hold time of 0 disables hold timer and keepalive | `src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |
+| §8.1 ConnectRetry timer is configurable (`SessionConfig.connect_retry_time`); FSM respects value from transport layer | `src/transport/mod.rs` | ✅ | `DEFAULT_CONNECT_RETRY_TIME` constant; exercised by `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` (2 s config) |
 
 ---
 
@@ -201,11 +202,11 @@ The FSM restart behavior is deferred.
 |---|---|---|---|
 | GracefulRestart capability (code 64) parsed from OPEN | `src/message/` | ✅ | `test_capability_graceful_restart_parsed` |
 | Capability forwarded to `SessionInfo` for upper layers | `src/fsm/mod.rs` | ✅ | `test_session_info_carries_graceful_restart` |
-| Stale timer: retain routes for restart-time seconds during restart | `src/fsm/mod.rs` | ❌ | — |
+| Stale timer: retain routes for restart-time seconds during restart | — | ✅ | Owned by `pathvectord` (GR deadline timer in event loop) — see `pathvectord/RFC.md` |
+| `TerminationReason` (Clean / Unclean) emitted on session close; upper layer uses it to decide GR eligibility | `src/transport/mod.rs` | ✅ | `test_termination_reason_notification_is_clean`, `test_termination_reason_tcp_failed_is_unclean`, `test_termination_reason_manual_stop_is_clean` |
 | EOR (End-of-RIB) marker: empty UPDATE sent after RIB dump | — | ✅ | Owned by `pathvectord` — see `pathvectord/RFC.md` |
 
-**Deferred:** FSM restart behavior (detecting peer restart, activating stale timer) requires
-coordination with `pathvector-rib` and is deferred. EOR send-side is implemented in `pathvectord`.
+**Deferred:** §3 SHOULD: suppress GR capability when peer's restart_time = 0 (logged as warning in `pathvectord`; deferred).
 
 ---
 
