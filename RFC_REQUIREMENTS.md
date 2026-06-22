@@ -36,7 +36,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 7854 | BGP Monitoring Protocol (BMP) | pathvector-bmp | ❌ | [bmp](pathvector-bmp/RFC.md#rfc-7854--bgp-monitoring-protocol-bmp) |
 | RFC 7911 | Advertisement of Multiple Paths (ADD-PATH) | pathvector-session, pathvector-rib | ❌ | — |
 | RFC 7947 | Internet Exchange BGP Route Server | pathvectord | ❌ | — |
-| RFC 7999 | BLACKHOLE Community | pathvector-types, pathvector-policy, pathvectord | ✅ | [types](pathvector-types/RFC.md#rfc-7999--blackhole-community) · [policy](pathvector-policy/RFC.md#rfc-7999--blackhole-community-policy-integration) · [daemon](pathvectord/RFC.md#rfc-7999--blackhole-community-discard-action) |
+| RFC 7999 | BLACKHOLE Community | pathvector-types, pathvector-policy, pathvectord, pathvector-sys | ✅ | [types](pathvector-types/RFC.md#rfc-7999--blackhole-community) · [policy](pathvector-policy/RFC.md#rfc-7999--blackhole-community-policy-integration) · [daemon](pathvectord/RFC.md#rfc-7999--blackhole-community-discard-action) · [sys](pathvector-sys/RFC.md#rfc-7999--blackhole-community-kernel-programming) |
 | RFC 8092 | BGP Large Communities | pathvector-types, pathvector-policy | ✅ | [types](pathvector-types/RFC.md#rfc-8092--bgp-large-communities-attribute) · [policy](pathvector-policy/RFC.md#rfc-8092--bgp-large-communities-attribute-policy-layer) |
 | RFC 8205 | BGPsec_PATH | pathvector-types, pathvector-session | ❌ | — |
 | RFC 8212 | Default eBGP Route Propagation | pathvectord | ✅ | [daemon](pathvectord/RFC.md#rfc-8212--default-external-bgp-route-propagation-without-policy) |
