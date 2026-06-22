@@ -2550,6 +2550,116 @@ mod tests {
         );
     }
 
+    /// Regression: when a session tears down, kernel null routes installed for
+    /// BLACKHOLE-tagged prefixes from that peer must be withdrawn.
+    /// Previously `on_terminated` cleared AdjRibIn without scanning for
+    /// BLACKHOLE routes, leaking the kernel null route indefinitely.
+    #[test]
+    fn blackhole_route_removed_on_session_teardown() {
+        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let fib = with_recording_fib(&mut state);
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        fib.blackhole_v4.lock().unwrap().clear();
+
+        state.on_terminated(peer, TerminationReason::Clean, false);
+
+        let bh = fib.blackhole_v4.lock().unwrap().clone();
+        let nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        assert!(
+            bh.iter().any(|(n, announced)| *n == nlri && !*announced),
+            "on_terminated must call withdraw_blackhole_v4 for BLACKHOLE-tagged prefixes"
+        );
+    }
+
+    /// Regression: when a unicast route for prefix X is in LocRib and a peer
+    /// re-announces X with the BLACKHOLE community, the unicast LocRib entry
+    /// must be removed so a unicast kernel route and a null route don't coexist.
+    #[test]
+    fn blackhole_upgrade_evicts_unicast_from_loc_rib() {
+        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        with_recording_fib(&mut state);
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        // First announce as unicast — enters LocRib.
+        state.on_route_update(
+            peer,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop("192.0.2.1".parse::<Ipv4Addr>().unwrap()),
+                ],
+                announced: vec!["10.0.0.0/8".parse().unwrap()],
+            },
+        );
+        assert_eq!(Arc::clone(&state.rib).loc_rib.len(), 1, "unicast must be in LocRib");
+
+        // Now re-announce the same prefix with BLACKHOLE community.
+        state.on_route_update(peer, blackhole_announce("10.0.0.0/8"));
+
+        assert_eq!(
+            Arc::clone(&state.rib).loc_rib.len(),
+            0,
+            "re-announcement as BLACKHOLE must evict the unicast LocRib entry"
+        );
+    }
+
+    /// Regression: a BLACKHOLE route held through GR (peer's stale routes
+    /// retained) must have its kernel null route removed when the GR deadline
+    /// expires and the stale routes are flushed.
+    #[test]
+    fn blackhole_route_removed_when_gr_deadline_expires() {
+        use pathvector_session::message::{Capability, GracefulRestartFamily};
+        use pathvector_types::AfiSafi;
+
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut state, _rxs) = make_state(65001, &[(peer, 65002)]);
+        let fib = with_recording_fib(&mut state);
+
+        let gr_family = GracefulRestartFamily {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            forwarding_preserved: true,
+        };
+        state.on_established(
+            peer,
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![gr_family],
+            }],
+            None,
+        );
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        // Install a BLACKHOLE kernel null route.
+        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        fib.blackhole_v4.lock().unwrap().clear();
+
+        // Session drops uncleanly — GR helper mode entered, stale routes kept.
+        state.on_terminated(peer, TerminationReason::Unclean, false);
+
+        // GR deadline expires — stale routes must be flushed.
+        state.on_gr_deadline_expired(peer);
+
+        let bh = fib.blackhole_v4.lock().unwrap().clone();
+        let nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        assert!(
+            bh.iter().any(|(n, announced)| *n == nlri && !*announced),
+            "GR deadline expiry must withdraw the kernel null route for stale BLACKHOLE prefix"
+        );
+    }
+
     // ── MP_UNREACH_NLRI / MP_REACH_NLRI (RFC 4760) ───────────────────────────
 
     #[test]

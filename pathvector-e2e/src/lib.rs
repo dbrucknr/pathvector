@@ -1196,6 +1196,104 @@ impl FibHarness {
             .expect("docker exec gobgp withdraw");
         assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
     }
+
+    /// Announce a prefix tagged with the BLACKHOLE community (65535:666,
+    /// RFC 7999) from GoBGP so pathvectord receives a BLACKHOLE UPDATE.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_announce_blackhole(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp",
+                "global",
+                "rib",
+                "add",
+                prefix,
+                "nexthop",
+                &self.gobgp_ip.to_string(),
+                "origin",
+                "igp",
+                "community",
+                "65535:666",
+            ])
+            .status()
+            .expect("docker exec gobgp announce blackhole");
+        assert!(
+            status.success(),
+            "gobgp announce blackhole {prefix} failed: {status}"
+        );
+    }
+}
+
+/// Polls `ip route show table 254 proto bgp` inside `container_id` until
+/// `prefix` appears as a `blackhole` route.
+///
+/// The Linux kernel renders RTN_BLACKHOLE routes as:
+/// `blackhole <prefix> proto bgp`
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the blackhole route appears.
+pub async fn wait_for_kernel_blackhole_route(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            let full_table = Command::new("docker")
+                .args(["exec", container_id, "ip", "route", "show", "table", "254"])
+                .output()
+                .map_or_else(
+                    |e| format!("<ip route failed: {e}>"),
+                    |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+                );
+            return Err(format!(
+                "timed out waiting for kernel blackhole route {prefix} (proto bgp) in container {container_id}\nfull table:\n{full_table}"
+            ));
+        }
+        let out = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "ip",
+                "route",
+                "show",
+                "table",
+                "254",
+                "proto",
+                "bgp",
+            ])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            // The kernel renders RTN_BLACKHOLE as "blackhole <prefix> proto bgp"
+            if text.contains("blackhole") && text.contains(prefix) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Polls `ip route show table 254 proto bgp` inside `container_id` until
+/// `prefix` is absent.
+///
+/// Shared with both unicast and blackhole withdrawal assertions.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix disappears.
+pub async fn wait_for_kernel_blackhole_route_withdrawn(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_kernel_route_withdrawn(container_id, prefix, timeout).await
 }
 
 /// Polls `ip route show table 254 proto bgp` inside `container_id` until

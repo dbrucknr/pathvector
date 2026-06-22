@@ -1058,6 +1058,9 @@ pub(super) fn handle_update(
         // RFC 7999: routes tagged with the BLACKHOLE community bypass LocRib
         // and outbound advertisement. Store in AdjRibIn for soft-reconfig, and
         // program a kernel null route so the local box drops the traffic too.
+        // If the prefix was previously a unicast route from this peer, evict it
+        // from LocRib — a unicast FIB entry and a kernel null route must not
+        // coexist for the same prefix.
         if raw
             .rare_or_default()
             .communities
@@ -1065,6 +1068,7 @@ pub(super) fn handle_update(
             .any(|c| c.is_blackhole())
         {
             adj_rib_in.insert(raw.clone());
+            fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
             tracing::debug!(peer = %peer, prefix = %nlri, "programming kernel null route for BLACKHOLE prefix (RFC 7999)");
             blackhole_announced_v4.push(nlri);
             rejected += 1;
@@ -1164,6 +1168,7 @@ pub(super) fn handle_update(
             .any(|c| c.is_blackhole())
         {
             adj_rib_in_v6.insert(raw.clone());
+            fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
             tracing::debug!(peer = %peer, prefix = %nlri, "programming kernel null route for BLACKHOLE IPv6 prefix (RFC 7999)");
             blackhole_announced_v6.push(nlri);
             rejected_v6 += 1;
