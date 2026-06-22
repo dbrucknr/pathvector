@@ -75,10 +75,7 @@ impl DaemonState {
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
         self.rib_mut().gr_capable_peers.remove(&peer_ip);
-        self.gr_peer_families.remove(&peer_ip);
-        self.gr_stale_nlri.remove(&peer_ip);
-        self.gr_stale_nlri_v6.remove(&peer_ip);
-        self.gr_deadlines.remove(&peer_ip);
+        self.gr.remove_peer(peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
         self.pending_decisions.remove(&peer_ip);
@@ -161,16 +158,16 @@ impl DaemonState {
         // RFC 4724 §4.2 — GR re-establishment: if we were holding stale routes
         // from this peer, cancel the deadline.  The peer will re-advertise its
         // full table; EOR receipt triggers `prune_stale_nlri` below.
-        let was_in_gr = self.gr_deadlines.remove(&peer_ip).is_some();
+        let was_in_gr = self.gr.deadlines.remove(&peer_ip).is_some();
         // Determine which families the peer supports GR for (from prior session).
         let gr_v4 = was_in_gr
             && self
-                .gr_peer_families
+                .gr.peer_families
                 .get(&peer_ip)
                 .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
         let gr_v6 = was_in_gr
             && self
-                .gr_peer_families
+                .gr.peer_families
                 .get(&peer_ip)
                 .is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
         if was_in_gr {
@@ -183,7 +180,7 @@ impl DaemonState {
                     .map(|ari| ari.routes().map(|(nlri, _)| *nlri).collect())
                     .unwrap_or_default();
                 if !stale_now.is_empty() {
-                    self.gr_stale_nlri.insert(peer_ip, stale_now);
+                    self.gr.stale_nlri.insert(peer_ip, stale_now);
                 }
             }
             if gr_v6 {
@@ -193,13 +190,13 @@ impl DaemonState {
                     .map(|ari| ari.routes().map(|(nlri, _)| *nlri).collect())
                     .unwrap_or_default();
                 if !stale_now_v6.is_empty() {
-                    self.gr_stale_nlri_v6.insert(peer_ip, stale_now_v6);
+                    self.gr.stale_nlri_v6.insert(peer_ip, stale_now_v6);
                 }
             }
             tracing::info!(
                 peer = %peer_ip,
-                stale_v4 = self.gr_stale_nlri.get(&peer_ip).map_or(0, HashSet::len),
-                stale_v6 = self.gr_stale_nlri_v6.get(&peer_ip).map_or(0, HashSet::len),
+                stale_v4 = self.gr.stale_nlri.get(&peer_ip).map_or(0, HashSet::len),
+                stale_v6 = self.gr.stale_nlri_v6.get(&peer_ip).map_or(0, HashSet::len),
                 "peer re-established within GR window — stale routes kept until EOR"
             );
         }
@@ -430,9 +427,9 @@ impl DaemonState {
             }
         }
         if peer_gr_time.is_some() {
-            self.gr_peer_families.insert(peer_ip, peer_gr_families);
+            self.gr.peer_families.insert(peer_ip, peer_gr_families);
         } else {
-            self.gr_peer_families.remove(&peer_ip);
+            self.gr.peer_families.remove(&peer_ip);
         }
         if peer_gr_time.is_none() && we_advertise_gr {
             tracing::warn!(
@@ -512,7 +509,7 @@ impl DaemonState {
         if enter_gr {
             // RFC 4724 §4.2 — only retain routes for families the peer
             // included in its GracefulRestart capability.
-            let families = self.gr_peer_families.get(&peer_ip);
+            let families = self.gr.peer_families.get(&peer_ip);
             let gr_v4 =
                 families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV4_UNICAST));
             let gr_v6 =
@@ -529,7 +526,7 @@ impl DaemonState {
             // GR helper path — retain covered routes; arm deadline timer.
             let deadline =
                 Instant::now() + std::time::Duration::from_secs(u64::from(gr_restart_time));
-            self.gr_deadlines.insert(peer_ip, deadline);
+            self.gr.deadlines.insert(peer_ip, deadline);
             tracing::info!(
                 peer = %peer_ip,
                 restart_time = gr_restart_time,

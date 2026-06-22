@@ -24,7 +24,7 @@ impl DaemonState {
             // RFC 4724 §4.2 — EOR ends the GR re-establishment window.  Any
             // NLRIs still in the stale set were not refreshed by the peer and
             // must be withdrawn now.
-            if let Some(stale) = self.gr_stale_nlri.remove(&peer_ip) {
+            if let Some(stale) = self.gr.stale_nlri.remove(&peer_ip) {
                 let count = stale.len();
                 if count > 0 {
                     tracing::info!(
@@ -48,7 +48,7 @@ impl DaemonState {
         {
             tracing::info!(peer = %peer_ip, "received IPv6 unicast End-of-RIB marker (RFC 4724 §2)");
             Arc::make_mut(&mut self.rib).eor_received_v6.insert(peer_ip);
-            if let Some(stale) = self.gr_stale_nlri_v6.remove(&peer_ip) {
+            if let Some(stale) = self.gr.stale_nlri_v6.remove(&peer_ip) {
                 let count = stale.len();
                 if count > 0 {
                     tracing::info!(
@@ -229,12 +229,12 @@ impl DaemonState {
         // RFC 4724 §4.2 — during GR re-establishment, any NLRI the peer
         // re-announces is no longer stale.  Remove it from the tracking sets so
         // it is not withdrawn when EOR arrives.
-        if let Some(stale) = self.gr_stale_nlri.get_mut(&peer_ip) {
+        if let Some(stale) = self.gr.stale_nlri.get_mut(&peer_ip) {
             for nlri in &msg.announced {
                 stale.remove(nlri);
             }
         }
-        if let Some(stale_v6) = self.gr_stale_nlri_v6.get_mut(&peer_ip) {
+        if let Some(stale_v6) = self.gr.stale_nlri_v6.get_mut(&peer_ip) {
             for attr in &msg.attributes {
                 if let PathAttribute::MpReachNlri(m) = attr
                     && m.afi_safi == AfiSafi::IPV6_UNICAST

@@ -417,13 +417,13 @@ pathvectord currently logs a warning but still advertises its own GR capability.
 RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
 overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
 
-**7. `daemon.rs` GR logic should move to a dedicated module**
+~~**7. `daemon.rs` GR logic should move to a dedicated module**~~
 
-The GR-related functions (`mark_stale_and_repropagate`, `prune_stale_routes_v4/v6`,
-the deadline timer branch) are correct but embedded in a 14k-line file. When
-splitting the daemon becomes worthwhile, extract these into
-`pathvectord/src/graceful_restart.rs` with `DaemonState` as a parameter. No
-behaviour change — purely a maintainability improvement.
+~~Resolved 2026-06-22: `daemon.rs` split into 8 submodules; GR logic now lives in
+`daemon/gr.rs`. The four scattered GR fields on `DaemonState` consolidated into
+`GracefulRestartState` with `earliest_deadline()`, `drain_expired()`, and
+`remove_peer()` helpers. O(n²) `Vec::contains` in `repropagate_after_stale_mark_v4`
+fixed to `HashSet` lookup. Double write-lock bug in GR deadline branch corrected.~~
 
 ### Remaining
 

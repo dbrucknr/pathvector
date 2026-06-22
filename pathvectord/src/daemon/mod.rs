@@ -47,6 +47,7 @@ mod route;
 // items defined in other sibling submodules.
 use capabilities::{SpawnConfig, build_local_capabilities};
 use fib::withdraw_stale_bgp_routes;
+use gr::GracefulRestartState;
 use peer::{run_bgp_listener, run_command_processor};
 use route::{reapply_import_policy, reapply_import_policy_v6};
 #[cfg(test)]
@@ -290,27 +291,10 @@ pub(crate) struct DaemonState {
     /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
     /// resetting it for a reconnect.
     pub(crate) pending_removal: HashSet<Ipv4Addr>,
-    /// RFC 4724 §4.2 — active Graceful Restart windows, keyed by peer address.
+    /// RFC 4724 §4.2 GR state: active windows, stale-NLRI snapshots, peer families.
     ///
-    /// Present while pathvectord is holding stale routes from a peer that
-    /// disconnected uncleanly.  Mapped to the `Instant` at which the window
-    /// expires.  On expiry the stale routes are flushed exactly as they would
-    /// be in a normal `on_terminated`.  On re-establishment the entry is
-    /// cancelled and normal EOR-based pruning takes over.
-    pub(crate) gr_deadlines: HashMap<Ipv4Addr, Instant>,
-    /// NLRIs that were in AdjRibIn when a GR peer re-established.
-    ///
-    /// Set in `on_established` when `gr_deadlines` had an entry for the peer.
-    /// Routes that are NOT refreshed by the peer before its EOR are stale and
-    /// must be withdrawn when the EOR arrives.  Cleared on EOR or on deadline
-    /// expiry (whichever comes first).
-    pub(crate) gr_stale_nlri: HashMap<Ipv4Addr, HashSet<Nlri<Ipv4Addr>>>,
-    /// IPv6 counterpart of `gr_stale_nlri` — same lifecycle, v6 NLRIs only.
-    pub(crate) gr_stale_nlri_v6: HashMap<Ipv4Addr, HashSet<Nlri<Ipv6Addr>>>,
-    /// Per-family GR info from the most-recent peer OPEN.  Retained across
-    /// termination so `on_terminated` knows which families the peer supports
-    /// GR for.  Cleared when the peer is removed.
-    pub(crate) gr_peer_families: HashMap<Ipv4Addr, Vec<GracefulRestartFamily>>,
+    /// See [`GracefulRestartState`] for field-level documentation.
+    pub(crate) gr: GracefulRestartState,
     /// RFC 9003 shutdown reason strings, keyed by peer address.
     ///
     /// Populated when a peer is added (static or dynamic) and has a
@@ -484,10 +468,7 @@ impl DaemonState {
             pending_decisions: HashMap::new(),
             pending_decisions_v6: HashMap::new(),
             pending_removal: HashSet::new(),
-            gr_deadlines: HashMap::new(),
-            gr_stale_nlri: HashMap::new(),
-            gr_stale_nlri_v6: HashMap::new(),
-            gr_peer_families: HashMap::new(),
+            gr: GracefulRestartState::new(),
             shutdown_messages,
             route_tx,
             peer_tx,
@@ -1010,7 +991,7 @@ pub(crate) async fn run_event_loop(
             // active deadline is reached.  If there are no active GR windows the
             // future is `pending()` so this branch never wakes the select.
             () = async {
-                let earliest = state.read().await.gr_deadlines.values().copied().min();
+                let earliest = state.read().await.gr.earliest_deadline();
                 match earliest {
                     Some(d) => tokio::time::sleep_until(d.into()).await,
                     None    => std::future::pending::<()>().await,
@@ -1018,21 +999,15 @@ pub(crate) async fn run_event_loop(
             } => {
                 let now = Instant::now();
                 let expired: Vec<Ipv4Addr> = {
-                    let s = state.read().await;
-                    s.gr_deadlines
-                        .iter()
-                        .filter(|(_, d)| **d <= now)
-                        .map(|(&ip, _)| ip)
-                        .collect()
+                    let mut s = state.write().await;
+                    let expired = s.gr.drain_expired(now);
+                    for peer_ip in &expired {
+                        s.on_gr_deadline_expired(*peer_ip);
+                    }
+                    expired
                 };
                 if !expired.is_empty() {
-                    let mut s = state.write().await;
-                    for peer_ip in expired {
-                        s.gr_deadlines.remove(&peer_ip);
-                        s.on_gr_deadline_expired(peer_ip);
-                    }
-                    let stalled = s.take_stalled_peers();
-                    drop(s);
+                    let stalled = state.write().await.take_stalled_peers();
                     for peer in stalled {
                         tracing::error!(
                             peer = %peer,
@@ -11118,7 +11093,7 @@ mod test_gr_phase2 {
             "LocRib route must be retained during GR window"
         );
         assert!(
-            state.gr_deadlines.contains_key(&PEER_IP),
+            state.gr.deadlines.contains_key(&PEER_IP),
             "gr_deadlines must be armed for the peer"
         );
     }
@@ -11139,7 +11114,7 @@ mod test_gr_phase2 {
             "LocRib must be flushed immediately on clean termination"
         );
         assert!(
-            !state.gr_deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&PEER_IP),
             "gr_deadlines must not be armed on clean termination"
         );
     }
@@ -11160,7 +11135,7 @@ mod test_gr_phase2 {
             "LocRib must be flushed for a non-GR peer even on unclean termination"
         );
         assert!(
-            !state.gr_deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&PEER_IP),
             "gr_deadlines must not be armed for a non-GR peer"
         );
     }
@@ -11221,10 +11196,10 @@ mod test_gr_phase2 {
             1,
             "route retained during GR window"
         );
-        assert!(state.gr_deadlines.contains_key(&PEER_IP));
+        assert!(state.gr.deadlines.contains_key(&PEER_IP));
 
         // Simulate deadline expiry.
-        state.gr_deadlines.remove(&PEER_IP);
+        state.gr.deadlines.remove(&PEER_IP);
         state.on_gr_deadline_expired(PEER_IP);
 
         assert_eq!(
@@ -11246,7 +11221,7 @@ mod test_gr_phase2 {
         // First unclean disconnect — opens GR window.
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
         let first_deadline = *state
-            .gr_deadlines
+            .gr.deadlines
             .get(&PEER_IP)
             .expect("deadline must be set after first unclean disconnect");
 
@@ -11254,7 +11229,7 @@ mod test_gr_phase2 {
         establish_with_gr(&mut state, 30);
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
         let second_deadline = *state
-            .gr_deadlines
+            .gr.deadlines
             .get(&PEER_IP)
             .expect("deadline must still be set after second unclean disconnect");
 
@@ -11271,7 +11246,7 @@ mod test_gr_phase2 {
             "routes must be retained after re-termination during GR window"
         );
         assert!(
-            state.gr_deadlines.contains_key(&PEER_IP),
+            state.gr.deadlines.contains_key(&PEER_IP),
             "gr_deadlines must remain armed after re-termination"
         );
     }
@@ -11288,7 +11263,7 @@ mod test_gr_phase2 {
         // First disconnect is unclean — GR window opens.
         state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
         assert_eq!(state.rib.loc_rib.len(), 1, "route held during GR window");
-        assert!(state.gr_deadlines.contains_key(&PEER_IP));
+        assert!(state.gr.deadlines.contains_key(&PEER_IP));
 
         // Peer re-establishes then sends a NOTIFICATION (clean).
         establish_with_gr(&mut state, 30);
@@ -11300,7 +11275,7 @@ mod test_gr_phase2 {
             "clean termination during GR window must flush routes immediately"
         );
         assert!(
-            !state.gr_deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&PEER_IP),
             "gr_deadlines must be cleared on clean termination"
         );
     }

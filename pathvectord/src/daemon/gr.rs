@@ -2,6 +2,69 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Per-daemon GR state: active windows, stale-NLRI snapshots, and peer family info.
+///
+/// Consolidates four `DaemonState` fields that share a key type and lifecycle:
+/// created together on unclean termination, read together on re-establishment,
+/// and removed together on deadline expiry or peer removal.
+pub(crate) struct GracefulRestartState {
+    /// Active GR windows: `peer_ip → Instant` at which the window expires.
+    ///
+    /// Present while pathvectord holds stale routes from an uncleanly-terminated
+    /// GR-capable peer.  Removed on re-establishment or deadline expiry.
+    pub(crate) deadlines: HashMap<Ipv4Addr, Instant>,
+    /// NLRIs snapshotted from AdjRibIn at GR re-establishment time (IPv4).
+    ///
+    /// Routes that are not refreshed by the peer before its EOR are withdrawn on
+    /// EOR receipt.  Cleared on EOR, deadline expiry, or peer removal.
+    pub(crate) stale_nlri: HashMap<Ipv4Addr, HashSet<Nlri<Ipv4Addr>>>,
+    /// IPv6 counterpart of `stale_nlri` — same lifecycle, v6 NLRIs only.
+    pub(crate) stale_nlri_v6: HashMap<Ipv4Addr, HashSet<Nlri<Ipv6Addr>>>,
+    /// Per-family GR info from the most-recent peer OPEN.
+    ///
+    /// Retained across termination so `on_terminated` knows which AFI/SAFIs the
+    /// peer declared GR support for.  Cleared only on `remove_peer`.
+    pub(crate) peer_families: HashMap<Ipv4Addr, Vec<GracefulRestartFamily>>,
+}
+
+impl GracefulRestartState {
+    pub(crate) fn new() -> Self {
+        Self {
+            deadlines: HashMap::new(),
+            stale_nlri: HashMap::new(),
+            stale_nlri_v6: HashMap::new(),
+            peer_families: HashMap::new(),
+        }
+    }
+
+    /// Remove all GR state for `peer_ip`.  Called from `remove_peer`.
+    pub(crate) fn remove_peer(&mut self, peer_ip: Ipv4Addr) {
+        self.deadlines.remove(&peer_ip);
+        self.stale_nlri.remove(&peer_ip);
+        self.stale_nlri_v6.remove(&peer_ip);
+        self.peer_families.remove(&peer_ip);
+    }
+
+    /// Earliest deadline across all active GR windows, or `None` when empty.
+    pub(crate) fn earliest_deadline(&self) -> Option<Instant> {
+        self.deadlines.values().copied().min()
+    }
+
+    /// Drain all peers whose deadline has passed.  Returns their addresses.
+    pub(crate) fn drain_expired(&mut self, now: Instant) -> Vec<Ipv4Addr> {
+        let expired: Vec<Ipv4Addr> = self
+            .deadlines
+            .iter()
+            .filter(|(_, d)| **d <= now)
+            .map(|(ip, _)| *ip)
+            .collect();
+        for ip in &expired {
+            self.deadlines.remove(ip);
+        }
+        expired
+    }
+}
+
 impl DaemonState {
     pub(super) fn mark_stale_and_repropagate(&mut self, peer_ip: Ipv4Addr, do_v4: bool, do_v6: bool) {
         let stale_peer = PeerId::from(peer_ip);
@@ -66,17 +129,13 @@ impl DaemonState {
         peer_ip: Ipv4Addr,
         prev_prefixes: &[Nlri<Ipv4Addr>],
     ) {
+        // Use a HashSet for O(1) membership tests; the slice-based contains is O(n²).
+        let prev_set: HashSet<Nlri<Ipv4Addr>> = prev_prefixes.iter().copied().collect();
         let affected: Vec<Nlri<Ipv4Addr>> = self
             .rib
             .loc_rib
             .best_routes()
-            .filter_map(|(n, _)| {
-                if prev_prefixes.contains(&n) {
-                    Some(n)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(n, _)| if prev_set.contains(&n) { Some(n) } else { None })
             .chain(
                 prev_prefixes
                     .iter()
@@ -397,8 +456,8 @@ impl DaemonState {
             "GR restart window expired — flushing stale routes"
         );
         // Remove any stale tracking (re-establishment was not attempted).
-        self.gr_stale_nlri.remove(&peer_ip);
-        self.gr_stale_nlri_v6.remove(&peer_ip);
+        self.gr.stale_nlri.remove(&peer_ip);
+        self.gr.stale_nlri_v6.remove(&peer_ip);
         // Clear AdjRibIn and flush LocRib exactly as on_terminated does.
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
