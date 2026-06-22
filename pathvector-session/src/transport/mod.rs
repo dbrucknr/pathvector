@@ -445,7 +445,12 @@ impl<T: BgpTransport> Session<T> {
             // FSM only emits SessionTerminated from that state.
             if self.fsm.is_established() {
                 self.termination_reason = match &input {
+                    // Peer sent NOTIFICATION → clean session close from their side.
                     FsmInput::MessageReceived(BgpMessage::Notification(_)) => {
+                        TerminationReason::Clean
+                    }
+                    // Operator-initiated stop: we send CEASE or just halt.
+                    FsmInput::ManualStop | FsmInput::NotificationToSend(_) => {
                         TerminationReason::Clean
                     }
                     _ => TerminationReason::Unclean,

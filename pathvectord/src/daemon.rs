@@ -3114,10 +3114,12 @@ async fn run_command_processor<H, F>(
                     // stop sender was dropped).  Synthesize Terminated directly so the
                     // event loop still performs the pending_removal cleanup path —
                     // otherwise the peer would be stuck in pending_removal forever.
+                    // Operator-initiated removal with no live session — use
+                    // Clean so on_terminated does not open a GR window.
                     let _ = event_tx
                         .send((
                             peer_ip,
-                            SessionEvent::Terminated(TerminationReason::Unclean),
+                            SessionEvent::Terminated(TerminationReason::Clean),
                         ))
                         .await;
                 }
