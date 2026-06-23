@@ -2487,6 +2487,18 @@ mod tests {
         }
     }
 
+    fn unicast_announce(prefix: &str, next_hop: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::NextHop(next_hop.parse::<Ipv4Addr>().unwrap()),
+            ],
+            announced: vec![prefix.parse().unwrap()],
+        }
+    }
+
     /// A BLACKHOLE-tagged route must trigger `apply_blackhole_v4` on the FIB
     /// manager so the kernel programs a null route.
     #[test]
@@ -2707,6 +2719,58 @@ mod tests {
         assert!(
             bh.iter().any(|(n, announced)| *n == nlri && !*announced),
             "IPv4 BLACKHOLE kernel null route must be withdrawn when IPv4 is not a GR family"
+        );
+    }
+
+    /// When peer A sends a BLACKHOLE route for prefix X (suppressing any prior
+    /// unicast entry), and peer B has a unicast route for X in LocRib, withdrawing
+    /// the BLACKHOLE must re-install peer B's unicast route in the kernel FIB.
+    ///
+    /// Without the fix, `loc_rib.withdraw(&peer_a, X)` returns `Unchanged` (A was
+    /// never in LocRib for the BLACKHOLE) and no FIB event fires for B's route —
+    /// leaving the kernel with no route for X despite LocRib having B's path.
+    #[test]
+    fn blackhole_withdrawal_restores_surviving_peer_unicast_route() {
+        let peer_a = Ipv4Addr::new(10, 0, 0, 2);
+        let peer_b = Ipv4Addr::new(10, 0, 0, 3);
+        let (mut state, _rxs) =
+            make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let fib = with_recording_fib(&mut state);
+
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.set_import_default(peer_a, DefaultAction::Accept);
+        state.set_import_default(peer_b, DefaultAction::Accept);
+
+        // Peer B announces a unicast route for the prefix.
+        state.on_route_update(peer_b, unicast_announce("10.2.0.0/24", "10.0.0.3"));
+
+        // Peer A announces the same prefix with BLACKHOLE community.
+        // This should program a kernel null route.
+        state.on_route_update(peer_a, blackhole_announce("10.2.0.0/24"));
+
+        // Clear the recorded FIB events so we only observe what happens on withdrawal.
+        fib.v4.lock().unwrap().clear();
+        fib.blackhole_v4.lock().unwrap().clear();
+
+        // Peer A withdraws the BLACKHOLE route.
+        state.on_route_update(peer_a, blackhole_withdraw("10.2.0.0/24"));
+
+        let nlri: Nlri<Ipv4Addr> = "10.2.0.0/24".parse().unwrap();
+
+        // The kernel null route must be withdrawn.
+        let bh = fib.blackhole_v4.lock().unwrap().clone();
+        assert!(
+            bh.iter().any(|(n, announced)| *n == nlri && !*announced),
+            "BLACKHOLE withdrawal must remove the kernel null route"
+        );
+
+        // Peer B's unicast route must be re-installed in the kernel FIB.
+        let v4 = fib.v4.lock().unwrap().clone();
+        assert!(
+            v4.iter().any(|c| matches!(c, BestPathChange::Announced(n, _) if *n == nlri)),
+            "BLACKHOLE withdrawal must trigger re-install of surviving peer-B unicast route; \
+             got: {v4:?}"
         );
     }
 

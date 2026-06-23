@@ -289,9 +289,19 @@ impl DaemonState {
             }
             for nlri in result.blackhole_withdrawn_v4 {
                 fm.withdraw_blackhole_v4(nlri);
+                // If another peer's unicast route survives in LocRib for this
+                // NLRI, re-install it. The BLACKHOLE route bypassed LocRib, so
+                // its withdrawal does not automatically trigger a FIB re-install
+                // of any competing unicast best path.
+                if let Some(route) = rib.loc_rib.best(&nlri) {
+                    fm.apply_v4(BestPathChange::Announced(nlri, route.clone()));
+                }
             }
             for nlri in result.blackhole_withdrawn_v6 {
                 fm.withdraw_blackhole_v6(nlri);
+                if let Some(route) = rib.loc_rib_v6.best(&nlri) {
+                    fm.apply_v6(BestPathChange::Announced(nlri, route.clone()));
+                }
             }
         }
 
