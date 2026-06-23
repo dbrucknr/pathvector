@@ -131,8 +131,9 @@ async fn blackhole_route_is_not_installed_as_unicast() {
         .await
         .expect("192.0.4.0/24 (BLACKHOLE) kernel null route did not appear within 15 s");
 
-    // Verify there is no via/nexthop entry for this prefix — it must only be
-    // the blackhole variant. `ip route show` without "proto bgp" to catch any type.
+    // Verify the BGP table entry for this prefix is `blackhole` only — no `via`
+    // nexthop. Restrict to `table 254 proto bgp` so we only see BGP-installed
+    // routes and don't pick up routes from other tables or protocols.
     let output = std::process::Command::new("docker")
         .args([
             "exec",
@@ -140,17 +141,21 @@ async fn blackhole_route_is_not_installed_as_unicast() {
             "ip",
             "route",
             "show",
+            "table",
+            "254",
+            "proto",
+            "bgp",
             "192.0.4.0/24",
         ])
         .output()
-        .expect("docker exec ip route show");
+        .expect("docker exec ip route show table 254 proto bgp 192.0.4.0/24");
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !text.contains("via"),
-        "BLACKHOLE prefix must not be installed as a unicast (via) route; got: {text}"
+        text.contains("blackhole"),
+        "BLACKHOLE prefix must appear as a kernel blackhole route in table 254 proto bgp; got: {text}"
     );
     assert!(
-        text.contains("blackhole"),
-        "BLACKHOLE prefix must appear as a kernel blackhole route; got: {text}"
+        !text.contains("via"),
+        "BLACKHOLE prefix must not be installed as a unicast (via) route in table 254 proto bgp; got: {text}"
     );
 }
