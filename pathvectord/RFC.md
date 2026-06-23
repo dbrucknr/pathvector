@@ -170,6 +170,20 @@ lives in `pathvector-policy`. Kernel programming lives in `pathvector-sys`.
 | BLACKHOLE route not advertised to peers | `src/daemon/route.rs` | ✅ | `blackhole_route_not_in_loc_rib` (LocRib empty → nothing propagated) |
 | Kernel null route (`RTN_BLACKHOLE`) programmed on announce | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_programs_kernel_null_route` |
 | Kernel null route removed on withdrawal | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_withdrawal_removes_kernel_null_route` |
+| BLACKHOLE routes for non-GR address families withdrawn on unclean peer termination | `src/daemon/peer.rs` | ✅ | `blackhole_route_removed_for_non_gr_family_on_unclean_termination` |
+| Surviving unicast best path re-installed after BLACKHOLE withdrawal | `src/daemon/route.rs` | ✅ | `blackhole_withdrawal_restores_surviving_peer_unicast_route` |
+
+**Known limitation — BLACKHOLE-to-unicast failover coalescing:** when a BLACKHOLE route is
+withdrawn and a competing unicast best path exists in Loc-RIB for the same prefix, the
+FibManager coalescing map receives `WithdrawBlackhole` immediately followed by
+`Install { gateway }`. Because the map keeps only the latest desired state per prefix, the
+`Install` overwrites `WithdrawBlackhole` — the explicit `RTN_BLACKHOLE` kernel delete is
+skipped, and the kernel receives `RTM_NEWROUTE` (unicast) while the null route may still be
+present. In practice this works because `RTM_NEWROUTE` with `NLM_F_REPLACE` replaces the
+existing entry regardless of route type, but this code path has not been exercised by a
+multi-peer end-to-end test. If you operate a topology where a peer simultaneously
+originates both a BLACKHOLE and a unicast for the same prefix, verify this behavior in
+your environment.
 
 ---
 
