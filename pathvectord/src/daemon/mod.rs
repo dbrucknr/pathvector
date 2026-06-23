@@ -1164,7 +1164,7 @@ mod tests {
     pub(super) struct RecordingFib {
         pub(super) v4: Mutex<Vec<BestPathChange<Ipv4Addr>>>,
         pub(super) v6: Mutex<Vec<BestPathChange<Ipv6Addr>>>,
-        pub(super) blackhole_v4: Mutex<Vec<(Nlri<Ipv4Addr>, bool)>>,  // (nlri, announced)
+        pub(super) blackhole_v4: Mutex<Vec<(Nlri<Ipv4Addr>, bool)>>, // (nlri, announced)
         pub(super) blackhole_v6: Mutex<Vec<(Nlri<Ipv6Addr>, bool)>>,
     }
     impl RecordingFib {
@@ -2514,7 +2514,8 @@ mod tests {
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let announced_nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
         assert!(
-            bh.iter().any(|(n, announced)| *n == announced_nlri && *announced),
+            bh.iter()
+                .any(|(n, announced)| *n == announced_nlri && *announced),
             "apply_blackhole_v4 must be called for BLACKHOLE-tagged prefix"
         );
     }
@@ -2557,7 +2558,8 @@ mod tests {
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let withdrawn_nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
         assert!(
-            bh.iter().any(|(n, announced)| *n == withdrawn_nlri && !announced),
+            bh.iter()
+                .any(|(n, announced)| *n == withdrawn_nlri && !announced),
             "withdraw_blackhole_v4 must be called when BLACKHOLE route is withdrawn"
         );
     }
@@ -2611,7 +2613,11 @@ mod tests {
                 announced: vec!["10.0.0.0/8".parse().unwrap()],
             },
         );
-        assert_eq!(Arc::clone(&state.rib).loc_rib.len(), 1, "unicast must be in LocRib");
+        assert_eq!(
+            Arc::clone(&state.rib).loc_rib.len(),
+            1,
+            "unicast must be in LocRib"
+        );
 
         // Now re-announce the same prefix with BLACKHOLE community.
         state.on_route_update(peer, blackhole_announce("10.0.0.0/8"));
@@ -2733,8 +2739,7 @@ mod tests {
     fn blackhole_withdrawal_restores_surviving_peer_unicast_route() {
         let peer_a = Ipv4Addr::new(10, 0, 0, 2);
         let peer_b = Ipv4Addr::new(10, 0, 0, 3);
-        let (mut state, _rxs) =
-            make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, _rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
         let fib = with_recording_fib(&mut state);
 
         state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
@@ -2768,7 +2773,8 @@ mod tests {
         // Peer B's unicast route must be re-installed in the kernel FIB.
         let v4 = fib.v4.lock().unwrap().clone();
         assert!(
-            v4.iter().any(|c| matches!(c, BestPathChange::Announced(n, _) if *n == nlri)),
+            v4.iter()
+                .any(|c| matches!(c, BestPathChange::Announced(n, _) if *n == nlri)),
             "BLACKHOLE withdrawal must trigger re-install of surviving peer-B unicast route; \
              got: {v4:?}"
         );
@@ -6409,7 +6415,8 @@ mod tests {
             65002,
             None,
             None,
-        ).notification
+        )
+        .notification
     }
 
     #[test]

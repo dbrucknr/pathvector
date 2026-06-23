@@ -636,7 +636,10 @@ mod tests {
         });
 
         assert!(oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
-        assert_eq!(oracle.igp_metric_v6("2001:db8::1".parse().unwrap()), Some(7));
+        assert_eq!(
+            oracle.igp_metric_v6("2001:db8::1".parse().unwrap()),
+            Some(7)
+        );
         assert_eq!(oracle.igp_metric_v6("2001:db9::1".parse().unwrap()), None);
     }
 
@@ -649,10 +652,14 @@ mod tests {
         // On non-Linux platforms (including macOS CI), the stub always returns [].
         // On Linux this test still compiles but would require a real netlink handle —
         // the assertion holds: an empty kernel produces empty stale lists.
-        assert!(v4.is_empty() || cfg!(target_os = "linux"),
-            "non-Linux stub must return empty v4");
-        assert!(v6.is_empty() || cfg!(target_os = "linux"),
-            "non-Linux stub must return empty v6");
+        assert!(
+            v4.is_empty() || cfg!(target_os = "linux"),
+            "non-Linux stub must return empty v4"
+        );
+        assert!(
+            v6.is_empty() || cfg!(target_os = "linux"),
+            "non-Linux stub must return empty v6"
+        );
     }
 
     // ── KernelFib construction and spawn ─────────────────────────────────────

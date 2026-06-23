@@ -84,7 +84,9 @@ impl NextHopOracle for DaemonOracle {
 /// The desired kernel state for an IPv4 prefix.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PendingV4 {
-    Install { gateway: Ipv4Addr },
+    Install {
+        gateway: Ipv4Addr,
+    },
     /// RFC 7999: program a kernel null route (`RTN_BLACKHOLE`) for this prefix.
     Blackhole,
     Withdraw,
@@ -93,7 +95,9 @@ pub(crate) enum PendingV4 {
 /// The desired kernel state for an IPv6 prefix.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PendingV6 {
-    Install { gateway: Ipv6Addr },
+    Install {
+        gateway: Ipv6Addr,
+    },
     /// RFC 7999: program a kernel null route (`RTN_BLACKHOLE`) for this prefix.
     Blackhole,
     Withdraw,
@@ -208,22 +212,34 @@ impl ApplyFibChange for FibManager {
     }
 
     fn apply_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>) {
-        self.pending_v4.lock().unwrap().insert(nlri, PendingV4::Blackhole);
+        self.pending_v4
+            .lock()
+            .unwrap()
+            .insert(nlri, PendingV4::Blackhole);
         self.notify.notify_one();
     }
 
     fn withdraw_blackhole_v4(&self, nlri: Nlri<Ipv4Addr>) {
-        self.pending_v4.lock().unwrap().insert(nlri, PendingV4::Withdraw);
+        self.pending_v4
+            .lock()
+            .unwrap()
+            .insert(nlri, PendingV4::Withdraw);
         self.notify.notify_one();
     }
 
     fn apply_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>) {
-        self.pending_v6.lock().unwrap().insert(nlri, PendingV6::Blackhole);
+        self.pending_v6
+            .lock()
+            .unwrap()
+            .insert(nlri, PendingV6::Blackhole);
         self.notify.notify_one();
     }
 
     fn withdraw_blackhole_v6(&self, nlri: Nlri<Ipv6Addr>) {
-        self.pending_v6.lock().unwrap().insert(nlri, PendingV6::Withdraw);
+        self.pending_v6
+            .lock()
+            .unwrap()
+            .insert(nlri, PendingV6::Withdraw);
         self.notify.notify_one();
     }
 }
@@ -439,23 +455,47 @@ mod tests {
         }
 
         async fn install_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
-            self.calls.lock().unwrap().blackhole_v4.push((dst, prefix_len));
+            self.calls
+                .lock()
+                .unwrap()
+                .blackhole_v4
+                .push((dst, prefix_len));
             Ok(())
         }
 
-        async fn withdraw_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+        async fn withdraw_blackhole_v4(
+            &self,
+            dst: Ipv4Addr,
+            prefix_len: u8,
+        ) -> std::io::Result<()> {
             // Reuse withdrawn_v4 for withdraw — distinguish by checking blackhole_v4 absence.
-            self.calls.lock().unwrap().withdrawn_v4.push((dst, prefix_len));
+            self.calls
+                .lock()
+                .unwrap()
+                .withdrawn_v4
+                .push((dst, prefix_len));
             Ok(())
         }
 
         async fn install_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
-            self.calls.lock().unwrap().blackhole_v6.push((dst, prefix_len));
+            self.calls
+                .lock()
+                .unwrap()
+                .blackhole_v6
+                .push((dst, prefix_len));
             Ok(())
         }
 
-        async fn withdraw_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
-            self.calls.lock().unwrap().withdrawn_v6.push((dst, prefix_len));
+        async fn withdraw_blackhole_v6(
+            &self,
+            dst: Ipv6Addr,
+            prefix_len: u8,
+        ) -> std::io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .withdrawn_v6
+                .push((dst, prefix_len));
             Ok(())
         }
     }

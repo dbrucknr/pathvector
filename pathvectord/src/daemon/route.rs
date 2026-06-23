@@ -801,10 +801,12 @@ pub(super) fn handle_update(
     for nlri in &msg.withdrawn {
         // If this NLRI had a blackhole kernel route (bypassed LocRib), record
         // it for withdrawal before clearing from AdjRibIn.
-        if adj_rib_in
-            .get(nlri)
-            .is_some_and(|r| r.rare_or_default().communities.iter().any(|c| c.is_blackhole()))
-        {
+        if adj_rib_in.get(nlri).is_some_and(|r| {
+            r.rare_or_default()
+                .communities
+                .iter()
+                .any(|c| c.is_blackhole())
+        }) {
             blackhole_withdrawn_v4.push(*nlri);
         }
         adj_rib_in.withdraw(nlri);
@@ -983,10 +985,12 @@ pub(super) fn handle_update(
     // ── MP_UNREACH_NLRI withdrawals (RFC 4760) ────────────────────────────
     let mp_withdrawn_count = mp_v4_withdrawn.len();
     for nlri in &mp_v4_withdrawn {
-        if adj_rib_in
-            .get(nlri)
-            .is_some_and(|r| r.rare_or_default().communities.iter().any(|c| c.is_blackhole()))
-        {
+        if adj_rib_in.get(nlri).is_some_and(|r| {
+            r.rare_or_default()
+                .communities
+                .iter()
+                .any(|c| c.is_blackhole())
+        }) {
             blackhole_withdrawn_v4.push(*nlri);
         }
         adj_rib_in.withdraw(nlri);
@@ -1104,10 +1108,12 @@ pub(super) fn handle_update(
     // ── MP_UNREACH_NLRI IPv6 withdrawals (RFC 4760) ──────────────────────────
     let mp_v6_withdrawn_count = mp_v6_withdrawn.len();
     for nlri in &mp_v6_withdrawn {
-        if adj_rib_in_v6
-            .get(nlri)
-            .is_some_and(|r| r.rare_or_default().communities.iter().any(|c| c.is_blackhole()))
-        {
+        if adj_rib_in_v6.get(nlri).is_some_and(|r| {
+            r.rare_or_default()
+                .communities
+                .iter()
+                .any(|c| c.is_blackhole())
+        }) {
             blackhole_withdrawn_v6.push(*nlri);
         }
         adj_rib_in_v6.withdraw(nlri);

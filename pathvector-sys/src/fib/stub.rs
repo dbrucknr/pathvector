@@ -239,13 +239,9 @@ mod tests {
     async fn fib_write_trait_install_blackhole_v6_is_noop() {
         let fw = FibWriter::new(254, 20).unwrap();
         assert!(
-            <FibWriter as FibWrite>::install_blackhole_v6(
-                &fw,
-                "2001:db8::".parse().unwrap(),
-                32
-            )
-            .await
-            .is_ok()
+            <FibWriter as FibWrite>::install_blackhole_v6(&fw, "2001:db8::".parse().unwrap(), 32)
+                .await
+                .is_ok()
         );
     }
 
@@ -253,13 +249,9 @@ mod tests {
     async fn fib_write_trait_withdraw_blackhole_v6_is_noop() {
         let fw = FibWriter::new(254, 20).unwrap();
         assert!(
-            <FibWriter as FibWrite>::withdraw_blackhole_v6(
-                &fw,
-                "2001:db8::".parse().unwrap(),
-                32
-            )
-            .await
-            .is_ok()
+            <FibWriter as FibWrite>::withdraw_blackhole_v6(&fw, "2001:db8::".parse().unwrap(), 32)
+                .await
+                .is_ok()
         );
     }
 }

@@ -836,7 +836,9 @@ mod tests {
         );
         // No gateway attribute.
         assert!(
-            !msg.attributes.iter().any(|a| matches!(a, RouteAttribute::Gateway(_))),
+            !msg.attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Gateway(_))),
             "blackhole route must have no gateway"
         );
     }
@@ -861,7 +863,9 @@ mod tests {
             "IPv6 blackhole route must be tagged RTPROT_BGP"
         );
         assert!(
-            !msg.attributes.iter().any(|a| matches!(a, RouteAttribute::Gateway(_))),
+            !msg.attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Gateway(_))),
             "IPv6 blackhole route must have no gateway"
         );
     }
