@@ -293,12 +293,22 @@ impl DaemonState {
                 // NLRI, re-install it. The BLACKHOLE route bypassed LocRib, so
                 // its withdrawal does not automatically trigger a FIB re-install
                 // of any competing unicast best path.
+                //
+                // Known limitation: when apply_v4(Announced) is called here, the
+                // FibManager coalescing map will overwrite the WithdrawBlackhole
+                // entry with Install — meaning the RTN_BLACKHOLE delete is skipped
+                // and the kernel receives RTM_NEWROUTE (unicast) while the blackhole
+                // route still exists. This works if RTM_NEWROUTE uses replace
+                // semantics (NLM_F_REPLACE), but has not been exercised by a
+                // multi-peer e2e test where one peer sends BLACKHOLE and another
+                // sends a unicast for the same prefix simultaneously.
                 if let Some(route) = rib.loc_rib.best(&nlri) {
                     fm.apply_v4(BestPathChange::Announced(nlri, route.clone()));
                 }
             }
             for nlri in result.blackhole_withdrawn_v6 {
                 fm.withdraw_blackhole_v6(nlri);
+                // Same coalescing caveat as the v4 path above.
                 if let Some(route) = rib.loc_rib_v6.best(&nlri) {
                     fm.apply_v6(BestPathChange::Announced(nlri, route.clone()));
                 }
