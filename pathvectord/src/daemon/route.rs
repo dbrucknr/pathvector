@@ -272,6 +272,61 @@ impl DaemonState {
             local_v4_addr,
             local_v6_addr,
         );
+
+        // RFC 4486 §4 — Maximum Prefix limit.
+        //
+        // Per-AFI max-prefix enforcement (RFC 4486 §4).
+        //
+        // Checked after handle_update so AdjRibIn reflects the routes just
+        // accepted. Either limit firing causes an immediate CEASE; on_terminated
+        // cleans up RIB state. Checks are independent — IPv4 and IPv6 each have
+        // their own configured limit.
+        let exceed_v4 = self
+            .peer_max_prefixes_v4
+            .get(&peer_ip)
+            .is_some_and(|&lim| adj_rib_in.len() > lim as usize);
+        let exceed_v6 = self
+            .peer_max_prefixes_v6
+            .get(&peer_ip)
+            .is_some_and(|&lim| adj_rib_in_v6.len() > lim as usize);
+        if exceed_v4 || exceed_v6 {
+            let (afi, size, limit) = if exceed_v4 {
+                (
+                    "IPv4",
+                    adj_rib_in.len(),
+                    *self.peer_max_prefixes_v4.get(&peer_ip).unwrap(),
+                )
+            } else {
+                (
+                    "IPv6",
+                    adj_rib_in_v6.len(),
+                    *self.peer_max_prefixes_v6.get(&peer_ip).unwrap(),
+                )
+            };
+            tracing::warn!(
+                peer = %peer_ip,
+                afi,
+                adj_rib_size = size,
+                limit,
+                "max-prefix limit exceeded ({size} > {limit} {afi}) — \
+                 sending CEASE/MaximumNumberOfPrefixesReached (RFC 4486 §4)"
+            );
+            if let Some(&restart_secs) = self.peer_max_prefixes_restart.get(&peer_ip) {
+                let deadline =
+                    Instant::now() + std::time::Duration::from_secs(u64::from(restart_secs));
+                self.max_prefix_idle.insert(peer_ip, deadline);
+                tracing::info!(
+                    peer = %peer_ip,
+                    restart_secs,
+                    "max-prefix idle-hold: reconnect blocked for {restart_secs}s"
+                );
+            }
+            return Some(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+                data: vec![],
+            });
+        }
+
         let notification = result.notification;
 
         if let Some(fm) = &self.fib_manager {

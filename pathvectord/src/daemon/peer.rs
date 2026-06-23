@@ -44,6 +44,15 @@ impl DaemonState {
         if let Some(msg) = peer.shutdown_message.clone() {
             self.shutdown_messages.insert(peer.address, msg);
         }
+        if let Some(limit) = peer.max_prefixes_v4 {
+            self.peer_max_prefixes_v4.insert(peer.address, limit);
+        }
+        if let Some(limit) = peer.max_prefixes_v6 {
+            self.peer_max_prefixes_v6.insert(peer.address, limit);
+        }
+        if let Some(restart) = peer.max_prefixes_restart.filter(|&r| r > 0) {
+            self.peer_max_prefixes_restart.insert(peer.address, restart);
+        }
         let rib = Arc::make_mut(&mut self.rib);
         rib.peer_remote_as.insert(peer.address, peer.remote_as);
         if peer.next_hop_self {
@@ -81,6 +90,10 @@ impl DaemonState {
         self.pending_decisions.remove(&peer_ip);
         self.pending_decisions_v6.remove(&peer_ip);
         self.shutdown_messages.remove(&peer_ip);
+        self.peer_max_prefixes_v4.remove(&peer_ip);
+        self.peer_max_prefixes_v6.remove(&peer_ip);
+        self.peer_max_prefixes_restart.remove(&peer_ip);
+        self.max_prefix_idle.remove(&peer_ip);
         let rib = Arc::make_mut(&mut self.rib);
         rib.peer_remote_as.remove(&peer_ip);
         rib.peer_types.remove(&peer_ip);

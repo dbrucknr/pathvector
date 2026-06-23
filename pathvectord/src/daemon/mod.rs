@@ -302,6 +302,31 @@ pub(crate) struct DaemonState {
     /// `shutdown_message` configured. Used by `RemovePeer` to send a
     /// CEASE/AdministrativeShutdown NOTIFICATION with the reason attached.
     pub(crate) shutdown_messages: HashMap<Ipv4Addr, String>,
+    /// Per-peer IPv4 prefix limit for RFC 4486 §4 enforcement.
+    ///
+    /// When a peer's `adj_rib_in.len()` (IPv4 only) exceeds this value after
+    /// processing an UPDATE, the session is torn down with a
+    /// CEASE/MaximumNumberOfPrefixesReached NOTIFICATION.
+    ///
+    /// Absent when no `max_prefixes_v4` was configured for the peer.
+    pub(crate) peer_max_prefixes_v4: HashMap<Ipv4Addr, u32>,
+    /// Per-peer IPv6 prefix limit for RFC 4486 §4 enforcement.
+    ///
+    /// Mirrors `peer_max_prefixes_v4` but checked against `adj_rib_in_v6.len()`.
+    /// Either limit firing causes the session to be torn down.
+    pub(crate) peer_max_prefixes_v6: HashMap<Ipv4Addr, u32>,
+    /// Idle-hold duration (seconds) after a max-prefix CEASE.
+    ///
+    /// When non-zero, pathvectord blocks the peer from re-establishing for
+    /// this many seconds after dropping the session. `0` means reconnect
+    /// immediately according to the normal `connect_retry_time`.
+    pub(crate) peer_max_prefixes_restart: HashMap<Ipv4Addr, u16>,
+    /// Active max-prefix idle-hold deadlines, keyed by peer address.
+    ///
+    /// Inserted when a max-prefix CEASE is sent and `max_prefixes_restart > 0`.
+    /// The event loop polls this map and blocks `SessionEvent::Established`
+    /// until the deadline passes.
+    pub(crate) max_prefix_idle: HashMap<Ipv4Addr, Instant>,
     /// Broadcast channel for Loc-RIB events (announced / withdrawn).
     ///
     /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
@@ -415,6 +440,25 @@ impl DaemonState {
             .filter_map(|p| p.shutdown_message.as_ref().map(|m| (p.address, m.clone())))
             .collect();
 
+        let peer_max_prefixes_v4: HashMap<Ipv4Addr, u32> = peers
+            .iter()
+            .filter_map(|p| p.max_prefixes_v4.map(|n| (p.address, n)))
+            .collect();
+
+        let peer_max_prefixes_v6: HashMap<Ipv4Addr, u32> = peers
+            .iter()
+            .filter_map(|p| p.max_prefixes_v6.map(|n| (p.address, n)))
+            .collect();
+
+        let peer_max_prefixes_restart: HashMap<Ipv4Addr, u16> = peers
+            .iter()
+            .filter_map(|p| {
+                p.max_prefixes_restart
+                    .filter(|&r| r > 0)
+                    .map(|r| (p.address, r))
+            })
+            .collect();
+
         // Capacity of 1024 events each.  A receiver that falls >1024 events
         // behind sees `RecvError::Lagged`; the `watch_peers` gRPC stream handler
         // defends against this by re-reading the full snapshot on any
@@ -470,6 +514,10 @@ impl DaemonState {
             pending_removal: HashSet::new(),
             gr: GracefulRestartState::new(),
             shutdown_messages,
+            peer_max_prefixes_v4,
+            peer_max_prefixes_v6,
+            peer_max_prefixes_restart,
+            max_prefix_idle: HashMap::new(),
             route_tx,
             peer_tx,
             fib_manager: None,
@@ -770,6 +818,22 @@ pub(crate) async fn run_event_loop(
                 let mut s = state.write().await;
                 match event {
                     SessionEvent::Established(info) => {
+                        // RFC 4486 §4 — max-prefix idle-hold: if the peer is
+                        // still within its post-CEASE idle window, reject the
+                        // reconnect attempt immediately with Stop so it retries
+                        // after connect_retry_time elapses.
+                        if s.max_prefix_idle.contains_key(&peer_ip) {
+                            tracing::info!(
+                                peer = %peer_ip,
+                                "max-prefix idle-hold active — rejecting reconnect"
+                            );
+                            drop(s);
+                            let tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
+                            if let Some(tx) = tx {
+                                let _ = tx.send(SessionCommand::Stop).await;
+                            }
+                            continue;
+                        }
                         s.on_established(
                             peer_ip,
                             info.peer_bgp_id,
@@ -882,9 +946,24 @@ pub(crate) async fn run_event_loop(
                 // (e.g. during MRT replay or full-table session establishment),
                 // we process them all into the pending_decisions buffers first,
                 // then flush_pending emits fewer, larger UPDATE messages.
+                //
+                // Peers that reconnected during a max-prefix idle-hold window;
+                // their Stop is sent after the drain loop alongside stalled peers
+                // to avoid dropping and re-acquiring the write lock mid-iteration.
+                let mut idle_hold_rejected: Vec<Ipv4Addr> = Vec::new();
+
                 while let Ok((extra_ip, extra_event)) = event_rx.try_recv() {
                     match extra_event {
                         SessionEvent::Established(info) => {
+                            // Same idle-hold guard as the primary Established arm.
+                            if s.max_prefix_idle.contains_key(&extra_ip) {
+                                tracing::info!(
+                                    peer = %extra_ip,
+                                    "max-prefix idle-hold active — rejecting reconnect (coalesced)"
+                                );
+                                idle_hold_rejected.push(extra_ip);
+                                continue;
+                            }
                             s.on_established(
                                 extra_ip,
                                 info.peer_bgp_id,
@@ -963,6 +1042,13 @@ pub(crate) async fn run_event_loop(
                         let _ = tx.send(SessionCommand::Stop).await;
                     }
                 }
+
+                for peer in idle_hold_rejected {
+                    let tx = stop_senders.lock().unwrap().get(&peer).cloned();
+                    if let Some(tx) = tx {
+                        let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                }
             }
 
             Ok(()) = fib_changed => {
@@ -1016,6 +1102,37 @@ pub(crate) async fn run_event_loop(
                             let _ = tx.send(SessionCommand::Stop).await;
                         }
                     }
+                }
+            }
+
+            // RFC 4486 §4 — max-prefix idle-hold expiry timer.  When no
+            // idle-hold is active, `pending()` keeps this branch dormant.
+            //
+            // The deadline is read with a temporary read guard (no local
+            // binding) so the lock is released before the sleep begins.
+            // Holding a read guard across the await would deadlock the
+            // event arm which needs a write lock.
+            () = async {
+                let earliest = state.read().await.max_prefix_idle.values().copied().min();
+                match earliest {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None    => std::future::pending::<()>().await,
+                }
+            } => {
+                let now = Instant::now();
+                let mut s = state.write().await;
+                let expired: Vec<Ipv4Addr> = s
+                    .max_prefix_idle
+                    .iter()
+                    .filter(|(_, deadline)| *deadline <= &now)
+                    .map(|(ip, _)| *ip)
+                    .collect();
+                for peer_ip in &expired {
+                    s.max_prefix_idle.remove(peer_ip);
+                    tracing::info!(
+                        peer = %peer_ip,
+                        "max-prefix idle-hold expired — peer may now reconnect"
+                    );
                 }
             }
 
@@ -1141,6 +1258,9 @@ mod tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -1329,6 +1449,9 @@ mod tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -1636,6 +1759,9 @@ mod tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(peer_ip, tx);
@@ -1713,6 +1839,9 @@ mod tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }];
         let mut state = DaemonState::new(
             65001,
@@ -3195,6 +3324,9 @@ mod tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -3240,6 +3372,9 @@ mod tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -6547,6 +6682,9 @@ mod tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
                 address,
@@ -6561,6 +6699,9 @@ mod tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             }))
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -7110,6 +7251,9 @@ mod tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         };
         let (tx, _rx) = mpsc::channel(64);
         state.add_peer(&new_peer, tx);
@@ -7176,6 +7320,9 @@ mod stall_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .collect();
         let state = DaemonState::new(
@@ -7267,6 +7414,9 @@ mod stall_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -7281,6 +7431,9 @@ mod stall_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -7390,6 +7543,9 @@ mod stall_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -7404,6 +7560,9 @@ mod stall_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -7815,6 +7974,9 @@ mod coalescing_tests {
                     hold_time: None,
                     shutdown_message: None,
                     connect_retry_time: None,
+                    max_prefixes_v4: None,
+                    max_prefixes_v6: None,
+                    max_prefixes_restart: None,
                 }
             })
             .collect();
@@ -8108,6 +8270,9 @@ mod coalescing_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -8122,6 +8287,9 @@ mod coalescing_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -8255,6 +8423,9 @@ mod coalescing_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -8269,6 +8440,9 @@ mod coalescing_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -8493,6 +8667,9 @@ mod event_loop_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .collect();
 
@@ -8630,6 +8807,9 @@ mod event_loop_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -8644,6 +8824,9 @@ mod event_loop_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -8833,6 +9016,9 @@ mod event_loop_tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }
     }
 
@@ -9320,6 +9506,9 @@ mod event_loop_tests {
             hold_time: None,
             shutdown_message: Some("planned maintenance".to_string()),
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         };
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
@@ -9536,6 +9725,9 @@ mod event_loop_tests {
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         };
         assert_eq!(
             peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
@@ -9633,6 +9825,9 @@ mod event_loop_tests {
             hold_time: Some(per_peer_hold_time),
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         };
 
         cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
@@ -10128,6 +10323,9 @@ mod dynamic_peer_prop_tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }
     }
 
@@ -10518,6 +10716,9 @@ mod run_with_tests {
                     hold_time: None,
                     shutdown_message: None,
                     connect_retry_time: None,
+                    max_prefixes_v4: None,
+                    max_prefixes_v6: None,
+                    max_prefixes_restart: None,
                 })
                 .collect(),
             sidecar_path: None,
@@ -10907,6 +11108,9 @@ mod run_with_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .await;
 
@@ -10958,6 +11162,9 @@ mod run_with_tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .await;
 
@@ -11504,6 +11711,9 @@ mod test_gr_phase2 {
                     hold_time: None,
                     shutdown_message: None,
                     connect_retry_time: None,
+                    max_prefixes_v4: None,
+                    max_prefixes_v6: None,
+                    max_prefixes_restart: None,
                 }
             })
             .collect();
@@ -13057,6 +13267,889 @@ mod test_gr_phase2 {
                 .iter()
                 .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "FibManager must receive v6 Withdrawn on GR deadline expiry"
+        );
+    }
+}
+
+// ── RFC 4486 §4: Maximum Prefix Limits ───────────────────────────────────────
+
+#[cfg(test)]
+mod test_max_prefix {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+
+    use pathvector_session::fsm::SessionInfo;
+    use pathvector_session::message::{
+        CeaseError, NotificationError, PathAttribute, UpdateMessage,
+    };
+    use pathvector_session::transport::TerminationReason;
+    use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
+
+    use super::*;
+    use crate::config;
+
+    const LOCAL_AS: u32 = 65001;
+    const PEER_AS: u32 = 65002;
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn make_state_with_limit(
+        limit: u32,
+        restart_secs: u16,
+    ) -> (
+        DaemonState,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+    ) {
+        let (tx, rx) = mpsc::channel::<UpdateMessage>(256);
+        let mut receivers = HashMap::new();
+        receivers.insert(PEER_IP, rx);
+        let peer_configs = vec![config::PeerConfig {
+            address: PEER_IP,
+            port: 179,
+            remote_as: PEER_AS,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: Some(limit),
+            max_prefixes_v6: None,
+            max_prefixes_restart: if restart_secs > 0 {
+                Some(restart_secs)
+            } else {
+                None
+            },
+        }];
+        let mut senders = HashMap::new();
+        senders.insert(PEER_IP, tx);
+        let state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        (state, receivers)
+    }
+
+    fn establish(state: &mut DaemonState) {
+        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+    }
+
+    fn announce(prefixes: &[&str]) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(PEER_AS)])),
+                PathAttribute::NextHop(PEER_IP),
+            ],
+            announced: prefixes.iter().map(|s| nlri(s)).collect(),
+        }
+    }
+
+    /// Under the limit — no CEASE returned.
+    #[test]
+    fn no_cease_when_under_limit() {
+        let (mut state, _rxs) = make_state_with_limit(5, 0);
+        establish(&mut state);
+        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        assert!(
+            result.is_none(),
+            "no notification expected when prefix count is below the limit"
+        );
+    }
+
+    /// Exactly at the limit — no CEASE.
+    #[test]
+    fn no_cease_at_exact_limit() {
+        let (mut state, _rxs) = make_state_with_limit(2, 0);
+        establish(&mut state);
+        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        assert!(
+            result.is_none(),
+            "no notification expected when prefix count equals the limit"
+        );
+    }
+
+    /// One prefix over the limit — CEASE/MaximumNumberOfPrefixesReached returned.
+    #[test]
+    fn cease_when_limit_exceeded() {
+        let (mut state, _rxs) = make_state_with_limit(2, 0);
+        establish(&mut state);
+        let result = state.on_route_update(
+            PEER_IP,
+            announce(&["10.0.0.0/8", "192.168.0.0/24", "172.16.0.0/12"]),
+        );
+        let notification =
+            result.expect("CEASE notification must be returned when limit is exceeded");
+        assert!(
+            matches!(
+                notification.error,
+                NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached)
+            ),
+            "error code must be CEASE/MaximumNumberOfPrefixesReached (RFC 4486 §4)"
+        );
+    }
+
+    /// With restart configured, idle-hold deadline is set after CEASE.
+    #[test]
+    fn idle_hold_inserted_when_restart_configured() {
+        let (mut state, _rxs) = make_state_with_limit(1, 60);
+        establish(&mut state);
+        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        assert!(result.is_some(), "CEASE must be returned");
+        assert!(
+            state.max_prefix_idle.contains_key(&PEER_IP),
+            "max_prefix_idle must be set for the peer when restart_secs > 0"
+        );
+        let deadline = state.max_prefix_idle[&PEER_IP];
+        assert!(deadline > Instant::now(), "deadline must be in the future");
+    }
+
+    /// Without restart, no idle-hold deadline is set.
+    #[test]
+    fn no_idle_hold_without_restart() {
+        let (mut state, _rxs) = make_state_with_limit(1, 0);
+        establish(&mut state);
+        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        assert!(result.is_some(), "CEASE must be returned");
+        assert!(
+            !state.max_prefix_idle.contains_key(&PEER_IP),
+            "max_prefix_idle must NOT be set when max_prefixes_restart is not configured"
+        );
+    }
+
+    /// Peer with no max_prefixes configured is never subject to the limit.
+    #[test]
+    fn no_limit_when_unconfigured() {
+        let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
+        let peer_configs = vec![config::PeerConfig {
+            address: PEER_IP,
+            port: 179,
+            remote_as: PEER_AS,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
+        }];
+        let mut senders = HashMap::new();
+        senders.insert(PEER_IP, tx);
+        let mut state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        establish(&mut state);
+        // Send 100 prefixes — no limit should fire.
+        let prefixes: Vec<String> = (0u8..100).map(|i| format!("10.{i}.0.0/24")).collect();
+        let prefix_strs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let result = state.on_route_update(PEER_IP, announce(&prefix_strs));
+        assert!(
+            result.is_none(),
+            "no limit when max_prefixes is not configured"
+        );
+    }
+
+    /// `add_peer` wires max_prefixes into the runtime maps.
+    #[test]
+    fn add_peer_populates_max_prefix_maps() {
+        let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
+        let peer_cfg = config::PeerConfig {
+            address: PEER_IP,
+            port: 179,
+            remote_as: PEER_AS,
+            import_default: None,
+            export_default: None,
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: Some(50),
+            max_prefixes_v6: Some(200),
+            max_prefixes_restart: Some(30),
+        };
+        let mut state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+        );
+        state.add_peer(&peer_cfg, tx);
+        assert_eq!(state.peer_max_prefixes_v4.get(&PEER_IP).copied(), Some(50));
+        assert_eq!(state.peer_max_prefixes_v6.get(&PEER_IP).copied(), Some(200));
+        assert_eq!(
+            state.peer_max_prefixes_restart.get(&PEER_IP).copied(),
+            Some(30)
+        );
+    }
+
+    /// `remove_peer` clears all three max-prefix maps.
+    #[test]
+    fn remove_peer_clears_max_prefix_maps() {
+        let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
+        let (mut state, _rxs) = make_state_with_limit(10, 60);
+        establish(&mut state);
+        // Trigger idle-hold by exceeding limit.
+        state.on_route_update(
+            PEER_IP,
+            announce(&[
+                "10.0.0.0/8",
+                "192.168.0.0/24",
+                "172.16.0.0/12",
+                "10.1.0.0/16",
+                "10.2.0.0/16",
+                "10.3.0.0/16",
+                "10.4.0.0/16",
+                "10.5.0.0/16",
+                "10.6.0.0/16",
+                "10.7.0.0/16",
+                "10.8.0.0/16",
+            ]),
+        );
+        // max_prefix_idle should now be set.
+        assert!(state.max_prefix_idle.contains_key(&PEER_IP));
+
+        state.remove_peer(PEER_IP);
+
+        assert!(
+            !state.peer_max_prefixes_v4.contains_key(&PEER_IP),
+            "peer_max_prefixes_v4 cleared"
+        );
+        assert!(
+            !state.peer_max_prefixes_v6.contains_key(&PEER_IP),
+            "peer_max_prefixes_v6 cleared"
+        );
+        assert!(
+            !state.peer_max_prefixes_restart.contains_key(&PEER_IP),
+            "peer_max_prefixes_restart cleared"
+        );
+        assert!(
+            !state.max_prefix_idle.contains_key(&PEER_IP),
+            "max_prefix_idle cleared"
+        );
+        drop(tx); // silence unused variable warning
+    }
+
+    // ── Event-loop integration tests ──────────────────────────────────────────
+    //
+    // These tests drive `run_event_loop` directly to verify the end-to-end
+    // behaviour of the max-prefix feature: CEASE delivery, idle-hold blocking,
+    // and idle-hold expiry.
+
+    fn peer_established_info(peer_as: u32) -> SessionInfo {
+        SessionInfo {
+            peer_as,
+            peer_bgp_id: PEER_IP,
+            hold_time: 90,
+            peer_capabilities: vec![],
+            peer_type: PeerType::External,
+            local_addr: None,
+        }
+    }
+
+    type EventLoopFixture = (
+        Arc<RwLock<DaemonState>>,
+        Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+        mpsc::Receiver<SessionCommand>,
+    );
+
+    fn make_state_for_loop(
+        peer_ip: Ipv4Addr,
+        peer_as: u32,
+        limit: u32,
+        restart_secs: u16,
+    ) -> EventLoopFixture {
+        let (update_tx, _) = mpsc::channel::<UpdateMessage>(64);
+        let (stop_tx, stop_rx) = mpsc::channel::<SessionCommand>(8);
+        let peer_cfg = config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: peer_as,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: Some(limit),
+            max_prefixes_v6: None,
+            max_prefixes_restart: if restart_secs > 0 {
+                Some(restart_secs)
+            } else {
+                None
+            },
+        };
+        let mut senders = HashMap::new();
+        senders.insert(peer_ip, update_tx);
+        let state = Arc::new(RwLock::new(DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &[peer_cfg],
+            senders,
+            vec![],
+        )));
+        let mut stop_map = HashMap::new();
+        stop_map.insert(peer_ip, stop_tx);
+        let stop_senders = Arc::new(Mutex::new(stop_map));
+        (state, stop_senders, stop_rx)
+    }
+
+    /// RFC 4486 §4 MUST: exceeding the limit causes the event loop to send
+    /// CEASE/MaximumNumberOfPrefixesReached to the peer's session.
+    #[tokio::test]
+    async fn event_loop_sends_cease_when_limit_exceeded() {
+        let peer_ip = PEER_IP;
+        let (state, stop_senders, mut stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 2, 0);
+
+        state.write().await.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        // 3 prefixes exceed limit of 2.
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::RouteUpdate(announce(&[
+                    "10.0.0.0/8",
+                    "192.168.0.0/24",
+                    "172.16.0.0/12",
+                ])),
+            ))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        )
+        .await;
+
+        let cmd = stop_rx
+            .try_recv()
+            .expect("peer must receive a SessionCommand when limit is exceeded");
+        let is_max_prefix_cease = matches!(
+            &cmd,
+            SessionCommand::Notification(n)
+                if matches!(
+                    n.error,
+                    NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached)
+                )
+        );
+        assert!(
+            is_max_prefix_cease,
+            "command must be CEASE/MaximumNumberOfPrefixesReached (RFC 4486 §4), got: {cmd:?}"
+        );
+    }
+
+    /// RFC 4486 §4 — after a CEASE the session terminates. The subsequent
+    /// Terminated event must flush the peer's routes from Loc-RIB so no stale
+    /// routes from the over-limit UPDATE persist.
+    #[tokio::test]
+    async fn over_limit_routes_flushed_after_termination() {
+        let peer_ip = PEER_IP;
+        let (state, stop_senders, _stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 2, 0);
+
+        state.write().await.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        // 3 prefixes exceed limit of 2.
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::RouteUpdate(announce(&[
+                    "10.0.0.0/8",
+                    "192.168.0.0/24",
+                    "172.16.0.0/12",
+                ])),
+            ))
+            .await
+            .unwrap();
+        // Session layer responds to CEASE with a Terminated event.
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Clean)))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        )
+        .await;
+
+        let s = state.read().await;
+        assert_eq!(
+            s.rib.loc_rib.len(),
+            0,
+            "Loc-RIB must be empty after over-limit update + termination"
+        );
+    }
+
+    /// Idle-hold: a reconnect attempt during the hold window must be rejected
+    /// with SessionCommand::Stop; the peer must NOT be established.
+    #[tokio::test]
+    async fn event_loop_idle_hold_blocks_reconnect() {
+        let peer_ip = PEER_IP;
+        // 300-second idle-hold so it does not expire during the test.
+        let (state, stop_senders, mut stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 1, 300);
+
+        state.write().await.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // 2 prefixes exceed limit of 1 → CEASE + idle-hold inserted.
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::RouteUpdate(announce(&["10.0.0.0/8", "192.168.0.0/24"])),
+            ))
+            .await
+            .unwrap();
+        // Session terminates.
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Clean)))
+            .await
+            .unwrap();
+        // Peer reconnects immediately — must be blocked.
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::Established(peer_established_info(PEER_AS)),
+            ))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        )
+        .await;
+
+        // First command: CEASE for the over-limit UPDATE.
+        let first = stop_rx.try_recv().expect("first command must be CEASE");
+        assert!(
+            matches!(
+                first,
+                SessionCommand::Notification(n)
+                    if matches!(
+                        n.error,
+                        NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached)
+                    )
+            ),
+            "first command must be CEASE/MaximumNumberOfPrefixesReached"
+        );
+
+        // Second command: Stop for the blocked reconnect.
+        let second = stop_rx
+            .try_recv()
+            .expect("second command must be Stop for blocked reconnect");
+        assert!(
+            matches!(second, SessionCommand::Stop),
+            "reconnect during idle-hold must receive Stop, got: {second:?}"
+        );
+
+        // Peer must not be established (no peer_type entry).
+        let s = state.read().await;
+        assert!(
+            !s.rib.peer_types.contains_key(&peer_ip),
+            "peer must not be established while idle-hold is active"
+        );
+    }
+
+    /// Idle-hold expiry: the timer branch in the event loop removes a deadline
+    /// that has already passed, allowing the next reconnect to succeed.
+    ///
+    /// Strategy: bypass the RouteUpdate/Terminated path (tested elsewhere) and
+    /// insert an already-expired deadline directly into `max_prefix_idle`. This
+    /// makes the timer arm fire on the first `select!` iteration without needing
+    /// `start_paused` or time-advance coordination.
+    #[tokio::test]
+    async fn event_loop_idle_hold_timer_clears_expired_deadline() {
+        let peer_ip = PEER_IP;
+        let (state, stop_senders, _stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 100, 0);
+
+        // Insert an idle-hold deadline that is already in the past.
+        let expired = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        state.write().await.max_prefix_idle.insert(peer_ip, expired);
+
+        // Run the event loop with a single no-op event then close the channel.
+        // The loop will see both the expired timer and the closed channel on
+        // the first select! iteration.  We send a Terminated for a peer that
+        // was never established (on_terminated is a no-op in that case) so
+        // the loop also processes something and doesn't immediately break —
+        // the timer branch wins the select! race at least once.
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let loop_handle = tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        ));
+
+        // Give the spawned loop time to enter select! and fire the timer.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if !state.read().await.max_prefix_idle.contains_key(&peer_ip) {
+                break;
+            }
+        }
+
+        assert!(
+            !state.read().await.max_prefix_idle.contains_key(&peer_ip),
+            "timer branch must remove an expired idle-hold deadline"
+        );
+
+        drop(event_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), loop_handle).await;
+    }
+
+    /// Idle-hold blocks reconnects arriving in the coalesced drain loop
+    /// (try_recv path), not just the primary await path.
+    #[tokio::test]
+    async fn event_loop_idle_hold_blocks_reconnect_in_drain_loop() {
+        let peer_ip = PEER_IP;
+        let (state, stop_senders, mut stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 1, 300);
+
+        state.write().await.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+
+        let (event_tx, event_rx) = mpsc::channel(16);
+
+        // Pre-fill channel: first event wakes the loop, subsequent events land
+        // in the try_recv drain. The Established arrives in the drain loop.
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::RouteUpdate(announce(&["10.0.0.0/8", "192.168.0.0/24"])),
+            ))
+            .await
+            .unwrap();
+        event_tx
+            .send((peer_ip, SessionEvent::Terminated(TerminationReason::Clean)))
+            .await
+            .unwrap();
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::Established(peer_established_info(PEER_AS)),
+            ))
+            .await
+            .unwrap();
+
+        // Yield before dropping so all three events are in the channel before
+        // the loop wakes, maximising the chance the Established is seen during drain.
+        tokio::task::yield_now().await;
+        drop(event_tx);
+
+        run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            None,
+        )
+        .await;
+
+        // Collect all commands sent to the peer.
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = stop_rx.try_recv() {
+            cmds.push(cmd);
+        }
+
+        let has_cease = cmds.iter().any(|c| {
+            matches!(
+                c,
+                SessionCommand::Notification(n)
+                    if matches!(
+                        n.error,
+                        NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached)
+                    )
+            )
+        });
+        let has_stop = cmds.iter().any(|c| matches!(c, SessionCommand::Stop));
+
+        assert!(has_cease, "peer must receive CEASE for over-limit update");
+        assert!(
+            has_stop,
+            "peer must receive Stop for reconnect during idle-hold (drain-loop path)"
+        );
+        assert!(
+            !state.read().await.rib.peer_types.contains_key(&peer_ip),
+            "peer must not be established while idle-hold is active"
+        );
+    }
+
+    // ── Two-peer displaced best-path test ─────────────────────────────────────
+    //
+    // Scenario: Peer A holds 10.0.0.0/8. Peer B (limit=1) sends 10.0.0.0/8
+    // plus 192.168.0.0/24, exceeding the limit. handle_update runs fully —
+    // AdjRibIn_B gets both routes and LocRib may temporarily prefer Peer B's
+    // route — but FIB changes are NOT applied (we return CEASE early). After
+    // on_terminated(B) the LocRib must revert to Peer A's 10.0.0.0/8, and
+    // 192.168.0.0/24 must be absent (Peer B was the only contributor).
+
+    const PEER_A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
+    const AS_A: u32 = 65100;
+    const AS_B: u32 = 65200;
+
+    fn announce_from(peer_ip: Ipv4Addr, peer_as: u32, prefixes: &[&str]) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(peer_as)])),
+                PathAttribute::NextHop(peer_ip),
+            ],
+            announced: prefixes.iter().map(|s| nlri(s)).collect(),
+        }
+    }
+
+    fn peer_cfg(address: Ipv4Addr, remote_as: u32, v4_limit: Option<u32>) -> config::PeerConfig {
+        config::PeerConfig {
+            address,
+            port: 179,
+            remote_as,
+            import_default: Some(config::ImportDefault::Accept),
+            import_default_v6: None,
+            export_default: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: v4_limit,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
+        }
+    }
+
+    fn make_two_peer_state() -> (
+        DaemonState,
+        tokio::sync::mpsc::Receiver<UpdateMessage>,
+        tokio::sync::mpsc::Receiver<UpdateMessage>,
+    ) {
+        let (tx_a, rx_a) = tokio::sync::mpsc::channel::<UpdateMessage>(256);
+        let (tx_b, rx_b) = tokio::sync::mpsc::channel::<UpdateMessage>(256);
+        let mut senders = HashMap::new();
+        senders.insert(PEER_A, tx_a);
+        senders.insert(PEER_B, tx_b);
+
+        let mut state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &[
+                peer_cfg(PEER_A, AS_A, None),
+                peer_cfg(PEER_B, AS_B, Some(1)),
+            ],
+            senders,
+            vec![],
+        );
+        state.on_established(PEER_A, PEER_A, PeerType::External, AS_A, 90, &[], None);
+        state.on_established(PEER_B, PEER_B, PeerType::External, AS_B, 90, &[], None);
+        (state, rx_a, rx_b)
+    }
+
+    /// When Peer B exceeds the limit and sends a CEASE, Peer B's routes (including
+    /// one that displaced Peer A's best path) must be fully withdrawn from the
+    /// LocRib after on_terminated. The FIB was never updated to Peer B's route,
+    /// so on_terminated reverts cleanly without exposing a transient state.
+    #[test]
+    fn displaced_best_path_reverts_after_termination() {
+        use pathvector_rib::PeerId;
+        use std::net::IpAddr;
+        let (mut state, _rx_a, _rx_b) = make_two_peer_state();
+
+        let shared: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let b_only: Nlri<Ipv4Addr> = "192.168.0.0/24".parse().unwrap();
+        let peer_a_id = PeerId::new(IpAddr::V4(PEER_A));
+
+        // Step 1: Peer A owns 10.0.0.0/8.
+        let r = state.on_route_update(PEER_A, announce_from(PEER_A, AS_A, &["10.0.0.0/8"]));
+        assert!(r.is_none(), "Peer A must not trigger a CEASE");
+        assert_eq!(
+            state.rib.loc_rib.best_peer(&shared),
+            Some(peer_a_id),
+            "Peer A must be best for 10.0.0.0/8 before Peer B arrives"
+        );
+
+        // Step 2: Peer B exceeds limit (1) by sending 2 prefixes.
+        // handle_update runs fully — LocRib may swap best path to Peer B —
+        // but on_route_update returns CEASE without applying FIB changes.
+        let r = state.on_route_update(
+            PEER_B,
+            announce_from(PEER_B, AS_B, &["10.0.0.0/8", "192.168.0.0/24"]),
+        );
+        assert!(
+            r.as_ref().is_some_and(|n| matches!(
+                n.error,
+                NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached)
+            )),
+            "Peer B must receive CEASE/MaximumNumberOfPrefixesReached"
+        );
+
+        // Step 3: Terminate Peer B. LocRib must revert fully to Peer A's world.
+        state.on_terminated(PEER_B, TerminationReason::Clean, true);
+
+        assert_eq!(
+            state.rib.loc_rib.best_peer(&shared),
+            Some(peer_a_id),
+            "Peer A must be best for 10.0.0.0/8 after Peer B termination"
+        );
+        assert!(
+            state.rib.loc_rib.best_peer(&b_only).is_none(),
+            "192.168.0.0/24 must be absent — Peer B was the only contributor"
+        );
+        let adj_b = state.adj_ribs_in.get(&PEER_B).map_or(0, AdjRibIn::len);
+        assert_eq!(adj_b, 0, "Peer B AdjRibIn must be empty after termination");
+    }
+
+    /// IPv6-limit fires independently of the IPv4 limit.
+    #[test]
+    fn cease_when_v6_limit_exceeded() {
+        use pathvector_session::message::{MpReachNlri, Prefix};
+        use pathvector_types::AfiSafi;
+        use pathvector_types::NextHop;
+
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UpdateMessage>(256);
+        let mut senders = HashMap::new();
+        senders.insert(peer_ip, tx);
+
+        let cfg = config::PeerConfig {
+            address: peer_ip,
+            port: 179,
+            remote_as: 65099,
+            import_default: None,
+            import_default_v6: None,
+            export_default: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: Some(1),
+            max_prefixes_restart: None,
+        };
+        let mut state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &[cfg],
+            senders,
+            vec![],
+        );
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65099, 90, &[], None);
+
+        let v6_nh: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let pfx1: Nlri<std::net::Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let pfx2: Nlri<std::net::Ipv6Addr> = "2001:db8:1::/48".parse().unwrap();
+
+        let update = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65099)])),
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    next_hop: NextHop::V6(v6_nh),
+                    prefixes: vec![Prefix::V6(pfx1), Prefix::V6(pfx2)],
+                }),
+            ],
+            announced: vec![],
+        };
+
+        let result = state.on_route_update(peer_ip, update);
+        assert!(
+            result.as_ref().is_some_and(|n| matches!(
+                n.error,
+                NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached)
+            )),
+            "must CEASE when IPv6 limit exceeded; got: {result:?}"
+        );
+        // The UPDATE carried no IPv4 NLRI, so the IPv4 Adj-RIB-In must be
+        // empty — confirming the limits are checked independently, not combined.
+        let v4_count = state.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
+        assert_eq!(
+            v4_count, 0,
+            "IPv4 Adj-RIB-In must be empty when only IPv6 prefixes were sent"
         );
     }
 }

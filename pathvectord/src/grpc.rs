@@ -502,6 +502,9 @@ impl PeerService for PeerServiceImpl {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -1315,6 +1318,9 @@ mod tests {
                 hold_time: None,
                 shutdown_message: None,
                 connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
             })
             .collect();
         DaemonState::new(

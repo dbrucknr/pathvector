@@ -260,3 +260,38 @@ to the `pathvector-session` transport layer via `SessionHandle`.
 | Detect when both the local and remote side open a connection to each other | `pathvector-session/src/transport/mod.rs` | ✅ | `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming` (in `pathvector-session`) |
 | Keep the connection initiated by the router with higher BGP Identifier | `pathvector-session/src/transport/mod.rs` | ✅ | `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming` (in `pathvector-session`) |
 | Send NOTIFICATION Cease / Connection Collision Resolution on dropped connection | `pathvector-session/src/transport/mod.rs` | ✅ | — |
+
+---
+
+## RFC 4486 §4 — Maximum Number of Prefixes (Daemon Integration)
+
+**Owns:** Per-AFI Adj-RIB-In size checking after each UPDATE; sending
+`CEASE/MaximumNumberOfPrefixesReached`; enforcing an idle-hold period before the peer
+may reconnect.  
+**Boundary:** The `CeaseError::MaximumNumberOfPrefixesReached` subcode constant and NOTIFICATION
+wire encoding live in `pathvector-session`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4486#section-4
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `max_prefixes_v4` / `max_prefixes_v6` / `max_prefixes_restart` in `PeerConfig` | `src/config.rs` | ✅ | `test_sidecar_round_trips_all_fields` |
+| After each UPDATE, check IPv4 Adj-RIB-In against `max_prefixes_v4` | `src/daemon/route.rs` | ✅ | `cease_when_limit_exceeded` |
+| After each UPDATE, check IPv6 Adj-RIB-In against `max_prefixes_v6` | `src/daemon/route.rs` | ✅ | `cease_when_v6_limit_exceeded` |
+| Either limit firing causes CEASE independently | `src/daemon/route.rs` | ✅ | `cease_when_v6_limit_exceeded` |
+| No CEASE when count is at or below limit | `src/daemon/route.rs` | ✅ | `no_cease_at_exact_limit`, `no_cease_when_under_limit` |
+| Send `CEASE/MaximumNumberOfPrefixesReached` when limit exceeded | `src/daemon/route.rs` | ✅ | `cease_when_limit_exceeded` |
+| Set idle-hold deadline when `max_prefixes_restart > 0` | `src/daemon/route.rs` | ✅ | `idle_hold_inserted_when_restart_configured` |
+| No idle-hold when `max_prefixes_restart` is absent or zero | `src/daemon/route.rs` | ✅ | `no_idle_hold_without_restart` |
+| Block `SessionEvent::Established` during idle-hold; send Stop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
+| Block reconnect during idle-hold via coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop` |
+| Clear idle-hold deadline when timer expires (event loop) | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_timer_clears_expired_deadline` |
+| `add_peer` populates `peer_max_prefixes_v4/v6` + `peer_max_prefixes_restart` | `src/daemon/peer.rs` | ✅ | `add_peer_populates_max_prefix_maps` |
+| `remove_peer` clears all max-prefix maps | `src/daemon/peer.rs` | ✅ | `remove_peer_clears_max_prefix_maps` |
+| No limit enforced when `max_prefixes_v4`/`v6` is not configured | `src/daemon/route.rs` | ✅ | `no_limit_when_unconfigured` |
+| LocRib reverts correctly when over-limit peer displaces an existing best path | `src/daemon/mod.rs` | ✅ | `displaced_best_path_reverts_after_termination` |
+
+**Deferred:**
+- RFC 4486 §4 does not specify behaviour when the peer reconnects after the idle-hold
+  expires and immediately re-floods the same table. pathvectord will CEASE again —
+  this is correct but can produce rapid reconnect loops. Operators should size
+  `max_prefixes_restart` to allow time for the peer's operator to intervene.
