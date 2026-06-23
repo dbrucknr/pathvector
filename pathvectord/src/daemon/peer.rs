@@ -464,7 +464,7 @@ impl DaemonState {
     /// Must be called before any `adj_ribs_in.clear()` on session teardown,
     /// GR deadline expiry, or stale-route pruning — BLACKHOLE routes bypass
     /// LocRib and are therefore invisible to `rib_withdraw_peer_v4/v6`.
-    pub(super) fn withdraw_peer_blackhole_kernel_routes(&self, peer_ip: Ipv4Addr) {
+    pub(super) fn withdraw_peer_blackhole_kernel_routes_v4(&self, peer_ip: Ipv4Addr) {
         let Some(fm) = &self.fib_manager else { return };
         if let Some(ari) = self.adj_ribs_in.get(&peer_ip) {
             for (nlri, route) in ari.routes() {
@@ -478,6 +478,10 @@ impl DaemonState {
                 }
             }
         }
+    }
+
+    pub(super) fn withdraw_peer_blackhole_kernel_routes_v6(&self, peer_ip: Ipv4Addr) {
+        let Some(fm) = &self.fib_manager else { return };
         if let Some(ari) = self.adj_ribs_in_v6.get(&peer_ip) {
             for (nlri, route) in ari.routes() {
                 if route
@@ -490,6 +494,11 @@ impl DaemonState {
                 }
             }
         }
+    }
+
+    pub(super) fn withdraw_peer_blackhole_kernel_routes(&self, peer_ip: Ipv4Addr) {
+        self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
+        self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
     }
 
     ///
@@ -553,11 +562,19 @@ impl DaemonState {
                 families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
 
             // Flush routes for families NOT covered by the peer's GR capability.
-            if !gr_v4 && let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
-                ari.clear();
+            // Withdraw kernel null routes first — BLACKHOLE routes bypass LocRib
+            // and are invisible to rib_withdraw_peer_v4/v6 (RFC 7999).
+            if !gr_v4 {
+                self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
+                if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
+                    ari.clear();
+                }
             }
-            if !gr_v6 && let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
-                ari.clear();
+            if !gr_v6 {
+                self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
+                if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
+                    ari.clear();
+                }
             }
 
             // GR helper path — retain covered routes; arm deadline timer.

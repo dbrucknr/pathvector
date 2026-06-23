@@ -2660,6 +2660,56 @@ mod tests {
         );
     }
 
+    /// When a peer has GR capability for IPv6 only (not IPv4), and the session
+    /// drops uncleanly, IPv4 AdjRibIn is cleared immediately. Any IPv4 BLACKHOLE
+    /// kernel null routes must be withdrawn BEFORE the clear — they bypass LocRib
+    /// and are otherwise invisible to the normal withdrawal path.
+    #[test]
+    fn blackhole_route_removed_for_non_gr_family_on_unclean_termination() {
+        use pathvector_session::message::{Capability, GracefulRestartFamily};
+        use pathvector_types::AfiSafi;
+
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut state, _rxs) = make_state(65001, &[(peer, 65002)]);
+        let fib = with_recording_fib(&mut state);
+
+        // Peer advertises GR for IPv6 only — IPv4 is NOT covered.
+        let gr_family_v6 = GracefulRestartFamily {
+            afi_safi: AfiSafi::IPV6_UNICAST,
+            forwarding_preserved: true,
+        };
+        state.on_established(
+            peer,
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![gr_family_v6],
+            }],
+            None,
+        );
+        state.set_import_default(peer, DefaultAction::Accept);
+
+        // Peer announces an IPv4 BLACKHOLE prefix.
+        state.on_route_update(peer, blackhole_announce("192.0.5.0/24"));
+        fib.blackhole_v4.lock().unwrap().clear();
+
+        // Unclean termination — enters GR helper mode for IPv6, but IPv4 is
+        // NOT covered by GR, so IPv4 AdjRibIn is cleared immediately.
+        // The kernel null route for 192.0.5.0/24 must be withdrawn first.
+        state.on_terminated(peer, TerminationReason::Unclean, false);
+
+        let bh = fib.blackhole_v4.lock().unwrap().clone();
+        let nlri: Nlri<Ipv4Addr> = "192.0.5.0/24".parse().unwrap();
+        assert!(
+            bh.iter().any(|(n, announced)| *n == nlri && !*announced),
+            "IPv4 BLACKHOLE kernel null route must be withdrawn when IPv4 is not a GR family"
+        );
+    }
+
     // ── MP_UNREACH_NLRI / MP_REACH_NLRI (RFC 4760) ───────────────────────────
 
     #[test]
