@@ -457,6 +457,50 @@ impl DaemonState {
     }
 
     /// Called when a BGP session terminates.
+    /// Scans the peer's AdjRibIn for BLACKHOLE-tagged routes and issues
+    /// `withdraw_blackhole_v4/v6` for each, so the kernel null routes installed
+    /// by RFC 7999 processing are removed before the RIB is cleared.
+    ///
+    /// Must be called before any `adj_ribs_in.clear()` on session teardown,
+    /// GR deadline expiry, or stale-route pruning — BLACKHOLE routes bypass
+    /// LocRib and are therefore invisible to `rib_withdraw_peer_v4/v6`.
+    pub(super) fn withdraw_peer_blackhole_kernel_routes_v4(&self, peer_ip: Ipv4Addr) {
+        let Some(fm) = &self.fib_manager else { return };
+        if let Some(ari) = self.adj_ribs_in.get(&peer_ip) {
+            for (nlri, route) in ari.routes() {
+                if route
+                    .rare_or_default()
+                    .communities
+                    .iter()
+                    .any(|c| c.is_blackhole())
+                {
+                    fm.withdraw_blackhole_v4(*nlri);
+                }
+            }
+        }
+    }
+
+    pub(super) fn withdraw_peer_blackhole_kernel_routes_v6(&self, peer_ip: Ipv4Addr) {
+        let Some(fm) = &self.fib_manager else { return };
+        if let Some(ari) = self.adj_ribs_in_v6.get(&peer_ip) {
+            for (nlri, route) in ari.routes() {
+                if route
+                    .rare_or_default()
+                    .communities
+                    .iter()
+                    .any(|c| c.is_blackhole())
+                {
+                    fm.withdraw_blackhole_v6(*nlri);
+                }
+            }
+        }
+    }
+
+    pub(super) fn withdraw_peer_blackhole_kernel_routes(&self, peer_ip: Ipv4Addr) {
+        self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
+        self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
+    }
+
     ///
     /// Clears the peer's RIB state, resets its outbound table, and propagates
     /// any best-path changes caused by the withdrawal to all remaining
@@ -518,11 +562,19 @@ impl DaemonState {
                 families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
 
             // Flush routes for families NOT covered by the peer's GR capability.
-            if !gr_v4 && let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
-                ari.clear();
+            // Withdraw kernel null routes first — BLACKHOLE routes bypass LocRib
+            // and are invisible to rib_withdraw_peer_v4/v6 (RFC 7999).
+            if !gr_v4 {
+                self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
+                if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
+                    ari.clear();
+                }
             }
-            if !gr_v6 && let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
-                ari.clear();
+            if !gr_v6 {
+                self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
+                if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
+                    ari.clear();
+                }
             }
 
             // GR helper path — retain covered routes; arm deadline timer.
@@ -550,6 +602,12 @@ impl DaemonState {
             }
             return;
         }
+
+        // Before clearing AdjRibIn, withdraw any kernel null routes that were
+        // installed for BLACKHOLE-tagged prefixes from this peer (RFC 7999).
+        // BLACKHOLE routes bypass LocRib, so rib_withdraw_peer_v4/v6 never
+        // sees them — they must be removed explicitly here.
+        self.withdraw_peer_blackhole_kernel_routes(peer_ip);
 
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();

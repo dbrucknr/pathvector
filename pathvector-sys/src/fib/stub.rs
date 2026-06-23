@@ -100,6 +100,22 @@ impl FibWrite for FibWriter {
     async fn withdraw_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
         Ok(())
     }
+
+    async fn install_blackhole_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn withdraw_blackhole_v4(&self, _dst: Ipv4Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn install_blackhole_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn withdraw_blackhole_v6(&self, _dst: Ipv6Addr, _prefix_len: u8) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +210,46 @@ mod tests {
         let fw = FibWriter::new(254, 20).unwrap();
         assert!(
             <FibWriter as FibWrite>::withdraw_v6(&fw, "2001:db8::".parse().unwrap(), 32)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn fib_write_trait_install_blackhole_v4_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(
+            <FibWriter as FibWrite>::install_blackhole_v4(&fw, Ipv4Addr::new(192, 0, 2, 0), 24)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn fib_write_trait_withdraw_blackhole_v4_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(
+            <FibWriter as FibWrite>::withdraw_blackhole_v4(&fw, Ipv4Addr::new(192, 0, 2, 0), 24)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn fib_write_trait_install_blackhole_v6_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(
+            <FibWriter as FibWrite>::install_blackhole_v6(&fw, "2001:db8::".parse().unwrap(), 32)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn fib_write_trait_withdraw_blackhole_v6_is_noop() {
+        let fw = FibWriter::new(254, 20).unwrap();
+        assert!(
+            <FibWriter as FibWrite>::withdraw_blackhole_v6(&fw, "2001:db8::".parse().unwrap(), 32)
                 .await
                 .is_ok()
         );

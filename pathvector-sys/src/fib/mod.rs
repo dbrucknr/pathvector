@@ -120,6 +120,37 @@ pub trait FibWrite {
         dst: Ipv6Addr,
         prefix_len: u8,
     ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Install a kernel blackhole (null) route for an IPv4 prefix (RFC 7999).
+    ///
+    /// Uses `RTN_BLACKHOLE` — the kernel silently drops all matching packets.
+    /// No gateway is needed. `NLM_F_REPLACE` makes this idempotent.
+    fn install_blackhole_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Remove a kernel blackhole route for an IPv4 prefix.
+    fn withdraw_blackhole_v4(
+        &self,
+        dst: Ipv4Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Install a kernel blackhole (null) route for an IPv6 prefix (RFC 7999).
+    fn install_blackhole_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
+
+    /// Remove a kernel blackhole route for an IPv6 prefix.
+    fn withdraw_blackhole_v6(
+        &self,
+        dst: Ipv6Addr,
+        prefix_len: u8,
+    ) -> impl Future<Output = io::Result<()>> + Send + '_;
 }
 
 // ── FibSnapshot ──────────────────────────────────────────────────────────────
@@ -524,7 +555,114 @@ mod tests {
         assert!(snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
     }
 
-    // ── KernelFib construction ────────────────────────────────────────────────
+    // ── FibSnapshot IPv6 reachability ─────────────────────────────────────────
+
+    #[test]
+    fn ipv6_link_local_is_always_reachable() {
+        // fe80::/10 addresses are on-link — reachable even with an empty snapshot.
+        let snap = FibSnapshot::new();
+        assert!(snap.is_v6_reachable("fe80::1".parse().unwrap()));
+        assert!(snap.is_v6_reachable("fe80::dead:beef".parse().unwrap()));
+        // febf:: is still in fe80::/10 (second byte & 0xc0 == 0x80)
+        assert!(snap.is_v6_reachable("febf::1".parse().unwrap()));
+        // fec0:: is NOT link-local (second byte 0xc0 & 0xc0 == 0xc0 ≠ 0x80)
+        assert!(!snap.is_v6_reachable("fec0::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_non_link_local_needs_route() {
+        let snap = FibSnapshot::new();
+        // 2001:db8:: is not link-local; needs a route.
+        assert!(!snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
+        let snap = snap_with_v6(&[("2001:db8::".parse().unwrap(), 32, 10)]);
+        assert!(snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn igp_metric_v6_returns_metric_of_covering_route() {
+        let snap = snap_with_v6(&[
+            ("2001:db8::".parse().unwrap(), 32, 100),
+            ("2001:db8:1::".parse().unwrap(), 48, 20),
+        ]);
+        // /48 is more specific → metric 20
+        assert_eq!(
+            snap.igp_metric_v6("2001:db8:1::1".parse().unwrap()),
+            Some(20)
+        );
+        // In /32 but outside /48 → metric 100
+        assert_eq!(
+            snap.igp_metric_v6("2001:db8:2::1".parse().unwrap()),
+            Some(100)
+        );
+        // Completely uncovered
+        assert_eq!(snap.igp_metric_v6("2001:db9::1".parse().unwrap()), None);
+    }
+
+    // ── KernelOracle ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn kernel_oracle_v4_reachability_and_metric() {
+        let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
+        let oracle = fib.oracle();
+
+        assert!(!oracle.is_v4_reachable("10.0.0.1".parse().unwrap()));
+        assert_eq!(oracle.igp_metric_v4("10.0.0.1".parse().unwrap()), None);
+
+        fib.snapshot.write().unwrap().v4.push(FibEntry4 {
+            network: "10.0.0.0".parse().unwrap(),
+            prefix_len: 8,
+            metric: 42,
+        });
+
+        assert!(oracle.is_v4_reachable("10.1.2.3".parse().unwrap()));
+        assert_eq!(oracle.igp_metric_v4("10.1.2.3".parse().unwrap()), Some(42));
+        assert_eq!(oracle.igp_metric_v4("11.0.0.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn kernel_oracle_v6_reachability_and_metric() {
+        let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
+        let oracle = fib.oracle();
+
+        // Link-local is always reachable even without a route.
+        assert!(oracle.is_v6_reachable("fe80::1".parse().unwrap()));
+        assert!(!oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
+        assert_eq!(oracle.igp_metric_v6("2001:db8::1".parse().unwrap()), None);
+
+        fib.snapshot.write().unwrap().v6.push(FibEntry6 {
+            network: "2001:db8::".parse().unwrap(),
+            prefix_len: 32,
+            metric: 7,
+        });
+
+        assert!(oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            oracle.igp_metric_v6("2001:db8::1".parse().unwrap()),
+            Some(7)
+        );
+        assert_eq!(oracle.igp_metric_v6("2001:db9::1".parse().unwrap()), None);
+    }
+
+    // ── KernelFib::stale_bgp_routes (non-Linux stub) ─────────────────────────
+
+    #[tokio::test]
+    async fn stale_bgp_routes_returns_empty_on_non_linux() {
+        let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
+        let (v4, v6) = fib.stale_bgp_routes().await.expect("stub must not fail");
+        // On non-Linux platforms (including macOS CI), the stub always returns [].
+        // On Linux this test still compiles but would require a real netlink handle —
+        // the assertion holds: an empty kernel produces empty stale lists.
+        assert!(
+            v4.is_empty() || cfg!(target_os = "linux"),
+            "non-Linux stub must return empty v4"
+        );
+        assert!(
+            v6.is_empty() || cfg!(target_os = "linux"),
+            "non-Linux stub must return empty v6"
+        );
+    }
+
+    // ── KernelFib construction and spawn ─────────────────────────────────────
 
     #[test]
     fn kernel_fib_new_snapshot_is_empty() {
@@ -532,6 +670,17 @@ mod tests {
         let snap = fib.snapshot().read().unwrap().clone();
         assert!(snap.v4.is_empty());
         assert!(snap.v6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_succeeds_on_non_linux() {
+        // On non-Linux (macOS) spawn() is a no-op that returns Ok(()) immediately.
+        // On Linux this would block indefinitely; the cfg guard prevents that.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
+            fib.spawn().await.expect("spawn must succeed on non-Linux");
+        }
     }
 
     #[test]

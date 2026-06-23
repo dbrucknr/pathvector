@@ -12,7 +12,8 @@
 use std::time::Duration;
 
 use pathvector_e2e::{
-    FibHarness, wait_for_kernel_route, wait_for_kernel_route_withdrawn, wait_for_route,
+    FibHarness, wait_for_kernel_blackhole_route, wait_for_kernel_blackhole_route_withdrawn,
+    wait_for_kernel_route, wait_for_kernel_route_withdrawn, wait_for_route,
     wait_for_route_withdrawn,
 };
 
@@ -76,4 +77,85 @@ async fn multiple_routes_installed_in_kernel_fib() {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
     }
+}
+
+// ── RFC 7999 BLACKHOLE kernel null routes ─────────────────────────────────────
+
+/// A prefix tagged with the BLACKHOLE community (RFC 7999) must appear in the
+/// kernel routing table as a `blackhole` route (`RTN_BLACKHOLE`, not unicast).
+/// This proves the actual netlink call reaches the kernel, not just that the
+/// daemon method is called (which is covered by unit tests).
+#[tokio::test]
+async fn blackhole_route_installed_as_kernel_null_route() {
+    let h = FibHarness::new().await;
+
+    h.gobgp_announce_blackhole("192.0.2.0/24");
+
+    wait_for_kernel_blackhole_route(&h.pathvectord_id, "192.0.2.0/24", Duration::from_secs(15))
+        .await
+        .expect("192.0.2.0/24 (BLACKHOLE) was not installed as a kernel null route within 15 s");
+}
+
+/// When GoBGP withdraws a BLACKHOLE-tagged prefix, the kernel null route must
+/// be removed. This is the e2e counterpart of the `blackhole_route_withdrawal_removes_kernel_null_route` unit test.
+#[tokio::test]
+async fn blackhole_route_withdrawn_removes_kernel_null_route() {
+    let h = FibHarness::new().await;
+
+    h.gobgp_announce_blackhole("192.0.3.0/24");
+
+    wait_for_kernel_blackhole_route(&h.pathvectord_id, "192.0.3.0/24", Duration::from_secs(15))
+        .await
+        .expect("192.0.3.0/24 (BLACKHOLE) was not installed in kernel FIB within 15 s");
+
+    h.gobgp_withdraw("192.0.3.0/24");
+
+    wait_for_kernel_blackhole_route_withdrawn(
+        &h.pathvectord_id,
+        "192.0.3.0/24",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("192.0.3.0/24 (BLACKHOLE) null route was not removed from kernel FIB within 15 s");
+}
+
+/// A BLACKHOLE prefix must NOT appear as a unicast route in the kernel FIB —
+/// only the `blackhole` entry must exist.
+#[tokio::test]
+async fn blackhole_route_is_not_installed_as_unicast() {
+    let h = FibHarness::new().await;
+
+    h.gobgp_announce_blackhole("192.0.4.0/24");
+
+    wait_for_kernel_blackhole_route(&h.pathvectord_id, "192.0.4.0/24", Duration::from_secs(15))
+        .await
+        .expect("192.0.4.0/24 (BLACKHOLE) kernel null route did not appear within 15 s");
+
+    // Verify the BGP table entry for this prefix is `blackhole` only — no `via`
+    // nexthop. Restrict to `table 254 proto bgp` so we only see BGP-installed
+    // routes and don't pick up routes from other tables or protocols.
+    let output = std::process::Command::new("docker")
+        .args([
+            "exec",
+            &h.pathvectord_id,
+            "ip",
+            "route",
+            "show",
+            "table",
+            "254",
+            "proto",
+            "bgp",
+            "192.0.4.0/24",
+        ])
+        .output()
+        .expect("docker exec ip route show table 254 proto bgp 192.0.4.0/24");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("blackhole"),
+        "BLACKHOLE prefix must appear as a kernel blackhole route in table 254 proto bgp; got: {text}"
+    );
+    assert!(
+        !text.contains("via"),
+        "BLACKHOLE prefix must not be installed as a unicast (via) route in table 254 proto bgp; got: {text}"
+    );
 }

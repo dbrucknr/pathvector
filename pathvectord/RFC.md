@@ -155,21 +155,35 @@ as warning only). All §4.2 requirements now implemented and e2e verified.
 ## RFC 7999 — BLACKHOLE Community (Discard Action)
 
 **Owns:** The discard action: when a received UPDATE contains BLACKHOLE community
-(0xFFFF029A), the route is stored in Adj-RIB-In but not installed in Loc-RIB (implicitly
-discarded). Relies on `is_blackhole()` from `pathvector-types` and `BlackholeCondition`
-from `pathvector-policy`.  
+(0xFFFF029A), the route is stored in Adj-RIB-In but bypasses Loc-RIB and outbound
+advertisement, and a kernel null route (`RTN_BLACKHOLE`) is programmed via rtnetlink.
+On withdrawal, the kernel null route is removed. Relies on `is_blackhole()` from
+`pathvector-types`, `BlackholeCondition` from `pathvector-policy`, and
+`FibWrite::install_blackhole_v4/v6` from `pathvector-sys`.  
 **Boundary:** The `BLACKHOLE` constant lives in `pathvector-types`. The policy condition
-lives in `pathvector-policy`. The actual kernel null-route programming is deferred.  
+lives in `pathvector-policy`. Kernel programming lives in `pathvector-sys`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc7999
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Route with BLACKHOLE community stored in Adj-RIB-In but not installed in Loc-RIB | `src/daemon.rs` | ✅ | `test_handle_update_blackhole_route_stored_in_adj_rib_in`, `test_handle_update_blackhole_route_not_installed` |
-| Kernel null route programmed for BLACKHOLE prefix | — | ❌ | — |
+| Route with BLACKHOLE community stored in Adj-RIB-In but not installed in Loc-RIB | `src/daemon/route.rs` | ✅ | `blackhole_route_not_in_loc_rib` |
+| BLACKHOLE route not advertised to peers | `src/daemon/route.rs` | ✅ | `blackhole_route_not_in_loc_rib` (LocRib empty → nothing propagated) |
+| Kernel null route (`RTN_BLACKHOLE`) programmed on announce | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_programs_kernel_null_route` |
+| Kernel null route removed on withdrawal | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_withdrawal_removes_kernel_null_route` |
+| BLACKHOLE routes for non-GR address families withdrawn on unclean peer termination | `src/daemon/peer.rs` | ✅ | `blackhole_route_removed_for_non_gr_family_on_unclean_termination` |
+| Surviving unicast best path re-installed after BLACKHOLE withdrawal | `src/daemon/route.rs` | ✅ | `blackhole_withdrawal_restores_surviving_peer_unicast_route` |
 
-**Deferred:** Kernel/FIB null-route programming requires a netlink or routing socket
-abstraction. Currently the route is rejected from Loc-RIB and can be inspected via
-Adj-RIB-In, but no kernel forwarding entry is created.
+**Known limitation — BLACKHOLE-to-unicast failover coalescing:** when a BLACKHOLE route is
+withdrawn and a competing unicast best path exists in Loc-RIB for the same prefix, the
+FibManager coalescing map receives `WithdrawBlackhole` immediately followed by
+`Install { gateway }`. Because the map keeps only the latest desired state per prefix, the
+`Install` overwrites `WithdrawBlackhole` — the explicit `RTN_BLACKHOLE` kernel delete is
+skipped, and the kernel receives `RTM_NEWROUTE` (unicast) while the null route may still be
+present. In practice this works because `RTM_NEWROUTE` with `NLM_F_REPLACE` replaces the
+existing entry regardless of route type, but this code path has not been exercised by a
+multi-peer end-to-end test. If you operate a topology where a peer simultaneously
+originates both a BLACKHOLE and a unicast for the same prefix, verify this behavior in
+your environment.
 
 ---
 

@@ -282,6 +282,24 @@ impl DaemonState {
     pub(super) fn prune_stale_nlri(&mut self, peer_ip: Ipv4Addr, stale: &HashSet<Nlri<Ipv4Addr>>) {
         let stale_peer = PeerId::from(peer_ip);
 
+        // Withdraw kernel null routes for any BLACKHOLE-tagged stale NLRIs before
+        // removing them from AdjRibIn — they bypass LocRib and are invisible to
+        // the normal FIB change path below.
+        if let Some(fm) = &self.fib_manager
+            && let Some(ari) = self.adj_ribs_in.get(&peer_ip)
+        {
+            for nlri in stale {
+                if ari.get(nlri).is_some_and(|r| {
+                    r.rare_or_default()
+                        .communities
+                        .iter()
+                        .any(|c| c.is_blackhole())
+                }) {
+                    fm.withdraw_blackhole_v4(*nlri);
+                }
+            }
+        }
+
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             for nlri in stale {
                 ari.withdraw(nlri);
@@ -371,6 +389,22 @@ impl DaemonState {
         stale: &HashSet<Nlri<Ipv6Addr>>,
     ) {
         let stale_peer = PeerId::from(peer_ip);
+
+        // Same as prune_stale_nlri: check for BLACKHOLE routes before removal.
+        if let Some(fm) = &self.fib_manager
+            && let Some(ari) = self.adj_ribs_in_v6.get(&peer_ip)
+        {
+            for nlri in stale {
+                if ari.get(nlri).is_some_and(|r| {
+                    r.rare_or_default()
+                        .communities
+                        .iter()
+                        .any(|c| c.is_blackhole())
+                }) {
+                    fm.withdraw_blackhole_v6(*nlri);
+                }
+            }
+        }
 
         if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
             for nlri in stale {
@@ -467,6 +501,8 @@ impl DaemonState {
         // Remove any stale tracking (re-establishment was not attempted).
         self.gr.stale_nlri.remove(&peer_ip);
         self.gr.stale_nlri_v6.remove(&peer_ip);
+        // Remove kernel null routes for BLACKHOLE prefixes before clearing AdjRibIn.
+        self.withdraw_peer_blackhole_kernel_routes(peer_ip);
         // Clear AdjRibIn and flush LocRib exactly as on_terminated does.
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
