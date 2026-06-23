@@ -13575,16 +13575,18 @@ mod test_max_prefix {
         }
     }
 
+    type EventLoopFixture = (
+        Arc<RwLock<DaemonState>>,
+        Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+        mpsc::Receiver<SessionCommand>,
+    );
+
     fn make_state_for_loop(
         peer_ip: Ipv4Addr,
         peer_as: u32,
         limit: u32,
         restart_secs: u16,
-    ) -> (
-        Arc<RwLock<DaemonState>>,
-        Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
-        mpsc::Receiver<SessionCommand>,
-    ) {
+    ) -> EventLoopFixture {
         let (update_tx, _) = mpsc::channel::<UpdateMessage>(64);
         let (stop_tx, stop_rx) = mpsc::channel::<SessionCommand>(8);
         let peer_cfg = config::PeerConfig {
@@ -14028,9 +14030,9 @@ mod test_max_prefix {
     /// so on_terminated reverts cleanly without exposing a transient state.
     #[test]
     fn displaced_best_path_reverts_after_termination() {
-        let (mut state, _rx_a, _rx_b) = make_two_peer_state();
         use pathvector_rib::PeerId;
         use std::net::IpAddr;
+        let (mut state, _rx_a, _rx_b) = make_two_peer_state();
 
         let shared: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         let b_only: Nlri<Ipv4Addr> = "192.168.0.0/24".parse().unwrap();
@@ -14072,7 +14074,7 @@ mod test_max_prefix {
             state.rib.loc_rib.best_peer(&b_only).is_none(),
             "192.168.0.0/24 must be absent — Peer B was the only contributor"
         );
-        let adj_b = state.adj_ribs_in.get(&PEER_B).map_or(0, |r| r.len());
+        let adj_b = state.adj_ribs_in.get(&PEER_B).map_or(0, AdjRibIn::len);
         assert_eq!(adj_b, 0, "Peer B AdjRibIn must be empty after termination");
     }
 
@@ -14144,7 +14146,7 @@ mod test_max_prefix {
         );
         // The UPDATE carried no IPv4 NLRI, so the IPv4 Adj-RIB-In must be
         // empty — confirming the limits are checked independently, not combined.
-        let v4_count = state.adj_ribs_in.get(&peer_ip).map_or(0, |r| r.len());
+        let v4_count = state.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
         assert_eq!(
             v4_count, 0,
             "IPv4 Adj-RIB-In must be empty when only IPv6 prefixes were sent"
