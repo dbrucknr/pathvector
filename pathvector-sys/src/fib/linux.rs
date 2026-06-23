@@ -133,7 +133,7 @@ impl FibWrite for FibWriter {
     }
 
     async fn withdraw_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
-        withdraw_route_v4(&self.handle, dst, prefix_len, self.table, self.metric).await
+        withdraw_blackhole_route_v4(&self.handle, dst, prefix_len, self.table, self.metric).await
     }
 
     async fn install_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> io::Result<()> {
@@ -141,7 +141,7 @@ impl FibWrite for FibWriter {
     }
 
     async fn withdraw_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> io::Result<()> {
-        withdraw_route_v6(&self.handle, dst, prefix_len, self.table, self.metric).await
+        withdraw_blackhole_route_v6(&self.handle, dst, prefix_len, self.table, self.metric).await
     }
 }
 
@@ -635,6 +635,58 @@ async fn install_blackhole_v6(
         .map_err(io::Error::other)
 }
 
+/// Remove an IPv4 blackhole route (`RTN_BLACKHOLE`) from the kernel FIB.
+///
+/// The route type must be specified in the `RTM_DELROUTE` message; using
+/// `RTN_UNSPEC` (the builder default) causes the kernel to return ESRCH for
+/// a blackhole route even when the prefix, table, metric, and protocol match.
+async fn withdraw_blackhole_route_v4(
+    handle: &rtnetlink::Handle,
+    dst: Ipv4Addr,
+    prefix_len: u8,
+    table: u32,
+    metric: u32,
+) -> io::Result<()> {
+    let mut msg = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(dst, prefix_len)
+        .table_id(table)
+        .priority(metric)
+        .protocol(RouteProtocol::Bgp)
+        .build();
+    msg.header.kind = RouteType::BlackHole;
+    match handle.route().del(msg).execute().await {
+        Ok(()) => Ok(()),
+        Err(rtnetlink::Error::NetlinkError(ref e)) if e.code.is_some_and(|c| c.get() == -3) => {
+            Ok(())
+        }
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// Remove an IPv6 blackhole route (`RTN_BLACKHOLE`) from the kernel FIB.
+async fn withdraw_blackhole_route_v6(
+    handle: &rtnetlink::Handle,
+    dst: Ipv6Addr,
+    prefix_len: u8,
+    table: u32,
+    metric: u32,
+) -> io::Result<()> {
+    let mut msg = RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(dst, prefix_len)
+        .table_id(table)
+        .priority(metric)
+        .protocol(RouteProtocol::Bgp)
+        .build();
+    msg.header.kind = RouteType::BlackHole;
+    match handle.route().del(msg).execute().await {
+        Ok(()) => Ok(()),
+        Err(rtnetlink::Error::NetlinkError(ref e)) if e.code.is_some_and(|c| c.get() == -3) => {
+            Ok(())
+        }
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
 /// Remove an IPv4 route from the kernel FIB.
 ///
 /// Returns `Ok(())` if the route was deleted **or was already absent**
@@ -867,6 +919,54 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, RouteAttribute::Gateway(_))),
             "IPv6 blackhole route must have no gateway"
+        );
+    }
+
+    // ── withdraw_blackhole_route_v4/v6 — message shape ───────────────────────
+
+    #[test]
+    fn withdraw_blackhole_v4_message_has_blackhole_type_and_bgp_protocol() {
+        // RTM_DELROUTE for a blackhole route must carry RTN_BLACKHOLE. The
+        // kernel matches on route type for deletion — sending RTN_UNSPEC (the
+        // builder default) returns ESRCH, which we treat as success, causing
+        // the kernel null route to persist silently.
+        let mut msg = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix("192.0.2.0".parse().unwrap(), 24)
+            .table_id(254)
+            .priority(20)
+            .protocol(RouteProtocol::Bgp)
+            .build();
+        msg.header.kind = RouteType::BlackHole;
+        assert_eq!(
+            msg.header.kind,
+            RouteType::BlackHole,
+            "RTM_DELROUTE for a blackhole route must use RTN_BLACKHOLE, not RTN_UNSPEC"
+        );
+        assert_eq!(
+            msg.header.protocol,
+            RouteProtocol::Bgp,
+            "RTM_DELROUTE must carry RTPROT_BGP to match the installed route"
+        );
+    }
+
+    #[test]
+    fn withdraw_blackhole_v6_message_has_blackhole_type_and_bgp_protocol() {
+        let mut msg = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix("2001:db8::".parse().unwrap(), 32)
+            .table_id(254)
+            .priority(20)
+            .protocol(RouteProtocol::Bgp)
+            .build();
+        msg.header.kind = RouteType::BlackHole;
+        assert_eq!(
+            msg.header.kind,
+            RouteType::BlackHole,
+            "IPv6 RTM_DELROUTE for a blackhole route must use RTN_BLACKHOLE"
+        );
+        assert_eq!(
+            msg.header.protocol,
+            RouteProtocol::Bgp,
+            "IPv6 RTM_DELROUTE must carry RTPROT_BGP"
         );
     }
 
