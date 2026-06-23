@@ -368,6 +368,53 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub connect_retry_time: Option<u16>,
+    /// Maximum number of prefixes (IPv4 + IPv6 combined) accepted from this
+    /// peer before the session is torn down with a CEASE/MaximumNumberOfPrefixes
+    /// NOTIFICATION (RFC 4486 §4).
+    ///
+    /// When omitted no prefix limit is enforced. Setting this protects against
+    /// misconfigured or misbehaving peers flooding the RIB.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address      = "10.0.0.2"
+    /// remote_as    = 65001
+    /// max_prefixes = 500000
+    /// ```
+    /// Maximum IPv4 prefixes accepted from this peer (RFC 4486 §4).
+    ///
+    /// Checked against the IPv4 Adj-RIB-In size after each UPDATE.
+    /// When exceeded, the session is torn down with a
+    /// CEASE/MaximumNumberOfPrefixesReached NOTIFICATION.
+    #[serde(default)]
+    pub max_prefixes_v4: Option<u32>,
+    /// Maximum IPv6 prefixes accepted from this peer (RFC 4486 §4).
+    ///
+    /// Checked independently of `max_prefixes_v4`. Either limit firing
+    /// causes the session to be torn down.
+    #[serde(default)]
+    pub max_prefixes_v6: Option<u32>,
+    /// Seconds to wait before reconnecting after a max-prefix CEASE.
+    ///
+    /// When either `max_prefixes_v4` or `max_prefixes_v6` is exceeded and
+    /// the session is dropped, pathvectord waits this many seconds before
+    /// allowing the peer to reconnect. Use this as a back-off to give
+    /// operators time to investigate and correct a route leak before the
+    /// peer floods the RIB again.
+    ///
+    /// `0` (the default) means reconnect immediately according to the
+    /// normal `connect_retry_time`.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address                = "10.0.0.2"
+    /// remote_as              = 65001
+    /// max_prefixes_v4        = 500000
+    /// max_prefixes_v6        = 100000
+    /// max_prefixes_restart   = 300
+    /// ```
+    #[serde(default)]
+    pub max_prefixes_restart: Option<u16>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -486,6 +533,9 @@ mod sidecar_tests {
             hold_time: None,
             shutdown_message: None,
             connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
         }
     }
 
@@ -565,6 +615,9 @@ mod sidecar_tests {
             hold_time: Some(60),
             shutdown_message: Some("planned maintenance".into()),
             connect_retry_time: Some(5),
+            max_prefixes_v4: Some(500_000),
+            max_prefixes_v6: Some(100_000),
+            max_prefixes_restart: Some(300),
         };
         store.upsert(full_peer.clone()).await;
 
@@ -578,6 +631,21 @@ mod sidecar_tests {
         assert!(got.is_rr_client);
         assert_eq!(got.hold_time, Some(60));
         assert_eq!(got.shutdown_message.as_deref(), Some("planned maintenance"));
+        assert_eq!(
+            got.max_prefixes_v4,
+            Some(500_000),
+            "max_prefixes_v4 must round-trip"
+        );
+        assert_eq!(
+            got.max_prefixes_v6,
+            Some(100_000),
+            "max_prefixes_v6 must round-trip"
+        );
+        assert_eq!(
+            got.max_prefixes_restart,
+            Some(300),
+            "max_prefixes_restart must round-trip"
+        );
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ async-stream       = { workspace = true }
 futures            = { workspace = true }
 serde              = { version = "1", features = ["derive"] }
 tokio-stream       = { workspace = true }
-toml               = "0.8"
+toml               = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tikv-jemallocator  = { workspace = true }
@@ -39,6 +39,7 @@ tonic-prost-build = "0.14"
 proptest          = { workspace = true }
 pathvector-client = { workspace = true }
 tempfile          = "3"
+tokio             = { workspace = true, features = ["test-util"] }
 
 # pathvectord generates code via tonic_prost_build.  The generated file
 # triggers four pedantic lints (doc_markdown, trivially_copy_pass_by_ref,
