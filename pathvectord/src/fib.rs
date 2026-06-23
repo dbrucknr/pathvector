@@ -89,7 +89,12 @@ pub(crate) enum PendingV4 {
     },
     /// RFC 7999: program a kernel null route (`RTN_BLACKHOLE`) for this prefix.
     Blackhole,
+    /// Remove a unicast (`RTN_UNICAST`) BGP route from the kernel FIB.
     Withdraw,
+    /// Remove a blackhole (`RTN_BLACKHOLE`) BGP route from the kernel FIB.
+    /// Must use a separate netlink delete with `rtm_type = RTN_BLACKHOLE` because
+    /// the kernel matches the route type on deletion.
+    WithdrawBlackhole,
 }
 
 /// The desired kernel state for an IPv6 prefix.
@@ -100,7 +105,10 @@ pub(crate) enum PendingV6 {
     },
     /// RFC 7999: program a kernel null route (`RTN_BLACKHOLE`) for this prefix.
     Blackhole,
+    /// Remove a unicast (`RTN_UNICAST`) BGP route from the kernel FIB.
     Withdraw,
+    /// Remove a blackhole (`RTN_BLACKHOLE`) BGP route from the kernel FIB.
+    WithdrawBlackhole,
 }
 
 /// Abstraction over FIB change application, enabling kernel-free unit testing.
@@ -223,7 +231,7 @@ impl ApplyFibChange for FibManager {
         self.pending_v4
             .lock()
             .unwrap()
-            .insert(nlri, PendingV4::Withdraw);
+            .insert(nlri, PendingV4::WithdrawBlackhole);
         self.notify.notify_one();
     }
 
@@ -239,7 +247,7 @@ impl ApplyFibChange for FibManager {
         self.pending_v6
             .lock()
             .unwrap()
-            .insert(nlri, PendingV6::Withdraw);
+            .insert(nlri, PendingV6::WithdrawBlackhole);
         self.notify.notify_one();
     }
 }
@@ -282,6 +290,14 @@ pub(crate) async fn process_batch<W: FibWrite>(
                     );
                 }
             }
+            PendingV4::WithdrawBlackhole => {
+                if let Err(e) = writer.withdraw_blackhole_v4(dst, prefix_len).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        "FIB blackhole withdraw failed: {e}"
+                    );
+                }
+            }
         }
     }
 
@@ -310,6 +326,14 @@ pub(crate) async fn process_batch<W: FibWrite>(
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB withdraw (v6) failed: {e}"
+                    );
+                }
+            }
+            PendingV6::WithdrawBlackhole => {
+                if let Err(e) = writer.withdraw_blackhole_v6(dst, prefix_len).await {
+                    tracing::warn!(
+                        prefix = %format!("{dst}/{prefix_len}"),
+                        "FIB blackhole withdraw (v6) failed: {e}"
                     );
                 }
             }
@@ -596,6 +620,52 @@ mod tests {
             "Blackhole variant must call install_blackhole_v6"
         );
         assert!(c.installed_v6.is_empty(), "must not call install_v6");
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_withdraw_blackhole_v4_calls_withdraw_blackhole() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::WithdrawBlackhole);
+        super::process_batch(&mock, v4, HashMap::new()).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            c.withdrawn_v4,
+            vec![("192.0.2.0".parse().unwrap(), 24)],
+            "WithdrawBlackhole must call withdraw_blackhole_v4"
+        );
+        assert!(c.withdrawn_v6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_withdraw_blackhole_v6_calls_withdraw_blackhole() {
+        let (mock, calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::WithdrawBlackhole);
+        super::process_batch(&mock, HashMap::new(), v6).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            c.withdrawn_v6,
+            vec![("2001:db8::".parse().unwrap(), 32)],
+            "WithdrawBlackhole must call withdraw_blackhole_v6"
+        );
+        assert!(c.withdrawn_v4.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fib_manager_withdraw_blackhole_v4_queues_withdraw_blackhole_variant() {
+        let (mock, _calls) = MockFibWriter::new();
+        let mgr = FibManager::new(mock);
+        let nlri: Nlri<Ipv4Addr> = "192.0.3.0/24".parse().unwrap();
+        mgr.withdraw_blackhole_v4(nlri);
+        let snap = mgr.pending_v4_snapshot();
+        assert_eq!(
+            snap[&nlri],
+            PendingV4::WithdrawBlackhole,
+            "withdraw_blackhole_v4 must queue WithdrawBlackhole, not Withdraw"
+        );
     }
 
     #[tokio::test]
