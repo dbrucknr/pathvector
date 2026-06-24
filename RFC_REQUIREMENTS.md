@@ -46,6 +46,6 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 6811 | BGP Prefix Origin Validation (ROV) | pathvectord, pathvector-policy | ❌ | — |
 | RFC 7313 | Enhanced Route Refresh Capability | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-7313--enhanced-route-refresh-capability) |
 | RFC 8210 | RPKI-to-Router Protocol v1 (RTR) | pathvectord | ❌ | — |
-| RFC 8538 | NOTIFICATION Support for BGP Graceful Restart | pathvector-session | ❌ | — |
+| RFC 8538 | NOTIFICATION Support for BGP Graceful Restart | pathvectord | ✅ | [daemon](pathvectord/RFC.md#rfc-8538--enhancements-to-bgp-graceful-restart) |
 | RFC 9003 | Extended BGP Administrative Shutdown Communication | pathvector-session, pathvectord | ✅ | [session](pathvector-session/RFC.md#rfc-9003--extended-bgp-administrative-shutdown-communication) · [daemon](pathvectord/RFC.md#rfc-9003--extended-bgp-administrative-shutdown-communication-daemon-integration) |
 | RFC 9234 | BGP Route Leak Prevention Using Roles | pathvector-session, pathvectord | ❌ | — |

@@ -236,7 +236,8 @@ What remains as optional future work:
 ### Remaining
 
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-- NOTIFICATION support for Graceful Restart (RFC 8538) — allows sending CEASE NOTIFICATION during a GR window without tearing down the restart; prevents the helper from flushing routes when it receives a CEASE from a restarting speaker. Extends RFC 4724 Phase 2 (now implemented); depends on no additional session changes beyond what exists today, but requires pathvectord to suppress flush on CEASE if the peer is in an active GR window.
+~~**NOTIFICATION support for Graceful Restart (RFC 8538)** — N-bit negotiation, notification_gr_eligible logic, Hard Reset bypass.~~
+~~**Resolved 2026-06-24**: Full RFC 8538 implementation in pathvectord. N-bit set when GR enabled; peer N-bit tracked on Established; non-HardReset CEASE + both N-bits → GR window opens; CEASE/HardReset always flushes. 11 unit tests + 2 e2e tests (GoBGP for §5 Hard Reset path; FRR for §4 positive path). See `pathvectord/RFC.md`.~~
 
 ~~**Graceful Restart FSM behaviour (RFC 4724)** — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)~~
 ~~**Resolved 2026-06-22**: Full RFC 4724 Phase 1 (speaker/helper role) and Phase 2 (holding peer stale routes) implemented. See `pathvectord/RFC.md` for clause-by-clause status.~~
