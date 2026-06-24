@@ -573,10 +573,8 @@ impl DaemonState {
         let notification_gr_eligible = match &reason {
             TerminationReason::Notification(n) => {
                 use pathvector_session::message::{CeaseError, NotificationError};
-                let is_hard_reset = matches!(
-                    &n.error,
-                    NotificationError::Cease(CeaseError::HardReset)
-                );
+                let is_hard_reset =
+                    matches!(&n.error, NotificationError::Cease(CeaseError::HardReset));
                 !is_hard_reset
                     && we_have_n_bit
                     && self.gr.notification_capable_peers.contains(&peer_ip)
@@ -950,7 +948,10 @@ pub(super) async fn run_command_processor<H, F>(
                     // Operator-initiated removal with no live session — use
                     // Clean so on_terminated does not open a GR window.
                     let _ = event_tx
-                        .send((peer_ip, SessionEvent::Terminated(TerminationReason::OperatorStop)))
+                        .send((
+                            peer_ip,
+                            SessionEvent::Terminated(TerminationReason::OperatorStop),
+                        ))
                         .await;
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and

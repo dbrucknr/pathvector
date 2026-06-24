@@ -11386,7 +11386,10 @@ mod test_build_local_capabilities {
             find_gr(&caps).expect("GracefulRestart capability must be present");
         // RFC 8538: N-bit (0x04) is set whenever gr_time > 0; R-bit (0x08) is not
         // set because we are not restarting.
-        assert_eq!(flags, 0x04, "N-bit must be set, R-bit must be clear on normal startup");
+        assert_eq!(
+            flags, 0x04,
+            "N-bit must be set, R-bit must be clear on normal startup"
+        );
         assert_eq!(time, 120);
         assert_eq!(families.len(), 2);
         let v4 = families
@@ -13280,7 +13283,7 @@ mod test_rfc8538 {
     use std::net::Ipv4Addr;
 
     use pathvector_session::message::{
-        CeaseError, Capability, GracefulRestartFamily, NotificationError, NotificationMessage,
+        Capability, CeaseError, GracefulRestartFamily, NotificationError, NotificationMessage,
         UpdateMessage,
     };
     use pathvector_session::transport::TerminationReason;
@@ -13369,7 +13372,15 @@ mod test_rfc8538 {
     }
 
     fn establish(state: &mut DaemonState, caps: &[Capability]) {
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, caps, None);
+        state.on_established(
+            PEER_IP,
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            caps,
+            None,
+        );
     }
 
     fn notification(error: NotificationError) -> TerminationReason {
@@ -13405,7 +13416,10 @@ mod test_rfc8538 {
             .get(&PEER_IP)
             .expect("AdjRibIn must still exist")
             .len();
-        assert_eq!(adj_len, 1, "stale route must be retained in GR window after NOTIFICATION");
+        assert_eq!(
+            adj_len, 1,
+            "stale route must be retained in GR window after NOTIFICATION"
+        );
 
         // A GR deadline must be scheduled.
         assert!(
@@ -13434,8 +13448,7 @@ mod test_rfc8538 {
             .get(&PEER_IP)
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
-            adj_len,
-            0,
+            adj_len, 0,
             "CEASE/HardReset must flush routes immediately, even with N-bit"
         );
         assert!(
@@ -13466,8 +13479,7 @@ mod test_rfc8538 {
             .get(&PEER_IP)
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
-            adj_len,
-            0,
+            adj_len, 0,
             "NOTIFICATION from non-N-capable peer must flush routes (RFC 4724 §4.2)"
         );
         assert!(
@@ -13493,7 +13505,10 @@ mod test_rfc8538 {
             .adj_ribs_in
             .get(&PEER_IP)
             .map_or(0, pathvector_rib::AdjRibIn::len);
-        assert_eq!(adj_len, 0, "OperatorStop must always flush routes immediately");
+        assert_eq!(
+            adj_len, 0,
+            "OperatorStop must always flush routes immediately"
+        );
         assert!(
             !state.gr.deadlines.contains_key(&PEER_IP),
             "no GR deadline on OperatorStop"
@@ -13519,8 +13534,16 @@ mod test_rfc8538 {
         });
         let (flags, time) = gr_cap.expect("GracefulRestart capability must be present");
         assert_eq!(time, 120, "restart_time must be threaded through");
-        assert_ne!(flags & 0x04, 0, "N-bit must be set when graceful_restart_time > 0");
-        assert_eq!(flags & 0x08, 0, "R-bit must be clear on non-restarting startup");
+        assert_ne!(
+            flags & 0x04,
+            0,
+            "N-bit must be set when graceful_restart_time > 0"
+        );
+        assert_eq!(
+            flags & 0x08,
+            0,
+            "R-bit must be clear on non-restarting startup"
+        );
     }
 
     /// When graceful_restart_time = 0, N-bit must NOT be set.
@@ -13631,8 +13654,7 @@ mod test_rfc8538 {
             .get(&PEER_IP)
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
-            adj_len,
-            0,
+            adj_len, 0,
             "NOTIFICATION must flush when local daemon has no N-bit (graceful_restart_time = 0)"
         );
         assert!(
@@ -14101,7 +14123,10 @@ mod test_max_prefix {
             .unwrap();
         // Session layer responds to CEASE with a Terminated event.
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::OperatorStop)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+            ))
             .await
             .unwrap();
         drop(event_tx);
@@ -14151,7 +14176,10 @@ mod test_max_prefix {
             .unwrap();
         // Session terminates.
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::OperatorStop)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+            ))
             .await
             .unwrap();
         // Peer reconnects immediately — must be blocked.
@@ -14281,7 +14309,10 @@ mod test_max_prefix {
             .await
             .unwrap();
         event_tx
-            .send((peer_ip, SessionEvent::Terminated(TerminationReason::OperatorStop)))
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+            ))
             .await
             .unwrap();
         event_tx
