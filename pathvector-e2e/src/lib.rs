@@ -361,6 +361,59 @@ pub fn write_gobgp_config_with_restart_time(restart_secs: u16) -> NamedTempFile 
     f
 }
 
+/// Like [`write_gobgp_config_with_restart_time`] but also sets
+/// `notification-enabled = true` in the GracefulRestart config block.
+///
+/// This causes GoBGP to advertise the RFC 8538 N-bit (0x04) in its
+/// `GracefulRestart` capability, enabling notification-mode GR on both sides
+/// when pathvectord is also configured with `graceful_restart_time > 0`.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_with_notification_and_restart_time(restart_secs: u16) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  [peer-groups.graceful-restart.config]
+    enabled              = true
+    restart-time         = {restart_secs}
+    notification-enabled = true
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp config");
+    f
+}
+
 /// Writes the gobgpd config for a **route-source** container (AS 65003).
 ///
 /// This is used in two-peer outbound tests: the source announces prefixes to
@@ -1690,6 +1743,28 @@ impl Harness {
         Self::new_inner_with_gobgp_config(
             move || write_gobgp_config_with_restart_time(peer_restart_secs),
             move |peers| write_daemon_config_fast_retry(peers, 2),
+        )
+        .await
+    }
+
+    /// Stand up a harness for RFC 8538 notification-mode GR testing.
+    ///
+    /// Both sides are configured with the N-bit:
+    /// - GoBGP: `graceful-restart.enabled = true`, `notification-enabled = true`,
+    ///   `restart-time = peer_restart_secs`
+    /// - pathvectord: `graceful_restart_time = peer_restart_secs` (sets N-bit)
+    ///
+    /// Use a short `peer_restart_secs` (e.g. 10) so the GR window expires quickly
+    /// in tests.  With this harness, `docker stop` (SIGTERM → CEASE NOTIFICATION)
+    /// triggers a GR window instead of an immediate flush.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_rfc8538_gr(peer_restart_secs: u16) -> Self {
+        Self::new_inner_with_gobgp_config(
+            move || write_gobgp_config_with_notification_and_restart_time(peer_restart_secs),
+            move |peers| write_daemon_config_gr(peers, peer_restart_secs),
         )
         .await
     }
