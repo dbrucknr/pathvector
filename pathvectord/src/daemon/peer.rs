@@ -341,26 +341,33 @@ impl DaemonState {
         // RFC 4724: record whether the peer advertised GracefulRestart with a
         // non-zero restart_time. A zero restart_time means the peer does not
         // participate in the GR restart window (capability present for EOR only).
-        let (peer_gr_time, peer_gr_families): (Option<u16>, Vec<GracefulRestartFamily>) =
-            peer_capabilities
-                .iter()
-                .find_map(|c| {
-                    if let Capability::GracefulRestart {
-                        restart_time,
-                        families,
-                        ..
-                    } = c
-                    {
-                        if *restart_time > 0 {
-                            Some((*restart_time, families.clone()))
-                        } else {
-                            None
-                        }
+        // RFC 8538 §2: also extract the N-bit (0x04 in restart_flags) — when
+        // set, the peer supports notification mode (non-HardReset NOTIFICATIONs
+        // preserve the GR window rather than triggering an immediate flush).
+        let (peer_gr_time, peer_gr_families, peer_has_n_bit): (
+            Option<u16>,
+            Vec<GracefulRestartFamily>,
+            bool,
+        ) = peer_capabilities
+            .iter()
+            .find_map(|c| {
+                if let Capability::GracefulRestart {
+                    restart_flags,
+                    restart_time,
+                    families,
+                } = c
+                {
+                    if *restart_time > 0 {
+                        let n_bit = restart_flags & 0x04 != 0;
+                        Some((*restart_time, families.clone(), n_bit))
                     } else {
                         None
                     }
-                })
-                .map_or((None, vec![]), |(t, f)| (Some(t), f));
+                } else {
+                    None
+                }
+            })
+            .map_or((None, vec![], false), |(t, f, n)| (Some(t), f, n));
         let mut stalled = !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte);
         if stalled {
             self.stalled_peers.push(peer_ip);
@@ -443,8 +450,14 @@ impl DaemonState {
         }
         if peer_gr_time.is_some() {
             self.gr.peer_families.insert(peer_ip, peer_gr_families);
+            if peer_has_n_bit {
+                self.gr.notification_capable_peers.insert(peer_ip);
+            } else {
+                self.gr.notification_capable_peers.remove(&peer_ip);
+            }
         } else {
             self.gr.peer_families.remove(&peer_ip);
+            self.gr.notification_capable_peers.remove(&peer_ip);
         }
         if peer_gr_time.is_none() && we_advertise_gr {
             tracing::warn!(
@@ -519,6 +532,7 @@ impl DaemonState {
     /// any best-path changes caused by the withdrawal to all remaining
     /// established peers.
     #[allow(clippy::similar_names)]
+    #[allow(clippy::needless_pass_by_value)]
     /// `notify` controls whether a `peer_tx` broadcast is sent.  Pass `false`
     /// when the caller will send a more specific event (e.g. `Removed`) instead.
     pub(crate) fn on_terminated(
@@ -529,18 +543,47 @@ impl DaemonState {
     ) {
         let peer_id = PeerId::from(peer_ip);
 
-        // RFC 4724 §4.2 — if the peer disconnected uncleanly AND previously
-        // advertised a non-zero restart_time, enter GR helper mode: keep the
-        // peer's routes in AdjRibIn and LocRib for up to restart_time seconds.
+        // RFC 4724 §4.2 + RFC 8538 §4 — decide whether to enter GR helper mode.
+        //
+        // Enter GR when:
+        // - Unclean termination (TCP failure / hold-timer expiry): always eligible.
+        // - Peer sent a NOTIFICATION (RFC 8538): eligible if BOTH sides negotiated
+        //   the N-bit AND the notification is NOT CEASE/HardReset (subcode 9).
+        //   Hard Reset always triggers an immediate flush regardless of N-bit.
+        // - OperatorStop: never eligible — we initiated the teardown.
+        //
+        // Additional guards: peer must have advertised a non-zero restart_time,
+        // and must not be pending removal.
         let gr_restart_time = self
             .rib
             .gr_capable_peers
             .get(&peer_ip)
             .copied()
             .unwrap_or(0);
-        let enter_gr = reason == TerminationReason::Unclean
+        let pending = self.pending_removal.contains(&peer_ip);
+        // RFC 8538 §4: both sides must have the N-bit set for notification mode.
+        // We advertise N-bit iff our own GracefulRestart capability has
+        // restart_flags & 0x04 != 0 (set by build_local_capabilities whenever
+        // graceful_restart_time > 0).  This is independent of the peer's time.
+        let we_have_n_bit = self.config_capabilities.iter().any(|c| {
+            matches!(c,
+                Capability::GracefulRestart { restart_flags, restart_time, .. }
+                if *restart_time > 0 && restart_flags & 0x04 != 0)
+        });
+        let notification_gr_eligible = match &reason {
+            TerminationReason::Notification(n) => {
+                use pathvector_session::message::{CeaseError, NotificationError};
+                let is_hard_reset =
+                    matches!(&n.error, NotificationError::Cease(CeaseError::HardReset));
+                !is_hard_reset
+                    && we_have_n_bit
+                    && self.gr.notification_capable_peers.contains(&peer_ip)
+            }
+            _ => false,
+        };
+        let enter_gr = !pending
             && gr_restart_time > 0
-            && !self.pending_removal.contains(&peer_ip);
+            && (reason == TerminationReason::Unclean || notification_gr_eligible);
 
         // Remove live session state from snapshot.
         {
@@ -905,7 +948,10 @@ pub(super) async fn run_command_processor<H, F>(
                     // Operator-initiated removal with no live session — use
                     // Clean so on_terminated does not open a GR window.
                     let _ = event_tx
-                        .send((peer_ip, SessionEvent::Terminated(TerminationReason::Clean)))
+                        .send((
+                            peer_ip,
+                            SessionEvent::Terminated(TerminationReason::OperatorStop),
+                        ))
                         .await;
                 }
                 // stop_senders entry is cleaned up when Terminated arrives and
@@ -1022,7 +1068,7 @@ mod tests {
         state.on_route_update(PEER_IP, announce("10.0.0.0/8"));
         fib.v4.lock().unwrap().clear();
 
-        state.on_terminated(PEER_IP, TerminationReason::Clean, true);
+        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
 
         let changes = fib.v4_changes();
         assert!(
@@ -1074,7 +1120,7 @@ mod tests {
         );
         fib.v6.lock().unwrap().clear();
 
-        state.on_terminated(PEER_IP, TerminationReason::Clean, true);
+        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
 
         let v6_changes = fib.v6.lock().unwrap().clone();
         assert!(

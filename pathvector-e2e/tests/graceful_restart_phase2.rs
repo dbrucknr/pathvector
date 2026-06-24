@@ -8,10 +8,16 @@
 //!   - Unclean TCP drop → routes held for peer's restart_time
 //!   - Window expiry → stale routes flushed from Loc-RIB
 //!   - Clean disconnect (NOTIFICATION) → routes flushed immediately
+//!
+//! RFC 8538 requirements tested:
+//!   - N-bit negotiated on both sides + GoBGP HardReset → GR window bypassed (immediate flush)
+//!   - N-bit negotiated on both sides + FRR non-HardReset CEASE → GR window opens
 
 use std::{process::Command, time::Duration};
 
-use pathvector_e2e::{Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn};
+use pathvector_e2e::{
+    FrrHarness, Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn,
+};
 
 /// RFC 4724 §4.2 — when a GR-capable peer disconnects via unclean TCP
 /// failure (SIGKILL, no NOTIFICATION), pathvectord must retain the peer's
@@ -153,7 +159,13 @@ async fn gr_phase2_clean_disconnect_flushes_routes_immediately() {
         .expect("203.0.113.1/32 did not appear in Loc-RIB within 10 s");
 
     // `docker stop` (no --time=0) sends SIGTERM; GoBGP sends a CEASE
-    // NOTIFICATION before exiting → pathvectord sees a clean termination.
+    // NOTIFICATION before exiting → pathvectord receives TerminationReason::Notification.
+    //
+    // Safety invariant: this harness uses write_daemon_config (graceful_restart_time = 0),
+    // so we_have_n_bit = false and the RFC 8538 notification-mode GR path never fires.
+    // The GoBGP config also lacks `notification-enabled = true`, so GoBGP is not in
+    // notification_capable_peers.  Both layers independently ensure routes flush immediately.
+    // If you add RFC 8538 e2e coverage, use a separate harness that enables GR on both sides.
     Command::new("docker")
         .args(["stop", &h.gobgpd_id])
         .status()
@@ -168,4 +180,106 @@ async fn gr_phase2_clean_disconnect_flushes_routes_immediately() {
             "203.0.113.1/32 was not withdrawn after a clean BGP disconnect; \
              pathvectord should not have opened a GR window for a NOTIFICATION-terminated session",
         );
+}
+
+/// RFC 8538 §5 — `CEASE/Hard Reset` bypasses the GR window even when both
+/// sides have negotiated the N-bit.
+///
+/// GoBGP 4.6.0 correctly sends `CEASE/Hard Reset` (subcode 9) on any
+/// shutdown when `notification-enabled = true` is configured — this is the
+/// RFC 8538 §5 "permanent shutdown" signal meaning "do not enter GR for me."
+/// pathvectord must detect the Hard Reset subcode and flush routes immediately
+/// despite the N-bit being set on both sides.
+///
+/// This test validates the end-to-end RFC 8538 Hard Reset path:
+/// 1. Both GoBGP and pathvectord negotiate the N-bit (GoBGP via
+///    `notification-enabled = true`; pathvectord via `graceful_restart_time > 0`).
+/// 2. GoBGP announces 203.0.113.3/32.
+/// 3. `docker stop` → GoBGP sends `CEASE/Hard Reset` (subcode 9).
+///    pathvectord sees `TerminationReason::Notification(HardReset)`.
+///    Per RFC 8538 §5, Hard Reset MUST NOT open a GR window regardless of
+///    N-bit negotiation.
+/// 4. Route must be flushed immediately — the N-bit does NOT prevent flush on
+///    Hard Reset.
+///
+/// The positive path (non-HardReset CEASE + N-bit → GR window opens) is
+/// verified end-to-end by `gr_phase2_rfc8538_frr_notification_opens_gr_window`
+/// (FRR sends non-HardReset CEASE on `docker stop`).
+#[tokio::test]
+async fn gr_phase2_rfc8538_hard_reset_bypasses_gr_window() {
+    let mut h = Harness::new_rfc8538_gr(10).await;
+
+    h.gobgp_announce("203.0.113.3/32", "10.0.0.1");
+    wait_for_route(&mut h.client, "203.0.113.3/32", Duration::from_secs(10))
+        .await
+        .expect("203.0.113.3/32 did not appear in Loc-RIB within 10 s");
+
+    // docker stop → GoBGP sends CEASE/Hard Reset (subcode 9).
+    // Both sides have N-bit, but Hard Reset MUST NOT open a GR window.
+    Command::new("docker")
+        .args(["stop", &h.gobgpd_id])
+        .status()
+        .expect("docker stop gobgpd");
+
+    // Route must be withdrawn quickly — Hard Reset overrides the N-bit.
+    // Allow 10 s for pathvectord to process the Hard Reset and flush.
+    wait_for_route_withdrawn(&mut h.client, "203.0.113.3/32", Duration::from_secs(10))
+        .await
+        .expect(
+            "203.0.113.3/32 was not flushed after CEASE/Hard Reset; \
+             RFC 8538 §5 requires Hard Reset to bypass the GR window regardless of N-bit",
+        );
+}
+
+/// RFC 8538 §4 — end-to-end validation that pathvectord opens a GR window
+/// and holds routes when FRR shuts down with N-bit negotiated on both sides.
+///
+/// FRR 8.x with `neighbor X graceful-restart-notification` configured sends a
+/// non-HardReset CEASE on `docker stop` (Hard Reset is an explicit operator
+/// action in FRR, not the default teardown).  This makes FRR the right peer
+/// for this test: pathvectord must open a GR window and retain routes until
+/// the restart timer expires.
+///
+/// **Coverage note:** this test verifies the observable end-to-end behavior
+/// (route held during the restart window, flushed on expiry) but does not
+/// confirm on the wire whether pathvectord received a `Notification` or an
+/// unclean TCP close — both open a GR window.  The distinction between the
+/// `notification_gr_eligible` and `Unclean` code paths is definitively covered
+/// by the `test_rfc8538` unit-test suite in `pathvectord/src/daemon/mod.rs`,
+/// which injects `NotificationMessage` values directly into `on_terminated`.
+///
+/// Sequence:
+/// 1. FRR and pathvectord both have N-bit + restart_time=10 in their OPEN.
+/// 2. FRR announces 203.0.113.4/32.
+/// 3. `docker stop` → FRR tears down the session without Hard Reset.
+///    pathvectord opens a 10 s GR window and retains the route.
+/// 4. Route must still be present immediately after the stop.
+/// 5. After the window expires the route must be flushed.
+#[tokio::test]
+async fn gr_phase2_rfc8538_frr_notification_opens_gr_window() {
+    let mut h = FrrHarness::new_rfc8538_gr(&["203.0.113.4/32"], 10).await;
+
+    wait_for_route(&mut h.client, "203.0.113.4/32", Duration::from_secs(10))
+        .await
+        .expect("203.0.113.4/32 did not appear in Loc-RIB within 10 s");
+
+    // docker stop → FRR sends CEASE/Administrative-Shutdown (non-HardReset).
+    // Both sides have N-bit; pathvectord MUST open a 10 s GR window.
+    Command::new("docker")
+        .args(["stop", &h.frr_id])
+        .status()
+        .expect("docker stop frr");
+
+    // Route must still be present — GR window is open.
+    wait_for_route(&mut h.client, "203.0.113.4/32", Duration::from_secs(5))
+        .await
+        .expect(
+            "203.0.113.4/32 was flushed immediately after non-HardReset CEASE; \
+             RFC 8538 §4 requires GR window to open when both sides have N-bit",
+        );
+
+    // After the 10 s restart window expires the route must be gone.
+    wait_for_route_withdrawn(&mut h.client, "203.0.113.4/32", Duration::from_secs(20))
+        .await
+        .expect("203.0.113.4/32 was not flushed after the 10 s GR restart window expired");
 }

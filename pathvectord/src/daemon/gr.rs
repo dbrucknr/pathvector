@@ -25,6 +25,13 @@ pub(crate) struct GracefulRestartState {
     /// Retained across termination so `on_terminated` knows which AFI/SAFIs the
     /// peer declared GR support for.  Cleared only on `remove_peer`.
     pub(crate) peer_families: HashMap<Ipv4Addr, Vec<GracefulRestartFamily>>,
+    /// Peers that advertised the RFC 8538 N-bit in their GracefulRestart capability.
+    ///
+    /// When a peer is in this set AND we advertise a non-zero `graceful_restart_time`
+    /// (meaning we also have the N-bit set), a received NOTIFICATION other than
+    /// `CEASE/HardReset` is treated as Unclean — the GR window opens rather than
+    /// flushing routes immediately.
+    pub(crate) notification_capable_peers: HashSet<Ipv4Addr>,
 }
 
 impl GracefulRestartState {
@@ -34,6 +41,7 @@ impl GracefulRestartState {
             stale_nlri: HashMap::new(),
             stale_nlri_v6: HashMap::new(),
             peer_families: HashMap::new(),
+            notification_capable_peers: HashSet::new(),
         }
     }
 
@@ -43,6 +51,7 @@ impl GracefulRestartState {
         self.stale_nlri.remove(&peer_ip);
         self.stale_nlri_v6.remove(&peer_ip);
         self.peer_families.remove(&peer_ip);
+        self.notification_capable_peers.remove(&peer_ip);
     }
 
     /// Earliest deadline across all active GR windows, or `None` when empty.
