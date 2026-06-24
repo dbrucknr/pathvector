@@ -10,11 +10,14 @@
 //!   - Clean disconnect (NOTIFICATION) → routes flushed immediately
 //!
 //! RFC 8538 requirements tested:
-//!   - N-bit negotiated on both sides + non-HardReset NOTIFICATION → GR window opens
+//!   - N-bit negotiated on both sides + GoBGP HardReset → GR window bypassed (immediate flush)
+//!   - N-bit negotiated on both sides + FRR non-HardReset CEASE → GR window opens
 
 use std::{process::Command, time::Duration};
 
-use pathvector_e2e::{Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn};
+use pathvector_e2e::{
+    FrrHarness, Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn,
+};
 
 /// RFC 4724 §4.2 — when a GR-capable peer disconnects via unclean TCP
 /// failure (SIGKILL, no NOTIFICATION), pathvectord must retain the peer's
@@ -199,10 +202,9 @@ async fn gr_phase2_clean_disconnect_flushes_routes_immediately() {
 /// 4. Route must be flushed immediately — the N-bit does NOT prevent flush on
 ///    Hard Reset.
 ///
-/// The complementary RFC 8538 positive path (non-HardReset CEASE + N-bit →
-/// GR window opens) is verified by the `test_rfc8538` unit-test suite in
-/// `pathvectord/src/daemon/mod.rs`, which directly exercises `on_terminated`
-/// with injected `NotificationMessage` values.
+/// The positive path (non-HardReset CEASE + N-bit → GR window opens) is
+/// verified end-to-end by `gr_phase2_rfc8538_frr_notification_opens_gr_window`
+/// (FRR sends non-HardReset CEASE on `docker stop`).
 #[tokio::test]
 async fn gr_phase2_rfc8538_hard_reset_bypasses_gr_window() {
     let mut h = Harness::new_rfc8538_gr(10).await;
@@ -227,4 +229,52 @@ async fn gr_phase2_rfc8538_hard_reset_bypasses_gr_window() {
             "203.0.113.3/32 was not flushed after CEASE/Hard Reset; \
              RFC 8538 §5 requires Hard Reset to bypass the GR window regardless of N-bit",
         );
+}
+
+/// RFC 8538 §4 — when both peers have negotiated the N-bit and the peer sends
+/// a non-HardReset CEASE NOTIFICATION, pathvectord MUST open a GR window and
+/// hold the peer's routes for the duration of the peer's advertised restart time.
+///
+/// FRR 8.x with `neighbor X graceful-restart-notification` (N-bit) sends a
+/// non-HardReset CEASE on `docker stop` (SIGTERM → Administrative-Shutdown,
+/// subcode 2).  This is the RFC 8538 "normal" shutdown path: Hard Reset is
+/// an explicit operator action (`clear bgp * hard-reset`) in FRR, not the
+/// default teardown.
+///
+/// Sequence:
+/// 1. FRR and pathvectord both have N-bit + restart_time=10 in their OPEN.
+/// 2. FRR announces 203.0.113.4/32.
+/// 3. `docker stop` → FRR sends CEASE/Administrative-Shutdown (non-HardReset).
+///    pathvectord sees `TerminationReason::Notification(subcode != HardReset)`.
+///    Per RFC 8538 §4, both N-bits set + non-HardReset → GR window opens.
+/// 4. Route must still be present immediately after the stop —
+///    pathvectord is holding it during the 10 s restart window.
+/// 5. After the window expires the route must be flushed.
+#[tokio::test]
+async fn gr_phase2_rfc8538_frr_notification_opens_gr_window() {
+    let mut h = FrrHarness::new_rfc8538_gr(&["203.0.113.4/32"], 10).await;
+
+    wait_for_route(&mut h.client, "203.0.113.4/32", Duration::from_secs(10))
+        .await
+        .expect("203.0.113.4/32 did not appear in Loc-RIB within 10 s");
+
+    // docker stop → FRR sends CEASE/Administrative-Shutdown (non-HardReset).
+    // Both sides have N-bit; pathvectord MUST open a 10 s GR window.
+    Command::new("docker")
+        .args(["stop", &h.frr_id])
+        .status()
+        .expect("docker stop frr");
+
+    // Route must still be present — GR window is open.
+    wait_for_route(&mut h.client, "203.0.113.4/32", Duration::from_secs(5))
+        .await
+        .expect(
+            "203.0.113.4/32 was flushed immediately after non-HardReset CEASE; \
+             RFC 8538 §4 requires GR window to open when both sides have N-bit",
+        );
+
+    // After the 10 s restart window expires the route must be gone.
+    wait_for_route_withdrawn(&mut h.client, "203.0.113.4/32", Duration::from_secs(20))
+        .await
+        .expect("203.0.113.4/32 was not flushed after the 10 s GR restart window expired");
 }

@@ -3384,6 +3384,82 @@ export_default = "accept"
     f
 }
 
+/// Writes an FRR bgpd config with RFC 8538 N-bit (`graceful-restart notification`).
+///
+/// `routes`: prefixes FRR announces to pathvectord via `network` statements.
+#[must_use]
+pub fn write_frr_config_gr_notification(
+    routes: &[&str],
+    pathvectord_ip: &str,
+    restart_secs: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp frr RFC8538 config");
+    write!(
+        f,
+        "
+frr defaults traditional
+
+router bgp 65001
+ bgp router-id 1.0.0.1
+ no bgp ebgp-requires-policy
+ no bgp network import-check
+ bgp graceful-restart restart-time {restart_secs}
+ neighbor {pathvectord_ip} remote-as 65002
+ neighbor {pathvectord_ip} passive
+ neighbor {pathvectord_ip} graceful-restart
+ neighbor {pathvectord_ip} graceful-restart-notification
+ !
+ address-family ipv4 unicast
+  neighbor {pathvectord_ip} activate
+  neighbor {pathvectord_ip} next-hop-self
+"
+    )
+    .expect("write frr RFC8538 config header");
+
+    for route in routes {
+        writeln!(f, "  network {route}").expect("write frr network statement");
+    }
+
+    writeln!(f, " exit-address-family\nexit").expect("write frr config footer");
+    f
+}
+
+/// Pathvectord config with `graceful_restart_time` for FRR RFC 8538 tests.
+pub fn write_daemon_config_frr_gr_notification(
+    peers: &[(Ipv4Addr, u32)],
+    restart_time: u16,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord FRR RFC8538 config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+"#
+    )
+    .expect("write pathvectord FRR RFC8538 config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord FRR RFC8538 peer config");
+    }
+    f
+}
+
 fn write_daemon_config_frr_gr_restarting(
     peers: &[(Ipv4Addr, u32)],
     restart_time: u16,
@@ -3434,6 +3510,8 @@ pub struct FrrHarness {
     pub client: PathvectorClient,
     /// Container ID of the FRR container — pass to [`wait_for_frr_rib_entry`].
     pub frr_id: String,
+    /// Container ID of the pathvectord container.
+    pub pathvectord_id: String,
     /// The FRR container's IP on the shared network.
     pub frr_ip: Ipv4Addr,
     /// The pathvectord container's IP on the shared network.
@@ -3445,6 +3523,82 @@ impl FrrHarness {
     /// Stand up the environment with no pre-announced routes.
     pub async fn new() -> Self {
         Self::with_routes(&[]).await
+    }
+
+    /// Both FRR and pathvectord configured with N-bit and `restart_time` for
+    /// RFC 8538 notification-mode testing.
+    ///
+    /// FRR uses `neighbor X graceful-restart-notification` (RFC 8538 N-bit).
+    /// pathvectord uses `graceful_restart_time = restart_secs` (sets N-bit too).
+    pub async fn new_rfc8538_gr(routes: &'static [&'static str], restart_secs: u16) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-frr-rfc8538-{test_id}");
+
+        let subnet = frr_test_subnet(test_id);
+        let frr_ip_str = frr_peer_ip(test_id);
+        let pv_ip_str = frr_pathvectord_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let frr_config = write_frr_config_gr_notification(routes, &pv_ip_str, restart_secs);
+        let frr_config_path = frr_config.path().to_str().unwrap().to_owned();
+
+        let frr = docker_start_with_caps(
+            &format!("frr-rfc8538-{test_id}"),
+            FRR_IMAGE,
+            &network_name,
+            Some(&frr_ip_str),
+            true,
+            true,
+            &frr_config_path,
+            "/etc/frr/frr.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&frr.0, Duration::from_secs(60));
+
+        let pathvectord_config = {
+            let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+            write_daemon_config_frr_gr_notification(&[(frr_ip, 65001)], restart_secs)
+        };
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start(
+            &format!("pathvectord-frr-rfc8538-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pv_ip_str),
+            false,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for FrrHarness::new_rfc8538_gr");
+
+        let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+        wait_for_established(&mut client, frr_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session with FRR (RFC 8538) did not reach Established within 30 s");
+
+        let frr_container_id = frr.0.clone();
+        let pv_container_id = pathvectord.0.clone();
+        FrrHarness {
+            _frr: frr,
+            _pathvectord: pathvectord,
+            _frr_config: frr_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            frr_id: frr_container_id,
+            pathvectord_id: pv_container_id,
+            frr_ip,
+            pathvectord_ip: pv_ip_str.parse().unwrap(),
+            _network: network,
+        }
     }
 
     /// Stand up pathvectord with `graceful_restart_time` set and `restarting = true`,
@@ -3513,14 +3667,16 @@ impl FrrHarness {
             .await
             .expect("BGP session with FRR (GR restarting) did not reach Established within 30 s");
 
-        let container_id = frr.0.clone();
+        let frr_container_id = frr.0.clone();
+        let pv_container_id = pathvectord.0.clone();
         FrrHarness {
             _frr: frr,
             _pathvectord: pathvectord,
             _frr_config: frr_config,
             _pathvectord_config: pathvectord_config,
             client,
-            frr_id: container_id,
+            frr_id: frr_container_id,
+            pathvectord_id: pv_container_id,
             frr_ip,
             pathvectord_ip: pv_ip_str.parse().unwrap(),
             _network: network,
@@ -3588,14 +3744,16 @@ impl FrrHarness {
             .await
             .expect("BGP session with FRR did not reach Established within 30 s");
 
-        let container_id = frr.0.clone();
+        let frr_container_id = frr.0.clone();
+        let pv_container_id = pathvectord.0.clone();
         FrrHarness {
             _frr: frr,
             _pathvectord: pathvectord,
             _frr_config: frr_config,
             _pathvectord_config: pathvectord_config,
             client,
-            frr_id: container_id,
+            frr_id: frr_container_id,
+            pathvectord_id: pv_container_id,
             frr_ip,
             pathvectord_ip: pv_ip_str.parse().unwrap(),
             _network: network,

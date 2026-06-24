@@ -168,18 +168,16 @@ NOTIFICATIONs on termination to decide between immediate flush and GR window.
 | §3 Peer N-bit extracted from peer OPEN `restart_flags` on Established | `src/daemon/peer.rs` — `on_established` | ✅ | `n_bit_peer_tracked_on_established`, `non_n_bit_peer_not_tracked_on_established` |
 | §3 Peer N-bit tracking cleared when peer re-establishes without N-bit | `src/daemon/peer.rs` | ✅ | `n_bit_cleared_when_peer_re_establishes_without_it` |
 | §3 Peer N-bit tracking cleared on `remove_peer` | `src/daemon/gr.rs` — `GracefulRestartState::remove_peer` | ✅ | `n_bit_cleared_on_remove_peer` |
-| §4 Non-HardReset NOTIFICATION from N-capable peer → GR window (both sides must have N-bit) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_non_hard_reset_with_n_bit_enters_gr_window` |
+| §4 Non-HardReset NOTIFICATION from N-capable peer → GR window (both sides must have N-bit) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_non_hard_reset_with_n_bit_enters_gr_window`, e2e: `gr_phase2_rfc8538_frr_notification_opens_gr_window` |
 | §4 CEASE/HardReset (subcode 9) MUST trigger immediate flush even with N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_hard_reset_always_flushes`, e2e: `gr_phase2_rfc8538_hard_reset_bypasses_gr_window` |
 | §4 NOTIFICATION from peer without N-bit → flush immediately (RFC 4724 §4.2 preserved) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_without_peer_n_bit_flushes` |
 | §4 WE must have N-bit for notification mode to engage; otherwise flush immediately | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_flushes_when_local_daemon_has_no_gr` |
 | `OperatorStop` (local-initiated teardown) always flushes immediately, regardless of N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `operator_stop_always_flushes` |
 
-**Note on e2e coverage:** GoBGP 4.6.0 correctly sends `CEASE/Hard Reset` (subcode 9) on all
-shutdowns when `notification-enabled = true` is configured (RFC 8538 §5 "permanent shutdown"
-signal). The e2e test `gr_phase2_rfc8538_hard_reset_bypasses_gr_window` therefore exercises
-the Hard Reset bypass path rather than the GR-window-opens path. The GR-window-opens path
-(non-HardReset CEASE + N-bit → hold routes) is fully covered by the 11 unit tests in
-`test_rfc8538` in `pathvectord/src/daemon/mod.rs`.
+**Note on e2e peers:** GoBGP 4.6.0 sends `CEASE/Hard Reset` (subcode 9) on all shutdowns
+when `notification-enabled = true` — used to validate the §5 Hard Reset bypass path.
+FRR 8.x with `neighbor X graceful-restart-notification` sends `CEASE/Administrative-Shutdown`
+(non-HardReset) on `docker stop` — used to validate the §4 positive path (GR window opens).
 
 ---
 
