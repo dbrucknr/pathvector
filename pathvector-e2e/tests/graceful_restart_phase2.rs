@@ -153,7 +153,13 @@ async fn gr_phase2_clean_disconnect_flushes_routes_immediately() {
         .expect("203.0.113.1/32 did not appear in Loc-RIB within 10 s");
 
     // `docker stop` (no --time=0) sends SIGTERM; GoBGP sends a CEASE
-    // NOTIFICATION before exiting → pathvectord sees a clean termination.
+    // NOTIFICATION before exiting → pathvectord receives TerminationReason::Notification.
+    //
+    // Safety invariant: this harness uses write_daemon_config (graceful_restart_time = 0),
+    // so we_have_n_bit = false and the RFC 8538 notification-mode GR path never fires.
+    // The GoBGP config also lacks `notification-enabled = true`, so GoBGP is not in
+    // notification_capable_peers.  Both layers independently ensure routes flush immediately.
+    // If you add RFC 8538 e2e coverage, use a separate harness that enables GR on both sides.
     Command::new("docker")
         .args(["stop", &h.gobgpd_id])
         .status()
