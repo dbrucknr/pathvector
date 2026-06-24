@@ -208,16 +208,23 @@ pub enum SessionCommand {
 /// Why a BGP session was torn down.
 ///
 /// Used by the daemon to decide whether to retain stale routes from the peer
-/// during the peer's Graceful Restart window (RFC 4724 §4.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// during the peer's Graceful Restart window (RFC 4724 §4.2, RFC 8538).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminationReason {
     /// TCP failure or hold-timer expiry — no NOTIFICATION was received from
     /// the peer before the session dropped.  RFC 4724 §4.2: the helper MAY
     /// retain stale routes from a GR-capable peer for up to `restart_time`.
     Unclean,
-    /// The peer sent a NOTIFICATION before the connection closed.  RFC 4724
-    /// §4.2: the helper MUST NOT retain stale routes in this case.
-    Clean,
+    /// The peer sent a NOTIFICATION.
+    ///
+    /// RFC 8538: when both sides have negotiated the N-bit in their
+    /// `GracefulRestart` capability, the daemon MUST still retain stale routes
+    /// unless the notification is `CEASE`/`HardReset` (subcode 9).  The daemon
+    /// inspects the carried message to make that determination.
+    Notification(crate::message::NotificationMessage),
+    /// The session was torn down by the local operator (`ManualStop` or we sent
+    /// a NOTIFICATION outbound).  Always flushes routes immediately.
+    OperatorStop,
 }
 
 /// Events emitted by a session to its caller.
@@ -452,10 +459,15 @@ impl<T: BgpTransport> Session<T> {
             // FSM only emits SessionTerminated from that state.
             if self.fsm.is_established() {
                 self.termination_reason = match &input {
-                    // Peer sent NOTIFICATION, or operator-initiated stop/CEASE.
-                    FsmInput::MessageReceived(BgpMessage::Notification(_))
-                    | FsmInput::ManualStop
-                    | FsmInput::NotificationToSend(_) => TerminationReason::Clean,
+                    // Peer sent a NOTIFICATION — carry it so the daemon can
+                    // apply RFC 8538 logic (HardReset vs. non-HardReset).
+                    FsmInput::MessageReceived(BgpMessage::Notification(n)) => {
+                        TerminationReason::Notification(n.clone())
+                    }
+                    // We initiated the teardown; always flush immediately.
+                    FsmInput::ManualStop | FsmInput::NotificationToSend(_) => {
+                        TerminationReason::OperatorStop
+                    }
                     _ => TerminationReason::Unclean,
                 };
             }
@@ -739,7 +751,7 @@ impl<T: BgpTransport> Session<T> {
                 FsmOutput::SessionTerminated => {
                     let _ = self
                         .event_tx
-                        .send(SessionEvent::Terminated(self.termination_reason))
+                        .send(SessionEvent::Terminated(self.termination_reason.clone()))
                         .await;
                 }
                 FsmOutput::RouteUpdate(update) => {

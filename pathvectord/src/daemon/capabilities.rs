@@ -54,12 +54,14 @@ pub(super) fn build_local_capabilities(
     // so peers hold our routes during our restart window.  When 0, advertise an
     // empty family list — peers still send EOR markers but withdraw our routes
     // immediately on session loss.
-    // RFC 4724 §3: Restart State (R) bit is the high bit of restart_flags.
-    // Set when we are the restarting speaker within the restart window so peers
-    // know to stop their stale-route timers when our session re-establishes.
-    // Only meaningful when graceful_restart_time > 0.
-    let restart_flags: u8 = if restarting && graceful_restart_time > 0 {
-        0x08
+    // RFC 4724 §3: Restart State (R) bit (0x08) — set when we are the
+    // restarting speaker within the restart window.
+    // RFC 8538 §2: Notification (N) bit (0x04) — set whenever we advertise
+    // a non-zero restart_time, signalling that we support the RFC 8538
+    // notification mode (non-HardReset NOTIFICATIONs preserve GR windows).
+    let restart_flags: u8 = if graceful_restart_time > 0 {
+        let r_bit: u8 = if restarting { 0x08 } else { 0x00 };
+        r_bit | 0x04 // N-bit always set when we participate in GR
     } else {
         0x00
     };
