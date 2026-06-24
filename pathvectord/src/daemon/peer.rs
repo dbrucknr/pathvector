@@ -561,11 +561,15 @@ impl DaemonState {
             .copied()
             .unwrap_or(0);
         let pending = self.pending_removal.contains(&peer_ip);
-        // We advertise the N-bit whenever we have a non-zero graceful_restart_time,
-        // which is exactly when gr_restart_time > 0 would be true for ourselves.
-        // Use the peer capability check as the local proxy: if we've populated
-        // gr_capable_peers it means our own build_local_capabilities emits GR too.
-        let we_have_n_bit = gr_restart_time > 0; // we set N-bit iff gr_time > 0
+        // RFC 8538 §4: both sides must have the N-bit set for notification mode.
+        // We advertise N-bit iff our own GracefulRestart capability has
+        // restart_flags & 0x04 != 0 (set by build_local_capabilities whenever
+        // graceful_restart_time > 0).  This is independent of the peer's time.
+        let we_have_n_bit = self.config_capabilities.iter().any(|c| {
+            matches!(c,
+                Capability::GracefulRestart { restart_flags, restart_time, .. }
+                if *restart_time > 0 && restart_flags & 0x04 != 0)
+        });
         let notification_gr_eligible = match &reason {
             TerminationReason::Notification(n) => {
                 use pathvector_session::message::{CeaseError, NotificationError};

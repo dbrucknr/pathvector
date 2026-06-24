@@ -11980,7 +11980,7 @@ mod test_gr_phase2 {
         assert_eq!(state.rib.loc_rib.len(), 1, "route held during GR window");
         assert!(state.gr.deadlines.contains_key(&PEER_IP));
 
-        // Peer re-establishes then sends a NOTIFICATION (clean).
+        // Peer re-establishes, then we tear it down (operator stop).
         establish_with_gr(&mut state, 30);
         state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
 
@@ -13340,6 +13340,9 @@ mod test_rfc8538 {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
         };
+        // Build local capabilities with GR time 120 and N-bit set, matching a
+        // realistic pathvectord deployment that participates in RFC 8538.
+        let local_caps = build_local_capabilities(LOCAL_AS, 120, false);
         DaemonState::new(
             LOCAL_AS,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -13347,7 +13350,7 @@ mod test_rfc8538 {
             None,
             &[peer],
             [(PEER_IP, tx)].into(),
-            vec![],
+            local_caps,
         )
     }
 
@@ -13575,6 +13578,66 @@ mod test_rfc8538 {
         assert!(
             !state.gr.notification_capable_peers.contains(&PEER_IP),
             "N-bit tracking must be cleared when peer re-establishes without it"
+        );
+    }
+
+    /// RFC 8538 §4 — if WE don't have the N-bit (our graceful_restart_time = 0),
+    /// a NOTIFICATION from an N-capable peer must still flush immediately.
+    /// This verifies the we_have_n_bit check reads from our own config_capabilities,
+    /// not the peer's gr_restart_time.
+    #[test]
+    fn notification_flushes_when_local_daemon_has_no_gr() {
+        let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
+        let peer = config::PeerConfig {
+            address: PEER_IP,
+            port: 179,
+            remote_as: PEER_AS,
+            import_default: Some(config::ImportDefault::Accept),
+            export_default: Some(config::ExportDefault::Accept),
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
+        };
+        // Local daemon has graceful_restart_time = 0 → no N-bit advertised.
+        let mut state = DaemonState::new(
+            LOCAL_AS,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &[peer],
+            [(PEER_IP, tx)].into(),
+            build_local_capabilities(LOCAL_AS, 0, false),
+        );
+        // Peer advertises N-bit, but we don't → notification mode must NOT engage.
+        establish(&mut state, &[gr_cap_with_n_bit(120)]);
+        assert_eq!(
+            state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"])),
+            None,
+            "unexpected CEASE on announce"
+        );
+
+        let reason = notification(NotificationError::HoldTimerExpired);
+        state.on_terminated(PEER_IP, reason, false);
+
+        let adj_len = state
+            .adj_ribs_in
+            .get(&PEER_IP)
+            .map_or(0, pathvector_rib::AdjRibIn::len);
+        assert_eq!(
+            adj_len,
+            0,
+            "NOTIFICATION must flush when local daemon has no N-bit (graceful_restart_time = 0)"
+        );
+        assert!(
+            !state.gr.deadlines.contains_key(&PEER_IP),
+            "no GR deadline when local daemon has no N-bit"
         );
     }
 

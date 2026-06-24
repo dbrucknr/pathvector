@@ -135,7 +135,7 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | e2e: GoBGP holds routes during our restart window (blackhole use case) | `pathvector-e2e/tests/session.rs` | ✅ | `gr_helper_gobgp_holds_routes_during_restart_window` |
 | e2e: peer GR restart_time visible via management API | `pathvector-e2e/tests/session.rs` | ✅ | `gr_capability_negotiated_peer_gr_restart_time_reflects_config` |
 | §4.2 MUST: unclean termination of GR-capable peer retains routes in AdjRibIn/LocRib | `src/daemon.rs` | ✅ | `unclean_termination_of_gr_peer_retains_routes` |
-| §4.2 MUST: NOTIFICATION-driven termination flushes routes immediately | `src/daemon.rs` | ✅ | `clean_termination_flushes_immediately` |
+| §4.2 MUST: NOTIFICATION-driven termination flushes immediately when RFC 8538 not in effect | `src/daemon.rs` | ✅ | `clean_termination_flushes_immediately` (see also RFC 8538 below) |
 | §4.2 MUST: non-GR peer routes always flushed on unclean termination | `src/daemon.rs` | ✅ | `non_gr_peer_always_flushes_on_unclean_termination` |
 | §4.2 MUST: per-family GR — only families listed in peer OPEN are retained | `src/daemon.rs` | ✅ | per-family `gr_v4`/`gr_v6` check in `on_terminated` |
 | §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
@@ -149,6 +149,32 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 
 **Deferred:** §3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently logged
 as warning only). All §4.2 requirements now implemented and e2e verified.
+
+---
+
+## RFC 8538 — Enhancements to BGP Graceful Restart
+
+**Owns:** N-bit advertisement in the `GracefulRestart` capability; inspection of received
+NOTIFICATIONs on termination to decide between immediate flush and GR window.  
+**Boundary:** `TerminationReason::Notification` is produced by `pathvector-session`;
+`on_terminated` in `pathvectord` applies the RFC 8538 decision logic.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc8538
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| §2 N-bit (0x04) set in `restart_flags` whenever `graceful_restart_time > 0` | `src/daemon/capabilities.rs` | ✅ | `build_local_capabilities_sets_n_bit_when_gr_enabled`, `build_local_capabilities_no_n_bit_when_gr_disabled` |
+| §2 N-bit not set when `graceful_restart_time = 0` | `src/daemon/capabilities.rs` | ✅ | `build_local_capabilities_no_n_bit_when_gr_disabled` |
+| §2 R-bit and N-bit set independently (R-bit only within restart window; N-bit always when GR enabled) | `src/daemon/capabilities.rs` | ✅ | `test_build_local_capabilities_gr_enabled`, `spawn_config_r_bit_set_within_restart_window` |
+| §3 Peer N-bit extracted from peer OPEN `restart_flags` on Established | `src/daemon/peer.rs` — `on_established` | ✅ | `n_bit_peer_tracked_on_established`, `non_n_bit_peer_not_tracked_on_established` |
+| §3 Peer N-bit tracking cleared when peer re-establishes without N-bit | `src/daemon/peer.rs` | ✅ | `n_bit_cleared_when_peer_re_establishes_without_it` |
+| §3 Peer N-bit tracking cleared on `remove_peer` | `src/daemon/gr.rs` — `GracefulRestartState::remove_peer` | ✅ | `n_bit_cleared_on_remove_peer` |
+| §4 Non-HardReset NOTIFICATION from N-capable peer → GR window (both sides must have N-bit) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_non_hard_reset_with_n_bit_enters_gr_window` |
+| §4 CEASE/HardReset (subcode 9) MUST trigger immediate flush even with N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_hard_reset_always_flushes` |
+| §4 NOTIFICATION from peer without N-bit → flush immediately (RFC 4724 §4.2 preserved) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_without_peer_n_bit_flushes` |
+| §4 WE must have N-bit for notification mode to engage; otherwise flush immediately | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_flushes_when_local_daemon_has_no_gr` |
+| `OperatorStop` (local-initiated teardown) always flushes immediately, regardless of N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `operator_stop_always_flushes` |
+
+**Deferred:** e2e test with a GoBGP peer that supports the N-bit (requires GoBGP config for RFC 8538 mode). Unit coverage is complete.
 
 ---
 
