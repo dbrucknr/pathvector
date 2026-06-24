@@ -3387,6 +3387,10 @@ export_default = "accept"
 /// Writes an FRR bgpd config with RFC 8538 N-bit (`graceful-restart notification`).
 ///
 /// `routes`: prefixes FRR announces to pathvectord via `network` statements.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
 #[must_use]
 pub fn write_frr_config_gr_notification(
     routes: &[&str],
@@ -3425,6 +3429,11 @@ router bgp 65001
 }
 
 /// Pathvectord config with `graceful_restart_time` for FRR RFC 8538 tests.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
 pub fn write_daemon_config_frr_gr_notification(
     peers: &[(Ipv4Addr, u32)],
     restart_time: u16,
@@ -3530,6 +3539,10 @@ impl FrrHarness {
     ///
     /// FRR uses `neighbor X graceful-restart-notification` (RFC 8538 N-bit).
     /// pathvectord uses `graceful_restart_time = restart_secs` (sets N-bit too).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any Docker or network setup step fails.
     pub async fn new_rfc8538_gr(routes: &'static [&'static str], restart_secs: u16) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
