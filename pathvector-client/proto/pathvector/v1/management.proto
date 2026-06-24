@@ -1,0 +1,508 @@
+syntax = "proto3";
+
+package pathvector.v1;
+
+// ── Common types ──────────────────────────────────────────────────────────────
+
+/// BGP session state for a configured peer.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_IDLE        = 1;
+  SESSION_STATE_ESTABLISHED = 2;
+}
+
+/// Whether a peer is iBGP (same AS) or eBGP (different AS).
+enum PeerType {
+  PEER_TYPE_UNSPECIFIED = 0;
+  PEER_TYPE_EXTERNAL    = 1;
+  PEER_TYPE_INTERNAL    = 2;
+}
+
+/// BGP ORIGIN path attribute (RFC 4271 §4.3).
+enum Origin {
+  ORIGIN_IGP        = 0;
+  ORIGIN_EGP        = 1;
+  ORIGIN_INCOMPLETE = 2;
+}
+
+/// One segment of a BGP AS_PATH attribute (RFC 4271 §4.3).
+///
+/// A path is composed of one or more segments, each of which is either an
+/// ordered sequence (the common case) or an unordered set (produced by
+/// aggregation).  Confederation segments (RFC 5065) are preserved for
+/// operators running confederation topologies.
+message AsSegment {
+  enum Type {
+    TYPE_UNSPECIFIED     = 0;
+    TYPE_SEQUENCE        = 1;  // AS_SEQUENCE — ordered list
+    TYPE_SET             = 2;  // AS_SET — unordered, from aggregation
+    TYPE_CONFED_SEQUENCE = 3;  // AS_CONFED_SEQUENCE — ordered, intra-confed
+    TYPE_CONFED_SET      = 4;  // AS_CONFED_SET — unordered, intra-confed
+  }
+  Type            type = 1;
+  repeated uint32 asns = 2;
+}
+
+/// RFC 8092 LARGE_COMMUNITY — three 4-byte unsigned integers.
+message LargeCommunity {
+  uint32 global_admin = 1;
+  uint32 local_data1  = 2;
+  uint32 local_data2  = 3;
+}
+
+/// BGP AGGREGATOR attribute — identifies the router that created an aggregate.
+message Aggregator {
+  /// AS number of the aggregating router.
+  uint32 asn     = 1;
+  /// BGP ID (router-id) of the aggregating router in dotted-decimal notation.
+  string address = 2;
+}
+
+/// A single BGP route with all path attributes intact.
+///
+/// Peer address is included so callers can correlate routes to sessions without
+/// a separate lookup.
+message Route {
+  /// Advertised prefix in CIDR notation, e.g. "10.0.0.0/8".
+  string prefix = 1;
+  /// Dotted-decimal address of the peer that sent this route.
+  /// "local" for routes injected via OriginationService.
+  string peer_address = 2;
+  /// Whether the peer is iBGP or eBGP.
+  PeerType peer_type = 3;
+  /// Forwarding next-hop address in dotted-decimal; empty string if absent.
+  string next_hop = 4;
+  /// AS_PATH segments in order; empty for locally originated routes.
+  repeated AsSegment as_path = 5;
+  /// ORIGIN attribute.
+  Origin origin = 6;
+  /// LOCAL_PREF (RFC 4271 §5.1.5); present for iBGP routes, absent otherwise.
+  optional uint32 local_pref = 7;
+  /// MULTI_EXIT_DISC (RFC 4271 §5.1.4); absent if the peer did not advertise it.
+  optional uint32 med = 8;
+  /// Standard BGP communities (RFC 1997), encoded as raw uint32 values.
+  /// Decode as high 16 bits = AS, low 16 bits = value.
+  repeated uint32 communities = 9;
+  /// Large communities (RFC 8092).
+  repeated LargeCommunity large_communities = 10;
+  /// Extended communities (RFC 4360), each serialised as exactly 8 bytes.
+  repeated bytes extended_communities = 11;
+  /// True if the ATOMIC_AGGREGATE attribute is present (RFC 4271 §5.1.6).
+  bool atomic_aggregate = 12;
+  /// AGGREGATOR attribute (RFC 4271 §5.1.7); absent if not set.
+  optional Aggregator aggregator = 13;
+}
+
+// ── Peer service ──────────────────────────────────────────────────────────────
+
+service PeerService {
+  /// Returns the state of every configured peer.
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  /// Returns the state of a single peer identified by its IP address.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc GetPeer(GetPeerRequest) returns (PeerState);
+  /// Streams peer state changes. Sends the current state of all peers first
+  /// (PEER_EVENT_CURRENT per peer, then PEER_EVENT_END_INITIAL), then streams
+  /// live PEER_EVENT_CHANGED events as sessions transition.
+  rpc WatchPeers(WatchPeersRequest) returns (stream PeerEvent);
+
+  /// Adds a new BGP peer at runtime without restarting the daemon.
+  ///
+  /// The peer is immediately added to the routing state and a BGP session is
+  /// dialled.  Idempotent: calling AddPeer for an already-configured address
+  /// returns OK without modifying the existing session.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address, remote_as is 0,
+  ///                      or remote_as is 23456 (AS_TRANS, RFC 6793)
+  rpc AddPeer(AddPeerRequest) returns (AddPeerResponse);
+
+  /// Removes a BGP peer at runtime.
+  ///
+  /// The session is torn down with a NOTIFICATION (Cease/Administrative
+  /// Shutdown), all routes received from the peer are withdrawn, and best-path
+  /// is recomputed for every affected prefix.  Remaining peers receive the
+  /// resulting UPDATE messages before the peer entry is removed.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
+
+  /// Sends a ROUTE-REFRESH request to the peer for the given address family
+  /// (RFC 2918), asking it to re-advertise all routes without resetting the
+  /// session.  This is the BGP inbound soft-reset operation.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address, or afi_safi
+  ///                      is not a recognised address family
+  ///   NOT_FOUND        — address is not a configured peer
+  ///   FAILED_PRECONDITION — session is not currently established
+  rpc SoftReset(SoftResetRequest) returns (SoftResetResponse);
+}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated PeerState peers = 1;
+}
+
+message GetPeerRequest {
+  /// Dotted-decimal IPv4 address of the peer to look up.
+  string address = 1;
+}
+
+/// Operational state of a single BGP peer.
+message PeerState {
+  /// Configured peer IP address in dotted-decimal notation.
+  string address = 1;
+  /// Remote AS number from configuration.
+  uint32 remote_as = 2;
+  /// Local AS number.
+  uint32 local_as = 3;
+  /// Current BGP FSM state.
+  SessionState session_state = 4;
+  /// Peer relationship type; UNSPECIFIED when the session is not established.
+  PeerType peer_type = 5;
+  /// Negotiated hold-timer value in seconds; 0 if not established.
+  uint32 hold_time = 6;
+  /// Seconds since the session reached Established; 0 if not established.
+  uint64 uptime_seconds = 7;
+  /// Routes stored in Adj-RIB-In (pre-policy, all prefixes received from peer).
+  uint32 prefixes_received = 8;
+  /// Routes from this peer that are currently the best path in the Loc-RIB.
+  uint32 prefixes_accepted = 9;
+  /// Routes currently being advertised to this peer (Adj-RIB-Out size).
+  uint32 prefixes_advertised = 10;
+  /// True once we have received the peer's End-of-RIB marker for IPv4 unicast
+  /// (RFC 4724 §2). False before the initial table sync is complete or if the
+  /// session is not Established.
+  bool eor_ipv4_received = 11;
+  /// True once we have received the peer's End-of-RIB marker for IPv6 unicast
+  /// (RFC 4724 §2).
+  bool eor_ipv6_received = 12;
+  /// The peer's advertised RFC 4724 GracefulRestart `restart_time` in seconds.
+  ///
+  /// Non-zero means the peer supports the GR restart window and will hold
+  /// our routes for this many seconds after an unclean session loss.
+  /// Zero means the peer either did not advertise GracefulRestart or advertised
+  /// `restart_time = 0` (EOR-only mode, no stale-route window).
+  uint32 peer_gr_restart_time = 13;
+}
+
+/// Event type for WatchPeers stream.
+enum PeerEventType {
+  PEER_EVENT_TYPE_UNSPECIFIED = 0;
+  /// Snapshot phase: current state of one peer.
+  PEER_EVENT_TYPE_CURRENT     = 1;
+  /// Snapshot complete; live deltas follow.
+  PEER_EVENT_TYPE_END_INITIAL = 2;
+  /// A peer's session state changed.
+  PEER_EVENT_TYPE_CHANGED     = 3;
+  /// A peer was removed from the daemon (via RemovePeer or config reload).
+  /// The `peer` field is always present and carries `address`, `remote_as`,
+  /// and `local_as` captured immediately before the peer was torn down.
+  /// Session-level fields (session_state, hold_time, uptime_seconds, prefix
+  /// counters) are zero — the session was already closed before removal fires.
+  PEER_EVENT_TYPE_REMOVED     = 4;
+}
+
+/// A peer state event emitted on the WatchPeers stream.
+message PeerEvent {
+  PeerEventType type = 1;
+  /// Present for CURRENT and CHANGED; absent for END_INITIAL.
+  optional PeerState peer = 2;
+}
+
+message WatchPeersRequest {}
+
+message AddPeerRequest {
+  /// Dotted-decimal IPv4 address of the new peer.
+  string address = 1;
+  /// Remote AS number.  Must not be 0 or 23456 (AS_TRANS).
+  uint32 remote_as = 2;
+  /// TCP port to dial.  0 means the BGP default (179).
+  uint32 port = 3;
+  /// Import-policy default action.  UNSPECIFIED means the RFC 8212 default
+  /// (REJECT for eBGP, ACCEPT for iBGP).
+  PolicyAction import_default = 4;
+  /// Export-policy default action.  UNSPECIFIED means the RFC 8212 default
+  /// (REJECT for eBGP, ACCEPT for iBGP).
+  PolicyAction export_default = 5;
+  /// RFC 2385 TCP MD5 authentication key.  Empty string means no MD5.
+  string md5_password = 6;
+}
+
+message AddPeerResponse {}
+
+message RemovePeerRequest {
+  /// Dotted-decimal IPv4 address of the peer to remove.
+  string address = 1;
+}
+
+message RemovePeerResponse {}
+
+message SoftResetRequest {
+  /// Dotted-decimal IPv4 address of the peer to soft-reset.
+  string address = 1;
+  /// Address family to refresh.  "ipv4" (default) or "ipv6".
+  string afi_safi = 2;
+}
+
+message SoftResetResponse {}
+
+// ── RIB service ───────────────────────────────────────────────────────────────
+
+service RibService {
+  /// Returns the best route for a single prefix.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — prefix is not valid CIDR notation
+  rpc GetBestRoute(GetBestRouteRequest) returns (RouteResponse);
+
+  /// Returns every best route in the Loc-RIB, optionally filtered by peer.
+  ///
+  /// If peer_address is non-empty, only routes whose best-path winner is that
+  /// peer are returned.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — peer_address is non-empty and not a valid IPv4 address
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+
+  /// Returns all candidate routes (from all peers) for a single prefix.
+  ///
+  /// Candidates are routes that passed import policy and are tracked in the
+  /// Loc-RIB candidate map.  The best route among them is indicated by the
+  /// RouteResponse returned from GetBestRoute.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — prefix is not valid CIDR notation
+  rpc ListCandidates(ListCandidatesRequest) returns (ListRoutesResponse);
+
+  /// Streams Loc-RIB changes. Sends all current best routes first
+  /// (ROUTE_EVENT_CURRENT per prefix, then ROUTE_EVENT_END_INITIAL), then
+  /// streams live ROUTE_EVENT_ANNOUNCED / ROUTE_EVENT_WITHDRAWN deltas.
+  /// If peer_address is set, only routes from that peer are included in the
+  /// snapshot; all deltas are delivered regardless (client-side filtering).
+  rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteEvent);
+}
+
+message GetBestRouteRequest {
+  /// Prefix in CIDR notation, e.g. "10.0.0.0/8".
+  string prefix = 1;
+}
+
+message RouteResponse {
+  /// True if a best route exists for the requested prefix.
+  bool found = 1;
+  /// The best route; present only when found is true.
+  optional Route route = 2;
+}
+
+message ListRoutesRequest {
+  /// If non-empty, return only routes whose best-path winner is this peer.
+  /// Dotted-decimal IPv4 address.
+  string peer_address = 1;
+
+  /// Maximum number of routes to return in this response.
+  /// 0 (default) means no limit — the server returns all matching routes in
+  /// one response, which may fail with RESOURCE_EXHAUSTED for large tables.
+  /// Use a non-zero value (e.g. 5000) to enable pagination.
+  uint32 page_size = 2;
+
+  /// Cursor returned by a previous ListRoutes call.
+  /// Empty string (default) requests the first page.
+  string page_token = 3;
+}
+
+message ListRoutesResponse {
+  repeated Route routes = 1;
+
+  /// Cursor for the next page.  Empty when this is the last page.
+  /// Pass this value as page_token in the next ListRoutes request.
+  string next_page_token = 2;
+}
+
+message ListCandidatesRequest {
+  /// Prefix in CIDR notation for which to list all candidate routes.
+  string prefix = 1;
+}
+
+/// Event type for WatchRoutes stream.
+enum RouteEventType {
+  ROUTE_EVENT_TYPE_UNSPECIFIED = 0;
+  /// Snapshot phase: a current best route.
+  ROUTE_EVENT_TYPE_CURRENT     = 1;
+  /// Snapshot complete; live deltas follow.
+  ROUTE_EVENT_TYPE_END_INITIAL = 2;
+  /// A prefix was announced or its best-path changed.
+  ROUTE_EVENT_TYPE_ANNOUNCED   = 3;
+  /// A prefix was withdrawn from the Loc-RIB.
+  ROUTE_EVENT_TYPE_WITHDRAWN   = 4;
+}
+
+/// A route event emitted on the WatchRoutes stream.
+message RouteEvent {
+  RouteEventType type = 1;
+  /// Present for CURRENT and ANNOUNCED; absent for WITHDRAWN and END_INITIAL.
+  optional Route route            = 2;
+  /// Present for WITHDRAWN; absent otherwise.
+  optional string withdrawn_prefix = 3;
+}
+
+message WatchRoutesRequest {
+  /// If non-empty, the snapshot phase filters to routes won by this peer.
+  /// Dotted-decimal IPv4 address; use "local" for originated routes.
+  string peer_address = 1;
+}
+
+// ── Policy service ────────────────────────────────────────────────────────────
+
+/// Default policy action: whether routes are accepted or rejected when no
+/// explicit policy term matches.
+enum PolicyAction {
+  POLICY_ACTION_UNSPECIFIED = 0;
+  POLICY_ACTION_ACCEPT      = 1;
+  POLICY_ACTION_REJECT      = 2;
+}
+
+service PolicyService {
+  /// Replaces the import-policy default action for a single eBGP peer and
+  /// immediately re-evaluates the peer's Adj-RIB-In against the new policy.
+  /// Any routes that change accepted/rejected status are reflected in Loc-RIB,
+  /// and the resulting best-path changes are propagated to all established peers.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc SetImportDefault(SetImportDefaultRequest) returns (SetImportDefaultResponse);
+
+  /// Replaces the export-policy default action for a single eBGP peer and
+  /// immediately re-evaluates the entire Loc-RIB against the new policy for
+  /// that peer.  The peer receives UPDATEs for newly-accepted prefixes and
+  /// WITHDRAWs for newly-rejected ones.  Has no effect if the peer is not
+  /// currently established (changes apply on the next session).
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   NOT_FOUND        — address is not a configured peer
+  rpc SetExportDefault(SetExportDefaultRequest) returns (SetExportDefaultResponse);
+}
+
+message SetImportDefaultRequest {
+  /// Dotted-decimal IPv4 address of the peer whose import policy to update.
+  string peer_address = 1;
+  /// New default action.
+  PolicyAction action = 2;
+}
+
+message SetImportDefaultResponse {}
+
+message SetExportDefaultRequest {
+  /// Dotted-decimal IPv4 address of the peer whose export policy to update.
+  string peer_address = 1;
+  /// New default action.
+  PolicyAction action = 2;
+}
+
+message SetExportDefaultResponse {}
+
+// ── Origination service ───────────────────────────────────────────────────────
+
+/// Parameters for a single locally originated route.
+message OriginateRouteRequest {
+  /// Prefix in CIDR notation, e.g. "1.2.3.4/32".
+  string prefix   = 1;
+  /// Forwarding next-hop in dotted-decimal notation.
+  string next_hop = 2;
+  /// ORIGIN attribute.
+  Origin origin   = 3;
+  /// Standard BGP communities (RFC 1997), encoded as raw uint32 values.
+  repeated uint32         communities            = 4;
+  /// Large communities (RFC 8092).
+  repeated LargeCommunity large_communities      = 5;
+  /// Extended communities (RFC 4360), each exactly 8 bytes.
+  repeated bytes          extended_communities   = 6;
+  /// LOCAL_PREF; absent means unset (not advertised to eBGP peers).
+  optional uint32 local_pref = 7;
+  /// MULTI_EXIT_DISC; absent means unset.
+  optional uint32 med        = 8;
+}
+
+message OriginateRouteResponse {}
+
+/// Parameters for a batch origination call.
+message OriginateRoutesRequest {
+  repeated OriginateRouteRequest routes = 1;
+}
+
+message OriginateRoutesResponse {
+  /// Number of routes accepted and inserted.
+  uint32 count = 1;
+}
+
+message WithdrawOriginatedRouteRequest {
+  /// Prefix in CIDR notation to withdraw.
+  string prefix = 1;
+}
+
+message WithdrawOriginatedRouteResponse {}
+
+message WithdrawOriginatedRoutesRequest {
+  repeated string prefixes = 1;
+}
+
+message WithdrawOriginatedRoutesResponse {
+  /// Number of prefixes withdrawn.
+  uint32 count = 1;
+}
+
+message ListOriginatedRoutesRequest {}
+
+message ListOriginatedRoutesResponse {
+  /// All currently originated routes. Uses the Route message with
+  /// peer_address = "local".
+  repeated Route routes = 1;
+}
+
+service OriginationService {
+  /// Injects a single route into the Loc-RIB and advertises it to all
+  /// established peers via export policy.  Idempotent: re-originating the same
+  /// prefix replaces the previous route.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — prefix or next_hop is malformed, or an
+  ///                      extended_community entry is not exactly 8 bytes
+  rpc OriginateRoute(OriginateRouteRequest) returns (OriginateRouteResponse);
+
+  /// Batch variant of OriginateRoute.  All routes are inserted before any
+  /// outbound advertisement is computed, so a single propagation pass is
+  /// performed regardless of batch size.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — any entry has a malformed prefix, next_hop, or
+  ///                      extended_community
+  rpc OriginateRoutes(OriginateRoutesRequest) returns (OriginateRoutesResponse);
+
+  /// Withdraws a single locally originated route.  No-op if the prefix was
+  /// not previously originated.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — prefix is not valid CIDR notation
+  rpc WithdrawOriginatedRoute(WithdrawOriginatedRouteRequest)
+      returns (WithdrawOriginatedRouteResponse);
+
+  /// Batch variant of WithdrawOriginatedRoute.
+  ///
+  /// Status codes:
+  ///   INVALID_ARGUMENT — any prefix is not valid CIDR notation
+  rpc WithdrawOriginatedRoutes(WithdrawOriginatedRoutesRequest)
+      returns (WithdrawOriginatedRoutesResponse);
+
+  /// Returns all currently originated routes.
+  rpc ListOriginatedRoutes(ListOriginatedRoutesRequest)
+      returns (ListOriginatedRoutesResponse);
+}
