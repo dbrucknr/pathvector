@@ -231,24 +231,29 @@ async fn gr_phase2_rfc8538_hard_reset_bypasses_gr_window() {
         );
 }
 
-/// RFC 8538 §4 — when both peers have negotiated the N-bit and the peer sends
-/// a non-HardReset CEASE NOTIFICATION, pathvectord MUST open a GR window and
-/// hold the peer's routes for the duration of the peer's advertised restart time.
+/// RFC 8538 §4 — end-to-end validation that pathvectord opens a GR window
+/// and holds routes when FRR shuts down with N-bit negotiated on both sides.
 ///
-/// FRR 8.x with `neighbor X graceful-restart-notification` (N-bit) sends a
-/// non-HardReset CEASE on `docker stop` (SIGTERM → Administrative-Shutdown,
-/// subcode 2).  This is the RFC 8538 "normal" shutdown path: Hard Reset is
-/// an explicit operator action (`clear bgp * hard-reset`) in FRR, not the
-/// default teardown.
+/// FRR 8.x with `neighbor X graceful-restart-notification` configured sends a
+/// non-HardReset CEASE on `docker stop` (Hard Reset is an explicit operator
+/// action in FRR, not the default teardown).  This makes FRR the right peer
+/// for this test: pathvectord must open a GR window and retain routes until
+/// the restart timer expires.
+///
+/// **Coverage note:** this test verifies the observable end-to-end behavior
+/// (route held during the restart window, flushed on expiry) but does not
+/// confirm on the wire whether pathvectord received a `Notification` or an
+/// unclean TCP close — both open a GR window.  The distinction between the
+/// `notification_gr_eligible` and `Unclean` code paths is definitively covered
+/// by the `test_rfc8538` unit-test suite in `pathvectord/src/daemon/mod.rs`,
+/// which injects `NotificationMessage` values directly into `on_terminated`.
 ///
 /// Sequence:
 /// 1. FRR and pathvectord both have N-bit + restart_time=10 in their OPEN.
 /// 2. FRR announces 203.0.113.4/32.
-/// 3. `docker stop` → FRR sends CEASE/Administrative-Shutdown (non-HardReset).
-///    pathvectord sees `TerminationReason::Notification(subcode != HardReset)`.
-///    Per RFC 8538 §4, both N-bits set + non-HardReset → GR window opens.
-/// 4. Route must still be present immediately after the stop —
-///    pathvectord is holding it during the 10 s restart window.
+/// 3. `docker stop` → FRR tears down the session without Hard Reset.
+///    pathvectord opens a 10 s GR window and retains the route.
+/// 4. Route must still be present immediately after the stop.
 /// 5. After the window expires the route must be flushed.
 #[tokio::test]
 async fn gr_phase2_rfc8538_frr_notification_opens_gr_window() {
