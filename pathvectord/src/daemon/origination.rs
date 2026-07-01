@@ -20,8 +20,7 @@ impl DaemonState {
         for route in routes {
             let nlri = route.nlri;
             self.rib_mut().originated_routes.insert(nlri);
-            self.rib_insert_v4(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
-            nlris.push(nlri);
+            // Borrow for the event before moving into rib_insert_v4.
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Announced as i32,
                 route: Some(grpc::route_to_proto(
@@ -31,6 +30,8 @@ impl DaemonState {
                 )),
                 withdrawn_prefix: None,
             });
+            self.rib_insert_v4(PeerId::from(LOCAL_ORIGIN_PEER), route);
+            nlris.push(nlri);
         }
         self.propagate_to_all_peers(&nlris);
         self.flush_pending();
@@ -48,11 +49,7 @@ impl DaemonState {
         for route in routes {
             let nlri = route.nlri;
             self.rib_mut().originated_routes_v6.insert(nlri);
-            let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route.clone());
-            if let Some(fm) = &self.fib_manager {
-                fm.apply_v6(fib_change);
-            }
-            nlris.push(nlri);
+            // Borrow for the event before moving into rib_insert_v6.
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Announced as i32,
                 route: Some(grpc::route_v6_to_proto(
@@ -62,6 +59,11 @@ impl DaemonState {
                 )),
                 withdrawn_prefix: None,
             });
+            let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route);
+            if let Some(fm) = &self.fib_manager {
+                fm.apply_v6(fib_change);
+            }
+            nlris.push(nlri);
         }
         self.propagate_to_all_peers_v6(&nlris);
         self.flush_pending();
