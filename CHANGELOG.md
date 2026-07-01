@@ -4,6 +4,103 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-01
+
+### [pathvectord] Prometheus metrics endpoint
+
+**`/metrics` HTTP endpoint** — new `metrics_port: Option<u16>` field in `[daemon]` config.
+When set, pathvectord serves Prometheus text-format metrics on `0.0.0.0:<metrics_port>`.
+Omitted by default (no behavior change for existing deployments). New `pathvectord/src/metrics.rs`
+module owns all instrumentation.
+
+**Metrics exposed:**
+- Gauges: `pathvectord_bgp_session_up{peer}`, `pathvectord_bgp_session_established_timestamp_seconds{peer}`,
+  `pathvectord_bgp_adj_rib_in_prefixes{peer}`, `pathvectord_bgp_adj_rib_out_prefixes{peer}`,
+  `pathvectord_bgp_loc_rib_prefixes{afi}`
+- Counters: `pathvectord_bgp_sessions_established_total{peer}`,
+  `pathvectord_bgp_sessions_terminated_total{peer,reason}`, `pathvectord_bgp_updates_received_total{peer}`
+
+Hooked into the real event loop at three sites in `daemon/mod.rs`: session established/terminated,
+route update processing, and post-`flush_pending()` RIB size updates.
+
+**Graceful degradation on bind failure** — `metrics::install()` returns `Result` rather than
+panicking. A metrics port conflict (e.g. already in use) logs a warning and the daemon continues
+running BGP sessions normally — matches the existing FIB-writer failure pattern in `main.rs`
+rather than being a hard dependency.
+
+**Test coverage:**
+- 5 unit tests in `pathvectord/src/metrics.rs` using `metrics-util`'s `DebuggingRecorder` +
+  `metrics::with_local_recorder` to assert on emitted values/labels in isolation.
+- 4 e2e tests in `pathvector-e2e/tests/metrics.rs` (new `MetricsHarness`) that stand up a real
+  pathvectord + GoBGP session and scrape the actual HTTP endpoint — proving the event-loop hooks
+  are correctly wired, not just correct in isolation. Running these against real containers caught
+  a real bug in the first draft: the `metrics` crate does not materialize a gauge series until its
+  first `.set()` call (no implicit zero value) — the test asserted a nonexistent baseline instead
+  of the correct absence-then-appearance behavior. Fixed and documented.
+
+**Known limitation (tracked in TODO.md):** metric series are labeled by peer IP and are zeroed
+but never removed on `RemovePeer`. Non-issue for static peer sets; unbounded growth for
+deployments with frequent dynamic peer churn via the gRPC API.
+
+**Documentation** — full metrics reference, sample scrape output, Prometheus scrape config,
+and PromQL query examples added to `pathvectord/README.md` Observability section.
+
+---
+
+## 2026-06-24
+
+### [pathvector-session, pathvectord] RFC 8538 — NOTIFICATION support for BGP Graceful Restart
+
+Full implementation of RFC 8538 (extends RFC 4724 GR with NOTIFICATION-triggered restarts).
+N-bit set in the GracefulRestart capability when GR is enabled locally; peer's N-bit tracked
+on `Established`. A non-HardReset CEASE received from a peer with both sides' N-bit set opens
+the GR window (routes held, stale-marked, subject to the deadline timer) instead of flushing
+immediately. `CEASE/HardReset` (subcode 9) always flushes immediately regardless of N-bit
+state, per §5.
+
+11 unit tests cover the N-bit negotiation and eligibility logic. 2 e2e tests: one against
+GoBGP (validates the §5 Hard Reset bypass path — GoBGP 4.6.0 sends `CEASE/HardReset` on all
+shutdowns) and one against FRR (validates the §4 positive path — FRR sends non-HardReset
+`CEASE/AdministrativeShutdown` on `docker stop`, confirming the GR window opens and expires
+correctly). See `pathvectord/RFC.md` for the full clause-by-clause status.
+
+---
+
+## 2026-06-22
+
+### [pathvector-session, pathvector-rib, pathvectord] RFC 4724 Graceful Restart — Phase 1 (Helper) + Phase 2 (Speaker)
+
+**Phase 1 — Helper role:** pathvectord advertises `restart_time` and marks IPv4/IPv6 unicast
+families `forwarding_preserved` in its GracefulRestart capability when `graceful_restart_time`
+is configured, so upstream peers hold pathvectord's routes across a restart.
+
+**Phase 2 — Speaker role:** pathvectord holds a peer's routes as stale (not withdrawn) when
+that peer's session terminates uncleanly and the peer had advertised GracefulRestart with
+`restart_time > 0`. A deadline timer (wired into the main event loop's `tokio::select!`) flushes
+stale routes if the peer does not re-establish within the window; routes not re-announced by
+the time the peer sends its End-of-RIB marker on re-establishment are pruned.
+
+**`daemon.rs` restructured into 8 submodules** (`daemon/mod.rs`, `capabilities.rs`, `fib.rs`,
+`gr.rs`, `origination.rs`, `peer.rs`, `policy.rs`, `route.rs`). The four previously-scattered GR
+fields on `DaemonState` consolidated into a `GracefulRestartState` struct with
+`earliest_deadline()`, `drain_expired()`, and `remove_peer()` helpers. An O(n²) `Vec::contains`
+in `repropagate_after_stale_mark_v4` fixed to a `HashSet` lookup. A double write-lock bug in the
+GR deadline branch corrected.
+
+**e2e coverage:** `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` uses
+`docker network disconnect/connect --ip` to simulate a partial-RIB restart without changing the
+GoBGP container IP; `connect_retry_time` made configurable (default 120s, 2s in the test harness)
+to keep the test fast.
+
+**Unit coverage:** `gr_re_termination_during_window_resets_deadline_and_holds_routes` confirms
+the deadline is refreshed and routes are not double-flushed on a second unclean disconnect;
+`gr_clean_termination_during_window_flushes_immediately` confirms a NOTIFICATION received inside
+a GR window overrides the window and flushes immediately.
+
+See `pathvectord/RFC.md` for clause-by-clause RFC 4724 status.
+
+---
+
 ## 2026-06-21
 
 ### [pathvectord] End-of-RIB marker — full RFC 4724 §2/§3 implementation (send + receive)
@@ -69,6 +166,14 @@ route updates and packs NLRIs sharing the same attribute set into single UPDATE 
 
 All 443 existing tests updated to call `flush_pending()` where they previously relied on
 immediate channel writes.
+
+### [pathvector-mrt] Convergence detection via snapshot polling instead of watch_routes quiescence
+
+`pathvector-mrt` now polls snapshots every 50ms and declares convergence based on
+time-since-last-change rather than two identical consecutive counts. The `watch_routes`
+delta-stream approach was attempted first but the broadcast channel drops slow consumers at
+1M+ event/s flood rates during MRT replay. The 50ms-interval snapshot approach gives adequate
+accuracy (~200ms window) without the reconnect-on-lag problem.
 
 ---
 
@@ -489,6 +594,23 @@ explanations and GoBGP/BIRD interop guide. Adds "Behavior on restart" section do
 `RTPROT_BGP` stale-route cleanup. `docs/` mdBook and `CLI.md`, `DAEMON.md`, `PERFORMANCE.md`,
 `LOCAL_INTEROP.md` removed; `book.toml` removed. `CONTRIBUTING.md` gains "Which crate do I
 edit?" routing table. `e2e/` renamed to `pathvector-e2e/`, `fuzz/` to `pathvector-fuzz/`.
+
+### [pathvector-rib] Memory optimization — `rib-memory-opt` branch
+
+Stress benchmark (release profile, Apple M2 Max, synthetic uniform routes):
+
+| Table size | pathvectord RSS | GoBGP RSS | Ratio |
+|---|---|---|---|
+| 10k  | 11.8 MB  | 51.7 MB  | pathvector 4.4× less |
+| 100k | 66.8 MB  | 133.2 MB | pathvector 2.0× less |
+| 500k | 461.2 MB | 465.4 MB | ~equal |
+| 900k | 515.2 MB | 792.4 MB | pathvector 35% less |
+
+Per-route at 900k: **0.57 KB/route** (pathvectord) vs **0.88 KB/route** (GoBGP). The RSS
+plateau between 500k–900k (+54 MB for 400k additional routes) confirms attribute interning /
+Arc-sharing is effective — real internet routes converge onto a small set of shared
+attribute sets as the table grows. No further memory audit planned unless profiling on a
+real multi-peer internet table (not synthetic) reveals a regression.
 
 ## 2026-06-16
 
