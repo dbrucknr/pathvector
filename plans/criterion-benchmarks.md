@@ -33,7 +33,7 @@ All results reported with three sizes and a Takeaway column (established convent
 
 | Action | Path |
 |---|---|
-| Edit | `Cargo.toml` (workspace) — add `criterion = { version = "0.5", features = ["html_reports"] }` to `[workspace.dependencies]` |
+| Edit | `Cargo.toml` (workspace) — add `criterion = { version = "0.8", features = ["html_reports"] }` to `[workspace.dependencies]` |
 | Edit | `pathvector-types/Cargo.toml` — add `criterion` dev-dep + `[[bench]]` targets |
 | Edit | `pathvector-policy/Cargo.toml` — add `criterion` dev-dep + `[[bench]]` target |
 | Edit | `pathvector-rib/Cargo.toml` — add `criterion` dev-dep + `[[bench]]` targets |
