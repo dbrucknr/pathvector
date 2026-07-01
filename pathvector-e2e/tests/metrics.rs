@@ -51,24 +51,16 @@ async fn established_counter_and_timestamp_present() {
 async fn adj_rib_in_gauge_updates_after_route_announce() {
     let h = MetricsHarness::new().await;
 
-    // Baseline: no UPDATE has been processed yet, so the gauge series does not
-    // exist at all — the `metrics` crate only materializes a series on its
-    // first `.set()` call, there is no implicit zero value. Wait for the
-    // established-session metric first (proves the scrape endpoint itself is
-    // up) then confirm adj_rib_in_prefixes is genuinely absent before any
-    // route has been received.
-    wait_for_metric(
-        h.metrics_host_port,
-        &format!("pathvectord_bgp_session_up{{peer=\"{}\"}} 1", h.gobgp_ip),
-        Duration::from_secs(10),
-    )
-    .await;
-    let baseline = scrape_metrics_text(h.metrics_host_port);
-    assert!(
-        !baseline.contains("pathvectord_bgp_adj_rib_in_prefixes"),
-        "adj_rib_in_prefixes should not exist before any route UPDATE is processed\n\
-         full body:\n{baseline}"
-    );
+    // No baseline-absence check here: GoBGP's config (`write_gobgp_config`)
+    // enables RFC 4724 graceful-restart, so it sends an End-of-RIB marker
+    // (an empty UPDATE) immediately after Established, independent of
+    // whether pathvectord negotiates GR itself. That EOR still flows through
+    // `on_route_update` in the event loop, which unconditionally calls the
+    // metrics hook and materializes `adj_rib_in_prefixes{peer}` at 0 — before
+    // any real route exists. Asserting the series is *absent* pre-announce is
+    // therefore a race against EOR delivery timing (this flaked on the CI
+    // runner's scheduling while passing locally). The invariant that actually
+    // matters — and is deterministic — is the transition to `1` below.
 
     h.gobgp_announce("10.200.0.0/24", &h.gobgp_ip.to_string());
 

@@ -33,10 +33,20 @@ rather than being a hard dependency.
   `metrics::with_local_recorder` to assert on emitted values/labels in isolation.
 - 4 e2e tests in `pathvector-e2e/tests/metrics.rs` (new `MetricsHarness`) that stand up a real
   pathvectord + GoBGP session and scrape the actual HTTP endpoint — proving the event-loop hooks
-  are correctly wired, not just correct in isolation. Running these against real containers caught
-  a real bug in the first draft: the `metrics` crate does not materialize a gauge series until its
-  first `.set()` call (no implicit zero value) — the test asserted a nonexistent baseline instead
-  of the correct absence-then-appearance behavior. Fixed and documented.
+  are correctly wired, not just correct in isolation.
+
+  Running these against real containers caught two real issues in the first drafts, both in the
+  test's assumptions rather than the daemon: (1) the `metrics` crate does not materialize a gauge
+  series until its first `.set()` call, so an initial "must equal 0 before any route arrives"
+  assertion was wrong; (2) a follow-up "series must not exist at all before any route arrives"
+  assertion — meant to fix (1) — was itself a race: GoBGP's e2e config
+  (`write_gobgp_config`) always enables RFC 4724 graceful-restart, so it sends an End-of-RIB
+  marker (an empty UPDATE) immediately after `Established`, independent of whether pathvectord
+  negotiates GR. That EOR flows through `on_route_update` in the real event loop and
+  unconditionally materializes `adj_rib_in_prefixes{peer}` at `0` — before the test's real route
+  announcement. This raced against the test's baseline check and flaked under GitHub Actions'
+  scheduling while passing locally. Fixed by dropping the pre-announce assertion entirely and
+  keeping only the deterministic invariant: the gauge reaches `1` after the real announce.
 
 **Known limitation (tracked in TODO.md):** metric series are labeled by peer IP and are zeroed
 but never removed on `RemovePeer`. Non-issue for static peer sets; unbounded growth for
