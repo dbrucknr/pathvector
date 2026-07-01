@@ -10,18 +10,19 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 1997 | BGP Communities Attribute | pathvector-types, pathvector-policy | ✅ | [types](pathvector-types/RFC.md#rfc-1997--bgp-communities-attribute) · [policy](pathvector-policy/RFC.md#rfc-1997--bgp-communities-attribute-policy-layer) |
 | RFC 1930 | AS Number Guidelines (2-byte private range) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-1930--as-number-guidelines-private-range-2-byte) |
 | RFC 2385 | BGP TCP MD5 Protection | pathvector-sys, pathvector-session, pathvectord | ✅ | — |
+| RFC 2439 | Route Flap Dampening | pathvectord | ❌ | — |
 | RFC 2918 | Route Refresh Capability | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-2918--route-refresh-capability-for-bgp-4) |
 | RFC 3107 | MPLS Label in BGP (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 4271 §4 | BGP Message Formats | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-4--message-formats) |
 | RFC 4271 §5 | Path Attribute Types | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-4271-5--path-attribute-types) |
 | RFC 4271 §8 | BGP Finite State Machine | pathvector-session, pathvectord | ✅ | [session](pathvector-session/RFC.md#rfc-4271-8--bgp-finite-state-machine) · [daemon](pathvectord/RFC.md#rfc-4271-8--connection-collision-coordination) |
-| RFC 4271 §9.1 | Best-Path Decision Process (steps 1, 8 deferred) | pathvector-rib | ⚠️ | [rib](pathvector-rib/RFC.md#rfc-4271-91--decision-process-best-path-selection) |
+| RFC 4271 §9.1 | Best-Path Decision Process (iBGP MRAI deferred) | pathvector-rib, pathvectord | ⚠️ | [rib](pathvector-rib/RFC.md#rfc-4271-91--decision-process-best-path-selection) · [mrai](pathvectord/RFC.md#rfc-4271-9211--minimum-route-advertisement-interval-mrai) |
 | RFC 4271 §9.2 | Update-Send Process / RIB Structures / MRAI | pathvector-rib, pathvectord | ⚠️ | [rib](pathvector-rib/RFC.md#rfc-4271-92--update-send-process-rib-structures) · [daemon](pathvectord/RFC.md#rfc-4271-92--update-send-process) · [mrai](pathvectord/RFC.md#rfc-4271-9211--minimum-route-advertisement-interval-mrai) |
 | RFC 4360 | Extended Communities Attribute | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-4360--bgp-extended-communities-attribute) |
 | RFC 4364 | BGP/MPLS IP VPNs (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 4456 | BGP Route Reflection | pathvector-rib, pathvectord | ✅ | [rib](pathvector-rib/RFC.md#rfc-4456--bgp-route-reflection) · [daemon](pathvectord/RFC.md#rfc-4456--bgp-route-reflection) |
 | RFC 4486 | Cease NOTIFICATION Subcodes | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4486--subcodes-for-bgp-cease-notification-message) |
-| RFC 4724 | Graceful Restart | pathvector-session, pathvector-rib, pathvectord | ⚠️ | [session](pathvector-session/RFC.md#rfc-4724--graceful-restart-mechanism-for-bgp) · [rib](pathvector-rib/RFC.md#rfc-4724--graceful-restart-stale-route-timer-deferred) · [daemon](pathvectord/RFC.md#rfc-4724-2--end-of-rib-marker-send-side) |
+| RFC 4724 | Graceful Restart | pathvector-session, pathvector-rib, pathvectord | ✅ | [session](pathvector-session/RFC.md#rfc-4724--graceful-restart-mechanism-for-bgp) · [daemon](pathvectord/RFC.md#rfc-4724-2--end-of-rib-marker-send-side) |
 | RFC 4760 | Multiprotocol Extensions (AFI/SAFI) | pathvector-types, pathvector-session, pathvectord | ✅ | [types](pathvector-types/RFC.md#rfc-4760--multiprotocol-extensions-for-bgp-4-afisafi-registry) · [session](pathvector-session/RFC.md#rfc-4760--multiprotocol-extensions-for-bgp-4-codec) · [daemon](pathvectord/RFC.md#rfc-4760--multiprotocol-extensions-daemon-processing) |
 | RFC 4761 | VPLS Using BGP (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 5065 | AS Confederations | pathvector-types, pathvector-rib | ✅ | [types](pathvector-types/RFC.md#rfc-5065--as-confederations-for-bgp) · [rib](pathvector-rib/RFC.md#rfc-5065--as-confederations-for-bgp-rib-layer) |

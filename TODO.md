@@ -6,6 +6,74 @@ which crate it belongs to and why it was deferred.
 
 ---
 
+## Production readiness gaps (2026-06-24)
+
+Items identified as blocking or materially impairing trustworthy production
+operation of pathvectord as an internet-facing BGP speaker.
+
+### Tier 1 — Blocks operating safely on the internet
+
+**RPKI / Route Origin Validation (RFC 6810/6811/8210)**
+Without prefix origin validation, pathvectord cannot distinguish a legitimately
+originated route from a hijack or misconfigured announcement. For a DDoS
+blackhole operator this is especially sharp: accepting a bogus route and
+installing a blackhole null-route for it drops legitimate traffic silently.
+
+Likely warrants a `pathvector-rpki` crate owning an RTR client (RFC 8210 v1,
+falling back to RFC 6810 v0) and a validity cache (`Valid`/`Invalid`/`NotFound`
+per prefix+origin-AS pair). The cache plugs into `pathvector-policy` as a new
+`RoaValidityCondition` so operators can filter `Invalid` routes in import policy.
+BIRD and FRR both implement this; it is increasingly a precondition for peering
+at IXPs. See also: existing `RPKI` entries in the pathvectord `Remaining` section.
+
+**Route leak prevention (RFC 9234)**
+Route leaks (a customer re-advertising a provider's routes to another provider)
+are responsible for a large class of BGP incidents. RFC 9234 defines a `ROLE`
+OPEN capability (`provider`, `customer`, `rs`, `rs-client`, `peer`) and an
+`ONLY_TO_CUSTOMER` community that together allow automatic leak detection at the
+session layer. Without it, pathvectord has no mechanism to detect or reject a
+leaking peer. Requires role config per peer and NOTIFICATION on violation.
+Already listed in `Remaining` below; promoted here because it gates
+production eBGP peering on untrusted links.
+
+---
+
+### Tier 2 — Operability and reliability
+
+**Operational telemetry / observability**
+No BMP, no Prometheus metrics endpoint, no structured event export. A production
+daemon you cannot inspect is not safely operable. At minimum, pathvectord needs:
+- Per-peer session state and uptime counters
+- Prefix counts (received, accepted after policy, advertised)
+- GR window active/expired events
+- NOTIFICATION send/receive events with subcode
+
+The lightest path is a Prometheus scrape endpoint (`/metrics` on a configurable
+port) using `metrics` + `metrics-exporter-prometheus`. BMP (RFC 7854) is the
+richer path but significantly more work. Either addresses the core observability
+gap; the Prometheus path is the faster one.
+
+**Capability negotiation retry (RFC 5492)**
+If a peer sends `Unsupported Capability` NOTIFICATION, pathvectord does not
+retry the session without the offending capability. Real-world peers — especially
+older vendor gear — do this during capability negotiation. A session that cannot
+recover requires manual `remove_peer` / `add_peer` intervention. The FSM already
+has the `UnsupportedCapability` NOTIFICATION subcode parsed; the fix is a retry
+loop in the connect/open path that drops the flagged capability and redials.
+See `pathvector-session/RFC.md` RFC 5492 deferred section.
+
+**Route flap dampening (RFC 2439)**
+A peer whose route oscillates rapidly (flap) causes repeated best-path
+recomputes and UPDATE bursts to all other peers. Without dampening, a single
+unstable peer can drive CPU to 100% and trigger hold-timer expiry on unrelated
+sessions. RFC 2439 defines a penalty accumulation + half-life decay model that
+suppresses flapping prefixes. Requires a per-(peer, NLRI) penalty counter and
+a background decay timer — architecturally similar to the GR deadline timer
+already in the event loop. `pathvector-rib` would own the penalty model;
+`pathvectord` wires the timer branch.
+
+---
+
 ## Prioritized next steps
 
 Items are grouped by what they unlock, not just by effort. A small correctness
