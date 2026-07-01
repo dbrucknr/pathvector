@@ -30,6 +30,8 @@ tokio-stream       = { workspace = true }
 toml               = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics                     = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 tikv-jemallocator  = { workspace = true }
 
 [build-dependencies]

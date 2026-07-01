@@ -539,6 +539,7 @@ where
     let daemon_start = std::time::Instant::now();
     let grpc_port = cfg.daemon.grpc_port;
     let bgp_port = cfg.daemon.bgp_port;
+    let metrics_port = cfg.daemon.metrics_port;
     let fib_table = cfg.daemon.fib_table;
     let fib_metric = cfg.daemon.fib_metric;
     let local_as = cfg.daemon.local_as;
@@ -616,6 +617,11 @@ where
     tokio::spawn(async move {
         grpc::serve(grpc_state, grpc_port, cmd_tx, grpc_stop_senders).await;
     });
+
+    // Install Prometheus metrics endpoint when configured.
+    if let Some(port) = metrics_port {
+        crate::metrics::install(port);
+    }
 
     // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
     {
@@ -843,6 +849,7 @@ pub(crate) async fn run_event_loop(
                             &info.peer_capabilities,
                             info.local_addr,
                         );
+                        crate::metrics::on_session_established(peer_ip);
                     }
                     SessionEvent::Terminated(termination_reason) => {
                         let is_removed = s.pending_removal.remove(&peer_ip);
@@ -860,6 +867,7 @@ pub(crate) async fn run_event_loop(
                         // For removal, suppress the intermediate Changed(None)
                         // broadcast — the explicit Removed event below is the
                         // authoritative notification.
+                        crate::metrics::on_session_terminated(peer_ip, &termination_reason);
                         s.on_terminated(peer_ip, termination_reason, !is_removed);
                         // RFC 4724 §3: refresh the session's capability set so
                         // the next OPEN reflects the current R-bit state. The
@@ -917,6 +925,8 @@ pub(crate) async fn run_event_loop(
                     }
                     SessionEvent::RouteUpdate(msg) => {
                         let notify_err = s.on_route_update(peer_ip, msg);
+                        let adj_in = s.rib.prefixes_received.get(&peer_ip).copied().unwrap_or(0);
+                        crate::metrics::on_route_update(peer_ip, adj_in);
                         // RFC 4271 §6.3: mandatory attribute violation — send
                         // specific NOTIFICATION before tearing down the session.
                         if let Some(err) = notify_err {
@@ -1026,6 +1036,11 @@ pub(crate) async fn run_event_loop(
                 }
                 // Channel is empty — flush all accumulated outbound decisions.
                 s.flush_pending();
+                crate::metrics::update_rib_sizes(
+                    s.rib.loc_rib.len(),
+                    s.rib.loc_rib_v6.len(),
+                    &s.rib.prefixes_advertised,
+                );
                 // Collect any peers whose outbound channel overflowed.  Drain
                 // outside the write-lock so we don't hold it across async sends.
                 let stalled = s.take_stalled_peers();
@@ -1146,6 +1161,11 @@ pub(crate) async fn run_event_loop(
                     // flush_mrai_pending calls propagate_to_all_peers which
                     // buffers; drain those decisions now.
                     s.flush_pending();
+                    crate::metrics::update_rib_sizes(
+                        s.rib.loc_rib.len(),
+                        s.rib.loc_rib_v6.len(),
+                        &s.rib.prefixes_advertised,
+                    );
                     let stalled = s.take_stalled_peers();
                     drop(s);
                     for peer in stalled {
@@ -10694,6 +10714,7 @@ mod run_with_tests {
                 hold_time: 90,
                 grpc_port: 0,
                 bgp_port: 0, // 0 = OS assigns; listener will fail to bind but tests don't need it
+                metrics_port: None,
                 local_ipv6: None,
                 cluster_id: None,
                 fib_table: 254,
