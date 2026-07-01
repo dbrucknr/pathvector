@@ -30,6 +30,8 @@ tokio-stream       = { workspace = true }
 toml               = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics                     = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 tikv-jemallocator  = { workspace = true }
 
 [build-dependencies]
@@ -40,6 +42,7 @@ proptest          = { workspace = true }
 pathvector-client = { workspace = true }
 tempfile          = "3"
 tokio             = { workspace = true, features = ["test-util"] }
+metrics-util      = "0.19"
 
 # pathvectord generates code via tonic_prost_build.  The generated file
 # triggers four pedantic lints (doc_markdown, trivially_copy_pass_by_ref,

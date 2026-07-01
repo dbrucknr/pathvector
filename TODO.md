@@ -41,17 +41,39 @@ production eBGP peering on untrusted links.
 ### Tier 2 — Operability and reliability
 
 **Operational telemetry / observability**
-No BMP, no Prometheus metrics endpoint, no structured event export. A production
-daemon you cannot inspect is not safely operable. At minimum, pathvectord needs:
-- Per-peer session state and uptime counters
-- Prefix counts (received, accepted after policy, advertised)
-- GR window active/expired events
-- NOTIFICATION send/receive events with subcode
 
-The lightest path is a Prometheus scrape endpoint (`/metrics` on a configurable
-port) using `metrics` + `metrics-exporter-prometheus`. BMP (RFC 7854) is the
-richer path but significantly more work. Either addresses the core observability
-gap; the Prometheus path is the faster one.
+A Prometheus `/metrics` endpoint shipped 2026-07-01 (see CHANGELOG.md), covering
+session state, uptime timestamps, per-peer prefix counts, and session termination
+reasons. See `pathvectord/README.md` Observability section for the full metric
+reference. Remaining gaps:
+
+- **Series pruning on `RemovePeer`.** Metric series are labeled by peer IP and are
+  zeroed but never removed when a peer is deconfigured. Fine for static peer sets;
+  becomes unbounded growth for deployments that churn peers frequently via the
+  dynamic-peer gRPC API. Fix: call a `remove_peer_series(peer_ip)` helper in
+  `pathvectord/src/metrics.rs` from the `RemovePeer` handling arm in
+  `daemon/mod.rs`, using the Prometheus recorder handle's descriptor-clear API
+  (`metrics_exporter_prometheus::PrometheusHandle` does not currently expose a
+  direct per-series clear — may require tracking the recorder handle in
+  `DaemonState` and filtering the rendered text, or a version bump if a newer
+  release adds this).
+- **GR window active/expired events** — not yet emitted as metrics.
+- **NOTIFICATION send/receive events with subcode** — not yet emitted as metrics.
+- **Post-install task supervision.** `metrics_exporter_prometheus::install()` spawns
+  the HTTP listener as a detached Tokio task; we hold no `JoinHandle` to it (the
+  crate's `install()` API doesn't expose one). A bind failure at startup is caught
+  and logged (see 2026-07-01 CHANGELOG entry), but if the listener task panics or
+  errors *after* startup, it fails silently — no log, no restart, metrics just stop.
+  The rest of the daemon is unaffected (Tokio isolates per-task panics; BGP sessions
+  and gRPC run in separate tasks). Fix: switch from `PrometheusBuilder::install()` to
+  `.build()`, which returns the exporter future directly — spawn it ourselves and log
+  if the `JoinHandle` ever resolves.
+- **BMP (RFC 7854)** — complementary to, not a replacement for, Prometheus metrics:
+  BMP streams every raw UPDATE/RIB-in/RIB-out event to a monitoring station for
+  route-level introspection and incident forensics, while Prometheus exposes
+  aggregate health signals (session up/down, counts, rates) for dashboards and
+  alerting. Both are useful; BMP is still not started (`pathvector-bmp` crate is a
+  stub).
 
 **Capability negotiation retry (RFC 5492)**
 If a peer sends `Unsupported Capability` NOTIFICATION, pathvectord does not
@@ -229,13 +251,7 @@ enable (`maximum-paths` knob).
 
 ### Route reflector — known sub-optimalities
 
-~~Items 1, 3, 4, 5, 6 resolved 2026-06-19. Full RFC 4456 §8 compliance implemented and audited.~~
-
-~~**A. `best_peer()` called twice per prefix per peer in the propagation loop** — **Resolved 2026-06-19**: `best_peer` is now computed once at the top of `propagate_prefix` and `propagate_prefix_v6`, eliminating the second internal call. The split-horizon check in the daemon closures still calls `best_peer` for RR topology filtering, but the function-internal redundant call is gone.~~
-
-~~**C. No e2e test for route reflection** — **Resolved 2026-06-19**: `RrHarness` added to `pathvector-e2e/src/lib.rs` (three-container: GoBGP-client, pathvectord RR, GoBGP-non-client, all AS 65002 iBGP). Three tests in `pathvector-e2e/tests/route_reflector.rs`: `rr_client_route_reflected_to_non_client`, `rr_non_client_route_reflected_to_client`, `rr_client_route_visible_in_pathvectord_rib`.~~
-
-~~**D. `peer_bgp_ids` reconfiguration race window** — **Resolved 2026-06-19**: `peer_bgp_id: Ipv4Addr` is now a parameter of `on_established` and inserted atomically with `peer_types`, eliminating the split at the call site in `run_event_loop`. The fallback `unwrap_or(peer_ip)` in ORIGINATOR_ID injection cannot materialize because `peer_bgp_ids` is always populated before the peer appears in `peer_types`.~~
+Items 1, 3, 4, 5, 6 (full RFC 4456 §8 compliance) resolved 2026-06-19 — see CHANGELOG.md.
 
 **E. Multi-tier RR topology not tested** — existing e2e tests cover a single-reflector
 topology (one RR, one client, one non-client). A two-tier or cascaded-RR topology
@@ -304,25 +320,12 @@ What remains as optional future work:
 ### Remaining
 
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-~~**NOTIFICATION support for Graceful Restart (RFC 8538)** — N-bit negotiation, notification_gr_eligible logic, Hard Reset bypass.~~
-~~**Resolved 2026-06-24**: Full RFC 8538 implementation in pathvectord. N-bit set when GR enabled; peer N-bit tracked on Established; non-HardReset CEASE + both N-bits → GR window opens; CEASE/HardReset always flushes. 11 unit tests + 2 e2e tests (GoBGP for §5 Hard Reset path; FRR for §4 positive path). See `pathvectord/RFC.md`.~~
-
-~~**Graceful Restart FSM behaviour (RFC 4724)** — capability is parsed and forwarded in `SessionInfo`, but the FSM does not yet act on it (hold forwarding state, stale route timer)~~
-~~**Resolved 2026-06-22**: Full RFC 4724 Phase 1 (speaker/helper role) and Phase 2 (holding peer stale routes) implemented. See `pathvectord/RFC.md` for clause-by-clause status.~~
 - BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
 
-~~**Enhanced Route Refresh codec (RFC 7313)** — adds `BeginRefresh` / `EndRefresh` subtypes so the receiver knows when a full re-advertisement is complete; extends RFC 2918.~~
-~~**Resolved 2026-06-18**: `RouteRefreshSubtype` enum added to `pathvector-session`. The previously reserved byte in the ROUTE-REFRESH wire format is now decoded as `Refresh` (0), `BeginRefresh` (1), or `EndRefresh` (2). Encode/decode updated; 4 new codec tests added.~~
-
-~~**Extended admin shutdown communication (RFC 9003)** — extends CEASE NOTIFICATION (RFC 4486) with a UTF-8 freetext reason string (max 128 bytes).~~
-~~**Resolved 2026-06-18**: `encode_shutdown_message` / `decode_shutdown_message` added to `pathvector-session::message::notification`. `pathvectord` reads `shutdown_message: Option<String>` from `PeerConfig`; `RemovePeer` sends `Cease/AdministrativeShutdown` with the encoded payload instead of a bare `Stop` command. 6 new unit tests.~~
-
-~~**Per-peer hold timer** — configurable per peer in `PeerConfig` with a global fallback in `[daemon]`.~~
-~~**Resolved 2026-06-18**: `PeerConfig.hold_time: Option<u16>` added. `build_daemon` and the `AddPeer` command processor both fall back to `DaemonConfig.hold_time` when the per-peer value is absent.~~
-
-~~**Outbound ROUTE-REFRESH trigger** — send a `ROUTE-REFRESH` message to a peer to request their full table re-advertisement.~~
-~~**Resolved 2026-06-18**: `SessionCommand::RouteRefresh(RouteRefreshMessage)` variant added. `SessionHandle::send_route_refresh` wired through `SpawnedSessionHandle`. `SoftReset` gRPC RPC added to `PeerService`; `PeerServiceImpl::soft_reset` sends a `RouteRefresh` command to the target peer's session actor.~~
+RFC 8538 (2026-06-24), RFC 4724 Phase 1+2 (2026-06-22), RFC 7313 (2026-06-18), RFC 9003
+(2026-06-18), per-peer hold timer (2026-06-18), and outbound ROUTE-REFRESH trigger
+(2026-06-18) are all complete — see CHANGELOG.md.
 
 ---
 
@@ -341,20 +344,7 @@ Not yet started. Key work items:
 ### Dynamic peer management — known gaps (2026-06-18)
 
 Six gaps identified during a correctness audit of the `AddPeer`/`RemovePeer` feature.
-Items 1, 4, 5, 6 are resolved (2026-06-18). Items 2 and 3 remain open.
-
-~~**1. `add_peer` returns `OK` when the peer is mid-teardown (`pending_removal`)** —
-**Resolved 2026-06-18**: `grpc.rs` `add_peer` handler now checks `pending_removal`
-before sending the command and returns `FAILED_PRECONDITION` if removal is in flight.
-The command processor also logs a warn! and drops the add if the race is lost.~~
-
-~~**2. Dynamic peers don't survive daemon restart** —
-**Resolved 2026-06-18**: `config::DynamicPeerStore` writes a TOML sidecar
-(`dynamic_peers.toml`) next to the config file on every `add_peer`/`remove_peer`
-using atomic write-then-rename. `main.rs` loads the sidecar at startup and merges
-peers into the config before `run_with`. Static-config peers take precedence (no
-duplication). Six unit tests cover sidecar round-trips; two `run_with_tests`
-integration tests prove the restart-loading path.~~
+Items 1, 2, 4, 5, 6 resolved 2026-06-18 — see CHANGELOG.md. Item 3 remains open.
 
 **3. MD5 password on dynamically-added peers doesn't work for inbound connections**
 
@@ -366,23 +356,6 @@ no key is installed for that source address.
 
 Fix (full): re-bind the listener socket when a new MD5 peer is added — requires moving
 the listener into a task that can be restarted. Documented in `pathvectord/README.md`.
-
-~~**4. `watch_peers` stream behavior after dynamic add/remove is unverified** —
-**Resolved 2026-06-18**: Traced and fixed. `on_terminated` now suppresses its
-`Changed(None)` broadcast during removal. The event loop captures `remote_as`/`local_as`
-before state is erased, then broadcasts an explicit `Removed(Some(PeerState))` event
-carrying correct identity fields. The stream handler forwards it directly. Dashboard
-`apply_peer_event` handles `Removed` by calling `retain`. Unit tests added for all
-`Removed` cases. E2e `DynamicPeerHarness` + `wait_for_peer_absent` helper added.~~
-
-~~**5. Event loop stall on large-peer removal is unbounded and underdocumented** —
-**Resolved 2026-06-18**: `on_terminated` now records `Instant::now()` before the
-propagation loop and emits `tracing::warn!` if the loop exceeds 100 ms, including
-peer address, prefix count, and elapsed milliseconds.~~
-
-~~**6. No watchdog for `run_command_processor` task panics** —
-**Resolved 2026-06-18**: `run()` now wraps the processor join handle in a second
-`tokio::spawn` that logs `tracing::error!` if the task exits with a panic.~~
 
 ### watch_routes broadcast channel — guaranteed delivery
 
@@ -396,15 +369,6 @@ If guaranteed delivery is needed: replace the broadcast channel with a persisten
 (e.g. bounded mpsc with back-pressure) and a snapshot + delta replay protocol so reconnecting
 clients can resume from a known position. Alternatively, document the limitation clearly
 and recommend clients use the snapshot endpoint (`list_routes`) for durable reads.
-
-### MRT convergence detection
-
-~~**Use watch_routes quiescence instead of snapshot polling**~~ — **Resolved 2026-06-20**:
-`pathvector-mrt` now polls snapshots every 50ms and declares convergence based on
-time-since-last-change rather than two identical consecutive counts. The delta stream
-approach was attempted but the broadcast channel drops slow consumers at 1M+ event/s
-flood rates. The snapshot approach at 50ms intervals gives adequate accuracy (~200ms
-window) without the reconnect-on-lag problem.
 
 ### API ergonomics
 
@@ -424,13 +388,9 @@ If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` i
 ### Graceful Restart — known gaps (2026-06-22)
 
 RFC 4724 Phase 1 and Phase 2 are fully implemented and e2e verified against GoBGP.
-The following gaps remain, ordered by priority.
-
-~~**1. EOR-prune e2e test missing**~~  
-~~*Resolved 2026-06-22* — `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` in~~
-~~`pathvector-e2e/tests/graceful_restart_phase2.rs` uses `docker network disconnect/connect --ip`~~
-~~to simulate a partial-RIB restart without changing the GoBGP container IP.  pathvectord~~
-~~`connect_retry_time` is now configurable (default 120 s, set to 2 s in test harness).~~
+The `daemon.rs` GR-module split and the initial EOR-prune/re-termination test gaps
+were resolved 2026-06-22 — see CHANGELOG.md. The following gaps remain, ordered by
+priority.
 
 **1. `mark_stale_and_repropagate` performance at full-table scale**
 
@@ -446,13 +406,7 @@ marking with a generation-counter or stale-epoch approach — routes are conside
 stale if their epoch < the current GR epoch for that peer, computed lazily at
 best-path selection time rather than eagerly on disconnect.
 
-~~**2. RFC 4724 §4.2: re-termination during an open GR window needs a unit test**~~  
-~~*Resolved 2026-06-22* — `gr_re_termination_during_window_resets_deadline_and_holds_routes`~~
-~~confirms deadline is refreshed and routes are not double-flushed on a second unclean~~
-~~disconnect. `gr_clean_termination_during_window_flushes_immediately` confirms a~~
-~~NOTIFICATION received inside a GR window overrides the window and flushes immediately.~~
-
-**3. EOR-prune e2e test timing margin**
+**2. EOR-prune e2e test timing margin**
 
 `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` uses a 15 s
 `wait_for_established` timeout with a 2 s `connect_retry_time`. On a fast machine
@@ -461,7 +415,7 @@ this is comfortable (first retry fires ≤2 s after reconnect, BGP exchange adds
 shows intermittent failures in CI, increase `connect_retry_time` to 3 s and the
 timeout to 20 s.
 
-**4. `PeerConfig` struct literal proliferation**
+**3. `PeerConfig` struct literal proliferation**
 
 Adding `connect_retry_time: Option<u16>` required inserting `connect_retry_time: None`
 into 30+ test struct literals via sed. Every future optional field on `PeerConfig`
@@ -470,7 +424,7 @@ helper (in `daemon.rs` test module) that fills sensible defaults, so call sites
 only specify the fields under test. `Ipv4Addr` not implementing `Default` blocks
 a derive — the helper is the right answer.
 
-**5. GR deadline timer re-polls on every event loop iteration**
+**4. GR deadline timer re-polls on every event loop iteration**
 
 The `tokio::select!` branch for deadline expiry calls
 `state.gr_deadlines.values().copied().min()` on every poll. When the map is empty
@@ -479,20 +433,12 @@ number of simultaneous GR windows (unlikely in production) this becomes a tighte
 loop than necessary. If needed, cache the next deadline as `Option<Instant>` on
 `DaemonState` and invalidate it only on GR window insert/remove.
 
-**6. RFC 4724 §3 SHOULD: suppress GR capability when peer restart_time = 0**
+**5. RFC 4724 §3 SHOULD: suppress GR capability when peer restart_time = 0**
 
 When the peer's OPEN carries a GracefulRestart capability with `restart_time = 0`,
 pathvectord currently logs a warning but still advertises its own GR capability.
 RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
 overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
-
-~~**7. `daemon.rs` GR logic should move to a dedicated module**~~
-
-~~Resolved 2026-06-22: `daemon.rs` split into 8 submodules; GR logic now lives in
-`daemon/gr.rs`. The four scattered GR fields on `DaemonState` consolidated into
-`GracefulRestartState` with `earliest_deadline()`, `drain_expired()`, and
-`remove_peer()` helpers. O(n²) `Vec::contains` in `repropagate_after_stale_mark_v4`
-fixed to `HashSet` lookup. Double write-lock bug in GR deadline branch corrected.~~
 
 ### Remaining
 
@@ -527,8 +473,6 @@ fixed to `HashSet` lookup. Double write-lock bug in GR deadline branch corrected
   Maps cleanly to a `[[peer_groups]]` TOML table and a `peer_group: Option<String>`
   field on `PeerConfig`.
 
-~~**Next-hop self** — **Resolved 2026-06-19**: `next_hop_self: bool` added to `PeerConfig`; `RibSnapshot.next_hop_self_peers: HashSet<Ipv4Addr>` stores enabled peers; `prepare_outbound`/`prepare_outbound_v6` rewrite NEXT_HOP for iBGP peers with this flag set; all propagation paths (`propagate_to_all_peers`, `propagate_to_all_peers_v6`, `on_established`, `on_terminated`, `set_export_default`) pass `next_hop_self` per peer. Unit test `test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop` added.~~
-
 - **AS path regex in policy** — match routes by AS path pattern
   (`^65001 ` for routes originated by AS 65001, `_65002_` for transit through AS 65002).
   Requires a regex condition in `pathvector-policy`; the `regex` crate is the natural
@@ -544,9 +488,8 @@ fixed to `HashSet` lookup. Double write-lock bug in GR deadline branch corrected
 - **IPv6 import policy per-AFI config** — currently IPv6 import policy is accept-all;
   per-AFI policy config (per-peer `import_default_v6`) is deferred.
 
-~~**`reapply_import_policy` has no IPv6 counterpart** — **Resolved 2026-06-19**: `reapply_import_policy_v6` added to `pathvectord/src/daemon.rs`; `set_import_default` now calls both the v4 and v6 variants so a policy reload applies to all address families without a session reset. Two unit tests added: `test_reapply_v6_accepts_previously_rejected_route`, `test_reapply_v6_rejects_previously_accepted_route`.~~
-
-~~**`cluster_id` configuration guidance** — **Resolved 2026-06-19**: `DaemonConfig::cluster_id` doc comment expanded in `pathvectord/src/config.rs` with an explicit "multi-cluster deployments" warning: distinct `cluster_id` values are required per cluster, otherwise CLUSTER_LIST loop detection fires incorrectly across clusters.~~
+`reapply_import_policy` IPv6 counterpart and `cluster_id` configuration guidance
+resolved 2026-06-19 — see CHANGELOG.md.
 
 **Remaining:** Add a callout to `pathvectord/README.md` alongside the `is_route_reflector` config example: "if you run multiple RR clusters, set distinct `cluster_id` values per cluster — sharing a `cluster_id` across clusters causes CLUSTER_LIST loop detection to fire incorrectly."
 
@@ -566,10 +509,8 @@ fixed to `HashSet` lookup. Double write-lock bug in GR deadline branch corrected
 
 ### Design patterns / dependency-inversion improvements
 
-Three targeted changes that improve testability or robustness without over-engineering.
-Priority order matches the payoff-to-cost ratio.
-
-~~**1. `RibSnapshot` split** — **Resolved 2026-06-11**: `DaemonState` now holds `rib: Arc<RibSnapshot>`. gRPC handlers call `snapshot()` to clone the Arc (O(1) atomic increment) and release the outer lock before iterating, eliminating gRPC/event-loop read contention.~~
+Two remaining changes that improve testability or robustness without over-engineering.
+(Item 1, the `RibSnapshot` split, was resolved 2026-06-11 — see CHANGELOG.md.)
 
 2. **`Clock` trait for timer injection** (`pathvector-session`) — the `ConnectRetry` and
    `HoldTimer` timers are currently wired to `tokio::time` directly. A two-impl trait
@@ -670,25 +611,11 @@ Any function that can fail should say so in its return type. Conduct a systemati
 
 ### Performance
 
-#### Memory — resolved by rib-memory-opt (2026-06-17)
+#### Memory
 
-Stress benchmark (release profile, Apple M2 Max, synthetic uniform routes):
-
-| Table size | pathvectord RSS | GoBGP RSS | Ratio |
-|---|---|---|---|
-| 10k  | 11.8 MB  | 51.7 MB  | pathvector 4.4× less |
-| 100k | 66.8 MB  | 133.2 MB | pathvector 2.0× less |
-| 500k | 461.2 MB | 465.4 MB | ~equal |
-| 900k | 515.2 MB | 792.4 MB | pathvector 35% less |
-
-Per-route at 900k: **0.57 KB/route** (pathvectord) vs **0.88 KB/route** (GoBGP).
-
-The RSS plateau between 500k–900k (+54 MB for 400k additional routes) confirms
-that attribute interning / Arc-sharing is effective — real internet routes converge
-onto a small set of shared attribute sets as the table grows.
-
-No further memory audit planned unless profiling on a real multi-peer internet
-table (not synthetic) reveals a regression.
+Resolved by `rib-memory-opt`, 2026-06-17 — see CHANGELOG.md for the full benchmark table.
+No further memory audit planned unless profiling on a real multi-peer internet table
+(not synthetic) reveals a regression.
 
 #### Known architectural concerns
 
@@ -703,19 +630,9 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    `DaemonState` by address family or introducing a per-peer processing pipeline would fix
    this, but requires significant ownership rework.
 
-2. ~~**No NLRI batching in outbound UPDATEs**~~ — **Resolved (2026-06-20)** on `nlri-batching`
-   branch. `DaemonState` now accumulates `PrefixDecision`s in per-peer buffers; the event
-   loop drains the event channel with `try_recv` after each initial `recv`, then calls
-   `flush_pending` once at quiescence. Routes sharing the same attribute set are packed into
-   a single `UpdateMessage` by `flush_updates`. The event loop's `fib_changed` and MRAI timer
-   arms also call `flush_pending` after their propagation pass. gRPC-facing mutation methods
-   (`originate_routes`, `withdraw_originated_routes`, `set_import_default`) self-flush to
-   preserve immediate delivery semantics outside the event loop.
-
-   The `try_recv` drain holds the write lock for up to 256 events (channel capacity), but
-   MRT benchmarks show no measurable starvation: RIB convergence improved from 4.46s to
-   2.88s after this change (M2 Max, 1.13M prefixes), confirming that batching the flush
-   reduces lock round-trips rather than worsening contention.
+2. **NLRI batching in outbound UPDATEs** — shipped 2026-06-20 (see CHANGELOG.md: Cross-UPDATE
+   NLRI coalescing in outbound pipeline). RIB convergence improved from 4.46s to 2.88s
+   (M2 Max, 1.13M prefixes).
 
    **Remaining test coverage risks (2026-06-20):**
 
@@ -773,12 +690,8 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
 
 #### Per-crate criterion benchmarks
 
-~~`pathvector-rib` — **Resolved 2026-06-18**: Three bench targets shipped:
-`select_best` (2/10/100 candidates), `loc_rib_insert` (10k/100k/500k prefixes),
-`outbound_pipeline` (1/10/50 peers × minimal/dense route). Baseline on M2 Max:
-`select_best/2` 158 ns, `select_best/100` 2.6 µs; `loc_rib_insert` flat at ~600 ns
-across all RIB sizes; `outbound_pipeline/minimal/50` 6.8 µs,
-`outbound_pipeline/dense/50` 13.7 µs.~~
+`pathvector-rib` benchmarks (`select_best`, `loc_rib_insert`, `outbound_pipeline`) shipped
+2026-06-18 — see CHANGELOG.md.
 
 Remaining crates to benchmark:
 

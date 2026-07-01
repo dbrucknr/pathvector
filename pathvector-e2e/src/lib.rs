@@ -64,6 +64,11 @@ pub const GOBGPD_BGP_PORT: u16 = 179;
 /// gRPC management port inside the pathvectord container.
 pub const PATHVECTORD_GRPC_PORT: u16 = 51_200;
 
+/// Prometheus metrics port inside the pathvectord container, used by
+/// [`MetricsHarness`]. Distinct from the gRPC port range so both can be
+/// published to the host simultaneously.
+pub const PATHVECTORD_METRICS_PORT: u16 = 51_300;
+
 // ── Port / ID allocation ──────────────────────────────────────────────────────
 
 /// Per-test unique ID — used to name Docker networks and containers so
@@ -73,12 +78,21 @@ static NEXT_TEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Host-side port base for pathvectord's gRPC mapping.
 static NEXT_GRPC_PORT: AtomicU16 = AtomicU16::new(51_200);
 
+/// Host-side port base for pathvectord's metrics mapping. A separate range
+/// from `NEXT_GRPC_PORT` so the two allocators never hand out the same host
+/// port to concurrent tests.
+static NEXT_METRICS_PORT: AtomicU16 = AtomicU16::new(59_300);
+
 pub fn alloc_test_id() -> u32 {
     NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn alloc_grpc_port() -> u16 {
     NEXT_GRPC_PORT.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn alloc_metrics_port() -> u16 {
+    NEXT_METRICS_PORT.fetch_add(1, Ordering::Relaxed)
 }
 
 // ── Binary / workspace paths ──────────────────────────────────────────────────
@@ -464,6 +478,40 @@ local_as  = 65002
 bgp_id    = "10.0.0.2"
 hold_time = 9
 grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `metrics_port` set, for
+/// [`MetricsHarness`]. Otherwise identical to [`write_daemon_config`].
+fn write_daemon_config_with_metrics(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as     = 65002
+bgp_id       = "10.0.0.2"
+hold_time    = 9
+grpc_port    = {PATHVECTORD_GRPC_PORT}
+metrics_port = {PATHVECTORD_METRICS_PORT}
 "#
     )
     .expect("write pathvectord config header");
@@ -949,6 +997,53 @@ pub fn docker_start_with_caps(
     ContainerGuard(id)
 }
 
+/// Like [`docker_start`] but also publishes pathvectord's metrics port to the
+/// host, for [`MetricsHarness`]. Kept as a separate function rather than
+/// widening [`docker_start_with_caps`]'s already-long parameter list.
+///
+/// # Panics
+///
+/// Panics if `docker run` exits non-zero.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn docker_start_with_metrics(
+    name: &str,
+    image: &str,
+    network: &str,
+    volume_src: &str,
+    volume_dst: &str,
+    host_grpc_port: u16,
+    host_metrics_port: u16,
+    cmd: &str,
+) -> ContainerGuard {
+    let args: Vec<String> = vec![
+        "run".into(),
+        "--detach".into(),
+        format!("--name={name}"),
+        format!("--network={network}"),
+        format!("--volume={volume_src}:{volume_dst}"),
+        format!("--publish={host_grpc_port}:{PATHVECTORD_GRPC_PORT}"),
+        format!("--publish={host_metrics_port}:{PATHVECTORD_METRICS_PORT}"),
+        format!("{image}:latest"),
+        cmd.into(),
+    ];
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .expect("docker run");
+    assert!(
+        output.status.success(),
+        "docker run {image} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let id = std::str::from_utf8(&output.stdout)
+        .expect("docker run output is UTF-8")
+        .trim()
+        .to_owned();
+    ContainerGuard(id)
+}
+
 /// Block (synchronously, with short sleeps) until the container's Docker
 /// HEALTHCHECK reports `healthy`, or panic if `timeout` expires.
 ///
@@ -1278,6 +1373,180 @@ impl FibHarness {
             status.success(),
             "gobgp announce blackhole {prefix} failed: {status}"
         );
+    }
+}
+
+// ── MetricsHarness ───────────────────────────────────────────────────────────
+
+/// Test harness for the Prometheus `/metrics` endpoint (`pathvectord/src/metrics.rs`).
+///
+/// Starts pathvectord with `metrics_port` configured and publishes both the
+/// gRPC and metrics ports to the host, so tests can assert on the *actual*
+/// rendered Prometheus output — not just on the internal `metrics` crate
+/// calls (which are covered separately by unit tests in
+/// `pathvectord/src/metrics.rs`). This is what proves the event-loop hooks in
+/// `daemon/mod.rs` (`on_session_established`, `on_route_update`, etc.) are
+/// correctly wired, not just correct in isolation.
+///
+/// # Panics
+///
+/// [`MetricsHarness::new`] panics if Docker is not running, either image is
+/// missing, or the BGP session does not reach `Established` within 30 seconds.
+pub struct MetricsHarness {
+    _gobgpd: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// GoBGP container ID — used by `gobgp_announce`.
+    pub gobgpd_id: String,
+    /// IP address that gobgpd appears as to pathvectord on the shared network.
+    pub gobgp_ip: Ipv4Addr,
+    /// Host-mapped port for pathvectord's `/metrics` endpoint.
+    pub metrics_host_port: u16,
+    _network: DockerNetwork,
+}
+
+impl MetricsHarness {
+    /// Stand up GoBGP + pathvectord (metrics enabled) and wait for the BGP
+    /// session to reach `Established`.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let metrics_host_port = alloc_metrics_port();
+        let network_name = format!("pathvector-metrics-test-{test_id}");
+
+        let network = DockerNetwork::create(network_name.clone());
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd = docker_start(
+            &format!("gobgpd-metrics-{test_id}"),
+            GOBGPD_IMAGE,
+            &network_name,
+            None,
+            false,
+            &gobgpd_config_path,
+            "/etc/gobgp/gobgpd.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
+
+        let gobgpd_id = gobgpd.0.clone();
+        let gobgp_ip = container_network_ip(&gobgpd_id, &network_name);
+
+        let pathvectord_config = write_daemon_config_with_metrics(&[(gobgp_ip, 65001)]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start_with_metrics(
+            &format!("pathvectord-metrics-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            grpc_host_port,
+            metrics_host_port,
+            "/etc/pathvectord.toml",
+        );
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for MetricsHarness");
+
+        wait_for_established(&mut client, gobgp_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            gobgpd_id,
+            gobgp_ip,
+            metrics_host_port,
+            _network: network,
+        }
+    }
+
+    /// Announce a prefix from GoBGP into pathvectord's RIB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp announce");
+        assert!(status.success(), "gobgp announce {prefix} failed: {status}");
+    }
+}
+
+/// Fetches the Prometheus text-format response body from
+/// `http://127.0.0.1:<port>/metrics`.
+///
+/// Uses a raw `std::net::TcpStream` HTTP/1.1 request rather than pulling in an
+/// HTTP client crate — this is a single plaintext localhost GET in a test, not
+/// production code.
+///
+/// # Panics
+///
+/// Panics if the connection fails or the response cannot be read as UTF-8.
+#[must_use]
+pub fn scrape_metrics_text(port: u16) -> String {
+    use std::io::{Read, Write as _};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("connect to metrics endpoint on port {port}: {e}"));
+    stream
+        .write_all(
+            format!("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("write metrics HTTP request");
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read metrics HTTP response");
+
+    // Strip the HTTP headers — the caller only wants the Prometheus text body.
+    response
+        .split_once("\r\n\r\n")
+        .map_or(response.as_str(), |(_headers, body)| body)
+        .to_owned()
+}
+
+/// Polls [`scrape_metrics_text`] until `needle` appears in the response body,
+/// or panics if `timeout` expires.
+///
+/// # Panics
+///
+/// Panics if `needle` does not appear within `timeout`.
+pub async fn wait_for_metric(port: u16, needle: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let body = scrape_metrics_text(port);
+        if body.contains(needle) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "timed out after {timeout:?} waiting for metric containing {needle:?}\n\
+             full /metrics response:\n{body}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

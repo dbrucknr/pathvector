@@ -97,6 +97,7 @@ remote_as = 65001
 | `bgp_id` | `IPv4` | **required** | Router-ID in dotted-decimal. Must not be a loopback address (`127.0.0.0/8`) — real BGP implementations reject loopback BGP IDs (RFC 6286 §2.1) |
 | `hold_time` | `u16` | `90` | Proposed hold timer in seconds. Negotiated down to the peer's value if lower |
 | `grpc_port` | `u16` | `50051` | TCP port for the gRPC management API, bound on all interfaces |
+| `metrics_port` | `u16` | — | TCP port for the Prometheus `/metrics` scrape endpoint. Omit to disable. Conventional value: `9179` |
 | `graceful_restart_time` | `u16` | `0` | Seconds peers should hold our routes after an unclean session loss (RFC 4724 §3). `0` disables forwarding-state advertisement — peers withdraw our routes immediately. See [Graceful Restart](#graceful-restart-rfc-4724) |
 | `restarting` | `bool` | `false` | Set to `true` when restarting pathvectord mid-session to signal the RFC 4724 Restart State (R) bit, so peers stop their stale-route timers as soon as the session re-establishes. Remove after restart. Ignored when `graceful_restart_time = 0` |
 
@@ -119,6 +120,7 @@ local_as              = 65002
 bgp_id                = "10.0.0.2"
 hold_time             = 90
 grpc_port             = 50051
+metrics_port          = 9179  # Prometheus scrape endpoint; omit to disable
 graceful_restart_time = 120   # hold our routes for 120 s on restart
 
 # eBGP peer — RFC 8212 reject-by-default; explicitly opt in
@@ -142,6 +144,125 @@ remote_as = 65002
 > **Note on port 179:** BGP's standard port is privileged (< 1024). During
 > development, configure both sides to use an unprivileged port (e.g. `1179`).
 > pathvectord dials outbound and does not need root for the BGP port itself.
+
+---
+
+## Observability
+
+pathvectord exposes a Prometheus-compatible `/metrics` endpoint for monitoring session
+state and RIB sizes. Enable it by adding `metrics_port` to your `[daemon]` config:
+
+```toml
+[daemon]
+local_as     = 65001
+bgp_id       = "10.0.0.1"
+metrics_port = 9179
+```
+
+On startup you will see:
+
+```
+INFO pathvectord: Prometheus metrics listening on http://0.0.0.0:9179/metrics
+```
+
+### Metrics reference
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `pathvectord_bgp_session_up` | Gauge | `peer` | `1` while the session is Established; `0` otherwise |
+| `pathvectord_bgp_session_established_timestamp_seconds` | Gauge | `peer` | Unix timestamp of the most recent session establishment |
+| `pathvectord_bgp_adj_rib_in_prefixes` | Gauge | `peer` | Routes received from this peer (Adj-RIB-In size, pre-policy) |
+| `pathvectord_bgp_adj_rib_out_prefixes` | Gauge | `peer` | Routes currently advertised to this peer (Adj-RIB-Out size) |
+| `pathvectord_bgp_loc_rib_prefixes` | Gauge | `afi` | Best-path routes in Loc-RIB (`afi=ipv4` or `afi=ipv6`) |
+| `pathvectord_bgp_sessions_established_total` | Counter | `peer` | Number of times this peer reached Established |
+| `pathvectord_bgp_sessions_terminated_total` | Counter | `peer`, `reason` | Session terminations by cause: `unclean`, `notification`, `operator_stop` |
+| `pathvectord_bgp_updates_received_total` | Counter | `peer` | BGP UPDATE messages received from this peer |
+
+### Quick check
+
+```bash
+curl -s http://localhost:9179/metrics | grep pathvectord
+```
+
+Sample output with one peer established and 4 routes received:
+
+```
+# HELP pathvectord_bgp_session_up 1 while the session is Established
+# TYPE pathvectord_bgp_session_up gauge
+pathvectord_bgp_session_up{peer="10.0.0.1"} 1
+
+# TYPE pathvectord_bgp_session_established_timestamp_seconds gauge
+pathvectord_bgp_session_established_timestamp_seconds{peer="10.0.0.1"} 1751234567.123
+
+# TYPE pathvectord_bgp_adj_rib_in_prefixes gauge
+pathvectord_bgp_adj_rib_in_prefixes{peer="10.0.0.1"} 4
+
+# TYPE pathvectord_bgp_adj_rib_out_prefixes gauge
+pathvectord_bgp_adj_rib_out_prefixes{peer="10.0.0.1"} 2
+
+# TYPE pathvectord_bgp_loc_rib_prefixes gauge
+pathvectord_bgp_loc_rib_prefixes{afi="ipv4"} 4
+pathvectord_bgp_loc_rib_prefixes{afi="ipv6"} 0
+
+# TYPE pathvectord_bgp_sessions_established_total counter
+pathvectord_bgp_sessions_established_total{peer="10.0.0.1"} 1
+
+# TYPE pathvectord_bgp_sessions_terminated_total counter
+pathvectord_bgp_sessions_terminated_total{peer="10.0.0.1",reason="unclean"} 0
+
+# TYPE pathvectord_bgp_updates_received_total counter
+pathvectord_bgp_updates_received_total{peer="10.0.0.1"} 4
+```
+
+### Prometheus scrape config
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: pathvectord
+    static_configs:
+      - targets: ["localhost:9179"]
+```
+
+### Useful PromQL queries
+
+```promql
+# Is any BGP session down?
+pathvectord_bgp_session_up == 0
+
+# How long has each session been up? (seconds)
+time() - pathvectord_bgp_session_established_timestamp_seconds
+
+# Session flap rate over the last hour
+rate(pathvectord_bgp_sessions_terminated_total[1h])
+
+# Routes accepted vs. advertised per peer
+pathvectord_bgp_adj_rib_in_prefixes
+pathvectord_bgp_adj_rib_out_prefixes
+
+# Total routes in Loc-RIB
+sum(pathvectord_bgp_loc_rib_prefixes)
+```
+
+### Security note
+
+The `/metrics` endpoint is unauthenticated. In production, bind pathvectord to a
+management-only interface or use a firewall rule to restrict scrape access to your
+Prometheus server:
+
+```bash
+# Allow only the Prometheus server to scrape
+ufw allow from <prometheus-ip> to any port 9179
+```
+
+### Cardinality note for dynamic peers
+
+Metric series are labeled by peer IP and are **zeroed, not removed**, when a peer is
+deconfigured via the `RemovePeer` gRPC call. For a static peer set — the common case for
+transit or blackhole upstreams — this has no practical effect. If you add and remove peers
+frequently at runtime via the dynamic-peer API, the Prometheus registry will accumulate one
+stale zeroed series per removed peer for the lifetime of the process. This is tracked as a
+follow-up in `TODO.md`; it is not expected to matter for typical deployments.
 
 ---
 

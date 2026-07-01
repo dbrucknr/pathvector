@@ -55,6 +55,8 @@ tonic-prost      = "0.14"
 tonic-reflection = "0.14"
 prost            = "0.14"
 prost-types      = "0.14"
+metrics                     = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

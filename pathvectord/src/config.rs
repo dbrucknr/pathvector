@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// ```toml
 /// [daemon]
-/// local_as  = 65002
-/// bgp_id    = "127.0.0.2"
-/// hold_time = 90          # optional, default 90 s
-/// grpc_port = 50051       # optional, default 50051
-/// bgp_port  = 179         # optional, default 179 (use 1179+ without CAP_NET_BIND_SERVICE)
+/// local_as     = 65002
+/// bgp_id       = "127.0.0.2"
+/// hold_time    = 90          # optional, default 90 s
+/// grpc_port    = 50051       # optional, default 50051
+/// bgp_port     = 179         # optional, default 179 (use 1179+ without CAP_NET_BIND_SERVICE)
+/// metrics_port = 9179        # optional; omit to disable Prometheus scrape endpoint
 ///
 /// [[peers]]
 /// address   = "127.0.0.1"
@@ -46,6 +47,22 @@ pub struct DaemonConfig {
     /// starts when the daemon runs).
     #[serde(default = "default_grpc_port")]
     pub grpc_port: u16,
+    /// TCP port for the Prometheus `/metrics` scrape endpoint.
+    ///
+    /// When set, pathvectord binds an HTTP listener on `0.0.0.0:<metrics_port>`
+    /// that serves standard Prometheus text format.  Omit (or set to `None`) to
+    /// disable the endpoint entirely.
+    ///
+    /// The conventional port for BGP exporters is `9179`.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as     = 65001
+    /// bgp_id       = "10.0.0.1"
+    /// metrics_port = 9179
+    /// ```
+    #[serde(default)]
+    pub metrics_port: Option<u16>,
     /// TCP port on which pathvectord listens for inbound BGP connections.
     ///
     /// Peers that also dial out will trigger RFC 4271 §6.8 collision detection.
