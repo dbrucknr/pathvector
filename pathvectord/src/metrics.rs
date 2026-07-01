@@ -33,7 +33,10 @@ pub fn install(port: u16) {
         .with_http_listener(([0, 0, 0, 0], port))
         .install()
         .expect("failed to install Prometheus metrics exporter");
-    tracing::info!(port, "Prometheus metrics listening on http://0.0.0.0:{port}/metrics");
+    tracing::info!(
+        port,
+        "Prometheus metrics listening on http://0.0.0.0:{port}/metrics"
+    );
 }
 
 pub fn on_session_established(peer: Ipv4Addr) {
@@ -76,10 +79,8 @@ pub fn on_session_terminated(peer: Ipv4Addr, reason: &TerminationReason) {
 #[allow(clippy::cast_precision_loss)]
 pub fn on_route_update(peer: Ipv4Addr, adj_rib_in: usize) {
     let p = peer.to_string();
-    metrics::counter!("pathvectord_bgp_updates_received_total", "peer" => p.clone())
-        .increment(1);
-    metrics::gauge!("pathvectord_bgp_adj_rib_in_prefixes", "peer" => p)
-        .set(adj_rib_in as f64);
+    metrics::counter!("pathvectord_bgp_updates_received_total", "peer" => p.clone()).increment(1);
+    metrics::gauge!("pathvectord_bgp_adj_rib_in_prefixes", "peer" => p).set(adj_rib_in as f64);
 }
 
 /// Update RIB size gauges after a flush.  Call after `flush_pending()` so the
@@ -90,10 +91,8 @@ pub fn update_rib_sizes(
     loc_rib_v6: usize,
     prefixes_advertised: &HashMap<Ipv4Addr, usize>,
 ) {
-    metrics::gauge!("pathvectord_bgp_loc_rib_prefixes", "afi" => "ipv4")
-        .set(loc_rib_v4 as f64);
-    metrics::gauge!("pathvectord_bgp_loc_rib_prefixes", "afi" => "ipv6")
-        .set(loc_rib_v6 as f64);
+    metrics::gauge!("pathvectord_bgp_loc_rib_prefixes", "afi" => "ipv4").set(loc_rib_v4 as f64);
+    metrics::gauge!("pathvectord_bgp_loc_rib_prefixes", "afi" => "ipv6").set(loc_rib_v6 as f64);
     for (peer, &count) in prefixes_advertised {
         metrics::gauge!(
             "pathvectord_bgp_adj_rib_out_prefixes",
