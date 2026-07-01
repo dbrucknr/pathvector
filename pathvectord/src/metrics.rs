@@ -13,6 +13,14 @@
 //     pathvectord_bgp_sessions_established_total{peer}
 //     pathvectord_bgp_sessions_terminated_total{peer, reason}       — reason: clean|notification|operator_stop|unclean
 //     pathvectord_bgp_updates_received_total{peer}
+//
+// Cardinality note: series are keyed by peer IP and are never removed, only
+// zeroed, when a peer is deconfigured (RemovePeer). For a static peer set
+// (the common case — transit/blackhole upstreams rarely change) this is a
+// non-issue. For deployments that add/remove peers frequently via the
+// dynamic-peer gRPC API, this means the Prometheus registry accumulates one
+// stale zeroed series per removed peer for the lifetime of the process. See
+// TODO.md for the tracked follow-up (prune series on RemovePeer).
 
 use std::{collections::HashMap, net::Ipv4Addr};
 
@@ -22,21 +30,25 @@ use pathvector_session::transport::TerminationReason;
 /// Install the Prometheus recorder and start the HTTP scrape listener.
 ///
 /// Must be called from within a Tokio runtime (the exporter spawns an internal
-/// HTTP server task).  Panics if the recorder has already been installed or the
-/// listener port is in use.
+/// HTTP server task).  Like the kernel FIB integration, a failure here degrades
+/// the daemon rather than crashing it: BGP session management and route
+/// propagation do not depend on metrics being available. The caller is
+/// expected to log the error and continue.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the Prometheus exporter cannot bind to `port`.
-pub fn install(port: u16) {
+/// Returns an error if the recorder has already been installed (only one
+/// recorder may be installed per process) or if binding to `port` fails
+/// (e.g. already in use, or insufficient privilege for a low port number).
+pub fn install(port: u16) -> Result<(), metrics_exporter_prometheus::BuildError> {
     PrometheusBuilder::new()
         .with_http_listener(([0, 0, 0, 0], port))
-        .install()
-        .expect("failed to install Prometheus metrics exporter");
+        .install()?;
     tracing::info!(
         port,
         "Prometheus metrics listening on http://0.0.0.0:{port}/metrics"
     );
+    Ok(())
 }
 
 pub fn on_session_established(peer: Ipv4Addr) {

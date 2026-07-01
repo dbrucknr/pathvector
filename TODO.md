@@ -40,18 +40,26 @@ production eBGP peering on untrusted links.
 
 ### Tier 2 — Operability and reliability
 
-**Operational telemetry / observability**
-No BMP, no Prometheus metrics endpoint, no structured event export. A production
-daemon you cannot inspect is not safely operable. At minimum, pathvectord needs:
-- Per-peer session state and uptime counters
-- Prefix counts (received, accepted after policy, advertised)
-- GR window active/expired events
-- NOTIFICATION send/receive events with subcode
+**Operational telemetry / observability** — ~~Prometheus endpoint shipped 2026-07-01~~
+A `/metrics` endpoint (`metrics_port` config field) is now live, covering session
+state, uptime timestamps, per-peer prefix counts, and session termination reasons.
+See `pathvectord/README.md` Observability section for the full metric reference.
 
-The lightest path is a Prometheus scrape endpoint (`/metrics` on a configurable
-port) using `metrics` + `metrics-exporter-prometheus`. BMP (RFC 7854) is the
-richer path but significantly more work. Either addresses the core observability
-gap; the Prometheus path is the faster one.
+Remaining gaps:
+- **Series pruning on `RemovePeer`.** Metric series are labeled by peer IP and are
+  zeroed but never removed when a peer is deconfigured. Fine for static peer sets;
+  becomes unbounded growth for deployments that churn peers frequently via the
+  dynamic-peer gRPC API. Fix: call a `remove_peer_series(peer_ip)` helper in
+  `pathvectord/src/metrics.rs` from the `RemovePeer` handling arm in
+  `daemon/mod.rs`, using the Prometheus recorder handle's descriptor-clear API
+  (`metrics_exporter_prometheus::PrometheusHandle` does not currently expose a
+  direct per-series clear — may require tracking the recorder handle in
+  `DaemonState` and filtering the rendered text, or a version bump if a newer
+  release adds this).
+- **GR window active/expired events** — not yet emitted as metrics.
+- **NOTIFICATION send/receive events with subcode** — not yet emitted as metrics.
+- **BMP (RFC 7854)** — the richer alternative/complement to Prometheus scrape;
+  still not started (`pathvector-bmp` crate is a stub).
 
 **Capability negotiation retry (RFC 5492)**
 If a peer sends `Unsupported Capability` NOTIFICATION, pathvectord does not

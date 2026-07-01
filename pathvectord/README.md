@@ -255,6 +255,15 @@ Prometheus server:
 ufw allow from <prometheus-ip> to any port 9179
 ```
 
+### Cardinality note for dynamic peers
+
+Metric series are labeled by peer IP and are **zeroed, not removed**, when a peer is
+deconfigured via the `RemovePeer` gRPC call. For a static peer set — the common case for
+transit or blackhole upstreams — this has no practical effect. If you add and remove peers
+frequently at runtime via the dynamic-peer API, the Prometheus registry will accumulate one
+stale zeroed series per removed peer for the lifetime of the process. This is tracked as a
+follow-up in `TODO.md`; it is not expected to matter for typical deployments.
+
 ---
 
 ## gRPC management API

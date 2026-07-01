@@ -618,9 +618,19 @@ where
         grpc::serve(grpc_state, grpc_port, cmd_tx, grpc_stop_senders).await;
     });
 
-    // Install Prometheus metrics endpoint when configured.
-    if let Some(port) = metrics_port {
-        crate::metrics::install(port);
+    // Install Prometheus metrics endpoint when configured.  A bind failure
+    // (e.g. port already in use) degrades observability only — BGP session
+    // management and route propagation do not depend on it — so we log and
+    // continue rather than crash the daemon, matching the FIB integration's
+    // failure-handling pattern above.
+    if let Some(port) = metrics_port
+        && let Err(e) = crate::metrics::install(port)
+    {
+        tracing::warn!(
+            port,
+            error = %e,
+            "metrics endpoint unavailable — running without Prometheus export"
+        );
     }
 
     // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
