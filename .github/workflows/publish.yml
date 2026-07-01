@@ -23,7 +23,7 @@ on:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: read
+  contents: write # release job needs write to create releases and upload assets
   packages: write
 
 env:
@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,3 +80,135 @@ jobs:
           cache-from: type=gha,scope=publish-pathvectord
           cache-to: type=gha,mode=max,scope=publish-pathvectord
           platforms: linux/amd64
+
+  # ── Binary releases ──────────────────────────────────────────────────────────
+  #
+  # Builds fully-static musl binaries (Linux) and native binaries (macOS) and
+  # uploads them to a GitHub Release when a semver tag is pushed (e.g. v0.1.0).
+  #
+  # Targets:
+  #   x86_64-unknown-linux-musl   — statically linked, no glibc dependency
+  #   aarch64-unknown-linux-musl  — statically linked, no glibc dependency
+  #   aarch64-apple-darwin        — macOS Apple Silicon (CLI only; daemon is Linux-only)
+  #   x86_64-apple-darwin         — macOS Intel (CLI only; daemon is Linux-only)
+  #
+  # Linux musl builds use `cross`, a cargo wrapper that compiles inside a
+  # pre-configured Docker container.  Cross.toml at the workspace root tells cross
+  # to install protoc before building (prost-build shells out to it at compile time).
+  #
+  # To cut a release:
+  #   git tag v0.1.0 && git push origin v0.1.0
+  #
+  release:
+    name: Release — ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+            daemon: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            daemon: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            daemon: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            daemon: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── Linux: native x86_64-musl ────────────────────────────────────────────
+      # musl-tools provides the musl-gcc wrapper; protobuf-compiler provides protoc.
+      - name: Install musl toolchain + protoc (Linux, native)
+        if: matrix.os == 'ubuntu-latest' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools protobuf-compiler
+
+      # ── Linux: aarch64-musl via cross ────────────────────────────────────────
+      # taiki-e/install-action downloads a pre-built cross binary — much faster
+      # than `cargo install cross`.  Cross reads Cross.toml to install protoc inside
+      # its container before the build runs.
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # ── macOS ────────────────────────────────────────────────────────────────
+      # Homebrew protobuf provides the protoc binary.  Apple's Xcode toolchain
+      # supports both arm64 and x86_64 targets from the same arm64 host runner,
+      # so we use macos-latest for both macOS targets.
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
+
+      # ── Build pathvectord (Linux targets only) ────────────────────────────────
+      - name: Build pathvectord
+        if: matrix.daemon
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p pathvectord
+          else
+            cargo build --release --target ${{ matrix.target }} -p pathvectord
+          fi
+
+      # ── Build pathvector CLI (all targets) ───────────────────────────────────
+      - name: Build pathvector CLI
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p pathvector
+          else
+            cargo build --release --target ${{ matrix.target }} -p pathvector
+          fi
+
+      # ── Package into .tar.gz archives ────────────────────────────────────────
+      # Naming convention: {binary}-{tag}-{target}.tar.gz
+      # Each archive contains a single binary at the top level so the install UX is:
+      #   tar xz pathvectord-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+      #   sudo mv pathvectord /usr/local/bin/
+      - name: Package
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          TARGET="${{ matrix.target }}"
+          BIN_DIR="target/${TARGET}/release"
+
+          if [ "${{ matrix.daemon }}" = "true" ]; then
+            tar -czf "pathvectord-${TAG}-${TARGET}.tar.gz" -C "${BIN_DIR}" pathvectord
+          fi
+          tar -czf "pathvector-${TAG}-${TARGET}.tar.gz" -C "${BIN_DIR}" pathvector
+
+      # ── Upload to GitHub Release ──────────────────────────────────────────────
+      # softprops/action-gh-release creates the release if it doesn't exist and
+      # appends files — concurrent matrix jobs all upload to the same release safely.
+      - name: Upload pathvectord binary
+        if: matrix.daemon
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: pathvectord-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+      - name: Upload pathvector CLI binary
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: pathvector-${{ github.ref_name }}-${{ matrix.target }}.tar.gz

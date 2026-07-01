@@ -1,0 +1,16 @@
+# Cross.toml — configuration for the `cross` cross-compilation tool.
+#
+# `cross` is a drop-in replacement for `cargo` that builds Rust code inside
+# a Docker container pre-configured with a foreign-architecture toolchain.
+# We use it to produce aarch64-unknown-linux-musl binaries from a GitHub
+# Actions x86_64 runner.
+#
+# The default cross images do not include `protoc`, but prost-build's build.rs
+# shells out to `protoc` at compile time to generate Rust from .proto files.
+# The `pre-build` hook installs it inside the container before cargo runs.
+
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update",
+    "apt-get install -y --no-install-recommends protobuf-compiler",
+]
