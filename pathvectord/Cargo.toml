@@ -42,6 +42,7 @@ proptest          = { workspace = true }
 pathvector-client = { workspace = true }
 tempfile          = "3"
 tokio             = { workspace = true, features = ["test-util"] }
+metrics-util      = "0.19"
 
 # pathvectord generates code via tonic_prost_build.  The generated file
 # triggers four pedantic lints (doc_markdown, trivially_copy_pass_by_ref,
