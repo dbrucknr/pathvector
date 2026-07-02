@@ -344,7 +344,7 @@ in `pathvector-rib`.
 |---|---|---|---|
 | `PeerConfig.role: Option<PeerRole>`, TOML `role = "provider"/"rs"/"rs_client"/"customer"/"peer"` | `src/config.rs` | ✅ | `sidecar_round_trips_all_fields` |
 | `Role` capability included in OPEN when `role` configured; omitted (non-strict default) otherwise | `src/daemon/capabilities.rs` | ✅ | `test_build_local_capabilities_includes_role_when_configured`, `test_build_local_capabilities_omits_role_when_none` |
-| Role capability rebuilt per-session-spawn, including on reconnect (mirrors the GR R-bit lesson) | `src/daemon/mod.rs` | ✅ | `spawn_config_capabilities_includes_role_when_configured` (unit-level; no event-loop-level reconnect integration test yet — see Deferred) |
+| Role capability rebuilt per-session-spawn, including on reconnect (mirrors the GR R-bit lesson) | `src/daemon/mod.rs` | ✅ | `spawn_config_capabilities_includes_role_when_configured` (unit-level); `reconnect_resends_role_and_gr_capabilities_via_set_capabilities` (event-loop-level, also covers the pre-existing GR R-bit reconnect path) |
 | OTC ingress terms (leak-reject + attach-if-absent) installed per the corrected role mapping | `src/daemon/mod.rs` `install_otc_import_term` | ✅ | `test_install_otc_terms_counts_per_role` (all 5 roles) |
 | OTC egress terms (propagation-block + attach-if-absent) installed per the corrected role mapping | `src/daemon/mod.rs` `install_otc_export_term` | ✅ | `test_install_otc_terms_counts_per_role` (all 5 roles) |
 | No OTC terms installed when `role` is unconfigured (non-strict default) | `src/daemon/mod.rs` | ✅ | `test_no_role_configured_installs_no_otc_terms` |
@@ -373,15 +373,6 @@ in `pathvector-rib`.
   it structurally impossible for two correctly configured routers to leak between
   each other. Reproducing a real leak over the wire requires a peer willing to send
   one on purpose, which is what the mock peer is for.
-- No event-loop-level integration test proves Role capability actually survives a
-  real reconnect (Terminated → `SessionCommand::SetCapabilities` → next OPEN).
-  `spawn_config_capabilities_includes_role_when_configured` proves the pure
-  function (`SpawnConfig::capabilities`) carries `role` through correctly, and the
-  call site was fixed to read `s.rib.peer_roles.get(&peer_ip)` (the same class of
-  bug the GR R-bit lifetime fix closed), but this is unverified end-to-end — and,
-  on inspection, so is the *pre-existing* GR R-bit reconnect path (no test
-  references `SessionCommand::SetCapabilities` at all). Tracked in `TODO.md` as a
-  shared follow-up, not unique to this feature.
 
 **Correctness re-verification (2026-07-02):** independently re-checked the OTC
 ingress/egress role mapping against the RFC 9234 datatracker text directly (not

@@ -4,6 +4,40 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (RFC 9234 correctness reflection)
+
+### [pathvectord] Close test-coverage gaps found during a post-implementation review
+
+Prompted by a deliberate "did we actually prove this correct" pass on the RFC 9234
+work above, rather than new feature scope. Independently re-checked the OTC
+ingress/egress role mapping against the RFC 9234 datatracker text directly (not
+from memory of the feature's own earlier development) — confirmed correct,
+including the Peer role's simultaneous ingress-attach/egress-attach/egress-block
+handling. Ran the grown `pathvector-fuzz` targets (`session_framing`,
+`session_message`) for 60s each, ~10M executions apiece, no crashes — called for
+in the original plan but never actually executed until now.
+
+Closed five real daemon-level test-coverage gaps: RouteServer and RsClient roles
+had zero route-behavior tests (only a term-count assertion); Peer role's egress
+interaction (simultaneous block-if-leaked and attach-if-absent) was untested;
+Peer role's "OTC present and correct" accept path was untested; IPv6 ingress OTC
+extraction was only proven to compile, never exercised by a real v6 UPDATE;
+`build_local_capabilities`/`SpawnConfig::capabilities` had no test touching the
+`role` parameter at all.
+
+Also closed a real, larger gap: no test exercised the actual event-loop
+reconnect capability-refresh path (`SessionEvent::Terminated` →
+`SessionCommand::SetCapabilities`) — nothing in the suite referenced
+`SetCapabilities` at all, meaning neither RFC 9234 Role nor the pre-existing
+RFC 4724 R-bit reconnect fix had integration-level coverage, only unit tests on
+the pure functions underneath. New test drives `run_event_loop` through
+Established → Terminated (unclean) via the existing `MockSessionHandle`
+infrastructure and asserts on the actual `Vec<Capability>` resent — proving both
+survive a real reconnect, not just that the function that computes them is
+correct in isolation.
+
+---
+
 ## 2026-07-02 (RFC 9234)
 
 ### [pathvector-types, pathvector-session, pathvector-rib, pathvector-policy, pathvectord] RFC 9234 — BGP Role + `ONLY_TO_CUSTOMER` route-leak prevention

@@ -12188,6 +12188,92 @@ mod run_with_tests {
         }
     }
 
+    // ── Reconnect capability refresh ──────────────────────────────────────────
+
+    /// On an unclean, non-removal termination, the event loop rebuilds and
+    /// resends this peer's capability set via `SessionCommand::SetCapabilities`
+    /// before the peer reconnects — so per-session dynamic state (the RFC 4724
+    /// R-bit, and RFC 9234 Role) survives a reconnect instead of reverting to
+    /// whatever `DaemonState::new()` computed once at startup.
+    ///
+    /// This is the exact call site the Role reconnect fix (mirroring the
+    /// pre-existing GR R-bit fix) touches, but until now nothing exercised it
+    /// through the real event loop — every other capability test calls the
+    /// pure `build_local_capabilities`/`SpawnConfig::capabilities` functions
+    /// directly, never `run_event_loop` end-to-end. Closes the gap tracked in
+    /// `TODO.md` under "No event-loop integration test for the reconnect
+    /// capability-refresh path".
+    #[tokio::test]
+    async fn reconnect_resends_role_and_gr_capabilities_via_set_capabilities() {
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (spawn_fn, peers) = make_mock_spawn_capturing_stop();
+        let mut cfg = make_config(&[(peer_ip, 65002)]);
+        cfg.daemon.graceful_restart_time = 120;
+        cfg.peers[0].role = Some(config::PeerRole::Provider);
+        let (state, event_rx, _event_tx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
+
+        tokio::spawn(run_event_loop(event_rx, state, stop_senders, None));
+        tokio::task::yield_now().await;
+
+        let (event_tx, mut stop_rx, _update_rx) = {
+            let mut guard = peers.lock().unwrap();
+            let p = guard.pop().expect("one peer spawned");
+            (p.event_tx, p.stop_rx, p.update_rx)
+        };
+
+        // Establish, then terminate uncleanly (not an operator-initiated
+        // removal) — this is the reconnect-eligible path.
+        event_tx
+            .send(established_info_for_peer(65002))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        event_tx
+            .send(SessionEvent::Terminated(TerminationReason::Unclean))
+            .await
+            .unwrap();
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), stop_rx.recv())
+            .await
+            .expect("timed out waiting for SessionCommand")
+            .expect("stop channel closed without sending SetCapabilities");
+
+        let caps = match cmd {
+            SessionCommand::SetCapabilities(caps) => caps,
+            other => panic!("expected SetCapabilities, got {other:?}"),
+        };
+
+        assert!(
+            caps.iter()
+                .any(|c| matches!(c, Capability::Role(Role::Provider))),
+            "Role(Provider) must survive the reconnect capability refresh, got {caps:?}"
+        );
+        let (restart_flags, restart_time) = caps
+            .iter()
+            .find_map(|c| {
+                if let Capability::GracefulRestart {
+                    restart_flags,
+                    restart_time,
+                    ..
+                } = c
+                {
+                    Some((*restart_flags, *restart_time))
+                } else {
+                    None
+                }
+            })
+            .expect("GracefulRestart capability must be present");
+        assert_eq!(
+            restart_time, 120,
+            "restart_time must reflect the configured GR window"
+        );
+        assert_eq!(
+            restart_flags & 0x08,
+            0,
+            "R-bit must always be 0 on reconnect — see the comment at the caps_refresh call site"
+        );
+    }
+
     // ── withdraw_stale_bgp_routes ─────────────────────────────────────────────
     //
     // Full integration coverage (actual netlink withdrawals against a Linux

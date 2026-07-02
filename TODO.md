@@ -536,19 +536,9 @@ overhead of a feature the peer cannot use. Low priority — correctness is unaff
   `export_policy: &Policy<Route<Ipv6Addr>>` parameter and apply it the same way
   the IPv4 path does.
 
-- **No event-loop integration test for the reconnect capability-refresh path** —
-  `run_event_loop`'s `SessionEvent::Terminated` handling rebuilds each session's
-  capability set and sends `SessionCommand::SetCapabilities` before the next OPEN,
-  so dynamic per-session state (the RFC 4724 R-bit, and now RFC 9234 Role) survives
-  a reconnect instead of reverting to whatever `DaemonState::new()` computed once
-  at startup. Found while reflecting on RFC 9234 test coverage: nothing in the test
-  suite references `SessionCommand::SetCapabilities` at all — the underlying pure
-  function (`build_local_capabilities`/`SpawnConfig::capabilities`) is unit-tested
-  for both the R-bit and Role, but the actual reconnect wiring inside
-  `run_event_loop` has no integration-level regression test for either. Not unique
-  to RFC 9234 — this gap predates it and covers the R-bit fix too. Needs a test
-  that drives `run_event_loop` through Established → Terminated (unclean, non-GR)
-  and asserts on the `Vec<Capability>` sent to the mock session's stop-sender.
+Event-loop integration test for the reconnect capability-refresh path (both the
+RFC 4724 R-bit and RFC 9234 Role surviving reconnect via
+`SessionCommand::SetCapabilities`) resolved 2026-07-02 — see CHANGELOG.md.
 
 `reapply_import_policy` IPv6 counterpart and `cluster_id` configuration guidance
 resolved 2026-06-19 — see CHANGELOG.md.
