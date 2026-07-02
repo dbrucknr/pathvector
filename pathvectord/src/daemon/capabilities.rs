@@ -26,12 +26,17 @@ impl SpawnConfig {
     /// AND the restart window (`graceful_restart_time` seconds) has not yet
     /// elapsed since daemon startup.  Once the window expires, R=0 — RFC 4724
     /// §3 requires the restarting speaker to clear the R-bit after completion.
-    pub(super) fn capabilities(&self) -> Vec<Capability> {
+    ///
+    /// `role` is per-peer (not part of `SpawnConfig` itself, which is shared
+    /// across every session) — pass `peer.role.map(Into::into)` from the
+    /// `PeerConfig` being spawned. `None` omits the Role capability entirely,
+    /// matching RFC 9234's own non-strict default.
+    pub(super) fn capabilities(&self, role: Option<Role>) -> Vec<Capability> {
         let in_window = self.configured_restarting
             && self.graceful_restart_time > 0
             && self.startup_instant.elapsed()
                 < std::time::Duration::from_secs(u64::from(self.graceful_restart_time));
-        build_local_capabilities(self.local_as, self.graceful_restart_time, in_window)
+        build_local_capabilities(self.local_as, self.graceful_restart_time, in_window, role)
     }
 }
 
@@ -45,10 +50,15 @@ impl SpawnConfig {
 /// `true` during the post-restart window so peers know to preserve their
 /// stale-route timers for us.  After the window elapses (or on normal startup)
 /// pass `false`.
+///
+/// `role` is this peer's configured RFC 9234 BGP Role, if any. `None` omits
+/// the Role capability — matching the RFC's own non-strict default of not
+/// requiring Role negotiation at all.
 pub(super) fn build_local_capabilities(
     local_as: u32,
     graceful_restart_time: u16,
     restarting: bool,
+    role: Option<Role>,
 ) -> Vec<Capability> {
     // RFC 4724 §3: when restart_time > 0, advertise forwarding-preserved families
     // so peers hold our routes during our restart window.  When 0, advertise an
@@ -84,7 +94,7 @@ pub(super) fn build_local_capabilities(
     } else {
         vec![]
     };
-    vec![
+    let mut caps = vec![
         Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
         Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         Capability::RouteRefresh,
@@ -95,5 +105,9 @@ pub(super) fn build_local_capabilities(
             restart_time: graceful_restart_time.min(4095),
             families: gr_families,
         },
-    ]
+    ];
+    if let Some(role) = role {
+        caps.push(Capability::Role(role));
+    }
+    caps
 }

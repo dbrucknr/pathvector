@@ -89,6 +89,11 @@ pub(crate) fn route_to_attributes(
             attrs.push(PathAttribute::ClusterList(rare.cluster_list.clone()));
         }
     }
+    // RFC 9234 §3: ONLY_TO_CUSTOMER is optional+transitive — forward it
+    // unconditionally once set, regardless of peer type.
+    if let Some(asn) = rare.otc {
+        attrs.push(PathAttribute::OnlyToCustomer(asn));
+    }
     // RFC 6793 §4: when the peer is 2-byte-only, include AS4_PATH so that
     // 4-byte-capable routers further along the path can reconstruct the full
     // AS path. Only emitted when downgrade actually substituted AS_TRANS above.
@@ -583,6 +588,11 @@ pub(crate) fn route_v6_to_attributes(
         if !rare.cluster_list.is_empty() {
             attrs.push(PathAttribute::ClusterList(rare.cluster_list.clone()));
         }
+    }
+    // RFC 9234 §3: ONLY_TO_CUSTOMER is optional+transitive — forward it
+    // unconditionally once set, regardless of peer type.
+    if let Some(asn) = rare.otc {
+        attrs.push(PathAttribute::OnlyToCustomer(asn));
     }
     if let Some(as4) = as4_path {
         attrs.push(PathAttribute::As4Path(as4));

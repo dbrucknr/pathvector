@@ -896,6 +896,7 @@ pub(super) fn handle_update(
     let mut aggregator = None;
     let mut originator_id: Option<Ipv4Addr> = None;
     let mut cluster_list: Vec<u32> = Vec::new();
+    let mut otc: Option<Asn> = None;
     // (nlri, next_hop) pairs from MP_REACH_NLRI; next_hop is mandatory there.
     let mut mp_v4_announced: Vec<(Nlri<Ipv4Addr>, NextHop)> = Vec::new();
     let mut mp_v4_withdrawn: Vec<Nlri<Ipv4Addr>> = Vec::new();
@@ -922,6 +923,7 @@ pub(super) fn handle_update(
             PathAttribute::Aggregator(a) => aggregator = Some(*a),
             PathAttribute::OriginatorId(id) => originator_id = Some(*id),
             PathAttribute::ClusterList(list) => cluster_list.clone_from(list),
+            PathAttribute::OnlyToCustomer(asn) => otc = Some(*asn),
             PathAttribute::MpReachNlri(mp) => {
                 if mp.afi_safi == AfiSafi::IPV4_UNICAST {
                     for prefix in &mp.prefixes {
@@ -1126,6 +1128,9 @@ pub(super) fn handle_update(
         if let Some(agg) = aggregator {
             builder = builder.aggregator(agg);
         }
+        if let Some(asn) = otc {
+            builder = builder.otc(asn);
+        }
 
         let mut raw = builder.build();
         if originator_id.is_some() || !cluster_list.is_empty() {
@@ -1238,6 +1243,9 @@ pub(super) fn handle_update(
         }
         if let Some(agg) = aggregator {
             builder = builder.aggregator(agg);
+        }
+        if let Some(asn) = otc {
+            builder = builder.otc(asn);
         }
 
         let raw = builder.build();

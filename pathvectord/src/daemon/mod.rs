@@ -10,7 +10,10 @@ use std::{
     time::Instant,
 };
 
-use pathvector_policy::{Decision, DefaultAction, Policy};
+use pathvector_policy::{
+    AnyCondition, BgpRoute, Decision, DefaultAction, OtcLeakCondition, OtcPropagationCondition,
+    Policy, Reject, SetOtc, Term,
+};
 use pathvector_rib::{
     AdjRibIn, AdjRibOut, BestPathChange, LocRib, PeerId, Route, RouteBuilder,
     oracle::{AlwaysReachable, NextHopOracle},
@@ -26,7 +29,9 @@ use pathvector_session::{
         SessionHandle, TerminationReason,
     },
 };
-use pathvector_types::{AfiSafi, AsPath, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
+use pathvector_types::{
+    AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType, Role,
+};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::outbound::{
@@ -209,6 +214,20 @@ pub(crate) struct RibSnapshot {
     /// either did not advertise the capability or advertised `restart_time = 0`
     /// (EOR-only mode, no stale-route window).
     pub(crate) gr_capable_peers: HashMap<Ipv4Addr, u16>,
+    /// RFC 9234 BGP Role configured for each peer, if any. Present only for
+    /// peers with `role` set in `PeerConfig` — absent means Role capability
+    /// negotiation and OTC leak prevention are disabled for that peer
+    /// (matching the RFC's own non-strict default). Consulted both when
+    /// building each session's OPEN capabilities (including on reconnect,
+    /// so Role survives a session reset the same way GR capabilities do)
+    /// and when installing this peer's OTC policy terms. Immutable after
+    /// startup for static peers; updated by `add_peer`/`remove_peer` for
+    /// dynamic peers — mirrors `peer_remote_as`'s lifecycle exactly.
+    pub(crate) peer_roles: HashMap<Ipv4Addr, Role>,
+    /// The peer's negotiated RFC 9234 BGP Role, extracted from their
+    /// advertised Role capability in OPEN. Populated on `Established`;
+    /// removed on `Terminated` — mirrors `peer_bgp_ids`'s lifecycle exactly.
+    pub(crate) negotiated_roles: HashMap<Ipv4Addr, Role>,
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -378,10 +397,11 @@ impl DaemonState {
             .iter()
             .map(|p| {
                 let is_ebgp = p.remote_as != local_as;
-                (
-                    p.address,
-                    Policy::new(resolve_import_default(p.import_default, is_ebgp)),
-                )
+                let mut policy = Policy::new(resolve_import_default(p.import_default, is_ebgp));
+                if let Some(role) = p.role {
+                    install_otc_import_term(&mut policy, role.into(), Asn::new(p.remote_as));
+                }
+                (p.address, policy)
             })
             .collect();
 
@@ -392,21 +412,28 @@ impl DaemonState {
                 // import_default_v6 takes precedence; falls back to import_default,
                 // then to the RFC 8212 default for the peer type.
                 let default_v6 = p.import_default_v6.or(p.import_default);
-                (
-                    p.address,
-                    Policy::new(resolve_import_default(default_v6, is_ebgp)),
-                )
+                let mut policy = Policy::new(resolve_import_default(default_v6, is_ebgp));
+                if let Some(role) = p.role {
+                    install_otc_import_term(&mut policy, role.into(), Asn::new(p.remote_as));
+                }
+                (p.address, policy)
             })
             .collect();
 
+        // RFC 9234 §6 egress terms only apply here — export policy is currently
+        // only evaluated for IPv4 routes (`propagate_prefix`); `propagate_prefix_v6`
+        // does not consult `export_policies` at all (see TODO.md, IPv6 export
+        // policy gap). Until that's closed, OTC egress enforcement for IPv6
+        // routes is unavailable regardless of role configuration.
         let export_policies = peers
             .iter()
             .map(|p| {
                 let is_ebgp = p.remote_as != local_as;
-                (
-                    p.address,
-                    Policy::new(resolve_export_default(p.export_default, is_ebgp)),
-                )
+                let mut policy = Policy::new(resolve_export_default(p.export_default, is_ebgp));
+                if let Some(role) = p.role {
+                    install_otc_export_term(&mut policy, role.into(), Asn::new(local_as));
+                }
+                (p.address, policy)
             })
             .collect();
 
@@ -463,6 +490,11 @@ impl DaemonState {
             })
             .collect();
 
+        let peer_roles: HashMap<Ipv4Addr, Role> = peers
+            .iter()
+            .filter_map(|p| p.role.map(|r| (p.address, r.into())))
+            .collect();
+
         // Capacity of 1024 events each.  A receiver that falls >1024 events
         // behind sees `RecvError::Lagged`; the `watch_peers` gRPC stream handler
         // defends against this by re-reading the full snapshot on any
@@ -492,6 +524,8 @@ impl DaemonState {
             eor_received: HashSet::new(),
             eor_received_v6: HashSet::new(),
             gr_capable_peers: HashMap::new(),
+            peer_roles,
+            negotiated_roles: HashMap::new(),
         });
 
         Self {
@@ -559,6 +593,46 @@ impl DaemonState {
                 pathvector_policy::Reject,
             ));
         }
+    }
+}
+
+/// RFC 9234 §5 ingress terms for a peer configured with `session_role`.
+///
+/// Always installs the leak-detection term (a no-op for roles it doesn't
+/// apply to — see [`OtcLeakCondition`]'s doc comment). Additionally installs
+/// the ingress-attach term (`OTC = peer_asn`) when `session_role` is
+/// `Customer`, `Peer`, or `RsClient` — i.e. the route came from our
+/// Provider/Peer/RS on this session.
+fn install_otc_import_term<R: BgpRoute>(policy: &mut Policy<R>, session_role: Role, peer_asn: Asn) {
+    policy.add_term(Term::new(
+        OtcLeakCondition::new(session_role, peer_asn),
+        Reject,
+    ));
+    if matches!(session_role, Role::Customer | Role::Peer | Role::RsClient) {
+        policy.add_term(Term::new(AnyCondition, SetOtc::new(peer_asn)));
+    }
+}
+
+/// RFC 9234 §6 egress terms for a peer configured with `session_role`.
+///
+/// Installs the propagation-block term (reject routes that already carry
+/// OTC) when `session_role` is `Customer`, `Peer`, or `RsClient` — i.e.
+/// we're sending to our Provider/Peer/RS on this session. Installs the
+/// egress-attach term (`OTC = local_asn`) when `session_role` is `Provider`,
+/// `Peer`, or `RouteServer` — i.e. we're sending to our Customer/Peer/RS-Client.
+fn install_otc_export_term<R: BgpRoute>(
+    policy: &mut Policy<R>,
+    session_role: Role,
+    local_asn: Asn,
+) {
+    if matches!(session_role, Role::Customer | Role::Peer | Role::RsClient) {
+        policy.add_term(Term::new(OtcPropagationCondition, Reject));
+    }
+    if matches!(
+        session_role,
+        Role::Provider | Role::Peer | Role::RouteServer
+    ) {
+        policy.add_term(Term::new(AnyCondition, SetOtc::new(local_asn)));
     }
 }
 
@@ -840,6 +914,7 @@ where
                 && cfg.daemon.graceful_restart_time > 0
                 && startup_instant.elapsed()
                     < std::time::Duration::from_secs(u64::from(cfg.daemon.graceful_restart_time)),
+            peer.role.map(Into::into),
         );
         let session_cfg = SessionConfig {
             local_as,
@@ -895,7 +970,7 @@ where
     // support GR" warning in on_established) — not for per-session OPENs.
     // The R-bit is not relevant here; we use restarting=false.
     let config_capabilities =
-        build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, false);
+        build_local_capabilities(local_as, cfg.daemon.graceful_restart_time, false, None);
     let state = Arc::new(RwLock::new(DaemonState::new(
         local_as,
         local_bgp_id,
@@ -1009,8 +1084,12 @@ pub(crate) async fn run_event_loop(
                                         None
                                     }
                                 }).unwrap_or(0);
-                                let fresh_caps =
-                                    build_local_capabilities(s.rib.local_as, gr_time, false);
+                                let fresh_caps = build_local_capabilities(
+                                    s.rib.local_as,
+                                    gr_time,
+                                    false,
+                                    s.rib.peer_roles.get(&peer_ip).copied(),
+                                );
                                 stop_senders.lock().unwrap().get(&peer_ip).cloned()
                                     .map(|tx| (tx, fresh_caps))
                             };
@@ -1404,6 +1483,7 @@ mod tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -1595,6 +1675,7 @@ mod tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -1905,6 +1986,7 @@ mod tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(peer_ip, tx);
@@ -1985,6 +2067,7 @@ mod tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }];
         let mut state = DaemonState::new(
             65001,
@@ -2639,6 +2722,245 @@ mod tests {
             },
         );
         assert_eq!(state.rib.loc_rib.len(), 0);
+    }
+
+    // ── RFC 9234 — BGP Role + OTC route-leak prevention ───────────────────────
+
+    fn make_state_with_roles(
+        local_as: u32,
+        peers: &[(Ipv4Addr, u32, config::PeerRole)],
+    ) -> (
+        DaemonState,
+        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
+    ) {
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+        for &(ip, _, _) in peers {
+            let (tx, rx) = mpsc::channel(64);
+            senders.insert(ip, tx);
+            receivers.insert(ip, rx);
+        }
+        let peer_configs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(address, remote_as, role)| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+                connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
+                role: Some(role),
+            })
+            .collect();
+        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let state = DaemonState::new(
+            local_as,
+            local_bgp_id,
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        (state, receivers)
+    }
+
+    fn announce_with_otc(peer_as: u32, prefix: &str, otc: Option<u32>) -> UpdateMessage {
+        let mut attributes = vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(peer_as)])),
+            PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+        ];
+        if let Some(asn) = otc {
+            attributes.push(PathAttribute::OnlyToCustomer(Asn::new(asn)));
+        }
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes,
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    #[test]
+    fn test_install_otc_terms_counts_per_role() {
+        use config::PeerRole;
+        // (role, expected import term count [v4 and v6 identical], expected export term count)
+        let cases = [
+            (PeerRole::Provider, 1, 1),
+            (PeerRole::RouteServer, 1, 1),
+            (PeerRole::Customer, 2, 1),
+            (PeerRole::RsClient, 2, 1),
+            (PeerRole::Peer, 2, 2),
+        ];
+        for (role, expected_import, expected_export) in cases {
+            let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+            let (state, _rx) = make_state_with_roles(65001, &[(peer_ip, 65002, role)]);
+            assert_eq!(
+                state.import_policies[&peer_ip].len(),
+                expected_import,
+                "{role:?}: import policy term count"
+            );
+            assert_eq!(
+                state.import_policies_v6[&peer_ip].len(),
+                expected_import,
+                "{role:?}: import_v6 policy term count"
+            );
+            assert_eq!(
+                state.export_policies[&peer_ip].len(),
+                expected_export,
+                "{role:?}: export policy term count"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_role_configured_installs_no_otc_terms() {
+        // Regression guard: omitting `role` must have zero effect — matches
+        // RFC 9234's own non-strict default of not requiring Role at all.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (state, _rx) = make_state(65001, &[(peer_ip, 65002)]);
+        assert_eq!(state.import_policies[&peer_ip].len(), 0);
+        assert_eq!(state.import_policies_v6[&peer_ip].len(), 0);
+        assert_eq!(state.export_policies[&peer_ip].len(), 0);
+    }
+
+    #[test]
+    fn test_provider_role_rejects_route_leaked_with_otc_from_customer() {
+        // session_role = Provider: the peer is our Customer. A well-behaved
+        // Customer never sends OTC — receiving one at all is a leak.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Provider)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(1)));
+
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "route leaked with OTC from a Customer must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_provider_role_accepts_clean_route_without_attaching_otc() {
+        // session_role = Provider: a route without OTC from our Customer is
+        // legitimate and accepted; no ingress attach happens on this side
+        // (attach only applies when session_role is Customer/Peer/RsClient).
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Provider)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", None));
+
+        let route = state
+            .rib
+            .loc_rib
+            .best(&nlri("10.0.0.0/8"))
+            .expect("clean route from Customer must be accepted");
+        assert_eq!(route.otc(), None);
+    }
+
+    #[test]
+    fn test_customer_role_attaches_peer_asn_on_ingress() {
+        // session_role = Customer: the peer is our Provider. No leak
+        // detection applies here; the route gets OTC = peer's ASN attached
+        // so downstream OTC enforcement (at the next hop) can work.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Customer)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", None));
+
+        let route = state
+            .rib
+            .loc_rib
+            .best(&nlri("10.0.0.0/8"))
+            .expect("route from Provider must be accepted");
+        assert_eq!(route.otc(), Some(Asn::new(65002)));
+    }
+
+    #[test]
+    fn test_peer_role_rejects_route_with_mismatched_otc_asn() {
+        // session_role = Peer: OTC present with a value other than the
+        // peer's own ASN indicates a leak further upstream.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Peer)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(99999)));
+
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none());
+    }
+
+    #[test]
+    fn test_route_leak_prevented_across_two_provider_peers() {
+        // The canonical RFC 9234 scenario: a route learned from one Provider
+        // must never be re-advertised to another Provider (the leak that
+        // caused the 2019 Verizon/Allegheny/Cloudflare incident). peer_a and
+        // peer_b are both configured as our Customer (session_role =
+        // Customer — they are our upstream Providers); peer_c is configured
+        // as our Provider (session_role = Provider — they are our Customer).
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let peer_c: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        let (mut state, mut receivers) = make_state_with_roles(
+            65001,
+            &[
+                (peer_a, 65002, config::PeerRole::Customer),
+                (peer_b, 65003, config::PeerRole::Customer),
+                (peer_c, 65004, config::PeerRole::Provider),
+            ],
+        );
+        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(peer_c, peer_c, PeerType::External, 65004, 90, &[], None);
+        drain_all(&mut receivers);
+
+        // Learned from peer_a (our Provider) with no OTC yet — gets attached.
+        state.on_route_update(peer_a, announce_with_otc(65002, "10.0.0.0/8", None));
+        state.flush_pending();
+
+        let stored = state
+            .rib
+            .loc_rib
+            .best(&nlri("10.0.0.0/8"))
+            .expect("route from peer_a must be accepted");
+        assert_eq!(
+            stored.otc(),
+            Some(Asn::new(65002)),
+            "ingress attach must fire for a Customer-role session"
+        );
+
+        // Must NOT reach peer_b — another Provider. This is the leak.
+        assert!(
+            receivers.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            "route already carrying OTC must never be advertised to another Provider"
+        );
+
+        // Must reach peer_c — our Customer — with OTC preserved on the wire.
+        let msg = receivers
+            .get_mut(&peer_c)
+            .unwrap()
+            .try_recv()
+            .expect("route must be advertised to our Customer");
+        assert!(
+            msg.attributes.iter().any(
+                |a| matches!(a, PathAttribute::OnlyToCustomer(asn) if *asn == Asn::new(65002))
+            ),
+            "OTC must be preserved unchanged on the wire toward our Customer"
+        );
     }
 
     // ── test wrappers ─────────────────────────────────────────────────────────
@@ -3650,6 +3972,7 @@ mod tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -3698,6 +4021,7 @@ mod tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -7008,6 +7332,7 @@ mod tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
                 address,
@@ -7025,6 +7350,7 @@ mod tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             }))
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -7577,6 +7903,7 @@ mod tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
         let (tx, _rx) = mpsc::channel(64);
         state.add_peer(&new_peer, tx);
@@ -7646,6 +7973,7 @@ mod stall_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .collect();
         let state = DaemonState::new(
@@ -7740,6 +8068,7 @@ mod stall_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -7757,6 +8086,7 @@ mod stall_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -7869,6 +8199,7 @@ mod stall_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -7886,6 +8217,7 @@ mod stall_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -8300,6 +8632,7 @@ mod coalescing_tests {
                     max_prefixes_v4: None,
                     max_prefixes_v6: None,
                     max_prefixes_restart: None,
+                    role: None,
                 }
             })
             .collect();
@@ -8596,6 +8929,7 @@ mod coalescing_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -8613,6 +8947,7 @@ mod coalescing_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -8749,6 +9084,7 @@ mod coalescing_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -8766,6 +9102,7 @@ mod coalescing_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -8993,6 +9330,7 @@ mod event_loop_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .collect();
 
@@ -9133,6 +9471,7 @@ mod event_loop_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
             config::PeerConfig {
                 address: peer_b,
@@ -9150,6 +9489,7 @@ mod event_loop_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -9342,6 +9682,7 @@ mod event_loop_tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }
     }
 
@@ -9408,6 +9749,47 @@ mod event_loop_tests {
         let removed = state.write().await.remove_peer(peer_ip);
 
         assert!(!removed, "remove_peer must return false for unknown peer");
+    }
+
+    /// RFC 9234: a dynamically added peer with a configured role must get
+    /// `peer_roles` populated and OTC terms installed — mirrors the static-peer
+    /// path in `DaemonState::new`, which `test_install_otc_terms_counts_per_role`
+    /// already covers.
+    #[tokio::test]
+    async fn add_peer_with_role_installs_otc_terms_and_peer_roles() {
+        let (state, _rxs, _stop) = make_state(&[], 8);
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (update_tx, _update_rx) = mpsc::channel(8);
+
+        let mut cfg = peer_cfg(peer_ip, 65099);
+        cfg.role = Some(config::PeerRole::Customer);
+        state.write().await.add_peer(&cfg, update_tx);
+
+        let s = state.read().await;
+        assert_eq!(s.rib.peer_roles.get(&peer_ip), Some(&Role::Customer));
+        // Customer: leak-detect (no-op for this role) + ingress attach = 2 terms.
+        assert_eq!(s.import_policies[&peer_ip].len(), 2);
+        assert_eq!(s.import_policies_v6[&peer_ip].len(), 2);
+        // Customer: propagation-block = 1 term.
+        assert_eq!(s.export_policies[&peer_ip].len(), 1);
+    }
+
+    /// `remove_peer` must clear `peer_roles`, otherwise a later `AddPeer` for a
+    /// different role at the same address would inherit a stale role via the
+    /// reconnect capability-refresh path.
+    #[tokio::test]
+    async fn remove_peer_clears_peer_roles() {
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (state, _rxs, _stop) = make_state(&[], 8);
+        let (update_tx, _update_rx) = mpsc::channel(8);
+        let mut cfg = peer_cfg(peer_ip, 65099);
+        cfg.role = Some(config::PeerRole::Peer);
+        state.write().await.add_peer(&cfg, update_tx);
+        assert!(state.read().await.rib.peer_roles.contains_key(&peer_ip));
+
+        state.write().await.remove_peer(peer_ip);
+
+        assert!(!state.read().await.rib.peer_roles.contains_key(&peer_ip));
     }
 
     /// Termination of a peer in `pending_removal` must erase all per-peer state
@@ -9832,6 +10214,7 @@ mod event_loop_tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
@@ -10051,6 +10434,7 @@ mod event_loop_tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
         assert_eq!(
             peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
@@ -10151,6 +10535,7 @@ mod event_loop_tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
 
         cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
@@ -10649,6 +11034,7 @@ mod dynamic_peer_prop_tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }
     }
 
@@ -11045,6 +11431,7 @@ mod run_with_tests {
                     max_prefixes_v4: None,
                     max_prefixes_v6: None,
                     max_prefixes_restart: None,
+                    role: None,
                 })
                 .collect(),
             sidecar_path: None,
@@ -11599,6 +11986,7 @@ mod run_with_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .await;
 
@@ -11653,6 +12041,7 @@ mod run_with_tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .await;
 
@@ -11859,7 +12248,7 @@ mod test_build_local_capabilities {
 
     #[test]
     fn test_build_local_capabilities_gr_disabled() {
-        let caps = build_local_capabilities(65001, 0, false);
+        let caps = build_local_capabilities(65001, 0, false, None);
         let (flags, time, families) =
             find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(flags, 0);
@@ -11869,7 +12258,7 @@ mod test_build_local_capabilities {
 
     #[test]
     fn test_build_local_capabilities_gr_enabled() {
-        let caps = build_local_capabilities(65001, 120, false);
+        let caps = build_local_capabilities(65001, 120, false, None);
         let (flags, time, families) =
             find_gr(&caps).expect("GracefulRestart capability must be present");
         // RFC 8538: N-bit (0x04) is set whenever gr_time > 0; R-bit (0x08) is not
@@ -11900,7 +12289,7 @@ mod test_build_local_capabilities {
 
     #[test]
     fn test_build_local_capabilities_gr_clamps_at_4095() {
-        let caps = build_local_capabilities(65001, u16::MAX, false);
+        let caps = build_local_capabilities(65001, u16::MAX, false, None);
         let (_, time, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(
             time, 4095,
@@ -11912,7 +12301,7 @@ mod test_build_local_capabilities {
     /// startup before reconvergence.
     #[test]
     fn test_build_local_capabilities_f_bit_false_when_restarting() {
-        let caps = build_local_capabilities(65001, 120, true);
+        let caps = build_local_capabilities(65001, 120, true, None);
         let (_, _, families) = find_gr(&caps).expect("GracefulRestart must be present");
         for fam in &families {
             assert!(
@@ -11926,7 +12315,7 @@ mod test_build_local_capabilities {
     /// routes survive session loss on Linux.
     #[test]
     fn test_build_local_capabilities_f_bit_true_when_stable() {
-        let caps = build_local_capabilities(65001, 120, false);
+        let caps = build_local_capabilities(65001, 120, false, None);
         let (_, _, families) = find_gr(&caps).expect("GracefulRestart must be present");
         for fam in &families {
             assert!(
@@ -11940,7 +12329,7 @@ mod test_build_local_capabilities {
     /// must be set so peers know to stop their stale-route timers on re-establishment.
     #[test]
     fn test_build_local_capabilities_r_bit_set_when_restarting() {
-        let caps = build_local_capabilities(65001, 120, true);
+        let caps = build_local_capabilities(65001, 120, true, None);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(
             flags & 0x08,
@@ -11953,7 +12342,7 @@ mod test_build_local_capabilities {
     /// not be set — we are not signalling a restart to peers.
     #[test]
     fn test_build_local_capabilities_r_bit_clear_on_normal_startup() {
-        let caps = build_local_capabilities(65001, 120, false);
+        let caps = build_local_capabilities(65001, 120, false, None);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(
             flags & 0x08,
@@ -11966,7 +12355,7 @@ mod test_build_local_capabilities {
     /// even if `restarting = true` — there is no GR window to signal.
     #[test]
     fn test_build_local_capabilities_r_bit_ignored_when_gr_disabled() {
-        let caps = build_local_capabilities(65001, 0, true);
+        let caps = build_local_capabilities(65001, 0, true, None);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart capability must be present");
         assert_eq!(
             flags & 0x08,
@@ -11994,7 +12383,7 @@ mod test_build_local_capabilities {
     #[test]
     fn spawn_config_r_bit_set_within_restart_window() {
         let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(10));
-        let caps = cfg.capabilities();
+        let caps = cfg.capabilities(None);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
         assert_eq!(
             flags & 0x08,
@@ -12008,7 +12397,7 @@ mod test_build_local_capabilities {
     fn spawn_config_r_bit_cleared_after_restart_window() {
         // Simulate 130 s elapsed for a 120 s window.
         let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(130));
-        let caps = cfg.capabilities();
+        let caps = cfg.capabilities(None);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
         assert_eq!(
             flags & 0x08,
@@ -12021,7 +12410,7 @@ mod test_build_local_capabilities {
     #[test]
     fn spawn_config_r_bit_not_set_when_not_configured_restarting() {
         let cfg = spawn_cfg(120, false, std::time::Duration::from_secs(5));
-        let caps = cfg.capabilities();
+        let caps = cfg.capabilities(None);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
         assert_eq!(
             flags & 0x08,
@@ -12207,6 +12596,7 @@ mod test_gr_phase2 {
                     max_prefixes_v4: None,
                     max_prefixes_v6: None,
                     max_prefixes_restart: None,
+                    role: None,
                 }
             })
             .collect();
@@ -13830,10 +14220,11 @@ mod test_rfc8538 {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
         // Build local capabilities with GR time 120 and N-bit set, matching a
         // realistic pathvectord deployment that participates in RFC 8538.
-        let local_caps = build_local_capabilities(LOCAL_AS, 120, false);
+        let local_caps = build_local_capabilities(LOCAL_AS, 120, false, None);
         DaemonState::new(
             LOCAL_AS,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -14007,7 +14398,7 @@ mod test_rfc8538 {
     /// `restart_flags` whenever `graceful_restart_time > 0`.
     #[test]
     fn build_local_capabilities_sets_n_bit_when_gr_enabled() {
-        let caps = build_local_capabilities(LOCAL_AS, 120, false);
+        let caps = build_local_capabilities(LOCAL_AS, 120, false, None);
         let gr_cap = caps.iter().find_map(|c| {
             if let Capability::GracefulRestart {
                 restart_flags,
@@ -14037,7 +14428,7 @@ mod test_rfc8538 {
     /// When graceful_restart_time = 0, N-bit must NOT be set.
     #[test]
     fn build_local_capabilities_no_n_bit_when_gr_disabled() {
-        let caps = build_local_capabilities(LOCAL_AS, 0, false);
+        let caps = build_local_capabilities(LOCAL_AS, 0, false, None);
         let gr_cap = caps.iter().find_map(|c| {
             if let Capability::GracefulRestart {
                 restart_flags,
@@ -14115,6 +14506,7 @@ mod test_rfc8538 {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
         // Local daemon has graceful_restart_time = 0 → no N-bit advertised.
         let mut state = DaemonState::new(
@@ -14124,7 +14516,7 @@ mod test_rfc8538 {
             None,
             &[peer],
             [(PEER_IP, tx)].into(),
-            build_local_capabilities(LOCAL_AS, 0, false),
+            build_local_capabilities(LOCAL_AS, 0, false, None),
         );
         // Peer advertises N-bit, but we don't → notification mode must NOT engage.
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
@@ -14220,6 +14612,7 @@ mod test_max_prefix {
             } else {
                 None
             },
+            role: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(PEER_IP, tx);
@@ -14343,6 +14736,7 @@ mod test_max_prefix {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(PEER_IP, tx);
@@ -14386,6 +14780,7 @@ mod test_max_prefix {
             max_prefixes_v4: Some(50),
             max_prefixes_v6: Some(200),
             max_prefixes_restart: Some(30),
+            role: None,
         };
         let mut state = DaemonState::new(
             LOCAL_AS,
@@ -14503,6 +14898,7 @@ mod test_max_prefix {
             } else {
                 None
             },
+            role: None,
         };
         let mut senders = HashMap::new();
         senders.insert(peer_ip, update_tx);
@@ -14896,6 +15292,7 @@ mod test_max_prefix {
             max_prefixes_v4: v4_limit,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }
     }
 
@@ -15009,6 +15406,7 @@ mod test_max_prefix {
             max_prefixes_v4: None,
             max_prefixes_v6: Some(1),
             max_prefixes_restart: None,
+            role: None,
         };
         let mut state = DaemonState::new(
             LOCAL_AS,
