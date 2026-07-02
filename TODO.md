@@ -22,15 +22,17 @@ peer's import policy by `pathvectord`, gated by `[daemon.rpki].reject_invalid`
 optimization remains, tracked in the General section below:
 `routemap::covering_matches()`.
 
-**Route leak prevention (RFC 9234)**
-Route leaks (a customer re-advertising a provider's routes to another provider)
-are responsible for a large class of BGP incidents. RFC 9234 defines a `ROLE`
-OPEN capability (`provider`, `customer`, `rs`, `rs-client`, `peer`) and an
-`ONLY_TO_CUSTOMER` community that together allow automatic leak detection at the
-session layer. Without it, pathvectord has no mechanism to detect or reject a
-leaking peer. Requires role config per peer and NOTIFICATION on violation.
-Already listed in `Remaining` below; promoted here because it gates
-production eBGP peering on untrusted links.
+**Route leak prevention (RFC 9234)** — shipped. BGP Role capability (code 9,
+`provider`/`rs`/`rs_client`/`customer`/`peer` via `PeerConfig.role`), role-pair
+correctness at OPEN (NOTIFICATION on mismatch), and the `ONLY_TO_CUSTOMER`
+attribute's full ingress/egress leak-detection and attach/block semantics are
+implemented across `pathvector-session`, `pathvector-rib`, `pathvector-policy`,
+and `pathvectord`, with a real e2e proof over an actual BGP session (see
+`pathvector-e2e/tests/role.rs` and the per-crate `RFC.md` files). Two
+non-blocking follow-ups remain, tracked in the General section below: strict
+mode (reject when only one side advertises Role) and OTC egress enforcement
+for IPv6 routes (blocked on the pre-existing IPv6 export-policy gap, also
+tracked below).
 
 ---
 
@@ -358,12 +360,15 @@ What remains as optional future work:
 ### Remaining
 
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-- BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
+- RFC 9234 strict mode — reject a session at OPEN when only one side advertises the
+  Role capability. The RFC makes this optional and non-default (absence on either
+  side is not a mismatch); implemented behavior matches the non-strict default.
+  Add if an operator needs to enforce Role negotiation as a hard requirement.
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
 
 RFC 8538 (2026-06-24), RFC 4724 Phase 1+2 (2026-06-22), RFC 7313 (2026-06-18), RFC 9003
-(2026-06-18), per-peer hold timer (2026-06-18), and outbound ROUTE-REFRESH trigger
-(2026-06-18) are all complete — see CHANGELOG.md.
+(2026-06-18), per-peer hold timer (2026-06-18), outbound ROUTE-REFRESH trigger
+(2026-06-18), and RFC 9234 (2026-07-02) are all complete — see CHANGELOG.md.
 
 ---
 
@@ -518,6 +523,18 @@ overhead of a feature the peer cannot use. Low priority — correctness is unaff
 
 - **IPv6 import policy per-AFI config** — currently IPv6 import policy is accept-all;
   per-AFI policy config (per-peer `import_default_v6`) is deferred.
+
+- **IPv6 export policy is not evaluated at all** — `propagate_prefix_v6`
+  (`src/outbound.rs`) never consults `export_policies`, unlike `propagate_prefix`
+  (IPv4), which does. Discovered while wiring RFC 9234's OTC egress terms: the
+  `OtcPropagationCondition`/`SetOtc` egress terms are installed into
+  `export_policies` correctly, but since nothing calls `export_policy.evaluate(...)`
+  on the v6 path, they (and any other export policy an operator configures) have no
+  effect for IPv6 routes. IPv6 route *attributes* already present (including OTC)
+  are still correctly preserved and re-emitted on egress — only policy
+  *enforcement* is skipped. Needs `propagate_prefix_v6` to take an
+  `export_policy: &Policy<Route<Ipv6Addr>>` parameter and apply it the same way
+  the IPv4 path does.
 
 `reapply_import_policy` IPv6 counterpart and `cluster_id` configuration guidance
 resolved 2026-06-19 — see CHANGELOG.md.

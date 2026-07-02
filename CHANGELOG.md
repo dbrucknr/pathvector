@@ -4,6 +4,58 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (RFC 9234)
+
+### [pathvector-types, pathvector-session, pathvector-rib, pathvector-policy, pathvectord] RFC 9234 — BGP Role + `ONLY_TO_CUSTOMER` route-leak prevention
+
+Closes `TODO.md`'s last remaining Tier-1 ("blocks operating safely on the internet")
+item. Route leaks — a customer re-advertising a provider's route to another
+provider — are responsible for a large class of real-world BGP incidents (the 2019
+Verizon/Allegheny/Cloudflare leak being the canonical example). RFC 9234 closes this
+mechanically: each eBGP session gets an explicit configured role (Provider / Customer
+/ Peer / Route-Server / RS-Client), and an `ONLY_TO_CUSTOMER` (OTC) path attribute
+prevents a leaked route from ever being re-advertised somewhere it shouldn't go — no
+manual filter-list maintenance required.
+
+Added a shared `Role` enum to `pathvector-types`. `pathvector-session` gained the BGP
+Role capability (code 9), role-pair correctness validation during OPEN exchange
+(NOTIFICATION subcode 11 on an incompatible pair; RFC 9234's own non-strict default —
+absence of Role on either side is not a mismatch), and the OTC path attribute (type
+35, optional+transitive). `pathvector-rib` gained lazily-allocated OTC storage on
+`Route<A>`. `pathvector-policy` gained `OtcLeakCondition` (ingress leak detection),
+`OtcPropagationCondition` (egress block), and `SetOtc` (attach-if-absent, shared
+between the ingress and egress call sites) — all keyed off `session_role`, the role
+*we* play on a given session (RFC 9234's own rule text is phrased in terms of the
+peer's role, which is easy to misapply directly; every doc comment translates it
+explicitly, since getting this backwards silently inverts the whole mechanism — a bug
+caught and fixed during this feature's own development, before it reached daemon
+wiring).
+
+`pathvectord` gained `PeerConfig.role`, threaded the configured Role into each
+session's OPEN capabilities (rebuilt per-session-spawn, including on reconnect — the
+same lesson learned from the GR R-bit lifetime bug), and installs the OTC policy terms
+into every peer's import/export policy for both static and dynamically-added peers.
+Configured and negotiated Role are exposed via `PeerState.configured_role`/
+`negotiated_role` over gRPC and in `pathvector peer get`'s detail output.
+
+**Real e2e proof, not just unit tests:** a new `pathvector-e2e/tests/role.rs` proves
+the full pipeline over an actual BGP session using a small custom mock BGP peer
+(`pathvector-e2e/src/bin/mock_bgp_peer.rs`) rather than a real router — FRR 8.4.4 (the
+version pinned in `Dockerfile.frr`) does fully support RFC 9234, but a well-behaved,
+RFC-9234-conformant router will never produce a genuine leak by construction: role-pair
+validation at OPEN time makes it structurally impossible for two correctly configured
+routers to leak between each other. Reproducing a real leak over the wire requires a
+peer willing to send one on purpose.
+
+**Two non-blocking follow-ups tracked in `TODO.md`:** strict mode (the RFC makes it
+optional and non-default), and OTC egress *enforcement* for IPv6 routes — discovered
+along the way that `propagate_prefix_v6` never consults `export_policies` at all, a
+pre-existing gap unrelated to this feature. IPv6 OTC attributes are still correctly
+preserved and re-emitted on egress; only the block/attach policy terms can't run for
+IPv6 until that gap closes.
+
+---
+
 ## 2026-07-02 (Phase 2)
 
 ### [pathvector-policy, pathvector-rpki, pathvectord] RPKI Phase 2 — automatic route filtering on ROA validity

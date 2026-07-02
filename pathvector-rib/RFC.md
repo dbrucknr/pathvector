@@ -96,3 +96,22 @@ bypasses iBGP split-horizon so the daemon's propagation loop can implement corre
 
 **Deferred:** Requires coordination with `pathvector-session` (detecting graceful restart
 event) and a per-route stale flag. Deferred until graceful restart FSM is implemented.
+
+---
+
+## RFC 9234 — Route Leak Prevention Using Roles in UPDATE and OPEN Messages
+
+**Owns:** `ONLY_TO_CUSTOMER` (OTC) storage on `Route<A>` — a lazily-allocated
+`Option<Asn>` field on `RareAttrs`, plus the `BgpRoute::otc()`/`set_otc()`
+methods `pathvector-policy`'s conditions/actions read and write.  
+**Boundary:** Wire encode/decode of the OTC attribute is in `pathvector-session`.
+Leak-detection/prevention policy logic (`OtcLeakCondition`, `SetOtc`,
+`OtcPropagationCondition`) is in `pathvector-policy`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9234
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| OTC stored as `Option<Asn>` on `RareAttrs`, lazily allocated like other rare attributes | `src/route.rs` | ✅ | `test_route_builder_otc_defaults_to_none_and_lazily_allocates` |
+| `BgpRoute::otc()`/`set_otc()` round-trip on `Route<A>` | `src/route.rs` | ✅ | `test_route_bgproute_otc_getter_and_setter` |
+| Setting OTC to `None` on an unallocated `RareAttrs` does not force allocation | `src/route.rs` | ✅ | `test_route_set_otc_none_on_unallocated_rare_does_not_allocate` |
+| `.otc(asn)` builder method on `RouteBuilder` | `src/route.rs` | ✅ | (exercised by the getter/setter test above) |

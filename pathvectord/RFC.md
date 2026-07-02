@@ -324,3 +324,52 @@ wire encoding live in `pathvector-session`.
   expires and immediately re-floods the same table. pathvectord will CEASE again —
   this is correct but can produce rapid reconnect loops. Operators should size
   `max_prefixes_restart` to allow time for the peer's operator to intervene.
+
+---
+
+## RFC 9234 — Route Leak Prevention Using Roles in UPDATE and OPEN Messages
+
+**Owns:** `PeerConfig.role` config; threading the configured `Role` into each
+session's OPEN capabilities (including on reconnect, mirroring how the GR R-bit
+survives reconnects); installing `pathvector-policy`'s OTC terms into each peer's
+import/export policy with the corrected role-mapping; extracting/storing the
+`ONLY_TO_CUSTOMER` attribute on ingress and re-emitting it on egress; exposing
+configured/negotiated Role via gRPC and the CLI.  
+**Boundary:** Wire format and role-pair OPEN validation are in `pathvector-session`.
+OTC condition/action logic is in `pathvector-policy`. OTC storage on `Route<A>` is
+in `pathvector-rib`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9234
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `PeerConfig.role: Option<PeerRole>`, TOML `role = "provider"/"rs"/"rs_client"/"customer"/"peer"` | `src/config.rs` | ✅ | `sidecar_round_trips_all_fields` |
+| `Role` capability included in OPEN when `role` configured; omitted (non-strict default) otherwise | `src/daemon/capabilities.rs` | ✅ | (exercised by daemon capability tests) |
+| Role capability rebuilt per-session-spawn, including on reconnect (mirrors the GR R-bit lesson) | `src/daemon/mod.rs` | ✅ | (reconnect capability-refresh call site) |
+| OTC ingress terms (leak-reject + attach-if-absent) installed per the corrected role mapping | `src/daemon/mod.rs` `install_otc_import_term` | ✅ | `test_install_otc_terms_counts_per_role` (all 5 roles) |
+| OTC egress terms (propagation-block + attach-if-absent) installed per the corrected role mapping | `src/daemon/mod.rs` `install_otc_export_term` | ✅ | `test_install_otc_terms_counts_per_role` (all 5 roles) |
+| No OTC terms installed when `role` is unconfigured (non-strict default) | `src/daemon/mod.rs` | ✅ | `test_no_role_configured_installs_no_otc_terms` |
+| Per-role route-level accept/reject/attach behaviour, both static and dynamic peers | `src/daemon/mod.rs`, `src/daemon/peer.rs` | ✅ | `test_provider_role_rejects_route_leaked_with_otc_from_customer`, `test_provider_role_accepts_clean_route_without_attaching_otc`, `test_customer_role_attaches_peer_asn_on_ingress`, `test_peer_role_rejects_route_with_mismatched_otc_asn`, `add_peer_with_role_installs_otc_terms_and_peer_roles` |
+| Full leak-prevention scenario across three peers (mirrors the 2019 Verizon/Allegheny/Cloudflare incident shape) | `src/daemon/mod.rs` | ✅ | `test_route_leak_prevented_across_two_provider_peers` |
+| `peer_roles`/`remove_peer` lifecycle keeps Role config consistent across dynamic add/remove | `src/daemon/peer.rs` | ✅ | `add_peer_with_role_installs_otc_terms_and_peer_roles`, `remove_peer_clears_peer_roles` |
+| Ingress: `PathAttribute::OnlyToCustomer` extracted into `Route.otc`, both v4 and v6 | `src/daemon/route.rs` | ✅ | (exercised by the route-leak tests above via a real `on_route_update` path) |
+| Egress: `Route.otc` re-emitted as `PathAttribute::OnlyToCustomer`, both v4 and v6 | `src/outbound.rs` | ✅ | `test_route_leak_prevented_across_two_provider_peers` (asserts the wire attribute) |
+| Configured/negotiated Role exposed via gRPC `PeerState.configured_role`/`negotiated_role` | `src/grpc.rs` | ✅ | `test_build_peer_state_includes_configured_and_negotiated_role`, `test_build_peer_state_role_absent_by_default` |
+| Real e2e proof: a route pre-carrying OTC from a peer configured `role = "provider"` is rejected; a clean route is accepted | `pathvector-e2e/tests/role.rs` | ✅ | `leaked_route_is_rejected_clean_route_is_accepted` |
+
+**Deferred:**
+- Strict mode (reject when only one side advertises Role) — the RFC makes this
+  optional and non-default; tracked as a non-blocking follow-up in `TODO.md`.
+- OTC egress *enforcement* (block/attach) is only applied to IPv4 routes —
+  `propagate_prefix_v6` does not consult `export_policies` at all, a pre-existing
+  gap unrelated to this feature (see `TODO.md`'s IPv6 export-policy entry). OTC
+  attributes already present on an IPv6 route are still correctly preserved and
+  re-emitted on egress; only the block/attach *policy terms* can't run for IPv6
+  until that gap closes.
+- The e2e proof uses a custom mock BGP peer (`pathvector-e2e/src/bin/mock_bgp_peer.rs`)
+  rather than FRR. FRR 8.4.4 (the version pinned in `Dockerfile.frr`) does fully
+  support RFC 9234 (`neighbor <addr> local-role <role>`, confirmed directly against
+  the built test image), but a well-behaved, RFC-9234-conformant router will never
+  produce a genuine leak by construction — role-pair validation at OPEN time makes
+  it structurally impossible for two correctly configured routers to leak between
+  each other. Reproducing a real leak over the wire requires a peer willing to send
+  one on purpose, which is what the mock peer is for.
