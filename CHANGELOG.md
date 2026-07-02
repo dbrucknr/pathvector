@@ -4,6 +4,45 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (RFC 9234 bug audit)
+
+### [pathvector-policy, pathvectord] Fix two real bugs found during a dedicated bug/confidence audit
+
+Prompted by "do you have high confidence this is correct, and what about performance" —
+a deliberate audit pass looking specifically for bugs, not just missing test coverage.
+
+**Bug 1 — policy replacement silently disabled leak protection.** The gRPC-triggered
+`PolicyService::set_import_default`/`set_export_default` handlers did
+`self.import_policies.insert(peer_ip, Policy::new(action))` — a full replacement of the
+peer's `Policy`, discarding any installed terms. Proved with a throwaway reproduction
+before fixing: an RFC 9234 OTC leak-detection term count dropped from 1 to 0 after a
+single `set_import_default` call, no warning, no error. This also silently disabled the
+pre-existing RFC 6811 ROV reject term via the same code path — not unique to RFC 9234.
+Fixed by adding `Policy::set_default` (changes only the default action, in
+`pathvector-policy/src/term.rs`) and using it in both handlers instead of `Policy::new`.
+
+**Bug 2 — no eBGP guard on Role/OTC.** RFC 9234 is eBGP-only by definition, and the
+original implementation plan's own Non-goals section called for guarding Role/OTC
+application on `PeerType::External` — but the guard was never actually implemented.
+Confirmed via direct code inspection: no `is_ebgp` check existed anywhere near the
+`role` handling. An operator who set `role` on an iBGP peer (even by mistake) would get
+`Capability::Role` sent in OPEN to an internal router and OTC leak-detection applied to
+iBGP-learned routes, which could incorrectly reject a route that legitimately carries
+OTC from its original eBGP ingestion elsewhere in the network. Fixed with a new
+`effective_role()` helper (`pathvectord/src/daemon/mod.rs`) that returns `None` — with a
+one-time `tracing::warn!` — when `role` is configured on a peer where
+`remote_as == local_as`; wired into every call site that previously read `peer.role`
+directly (`DaemonState::new`, `add_peer`, `build_daemon`'s static-peer spawn loop, and
+the dynamic `AddPeer` command handler).
+
+**Performance:** re-benchmarked `pathvector-rib`'s full suite (`select_best`,
+`loc_rib_insert`, `outbound_pipeline`) against a clean `main` checkout in an isolated
+`git worktree` — all within ~1-2% of `main` (noise), no regression. Matches the
+architectural expectation that OTC storage (lazily allocated on `RareAttrs`) adds only
+O(1) checks on the hot path.
+
+---
+
 ## 2026-07-02 (RFC 9234 correctness reflection)
 
 ### [pathvectord] Close test-coverage gaps found during a post-implementation review

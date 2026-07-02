@@ -393,13 +393,22 @@ impl DaemonState {
             .collect();
         let cluster_id = cluster_id.unwrap_or_else(|| u32::from_be_bytes(local_bgp_id.octets()));
         let is_rr = !rr_clients.is_empty();
+
+        // Computed once (rather than inline in each closure below) so the
+        // iBGP-guard warning in `effective_role` fires at most once per peer,
+        // not once per policy map built from it.
+        let peer_roles: HashMap<Ipv4Addr, Role> = peers
+            .iter()
+            .filter_map(|p| effective_role(p, local_as).map(|r| (p.address, r)))
+            .collect();
+
         let import_policies = peers
             .iter()
             .map(|p| {
                 let is_ebgp = p.remote_as != local_as;
                 let mut policy = Policy::new(resolve_import_default(p.import_default, is_ebgp));
-                if let Some(role) = p.role {
-                    install_otc_import_term(&mut policy, role.into(), Asn::new(p.remote_as));
+                if let Some(role) = peer_roles.get(&p.address).copied() {
+                    install_otc_import_term(&mut policy, role, Asn::new(p.remote_as));
                 }
                 (p.address, policy)
             })
@@ -413,8 +422,8 @@ impl DaemonState {
                 // then to the RFC 8212 default for the peer type.
                 let default_v6 = p.import_default_v6.or(p.import_default);
                 let mut policy = Policy::new(resolve_import_default(default_v6, is_ebgp));
-                if let Some(role) = p.role {
-                    install_otc_import_term(&mut policy, role.into(), Asn::new(p.remote_as));
+                if let Some(role) = peer_roles.get(&p.address).copied() {
+                    install_otc_import_term(&mut policy, role, Asn::new(p.remote_as));
                 }
                 (p.address, policy)
             })
@@ -430,8 +439,8 @@ impl DaemonState {
             .map(|p| {
                 let is_ebgp = p.remote_as != local_as;
                 let mut policy = Policy::new(resolve_export_default(p.export_default, is_ebgp));
-                if let Some(role) = p.role {
-                    install_otc_export_term(&mut policy, role.into(), Asn::new(local_as));
+                if let Some(role) = peer_roles.get(&p.address).copied() {
+                    install_otc_export_term(&mut policy, role, Asn::new(local_as));
                 }
                 (p.address, policy)
             })
@@ -488,11 +497,6 @@ impl DaemonState {
                     .filter(|&r| r > 0)
                     .map(|r| (p.address, r))
             })
-            .collect();
-
-        let peer_roles: HashMap<Ipv4Addr, Role> = peers
-            .iter()
-            .filter_map(|p| p.role.map(|r| (p.address, r.into())))
             .collect();
 
         // Capacity of 1024 events each.  A receiver that falls >1024 events
@@ -594,6 +598,30 @@ impl DaemonState {
             ));
         }
     }
+}
+
+/// Resolves the effective RFC 9234 role for `peer`, or `None` if Role/OTC
+/// must not apply to this session.
+///
+/// RFC 9234 is eBGP-only by definition (Provider/Customer/Peer/RS/RS-Client
+/// relationships don't exist between routers in the same AS). Applying it to
+/// an iBGP peer anyway would send a meaningless `Capability::Role` in OPEN
+/// and, worse, could reject a route that legitimately carries OTC — attached
+/// correctly by another border router's real eBGP session and reflected to
+/// us over iBGP — as a false leak. Warns once (rather than failing startup)
+/// so a config typo doesn't silently disable a peer, matching how other
+/// eBGP-only features already degrade gracefully.
+fn effective_role(peer: &config::PeerConfig, local_as: u32) -> Option<Role> {
+    let role = peer.role?;
+    if peer.remote_as == local_as {
+        tracing::warn!(
+            peer = %peer.address,
+            "role is configured but this is an iBGP peer (remote_as == local_as); \
+             RFC 9234 is eBGP-only — ignoring role for this peer"
+        );
+        return None;
+    }
+    Some(role.into())
 }
 
 /// RFC 9234 §5 ingress terms for a peer configured with `session_role`.
@@ -914,7 +942,7 @@ where
                 && cfg.daemon.graceful_restart_time > 0
                 && startup_instant.elapsed()
                     < std::time::Duration::from_secs(u64::from(cfg.daemon.graceful_restart_time)),
-            peer.role.map(Into::into),
+            effective_role(peer, local_as),
         );
         let session_cfg = SessionConfig {
             local_as,
@@ -1637,6 +1665,52 @@ mod tests {
             resolve_export_default(Some(config::ExportDefault::Reject), false),
             DefaultAction::Reject
         ));
+    }
+
+    // ── RFC 9234 effective_role (eBGP-only guard) ─────────────────────────────
+
+    fn peer_with_role(remote_as: u32, role: Option<config::PeerRole>) -> config::PeerConfig {
+        config::PeerConfig {
+            address: "10.0.0.2".parse().unwrap(),
+            port: 179,
+            remote_as,
+            import_default: None,
+            export_default: None,
+            import_default_v6: None,
+            md5_password: None,
+            is_rr_client: false,
+            next_hop_self: false,
+            hold_time: None,
+            shutdown_message: None,
+            connect_retry_time: None,
+            max_prefixes_v4: None,
+            max_prefixes_v6: None,
+            max_prefixes_restart: None,
+            role,
+        }
+    }
+
+    #[test]
+    fn test_effective_role_none_when_unconfigured() {
+        let peer = peer_with_role(65002, None);
+        assert_eq!(effective_role(&peer, 65001), None);
+    }
+
+    #[test]
+    fn test_effective_role_returns_role_for_ebgp_peer() {
+        let peer = peer_with_role(65002, Some(config::PeerRole::Customer));
+        assert_eq!(effective_role(&peer, 65001), Some(Role::Customer));
+    }
+
+    #[test]
+    fn test_effective_role_none_for_ibgp_peer_even_when_configured() {
+        // remote_as == local_as: iBGP. RFC 9234 is eBGP-only by definition.
+        let peer = peer_with_role(65001, Some(config::PeerRole::Provider));
+        assert_eq!(
+            effective_role(&peer, 65001),
+            None,
+            "role must be ignored for an iBGP peer, not just downgraded to a default"
+        );
     }
 
     // ── DaemonState::new ─────────────────────────────────────────────────────
@@ -2831,6 +2905,137 @@ mod tests {
         assert_eq!(state.import_policies[&peer_ip].len(), 0);
         assert_eq!(state.import_policies_v6[&peer_ip].len(), 0);
         assert_eq!(state.export_policies[&peer_ip].len(), 0);
+    }
+
+    /// RFC 9234 is eBGP-only by definition. If an operator mistakenly sets
+    /// `role` on an iBGP peer (`remote_as == local_as`), it must be ignored
+    /// — no `Capability::Role` in OPEN, no OTC terms installed — rather than
+    /// silently applying leak-detection logic to internal sessions, which
+    /// could reject a route that legitimately carries OTC from its original
+    /// eBGP ingestion elsewhere in the network.
+    #[test]
+    fn test_role_ignored_for_ibgp_peer() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65001, config::PeerRole::Provider)]);
+
+        assert_eq!(
+            state.import_policies[&peer_ip].len(),
+            0,
+            "no OTC import term for an iBGP peer, even with role configured"
+        );
+        assert_eq!(state.import_policies_v6[&peer_ip].len(), 0);
+        assert_eq!(
+            state.export_policies[&peer_ip].len(),
+            0,
+            "no OTC export term for an iBGP peer, even with role configured"
+        );
+        assert!(
+            !state.rib.peer_roles.contains_key(&peer_ip),
+            "peer_roles must not record a role for an iBGP peer"
+        );
+    }
+
+    /// Regression guard: `set_import_default`/`set_export_default` (the
+    /// gRPC-triggered PolicyService handlers) must never silently disable
+    /// RFC 9234 leak protection. Both used to fully replace the peer's
+    /// `Policy` (`Policy::new(action)`), discarding any installed terms —
+    /// confirmed as a real bug via a throwaway reproduction before this fix
+    /// landed. `Policy::set_default` changes only the default action now.
+    #[test]
+    fn test_set_import_and_export_default_preserve_otc_terms() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Peer)]);
+        // Peer role installs 2 import terms and 2 export terms (see
+        // test_install_otc_terms_counts_per_role).
+        assert_eq!(state.import_policies[&peer_ip].len(), 2);
+        assert_eq!(state.export_policies[&peer_ip].len(), 2);
+
+        state.set_import_default(peer_ip, DefaultAction::Accept);
+        state.set_export_default(peer_ip, DefaultAction::Reject);
+
+        assert_eq!(
+            state.import_policies[&peer_ip].len(),
+            2,
+            "set_import_default must not remove OTC terms"
+        );
+        assert_eq!(
+            state.import_policies_v6[&peer_ip].len(),
+            2,
+            "set_import_default must not remove OTC terms from the v6 policy either"
+        );
+        assert_eq!(
+            state.export_policies[&peer_ip].len(),
+            2,
+            "set_export_default must not remove OTC terms"
+        );
+        assert_eq!(
+            state.import_policies[&peer_ip].default_action(),
+            DefaultAction::Accept,
+            "the default action itself must still change"
+        );
+        assert_eq!(
+            state.export_policies[&peer_ip].default_action(),
+            DefaultAction::Reject,
+            "the default action itself must still change"
+        );
+
+        // And the actual leak-rejection behavior must still function after
+        // the default-action change, not just the term count.
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(99999)));
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "leak rejection must still fire after set_import_default"
+        );
+    }
+
+    /// The same `set_import_default` bug fixed above also silently disabled
+    /// RFC 6811 ROV via the identical code path — `install_rpki_import_terms`
+    /// adds its reject term to `import_policies`/`import_policies_v6`, which
+    /// `set_import_default` used to fully replace. This is a direct
+    /// regression guard for that specific claim (made in `CHANGELOG.md` and
+    /// `pathvector-rpki/RFC.md`), not just an OTC-flavored duplicate of the
+    /// test above — a peer with no `role` configured at all (ROV is
+    /// role-independent) must still have its ROV term survive.
+    #[test]
+    fn test_set_import_default_preserves_rpki_rov_term() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) = make_state(65001, &[(peer_ip, 65002)]);
+        let rtr = pathvector_rpki::for_testing(
+            [(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 99999)],
+            std::iter::empty(),
+        );
+        state.install_rpki_import_terms(&rtr);
+        assert_eq!(state.import_policies[&peer_ip].len(), 1);
+
+        state.set_import_default(peer_ip, DefaultAction::Accept);
+
+        assert_eq!(
+            state.import_policies[&peer_ip].len(),
+            1,
+            "set_import_default must not remove the RPKI ROV term"
+        );
+
+        // And ROV rejection must still actually fire afterward.
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_ip),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "ROV rejection (wrong origin AS) must still fire after set_import_default"
+        );
     }
 
     #[test]
@@ -10036,6 +10241,30 @@ mod event_loop_tests {
         assert_eq!(s.import_policies_v6[&peer_ip].len(), 2);
         // Customer: propagation-block = 1 term.
         assert_eq!(s.export_policies[&peer_ip].len(), 1);
+    }
+
+    /// The dynamic `add_peer` path must apply the same eBGP-only guard as
+    /// the static `DaemonState::new` path (`test_role_ignored_for_ibgp_peer`)
+    /// — a `role` configured on an iBGP peer (`remote_as == local_as == 65001`
+    /// in this harness) must be ignored, not applied.
+    #[tokio::test]
+    async fn add_peer_ignores_role_for_ibgp_peer() {
+        let (state, _rxs, _stop) = make_state(&[], 8);
+        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let (update_tx, _update_rx) = mpsc::channel(8);
+
+        let mut cfg = peer_cfg(peer_ip, 65001); // local_as in this harness is 65001
+        cfg.role = Some(config::PeerRole::Customer);
+        state.write().await.add_peer(&cfg, update_tx);
+
+        let s = state.read().await;
+        assert!(
+            !s.rib.peer_roles.contains_key(&peer_ip),
+            "peer_roles must not record a role for an iBGP peer"
+        );
+        assert_eq!(s.import_policies[&peer_ip].len(), 0);
+        assert_eq!(s.import_policies_v6[&peer_ip].len(), 0);
+        assert_eq!(s.export_policies[&peer_ip].len(), 0);
     }
 
     /// `remove_peer` must clear `peer_roles`, otherwise a later `AddPeer` for a

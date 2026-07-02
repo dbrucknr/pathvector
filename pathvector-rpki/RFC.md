@@ -80,3 +80,14 @@ import policy (`DaemonState::install_rpki_import_terms`, gated by
 **Deferred:** `routemap::covering_matches()` — a native API that would let `validate()`'s
 ancestor walk collapse to a single trie traversal; tracked in `TODO.md` as a
 non-blocking optimization, not a correctness gap.
+
+**Bug fixed 2026-07-02:** `pathvectord::set_import_default` (the gRPC-triggered
+`PolicyService` handler) used to fully replace the peer's `Policy`
+(`Policy::new(action)`), silently discarding the installed ROV reject term along
+with any other terms — found while auditing the equivalent RFC 9234 OTC exposure.
+Any operator call to `pathvector peer set-import-default` on a peer would have
+silently disabled ROV for it. Fixed by adding `Policy::set_default` (changes only
+the default action, leaves terms untouched) and using it instead. See
+`pathvectord/RFC.md`'s RFC 9234 section for the fuller writeup. Direct regression
+test: `test_set_import_default_preserves_rpki_rov_term` (a ROV-only peer with no
+`role` configured, proving the fix isn't OTC-specific).

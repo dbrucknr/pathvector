@@ -8,8 +8,17 @@ impl DaemonState {
             tracing::warn!(peer = %peer_ip, "set_import_default: unknown peer — ignoring");
             return;
         }
-        self.import_policies.insert(peer_ip, Policy::new(action));
-        self.import_policies_v6.insert(peer_ip, Policy::new(action));
+        // `set_default` only, never `Policy::new(action)` — a full replacement
+        // would silently discard any installed terms (RFC 9234 OTC leak
+        // detection, RFC 6811 ROV reject) along with the default action.
+        self.import_policies
+            .get_mut(&peer_ip)
+            .unwrap()
+            .set_default(action);
+        self.import_policies_v6
+            .get_mut(&peer_ip)
+            .unwrap()
+            .set_default(action);
 
         self.reevaluate_import_for_peer(peer_ip);
         self.flush_pending();
@@ -97,9 +106,11 @@ impl DaemonState {
         self.propagate_to_all_peers_v6(&nlris_v6);
     }
 
-    /// Replaces the export-policy default for `peer_ip` and re-evaluates the
-    /// entire Loc-RIB against the new policy for that peer.  Newly accepted
-    /// prefixes are sent as UPDATEs; newly rejected ones trigger WITHDRAWs.
+    /// Replaces the export-policy default for `peer_ip` (leaving any
+    /// installed terms — e.g. RFC 9234 OTC block/attach — untouched) and
+    /// re-evaluates the entire Loc-RIB against the updated policy for that
+    /// peer.  Newly accepted prefixes are sent as UPDATEs; newly rejected
+    /// ones trigger WITHDRAWs.
     ///
     /// Has no effect on the wire if the peer is not currently established — the
     /// new policy will be applied on the next session's opening table dump.
@@ -108,7 +119,10 @@ impl DaemonState {
             tracing::warn!(peer = %peer_ip, "set_export_default: unknown peer — ignoring");
             return;
         }
-        self.export_policies.insert(peer_ip, Policy::new(action));
+        self.export_policies
+            .get_mut(&peer_ip)
+            .unwrap()
+            .set_default(action);
 
         if !self.rib.peer_types.contains_key(&peer_ip) {
             tracing::debug!(

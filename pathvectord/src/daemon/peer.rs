@@ -36,13 +36,11 @@ impl DaemonState {
         // doesn't consult `export_policies` at all), so OTC egress terms are
         // only installed on the v4 export policy.
         let mut export_policy = Policy::new(resolve_export_default(peer.export_default, is_ebgp));
-        let resolved_role: Option<Role> = peer.role.map(|role| {
-            let role = role.into();
+        let resolved_role: Option<Role> = effective_role(peer, local_as).inspect(|&role| {
             let peer_asn = Asn::new(peer.remote_as);
             install_otc_import_term(&mut import_policy, role, peer_asn);
             install_otc_import_term(&mut import_policy_v6, role, peer_asn);
             install_otc_export_term(&mut export_policy, role, Asn::new(local_as));
-            role
         });
         self.import_policies.insert(peer.address, import_policy);
         self.import_policies_v6
@@ -887,7 +885,7 @@ pub(super) async fn run_command_processor<H, F>(
                     local_as: cfg.local_as,
                     local_bgp_id: cfg.local_bgp_id,
                     hold_time: peer.hold_time.unwrap_or(cfg.hold_time),
-                    capabilities: cfg.capabilities(peer.role.map(Into::into)),
+                    capabilities: cfg.capabilities(effective_role(&peer, cfg.local_as)),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
                     peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),

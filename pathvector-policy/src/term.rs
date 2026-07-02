@@ -150,6 +150,23 @@ impl<R: BgpRoute> Policy<R> {
         self.default.into()
     }
 
+    /// Replaces the default action, leaving all installed terms untouched.
+    ///
+    /// Prefer this over `*policy = Policy::new(new_default)` whenever the
+    /// policy may already carry terms installed by another feature (e.g. an
+    /// RFC 9234 leak-detection term, or an RFC 6811 ROV reject term) —
+    /// replacing the whole `Policy` silently discards them along with the
+    /// default action.
+    pub fn set_default(&mut self, default: DefaultAction) {
+        self.default = default;
+    }
+
+    /// Returns the current default action.
+    #[must_use]
+    pub fn default_action(&self) -> DefaultAction {
+        self.default
+    }
+
     /// Returns the number of terms in this policy.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -345,6 +362,39 @@ mod tests {
         policy.add_term(Term::new(AnyCondition, Accept));
         assert!(!policy.is_empty());
         assert_eq!(policy.len(), 1);
+    }
+
+    #[test]
+    fn test_set_default_changes_default_action() {
+        let mut policy: Policy<TestRoute> = Policy::new(DefaultAction::Reject);
+        assert_eq!(policy.default_action(), DefaultAction::Reject);
+
+        policy.set_default(DefaultAction::Accept);
+        assert_eq!(policy.default_action(), DefaultAction::Accept);
+    }
+
+    #[test]
+    fn test_set_default_preserves_existing_terms() {
+        // Regression guard: `set_default` must never discard terms installed
+        // by another feature (e.g. RFC 9234 leak detection, RFC 6811 ROV) —
+        // that's the whole reason it exists instead of `*p = Policy::new(..)`.
+        let mut policy: Policy<TestRoute> = Policy::new(DefaultAction::Accept);
+        policy.add_term(Term::new(AnyCondition, Reject));
+        assert_eq!(policy.len(), 1);
+
+        policy.set_default(DefaultAction::Reject);
+
+        assert_eq!(
+            policy.len(),
+            1,
+            "set_default must not remove any installed terms"
+        );
+        let mut route = make_route("10.0.0.0/8");
+        assert_eq!(
+            policy.evaluate(&mut route),
+            Decision::Reject,
+            "the pre-existing term must still fire after set_default"
+        );
     }
 
     // ── PolicyBuilder ──────────────────────────────────────────────────────
