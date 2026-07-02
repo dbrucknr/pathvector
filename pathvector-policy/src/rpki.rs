@@ -187,6 +187,9 @@ mod tests {
         fn next_hop(&self) -> Option<pathvector_types::NextHop> {
             None
         }
+        fn otc(&self) -> Option<Asn> {
+            None
+        }
         fn set_origin(&mut self, _origin: pathvector_types::Origin) {}
         fn set_local_pref(&mut self, _lp: Option<pathvector_types::LocalPref>) {}
         fn set_med(&mut self, _med: Option<pathvector_types::Med>) {}
@@ -197,6 +200,7 @@ mod tests {
         fn set_large_communities(&mut self, _c: Vec<pathvector_types::LargeCommunity>) {}
         fn set_extended_communities(&mut self, _c: Vec<pathvector_types::ExtendedCommunity>) {}
         fn set_next_hop(&mut self, _nh: Option<pathvector_types::NextHop>) {}
+        fn set_otc(&mut self, _otc: Option<Asn>) {}
     }
 
     #[test]

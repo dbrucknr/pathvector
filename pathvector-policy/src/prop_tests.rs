@@ -53,6 +53,7 @@ prop_compose! {
             large_communities: vec![],
             extended_communities: vec![],
             next_hop: None,
+            otc: None,
         }
     }
 }
