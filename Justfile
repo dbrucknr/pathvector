@@ -249,20 +249,26 @@ mrt mrt_file='':
 fuzz-build:
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} build --fuzz-dir pathvector-fuzz
 
-# Smoke-run every target for 60 s each — used by CI
+# Smoke-run every target for 60 s each — used by CI.
+# Corpus dirs aren't committed (see .gitignore) — cargo-fuzz errors if the
+# target directory doesn't exist, so create it on a fresh clone / cache miss.
 fuzz-smoke: fuzz-build
+    mkdir -p pathvector-fuzz/corpus/session_framing pathvector-fuzz/corpus/session_message pathvector-fuzz/corpus/rtr_pdu
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_framing pathvector-fuzz/corpus/session_framing -- -max_total_time=60
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_message pathvector-fuzz/corpus/session_message -- -max_total_time=60
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz rtr_pdu pathvector-fuzz/corpus/rtr_pdu -- -max_total_time=60
 
 # Extended fuzzing of the framing decode path — runs until Ctrl-C, grows corpus
 fuzz-framing corpus="pathvector-fuzz/corpus/session_framing":
+    mkdir -p {{corpus}}
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_framing {{corpus}}
 
 # Extended fuzzing of the message decode path — runs until Ctrl-C, grows corpus
 fuzz-message corpus="pathvector-fuzz/corpus/session_message":
+    mkdir -p {{corpus}}
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_message {{corpus}}
 
 # Extended fuzzing of the RTR PDU decode path — runs until Ctrl-C, grows corpus
 fuzz-rtr-pdu corpus="pathvector-fuzz/corpus/rtr_pdu":
+    mkdir -p {{corpus}}
     PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz rtr_pdu {{corpus}}

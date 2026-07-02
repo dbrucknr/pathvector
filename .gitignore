@@ -5,9 +5,14 @@
 /target
 pathvector-fuzz/target/
 
-# Fuzz — corpus is committed (accumulated fuzzer knowledge used by CI).
+# Fuzz — corpus is NOT committed. A growing, effectively-binary corpus is a
+# poor fit for git history (every blob stays forever, even after an entry is
+# minimized away or superseded) — CI instead caches it across runs via
+# actions/cache (see .github/workflows/ci.yml's fuzz job), which gets the
+# same "don't start from empty every run" benefit without the repo bloat.
 # Artifacts are crash reproducers that should be investigated and fixed, not
 # stored long-term. Coverage data is generated on demand, not tracked.
+pathvector-fuzz/corpus/
 pathvector-fuzz/artifacts/
 pathvector-fuzz/coverage/
 

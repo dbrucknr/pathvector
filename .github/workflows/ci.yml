@@ -170,6 +170,20 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      # Corpus isn't committed (see .gitignore — a growing binary-ish corpus
+      # is a poor fit for git history). Cache it across runs instead so
+      # each 60s smoke run builds on prior coverage rather than starting
+      # from empty every time. restore-keys falls back to the most recent
+      # cache available; a new cache is saved under this run's own key
+      # regardless of whether the job ultimately passes.
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: pathvector-fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
       - name: Smoke-run fuzz targets
         run: just fuzz-smoke
 
