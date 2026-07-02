@@ -345,4 +345,139 @@ mod tests {
         action.apply(&mut clean);
         assert_eq!(clean.otc, Some(Asn::new(65001)));
     }
+
+    /// Exercises every other `BgpRoute` stub method on `V6Route` — the OTC
+    /// tests above only ever call `nlri()`/`otc()`/`set_otc()`. This asserts
+    /// the documented contract of each stub directly (fixed `Origin::Igp`, no
+    /// `LOCAL_PREF`/`MED`/communities/`NEXT_HOP`, empty `AS_PATH`, and that the
+    /// non-OTC setters are true no-ops) so a typo — e.g. accidentally
+    /// returning `Some(..)` from `next_hop()` — would be caught, rather than
+    /// leaving this stub impl provably untested.
+    #[test]
+    fn v6route_stub_methods_have_the_documented_fixed_contract() {
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut route = V6Route { nlri, otc: None };
+
+        assert_eq!(route.nlri(), nlri);
+        assert_eq!(route.origin(), pathvector_types::Origin::Igp);
+        assert_eq!(route.local_pref(), None);
+        assert_eq!(route.med(), None);
+        assert!(route.as_path().is_empty());
+        assert!(route.communities().is_empty());
+        assert!(route.large_communities().is_empty());
+        assert!(route.extended_communities().is_empty());
+        assert_eq!(route.next_hop(), None);
+
+        // All non-OTC setters are documented no-ops for this minimal double.
+        route.set_origin(pathvector_types::Origin::Egp);
+        route.set_local_pref(Some(pathvector_types::LocalPref::new(100)));
+        route.set_med(Some(pathvector_types::Med::new(50)));
+        route.set_as_path(pathvector_types::AsPath::from_sequence(vec![Asn::new(
+            65001,
+        )]));
+        route.set_communities(vec![pathvector_types::Community::from_parts(65001, 1)]);
+        route.set_large_communities(vec![pathvector_types::LargeCommunity::new(65001, 1, 1)]);
+        route.set_extended_communities(vec![]);
+        route.set_next_hop(Some(pathvector_types::NextHop::V6(
+            "2001:db8::1".parse().unwrap(),
+        )));
+
+        assert_eq!(
+            route.origin(),
+            pathvector_types::Origin::Igp,
+            "set_origin must be a no-op on this stub"
+        );
+        assert_eq!(route.local_pref(), None, "set_local_pref must be a no-op");
+        assert_eq!(route.med(), None, "set_med must be a no-op");
+        assert!(route.as_path().is_empty(), "set_as_path must be a no-op");
+        assert!(
+            route.communities().is_empty(),
+            "set_communities must be a no-op"
+        );
+        assert!(
+            route.large_communities().is_empty(),
+            "set_large_communities must be a no-op"
+        );
+        assert_eq!(route.next_hop(), None, "set_next_hop must be a no-op");
+
+        // set_otc is the one real, storage-backed setter on this double.
+        route.set_otc(Some(Asn::new(65099)));
+        assert_eq!(route.otc(), Some(Asn::new(65099)));
+    }
+
+    // ── Property tests ───────────────────────────────────────────────────────
+    //
+    // Independently re-derived from the RFC 9234 datatracker text (not copied
+    // from OtcLeakCondition's own implementation) so this checks the
+    // production logic against a fresh model, not itself.
+
+    fn arb_role() -> impl proptest::strategy::Strategy<Value = Role> {
+        proptest::prop_oneof![
+            proptest::strategy::Just(Role::Provider),
+            proptest::strategy::Just(Role::RouteServer),
+            proptest::strategy::Just(Role::RsClient),
+            proptest::strategy::Just(Role::Customer),
+            proptest::strategy::Just(Role::Peer),
+        ]
+    }
+
+    /// RFC 9234 §5 ingress leak rule, re-derived directly from the RFC text:
+    /// - `session_role` Provider/RouteServer: any OTC present is a leak.
+    /// - `session_role` Peer: OTC present with a value != the peer's own ASN
+    ///   is a leak.
+    /// - `session_role` Customer/RsClient, or no OTC present at all: never a
+    ///   leak (Customer/RsClient may legitimately relay an upstream OTC
+    ///   unchanged; a route with no OTC was never flagged upstream).
+    fn reference_is_leak(session_role: Role, otc: Option<u32>, peer_asn: u32) -> bool {
+        match (session_role, otc) {
+            (Role::Provider | Role::RouteServer, Some(_)) => true,
+            (Role::Peer, Some(v)) => v != peer_asn,
+            _ => false,
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_otc_leak_condition_matches_rfc9234_reference(
+            role in arb_role(),
+            otc in proptest::option::of(proptest::num::u32::ANY),
+            peer_asn in proptest::num::u32::ANY,
+        ) {
+            let cond = OtcLeakCondition::new(role, Asn::new(peer_asn));
+            let route = route_with_otc("10.0.0.0/8", otc);
+            proptest::prop_assert_eq!(
+                cond.matches(&route),
+                reference_is_leak(role, otc, peer_asn)
+            );
+        }
+
+        /// SetOtc is idempotent: applying it twice is the same as applying it
+        /// once — the second application must never overwrite a value the
+        /// first one set (RFC 9234 requires OTC be preserved unchanged once set).
+        #[test]
+        fn prop_set_otc_is_idempotent(
+            initial_otc in proptest::option::of(proptest::num::u32::ANY),
+            attach_asn1 in proptest::num::u32::ANY,
+            attach_asn2 in proptest::num::u32::ANY,
+        ) {
+            let mut once = route_with_otc("10.0.0.0/8", initial_otc);
+            SetOtc::new(Asn::new(attach_asn1)).apply(&mut once);
+
+            let mut twice = route_with_otc("10.0.0.0/8", initial_otc);
+            SetOtc::new(Asn::new(attach_asn1)).apply(&mut twice);
+            SetOtc::new(Asn::new(attach_asn2)).apply(&mut twice);
+
+            proptest::prop_assert_eq!(once.otc, twice.otc);
+        }
+
+        /// OtcPropagationCondition matches iff OTC is present — independent
+        /// of role, ASN, or any other route content.
+        #[test]
+        fn prop_otc_propagation_condition_matches_iff_otc_present(
+            otc in proptest::option::of(proptest::num::u32::ANY),
+        ) {
+            let route = route_with_otc("10.0.0.0/8", otc);
+            proptest::prop_assert_eq!(OtcPropagationCondition.matches(&route), otc.is_some());
+        }
+    }
 }

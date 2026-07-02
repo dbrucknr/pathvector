@@ -1928,6 +1928,10 @@ mod tests {
             PathAttribute::ClusterList(vec![]).type_code(),
             ATTR_CLUSTER_LIST
         );
+        assert_eq!(
+            PathAttribute::OnlyToCustomer(Asn::new(65001)).type_code(),
+            ATTR_ONLY_TO_CUSTOMER
+        );
     }
 
     /// `ORIGINATOR_ID` (type 9) encodes as 4-byte IPv4 address and round-trips.
@@ -2003,6 +2007,34 @@ mod tests {
         assert!(
             result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
             "ORIGINATOR_ID with 3-byte value must be an error or partial decode"
+        );
+    }
+
+    /// `CLUSTER_LIST` whose length isn't a multiple of 4 is rejected — each
+    /// entry is a 4-byte `CLUSTER_ID`, so a partial trailing entry is malformed.
+    ///
+    /// Hand-crafted UPDATE: same shape as the `ORIGINATOR_ID` wrong-length test
+    /// above, but type=10 (`CLUSTER_LIST`) with a 3-byte value.
+    #[test]
+    fn test_cluster_list_wrong_length_is_error() {
+        // flags: optional non-transitive (0x80), type=10, length=3, value=[1,2,3]
+        let attr: &[u8] = &[0x80, 10, 3, 1, 2, 3];
+        let attr_len = u16::try_from(attr.len()).unwrap();
+        let total_len = u16::try_from(19 + 2 + 2 + attr.len()).unwrap();
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&[0xff_u8; 16]); // marker
+        msg.extend_from_slice(&total_len.to_be_bytes()); // length
+        msg.push(2); // type = UPDATE
+        msg.extend_from_slice(&0u16.to_be_bytes()); // withdrawn-len
+        msg.extend_from_slice(&attr_len.to_be_bytes()); // attr-len
+        msg.extend_from_slice(attr);
+
+        let mut cur = Cursor::new(&msg[19..]);
+        let result = UpdateMessage::decode(&mut cur);
+        assert!(
+            result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
+            "CLUSTER_LIST with a length not a multiple of 4 must be an error or partial decode"
         );
     }
 }
@@ -2103,6 +2135,50 @@ mod prop_tests {
             };
             let second = roundtripped.encode();
             prop_assert_eq!(first, second, "double-encode must be byte-identical");
+        }
+
+        /// RFC 9234: `ONLY_TO_CUSTOMER` round-trips for any ASN value,
+        /// including edge cases the hand-picked unit tests don't hit
+        /// (0, AS_TRANS, 4-byte-only values, u32::MAX).
+        #[test]
+        fn prop_only_to_customer_roundtrip(asn in proptest::num::u32::ANY) {
+            let msg = UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)),
+                    PathAttribute::OnlyToCustomer(Asn::new(asn)),
+                ],
+                announced: vec!["10.0.0.0/8".parse().unwrap()],
+            };
+            let encoded = msg.encode();
+            let mut cur = Cursor::new(&encoded[19..]);
+            let decoded = UpdateMessage::decode(&mut cur)
+                .expect("structural decode error on well-formed message");
+            prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
+        }
+
+        /// `CLUSTER_LIST` round-trips for any list of `CLUSTER_ID`s, including
+        /// the empty list and lists long enough to span multiple 4-byte
+        /// alignment boundaries.
+        #[test]
+        fn prop_cluster_list_roundtrip(ids in proptest::collection::vec(proptest::num::u32::ANY, 0..16)) {
+            let msg = UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 1)),
+                    PathAttribute::ClusterList(ids),
+                ],
+                announced: vec!["10.0.0.0/8".parse().unwrap()],
+            };
+            let encoded = msg.encode();
+            let mut cur = Cursor::new(&encoded[19..]);
+            let decoded = UpdateMessage::decode(&mut cur)
+                .expect("structural decode error on well-formed message");
+            prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
     }
 

@@ -907,6 +907,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ClientError::Rpc(_)));
+
+        let status = c.get_rpki_status().await.unwrap();
+        assert!(!status.enabled);
+        assert!(!status.connected);
+
+        assert_eq!(
+            c.validate_roa("10.0.0.0/8", 65001).await.unwrap(),
+            RoaValidity::NotFound
+        );
     }
 
     /// A function generic over [`DaemonClient`] compiles and dispatches correctly.
@@ -1138,6 +1147,79 @@ mod tests {
             *call_count.lock().unwrap(),
             2,
             "list_all_routes must be called once per invocation"
+        );
+
+        // CountingClient implements the full DaemonClient trait (required to
+        // satisfy the bound), but this test's focus is list_all_routes's call
+        // counting above. Exercise the remaining canned-response methods here
+        // too, so this local stub isn't left provably untested.
+        assert!(client.list_peers().await.unwrap().is_empty());
+        assert!(matches!(
+            client
+                .get_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(client.list_routes(None).await.unwrap().is_empty());
+        assert_eq!(client.get_best_route("10.0.0.0/8").await.unwrap(), None);
+        assert!(
+            client
+                .list_candidates("10.0.0.0/8")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(client.set_import_default("10.0.0.1", true).await.is_ok());
+        assert!(client.set_export_default("10.0.0.1", false).await.is_ok());
+        assert!(client.originate_route(make_params()).await.is_ok());
+        assert_eq!(
+            client
+                .originate_routes(vec![make_params(), make_params()])
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(client.withdraw_originated_route("1.2.3.4/32").await.is_ok());
+        assert_eq!(
+            client
+                .withdraw_originated_routes(vec!["1.2.3.4/32".into()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(client.list_originated_routes().await.unwrap().is_empty());
+        assert!(client.watch_routes(None).await.is_ok());
+        assert!(client.watch_peers().await.is_ok());
+        assert!(
+            client
+                .add_peer(AddPeerParams {
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    remote_as: 65001,
+                    port: None,
+                    import_default: None,
+                    export_default: None,
+                    md5_password: None,
+                })
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .remove_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .soft_reset(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "ipv4")
+                .await
+                .is_ok()
+        );
+        let status = client.get_rpki_status().await.unwrap();
+        assert!(!status.enabled);
+        assert_eq!(
+            client.validate_roa("10.0.0.0/8", 65001).await.unwrap(),
+            RoaValidity::NotFound
         );
     }
 }

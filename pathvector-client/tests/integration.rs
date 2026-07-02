@@ -27,14 +27,16 @@ mod proto {
 }
 
 use proto::{
-    ListOriginatedRoutesResponse, ListPeersResponse, ListRoutesResponse, OriginateRouteResponse,
-    OriginateRoutesResponse, PeerEvent, PeerState as ProtoPeerState, Route as ProtoRoute,
-    RouteEvent, RouteResponse, SetExportDefaultResponse, SetImportDefaultResponse,
-    WithdrawOriginatedRouteResponse, WithdrawOriginatedRoutesResponse,
+    GetRpkiStatusResponse, ListOriginatedRoutesResponse, ListPeersResponse, ListRoutesResponse,
+    OriginateRouteResponse, OriginateRoutesResponse, PeerEvent, PeerState as ProtoPeerState,
+    Route as ProtoRoute, RouteEvent, RouteResponse, SetExportDefaultResponse,
+    SetImportDefaultResponse, ValidateRoaResponse, WithdrawOriginatedRouteResponse,
+    WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
     policy_service_server::{PolicyService, PolicyServiceServer},
     rib_service_server::{RibService, RibServiceServer},
+    rpki_service_server::{RpkiService, RpkiServiceServer},
 };
 
 // ── Proto fixture builders ────────────────────────────────────────────────────
@@ -217,12 +219,23 @@ impl RibService for MockRib {
 
     async fn list_routes(
         &self,
-        _req: Request<proto::ListRoutesRequest>,
+        req: Request<proto::ListRoutesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        Ok(Response::new(ListRoutesResponse {
-            routes: vec![proto_route("10.0.0.0/8"), proto_route("192.168.0.0/16")],
-            next_page_token: String::new(),
-        }))
+        // Page-aware: `list_routes()` always sends an empty page_token and
+        // only reads `.routes`, so it's unaffected by `next_page_token`.
+        // `list_all_routes()` loops on it — this lets one mock serve both
+        // the single-page callers and a real two-page pagination test.
+        if req.into_inner().page_token.is_empty() {
+            Ok(Response::new(ListRoutesResponse {
+                routes: vec![proto_route("10.0.0.0/8"), proto_route("192.168.0.0/16")],
+                next_page_token: "page2".to_string(),
+            }))
+        } else {
+            Ok(Response::new(ListRoutesResponse {
+                routes: vec![proto_route("203.0.113.0/24")],
+                next_page_token: String::new(),
+            }))
+        }
     }
 
     async fn list_candidates(
@@ -361,6 +374,95 @@ impl OriginationService for MockOrigination {
     }
 }
 
+struct MockRpki;
+
+#[tonic::async_trait]
+impl RpkiService for MockRpki {
+    async fn get_rpki_status(
+        &self,
+        _req: Request<proto::GetRpkiStatusRequest>,
+    ) -> Result<Response<GetRpkiStatusResponse>, Status> {
+        Ok(Response::new(GetRpkiStatusResponse {
+            enabled: true,
+            connected: true,
+            rtr_version: "1".to_string(),
+            serial: Some(42),
+            roa_count: 969_408,
+            last_update_unix: Some(1_700_000_000),
+            last_error: String::new(),
+        }))
+    }
+
+    async fn validate_roa(
+        &self,
+        req: Request<proto::ValidateRoaRequest>,
+    ) -> Result<Response<ValidateRoaResponse>, Status> {
+        let origin_as = req.into_inner().origin_as;
+        let state = if origin_as == 65001 {
+            proto::RoaValidityState::Valid
+        } else {
+            proto::RoaValidityState::Invalid
+        };
+        Ok(Response::new(ValidateRoaResponse {
+            state: state as i32,
+        }))
+    }
+}
+
+/// A `PeerService` mock identical to [`MockPeer`] except `remove_peer`
+/// succeeds — `MockPeer::remove_peer` always returns `not_found`, which
+/// proves error propagation but can never reach `PathvectorClient`'s
+/// success-path return.
+struct MockPeerRemoveOk;
+
+#[tonic::async_trait]
+impl PeerService for MockPeerRemoveOk {
+    async fn list_peers(
+        &self,
+        _req: Request<proto::ListPeersRequest>,
+    ) -> Result<Response<ListPeersResponse>, Status> {
+        Ok(Response::new(ListPeersResponse { peers: vec![] }))
+    }
+
+    async fn get_peer(
+        &self,
+        _req: Request<proto::GetPeerRequest>,
+    ) -> Result<Response<proto::PeerState>, Status> {
+        Err(Status::not_found("no peers"))
+    }
+
+    type WatchPeersStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<PeerEvent, Status>> + Send>>;
+
+    async fn watch_peers(
+        &self,
+        _req: Request<proto::WatchPeersRequest>,
+    ) -> Result<Response<Self::WatchPeersStream>, Status> {
+        Ok(Response::new(Box::pin(futures::stream::empty())))
+    }
+
+    async fn add_peer(
+        &self,
+        _req: Request<proto::AddPeerRequest>,
+    ) -> Result<Response<proto::AddPeerResponse>, Status> {
+        Ok(Response::new(proto::AddPeerResponse {}))
+    }
+
+    async fn remove_peer(
+        &self,
+        _req: Request<proto::RemovePeerRequest>,
+    ) -> Result<Response<proto::RemovePeerResponse>, Status> {
+        Ok(Response::new(proto::RemovePeerResponse {}))
+    }
+
+    async fn soft_reset(
+        &self,
+        _req: Request<proto::SoftResetRequest>,
+    ) -> Result<Response<proto::SoftResetResponse>, Status> {
+        Ok(Response::new(proto::SoftResetResponse {}))
+    }
+}
+
 // ── Server fixture ────────────────────────────────────────────────────────────
 
 /// Bind to an OS-assigned port, spawn the mock server, and return the address.
@@ -376,10 +478,29 @@ async fn start_server() -> SocketAddr {
             .add_service(RibServiceServer::new(MockRib))
             .add_service(PolicyServiceServer::new(MockPolicy))
             .add_service(OriginationServiceServer::new(MockOrigination))
+            .add_service(RpkiServiceServer::new(MockRpki))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
 
     // Allow the Tokio task to be scheduled before the first RPC.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    addr
+}
+
+/// Like [`start_server`] but `remove_peer` succeeds instead of returning
+/// `not_found` — see [`MockPeerRemoveOk`].
+async fn start_server_remove_peer_ok() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(PeerServiceServer::new(MockPeerRemoveOk))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+
     tokio::time::sleep(Duration::from_millis(10)).await;
     addr
 }
@@ -810,4 +931,137 @@ async fn watch_peers_conversion_closure_executes() {
     // One EndInitial event from the mock — conversion closure ran.
     assert_eq!(items.len(), 1);
     assert!(items[0].is_ok());
+}
+
+// ── add_peer() ───────────────────────────────────────────────────────────────
+
+use pathvector_client::types::AddPeerParams;
+
+fn add_peer_params(import_default: Option<bool>, export_default: Option<bool>) -> AddPeerParams {
+    AddPeerParams {
+        address: "10.0.0.1".parse().unwrap(),
+        remote_as: 65001,
+        port: None,
+        import_default,
+        export_default,
+        md5_password: None,
+    }
+}
+
+/// `import_default = Some(true)` and `export_default = Some(false)` — hits
+/// the Accept branch of one policy-action closure and the Reject branch of
+/// the other in a single call.
+#[tokio::test]
+async fn add_peer_accept_import_reject_export_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client
+        .add_peer(add_peer_params(Some(true), Some(false)))
+        .await;
+    assert!(result.is_ok());
+}
+
+/// The mirror image: `import_default = Some(false)`, `export_default =
+/// Some(true)` — hits the opposite branch of each closure from the test
+/// above, so both branches of both closures are covered across the two.
+#[tokio::test]
+async fn add_peer_reject_import_accept_export_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client
+        .add_peer(add_peer_params(Some(false), Some(true)))
+        .await;
+    assert!(result.is_ok());
+}
+
+/// `None` for both — the RFC 8212-default (`Unspecified`) branch of
+/// `map_or`, i.e. neither closure runs at all.
+#[tokio::test]
+async fn add_peer_with_no_explicit_defaults_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client.add_peer(add_peer_params(None, None)).await;
+    assert!(result.is_ok());
+}
+
+// ── remove_peer() ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn remove_peer_succeeds() {
+    let addr = start_server_remove_peer_ok().await;
+    let mut client = client_for(addr);
+    let result = client.remove_peer("10.0.0.1".parse().unwrap()).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn remove_peer_not_found_propagates_error() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client.remove_peer("10.0.0.1".parse().unwrap()).await;
+    assert!(matches!(result, Err(ClientError::Rpc(_))));
+}
+
+// ── soft_reset() ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn soft_reset_succeeds() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client.soft_reset("10.0.0.1".parse().unwrap(), "ipv4").await;
+    assert!(result.is_ok());
+}
+
+// ── get_rpki_status() / validate_roa() ────────────────────────────────────────
+
+#[tokio::test]
+async fn get_rpki_status_returns_converted_status() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let status = client.get_rpki_status().await.expect("get_rpki_status");
+    assert!(status.enabled);
+    assert!(status.connected);
+    assert_eq!(status.rtr_version, "1");
+    assert_eq!(status.serial, Some(42));
+    assert_eq!(status.roa_count, 969_408);
+    assert_eq!(status.last_update_unix, Some(1_700_000_000));
+}
+
+#[tokio::test]
+async fn validate_roa_valid_origin_returns_valid() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client
+        .validate_roa("10.0.0.0/8", 65001)
+        .await
+        .expect("validate_roa");
+    assert_eq!(result, pathvector_client::types::RoaValidity::Valid);
+}
+
+#[tokio::test]
+async fn validate_roa_wrong_origin_returns_invalid() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let result = client
+        .validate_roa("10.0.0.0/8", 99999)
+        .await
+        .expect("validate_roa");
+    assert_eq!(result, pathvector_client::types::RoaValidity::Invalid);
+}
+
+// ── list_all_routes() pagination ──────────────────────────────────────────────
+
+/// `MockRib::list_routes` (see above) serves 2 routes on the first page with
+/// a non-empty `next_page_token`, then 1 more route on the second page with
+/// an empty token — this is the real multi-request pagination loop in
+/// `PathvectorClient::list_all_routes`, not just a single-page call.
+#[tokio::test]
+async fn list_all_routes_accumulates_across_pages() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let routes = client.list_all_routes(None).await.expect("list_all_routes");
+    assert_eq!(routes.len(), 3);
+    assert_eq!(routes[0].prefix, "10.0.0.0/8");
+    assert_eq!(routes[1].prefix, "192.168.0.0/16");
+    assert_eq!(routes[2].prefix, "203.0.113.0/24");
 }
