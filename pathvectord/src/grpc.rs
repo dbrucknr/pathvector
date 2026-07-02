@@ -45,19 +45,21 @@ use crate::proto;
 
 use proto::{
     AddPeerRequest, AddPeerResponse, Aggregator, AsSegment, GetBestRouteRequest, GetPeerRequest,
-    LargeCommunity, ListCandidatesRequest, ListOriginatedRoutesRequest,
-    ListOriginatedRoutesResponse, ListPeersRequest, ListPeersResponse, ListRoutesRequest,
-    ListRoutesResponse, OriginateRouteRequest, OriginateRouteResponse, OriginateRoutesRequest,
-    OriginateRoutesResponse, PeerEvent, PeerEventType, PeerState, PolicyAction, RemovePeerRequest,
-    RemovePeerResponse, Route, RouteEvent, RouteEventType, RouteResponse, SetExportDefaultRequest,
-    SetExportDefaultResponse, SetImportDefaultRequest, SetImportDefaultResponse, SoftResetRequest,
-    SoftResetResponse, WatchPeersRequest, WatchRoutesRequest, WithdrawOriginatedRouteRequest,
+    GetRpkiStatusRequest, GetRpkiStatusResponse, LargeCommunity, ListCandidatesRequest,
+    ListOriginatedRoutesRequest, ListOriginatedRoutesResponse, ListPeersRequest, ListPeersResponse,
+    ListRoutesRequest, ListRoutesResponse, OriginateRouteRequest, OriginateRouteResponse,
+    OriginateRoutesRequest, OriginateRoutesResponse, PeerEvent, PeerEventType, PeerState,
+    PolicyAction, RemovePeerRequest, RemovePeerResponse, Route, RouteEvent, RouteEventType,
+    RouteResponse, SetExportDefaultRequest, SetExportDefaultResponse, SetImportDefaultRequest,
+    SetImportDefaultResponse, SoftResetRequest, SoftResetResponse, ValidateRoaRequest,
+    ValidateRoaResponse, WatchPeersRequest, WatchRoutesRequest, WithdrawOriginatedRouteRequest,
     WithdrawOriginatedRouteResponse, WithdrawOriginatedRoutesRequest,
     WithdrawOriginatedRoutesResponse,
     origination_service_server::{OriginationService, OriginationServiceServer},
     peer_service_server::{PeerService, PeerServiceServer},
     policy_service_server::{PolicyService, PolicyServiceServer},
     rib_service_server::{RibService, RibServiceServer},
+    rpki_service_server::{RpkiService, RpkiServiceServer},
 };
 
 // ── Type-conversion helpers ───────────────────────────────────────────────────
@@ -1189,6 +1191,92 @@ impl OriginationService for OriginationServiceImpl {
     }
 }
 
+// ── RpkiService ────────────────────────────────────────────────────────────────
+//
+// Read-only in this phase: exposes RTR session status and per-(prefix, AS)
+// ROA validity for operator inspection. Does not filter or otherwise affect
+// route processing — see pathvector-rpki/README.md for the phased rollout.
+
+struct RpkiServiceImpl {
+    state: Arc<tokio::sync::RwLock<DaemonState>>,
+}
+
+fn roa_validity_to_proto(v: pathvector_rpki::RoaValidity) -> proto::RoaValidityState {
+    match v {
+        pathvector_rpki::RoaValidity::Valid => proto::RoaValidityState::Valid,
+        pathvector_rpki::RoaValidity::Invalid => proto::RoaValidityState::Invalid,
+        pathvector_rpki::RoaValidity::NotFound => proto::RoaValidityState::NotFound,
+    }
+}
+
+#[tonic::async_trait]
+impl RpkiService for RpkiServiceImpl {
+    async fn get_rpki_status(
+        &self,
+        _request: Request<GetRpkiStatusRequest>,
+    ) -> Result<Response<GetRpkiStatusResponse>, Status> {
+        let guard = self.state.read().await;
+        let Some(handle) = &guard.rpki else {
+            return Ok(Response::new(GetRpkiStatusResponse {
+                enabled: false,
+                ..Default::default()
+            }));
+        };
+        let status = handle.status();
+        let rtr_version = status
+            .version
+            .map(|v| match v {
+                pathvector_rpki::RtrVersion::V0 => "0",
+                pathvector_rpki::RtrVersion::V1 => "1",
+            })
+            .unwrap_or_default()
+            .to_string();
+        let last_update_unix = status.wall_clock_update.and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+        });
+        Ok(Response::new(GetRpkiStatusResponse {
+            enabled: true,
+            connected: status.connected,
+            rtr_version,
+            serial: status.serial,
+            #[allow(clippy::cast_possible_truncation)]
+            roa_count: status.roa_count as u64,
+            last_update_unix,
+            last_error: status.last_error.unwrap_or_default(),
+        }))
+    }
+
+    async fn validate_roa(
+        &self,
+        request: Request<ValidateRoaRequest>,
+    ) -> Result<Response<ValidateRoaResponse>, Status> {
+        let req = request.into_inner();
+        let guard = self.state.read().await;
+        let Some(handle) = &guard.rpki else {
+            return Err(Status::failed_precondition(
+                "RPKI/RTR is not configured on this daemon",
+            ));
+        };
+
+        let state = if let Ok(nlri) = req.prefix.parse::<pathvector_types::Nlri<Ipv4Addr>>() {
+            handle.validate_v4(nlri.prefix().ip(), nlri.prefix_len(), req.origin_as)
+        } else if let Ok(nlri) = req.prefix.parse::<pathvector_types::Nlri<Ipv6Addr>>() {
+            handle.validate_v6(nlri.prefix().ip(), nlri.prefix_len(), req.origin_as)
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "'{}' is not valid CIDR notation",
+                req.prefix
+            )));
+        };
+
+        Ok(Response::new(ValidateRoaResponse {
+            state: roa_validity_to_proto(state) as i32,
+        }))
+    }
+}
+
 // ── Server entrypoint ─────────────────────────────────────────────────────────
 
 /// Start the gRPC management server on `0.0.0.0:<port>`.
@@ -1220,6 +1308,9 @@ pub(crate) async fn serve(
     let origination_svc = OriginationServiceServer::new(OriginationServiceImpl {
         state: Arc::clone(&state),
     });
+    let rpki_svc = RpkiServiceServer::new(RpkiServiceImpl {
+        state: Arc::clone(&state),
+    });
     let reflection_svc = match tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build_v1()
@@ -1236,6 +1327,7 @@ pub(crate) async fn serve(
         .add_service(rib_svc)
         .add_service(policy_svc)
         .add_service(origination_svc)
+        .add_service(rpki_svc)
         .add_service(reflection_svc)
         .serve(addr)
         .await
@@ -4085,5 +4177,133 @@ mod tests {
         all_prefixes.sort();
         all_prefixes.dedup();
         assert_eq!(all_prefixes.len(), 10, "no duplicates across pages");
+    }
+
+    // ── RpkiService ──────────────────────────────────────────────────────────
+
+    use super::{RpkiServiceImpl, roa_validity_to_proto};
+    use proto::{
+        GetRpkiStatusRequest, RoaValidityState, ValidateRoaRequest,
+        rpki_service_server::RpkiService,
+    };
+
+    #[tokio::test]
+    async fn get_rpki_status_reports_disabled_when_unconfigured() {
+        let svc = RpkiServiceImpl {
+            state: arc_state(65001, &[]),
+        };
+        let resp = svc
+            .get_rpki_status(Request::new(GetRpkiStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.enabled);
+        assert!(!resp.connected);
+    }
+
+    #[tokio::test]
+    async fn validate_roa_fails_precondition_when_unconfigured() {
+        let svc = RpkiServiceImpl {
+            state: arc_state(65001, &[]),
+        };
+        let err = svc
+            .validate_roa(Request::new(ValidateRoaRequest {
+                prefix: "192.0.2.0/24".to_string(),
+                origin_as: 65001,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// A configured-but-never-synced RTR client (pointed at a closed port so
+    /// it never connects) deterministically reports `enabled: true,
+    /// connected: false`, and validates every query as `NotFound` — proving
+    /// the wiring and proto translation without needing to fabricate ROA
+    /// data (`RoaTable`'s insert path is `pub(crate)` to pathvector-rpki and
+    /// already covered by that crate's own test suite).
+    async fn state_with_unsynced_rpki() -> Arc<RwLock<DaemonState>> {
+        let state = arc_state(65001, &[]);
+        let (handle, _join) = pathvector_rpki::RtrClient::spawn(pathvector_rpki::RtrConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1, // reserved; nothing listens here
+            ..Default::default()
+        });
+        state.write().await.rpki = Some(handle);
+        state
+    }
+
+    #[tokio::test]
+    async fn get_rpki_status_reports_enabled_but_disconnected_when_never_synced() {
+        let state = state_with_unsynced_rpki().await;
+        let svc = RpkiServiceImpl { state };
+        let resp = svc
+            .get_rpki_status(Request::new(GetRpkiStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.enabled);
+        assert!(!resp.connected);
+        assert_eq!(resp.roa_count, 0);
+    }
+
+    #[tokio::test]
+    async fn validate_roa_returns_not_found_for_unsynced_table() {
+        let state = state_with_unsynced_rpki().await;
+        let svc = RpkiServiceImpl { state };
+        let resp = svc
+            .validate_roa(Request::new(ValidateRoaRequest {
+                prefix: "192.0.2.0/24".to_string(),
+                origin_as: 65001,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.state, RoaValidityState::NotFound as i32);
+    }
+
+    #[tokio::test]
+    async fn validate_roa_v6_returns_not_found_for_unsynced_table() {
+        let state = state_with_unsynced_rpki().await;
+        let svc = RpkiServiceImpl { state };
+        let resp = svc
+            .validate_roa(Request::new(ValidateRoaRequest {
+                prefix: "2001:db8::/32".to_string(),
+                origin_as: 65001,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.state, RoaValidityState::NotFound as i32);
+    }
+
+    #[tokio::test]
+    async fn validate_roa_rejects_malformed_prefix() {
+        let state = state_with_unsynced_rpki().await;
+        let svc = RpkiServiceImpl { state };
+        let err = svc
+            .validate_roa(Request::new(ValidateRoaRequest {
+                prefix: "not-a-prefix".to_string(),
+                origin_as: 65001,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn roa_validity_maps_to_correct_proto_variant() {
+        assert_eq!(
+            roa_validity_to_proto(pathvector_rpki::RoaValidity::Valid),
+            RoaValidityState::Valid
+        );
+        assert_eq!(
+            roa_validity_to_proto(pathvector_rpki::RoaValidity::Invalid),
+            RoaValidityState::Invalid
+        );
+        assert_eq!(
+            roa_validity_to_proto(pathvector_rpki::RoaValidity::NotFound),
+            RoaValidityState::NotFound
+        );
     }
 }
