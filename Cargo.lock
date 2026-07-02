@@ -1826,6 +1826,7 @@ name = "pathvector-policy"
 version = "0.1.0"
 dependencies = [
  "ipnetx",
+ "pathvector-rpki",
  "pathvector-types",
  "proptest",
  "routemap",

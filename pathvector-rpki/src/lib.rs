@@ -18,3 +18,6 @@ pub use client::{RtrClient, RtrConfig, RtrHandle, RtrStatus};
 pub use error::{PduError, RtrError};
 pub use pdu::RtrVersion;
 pub use table::{RoaTable, RoaValidity};
+
+#[cfg(any(test, feature = "test-util"))]
+pub use client::for_testing;

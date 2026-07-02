@@ -41,6 +41,7 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 proptest          = { workspace = true }
 pathvector-client = { workspace = true }
+pathvector-rpki   = { workspace = true, features = ["test-util"] }
 tempfile          = "3"
 tokio             = { workspace = true, features = ["test-util"] }
 metrics-util      = "0.19"

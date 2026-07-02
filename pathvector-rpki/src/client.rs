@@ -166,6 +166,44 @@ impl RtrClient {
     }
 }
 
+/// Builds an `RtrHandle` with a fixed set of ROAs already loaded, and
+/// `status().connected == true` — for tests that need deterministic ROA data
+/// without running a real or mock RTR server. Each tuple is
+/// `(prefix, prefix_len, max_len, origin_asn)`.
+#[cfg(any(test, feature = "test-util"))]
+#[must_use]
+pub fn for_testing(
+    v4: impl IntoIterator<Item = (Ipv4Addr, u8, u8, u32)>,
+    v6: impl IntoIterator<Item = (Ipv6Addr, u8, u8, u32)>,
+) -> RtrHandle {
+    let table = RoaTable::new();
+    for (prefix, prefix_len, max_len, asn) in v4 {
+        table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
+            flags: pdu::PrefixFlags { announce: true },
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+        });
+    }
+    for (prefix, prefix_len, max_len, asn) in v6 {
+        table.apply_prefix_pdu(&Pdu::Ipv6Prefix {
+            flags: pdu::PrefixFlags { announce: true },
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+        });
+    }
+    let mut status = RtrStatus::disconnected();
+    status.connected = true;
+    status.roa_count = table.len();
+    RtrHandle(Arc::new(Shared {
+        table,
+        status: RwLock::new(status),
+    }))
+}
+
 /// Outer reconnect loop. Never returns except via task cancellation.
 async fn run_session_loop(config: RtrConfig, shared: Arc<Shared>) {
     // `negotiated_version` and `session_id` persist across reconnects: once a

@@ -212,10 +212,24 @@ pub struct RpkiConfig {
     /// `8323` here was a mix-up between the two).
     #[serde(default = "default_rtr_port")]
     pub port: u16,
+    /// Reject routes whose RFC 6811 validity is `Invalid` — a covering ROA
+    /// exists but names a different origin AS, or the announcement is more
+    /// specific than the ROA's max length allows. `Valid` and `NotFound`
+    /// routes are unaffected. Matches RFC 7115 / BIRD / FRR default
+    /// convention. Applied to every configured peer's import policy, IPv4
+    /// and IPv6. Set to `false` to run RPKI in monitoring-only mode (cache
+    /// still queryable via `pathvector rpki status`/`validate`, but nothing
+    /// is filtered).
+    #[serde(default = "default_true")]
+    pub reject_invalid: bool,
 }
 
 fn default_rtr_port() -> u16 {
     3323
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_fib_table() -> u32 {

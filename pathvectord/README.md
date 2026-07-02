@@ -283,10 +283,28 @@ default `--rtr` listen port. (Routinator's HTTP status/metrics API defaults to a
 different port, `8323` — easy to mix up; double-check whichever validator you're
 pointing at.)
 
-**Current scope: read-only.** The cache is queryable but does not filter any routes yet
-— see `pathvector-rpki/README.md` and the project `TODO.md` for the policy-enforcement
-phase. Connection failures are logged and retried in the background; they never prevent
-the daemon from starting or block BGP session processing.
+**By default, `[daemon.rpki]` filters routes, not just monitors them.** Any route whose
+RFC 6811 validity is `Invalid` — a covering ROA exists but names a different origin AS,
+or the announcement is more specific than the ROA's max length allows — is rejected on
+import, for every configured peer, IPv4 and IPv6. `Valid` and `NotFound` routes are
+unaffected. This matches RFC 7115 / BIRD / FRR default convention. Set
+`reject_invalid = false` to run RPKI in monitoring-only mode instead (cache still
+queryable via `pathvector rpki status`/`validate`, but nothing is filtered):
+
+```toml
+[daemon.rpki]
+host = "127.0.0.1"
+port = 3323
+reject_invalid = false  # monitoring only — default is true
+```
+
+Connection failures are logged and retried in the background; they never prevent the
+daemon from starting or block BGP session processing. Routes accepted before the RTR
+client's first successful sync are evaluated against an empty cache (every prefix reads
+as `NotFound`, which is accepted) — this is intentional fail-open behavior, matching the
+rest of this integration's philosophy, not a gap. RTR sync against a local validator is
+typically seconds; a session reset naturally re-evaluates routes once the cache is
+populated.
 
 ```bash
 pathvector rpki status
@@ -604,10 +622,10 @@ an **RPKI validator**, and talks to it over a lightweight protocol called **RTR*
 [Routinator](https://github.com/NLnetLabs/routinator), NLnet Labs' open-source
 validator, running in Docker.
 
-**In Phase 1** (the current state of this integration), pathvectord maintains a live,
-queryable cache of RPKI validity — but doesn't yet use it to automatically accept or
-reject routes. This walkthrough shows you how to inspect that cache directly; automatic
-route filtering is a tracked follow-up (see `TODO.md`).
+pathvectord maintains a live, queryable cache of RPKI validity, and — by default —
+automatically rejects routes it finds `Invalid` (see `reject_invalid` above). This
+walkthrough shows both sides: inspecting the cache directly, and confirming a
+misoriginated route actually gets rejected.
 
 ### 1. Start Routinator
 

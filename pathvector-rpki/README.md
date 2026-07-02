@@ -189,15 +189,20 @@ expected, and not investigated further since it has no bearing on whether any gi
 
 ## Status
 
-**RTR client + ROA cache: implemented and hardened.** `pathvectord` integration is
-live (read-only); policy enforcement (automatically rejecting `Invalid` routes) is a
-tracked follow-up — see [RFC.md](RFC.md) for the detailed requirement-by-requirement
+**RTR client, ROA cache, and policy-layer filtering: implemented and hardened.**
+`pathvectord` rejects `Invalid` routes by default (`Valid`/`NotFound` are accepted) via
+a `RoaValidityCondition` in [`pathvector-policy`](../pathvector-policy) wired into every
+peer's import policy — see [RFC.md](RFC.md) for the detailed requirement-by-requirement
 status.
 
-**Phase 1 scope (current):** RTR session management, ROA validity cache, and a
-read-only way to inspect it. This phase deliberately does **not** filter or reject any
-BGP routes — it proves out the RTR client and cache correctness first. Automatic route
-filtering based on ROA validity is a follow-up phase, wired through `pathvector-policy`.
+**Phase 1** shipped RTR session management, the ROA validity cache, and a read-only way
+to inspect it (`pathvector rpki status`/`validate`), deliberately without touching route
+acceptance. **Phase 2** added the policy integration: `pathvectord`'s
+`[daemon.rpki].reject_invalid` (default `true`) controls whether `Invalid` routes are
+actually rejected, or whether RPKI runs in monitoring-only mode. See
+`pathvectord/README.md`'s "Local RPKI interop with Routinator" section for a full
+walkthrough, including how to verify a hijacked/misoriginated route actually gets
+rejected.
 
 ---
 

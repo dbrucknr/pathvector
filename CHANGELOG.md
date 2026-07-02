@@ -4,6 +4,34 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (Phase 2)
+
+### [pathvector-policy, pathvector-rpki, pathvectord] RPKI Phase 2 — automatic route filtering on ROA validity
+
+Phase 1 (see below) shipped a read-only RTR client and ROA cache; this closes the
+`TODO.md`-tracked follow-up by making pathvectord actually reject invalid routes,
+matching RFC 7115 / BIRD / FRR default convention.
+
+Added `RoaValidityCondition<A>` to `pathvector-policy` — an RFC 6811 `Condition<R>` that
+captures an `RtrHandle` at construction and matches routes whose ROA validity equals a
+target state. Address-family dispatch (`validate_v4` vs `validate_v6`) is bridged
+through a small sealed `RoaLookup` trait so the condition stays one generic `impl`
+(mirroring `PrefixListCondition`'s existing style) rather than two impls that would risk
+coherence-checker overlap.
+
+`pathvectord` wires a "reject `Invalid`" term into every configured peer's IPv4 and IPv6
+import policy via a new `DaemonState::install_rpki_import_terms`, called once right
+after the RTR client spawns (not threaded through `DaemonState::new`, to avoid touching
+its ~30 existing test call sites). Gated by a new `[daemon.rpki].reject_invalid` config
+field, default `true`; set to `false` for RPKI monitoring-only mode. `Valid` and
+`NotFound` routes are unaffected — they fall through to each peer's existing default
+action exactly as before this change.
+
+Also added a `test-util` Cargo feature to `pathvector-rpki` exposing
+`RtrHandle::for_testing(v4, v6)` — builds a handle with deterministic pre-seeded ROA
+data, so both `pathvector-policy` and `pathvectord` get fast, network-free ROV tests
+instead of needing a mock RTR server.
+
 ## 2026-07-02
 
 ### [pathvectord, pathvector-rpki] Real-world RPKI smoke test against Routinator — found and fixed a wrong default port

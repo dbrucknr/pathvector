@@ -22,5 +22,10 @@ tracing           = "0.1"
 proptest = { workspace = true }
 tokio    = { workspace = true, features = ["test-util"] }
 
+[features]
+# Exposes RtrHandle::for_testing() for downstream crates (pathvector-policy,
+# pathvectord) to build deterministic ROA fixtures without a mock RTR server.
+test-util = []
+
 [lints]
 workspace = true

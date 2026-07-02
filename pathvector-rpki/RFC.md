@@ -62,10 +62,12 @@ End of Data PDU omits the refresh/retry/expire fields present in v1).
 ## RFC 6811 — BGP Prefix Origin Validation
 
 **Owns:** The `validate(prefix, prefix_len, origin_asn) -> Valid/Invalid/NotFound`
-algorithm (§2) against the cached ROA set.
-**Boundary:** This crate computes validity on demand for a queried `(prefix, origin AS)`
-pair. It does **not** attach validity state to `pathvector-rib::Route<A>` or filter
-routes in `pathvector-policy` — that integration is a later phase (see `TODO.md`).
+algorithm (§2) against the cached ROA set, and (as of Phase 2) the policy-layer
+`RoaValidityCondition` in `pathvector-policy` that consumes it to filter routes.
+**Boundary:** This crate computes validity; `pathvector-policy` decides what to do with
+it (`RoaValidityCondition` + `Reject`); `pathvectord` wires that term into every peer's
+import policy (`DaemonState::install_rpki_import_terms`, gated by
+`[daemon.rpki].reject_invalid`, default `true`).
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc6811
 
 | Requirement | File | Status | Verified by |
@@ -73,6 +75,8 @@ routes in `pathvector-policy` — that integration is a later phase (see `TODO.m
 | §2 validation algorithm (covering-ROA search, not just longest match) | `src/table.rs` | ✅ | `less_specific_roa_can_validate_when_more_specific_does_not`, `multiple_overlapping_roas_no_match_is_invalid_not_not_found`, `proptest: family_table_agrees_with_naive_model` |
 | Multiple ROAs at the same prefix (different max-length/ASN) | `src/table.rs` | ✅ | `multiple_roas_at_same_prefix_any_match_wins`, `withdraw_of_one_of_several_leaves_others_intact` |
 | IPv4 and IPv6 | `src/table.rs` | ✅ | `v6_exact_match_is_valid`, `v6_exceeds_max_len_is_invalid`, `v6_disjoint_is_not_found`, `roa_table_dispatches_v4_and_v6_independently` |
+| Policy-layer filtering: reject `Invalid`, accept `Valid`/`NotFound` (RFC 7115 / BIRD / FRR convention) | `pathvector-policy/src/rpki.rs`, `pathvectord/src/daemon/mod.rs` | ✅ | `pathvector-policy`: `matches_invalid_on_wrong_origin_asn`, `uncovered_prefix_is_not_found_not_invalid`, `end_to_end_through_policy_invalid_rejected_others_fall_to_default`; `pathvectord`: `test_rov_accepts_route_with_valid_roa`, `test_rov_rejects_route_with_invalid_roa_wrong_origin_asn`, `test_rov_accepts_route_with_no_covering_roa`, `test_rov_not_installed_invalid_route_still_accepted` |
 
-**Deferred:** Policy integration (`RoaValidityCondition` in `pathvector-policy`,
-default-reject-Invalid wiring in `pathvectord`) — tracked in `TODO.md`, not this phase.
+**Deferred:** `routemap::covering_matches()` — a native API that would let `validate()`'s
+ancestor walk collapse to a single trie traversal; tracked in `TODO.md` as a
+non-blocking optimization, not a correctness gap.

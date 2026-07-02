@@ -530,6 +530,36 @@ impl DaemonState {
             oracle_v6: Arc::new(AlwaysReachable),
         }
     }
+
+    /// Injects a `RoaValidityCondition` "reject Invalid" term into every
+    /// configured peer's IPv4 and IPv6 import policy (RFC 6811 ROV).
+    ///
+    /// Called once, right after the RTR client is spawned — `DaemonState::new`
+    /// itself takes no RPKI parameter, since the RTR handle isn't available
+    /// until after construction and threading it through would touch this
+    /// struct's many existing test call sites. `Valid` and `NotFound` routes
+    /// are unaffected — they simply don't match this term and fall through to
+    /// each peer's existing default action, exactly as before this call.
+    pub(crate) fn install_rpki_import_terms(&mut self, rtr: &pathvector_rpki::RtrHandle) {
+        for policy in self.import_policies.values_mut() {
+            policy.add_term(pathvector_policy::Term::new(
+                pathvector_policy::RoaValidityCondition::<Ipv4Addr>::new(
+                    rtr.clone(),
+                    pathvector_rpki::RoaValidity::Invalid,
+                ),
+                pathvector_policy::Reject,
+            ));
+        }
+        for policy in self.import_policies_v6.values_mut() {
+            policy.add_term(pathvector_policy::Term::new(
+                pathvector_policy::RoaValidityCondition::<Ipv6Addr>::new(
+                    rtr.clone(),
+                    pathvector_rpki::RoaValidity::Invalid,
+                ),
+                pathvector_policy::Reject,
+            ));
+        }
+    }
 }
 
 pub(crate) async fn run(cfg: config::Config) {
@@ -649,10 +679,17 @@ where
             port: rpki_cfg.port,
             ..Default::default()
         });
-        state.write().await.rpki = Some(handle);
+        {
+            let mut guard = state.write().await;
+            if rpki_cfg.reject_invalid {
+                guard.install_rpki_import_terms(&handle);
+            }
+            guard.rpki = Some(handle);
+        }
         tracing::info!(
             host = %rpki_cfg.host,
             port = rpki_cfg.port,
+            reject_invalid = rpki_cfg.reject_invalid,
             "RPKI RTR client started"
         );
     }
@@ -2306,6 +2343,130 @@ mod tests {
         );
 
         assert_eq!(state.rib.loc_rib.len(), 1);
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+    }
+
+    // ── RPKI ROV (Phase 2) ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_install_rpki_import_terms_adds_one_term_per_peer_v4_and_v6() {
+        let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
+
+        state.install_rpki_import_terms(&rtr);
+
+        for ip in [peer_a, peer_b] {
+            assert_eq!(state.import_policies[&ip].len(), 1);
+            assert_eq!(state.import_policies_v6[&ip].len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_rov_accepts_route_with_valid_roa() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        let rtr = pathvector_rpki::for_testing(
+            [(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 65002)],
+            std::iter::empty(),
+        );
+        state.install_rpki_import_terms(&rtr);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_ip),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+    }
+
+    #[test]
+    fn test_rov_rejects_route_with_invalid_roa_wrong_origin_asn() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        // ROA authorizes AS 99999 for this prefix, not AS 65002 — the peer's
+        // announcement will be Invalid.
+        let rtr = pathvector_rpki::for_testing(
+            [(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 99999)],
+            std::iter::empty(),
+        );
+        state.install_rpki_import_terms(&rtr);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_ip),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none());
+    }
+
+    #[test]
+    fn test_rov_accepts_route_with_no_covering_roa() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        // Empty ROA table — every prefix is NotFound, which must be accepted
+        // by default, not treated the same as Invalid.
+        let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
+        state.install_rpki_import_terms(&rtr);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_ip),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+    }
+
+    #[test]
+    fn test_rov_not_installed_invalid_route_still_accepted() {
+        // Regression guard: without calling install_rpki_import_terms (the
+        // `reject_invalid = false` config path), ROV must have zero effect —
+        // an Invalid route is accepted exactly as it would be in Phase 1.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_ip),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+
         assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
     }
 

@@ -13,35 +13,14 @@ operation of pathvectord as an internet-facing BGP speaker.
 
 ### Tier 1 — Blocks operating safely on the internet
 
-**RPKI / Route Origin Validation (RFC 6810/6811/8210)** — Phase 1 shipped
-(RTR client + ROA cache); see CHANGELOG.md. A follow-up review against the RFC
-8210 §5 text (2026-07-01) found and closed three real gaps in the initial
-implementation: (1) the client only downgraded to v0 on an explicit
-`ErrorReport`, missing the RFC's own documented case of a v0-only cache
-silently replying at v0; (2) PDU length was allocated directly from an
-untrusted `u32` header field with no upper bound; (3) two protocol paths
-(`CacheReset` mid-stream, unsolicited `SerialNotify`) were implemented but
-only exercised indirectly. All three now have dedicated mock-server tests,
-each verified to fail when the corresponding fix is reverted. Remaining:
-
-- **Policy enforcement (Phase 2).** `pathvector-rpki` currently only exposes a
-  read-only validity cache via gRPC/CLI (`pathvector rpki status` /
-  `validate`) — it does not filter any routes. The next step is a
-  `RoaValidityCondition` in `pathvector-policy` (capturing an
-  `Arc<pathvector_rpki::RtrHandle>` at construction, since `Condition<R>` has
-  no external-context parameter) plus default-reject-`Invalid` /
-  accept-`NotFound` wiring in `pathvectord` import policy, matching RFC 7115 /
-  BIRD / FRR convention. BIRD and FRR both implement full ROV; it is
-  increasingly a precondition for peering at IXPs.
-- **`routemap::covering_matches()`.** `pathvector-rpki/src/table.rs`'s
-  `validate()` composes a `longest_match` short-circuit with a manual
-  ancestor-prefix walk to get RFC 6811's "all covering ROAs" semantics out of
-  `routemap`'s single-winner LPM API. Since `routemap` is our own crate, a
-  native `covering_matches(prefix) -> impl Iterator<Item = (IpPrefix<A>, &V)>`
-  that walks the trie path once would be strictly better (one trie walk
-  instead of up to 33/129 `get()` calls) and would simplify `validate()` to a
-  single loop. Not required for correctness — see the "Future improvement"
-  note in `table.rs`.
+**RPKI / Route Origin Validation (RFC 6810/6811/8210)** — shipped, both phases.
+Phase 1 (RTR client + ROA cache) and Phase 2 (policy-layer filtering: reject
+`Invalid`, accept `Valid`/`NotFound`, matching RFC 7115 / BIRD / FRR
+convention, via `pathvector-policy`'s `RoaValidityCondition` wired into every
+peer's import policy by `pathvectord`, gated by `[daemon.rpki].reject_invalid`
+— default `true`) are both complete; see CHANGELOG.md. One non-blocking
+optimization remains, tracked in the General section below:
+`routemap::covering_matches()`.
 
 **Route leak prevention (RFC 9234)**
 Route leaks (a customer re-advertising a provider's routes to another provider)
@@ -203,6 +182,14 @@ integration rather than direct unit tests.
 - `pathvector-session/src/transport/mod.rs` (96.0%) — `SessionCommand::Notification` branch
   (~line 411) and TCP send failure path (~line 479) require a real or mock transport pair
   to drive the async session loop.
+
+**`routemap::covering_matches()`** (non-blocking optimization). `pathvector-rpki/src/table.rs`'s
+`validate()` composes a `longest_match` short-circuit with a manual ancestor-prefix walk to
+get RFC 6811's "all covering ROAs" semantics out of `routemap`'s single-winner LPM API. Since
+`routemap` is our own crate, a native `covering_matches(prefix) -> impl Iterator<Item =
+(IpPrefix<A>, &V)>` that walks the trie path once would be strictly better (one trie walk
+instead of up to 33/129 `get()` calls) and would simplify `validate()` to a single loop. Not
+required for correctness — see the "Future improvement" note in `table.rs`.
 
 ---
 
