@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use pathvector_types::{Afi, AfiSafi, Safi};
+use pathvector_types::{Afi, AfiSafi, Role, Safi};
 
 use super::error::CodecError;
 use super::header::{MessageType, encode_header};
@@ -121,6 +121,24 @@ fn decode_capability(code: u8, cur: &mut Cursor<'_>) -> Result<Capability, Codec
         }
         // Route Refresh (RFC 2918): no value
         2 => Ok(Capability::RouteRefresh),
+        // BGP Role (RFC 9234 §4): single role-value byte. An unrecognized
+        // value (5-255, reserved/unassigned) decodes as Unknown rather than
+        // erroring — the RFC defines no meaning for future role values, and
+        // treating the capability as absent (Unknown is never matched by
+        // role-pair validation) is safer than guessing at one.
+        9 => {
+            if cur.remaining() < 1 {
+                return Err(CodecError::InvalidCapability { code });
+            }
+            let value = cur.read_u8()?;
+            match Role::from_wire_value(value) {
+                Some(role) => Ok(Capability::Role(role)),
+                None => Ok(Capability::Unknown {
+                    code,
+                    value: vec![value],
+                }),
+            }
+        }
         // Extended Message (RFC 8654): no value
         6 => Ok(Capability::ExtendedMessage),
         // 4-byte ASN (RFC 6793): 4-byte AS number
@@ -189,6 +207,9 @@ fn encode_capability_value(cap: &Capability) -> Vec<u8> {
         Capability::FourByteAsn(asn) => {
             v.put_u32(*asn);
         }
+        Capability::Role(role) => {
+            v.put_u8(role.as_wire_value());
+        }
         Capability::GracefulRestart {
             restart_flags,
             restart_time,
@@ -230,6 +251,13 @@ pub enum Capability {
     /// `AS_PATH` uses 4-byte ASNs and `AS_TRANS` substitution is not needed.
     FourByteAsn(u32),
 
+    /// BGP Role (RFC 9234 §4, code 9).
+    ///
+    /// Declares this session's role in a customer/provider/peer relationship.
+    /// Both sides' roles must be complementary (see [`Role::is_compatible_with`])
+    /// or the session is rejected with a Role Mismatch NOTIFICATION.
+    Role(Role),
+
     /// Graceful Restart (RFC 4724, code 64).
     ///
     /// Allows forwarding to continue while the BGP control plane restarts.
@@ -261,6 +289,7 @@ impl Capability {
             Self::ExtendedMessage => 6,
             Self::FourByteAsn(_) => 65,
             Self::GracefulRestart { .. } => 64,
+            Self::Role(_) => 9,
             Self::Unknown { code, .. } => *code,
         }
     }
@@ -426,6 +455,54 @@ mod tests {
         assert!(matches!(
             decode_open_body(&body),
             Err(CodecError::InvalidCapability { code: 65 })
+        ));
+    }
+
+    #[test]
+    fn test_role_capability_roundtrip_all_defined_values() {
+        for role in [
+            Role::Provider,
+            Role::RouteServer,
+            Role::RsClient,
+            Role::Customer,
+            Role::Peer,
+        ] {
+            let mut msg = base_open();
+            msg.capabilities = vec![Capability::Role(role)];
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    #[test]
+    fn test_role_capability_unrecognized_value_decodes_as_unknown() {
+        // cap_code=9 (Role), cap_len=1, value=200 (reserved/unassigned) —
+        // must decode without erroring, as Unknown rather than Role.
+        let params = [
+            OPT_PARAM_CAPABILITIES,
+            3,
+            9,
+            1,
+            200, // reserved role value
+        ];
+        let body = open_with_raw_opt_params(&params);
+        let open = decode_open_body(&body).unwrap();
+        assert_eq!(
+            open.capabilities,
+            vec![Capability::Unknown {
+                code: 9,
+                value: vec![200]
+            }]
+        );
+    }
+
+    #[test]
+    fn test_truncated_role_capability_is_error() {
+        // cap_code=9 (Role), cap_len=0, but Role needs 1 byte.
+        let params = [OPT_PARAM_CAPABILITIES, 2, 9, 0];
+        let body = open_with_raw_opt_params(&params);
+        assert!(matches!(
+            decode_open_body(&body),
+            Err(CodecError::InvalidCapability { code: 9 })
         ));
     }
 

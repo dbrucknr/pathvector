@@ -112,6 +112,7 @@ const ATTR_EXTENDED_COMMUNITIES: u8 = 16;
 const ATTR_AS4_PATH: u8 = 17;
 const ATTR_AS4_AGGREGATOR: u8 = 18;
 const ATTR_LARGE_COMMUNITY: u8 = 32;
+const ATTR_ONLY_TO_CUSTOMER: u8 = 35;
 
 // ── AS path segment type codes (RFC 4271) ────────────────────────────────────
 
@@ -379,6 +380,16 @@ fn decode_attr_value(
                 });
             }
             Ok(PathAttribute::LocalPref(cur.read_u32()?))
+        }
+
+        ATTR_ONLY_TO_CUSTOMER => {
+            if cur.remaining() < 4 {
+                return Err(CodecError::InvalidAttribute {
+                    type_code,
+                    detail: "ONLY_TO_CUSTOMER must be 4 bytes",
+                });
+            }
+            Ok(PathAttribute::OnlyToCustomer(Asn::new(cur.read_u32()?)))
         }
 
         ATTR_ATOMIC_AGGREGATE => Ok(PathAttribute::AtomicAggregate),
@@ -677,6 +688,12 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
 
         PathAttribute::LocalPref(lp) => (FLAGS_WKM, ATTR_LOCAL_PREF, lp.to_be_bytes().to_vec()),
 
+        PathAttribute::OnlyToCustomer(asn) => (
+            FLAGS_OT,
+            ATTR_ONLY_TO_CUSTOMER,
+            u32::from(*asn).to_be_bytes().to_vec(),
+        ),
+
         PathAttribute::AtomicAggregate => (FLAGS_WKM, ATTR_ATOMIC_AGGREGATE, vec![]),
 
         PathAttribute::Aggregator(agg) => {
@@ -868,6 +885,12 @@ pub enum PathAttribute {
     /// `LARGE_COMMUNITY` (type 32, RFC 8092) — three-field community designed
     /// for 4-byte ASN operators.
     LargeCommunities(Vec<LargeCommunity>),
+    /// `ONLY_TO_CUSTOMER` (type 35, RFC 9234) — route-leak prevention marker.
+    /// Carries the ASN of the peer the route was received from (ingress) or
+    /// the local ASN (egress). Once set, must be preserved unchanged and must
+    /// not be forwarded to a Provider, Peer, or Route Server — only to
+    /// Customers/RS-Clients.
+    OnlyToCustomer(Asn),
     /// Any unrecognised attribute. Flags and value are preserved intact so
     /// optional-transitive attributes can be forwarded to the next hop.
     Unknown {
@@ -898,6 +921,7 @@ impl PathAttribute {
             Self::As4Path(_) => ATTR_AS4_PATH,
             Self::As4Aggregator { .. } => ATTR_AS4_AGGREGATOR,
             Self::LargeCommunities(_) => ATTR_LARGE_COMMUNITY,
+            Self::OnlyToCustomer(_) => ATTR_ONLY_TO_CUSTOMER,
             Self::Unknown { type_code, .. } => *type_code,
         }
     }
@@ -1034,6 +1058,28 @@ mod tests {
             announced: vec![nlri4("10.0.0.0/8")],
         };
         roundtrip(msg);
+    }
+
+    #[test]
+    fn test_only_to_customer_roundtrip() {
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::OnlyToCustomer(Asn::new(65000)),
+            ],
+            announced: vec![nlri4("192.0.2.0/24")],
+        };
+        roundtrip(msg);
+    }
+
+    #[test]
+    fn test_only_to_customer_encodes_as_optional_transitive() {
+        // RFC 9234 §3: OTC must be optional (0x80) + transitive (0x40) = 0xC0.
+        let attr = PathAttribute::OnlyToCustomer(Asn::new(65000));
+        let (flags, type_code, _) = encode_attr_value(&attr);
+        assert_eq!(flags, FLAGS_OT);
+        assert_eq!(type_code, 35);
     }
 
     #[test]
@@ -2089,6 +2135,7 @@ mod prop_tests {
         (ATTR_AS4_PATH, &[9, 0]),             // unknown segment type
         (ATTR_AS4_AGGREGATOR, &[0; 7]),       // 7 bytes, needs 8
         (ATTR_LARGE_COMMUNITY, &[0; 11]),     // 11 bytes, not multiple of 12
+        (ATTR_ONLY_TO_CUSTOMER, &[0; 3]),     // 3 bytes, needs 4
     ];
 
     /// Build a minimal UPDATE body with one attribute whose value is `value`.

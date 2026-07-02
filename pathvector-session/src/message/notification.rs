@@ -146,6 +146,10 @@ pub enum OpenMsgError {
     UnsupportedOptionalParameter,
     UnacceptableHoldTime,
     UnsupportedCapability,
+    /// RFC 9234 §5.1: the two sides' BGP Role capabilities are not a valid
+    /// complementary pair (or one side sent Role but expected a specific
+    /// value that didn't match).
+    RoleMismatch,
     Unknown(u8),
 }
 
@@ -158,6 +162,7 @@ impl OpenMsgError {
             4 => Self::UnsupportedOptionalParameter,
             6 => Self::UnacceptableHoldTime,
             7 => Self::UnsupportedCapability,
+            11 => Self::RoleMismatch,
             _ => Self::Unknown(v),
         }
     }
@@ -170,6 +175,7 @@ impl OpenMsgError {
             Self::UnsupportedOptionalParameter => 4,
             Self::UnacceptableHoldTime => 6,
             Self::UnsupportedCapability => 7,
+            Self::RoleMismatch => 11,
             Self::Unknown(v) => v,
         }
     }
@@ -340,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn test_role_mismatch_encodes_as_code_2_subcode_11() {
+        // RFC 9234 §5.1 mandates NOTIFICATION code 2 (OPEN Message Error),
+        // subcode 11 (Role Mismatch) — assert the exact wire bytes, not just
+        // encode/decode symmetry.
+        let msg = NotificationMessage {
+            error: NotificationError::OpenMessage(OpenMsgError::RoleMismatch),
+            data: vec![],
+        };
+        let encoded = msg.encode();
+        // 19-byte header, then 1 byte code, 1 byte subcode.
+        assert_eq!(encoded[19], 2, "error code must be 2 (OPEN Message Error)");
+        assert_eq!(encoded[20], 11, "subcode must be 11 (Role Mismatch)");
+    }
+
+    #[test]
     fn test_unknown_code_preserved() {
         let msg = NotificationMessage {
             error: NotificationError::Unknown {
@@ -401,6 +422,7 @@ mod tests {
             NotificationError::OpenMessage(OpenMsgError::UnsupportedOptionalParameter),
             NotificationError::OpenMessage(OpenMsgError::UnacceptableHoldTime),
             NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability),
+            NotificationError::OpenMessage(OpenMsgError::RoleMismatch),
             NotificationError::OpenMessage(OpenMsgError::Unknown(9)),
         ];
         for error in cases {
