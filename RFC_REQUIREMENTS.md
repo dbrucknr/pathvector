@@ -43,10 +43,10 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 8212 | Default eBGP Route Propagation | pathvectord | ✅ | [daemon](pathvectord/RFC.md#rfc-8212--default-external-bgp-route-propagation-without-policy) |
 | RFC 8654 | Extended Message Support | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-8654--extended-message-support-for-bgp) |
 | RFC 6396 | MRT Routing Information Export Format | pathvector-mrt | ⚠️ | Parsing (TABLE_DUMP_V2 replay) implemented; write/export side not started |
-| RFC 6810 | RPKI-to-Router Protocol v0 (RTR) | pathvectord | ❌ | — |
-| RFC 6811 | BGP Prefix Origin Validation (ROV) | pathvectord, pathvector-policy | ❌ | — |
+| RFC 6810 | RPKI-to-Router Protocol v0 (RTR) | pathvector-rpki | ✅ | [rpki](pathvector-rpki/RFC.md#rfc-6810--the-rpki-to-router-protocol-version-0) |
+| RFC 6811 | BGP Prefix Origin Validation (ROV) | pathvector-rpki, pathvector-policy, pathvectord | ⚠️ | [rpki](pathvector-rpki/RFC.md#rfc-6811--bgp-prefix-origin-validation) — validation algorithm done; policy-layer route filtering (Phase 2) not started |
 | RFC 7313 | Enhanced Route Refresh Capability | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-7313--enhanced-route-refresh-capability) |
-| RFC 8210 | RPKI-to-Router Protocol v1 (RTR) | pathvectord | ❌ | — |
+| RFC 8210 | RPKI-to-Router Protocol v1 (RTR) | pathvector-rpki | ✅ | [rpki](pathvector-rpki/RFC.md#rfc-8210--the-rpki-to-router-protocol-version-1) |
 | RFC 8538 | NOTIFICATION Support for BGP Graceful Restart | pathvectord | ✅ | [daemon](pathvectord/RFC.md#rfc-8538--enhancements-to-bgp-graceful-restart) |
 | RFC 9003 | Extended BGP Administrative Shutdown Communication | pathvector-session, pathvectord | ✅ | [session](pathvector-session/RFC.md#rfc-9003--extended-bgp-administrative-shutdown-communication) · [daemon](pathvectord/RFC.md#rfc-9003--extended-bgp-administrative-shutdown-communication-daemon-integration) |
 | RFC 9234 | BGP Route Leak Prevention Using Roles | pathvector-session, pathvectord | ❌ | — |
