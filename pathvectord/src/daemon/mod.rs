@@ -340,6 +340,10 @@ pub(crate) struct DaemonState {
     ///
     /// `None` when no kernel FIB integration is configured (e.g. tests).
     pub(crate) fib_manager: Option<Arc<dyn ApplyFibChange>>,
+    /// RPKI RTR client handle. `None` when `[daemon.rpki]` is not configured.
+    /// Cheap to clone (Arc-backed); gRPC handlers clone it per-request like
+    /// `fib_manager`.
+    pub(crate) rpki: Option<pathvector_rpki::RtrHandle>,
     /// Next-hop oracle consulted on every IPv4 best-path recompute (RFC 4271 §9.1
     /// steps 1 & 8). Defaults to `AlwaysReachable`; replaced with `DaemonOracle`
     /// once `KernelFib` is initialised at startup.
@@ -521,6 +525,7 @@ impl DaemonState {
             route_tx,
             peer_tx,
             fib_manager: None,
+            rpki: None,
             oracle_v4: Arc::new(AlwaysReachable),
             oracle_v6: Arc::new(AlwaysReachable),
         }
@@ -630,6 +635,25 @@ where
             port,
             error = %e,
             "metrics endpoint unavailable — running without Prometheus export"
+        );
+    }
+
+    // Spawn the RPKI RTR client when configured. Unlike FibWriter::new (sync,
+    // fails fast), this is async-forever — there's no Result to match at
+    // spawn time. "Failure" (connect refused, version mismatch, etc.)
+    // surfaces later via RtrStatus.connected == false, which is why the
+    // read-only gRPC/CLI status surface matters for operator visibility.
+    if let Some(rpki_cfg) = cfg.daemon.rpki.clone() {
+        let (handle, _join) = pathvector_rpki::RtrClient::spawn(pathvector_rpki::RtrConfig {
+            host: rpki_cfg.host.clone(),
+            port: rpki_cfg.port,
+            ..Default::default()
+        });
+        state.write().await.rpki = Some(handle);
+        tracing::info!(
+            host = %rpki_cfg.host,
+            port = rpki_cfg.port,
+            "RPKI RTR client started"
         );
     }
 
@@ -10731,6 +10755,7 @@ mod run_with_tests {
                 fib_metric: 20,
                 graceful_restart_time: 0,
                 restarting: false,
+                rpki: None,
             },
             peers: peer_ips
                 .iter()
@@ -10757,6 +10782,43 @@ mod run_with_tests {
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────
+
+    /// `DaemonState.rpki` starts `None` when `[daemon.rpki]` is absent — the
+    /// common case for most deployments. Confirms `build_daemon` never
+    /// populates it unprompted.
+    #[tokio::test]
+    async fn daemon_state_rpki_is_none_when_unconfigured() {
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let cfg = make_config(&[]);
+        let (state, ..) = build_daemon(&cfg, spawn_fn).await;
+        assert!(state.read().await.rpki.is_none());
+    }
+
+    /// Mirrors the exact spawn-and-wire sequence `run_with` performs for
+    /// `[daemon.rpki]`, pointed at a closed port. `RtrClient::spawn` must
+    /// return immediately regardless of whether the TCP connect will
+    /// eventually succeed — confirms the RPKI wiring can never block daemon
+    /// startup, matching the FIB/metrics graceful-degradation pattern.
+    #[tokio::test]
+    async fn rpki_client_spawn_never_blocks_and_populates_daemon_state() {
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let cfg = make_config(&[]);
+        let (state, ..) = build_daemon(&cfg, spawn_fn).await;
+
+        let spawn_started = std::time::Instant::now();
+        let (handle, _join) = pathvector_rpki::RtrClient::spawn(pathvector_rpki::RtrConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1, // reserved; nothing listens here — connect will fail
+            ..Default::default()
+        });
+        assert!(
+            spawn_started.elapsed() < std::time::Duration::from_millis(100),
+            "RtrClient::spawn must return immediately, not block on the TCP connect"
+        );
+
+        state.write().await.rpki = Some(handle);
+        assert!(state.read().await.rpki.is_some());
+    }
 
     /// `build_daemon` calls the spawn function exactly once per configured peer.
     #[tokio::test]

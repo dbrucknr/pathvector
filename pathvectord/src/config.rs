@@ -180,6 +180,39 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub restarting: bool,
+    /// RPKI Route Origin Validation via the RTR protocol (RFC 8210 / RFC 6810).
+    ///
+    /// When present, pathvectord connects to an external RPKI validator
+    /// (Routinator, rpki-client, OctoRPKI, Cloudflare gortr, etc.) and
+    /// maintains a live ROA validity cache. Connection failures are logged
+    /// and retried in the background — they never prevent the daemon from
+    /// starting or processing BGP sessions. Omit this table to disable RPKI
+    /// support (the default).
+    ///
+    /// Phase 1: read-only cache queryable via gRPC/CLI. Does not affect
+    /// route acceptance or best-path selection.
+    ///
+    /// ```toml
+    /// [daemon.rpki]
+    /// host = "127.0.0.1"
+    /// port = 8323
+    /// ```
+    #[serde(default)]
+    pub rpki: Option<RpkiConfig>,
+}
+
+/// RTR server connection settings for RPKI Route Origin Validation.
+#[derive(Deserialize, Clone)]
+pub struct RpkiConfig {
+    pub host: String,
+    /// TCP port of the RTR server. Defaults to `8323`, the conventional
+    /// RTR-over-TCP port used by Routinator and other common validators.
+    #[serde(default = "default_rtr_port")]
+    pub port: u16,
+}
+
+fn default_rtr_port() -> u16 {
+    8323
 }
 
 fn default_fib_table() -> u32 {

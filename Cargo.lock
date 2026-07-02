@@ -1920,6 +1920,7 @@ dependencies = [
  "pathvector-client",
  "pathvector-policy",
  "pathvector-rib",
+ "pathvector-rpki",
  "pathvector-session",
  "pathvector-sys",
  "pathvector-types",
