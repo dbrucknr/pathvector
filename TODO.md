@@ -14,7 +14,15 @@ operation of pathvectord as an internet-facing BGP speaker.
 ### Tier 1 — Blocks operating safely on the internet
 
 **RPKI / Route Origin Validation (RFC 6810/6811/8210)** — Phase 1 shipped
-(RTR client + ROA cache); see CHANGELOG.md. Remaining:
+(RTR client + ROA cache); see CHANGELOG.md. A follow-up review against the RFC
+8210 §5 text (2026-07-01) found and closed three real gaps in the initial
+implementation: (1) the client only downgraded to v0 on an explicit
+`ErrorReport`, missing the RFC's own documented case of a v0-only cache
+silently replying at v0; (2) PDU length was allocated directly from an
+untrusted `u32` header field with no upper bound; (3) two protocol paths
+(`CacheReset` mid-stream, unsolicited `SerialNotify`) were implemented but
+only exercised indirectly. All three now have dedicated mock-server tests,
+each verified to fail when the corresponding fix is reverted. Remaining:
 
 - **Policy enforcement (Phase 2).** `pathvector-rpki` currently only exposes a
   read-only validity cache via gRPC/CLI (`pathvector rpki status` /
@@ -34,10 +42,6 @@ operation of pathvectord as an internet-facing BGP speaker.
   instead of up to 33/129 `get()` calls) and would simplify `validate()` to a
   single loop. Not required for correctness — see the "Future improvement"
   note in `table.rs`.
-- **Dedicated mock-server tests** for `CacheReset`-triggers-resync and
-  unsolicited-`SerialNotify`-triggers-immediate-resync — both paths are
-  implemented and exercised indirectly by other tests, but don't have a test
-  that isolates them specifically. See `pathvector-rpki/RFC.md`'s ⚠️ rows.
 
 **Route leak prevention (RFC 9234)**
 Route leaks (a customer re-advertising a provider's routes to another provider)

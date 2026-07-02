@@ -32,10 +32,12 @@ BGPsec support in `pathvector-session`).
 | Session establishment: Reset Query on first connect | `src/client.rs` | ✅ | `full_sync_populates_table_and_status` |
 | Incremental update: Serial Query with last known serial | `src/client.rs` | ✅ | `sync_once` (unit-level; covered indirectly by the idle-loop path in `full_sync_populates_table_and_status`) |
 | Session ID validation on End of Data | `src/client.rs` | ✅ | `session_id_mismatch_on_end_of_data_clears_table_and_errors` |
-| Cache Reset handling (full resync) | `src/client.rs` | ✅ | `apply_diff_stream` (unit-level; no dedicated mock-server test yet — see TODO.md) |
+| Cache Reset handling (full resync) | `src/client.rs` | ✅ | `cache_reset_mid_stream_triggers_full_resync_on_same_connection` |
 | Refresh/retry/expire interval timers, server-advertised override | `src/client.rs` | ✅ | `full_sync_populates_table_and_status` (refresh applied); retry/expire covered by `RtrConfig`/`RtrStatus::is_stale` |
 | Reconnect with retry-interval backoff on failure | `src/client.rs` | ✅ | `disconnect_mid_sync_reports_disconnected_without_clearing_table` |
-| Unsolicited Serial Notify triggers immediate resync | `src/client.rs` | ⚠️ | Implemented (`tokio::select!` idle branch in `run_one_connection`); no dedicated test yet — see TODO.md |
+| Unsolicited Serial Notify triggers immediate resync | `src/client.rs` | ✅ | `unsolicited_serial_notify_triggers_immediate_resync_not_timer_wait` |
+| Version-mismatch adoption without an Error Report (§5: a v0-only cache "responds with a version 0 response") | `src/client.rs` | ✅ | `server_silently_replies_at_v0_without_error_report`, `adopted_version_is_used_for_subsequent_queries` |
+| PDU length bound (reject before allocating, not just after) | `src/client.rs` | ✅ | `oversized_pdu_length_is_rejected_without_allocating` |
 
 **Deferred:** SSH transport (TCP-only; validators typically run on a loopback/internal
 network). ASPA (RFC 9582) — separate RFC, out of scope entirely for ROV.

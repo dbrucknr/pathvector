@@ -21,7 +21,7 @@ use tokio::{
 use tracing::warn;
 
 use crate::{
-    error::RtrError,
+    error::{PduError, RtrError},
     pdu::{self, EndOfDataIntervals, Pdu, RtrVersion},
     table::{RoaTable, RoaValidity},
 };
@@ -29,6 +29,15 @@ use crate::{
 /// RFC 8210 §8.4 error code for "Unsupported Protocol Version" — the trigger
 /// for falling back from v1 to v0.
 const ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION: u16 = 4;
+
+/// Upper bound on a single PDU's declared length. The largest legitimate
+/// PDU in practice is an `ErrorReport` carrying a copy of the offending PDU
+/// plus UTF-8 text, or a `RouterKey` carrying an SPKI — neither approaches
+/// this. Rejecting anything larger before allocating a buffer for it closes
+/// off a trivial memory-exhaustion vector: without this cap, a misbehaving
+/// or compromised RTR server could declare a length near `u32::MAX` and
+/// force an equivalent-sized allocation attempt per PDU.
+const MAX_PDU_LEN: u32 = 64 * 1024;
 
 /// Configuration for an RTR session.
 #[derive(Debug, Clone)]
@@ -261,7 +270,7 @@ async fn run_one_connection(
                 tokio::select! {
                     () = tokio::time::sleep(refresh) => {}
                     pdu_result = read_pdu(stream) => {
-                        match pdu_result? {
+                        match pdu_result?.1 {
                             Pdu::SerialNotify { .. } => {}
                             other => {
                                 return Err(RtrError::UnexpectedPdu {
@@ -298,14 +307,39 @@ async fn sync_once(
         };
         write_pdu(stream, *negotiated_version, &query).await?;
 
-        match read_pdu(stream).await? {
-            Pdu::CacheResponse { session_id } => return Ok(session_id),
+        let (observed_version, response) = read_pdu(stream).await?;
+
+        match response {
+            // RFC 8210 §5: a v0-only cache receiving a v1 query may simply
+            // "respond with a version 0 response" instead of an
+            // ErrorReport. `decode_payload` always trusts each PDU's own
+            // wire version byte (so the data itself decodes correctly
+            // regardless), but our *outbound* encoding for the next query
+            // is chosen from `negotiated_version` — if we don't adopt what
+            // the server actually used, every subsequent query is sent at
+            // the wrong version. Catch that here, not only on an explicit
+            // error.
+            Pdu::CacheResponse { session_id } => {
+                if observed_version != *negotiated_version {
+                    warn!(
+                        sent = ?*negotiated_version,
+                        got = ?observed_version,
+                        "RTR server accepted at a different protocol version than requested; adopting it"
+                    );
+                    *negotiated_version = observed_version;
+                }
+                return Ok(session_id);
+            }
+            // The explicit-rejection path. Deliberately not gated on the
+            // ErrorReport's own wire version: some servers echo the
+            // rejection at the version they support (v0), others at the
+            // version they received (v1) — either way, an
+            // "Unsupported Protocol Version" error_code is unambiguous
+            // signal to retry at v0 once. `attempted_fallback` is the only
+            // guard needed to prevent looping.
             Pdu::ErrorReport {
                 error_code, text, ..
-            } if error_code == ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION
-                && *negotiated_version == RtrVersion::V1
-                && !attempted_fallback =>
-            {
+            } if error_code == ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION && !attempted_fallback => {
                 warn!(text = %text, "RTR server rejected protocol v1, falling back to v0");
                 *negotiated_version = RtrVersion::V0;
                 // v0 and v1 session state (serial, session ID) are not
@@ -339,7 +373,7 @@ async fn apply_diff_stream(
     expected_session_id: u16,
 ) -> Result<DiffOutcome, RtrError> {
     loop {
-        let pdu = read_pdu(stream).await?;
+        let (_version, pdu) = read_pdu(stream).await?;
         match &pdu {
             Pdu::Ipv4Prefix { .. } | Pdu::Ipv6Prefix { .. } => {
                 shared.table.apply_prefix_pdu(&pdu);
@@ -381,10 +415,21 @@ async fn apply_diff_stream(
 
 /// Reads one complete PDU off the wire: the 8-byte header first (to learn the
 /// declared length), then the remaining `len - 8` bytes.
-async fn read_pdu(stream: &mut TcpStream) -> Result<Pdu, RtrError> {
+///
+/// Returns the *wire* protocol version alongside the decoded PDU. This
+/// matters because a server may reply at a different version than we sent
+/// without an `ErrorReport` — RFC 8210 §5 describes this directly: a
+/// v0-only cache receiving a v1 query "responds with a version 0 response."
+/// Callers that care about version negotiation (`sync_once`) must inspect
+/// this rather than assuming the response matches what was sent.
+async fn read_pdu(stream: &mut TcpStream) -> Result<(RtrVersion, Pdu), RtrError> {
     let mut header = [0u8; 8];
     read_exact_mapped(stream, &mut header).await?;
     let (version, pdu_type, field, len) = pdu::decode_header(&header)?;
+
+    if len > MAX_PDU_LEN {
+        return Err(RtrError::Pdu(PduError::InvalidLength { pdu_type: 0, len }));
+    }
 
     let mut full = header.to_vec();
     if let Some(remaining) = (len as usize).checked_sub(8) {
@@ -395,7 +440,8 @@ async fn read_pdu(stream: &mut TcpStream) -> Result<Pdu, RtrError> {
     // If `len < 8`, `full` stays at just the 8-byte header; decode_payload's
     // own length check below reports a proper InvalidLength error rather
     // than us needing a separate underflow guard.
-    Ok(pdu::decode_payload(version, pdu_type, field, len, &full)?)
+    let pdu = pdu::decode_payload(version, pdu_type, field, len, &full)?;
+    Ok((version, pdu))
 }
 
 async fn read_exact_mapped(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), RtrError> {
@@ -444,7 +490,7 @@ mod tests {
     }
 
     async fn read_one(stream: &mut TcpStream) -> Pdu {
-        read_pdu(stream).await.unwrap()
+        read_pdu(stream).await.unwrap().1
     }
 
     async fn write_one(stream: &mut TcpStream, version: RtrVersion, pdu: &Pdu) {
@@ -516,6 +562,165 @@ mod tests {
         assert_eq!(status.roa_count, 1);
     }
 
+    /// RFC 8210 §5.7: a `CacheReset` PDU received mid-diff (in place of a
+    /// Prefix PDU or `EndOfData`) means the server can't serve this sync
+    /// after all and the client must restart with a fresh Reset Query on
+    /// the *same* TCP connection — not treat it as a fatal error requiring
+    /// a reconnect. `apply_diff_stream`'s `DiffOutcome::ResyncNeeded` path
+    /// implements this; this test isolates it (previously only reachable
+    /// indirectly through other tests).
+    #[tokio::test]
+    async fn cache_reset_mid_stream_triggers_full_resync_on_same_connection() {
+        let (config, _server) = spawn_mock_server(|mut stream| async move {
+            // First attempt: normal Reset Query, accepted, then the server
+            // gives up mid-diff instead of sending prefixes + End of Data.
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 1 },
+            )
+            .await;
+            write_one(&mut stream, RtrVersion::V1, &Pdu::CacheReset).await;
+
+            // Second attempt: same TCP connection. The table was cleared, so
+            // the client has no serial to resume from and must send another
+            // Reset Query (not a Serial Query) — this time the server
+            // completes the sync normally.
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 2 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::Ipv4Prefix {
+                    flags: PrefixFlags { announce: true },
+                    prefix_len: 24,
+                    max_len: 24,
+                    prefix: "198.51.100.0".parse().unwrap(),
+                    asn: 65020,
+                },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 2,
+                    serial: 1,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (handle, _join) = RtrClient::spawn(config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "client did not complete the post-CacheReset resync within 5s \
+             (did it treat CacheReset as fatal instead of resyncing?)",
+        );
+
+        // Confirm the *second* session's data actually made it in — proving
+        // the resync completed, not just that the connection stayed open.
+        assert_eq!(
+            handle.validate_v4("198.51.100.1".parse().unwrap(), 24, 65020),
+            RoaValidity::Valid
+        );
+        assert_eq!(handle.status().serial, Some(1));
+    }
+
+    /// An unsolicited `SerialNotify` received during the idle phase must
+    /// trigger an immediate resync — not wait for the (potentially hours-
+    /// long) refresh timer. This test doesn't need `tokio::time::pause`:
+    /// the server advertises the default 3600s `refresh_interval`, and the
+    /// test's own 5-second real-time timeout is itself the proof — if the
+    /// idle `tokio::select!` only ever fired on the timer branch, this test
+    /// would time out roughly 3595 seconds before that timer could.
+    #[tokio::test]
+    async fn unsolicited_serial_notify_triggers_immediate_resync_not_timer_wait() {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (config, _server) = spawn_mock_server(move |mut stream| async move {
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 1 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 1,
+                    serial: 1,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+
+            // Server-initiated notification — the client never asked for
+            // this, and the refresh timer (3600s) is nowhere close to firing.
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::SerialNotify {
+                    session_id: 1,
+                    serial: 2,
+                },
+            )
+            .await;
+
+            let observed = read_pdu(&mut stream).await.map_err(|e| e.to_string());
+            let _ = result_tx.send(observed);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (_handle, _join) = RtrClient::spawn(config);
+
+        let (next_query_version, next_query) =
+            tokio::time::timeout(Duration::from_secs(5), result_rx)
+                .await
+                .expect(
+                    "client did not resync in response to Serial Notify within 5s \
+                     — did it wait for the 3600s refresh timer instead?",
+                )
+                .expect("mock server task's result channel closed unexpectedly")
+                .expect("mock server failed to read the follow-up PDU");
+
+        assert_eq!(next_query_version, RtrVersion::V1);
+        assert_eq!(
+            next_query,
+            Pdu::SerialQuery {
+                session_id: 1,
+                serial: 1
+            }
+        );
+    }
+
     #[tokio::test]
     async fn v1_rejected_falls_back_to_v0_and_completes_sync() {
         let (config, _server) = spawn_mock_server(|mut stream| async move {
@@ -570,6 +775,136 @@ mod tests {
 
         assert_eq!(handle.status().version, Some(RtrVersion::V0));
         assert_eq!(handle.status().serial, Some(9));
+    }
+
+    /// RFC 8210 §5 documents a v0-only cache as potentially replying
+    /// directly with a version-0 response instead of an `ErrorReport` —
+    /// this is the gap the fix in `sync_once` closes: adopt whatever
+    /// version the server actually replies at, not just on an explicit
+    /// rejection.
+    #[tokio::test]
+    async fn server_silently_replies_at_v0_without_error_report() {
+        let (config, _server) = spawn_mock_server(|mut stream| async move {
+            // Client sends a v1 Reset Query...
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            // ...but the server answers directly at v0, no ErrorReport.
+            write_one(
+                &mut stream,
+                RtrVersion::V0,
+                &Pdu::CacheResponse { session_id: 5 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V0,
+                &Pdu::EndOfData {
+                    session_id: 5,
+                    serial: 1,
+                    intervals: None,
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (handle, _join) = RtrClient::spawn(config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client did not report connected within 5s");
+
+        // The status must reflect the version the server actually used,
+        // not the version the client originally sent.
+        assert_eq!(handle.status().version, Some(RtrVersion::V0));
+    }
+
+    /// After silently adopting v0 (no `ErrorReport`), the *next* outbound
+    /// query on the same connection must be encoded at v0 too — proving
+    /// the adopted version isn't forgotten after the first exchange.
+    #[tokio::test]
+    async fn adopted_version_is_used_for_subsequent_queries() {
+        // The critical assertion here happens *after* the client already
+        // reports `connected`, so it can't rely on the "malformed exchange
+        // never completes sync, so the outer .expect(connected) times out"
+        // pattern the other tests use for early-assertion protection. A
+        // `assert_eq!` inside the detached mock-server task at this point
+        // would panic silently (its `JoinHandle` is never awaited) instead
+        // of failing the test — so the observed PDU is sent back over a
+        // channel and asserted on in the test body instead, where a failure
+        // actually fails the test.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (config, _server) = spawn_mock_server(move |mut stream| async move {
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V0,
+                &Pdu::CacheResponse { session_id: 7 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V0,
+                &Pdu::EndOfData {
+                    session_id: 7,
+                    serial: 1,
+                    intervals: None,
+                },
+            )
+            .await;
+
+            // Trigger an immediate resync via SerialNotify.
+            write_one(
+                &mut stream,
+                RtrVersion::V0,
+                &Pdu::SerialNotify {
+                    session_id: 7,
+                    serial: 2,
+                },
+            )
+            .await;
+            let observed = read_pdu(&mut stream).await.map_err(|e| e.to_string());
+            let _ = result_tx.send(observed);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (handle, _join) = RtrClient::spawn(config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client did not report connected within 5s");
+
+        let (next_query_version, next_query) =
+            tokio::time::timeout(Duration::from_secs(5), result_rx)
+                .await
+                .expect("mock server did not observe a follow-up query within 5s")
+                .expect("mock server task's result channel closed unexpectedly")
+                .expect("mock server failed to read the follow-up PDU");
+
+        // The client's follow-up query must be encoded at v0 (the version
+        // byte in its header, adopted from the earlier silent downgrade),
+        // not the v1 it originally sent the Reset Query at.
+        assert_eq!(next_query_version, RtrVersion::V0);
+        assert_eq!(
+            next_query,
+            Pdu::SerialQuery {
+                session_id: 7,
+                serial: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -687,5 +1022,46 @@ mod tests {
 
         assert!(!handle.status().connected);
         assert!(handle.status().last_error.unwrap().contains("session ID"));
+    }
+
+    /// A server (misbehaving or compromised) that declares an absurd PDU
+    /// length must be rejected based on the 8-byte header alone — before
+    /// the client attempts to allocate a buffer for the (nonexistent) rest
+    /// of the PDU. Without `MAX_PDU_LEN`, this would be an unbounded
+    /// allocation attempt sized directly from untrusted network input.
+    #[tokio::test]
+    async fn oversized_pdu_length_is_rejected_without_allocating() {
+        let (config, _server) = spawn_mock_server(|mut stream| async move {
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            // Hand-craft a header claiming a length far beyond MAX_PDU_LEN,
+            // for a Cache Reset PDU (type 8) whose real length is always 8.
+            // Written directly rather than via `pdu::encode`, which always
+            // computes a correct length — we need a malicious one here.
+            let mut header = Vec::new();
+            header.push(1u8); // version 1
+            header.push(8u8); // PDU type: Cache Reset
+            header.extend_from_slice(&0u16.to_be_bytes()); // reserved field
+            header.extend_from_slice(&(u32::MAX - 1).to_be_bytes()); // absurd length
+            stream.write_all(&header).await.unwrap();
+            // Deliberately never send the (nonexistent) huge payload — the
+            // client must reject based on the header alone, not hang
+            // waiting for bytes that will never arrive.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (handle, _join) = RtrClient::spawn(config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().last_error.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client did not report an error within 5s — did it hang trying to allocate?");
+
+        assert!(!handle.status().connected);
     }
 }

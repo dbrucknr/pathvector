@@ -6,6 +6,40 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-07-01
 
+### [pathvector-rpki] RTR client hardening — three gaps found and closed via RFC re-review
+
+After Phase 1 shipped, a deliberate re-verification pass against the actual RFC 8210 §5
+text (not memory) confirmed every fixed-size PDU wire format byte-for-byte, and found
+three real gaps in `client.rs`:
+
+1. **Version fallback was too narrow.** The client only downgraded from v1 to v0 on an
+   explicit `ErrorReport { error_code: 4, .. }`. RFC 8210 §5 documents a broader real-world
+   case: a v0-only cache "responds with a version 0 response" directly, no error at all.
+   `read_pdu` previously discarded the wire version byte it decoded, so `sync_once` had no
+   way to notice a silent mismatch — every subsequent outbound query would keep encoding at
+   v1 even after a v0 cache had already accepted the session. Fixed by threading the
+   observed version out of `read_pdu` and adopting it on any `CacheResponse`, not just an
+   explicit rejection.
+2. **Unbounded allocation from an untrusted length field.** `read_pdu` allocated
+   `vec![0u8; remaining]` directly from the PDU header's `u32` length field — a
+   misbehaving or compromised RTR server could declare a length near `u32::MAX` and force
+   a multi-gigabyte allocation attempt per PDU. Added `MAX_PDU_LEN` (64 KiB, generous for
+   any legitimate PDU) checked before any allocation.
+3. **Two protocol paths were implemented but only exercised indirectly.** `CacheReset`
+   received mid-diff-stream (server can't serve an incremental update, client must restart
+   with a fresh Reset Query on the same connection) and an unsolicited `SerialNotify`
+   during the idle phase (must trigger immediate resync, not wait for the refresh timer)
+   both had working code but no test that isolated them.
+
+Three new tests close gap 3 directly (`cache_reset_mid_stream_triggers_full_resync_on_same_connection`,
+`unsolicited_serial_notify_triggers_immediate_resync_not_timer_wait`), two more prove gap 1
+is fixed (`server_silently_replies_at_v0_without_error_report`,
+`adopted_version_is_used_for_subsequent_queries`), and one proves gap 2
+(`oversized_pdu_length_is_rejected_without_allocating`). Every one of these six tests was
+verified twice: once passing against the fix, once failing when the corresponding fix was
+temporarily reverted — confirming each test actually exercises the behavior it claims to,
+not a false-positive pass. 65 tests total (up from 60), zero clippy warnings.
+
 ### [pathvector-rpki, pathvectord, pathvector-client, pathvector] RPKI Route Origin Validation — Phase 1 (RTR client, read-only)
 
 New `pathvector-rpki` crate implementing the RTR (RPKI-to-Router) protocol client
