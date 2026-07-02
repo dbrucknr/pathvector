@@ -10,11 +10,15 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-pathvector-client = { workspace = true }
-tokio             = { workspace = true, features = ["io-util"] }
-tokio-stream      = { workspace = true }
-tempfile          = "3"
-testcontainers    = "0.23"
+pathvector-client  = { workspace = true }
+pathvector-session = { workspace = true }
+pathvector-types   = { workspace = true }
+tokio              = { workspace = true, features = ["io-util"] }
+tokio-stream       = { workspace = true }
+tokio-util         = { workspace = true }
+futures            = { workspace = true }
+tempfile           = "3"
+testcontainers     = "0.23"
 
 [lints.rust]
 unsafe_code = "forbid"

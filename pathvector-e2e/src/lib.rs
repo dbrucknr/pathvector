@@ -61,6 +61,11 @@ pub const PATHVECTORD_IMAGE: &str = "pathvector-e2e";
 /// ROA scenario it serves.
 pub const MOCK_RTR_IMAGE: &str = "pathvector-mock-rtr-test";
 
+/// Mock BGP peer image built by `just e2e` from
+/// `e2e/Dockerfile.mock-bgp-peer`, used by [`RoleHarness`]. See
+/// `src/bin/mock_bgp_peer.rs` for the fixed RFC 9234 leak scenario it sends.
+pub const MOCK_BGP_PEER_IMAGE: &str = "pathvector-mock-bgp-peer-test";
+
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
@@ -577,6 +582,34 @@ export_default = "accept"
         )
         .expect("write pathvectord peer config");
     }
+    f
+}
+
+/// Writes a pathvectord config with `role = "provider"` on the single
+/// configured peer, for [`RoleHarness`]. The peer (the mock BGP peer
+/// container) is thus treated as our Customer — RFC 9234 §5 ingress leak
+/// detection applies. Otherwise identical to [`write_daemon_config`].
+fn write_daemon_config_role(peer_ip: Ipv4Addr, peer_as: u32) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+
+[[peers]]
+address        = "{peer_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {peer_as}
+import_default = "accept"
+export_default = "accept"
+role           = "provider"
+"#
+    )
+    .expect("write pathvectord config");
     f
 }
 
@@ -1664,6 +1697,79 @@ impl RpkiHarness {
             .status()
             .expect("docker exec gobgp announce");
         assert!(status.success(), "gobgp announce {prefix} failed: {status}");
+    }
+}
+
+/// Harness for the RFC 9234 (BGP Role + `ONLY_TO_CUSTOMER`) route-leak
+/// prevention e2e test — two containers, no `gobgpd`: pathvectord and a
+/// custom mock BGP peer (see `src/bin/mock_bgp_peer.rs`) that speaks real
+/// BGP and deliberately sends one leaked route and one clean route.
+pub struct RoleHarness {
+    _mock_peer: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    pub peer: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl RoleHarness {
+    /// # Panics
+    ///
+    /// Panics if either container fails to start, or the BGP session doesn't
+    /// reach `Established` within 30s.
+    pub async fn new() -> Self {
+        const MOCK_PEER_AS: u32 = 65099;
+
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-role-test-{test_id}");
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let mock_peer = GenericImage::new(MOCK_BGP_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("mock-bgp-peer-{test_id}"))
+            .start()
+            .await
+            .expect("start mock BGP peer container");
+        let mock_peer_id = mock_peer.id().to_owned();
+        let mock_peer_ip = container_network_ip(&mock_peer_id, &network_name);
+
+        let pathvectord_config = write_daemon_config_role(mock_peer_ip, MOCK_PEER_AS);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-role-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for RoleHarness");
+
+        wait_for_established(&mut client, mock_peer_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
+
+        Self {
+            _mock_peer: mock_peer,
+            _pathvectord: pathvectord,
+            _pathvectord_config: pathvectord_config,
+            client,
+            peer: mock_peer_ip,
+            _network: network,
+        }
     }
 }
 

@@ -166,8 +166,18 @@ _build-mock-rtr-image:
         -t pathvector-mock-rtr-test:latest \
         .
 
+# Build the mock BGP peer test image (multi-stage Rust build, like pathvectord's).
+_build-mock-bgp-peer-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-mock-bgp-peer-test:latest..."
+    docker build \
+        -f pathvector-e2e/Dockerfile.mock-bgp-peer \
+        -t pathvector-mock-bgp-peer-test:latest \
+        .
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge

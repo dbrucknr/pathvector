@@ -1800,11 +1800,15 @@ dependencies = [
 name = "pathvector-e2e"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "pathvector-client",
+ "pathvector-session",
+ "pathvector-types",
  "tempfile",
  "testcontainers",
  "tokio",
  "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
