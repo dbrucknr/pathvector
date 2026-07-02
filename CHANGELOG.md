@@ -6,6 +6,62 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-07-01
 
+### [pathvector-rpki, pathvectord, pathvector-client, pathvector] RPKI Route Origin Validation — Phase 1 (RTR client, read-only)
+
+New `pathvector-rpki` crate implementing the RTR (RPKI-to-Router) protocol client
+per RFC 8210 (v1, primary) with RFC 6810 (v0) automatic fallback, and an RFC 6811 §2
+ROA validity cache. Connects to an external validator (Routinator, rpki-client,
+OctoRPKI, Cloudflare gortr) — no RPKI repository sync or certificate crypto
+validation is done in-process.
+
+Deliberately scoped narrow for this phase: no `pathvector-policy` condition, no
+`Route<A>` changes, no automatic route filtering. Proves out the hardest new
+protocol code (RTR session handling, ROA table correctness) before wiring it into
+route-acceptance decisions — see TODO.md for the tracked Phase 2 follow-up.
+
+**`pathvector-rpki` internals:**
+- `pdu.rs` — RTR PDU codec (all RFC 8210 §5 PDU types), `Cursor`/`Writer`
+  bounds-checked framing mirroring `pathvector-session`'s BGP codec.
+- `table.rs` — ROA cache built on `routemap::RouteMap` (an existing sibling-project
+  crate). Composes `RouteMap`'s single-winner LPM primitives into RFC 6811's "any
+  covering ROA" semantics via a fast `NotFound` short-circuit + ancestor-prefix walk.
+  A differential proptest against a naive linear-scan reference model caught a real
+  bug in the first draft (the short-circuit conflated "contains this address at any
+  length" with "covers this prefix at length ≤ query length") — fixed and preserved
+  as a regression case in `proptest-regressions/table.txt`.
+- `client.rs` — session state machine (connect → version-negotiate → sync →
+  idle-until-refresh-or-notify → reconnect-with-backoff), tested against a
+  hand-rolled mock RTR server: full sync, v1→v0 fallback, disconnect mid-session
+  (stale data survives — a blackhole operator's ROV decisions are better served by
+  stale-but-recent data than no data), and session-ID-mismatch detection.
+- `error.rs` — manual `Display`/`Error` impls (no `thiserror` — matches the
+  workspace convention already set by `pathvector-session`).
+
+**`pathvectord` wiring:** new `[daemon.rpki]` config table (`host`, `port`; defaults
+to Routinator's conventional 8323) and `DaemonState.rpki: Option<RtrHandle>`. Spawned
+in `run_with` right after the metrics-install block, following the same
+graceful-degradation philosophy as the FIB writer and Prometheus exporter:
+`RtrClient::spawn` is async-forever and never blocks startup — connection failures
+surface later via `RtrStatus.connected == false`, which is why the gRPC/CLI status
+surface matters.
+
+**gRPC surface:** new read-only `RpkiService` (`GetRpkiStatus`, `ValidateRoa`) added
+to `proto/pathvector/v1/management.proto` (and its manually-synced copy in
+`pathvector-client/proto/` — no symlink exists between the two, confirmed before
+editing). `ValidateRoa` reuses the existing `Nlri<Ipv4Addr>`/`Nlri<Ipv6Addr>` CIDR
+parsing rather than introducing a new helper.
+
+**`pathvector-client` + CLI:** new `types::RoaValidity` / `types::RpkiStatus` domain
+types, `DaemonClient::get_rpki_status()` / `validate_roa()` trait methods (implemented
+for the real gRPC client and every test double), and new `pathvector rpki status` /
+`pathvector rpki validate <prefix> <asn>` CLI subcommands.
+
+**Test coverage:** 60 tests in `pathvector-rpki` (PDU codec round-trips + proptests,
+ROA table unit + differential proptest, mock-server client integration tests), 9 new
+`pathvectord` tests (2 daemon wiring, 7 gRPC handler), 9 new `pathvector-client` tests
+(conversion edge cases), 9 new `pathvector` CLI tests (dispatch + output smoke tests).
+Zero clippy warnings workspace-wide.
+
 ### [pathvectord] Prometheus metrics endpoint
 
 **`/metrics` HTTP endpoint** — new `metrics_port: Option<u16>` field in `[daemon]` config.

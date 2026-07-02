@@ -13,18 +13,31 @@ operation of pathvectord as an internet-facing BGP speaker.
 
 ### Tier 1 — Blocks operating safely on the internet
 
-**RPKI / Route Origin Validation (RFC 6810/6811/8210)**
-Without prefix origin validation, pathvectord cannot distinguish a legitimately
-originated route from a hijack or misconfigured announcement. For a DDoS
-blackhole operator this is especially sharp: accepting a bogus route and
-installing a blackhole null-route for it drops legitimate traffic silently.
+**RPKI / Route Origin Validation (RFC 6810/6811/8210)** — Phase 1 shipped
+(RTR client + ROA cache); see CHANGELOG.md. Remaining:
 
-Likely warrants a `pathvector-rpki` crate owning an RTR client (RFC 8210 v1,
-falling back to RFC 6810 v0) and a validity cache (`Valid`/`Invalid`/`NotFound`
-per prefix+origin-AS pair). The cache plugs into `pathvector-policy` as a new
-`RoaValidityCondition` so operators can filter `Invalid` routes in import policy.
-BIRD and FRR both implement this; it is increasingly a precondition for peering
-at IXPs. See also: existing `RPKI` entries in the pathvectord `Remaining` section.
+- **Policy enforcement (Phase 2).** `pathvector-rpki` currently only exposes a
+  read-only validity cache via gRPC/CLI (`pathvector rpki status` /
+  `validate`) — it does not filter any routes. The next step is a
+  `RoaValidityCondition` in `pathvector-policy` (capturing an
+  `Arc<pathvector_rpki::RtrHandle>` at construction, since `Condition<R>` has
+  no external-context parameter) plus default-reject-`Invalid` /
+  accept-`NotFound` wiring in `pathvectord` import policy, matching RFC 7115 /
+  BIRD / FRR convention. BIRD and FRR both implement full ROV; it is
+  increasingly a precondition for peering at IXPs.
+- **`routemap::covering_matches()`.** `pathvector-rpki/src/table.rs`'s
+  `validate()` composes a `longest_match` short-circuit with a manual
+  ancestor-prefix walk to get RFC 6811's "all covering ROAs" semantics out of
+  `routemap`'s single-winner LPM API. Since `routemap` is our own crate, a
+  native `covering_matches(prefix) -> impl Iterator<Item = (IpPrefix<A>, &V)>`
+  that walks the trie path once would be strictly better (one trie walk
+  instead of up to 33/129 `get()` calls) and would simplify `validate()` to a
+  single loop. Not required for correctness — see the "Future improvement"
+  note in `table.rs`.
+- **Dedicated mock-server tests** for `CacheReset`-triggers-resync and
+  unsolicited-`SerialNotify`-triggers-immediate-resync — both paths are
+  implemented and exercised indirectly by other tests, but don't have a test
+  that isolates them specifically. See `pathvector-rpki/RFC.md`'s ⚠️ rows.
 
 **Route leak prevention (RFC 9234)**
 Route leaks (a customer re-advertising a provider's routes to another provider)
@@ -477,13 +490,6 @@ overhead of a feature the peer cannot use. Low priority — correctness is unaff
   (`^65001 ` for routes originated by AS 65001, `_65002_` for transit through AS 65002).
   Requires a regex condition in `pathvector-policy`; the `regex` crate is the natural
   choice. Most production policy engines expose this as a first-class condition.
-
-- **RPKI / Route Origin Validation (RFC 6811)** — connect to an RTR validator
-  (RFC 6810 / RFC 8210), receive ROA payloads, mark routes as Valid / Invalid /
-  NotFound, and optionally filter Invalid routes in the import policy. Significant
-  security feature; GoBGP, BIRD, and FRR all support it. Likely warrants a new
-  `pathvector-rpki` crate owning the RTR client and validity cache, with a policy
-  condition (`RoaValidityCondition`) consuming it.
 
 - **IPv6 import policy per-AFI config** — currently IPv6 import policy is accept-all;
   per-AFI policy config (per-peer `import_default_v6`) is deferred.
