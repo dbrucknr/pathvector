@@ -752,6 +752,18 @@ async fn install_rpki(
     reject_invalid: bool,
     state: &Arc<RwLock<DaemonState>>,
 ) {
+    // Subscribe before doing anything else. `handle` was already returned
+    // by `RtrClient::spawn`, whose background sync task starts running
+    // concurrently the instant it's spawned — on a multi-thread runtime
+    // that's a real second OS thread, not just cooperative scheduling. A
+    // `watch` receiver only observes changes sent *after* it subscribes, so
+    // subscribing late risks missing the very first sync's notification
+    // outright (not just seeing it delayed). Subscribing here, before the
+    // `state.write().await` below, minimizes that window; the eager
+    // `status().connected` check further down closes it completely by
+    // catching the case where the first sync still won the race.
+    let changed = reject_invalid.then(|| handle.subscribe());
+
     {
         let mut guard = state.write().await;
         if reject_invalid {
@@ -759,15 +771,22 @@ async fn install_rpki(
         }
         guard.rpki = Some(handle.clone());
     }
-    if reject_invalid {
+    if let Some(mut changed) = changed {
+        // If the first sync already completed before we subscribed above,
+        // its notification was sent to no receiver and this one will never
+        // see it — the watch channel only fires for changes after
+        // subscription. Catch that case explicitly rather than relying on
+        // subscribe() having won the race against the background task.
+        if handle.status().connected {
+            state.write().await.reevaluate_all_import_policies();
+        }
         // Re-evaluates every peer's import policy whenever the ROA cache
-        // changes (first sync or any later update) — closes the window
-        // between "route accepted while the cache was empty/stale" and the
-        // cache actually reflecting reality, without waiting for a session
-        // reset. Ends only if the RtrClient's own task ever drops its side
-        // of the channel, which never happens in practice (that task runs
+        // changes (any later update) — closes the window between "route
+        // accepted while the cache was empty/stale" and the cache actually
+        // reflecting reality, without waiting for a session reset. Ends
+        // only if the RtrClient's own task ever drops its side of the
+        // channel, which never happens in practice (that task runs
         // forever) — a clean, non-panicking exit either way.
-        let mut changed = handle.subscribe();
         let reeval_state = Arc::clone(state);
         tokio::spawn(async move {
             while changed.changed().await.is_ok() {
@@ -11134,6 +11153,66 @@ mod run_with_tests {
         })
         .await
         .expect("reactive task did not reject the route within 5s of the cache change");
+    }
+
+    /// Regression test for a subscribe-after-spawn race: `RtrClient::spawn`
+    /// starts its background sync task before `install_rpki` gets a chance
+    /// to call `handle.subscribe()`, so if the first sync completes first,
+    /// its `watch` notification is sent to no receiver and would otherwise
+    /// be silently missed — leaving an already-accepted-but-now-Invalid
+    /// route unrejected until the next unrelated cache change.
+    ///
+    /// `for_testing()` conveniently starts in exactly that "sync already
+    /// happened" state (`status().connected == true`, ROA data already
+    /// loaded, no watch notification ever fired for it) — a deterministic
+    /// stand-in for the race, no real timing dependency needed. The route
+    /// must be rejected the instant `install_rpki` returns, without this
+    /// test ever calling `reevaluate_all_import_policies` or
+    /// `insert_roa_v4` (which would exercise the normal, already-covered
+    /// watch-notification path instead of the eager catch-up check).
+    #[tokio::test]
+    async fn install_rpki_catches_up_when_first_sync_precedes_subscribe() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let mut cfg = make_config(&[(peer_ip, 65002)]);
+        cfg.peers[0].import_default = Some(config::ImportDefault::Accept);
+        let (state, ..) = build_daemon(&cfg, spawn_fn).await;
+
+        let nlri: pathvector_types::Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        {
+            let mut guard = state.write().await;
+            guard.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+            guard.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                        PathAttribute::NextHop(peer_ip),
+                    ],
+                    announced: vec![nlri],
+                },
+            );
+        }
+        assert!(
+            state.read().await.rib.loc_rib.best(&nlri).is_some(),
+            "route should be accepted before RPKI is installed at all"
+        );
+
+        // Already "synced" before install_rpki ever calls subscribe() —
+        // stands in for the background task's first sync winning the race.
+        let rtr = pathvector_rpki::for_testing(
+            [(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 99999)],
+            std::iter::empty(),
+        );
+        install_rpki(rtr, true, &state).await;
+
+        assert!(
+            state.read().await.rib.loc_rib.best(&nlri).is_none(),
+            "install_rpki must eagerly re-evaluate once if the handle was already \
+             synced when subscribe() was called, not only react to later changes"
+        );
     }
 
     /// `build_daemon` calls the spawn function exactly once per configured peer.
