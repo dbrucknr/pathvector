@@ -90,6 +90,40 @@ a background decay timer — architecturally similar to the GR deadline timer
 already in the event loop. `pathvector-rib` would own the penalty model;
 `pathvectord` wires the timer branch.
 
+**Lock contention risk in full-daemon policy re-evaluation (2026-07-02)**
+`DaemonState::reevaluate_all_import_policies` (`pathvectord/src/daemon/policy.rs`)
+holds `DaemonState`'s single write lock for the entire duration of a sweep over
+*every* configured peer's Adj-RIB-In, re-running import policy on each stored
+route. It's called automatically by the background task `install_rpki` spawns
+(`daemon/mod.rs`), once per RPKI ROA cache change (see the reactive
+re-evaluation work in CHANGELOG.md) — i.e. on a cadence the daemon doesn't
+control, potentially every RTR incremental sync. For a deployment with many
+peers and large tables, this could mean a multi-peer stall of route
+processing / peer state transitions / gRPC reads each time the RPKI cache
+updates, since nothing else can acquire the write lock until the full sweep
+finishes.
+
+This isn't a new *pattern* — `DaemonState::set_import_default` (same file)
+already holds the lock across one peer's full Adj-RIB-In re-evaluation via the
+same `reapply_import_policy`/`reapply_import_policy_v6` primitives, and
+`set_export_default` holds it across a full Loc-RIB scan for one peer. Both
+are fine as-is: they're triggered by an explicit, infrequent operator action
+(a gRPC call), so the stall is bounded and expected. `reevaluate_all_import_policies`
+is the first caller that (a) sweeps *every* peer in one lock hold and (b) fires
+on an external, potentially frequent trigger instead of a deliberate one —
+it's an amplification of an existing, previously-acceptable tradeoff into a
+regime where it may no longer be.
+
+Not fixed yet — flagged during self-review, not confirmed as an actual problem
+in practice (RTR incremental syncs are typically infrequent, matching the
+"stale-but-recent beats absent" philosophy already established for RPKI data).
+If it does need addressing, candidate directions: (1) only re-evaluate peers
+whose Adj-RIB-In actually contains a prefix covered by the changed ROA(s),
+rather than every peer unconditionally; (2) drop and re-acquire the write lock
+between peers instead of holding it for the whole sweep; (3) debounce rapid
+successive `RtrHandle::subscribe()` notifications so a burst of incremental
+syncs triggers one sweep, not one per notification.
+
 ---
 
 ## Prioritized next steps
