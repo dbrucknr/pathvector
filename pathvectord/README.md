@@ -266,6 +266,67 @@ follow-up in `TODO.md`; it is not expected to matter for typical deployments.
 
 ---
 
+## RPKI Route Origin Validation
+
+pathvectord can connect to an external RPKI validator over the RTR protocol (RFC 8210,
+falling back to RFC 6810) and maintain a live ROA validity cache. Enable it by adding a
+`[daemon.rpki]` table:
+
+```toml
+[daemon.rpki]
+host = "127.0.0.1"
+port = 3323
+```
+
+`port` defaults to `3323` — [Routinator](https://github.com/NLnetLabs/routinator)'s
+default `--rtr` listen port. (Routinator's HTTP status/metrics API defaults to a
+different port, `8323` — easy to mix up; double-check whichever validator you're
+pointing at.)
+
+**By default, `[daemon.rpki]` filters routes, not just monitors them.** Any route whose
+RFC 6811 validity is `Invalid` — a covering ROA exists but names a different origin AS,
+or the announcement is more specific than the ROA's max length allows — is rejected on
+import, for every configured peer, IPv4 and IPv6. `Valid` and `NotFound` routes are
+unaffected. This matches RFC 7115 / BIRD / FRR default convention. Set
+`reject_invalid = false` to run RPKI in monitoring-only mode instead (cache still
+queryable via `pathvector rpki status`/`validate`, but nothing is filtered):
+
+```toml
+[daemon.rpki]
+host = "127.0.0.1"
+port = 3323
+reject_invalid = false  # monitoring only — default is true
+```
+
+Connection failures are logged and retried in the background; they never prevent the
+daemon from starting or block BGP session processing. Routes accepted before the RTR
+client's first successful sync are evaluated against an empty cache (every prefix reads
+as `NotFound`, which is accepted) — this is intentional fail-open behavior, matching the
+rest of this integration's philosophy, not a gap. RTR sync against a local validator is
+typically seconds; a session reset naturally re-evaluates routes once the cache is
+populated.
+
+```bash
+pathvector rpki status
+# RPKI:       enabled
+# Connected:  yes
+# RTR version: 1
+# Serial:     0
+# ROA count:  969408
+# Last sync:  1782995122
+
+pathvector rpki validate 1.0.0.0/24 13335
+# 1.0.0.0/24 origin AS13335: VALID
+```
+
+The example above was captured against a real `nlnetlabs/routinator` container with a
+live, fully-synced RPKI table (~970k VRPs from all five RIRs) — not synthetic test data.
+
+New to RPKI, or want the full step-by-step walkthrough (including a plain-English
+explanation of what problem this solves)? See "Local RPKI interop with Routinator" below.
+
+---
+
 ## gRPC management API
 
 The API starts alongside the BGP event loop. It is unauthenticated — in production
@@ -522,6 +583,175 @@ pv *args:
 > **Start order matters.** Always start `gobgp-up` before `dev`. pathvectord
 > dials GoBGP immediately. If GoBGP is not listening yet, the BGP FSM starts a
 > 120-second `ConnectRetry` timer (RFC 4271 §8) before trying again.
+
+---
+
+## Local RPKI interop with Routinator
+
+A step-by-step walkthrough to see RPKI Route Origin Validation working end-to-end on a
+developer machine, against a real, live RPKI dataset — not synthetic test data. If
+you're new to RPKI or BGP security, start with the "In plain English" section below
+before touching any commands.
+
+### In plain English: what is this, and why would I want it?
+
+BGP — the protocol pathvectord speaks, and the one that decides how traffic finds its
+way across the internet — runs almost entirely on trust. When a network announces "I
+originate 192.0.2.0/24," other networks mostly just believe it. There's no built-in
+mechanism in BGP itself to check whether that announcement is legitimate.
+
+That's exploitable. If someone else announces a prefix they don't own — by mistake or
+on purpose — some of the internet's traffic for that prefix can get misdirected to
+them instead of the real owner. This is a **BGP hijack**, and it happens in the real
+world regularly, sometimes by accident (a router config typo that "leaks" globally)
+and sometimes deliberately (traffic interception, denial of service).
+
+**RPKI (Resource Public Key Infrastructure)** lets a prefix's legitimate owner publish
+a cryptographically signed statement — a **ROA (Route Origin Authorization)** — of the
+form "AS 65001 is authorized to originate 192.0.2.0/24." **Route Origin Validation**
+checks incoming BGP routes against the full set of published ROAs and labels each one
+`Valid`, `Invalid` (a ROA exists but contradicts this announcement — likely a hijack),
+or `NotFound` (no ROA published — common, since RPKI adoption isn't universal, and
+treated as "unverifiable" rather than "bad").
+
+Actually validating ROAs requires downloading and cryptographically verifying
+certificate chains from RPKI repositories — a big, security-sensitive job of its own.
+pathvectord doesn't do this itself. Instead it delegates to a separate program called
+an **RPKI validator**, and talks to it over a lightweight protocol called **RTR**
+(RPKI-to-Router Protocol). This walkthrough uses
+[Routinator](https://github.com/NLnetLabs/routinator), NLnet Labs' open-source
+validator, running in Docker.
+
+pathvectord maintains a live, queryable cache of RPKI validity, and — by default —
+automatically rejects routes it finds `Invalid` (see `reject_invalid` above). This
+walkthrough shows both sides: inspecting the cache directly, and confirming a
+misoriginated route actually gets rejected.
+
+### 1. Start Routinator
+
+```bash
+docker run -d --name routinator -p 3323:3323 -p 8323:8323 nlnetlabs/routinator:latest
+```
+
+Two ports matter here, and it's easy to mix them up:
+
+| Port | Protocol | Used for |
+|---|---|---|
+| `3323` | RTR (RFC 8210) | What pathvectord actually connects to |
+| `8323` | HTTP | Routinator's own status page and metrics — useful for watching progress below, but pathvectord never talks to it |
+
+### 2. Wait for the first sync to complete
+
+On a fresh container, Routinator needs to download and cryptographically verify
+certificate chains from all five Regional Internet Registries (ARIN, RIPE, APNIC,
+LACNIC, AFRINIC) before it can answer any RTR queries. This commonly takes a few
+minutes. Poll its status page until it reports real numbers instead of "ongoing":
+
+```bash
+curl -s http://localhost:8323/status
+```
+
+```text
+Initial validation ongoing. Please wait.
+```
+
+...eventually becomes...
+
+```text
+version: routinator/0.15.2
+serial: 0
+valid-roas: 377985
+valid-roas-per-tal: afrinic=11791 apnic=48108 arin=223467 lacnic=34017 ripe=60602
+vrps: 978014
+```
+
+### 3. Configure and start pathvectord
+
+**`rpki-config.toml`:**
+
+```toml
+[daemon]
+local_as  = 65099
+bgp_id    = "10.99.0.1"
+bgp_port  = 1179
+grpc_port = 51199
+
+[daemon.rpki]
+host = "127.0.0.1"
+port = 3323
+```
+
+No BGP peers are configured here on purpose — this walkthrough is specifically about
+the RPKI cache, not a full BGP session. (Combine this `[daemon.rpki]` block with a real
+`[[peers]]` section, like the ones in the [GoBGP](#local-interop-with-gobgp) or
+[BIRD](#manual-peering-with-bird) walkthroughs above, to see ROV context alongside real
+routes.)
+
+```bash
+RUST_LOG=info cargo run -p pathvectord -- rpki-config.toml
+```
+
+You should see:
+
+```text
+INFO pathvectord::daemon: RPKI RTR client started host=127.0.0.1 port=3323
+INFO pathvectord::grpc: gRPC management API listening addr=0.0.0.0:51199
+```
+
+### 4. Check the cache with the CLI
+
+```bash
+cargo run -p pathvector -- --address http://127.0.0.1:51199 rpki status
+```
+
+```text
+RPKI:       enabled
+Connected:  yes
+RTR version: 1
+Serial:     0
+ROA count:  969408
+Last sync:  1782995122
+```
+
+`Connected: yes` and a non-zero `ROA count` mean pathvectord successfully spoke RTR to
+Routinator and has a live copy of (nearly) the whole internet's published ROA set —
+almost a million entries, refreshed automatically in the background for as long as the
+daemon runs.
+
+### 5. Validate a real, well-known prefix
+
+`1.0.0.0/24`, originated by `AS13335` (Cloudflare — this range backs their `1.1.1.1`
+public DNS resolver), has a real, stable ROA you can check against at any time:
+
+```bash
+PV="cargo run -p pathvector -- --address http://127.0.0.1:51199"
+
+# The real origin AS — should print VALID.
+$PV rpki validate 1.0.0.0/24 13335
+
+# The same prefix, a made-up wrong AS — should print INVALID. A ROA does
+# cover this prefix, but it doesn't authorize AS 99999 to originate it.
+$PV rpki validate 1.0.0.0/24 99999
+
+# RFC 5737 TEST-NET-1 — reserved for documentation, deliberately never
+# allocated or covered by any ROA — should print NOTFOUND.
+$PV rpki validate 192.0.2.0/24 65001
+```
+
+```text
+1.0.0.0/24 origin AS13335: VALID
+1.0.0.0/24 origin AS99999: INVALID
+192.0.2.0/24 origin AS65001: NOTFOUND
+```
+
+Every example on this page was captured against a real Routinator container with a
+live, fully-synced RPKI table — not mocked or synthetic data.
+
+### 6. Clean up
+
+```bash
+docker stop routinator && docker rm routinator
+```
 
 ---
 

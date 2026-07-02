@@ -289,6 +289,60 @@ pub(crate) fn format_origin(origin: pathvector_client::types::Origin) -> &'stati
     }
 }
 
+// ── RPKI output ───────────────────────────────────────────────────────────────
+
+/// Print RTR session status and ROA cache statistics.
+pub fn print_rpki_status(status: &pathvector_client::types::RpkiStatus) {
+    if !status.enabled {
+        println!("RPKI:       disabled ([daemon.rpki] not configured)");
+        return;
+    }
+    println!("RPKI:       enabled");
+    println!(
+        "Connected:  {}",
+        if status.connected { "yes" } else { "no" }
+    );
+    println!(
+        "RTR version: {}",
+        if status.rtr_version.is_empty() {
+            "\u{2014}"
+        } else {
+            &status.rtr_version
+        }
+    );
+    println!(
+        "Serial:     {}",
+        status
+            .serial
+            .map_or_else(|| "\u{2014}".to_owned(), |s| s.to_string())
+    );
+    println!("ROA count:  {}", status.roa_count);
+    println!(
+        "Last sync:  {}",
+        status
+            .last_update_unix
+            .map_or_else(|| "\u{2014}".to_owned(), |t| t.to_string())
+    );
+    if let Some(err) = &status.last_error {
+        println!("Last error: {err}");
+    }
+}
+
+/// Print the result of a single ROA validation query.
+pub fn print_roa_validity(
+    prefix: &str,
+    origin_as: u32,
+    validity: pathvector_client::types::RoaValidity,
+) {
+    let label = match validity {
+        pathvector_client::types::RoaValidity::Valid => "VALID",
+        pathvector_client::types::RoaValidity::Invalid => "INVALID",
+        pathvector_client::types::RoaValidity::NotFound => "NOTFOUND",
+        _ => "UNKNOWN",
+    };
+    println!("{prefix} origin AS{origin_as}: {label}");
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -646,5 +700,50 @@ mod tests {
             event_type: PeerEventType::Changed,
             peer: None,
         });
+    }
+
+    #[test]
+    fn print_rpki_status_disabled() {
+        print_rpki_status(&pathvector_client::types::RpkiStatus {
+            enabled: false,
+            connected: false,
+            rtr_version: String::new(),
+            serial: None,
+            roa_count: 0,
+            last_update_unix: None,
+            last_error: None,
+        });
+    }
+
+    #[test]
+    fn print_rpki_status_enabled_connected_with_error() {
+        print_rpki_status(&pathvector_client::types::RpkiStatus {
+            enabled: true,
+            connected: true,
+            rtr_version: "1".to_string(),
+            serial: Some(42),
+            roa_count: 1000,
+            last_update_unix: Some(1_700_000_000),
+            last_error: Some("connection reset".to_string()),
+        });
+    }
+
+    #[test]
+    fn print_roa_validity_all_variants() {
+        print_roa_validity(
+            "192.0.2.0/24",
+            65001,
+            pathvector_client::types::RoaValidity::Valid,
+        );
+        print_roa_validity(
+            "192.0.2.0/24",
+            65001,
+            pathvector_client::types::RoaValidity::Invalid,
+        );
+        print_roa_validity(
+            "192.0.2.0/24",
+            65001,
+            pathvector_client::types::RoaValidity::NotFound,
+        );
     }
 }

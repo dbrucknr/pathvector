@@ -156,8 +156,18 @@ _build-frr-image:
         -t pathvector-frr-test:latest \
         pathvector-e2e/
 
+# Build the mock RTR server test image (multi-stage Rust build, like pathvectord's).
+_build-mock-rtr-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-mock-rtr-test:latest..."
+    docker build \
+        -f pathvector-e2e/Dockerfile.mock-rtr \
+        -t pathvector-mock-rtr-test:latest \
+        .
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge
@@ -237,17 +247,28 @@ mrt mrt_file='':
 
 # Compile all fuzz targets (no fuzzing — fast compile check)
 fuzz-build:
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} build
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} build --fuzz-dir pathvector-fuzz
 
-# Smoke-run every target for 60 s each — used by CI
+# Smoke-run every target for 60 s each — used by CI.
+# Corpus dirs aren't committed (see .gitignore) — cargo-fuzz errors if the
+# target directory doesn't exist, so create it on a fresh clone / cache miss.
 fuzz-smoke: fuzz-build
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_framing pathvector-fuzz/corpus/session_framing -- -max_total_time=60
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_message pathvector-fuzz/corpus/session_message -- -max_total_time=60
+    mkdir -p pathvector-fuzz/corpus/session_framing pathvector-fuzz/corpus/session_message pathvector-fuzz/corpus/rtr_pdu
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_framing pathvector-fuzz/corpus/session_framing -- -max_total_time=60
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_message pathvector-fuzz/corpus/session_message -- -max_total_time=60
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz rtr_pdu pathvector-fuzz/corpus/rtr_pdu -- -max_total_time=60
 
 # Extended fuzzing of the framing decode path — runs until Ctrl-C, grows corpus
 fuzz-framing corpus="pathvector-fuzz/corpus/session_framing":
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_framing {{corpus}}
+    mkdir -p {{corpus}}
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_framing {{corpus}}
 
 # Extended fuzzing of the message decode path — runs until Ctrl-C, grows corpus
 fuzz-message corpus="pathvector-fuzz/corpus/session_message":
-    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run session_message {{corpus}}
+    mkdir -p {{corpus}}
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz session_message {{corpus}}
+
+# Extended fuzzing of the RTR PDU decode path — runs until Ctrl-C, grows corpus
+fuzz-rtr-pdu corpus="pathvector-fuzz/corpus/rtr_pdu":
+    mkdir -p {{corpus}}
+    PATH="{{nightly-bin}}:$PATH" {{cargo-fuzz-bin}} run --fuzz-dir pathvector-fuzz rtr_pdu {{corpus}}

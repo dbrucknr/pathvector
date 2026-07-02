@@ -4,7 +4,153 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (Phase 2)
+
+### [pathvector-policy, pathvector-rpki, pathvectord] RPKI Phase 2 — automatic route filtering on ROA validity
+
+Phase 1 (see below) shipped a read-only RTR client and ROA cache; this closes the
+`TODO.md`-tracked follow-up by making pathvectord actually reject invalid routes,
+matching RFC 7115 / BIRD / FRR default convention.
+
+Added `RoaValidityCondition<A>` to `pathvector-policy` — an RFC 6811 `Condition<R>` that
+captures an `RtrHandle` at construction and matches routes whose ROA validity equals a
+target state. Address-family dispatch (`validate_v4` vs `validate_v6`) is bridged
+through a small sealed `RoaLookup` trait so the condition stays one generic `impl`
+(mirroring `PrefixListCondition`'s existing style) rather than two impls that would risk
+coherence-checker overlap.
+
+`pathvectord` wires a "reject `Invalid`" term into every configured peer's IPv4 and IPv6
+import policy via a new `DaemonState::install_rpki_import_terms`, called once right
+after the RTR client spawns (not threaded through `DaemonState::new`, to avoid touching
+its ~30 existing test call sites). Gated by a new `[daemon.rpki].reject_invalid` config
+field, default `true`; set to `false` for RPKI monitoring-only mode. `Valid` and
+`NotFound` routes are unaffected — they fall through to each peer's existing default
+action exactly as before this change.
+
+Also added a `test-util` Cargo feature to `pathvector-rpki` exposing
+`RtrHandle::for_testing(v4, v6)` — builds a handle with deterministic pre-seeded ROA
+data, so both `pathvector-policy` and `pathvectord` get fast, network-free ROV tests
+instead of needing a mock RTR server.
+
+## 2026-07-02
+
+### [pathvectord, pathvector-rpki] Real-world RPKI smoke test against Routinator — found and fixed a wrong default port
+
+Every RPKI test up to this point ran against a hand-rolled mock RTR server. Ran
+`pathvectord` against a real `nlnetlabs/routinator` Docker container with a fully-synced
+live RPKI table (~970k VRPs, all five RIRs) to validate the whole stack end-to-end —
+config → RTR client → ROA cache → gRPC → CLI — against real protocol behavior and real
+data, not synthetic fixtures.
+
+**Result:** connected, negotiated RTR v1 with the real server, synced 969,408 ROA
+entries. Validated three real (prefix, origin AS) outcomes against live data and got all
+three right: `1.0.0.0/24` origin `AS13335` (Cloudflare) → `VALID`; the same prefix with a
+wrong origin AS → `INVALID`; `192.0.2.0/24` (RFC 5737 TEST-NET-1, deliberately
+unallocated) → `NOTFOUND`. Also confirmed the IPv6 "exceeds ROA max-length" case
+(`2001:200::/48` under a ROA whose max-length is `/32`) correctly returns `INVALID`, not
+`NOTFOUND`. Zero warnings or errors logged during the session.
+
+**Bug found:** `RpkiConfig::port`'s documented default of `8323` was wrong — that's
+Routinator's *HTTP* status/metrics port, not its RTR port. The default `--rtr` port is
+`3323`. Confirmed directly against the published Docker image's exposed ports and default
+`CMD`. Fixed the default in both `pathvectord::config::default_rtr_port` and
+`pathvector_rpki::RtrConfig::default()`, plus doc comments in both crates.
+
+**Also added:** an "RPKI Route Origin Validation" section to `pathvectord/README.md`
+(previously undocumented — the feature had shipped without a README section), using the
+real numbers from this smoke test as the worked example rather than placeholder values.
+
 ## 2026-07-01
+
+### [pathvector-rpki] RTR client hardening — three gaps found and closed via RFC re-review
+
+After Phase 1 shipped, a deliberate re-verification pass against the actual RFC 8210 §5
+text (not memory) confirmed every fixed-size PDU wire format byte-for-byte, and found
+three real gaps in `client.rs`:
+
+1. **Version fallback was too narrow.** The client only downgraded from v1 to v0 on an
+   explicit `ErrorReport { error_code: 4, .. }`. RFC 8210 §5 documents a broader real-world
+   case: a v0-only cache "responds with a version 0 response" directly, no error at all.
+   `read_pdu` previously discarded the wire version byte it decoded, so `sync_once` had no
+   way to notice a silent mismatch — every subsequent outbound query would keep encoding at
+   v1 even after a v0 cache had already accepted the session. Fixed by threading the
+   observed version out of `read_pdu` and adopting it on any `CacheResponse`, not just an
+   explicit rejection.
+2. **Unbounded allocation from an untrusted length field.** `read_pdu` allocated
+   `vec![0u8; remaining]` directly from the PDU header's `u32` length field — a
+   misbehaving or compromised RTR server could declare a length near `u32::MAX` and force
+   a multi-gigabyte allocation attempt per PDU. Added `MAX_PDU_LEN` (64 KiB, generous for
+   any legitimate PDU) checked before any allocation.
+3. **Two protocol paths were implemented but only exercised indirectly.** `CacheReset`
+   received mid-diff-stream (server can't serve an incremental update, client must restart
+   with a fresh Reset Query on the same connection) and an unsolicited `SerialNotify`
+   during the idle phase (must trigger immediate resync, not wait for the refresh timer)
+   both had working code but no test that isolated them.
+
+Three new tests close gap 3 directly (`cache_reset_mid_stream_triggers_full_resync_on_same_connection`,
+`unsolicited_serial_notify_triggers_immediate_resync_not_timer_wait`), two more prove gap 1
+is fixed (`server_silently_replies_at_v0_without_error_report`,
+`adopted_version_is_used_for_subsequent_queries`), and one proves gap 2
+(`oversized_pdu_length_is_rejected_without_allocating`). Every one of these six tests was
+verified twice: once passing against the fix, once failing when the corresponding fix was
+temporarily reverted — confirming each test actually exercises the behavior it claims to,
+not a false-positive pass. 65 tests total (up from 60), zero clippy warnings.
+
+### [pathvector-rpki, pathvectord, pathvector-client, pathvector] RPKI Route Origin Validation — Phase 1 (RTR client, read-only)
+
+New `pathvector-rpki` crate implementing the RTR (RPKI-to-Router) protocol client
+per RFC 8210 (v1, primary) with RFC 6810 (v0) automatic fallback, and an RFC 6811 §2
+ROA validity cache. Connects to an external validator (Routinator, rpki-client,
+OctoRPKI, Cloudflare gortr) — no RPKI repository sync or certificate crypto
+validation is done in-process.
+
+Deliberately scoped narrow for this phase: no `pathvector-policy` condition, no
+`Route<A>` changes, no automatic route filtering. Proves out the hardest new
+protocol code (RTR session handling, ROA table correctness) before wiring it into
+route-acceptance decisions — see TODO.md for the tracked Phase 2 follow-up.
+
+**`pathvector-rpki` internals:**
+- `pdu.rs` — RTR PDU codec (all RFC 8210 §5 PDU types), `Cursor`/`Writer`
+  bounds-checked framing mirroring `pathvector-session`'s BGP codec.
+- `table.rs` — ROA cache built on `routemap::RouteMap` (an existing sibling-project
+  crate). Composes `RouteMap`'s single-winner LPM primitives into RFC 6811's "any
+  covering ROA" semantics via a fast `NotFound` short-circuit + ancestor-prefix walk.
+  A differential proptest against a naive linear-scan reference model caught a real
+  bug in the first draft (the short-circuit conflated "contains this address at any
+  length" with "covers this prefix at length ≤ query length") — fixed and preserved
+  as a regression case in `proptest-regressions/table.txt`.
+- `client.rs` — session state machine (connect → version-negotiate → sync →
+  idle-until-refresh-or-notify → reconnect-with-backoff), tested against a
+  hand-rolled mock RTR server: full sync, v1→v0 fallback, disconnect mid-session
+  (stale data survives — a blackhole operator's ROV decisions are better served by
+  stale-but-recent data than no data), and session-ID-mismatch detection.
+- `error.rs` — manual `Display`/`Error` impls (no `thiserror` — matches the
+  workspace convention already set by `pathvector-session`).
+
+**`pathvectord` wiring:** new `[daemon.rpki]` config table (`host`, `port`; defaults
+to Routinator's conventional 8323) and `DaemonState.rpki: Option<RtrHandle>`. Spawned
+in `run_with` right after the metrics-install block, following the same
+graceful-degradation philosophy as the FIB writer and Prometheus exporter:
+`RtrClient::spawn` is async-forever and never blocks startup — connection failures
+surface later via `RtrStatus.connected == false`, which is why the gRPC/CLI status
+surface matters.
+
+**gRPC surface:** new read-only `RpkiService` (`GetRpkiStatus`, `ValidateRoa`) added
+to `proto/pathvector/v1/management.proto` (and its manually-synced copy in
+`pathvector-client/proto/` — no symlink exists between the two, confirmed before
+editing). `ValidateRoa` reuses the existing `Nlri<Ipv4Addr>`/`Nlri<Ipv6Addr>` CIDR
+parsing rather than introducing a new helper.
+
+**`pathvector-client` + CLI:** new `types::RoaValidity` / `types::RpkiStatus` domain
+types, `DaemonClient::get_rpki_status()` / `validate_roa()` trait methods (implemented
+for the real gRPC client and every test double), and new `pathvector rpki status` /
+`pathvector rpki validate <prefix> <asn>` CLI subcommands.
+
+**Test coverage:** 60 tests in `pathvector-rpki` (PDU codec round-trips + proptests,
+ROA table unit + differential proptest, mock-server client integration tests), 9 new
+`pathvectord` tests (2 daemon wiring, 7 gRPC handler), 9 new `pathvector-client` tests
+(conversion edge cases), 9 new `pathvector` CLI tests (dispatch + output smoke tests).
+Zero clippy warnings workspace-wide.
 
 ### [pathvectord] Prometheus metrics endpoint
 

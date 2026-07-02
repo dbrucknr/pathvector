@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys      = "0.4"
 pathvector-session = { path = "../pathvector-session" }
+pathvector-rpki    = { path = "../pathvector-rpki", features = ["test-util"] }
 bytes              = "1"
 tokio-util         = { version = "0.7", features = ["codec"] }
 
@@ -23,6 +24,13 @@ doc = false
 [[bin]]
 name = "session_message"
 path = "fuzz_targets/session_message.rs"
+test = false
+doc = false
+
+# RTR PDU codec target
+[[bin]]
+name = "rtr_pdu"
+path = "fuzz_targets/rtr_pdu.rs"
 test = false
 doc = false
 

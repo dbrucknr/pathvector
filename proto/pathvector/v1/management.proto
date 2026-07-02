@@ -506,3 +506,56 @@ service OriginationService {
   rpc ListOriginatedRoutes(ListOriginatedRoutesRequest)
       returns (ListOriginatedRoutesResponse);
 }
+
+// ── RPKI (RTR) ───────────────────────────────────────────────────────────────
+
+/// RFC 6811 §2 Route Origin Validation state for a (prefix, origin AS) pair.
+enum RoaValidityState {
+  ROA_VALIDITY_STATE_UNSPECIFIED = 0;
+  ROA_VALIDITY_STATE_VALID       = 1;
+  ROA_VALIDITY_STATE_INVALID     = 2;
+  ROA_VALIDITY_STATE_NOT_FOUND   = 3;
+}
+
+message GetRpkiStatusRequest {}
+
+message GetRpkiStatusResponse {
+  /// False when RPKI is not configured ([daemon.rpki] absent).
+  bool enabled = 1;
+  /// True when the RTR session is currently established and synced.
+  bool connected = 2;
+  /// Negotiated RTR protocol version: "1" (RFC 8210) or "0" (RFC 6810).
+  /// Empty if never connected.
+  string rtr_version = 3;
+  /// Cache serial number from the last successful sync. Absent if never synced.
+  optional uint32 serial = 4;
+  /// Total ROA entry count across both address families.
+  uint64 roa_count = 5;
+  /// Unix timestamp (seconds) of the last successful sync. Absent if never synced.
+  optional int64 last_update_unix = 6;
+  /// Human-readable description of the most recent connection error, if any.
+  string last_error = 7;
+}
+
+message ValidateRoaRequest {
+  /// Prefix in CIDR notation, e.g. "192.0.2.0/24".
+  string prefix = 1;
+  uint32 origin_as = 2;
+}
+
+message ValidateRoaResponse {
+  RoaValidityState state = 1;
+}
+
+service RpkiService {
+  /// Returns RTR session state and ROA cache statistics.
+  rpc GetRpkiStatus(GetRpkiStatusRequest) returns (GetRpkiStatusResponse);
+
+  /// Validates a single (prefix, origin AS) pair against the current ROA
+  /// cache per RFC 6811 §2. Read-only — does not affect route processing.
+  ///
+  /// Status codes:
+  ///   FAILED_PRECONDITION — RPKI is not configured on this daemon
+  ///   INVALID_ARGUMENT    — prefix is not valid CIDR notation
+  rpc ValidateRoa(ValidateRoaRequest) returns (ValidateRoaResponse);
+}

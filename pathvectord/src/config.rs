@@ -180,6 +180,56 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub restarting: bool,
+    /// RPKI Route Origin Validation via the RTR protocol (RFC 8210 / RFC 6810).
+    ///
+    /// When present, pathvectord connects to an external RPKI validator
+    /// (Routinator, rpki-client, OctoRPKI, Cloudflare gortr, etc.) and
+    /// maintains a live ROA validity cache. Connection failures are logged
+    /// and retried in the background — they never prevent the daemon from
+    /// starting or processing BGP sessions. Omit this table to disable RPKI
+    /// support (the default).
+    ///
+    /// Phase 1: read-only cache queryable via gRPC/CLI. Does not affect
+    /// route acceptance or best-path selection.
+    ///
+    /// ```toml
+    /// [daemon.rpki]
+    /// host = "127.0.0.1"
+    /// port = 3323
+    /// ```
+    #[serde(default)]
+    pub rpki: Option<RpkiConfig>,
+}
+
+/// RTR server connection settings for RPKI Route Origin Validation.
+#[derive(Deserialize, Clone)]
+pub struct RpkiConfig {
+    pub host: String,
+    /// TCP port of the RTR server. Defaults to `3323`, Routinator's default
+    /// `--rtr` listen port (confirmed against `nlnetlabs/routinator`'s
+    /// published Docker image, which exposes `3323/tcp` for RTR and
+    /// `8323/tcp` for its HTTP status/metrics API — an earlier default of
+    /// `8323` here was a mix-up between the two).
+    #[serde(default = "default_rtr_port")]
+    pub port: u16,
+    /// Reject routes whose RFC 6811 validity is `Invalid` — a covering ROA
+    /// exists but names a different origin AS, or the announcement is more
+    /// specific than the ROA's max length allows. `Valid` and `NotFound`
+    /// routes are unaffected. Matches RFC 7115 / BIRD / FRR default
+    /// convention. Applied to every configured peer's import policy, IPv4
+    /// and IPv6. Set to `false` to run RPKI in monitoring-only mode (cache
+    /// still queryable via `pathvector rpki status`/`validate`, but nothing
+    /// is filtered).
+    #[serde(default = "default_true")]
+    pub reject_invalid: bool,
+}
+
+fn default_rtr_port() -> u16 {
+    3323
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_fib_table() -> u32 {

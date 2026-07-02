@@ -56,10 +56,18 @@ pub const GOBGPD_IMAGE: &str = "pathvector-gobgpd-test";
 /// pathvectord image built by `just e2e` from `e2e/Dockerfile.pathvectord`.
 pub const PATHVECTORD_IMAGE: &str = "pathvector-e2e";
 
+/// Mock RTR server image built by `just e2e` from `e2e/Dockerfile.mock-rtr`,
+/// used by [`RpkiHarness`]. See `src/bin/mock_rtr_server.rs` for the fixed
+/// ROA scenario it serves.
+pub const MOCK_RTR_IMAGE: &str = "pathvector-mock-rtr-test";
+
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
 pub const GOBGPD_BGP_PORT: u16 = 179;
+
+/// RTR listen port inside the mock RTR server container (RFC 8210 default).
+pub const MOCK_RTR_PORT: u16 = 3323;
 
 /// gRPC management port inside the pathvectord container.
 pub const PATHVECTORD_GRPC_PORT: u16 = 51_200;
@@ -512,6 +520,45 @@ bgp_id       = "10.0.0.2"
 hold_time    = 9
 grpc_port    = {PATHVECTORD_GRPC_PORT}
 metrics_port = {PATHVECTORD_METRICS_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `[daemon.rpki]` pointed at `rpki_host`
+/// (the mock RTR server's container IP), for [`RpkiHarness`]. `reject_invalid`
+/// defaults to `true` — exactly the behavior under test. Otherwise identical
+/// to [`write_daemon_config`].
+fn write_daemon_config_rpki(peers: &[(Ipv4Addr, u32)], rpki_host: Ipv4Addr) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+
+[daemon.rpki]
+host = "{rpki_host}"
+port = {MOCK_RTR_PORT}
 "#
     )
     .expect("write pathvectord config header");
@@ -1490,6 +1537,158 @@ impl MetricsHarness {
             .status()
             .expect("docker exec gobgp announce");
         assert!(status.success(), "gobgp announce {prefix} failed: {status}");
+    }
+}
+
+/// Stands up GoBGP + a mock RTR server + pathvectord (`[daemon.rpki]`
+/// configured, default `reject_invalid = true`) and waits for both the BGP
+/// session and the RTR sync to complete.
+///
+/// The mock RTR server ([`MOCK_RTR_IMAGE`], built from
+/// `Dockerfile.mock-rtr`) serves a fixed, deterministic pair of ROAs over
+/// the real RFC 8210 wire protocol — see `src/bin/mock_rtr_server.rs` for
+/// the exact scenario. This proves pathvectord actually rejects an Invalid
+/// route delivered over a real BGP session, not just that `pathvector rpki
+/// validate` reports `INVALID` in isolation (which the mock-server-free
+/// unit tests in `pathvectord`/`pathvector-policy` already cover).
+///
+/// A dedicated struct rather than another `Harness` constructor: `Harness`'s
+/// shared constructors all funnel through `new_inner_with_gobgp_config`,
+/// whose `make_cfg` closure signature has no way to carry the mock RTR
+/// server's discovered IP — mirrors [`MetricsHarness`]'s existing precedent
+/// of a separate struct for a scenario with a different container topology.
+pub struct RpkiHarness {
+    _gobgpd: ContainerAsync<GenericImage>,
+    _mock_rtr: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    pub gobgpd_id: String,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    pub peer: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl RpkiHarness {
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, the BGP session doesn't
+    /// reach `Established` within 30s, or the RTR sync doesn't complete
+    /// within 15s.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-rpki-test-{test_id}");
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-rpki-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                gobgpd_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd container");
+        let gobgpd_id = gobgpd.id().to_owned();
+        let gobgpd_ip = container_network_ip(&gobgpd_id, &network_name);
+
+        let mock_rtr = GenericImage::new(MOCK_RTR_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("mock-rtr-{test_id}"))
+            .start()
+            .await
+            .expect("start mock RTR server container");
+        let mock_rtr_id = mock_rtr.id().to_owned();
+        let mock_rtr_ip = container_network_ip(&mock_rtr_id, &network_name);
+
+        let pathvectord_config = write_daemon_config_rpki(&[(gobgpd_ip, 65001)], mock_rtr_ip);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-rpki-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for RpkiHarness");
+
+        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
+        wait_for_rpki_synced(&mut client, Duration::from_secs(15))
+            .await
+            .expect("RTR sync with the mock server did not complete within 15 s");
+
+        Self {
+            _gobgpd: gobgpd,
+            _mock_rtr: mock_rtr,
+            _pathvectord: pathvectord,
+            gobgpd_id,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            peer: gobgpd_ip,
+            _network: network,
+        }
+    }
+
+    /// Announce a prefix from GoBGP into pathvectord's RIB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_announce(&self, prefix: &str, nexthop: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp", "global", "rib", "add", prefix, "nexthop", nexthop, "origin", "igp",
+            ])
+            .status()
+            .expect("docker exec gobgp announce");
+        assert!(status.success(), "gobgp announce {prefix} failed: {status}");
+    }
+}
+
+/// Polls until pathvectord reports its RTR session as connected and synced
+/// (`roa_count > 0`).
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the RTR sync completes.
+pub async fn wait_for_rpki_synced(
+    client: &mut PathvectorClient,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err("timed out waiting for RTR sync with the mock server".to_string());
+        }
+        if let Ok(status) = client.get_rpki_status().await
+            && status.connected
+            && status.roa_count > 0
+        {
+            return Ok(());
+        }
     }
 }
 

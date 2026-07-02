@@ -5,6 +5,7 @@ mod route;
 
 pub mod action;
 pub mod condition;
+pub mod rpki;
 pub mod term;
 
 #[cfg(test)]
@@ -24,6 +25,9 @@ pub use condition::{
     Condition, LargeCommunityCondition, LocalPrefCondition, MedCondition, Not, OriginCondition,
     PrefixListCondition,
 };
+
+// RPKI Route Origin Validation
+pub use rpki::RoaValidityCondition;
 
 // Actions
 pub use action::{

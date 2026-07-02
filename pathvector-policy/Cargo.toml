@@ -13,11 +13,13 @@ keywords.workspace = true
 
 [dependencies]
 pathvector-types = { workspace = true }
+pathvector-rpki  = { workspace = true }
 ipnetx           = { workspace = true }
 routemap         = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+pathvector-rpki = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

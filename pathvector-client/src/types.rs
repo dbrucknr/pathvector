@@ -299,3 +299,40 @@ pub struct PeerEvent {
     /// removal event fires.
     pub peer: Option<PeerState>,
 }
+
+// ── RPKI ──────────────────────────────────────────────────────────────────────
+
+/// RFC 6811 §2 Route Origin Validation state for a (prefix, origin AS) pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum RoaValidity {
+    /// A covering ROA authorizes this exact origin AS for this prefix length.
+    Valid,
+    /// At least one covering ROA exists, but none authorize this origin AS
+    /// and prefix length combination.
+    Invalid,
+    /// No ROA covers this prefix at all.
+    NotFound,
+}
+
+/// RTR session state and ROA cache statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RpkiStatus {
+    /// `false` when `[daemon.rpki]` is not configured on the daemon.
+    pub enabled: bool,
+    /// `true` when the RTR session is currently established and synced.
+    pub connected: bool,
+    /// Negotiated RTR protocol version: `"1"` (RFC 8210) or `"0"` (RFC 6810).
+    /// Empty if never connected.
+    pub rtr_version: String,
+    /// Cache serial number from the last successful sync; [`None`] if never synced.
+    pub serial: Option<u32>,
+    /// Total ROA entry count across both address families.
+    pub roa_count: u64,
+    /// Unix timestamp (seconds) of the last successful sync; [`None`] if never synced.
+    pub last_update_unix: Option<i64>,
+    /// Human-readable description of the most recent connection error, if any.
+    pub last_error: Option<String>,
+}

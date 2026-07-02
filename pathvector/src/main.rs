@@ -44,7 +44,8 @@ use pathvector_client::{
 };
 
 use cli::{
-    Cli, Commands, Decision, OriginArg, PeerCommands, PolicyCommands, RouteCommands, WatchCommands,
+    Cli, Commands, Decision, OriginArg, PeerCommands, PolicyCommands, RouteCommands, RpkiCommands,
+    WatchCommands,
 };
 use client_trait::DaemonClient;
 use error::CliError;
@@ -264,6 +265,20 @@ where
                 }
                 PolicyCommands::SetExport { peer, decision } => {
                     client.set_export_default(&peer, decision.as_bool()).await?;
+                }
+            }
+        }
+
+        Commands::Rpki { command } => {
+            let mut client = connect(addr)?;
+            match command {
+                RpkiCommands::Status => {
+                    let status = client.get_rpki_status().await?;
+                    output::print_rpki_status(&status);
+                }
+                RpkiCommands::Validate { prefix, origin_as } => {
+                    let validity = client.validate_roa(&prefix, origin_as).await?;
+                    output::print_roa_validity(&prefix, origin_as, validity);
                 }
             }
         }
@@ -1033,6 +1048,47 @@ mod tests {
         ));
         assert!(
             run_cmd(&["pv", "policy", "set-export", "10.0.0.1", "reject"], mock)
+                .await
+                .is_err()
+        );
+    }
+
+    // ── rpki ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rpki_status_ok() {
+        run_cmd(&["pv", "rpki", "status"], MockDaemonClient::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpki_status_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(run_cmd(&["pv", "rpki", "status"], mock).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rpki_validate_ok() {
+        run_cmd(
+            &["pv", "rpki", "validate", "192.0.2.0/24", "65001"],
+            MockDaemonClient::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpki_validate_propagates_error() {
+        let mut mock = MockDaemonClient::new();
+        mock.force_error = Some(pathvector_client::error::ClientError::Rpc(
+            tonic::Status::unavailable("no daemon"),
+        ));
+        assert!(
+            run_cmd(&["pv", "rpki", "validate", "192.0.2.0/24", "65001"], mock)
                 .await
                 .is_err()
         );

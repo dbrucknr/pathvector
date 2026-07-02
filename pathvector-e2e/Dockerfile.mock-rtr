@@ -1,31 +1,29 @@
-# pathvectord image for pathvector-e2e tests.
+# Mock RTR (RPKI-to-Router Protocol) server for the pathvector-e2e RPKI test.
 #
-# Multi-stage build: Stage 1 compiles pathvectord inside a Rust toolchain
-# container (linux/arm64 on Apple Silicon — native speed, no QEMU).
-# Stage 2 copies only the binary into a slim runtime image.
+# Serves a fixed, deterministic pair of ROAs over the real RFC 8210 v1 wire
+# protocol — hand-encoded independently of pathvector-rpki's own encoder, so
+# this test proves pathvector-rpki's *decoder* against bytes it didn't
+# produce itself. See src/bin/mock_rtr_server.rs for the exact scenario.
+#
+# Multi-stage build, mirroring Dockerfile.pathvectord exactly.
 #
 # Built from the workspace root so all crate members are in context:
-#   docker build -f pathvector-e2e/Dockerfile.pathvectord -t pathvector-e2e:latest .
+#   docker build -f pathvector-e2e/Dockerfile.mock-rtr -t pathvector-mock-rtr-test:latest .
 
 # ── Stage 1: compile ──────────────────────────────────────────────────────────
 
 FROM rust:1.88-slim-bookworm AS builder
 
-# protoc is required by prost-build's code-generation step.
+# protoc is required by prost-build's code-generation step (pathvector-client
+# is a dependency of pathvector-e2e).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
-# CARGO_PROFILE: "debug" (default, used by e2e tests) or "release" (published image).
-ARG CARGO_PROFILE=debug
-
-# Copy workspace manifest and lock file first so dependency fetching is
-# cached as a separate layer — only invalidated when Cargo.lock changes.
 COPY Cargo.toml Cargo.lock ./
 
-# Copy every workspace member.
 COPY pathvector-types/    pathvector-types/
 COPY pathvector-policy/   pathvector-policy/
 COPY pathvector-rib/      pathvector-rib/
@@ -41,30 +39,23 @@ COPY pathvector-mrt/      pathvector-mrt/
 COPY pathvector-e2e/                 pathvector-e2e/
 COPY proto/               proto/
 
-RUN if [ "$CARGO_PROFILE" = "release" ]; then \
-        cargo build --release -p pathvectord; \
-    else \
-        cargo build -p pathvectord; \
-    fi
+RUN cargo build -p pathvector-e2e --bin mock_rtr_server
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 
 FROM debian:bookworm-slim
 
 # netcat-openbsd: nc for HEALTHCHECK TCP probe.
-# iproute2: ip-route(8) for FIB e2e tests (verify RTPROT_BGP routes installed).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends netcat-openbsd iproute2 \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-ARG CARGO_PROFILE=debug
-COPY --from=builder /workspace/target/${CARGO_PROFILE}/pathvectord /usr/local/bin/pathvectord
+COPY --from=builder /workspace/target/debug/mock_rtr_server /usr/local/bin/mock_rtr_server
 
-# 51200 — gRPC management API (mapped to a dynamic host port by testcontainers)
-EXPOSE 51200
+# 3323 — RTR (RFC 8210), container-to-container only, never mapped to host.
+EXPOSE 3323
 
-# Verify the gRPC port is accepting TCP connections.
 HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
-    CMD nc -z 127.0.0.1 51200 || exit 1
+    CMD nc -z 127.0.0.1 3323 || exit 1
 
-ENTRYPOINT ["pathvectord"]
+ENTRYPOINT ["mock_rtr_server"]

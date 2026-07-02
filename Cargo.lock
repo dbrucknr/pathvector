@@ -1826,6 +1826,7 @@ name = "pathvector-policy"
 version = "0.1.0"
 dependencies = [
  "ipnetx",
+ "pathvector-rpki",
  "pathvector-types",
  "proptest",
  "routemap",
@@ -1844,6 +1845,18 @@ dependencies = [
  "routemap",
  "smallvec",
  "tikv-jemallocator",
+]
+
+[[package]]
+name = "pathvector-rpki"
+version = "0.1.0"
+dependencies = [
+ "ipnetx",
+ "pathvector-types",
+ "proptest",
+ "routemap",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1908,6 +1921,7 @@ dependencies = [
  "pathvector-client",
  "pathvector-policy",
  "pathvector-rib",
+ "pathvector-rpki",
  "pathvector-session",
  "pathvector-sys",
  "pathvector-types",

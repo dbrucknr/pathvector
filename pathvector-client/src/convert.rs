@@ -7,8 +7,8 @@ use crate::{
     proto,
     types::{
         Aggregator, AsSegment, AsSegmentType, LargeCommunity, Origin, OriginateRouteParams,
-        PeerEvent, PeerEventType, PeerState, PeerType, Route, RouteEvent, RouteEventType,
-        SessionState,
+        PeerEvent, PeerEventType, PeerState, PeerType, RoaValidity, Route, RouteEvent,
+        RouteEventType, RpkiStatus, SessionState,
     },
 };
 
@@ -313,6 +313,41 @@ impl TryFrom<proto::PeerEvent> for PeerEvent {
             event_type: PeerEventType::try_from(p.r#type)?,
             peer: p.peer.map(PeerState::try_from).transpose()?,
         })
+    }
+}
+
+// ── RPKI ──────────────────────────────────────────────────────────────────────
+
+impl TryFrom<i32> for RoaValidity {
+    type Error = ConvertError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            // ROA_VALIDITY_STATE_VALID = 1
+            1 => Ok(Self::Valid),
+            // ROA_VALIDITY_STATE_INVALID = 2
+            2 => Ok(Self::Invalid),
+            // ROA_VALIDITY_STATE_UNSPECIFIED = 0 (treat as NotFound — a
+            // well-behaved server never sends this, but a query against an
+            // unsynced cache has the same practical meaning to the caller)
+            // ROA_VALIDITY_STATE_NOT_FOUND = 3
+            0 | 3 => Ok(Self::NotFound),
+            other => Err(ConvertError::UnknownEnumValue("RoaValidityState", other)),
+        }
+    }
+}
+
+impl From<proto::GetRpkiStatusResponse> for RpkiStatus {
+    fn from(p: proto::GetRpkiStatusResponse) -> Self {
+        Self {
+            enabled: p.enabled,
+            connected: p.connected,
+            rtr_version: p.rtr_version,
+            serial: p.serial,
+            roa_count: p.roa_count,
+            last_update_unix: p.last_update_unix,
+            last_error: (!p.last_error.is_empty()).then_some(p.last_error),
+        }
     }
 }
 
@@ -1376,5 +1411,87 @@ mod tests {
             peer: Some(bad_peer),
         };
         assert!(PeerEvent::try_from(ev).is_err());
+    }
+
+    // ── RoaValidity / RpkiStatus ─────────────────────────────────────────────
+
+    #[test]
+    fn roa_validity_valid() {
+        assert_eq!(RoaValidity::try_from(1).unwrap(), RoaValidity::Valid);
+    }
+
+    #[test]
+    fn roa_validity_invalid() {
+        assert_eq!(RoaValidity::try_from(2).unwrap(), RoaValidity::Invalid);
+    }
+
+    #[test]
+    fn roa_validity_not_found() {
+        assert_eq!(RoaValidity::try_from(3).unwrap(), RoaValidity::NotFound);
+    }
+
+    #[test]
+    fn roa_validity_unspecified_maps_to_not_found() {
+        // Proto ROA_VALIDITY_STATE_UNSPECIFIED = 0. A well-behaved server
+        // never sends this, but treat it the same as NotFound rather than
+        // erroring — matches SessionState's forward-compatibility policy.
+        assert_eq!(RoaValidity::try_from(0).unwrap(), RoaValidity::NotFound);
+    }
+
+    #[test]
+    fn roa_validity_unknown_value_is_error() {
+        assert!(RoaValidity::try_from(99).is_err());
+    }
+
+    #[test]
+    fn rpki_status_from_proto_disabled() {
+        let p = proto::GetRpkiStatusResponse {
+            enabled: false,
+            ..Default::default()
+        };
+        let status = RpkiStatus::from(p);
+        assert!(!status.enabled);
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn rpki_status_from_proto_empty_error_string_maps_to_none() {
+        let p = proto::GetRpkiStatusResponse {
+            enabled: true,
+            connected: true,
+            last_error: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(RpkiStatus::from(p).last_error, None);
+    }
+
+    #[test]
+    fn rpki_status_from_proto_nonempty_error_string_is_preserved() {
+        let p = proto::GetRpkiStatusResponse {
+            last_error: "connection refused".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            RpkiStatus::from(p).last_error,
+            Some("connection refused".to_string())
+        );
+    }
+
+    #[test]
+    fn rpki_status_from_proto_preserves_serial_and_roa_count() {
+        let p = proto::GetRpkiStatusResponse {
+            enabled: true,
+            connected: true,
+            rtr_version: "1".to_string(),
+            serial: Some(42),
+            roa_count: 1000,
+            last_update_unix: Some(1_700_000_000),
+            last_error: String::new(),
+        };
+        let status = RpkiStatus::from(p);
+        assert_eq!(status.serial, Some(42));
+        assert_eq!(status.roa_count, 1000);
+        assert_eq!(status.last_update_unix, Some(1_700_000_000));
+        assert_eq!(status.rtr_version, "1");
     }
 }

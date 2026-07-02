@@ -11,6 +11,34 @@ impl DaemonState {
         self.import_policies.insert(peer_ip, Policy::new(action));
         self.import_policies_v6.insert(peer_ip, Policy::new(action));
 
+        self.reevaluate_import_for_peer(peer_ip);
+        self.flush_pending();
+    }
+
+    /// Re-evaluates every configured peer's Adj-RIB-In against its
+    /// **current, unchanged** import policy — everything `set_import_default`
+    /// does, minus replacing the policy. Called whenever the RPKI ROA cache
+    /// changes (see `pathvector_rpki::RtrHandle::subscribe`, wired up in
+    /// `run_with`), so a route accepted while the cache was empty or stale
+    /// gets correctly re-judged once the cache reflects it — this closes the
+    /// "fail open until next session reset" window and reacts to a ROA
+    /// changing after the fact, matching BIRD/FRR's ROA-table-triggered
+    /// channel reload.
+    pub(crate) fn reevaluate_all_import_policies(&mut self) {
+        let peer_ips: Vec<Ipv4Addr> = self.import_policies.keys().copied().collect();
+        for peer_ip in peer_ips {
+            self.reevaluate_import_for_peer(peer_ip);
+        }
+        self.flush_pending();
+    }
+
+    /// Re-evaluates one peer's Adj-RIB-In (both address families) against
+    /// its current import policy, updates Loc-RIB and the FIB, and
+    /// propagates any resulting changes to other peers. Shared by
+    /// `set_import_default` (policy replaced first) and
+    /// `reevaluate_all_import_policies` (policy left as-is). Does **not**
+    /// call `flush_pending` — callers do that once, after their own loop.
+    fn reevaluate_import_for_peer(&mut self, peer_ip: Ipv4Addr) {
         // Collect affected NLRIs before the mutable borrow of loc_rib so the
         // borrow checker does not see two simultaneous borrows of `self`.
         let nlris: Vec<Nlri<Ipv4Addr>> = self
@@ -19,7 +47,7 @@ impl DaemonState {
             .map(|a| a.routes().map(|(n, _)| *n).collect())
             .unwrap_or_default();
 
-        // Re-evaluate the peer's Adj-RIB-In against the new policy.
+        // Re-evaluate the peer's Adj-RIB-In against the current policy.
         // Clone oracle before the mutable borrow of rib so the borrow checker
         // sees oracle_v4 and rib as independent fields of self.
         let oracle = Arc::clone(&self.oracle_v4);
@@ -43,7 +71,7 @@ impl DaemonState {
         // events too so the dashboard reflects the Loc-RIB change.
         self.emit_route_events(&nlris);
 
-        // Re-evaluate IPv6 Adj-RIB-In against the same policy change.
+        // Re-evaluate IPv6 Adj-RIB-In against the same policy.
         let nlris_v6: Vec<Nlri<Ipv6Addr>> = self
             .adj_ribs_in_v6
             .get(&peer_ip)
@@ -67,7 +95,6 @@ impl DaemonState {
         }
 
         self.propagate_to_all_peers_v6(&nlris_v6);
-        self.flush_pending();
     }
 
     /// Replaces the export-policy default for `peer_ip` and re-evaluates the

@@ -162,9 +162,9 @@ dependencies = [
 
 [[package]]
 name = "ipnetx"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66a41eaf30def4acb80956c4fad7f2593821496fb1985bb91356752a8a055be2"
+checksum = "50d6743467d5a35b780780bee8efdc46478ca2892f5563db20342a93d8c93dd3"
 
 [[package]]
 name = "jobserver"
@@ -293,8 +293,20 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
+ "pathvector-rpki",
  "pathvector-session",
  "tokio-util",
+]
+
+[[package]]
+name = "pathvector-rpki"
+version = "0.1.0"
+dependencies = [
+ "ipnetx",
+ "pathvector-types",
+ "routemap",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -358,6 +370,15 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "routemap"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7764e61350b2789b402d59415cbd887cc0561364a9fc5dd753c43343f4fa205"
+dependencies = [
+ "ipnetx",
+]
 
 [[package]]
 name = "rtnetlink"
@@ -466,6 +487,7 @@ version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
