@@ -220,6 +220,8 @@ impl TryFrom<proto::PeerState> for PeerState {
             eor_ipv4_received: p.eor_ipv4_received,
             eor_ipv6_received: p.eor_ipv6_received,
             peer_gr_restart_time: p.peer_gr_restart_time,
+            configured_role: (!p.configured_role.is_empty()).then_some(p.configured_role),
+            negotiated_role: (!p.negotiated_role.is_empty()).then_some(p.negotiated_role),
         })
     }
 }
@@ -400,6 +402,8 @@ mod tests {
             eor_ipv4_received: false,
             eor_ipv6_received: false,
             peer_gr_restart_time: 0,
+            configured_role: String::new(),
+            negotiated_role: String::new(),
         }
     }
 
@@ -975,6 +979,23 @@ mod tests {
         assert_eq!(ps.prefixes_received, 100);
         assert_eq!(ps.prefixes_accepted, 80);
         assert_eq!(ps.prefixes_advertised, 50);
+    }
+
+    #[test]
+    fn peer_state_role_absent_maps_to_none() {
+        let ps = PeerState::try_from(minimal_proto_peer_state()).unwrap();
+        assert_eq!(ps.configured_role, None);
+        assert_eq!(ps.negotiated_role, None);
+    }
+
+    #[test]
+    fn peer_state_role_present_maps_to_some() {
+        let mut p = minimal_proto_peer_state();
+        p.configured_role = "customer".into();
+        p.negotiated_role = "provider".into();
+        let ps = PeerState::try_from(p).unwrap();
+        assert_eq!(ps.configured_role, Some("customer".to_owned()));
+        assert_eq!(ps.negotiated_role, Some("provider".to_owned()));
     }
 
     #[test]

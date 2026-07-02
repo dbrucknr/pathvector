@@ -123,6 +123,12 @@ pub fn print_peer_detail(peer: &PeerState) {
     println!("Received:   {} prefix(es)", peer.prefixes_received);
     println!("Accepted:   {} prefix(es)", peer.prefixes_accepted);
     println!("Advertised: {} prefix(es)", peer.prefixes_advertised);
+    if let Some(role) = &peer.configured_role {
+        println!("Role:       {role} (configured)");
+    }
+    if let Some(role) = &peer.negotiated_role {
+        println!("            {role} (negotiated)");
+    }
 }
 
 // ── Route output ──────────────────────────────────────────────────────────────
@@ -449,6 +455,8 @@ mod tests {
             eor_ipv4_received: false,
             eor_ipv6_received: false,
             peer_gr_restart_time: 0,
+            configured_role: None,
+            negotiated_role: None,
         }
     }
 

@@ -241,6 +241,19 @@ struct PeerServiceImpl {
     stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
 }
 
+/// Renders an RFC 9234 [`Role`] the same way as `PeerConfig.role`'s TOML
+/// values (`"provider"`, `"rs"`, `"rs_client"`, `"customer"`, `"peer"`), so
+/// gRPC/CLI output matches what an operator wrote in config.
+fn role_to_str(role: pathvector_types::Role) -> &'static str {
+    match role {
+        pathvector_types::Role::Provider => "provider",
+        pathvector_types::Role::RouteServer => "rs",
+        pathvector_types::Role::RsClient => "rs_client",
+        pathvector_types::Role::Customer => "customer",
+        pathvector_types::Role::Peer => "peer",
+    }
+}
+
 /// Build a `PeerState` proto message from daemon state for `addr`.
 ///
 /// Returns `None` if `addr` is not in `peer_remote_as` (i.e. not configured).
@@ -307,6 +320,14 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
             .gr_capable_peers
             .get(&addr)
             .map_or(0, |&t| u32::from(t)),
+        configured_role: snap
+            .peer_roles
+            .get(&addr)
+            .map_or_else(String::new, |&r| role_to_str(r).to_string()),
+        negotiated_role: snap
+            .negotiated_roles
+            .get(&addr)
+            .map_or_else(String::new, |&r| role_to_str(r).to_string()),
     })
 }
 
@@ -507,6 +528,7 @@ impl PeerService for PeerServiceImpl {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -1413,6 +1435,7 @@ mod tests {
                 max_prefixes_v4: None,
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
+                role: None,
             })
             .collect();
         DaemonState::new(
@@ -1510,6 +1533,29 @@ mod tests {
         let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.prefixes_received, 1);
         assert_eq!(ps.prefixes_accepted, 1);
+    }
+
+    #[test]
+    fn test_build_peer_state_role_absent_by_default() {
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let s = make_state(65001, &[(addr, 65002)]);
+        let ps = build_peer_state(&s.rib, addr).unwrap();
+        assert_eq!(ps.configured_role, "");
+        assert_eq!(ps.negotiated_role, "");
+    }
+
+    #[test]
+    fn test_build_peer_state_includes_configured_and_negotiated_role() {
+        use pathvector_types::Role;
+
+        let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let mut s = make_state(65001, &[(addr, 65002)]);
+        s.rib_mut().peer_roles.insert(addr, Role::Customer);
+        s.rib_mut().negotiated_roles.insert(addr, Role::Provider);
+
+        let ps = build_peer_state(&s.rib, addr).unwrap();
+        assert_eq!(ps.configured_role, "customer");
+        assert_eq!(ps.negotiated_role, "provider");
     }
 
     // ── route_to_proto ────────────────────────────────────────────────────────

@@ -136,6 +136,14 @@ pub struct PeerState {
     /// an unclean session loss. Zero means the peer either did not advertise
     /// GracefulRestart or advertised `restart_time = 0` (EOR-only, no GR window).
     pub peer_gr_restart_time: u32,
+    /// This peer's configured RFC 9234 BGP Role (`"provider"`, `"rs"`,
+    /// `"rs_client"`, `"customer"`, or `"peer"`). [`None`] when no role is
+    /// configured for this peer.
+    pub configured_role: Option<String>,
+    /// The peer's negotiated RFC 9234 BGP Role, from their advertised Role
+    /// capability in OPEN. [`None`] if the session is not established or the
+    /// peer did not advertise a Role capability.
+    pub negotiated_role: Option<String>,
 }
 
 /// A single BGP route with all path attributes.
