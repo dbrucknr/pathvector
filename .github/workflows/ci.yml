@@ -137,40 +137,50 @@ jobs:
           cache-from: type=gha,scope=frr
           cache-to: type=gha,mode=max,scope=frr
 
+      - name: Build mock RTR image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pathvector-e2e/Dockerfile.mock-rtr
+          load: true
+          tags: pathvector-mock-rtr-test:latest
+          cache-from: type=gha,scope=mock-rtr
+          cache-to: type=gha,mode=max,scope=mock-rtr
+
       - name: Run e2e tests
         run: cargo test -p pathvector-e2e -- --test-threads=4
 
   # ── Fuzz ────────────────────────────────────────────────────────────────────
-  # fuzz:
-  #   name: Fuzz (smoke)
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 15
-  #   steps:
-  #     - uses: actions/checkout@v6
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
 
-  #     - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly
 
-  #     - uses: Swatinem/rust-cache@v2
-  #       with:
-  #         key: fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
 
-  #     - name: Install just
-  #       uses: extractions/setup-just@v2
+      - name: Install just
+        uses: extractions/setup-just@v2
 
-  #     - name: Install cargo-fuzz
-  #       run: cargo install cargo-fuzz --locked
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
-  #     - name: Smoke-run fuzz targets
-  #       run: just fuzz-smoke
+      - name: Smoke-run fuzz targets
+        run: just fuzz-smoke
 
-  #     # Upload crash inputs if any target panics, so they can be reproduced locally.
-  #     - name: Upload crash artifacts
-  #       if: failure()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: fuzz-crashes
-  #         path: pathvector-fuzz/artifacts/
-  #         if-no-files-found: ignore
+      # Upload crash inputs if any target panics, so they can be reproduced locally.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: pathvector-fuzz/artifacts/
+          if-no-files-found: ignore
 
   coverage:
     runs-on: ubuntu-latest

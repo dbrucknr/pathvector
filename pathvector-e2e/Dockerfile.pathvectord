@@ -32,6 +32,7 @@ COPY pathvector-rib/      pathvector-rib/
 COPY pathvector-session/  pathvector-session/
 COPY pathvector-sys/      pathvector-sys/
 COPY pathvector-bmp/      pathvector-bmp/
+COPY pathvector-rpki/     pathvector-rpki/
 COPY pathvector-client/   pathvector-client/
 COPY pathvector/          pathvector/
 COPY pathvectord/         pathvectord/

@@ -3,13 +3,13 @@
 
 # Rust build artifacts
 /target
-fuzz/target/
+pathvector-fuzz/target/
 
 # Fuzz — corpus is committed (accumulated fuzzer knowledge used by CI).
 # Artifacts are crash reproducers that should be investigated and fixed, not
 # stored long-term. Coverage data is generated on demand, not tracked.
-fuzz/artifacts/
-fuzz/coverage/
+pathvector-fuzz/artifacts/
+pathvector-fuzz/coverage/
 
 # Editor — project-level configs are committed (.zed/settings.json) so that
 # LSP and other shared settings work for all contributors. Only personal /

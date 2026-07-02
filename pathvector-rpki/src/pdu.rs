@@ -652,6 +652,30 @@ fn decode_router_key_body(
     Ok(Pdu::RouterKey)
 }
 
+/// Decodes one PDU from the start of `buf` exactly as `client.rs`'s
+/// `read_pdu` does off a live socket — 8-byte header, then `len - 8` more
+/// bytes — except operating on an in-memory slice instead of async I/O.
+/// Discards the result either way; only used to prove the decoder never
+/// panics on adversarial input.
+///
+/// Exposed only for fuzzing (`pathvector-fuzz`'s `rtr_pdu` target); not part
+/// of the crate's normal public API — real callers only ever decode PDUs
+/// already framed off a live TCP stream (see `client.rs`).
+#[cfg(any(test, feature = "test-util"))]
+pub fn decode_for_fuzzing(buf: &[u8]) {
+    if buf.len() < HEADER_LEN as usize {
+        return;
+    }
+    let Ok((version, pdu_type, field, len)) = decode_header(buf) else {
+        return;
+    };
+    let len_usize = len as usize;
+    if len < HEADER_LEN || buf.len() < len_usize || len > 64 * 1024 {
+        return;
+    }
+    let _ = decode_payload(version, pdu_type, field, len, &buf[..len_usize]);
+}
+
 fn expect_len(pdu_type: PduType, actual: u32, expected: u32) -> Result<(), PduError> {
     if actual == expected {
         Ok(())

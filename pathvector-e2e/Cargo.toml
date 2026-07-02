@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 pathvector-client = { workspace = true }
-tokio             = { workspace = true }
+tokio             = { workspace = true, features = ["io-util"] }
 tokio-stream      = { workspace = true }
 tempfile          = "3"
 testcontainers    = "0.23"

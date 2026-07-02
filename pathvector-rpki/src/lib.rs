@@ -21,3 +21,5 @@ pub use table::{RoaTable, RoaValidity};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use client::for_testing;
+#[cfg(any(test, feature = "test-util"))]
+pub use pdu::decode_for_fuzzing;

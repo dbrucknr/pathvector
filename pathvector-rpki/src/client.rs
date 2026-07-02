@@ -17,6 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::watch,
 };
 use tracing::warn;
 
@@ -117,6 +118,10 @@ impl RtrStatus {
 struct Shared {
     table: RoaTable,
     status: RwLock<RtrStatus>,
+    /// Fires whenever the ROA table changes (a completed sync, full or
+    /// incremental). The value itself is an unused generation counter — only
+    /// the change notification matters. See [`RtrHandle::subscribe`].
+    changed: watch::Sender<u64>,
 }
 
 /// A cheap-clone (`Arc`-backed) handle to a running RTR client. Safe to hold
@@ -144,6 +149,17 @@ impl RtrHandle {
     pub fn status(&self) -> RtrStatus {
         self.0.status.read().unwrap().clone()
     }
+
+    /// Returns a receiver that fires whenever the ROA table changes — a
+    /// completed sync, full or incremental. Callers should re-evaluate
+    /// anything derived from ROA validity (e.g. `pathvectord`'s import
+    /// policies) on each change; this is what lets a route accepted before
+    /// the first sync (or before a ROA update) get correctly re-judged once
+    /// the cache reflects it, without waiting for a session reset.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.changed.subscribe()
+    }
 }
 
 /// Namespace for spawning an RTR client; not constructed directly.
@@ -159,6 +175,7 @@ impl RtrClient {
         let shared = Arc::new(Shared {
             table: RoaTable::new(),
             status: RwLock::new(RtrStatus::disconnected()),
+            changed: watch::channel(0).0,
         });
         let handle = RtrHandle(Arc::clone(&shared));
         let join = tokio::spawn(run_session_loop(config, shared));
@@ -201,7 +218,51 @@ pub fn for_testing(
     RtrHandle(Arc::new(Shared {
         table,
         status: RwLock::new(status),
+        changed: watch::channel(0).0,
     }))
+}
+
+impl RtrHandle {
+    /// Inserts one ROA into the cache and fires the same change notification
+    /// a real incremental sync would — for tests that need to simulate "a
+    /// ROA was published/changed" after the handle was already built (e.g.
+    /// via [`for_testing`]), without a real or mock RTR server.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal status lock is poisoned (a prior holder
+    /// panicked while holding it) — not an expected runtime condition.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn insert_roa_v4(&self, prefix: Ipv4Addr, prefix_len: u8, max_len: u8, asn: u32) {
+        self.0.table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
+            flags: pdu::PrefixFlags { announce: true },
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+        });
+        self.0.status.write().unwrap().roa_count = self.0.table.len();
+        self.0.changed.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// IPv6 counterpart of [`RtrHandle::insert_roa_v4`].
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal status lock is poisoned (a prior holder
+    /// panicked while holding it) — not an expected runtime condition.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn insert_roa_v6(&self, prefix: Ipv6Addr, prefix_len: u8, max_len: u8, asn: u32) {
+        self.0.table.apply_prefix_pdu(&Pdu::Ipv6Prefix {
+            flags: pdu::PrefixFlags { announce: true },
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+        });
+        self.0.status.write().unwrap().roa_count = self.0.table.len();
+        self.0.changed.send_modify(|g| *g = g.wrapping_add(1));
+    }
 }
 
 /// Outer reconnect loop. Never returns except via task cancellation.
@@ -443,6 +504,10 @@ async fn apply_diff_stream(
                     });
                 }
                 shared.table.set_serial(*serial);
+                // Fires on every completed sync, full or incremental — the
+                // single, correct point to notify subscribers (see
+                // `RtrHandle::subscribe`) that the table just changed.
+                shared.changed.send_modify(|g| *g = g.wrapping_add(1));
                 return Ok(DiffOutcome::Complete(*intervals));
             }
             other => {
@@ -602,6 +667,145 @@ mod tests {
         assert_eq!(status.version, Some(RtrVersion::V1));
         assert_eq!(status.serial, Some(1));
         assert_eq!(status.roa_count, 1);
+    }
+
+    /// `RtrHandle::subscribe`'s receiver must fire once the first sync
+    /// completes — this is the signal `pathvectord` uses to re-evaluate
+    /// routes that were accepted while the cache was still empty.
+    #[tokio::test]
+    async fn subscribe_fires_after_full_sync_completes() {
+        let (config, _server) = spawn_mock_server(|mut stream| async move {
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 1 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 1,
+                    serial: 1,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (handle, _join) = RtrClient::spawn(config);
+        let mut changed = handle.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(5), changed.changed())
+            .await
+            .expect("subscribe() did not fire within 5s")
+            .expect("watch sender dropped unexpectedly");
+    }
+
+    /// A second, incremental sync (triggered by an unsolicited
+    /// `SerialNotify`) must fire the same channel again — proves the
+    /// notification isn't a one-shot "first sync only" signal, since a ROA
+    /// published after startup must also trigger re-evaluation.
+    #[tokio::test]
+    async fn subscribe_fires_again_after_incremental_sync() {
+        let (config, _server) = spawn_mock_server(|mut stream| async move {
+            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 1 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 1,
+                    serial: 1,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::SerialNotify {
+                    session_id: 1,
+                    serial: 2,
+                },
+            )
+            .await;
+            assert_eq!(
+                read_one(&mut stream).await,
+                Pdu::SerialQuery {
+                    session_id: 1,
+                    serial: 1,
+                }
+            );
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 1 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 1,
+                    serial: 2,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+
+        let (handle, _join) = RtrClient::spawn(config);
+        let mut changed = handle.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(5), changed.changed())
+            .await
+            .expect("subscribe() did not fire for the first sync within 5s")
+            .expect("watch sender dropped unexpectedly");
+        tokio::time::timeout(Duration::from_secs(5), changed.changed())
+            .await
+            .expect("subscribe() did not fire again for the incremental sync within 5s")
+            .expect("watch sender dropped unexpectedly");
+    }
+
+    /// `insert_roa_v4`/`insert_roa_v6` must fire the same channel a real
+    /// sync does — proves the test-util mutation path and the real wire path
+    /// share one notification mechanism, not two that could drift apart.
+    #[test]
+    fn insert_roa_v4_and_v6_fire_the_same_channel_as_real_sync() {
+        let handle = for_testing(std::iter::empty(), std::iter::empty());
+        let mut changed = handle.subscribe();
+        assert!(changed.has_changed().is_ok_and(|c| !c));
+
+        handle.insert_roa_v4(Ipv4Addr::new(192, 0, 2, 0), 24, 24, 65001);
+        assert!(changed.has_changed().unwrap());
+        changed.mark_unchanged();
+
+        handle.insert_roa_v6("2001:db8::".parse().unwrap(), 32, 32, 65001);
+        assert!(changed.has_changed().unwrap());
     }
 
     /// RFC 8210 §5.7: a `CacheReset` PDU received mid-diff (in place of a

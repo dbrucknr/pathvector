@@ -679,13 +679,7 @@ where
             port: rpki_cfg.port,
             ..Default::default()
         });
-        {
-            let mut guard = state.write().await;
-            if rpki_cfg.reject_invalid {
-                guard.install_rpki_import_terms(&handle);
-            }
-            guard.rpki = Some(handle);
-        }
+        install_rpki(handle, rpki_cfg.reject_invalid, &state).await;
         tracing::info!(
             host = %rpki_cfg.host,
             port = rpki_cfg.port,
@@ -742,6 +736,45 @@ where
     }
 
     run_event_loop(event_rx, state, stop_senders, Some(fib_change_rx)).await;
+}
+
+/// Installs the ROV import-policy term (if `reject_invalid`) and stores
+/// `handle` on `state`. If `reject_invalid`, also spawns the background task
+/// that re-evaluates every peer's import policy whenever `handle`'s ROA
+/// cache changes (see `pathvector_rpki::RtrHandle::subscribe`).
+///
+/// Split out from `run_with` so this exact sequence is directly testable
+/// against any `RtrHandle` — a real one from `RtrClient::spawn`, or a
+/// `for_testing()`/`insert_roa_v4`-driven one in tests — without needing a
+/// live TCP RTR server either way.
+async fn install_rpki(
+    handle: pathvector_rpki::RtrHandle,
+    reject_invalid: bool,
+    state: &Arc<RwLock<DaemonState>>,
+) {
+    {
+        let mut guard = state.write().await;
+        if reject_invalid {
+            guard.install_rpki_import_terms(&handle);
+        }
+        guard.rpki = Some(handle.clone());
+    }
+    if reject_invalid {
+        // Re-evaluates every peer's import policy whenever the ROA cache
+        // changes (first sync or any later update) — closes the window
+        // between "route accepted while the cache was empty/stale" and the
+        // cache actually reflecting reality, without waiting for a session
+        // reset. Ends only if the RtrClient's own task ever drops its side
+        // of the channel, which never happens in practice (that task runs
+        // forever) — a clean, non-panicking exit either way.
+        let mut changed = handle.subscribe();
+        let reeval_state = Arc::clone(state);
+        tokio::spawn(async move {
+            while changed.changed().await.is_ok() {
+                reeval_state.write().await.reevaluate_all_import_policies();
+            }
+        });
+    }
 }
 
 pub(crate) async fn build_daemon<H, F>(
@@ -2468,6 +2501,62 @@ mod tests {
         );
 
         assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+    }
+
+    #[test]
+    fn test_reevaluate_all_import_policies_closes_fail_open_window() {
+        // Gap 3: a route accepted while the RTR cache was still empty (the
+        // window before the first sync completes) must get correctly
+        // rejected once the cache actually reflects it as Invalid, without
+        // needing a session reset. reevaluate_all_import_policies is what
+        // makes that happen.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
+        state.install_rpki_import_terms(&rtr);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        // Accepted now: the cache is empty, so this reads as NotFound.
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(peer_ip),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some());
+
+        // The cache now learns of a ROA that makes this exact route Invalid
+        // (covers 10.0.0.0/8, but authorizes a different ASN).
+        rtr.insert_roa_v4(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 99999);
+        state.reevaluate_all_import_policies();
+
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "route must be rejected once the cache reflects it as Invalid"
+        );
+    }
+
+    #[test]
+    fn test_reevaluate_all_import_policies_does_not_duplicate_terms() {
+        // Regression guard: reevaluate_all_import_policies must never touch
+        // the installed Policy itself (unlike set_import_default, which
+        // replaces it) — calling it repeatedly must not grow the term list.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
+        state.install_rpki_import_terms(&rtr);
+
+        let before = state.import_policies[&peer_ip].len();
+        state.reevaluate_all_import_policies();
+        state.reevaluate_all_import_policies();
+        assert_eq!(state.import_policies[&peer_ip].len(), before);
+        assert_eq!(state.import_policies_v6[&peer_ip].len(), before);
     }
 
     #[test]
@@ -10818,10 +10907,11 @@ mod run_with_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use pathvector_session::message::UpdateMessage;
+    use pathvector_session::message::{PathAttribute, UpdateMessage};
     use pathvector_session::transport::{
         SessionCommand, SessionConfig, SessionEvent, SessionHandle, TerminationReason,
     };
+    use pathvector_types::{AsPath, Asn, Origin, PeerType};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -10979,6 +11069,71 @@ mod run_with_tests {
 
         state.write().await.rpki = Some(handle);
         assert!(state.read().await.rpki.is_some());
+    }
+
+    /// Exercises the exact production wiring in `install_rpki` (the
+    /// function `run_with` calls) end-to-end: a route accepted while the
+    /// ROA cache is empty must be automatically rejected once the cache
+    /// changes — *without* the test calling `reevaluate_all_import_policies`
+    /// itself. Proves the background task `install_rpki` spawns actually
+    /// fires, not just that the method it calls is correct in isolation
+    /// (already covered directly in `daemon::tests`).
+    ///
+    /// Uses a `for_testing()`/`insert_roa_v4`-driven handle rather than a
+    /// real TCP RTR server — the wire protocol itself is already covered by
+    /// `pathvector-rpki`'s own mock-server tests; this test is only
+    /// responsible for proving pathvectord's reaction to a cache change.
+    #[tokio::test]
+    async fn rpki_reactive_task_reevaluates_on_cache_change() {
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (spawn_fn, _peers) = make_mock_spawn();
+        let mut cfg = make_config(&[(peer_ip, 65002)]);
+        // RFC 8212 default-rejects eBGP peers with no explicit import policy —
+        // opt this peer in to accept-by-default so ROV alone governs whether
+        // the test route is accepted.
+        cfg.peers[0].import_default = Some(config::ImportDefault::Accept);
+        let (state, ..) = build_daemon(&cfg, spawn_fn).await;
+
+        let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
+        install_rpki(rtr.clone(), true, &state).await;
+
+        let nlri: pathvector_types::Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        {
+            let mut guard = state.write().await;
+            guard.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+            guard.on_route_update(
+                peer_ip,
+                UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                        PathAttribute::NextHop(peer_ip),
+                    ],
+                    announced: vec![nlri],
+                },
+            );
+        }
+        assert!(
+            state.read().await.rib.loc_rib.best(&nlri).is_some(),
+            "route should be accepted while the cache is still empty (NotFound)"
+        );
+
+        // A ROA arrives making the already-accepted route Invalid. Nothing
+        // in this test calls reevaluate_all_import_policies — only the
+        // background task install_rpki spawned should react.
+        rtr.insert_roa_v4(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 99999);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if state.read().await.rib.loc_rib.best(&nlri).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reactive task did not reject the route within 5s of the cache change");
     }
 
     /// `build_daemon` calls the spawn function exactly once per configured peer.
