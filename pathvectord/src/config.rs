@@ -195,7 +195,7 @@ pub struct DaemonConfig {
     /// ```toml
     /// [daemon.rpki]
     /// host = "127.0.0.1"
-    /// port = 8323
+    /// port = 3323
     /// ```
     #[serde(default)]
     pub rpki: Option<RpkiConfig>,
@@ -205,14 +205,17 @@ pub struct DaemonConfig {
 #[derive(Deserialize, Clone)]
 pub struct RpkiConfig {
     pub host: String,
-    /// TCP port of the RTR server. Defaults to `8323`, the conventional
-    /// RTR-over-TCP port used by Routinator and other common validators.
+    /// TCP port of the RTR server. Defaults to `3323`, Routinator's default
+    /// `--rtr` listen port (confirmed against `nlnetlabs/routinator`'s
+    /// published Docker image, which exposes `3323/tcp` for RTR and
+    /// `8323/tcp` for its HTTP status/metrics API — an earlier default of
+    /// `8323` here was a mix-up between the two).
     #[serde(default = "default_rtr_port")]
     pub port: u16,
 }
 
 fn default_rtr_port() -> u16 {
-    8323
+    3323
 }
 
 fn default_fib_table() -> u32 {

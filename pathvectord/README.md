@@ -266,6 +266,46 @@ follow-up in `TODO.md`; it is not expected to matter for typical deployments.
 
 ---
 
+## RPKI Route Origin Validation
+
+pathvectord can connect to an external RPKI validator over the RTR protocol (RFC 8210,
+falling back to RFC 6810) and maintain a live ROA validity cache. Enable it by adding a
+`[daemon.rpki]` table:
+
+```toml
+[daemon.rpki]
+host = "127.0.0.1"
+port = 3323
+```
+
+`port` defaults to `3323` — [Routinator](https://github.com/NLnetLabs/routinator)'s
+default `--rtr` listen port. (Routinator's HTTP status/metrics API defaults to a
+different port, `8323` — easy to mix up; double-check whichever validator you're
+pointing at.)
+
+**Current scope: read-only.** The cache is queryable but does not filter any routes yet
+— see `pathvector-rpki/README.md` and the project `TODO.md` for the policy-enforcement
+phase. Connection failures are logged and retried in the background; they never prevent
+the daemon from starting or block BGP session processing.
+
+```bash
+pathvector rpki status
+# RPKI:       enabled
+# Connected:  yes
+# RTR version: 1
+# Serial:     0
+# ROA count:  969408
+# Last sync:  1782995122
+
+pathvector rpki validate 1.0.0.0/24 13335
+# 1.0.0.0/24 origin AS13335: VALID
+```
+
+The example above was captured against a real `nlnetlabs/routinator` container with a
+live, fully-synced RPKI table (~970k VRPs from all five RIRs) — not synthetic test data.
+
+---
+
 ## gRPC management API
 
 The API starts alongside the BGP event loop. It is unauthenticated — in production

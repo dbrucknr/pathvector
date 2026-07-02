@@ -4,6 +4,34 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02
+
+### [pathvectord, pathvector-rpki] Real-world RPKI smoke test against Routinator — found and fixed a wrong default port
+
+Every RPKI test up to this point ran against a hand-rolled mock RTR server. Ran
+`pathvectord` against a real `nlnetlabs/routinator` Docker container with a fully-synced
+live RPKI table (~970k VRPs, all five RIRs) to validate the whole stack end-to-end —
+config → RTR client → ROA cache → gRPC → CLI — against real protocol behavior and real
+data, not synthetic fixtures.
+
+**Result:** connected, negotiated RTR v1 with the real server, synced 969,408 ROA
+entries. Validated three real (prefix, origin AS) outcomes against live data and got all
+three right: `1.0.0.0/24` origin `AS13335` (Cloudflare) → `VALID`; the same prefix with a
+wrong origin AS → `INVALID`; `192.0.2.0/24` (RFC 5737 TEST-NET-1, deliberately
+unallocated) → `NOTFOUND`. Also confirmed the IPv6 "exceeds ROA max-length" case
+(`2001:200::/48` under a ROA whose max-length is `/32`) correctly returns `INVALID`, not
+`NOTFOUND`. Zero warnings or errors logged during the session.
+
+**Bug found:** `RpkiConfig::port`'s documented default of `8323` was wrong — that's
+Routinator's *HTTP* status/metrics port, not its RTR port. The default `--rtr` port is
+`3323`. Confirmed directly against the published Docker image's exposed ports and default
+`CMD`. Fixed the default in both `pathvectord::config::default_rtr_port` and
+`pathvector_rpki::RtrConfig::default()`, plus doc comments in both crates.
+
+**Also added:** an "RPKI Route Origin Validation" section to `pathvectord/README.md`
+(previously undocumented — the feature had shipped without a README section), using the
+real numbers from this smoke test as the worked example rather than placeholder values.
+
 ## 2026-07-01
 
 ### [pathvector-rpki] RTR client hardening — three gaps found and closed via RFC re-review

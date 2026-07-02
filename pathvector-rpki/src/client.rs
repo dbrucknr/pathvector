@@ -62,7 +62,11 @@ impl Default for RtrConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 8323,
+            // Routinator's default `--rtr` listen port. Its HTTP status/
+            // metrics API defaults to 8323 — a previous version of this
+            // default mixed the two up (caught by a smoke test against a
+            // real `nlnetlabs/routinator` container).
+            port: 3323,
             refresh_interval: Duration::from_secs(3600),
             retry_interval: Duration::from_secs(600),
             expire_interval: Duration::from_secs(7200),
