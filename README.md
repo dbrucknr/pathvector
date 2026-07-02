@@ -1,4 +1,8 @@
-# pathvector
+<p align="center">
+  <img src="pathvector.png" alt="Alt Text" width="500">
+</p>
+
+---
 
 [![CI](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml/badge.svg)](https://github.com/dbrucknr/pathvector/actions/workflows/ci.yml)
 [![Publish](https://github.com/dbrucknr/pathvector/actions/workflows/publish.yml/badge.svg)](https://github.com/dbrucknr/pathvector/actions/workflows/publish.yml)
