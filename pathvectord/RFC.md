@@ -343,15 +343,15 @@ in `pathvector-rib`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | `PeerConfig.role: Option<PeerRole>`, TOML `role = "provider"/"rs"/"rs_client"/"customer"/"peer"` | `src/config.rs` | ✅ | `sidecar_round_trips_all_fields` |
-| `Role` capability included in OPEN when `role` configured; omitted (non-strict default) otherwise | `src/daemon/capabilities.rs` | ✅ | (exercised by daemon capability tests) |
-| Role capability rebuilt per-session-spawn, including on reconnect (mirrors the GR R-bit lesson) | `src/daemon/mod.rs` | ✅ | (reconnect capability-refresh call site) |
+| `Role` capability included in OPEN when `role` configured; omitted (non-strict default) otherwise | `src/daemon/capabilities.rs` | ✅ | `test_build_local_capabilities_includes_role_when_configured`, `test_build_local_capabilities_omits_role_when_none` |
+| Role capability rebuilt per-session-spawn, including on reconnect (mirrors the GR R-bit lesson) | `src/daemon/mod.rs` | ✅ | `spawn_config_capabilities_includes_role_when_configured` (unit-level; no event-loop-level reconnect integration test yet — see Deferred) |
 | OTC ingress terms (leak-reject + attach-if-absent) installed per the corrected role mapping | `src/daemon/mod.rs` `install_otc_import_term` | ✅ | `test_install_otc_terms_counts_per_role` (all 5 roles) |
 | OTC egress terms (propagation-block + attach-if-absent) installed per the corrected role mapping | `src/daemon/mod.rs` `install_otc_export_term` | ✅ | `test_install_otc_terms_counts_per_role` (all 5 roles) |
 | No OTC terms installed when `role` is unconfigured (non-strict default) | `src/daemon/mod.rs` | ✅ | `test_no_role_configured_installs_no_otc_terms` |
-| Per-role route-level accept/reject/attach behaviour, both static and dynamic peers | `src/daemon/mod.rs`, `src/daemon/peer.rs` | ✅ | `test_provider_role_rejects_route_leaked_with_otc_from_customer`, `test_provider_role_accepts_clean_route_without_attaching_otc`, `test_customer_role_attaches_peer_asn_on_ingress`, `test_peer_role_rejects_route_with_mismatched_otc_asn`, `add_peer_with_role_installs_otc_terms_and_peer_roles` |
+| Per-role route-level accept/reject/attach behaviour, all 5 roles, both static and dynamic peers | `src/daemon/mod.rs`, `src/daemon/peer.rs` | ✅ | `test_provider_role_rejects_route_leaked_with_otc_from_customer`, `test_provider_role_accepts_clean_route_without_attaching_otc`, `test_customer_role_attaches_peer_asn_on_ingress`, `test_route_server_role_rejects_leak_accepts_clean_without_attach`, `test_rs_client_role_attaches_peer_asn_on_ingress`, `test_peer_role_rejects_route_with_mismatched_otc_asn`, `test_peer_role_accepts_and_preserves_matching_otc`, `test_peer_role_egress_blocks_leaked_route_and_attaches_clean_one`, `add_peer_with_role_installs_otc_terms_and_peer_roles` |
 | Full leak-prevention scenario across three peers (mirrors the 2019 Verizon/Allegheny/Cloudflare incident shape) | `src/daemon/mod.rs` | ✅ | `test_route_leak_prevented_across_two_provider_peers` |
 | `peer_roles`/`remove_peer` lifecycle keeps Role config consistent across dynamic add/remove | `src/daemon/peer.rs` | ✅ | `add_peer_with_role_installs_otc_terms_and_peer_roles`, `remove_peer_clears_peer_roles` |
-| Ingress: `PathAttribute::OnlyToCustomer` extracted into `Route.otc`, both v4 and v6 | `src/daemon/route.rs` | ✅ | (exercised by the route-leak tests above via a real `on_route_update` path) |
+| Ingress: `PathAttribute::OnlyToCustomer` extracted into `Route.otc`, both v4 and v6 | `src/daemon/route.rs` | ✅ | `test_ipv6_ingress_otc_extraction_and_leak_rejection` (v6); the route-leak tests above (v4) |
 | Egress: `Route.otc` re-emitted as `PathAttribute::OnlyToCustomer`, both v4 and v6 | `src/outbound.rs` | ✅ | `test_route_leak_prevented_across_two_provider_peers` (asserts the wire attribute) |
 | Configured/negotiated Role exposed via gRPC `PeerState.configured_role`/`negotiated_role` | `src/grpc.rs` | ✅ | `test_build_peer_state_includes_configured_and_negotiated_role`, `test_build_peer_state_role_absent_by_default` |
 | Real e2e proof: a route pre-carrying OTC from a peer configured `role = "provider"` is rejected; a clean route is accepted | `pathvector-e2e/tests/role.rs` | ✅ | `leaked_route_is_rejected_clean_route_is_accepted` |
@@ -373,3 +373,22 @@ in `pathvector-rib`.
   it structurally impossible for two correctly configured routers to leak between
   each other. Reproducing a real leak over the wire requires a peer willing to send
   one on purpose, which is what the mock peer is for.
+- No event-loop-level integration test proves Role capability actually survives a
+  real reconnect (Terminated → `SessionCommand::SetCapabilities` → next OPEN).
+  `spawn_config_capabilities_includes_role_when_configured` proves the pure
+  function (`SpawnConfig::capabilities`) carries `role` through correctly, and the
+  call site was fixed to read `s.rib.peer_roles.get(&peer_ip)` (the same class of
+  bug the GR R-bit lifetime fix closed), but this is unverified end-to-end — and,
+  on inspection, so is the *pre-existing* GR R-bit reconnect path (no test
+  references `SessionCommand::SetCapabilities` at all). Tracked in `TODO.md` as a
+  shared follow-up, not unique to this feature.
+
+**Correctness re-verification (2026-07-02):** independently re-checked the OTC
+ingress/egress role mapping against the RFC 9234 datatracker text directly (not
+from memory of this feature's own earlier development) — confirmed correct,
+including the Peer role's symmetric handling (ingress-attach, egress-attach-if-
+absent, and egress-block-if-present all apply simultaneously to a Peer session).
+Also ran both `pathvector-fuzz` targets that decode the grown `Capability`/
+`PathAttribute` enums (`session_framing`, `session_message`) for 60s each
+(~10M executions apiece) — clean, no crashes. This was called for in the original
+implementation plan but not actually executed until this reflection pass.

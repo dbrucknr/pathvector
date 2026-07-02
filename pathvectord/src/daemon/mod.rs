@@ -2963,6 +2963,270 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_route_server_role_rejects_leak_accepts_clean_without_attach() {
+        // session_role = RouteServer: the peer is our RS-Client. Mirrors the
+        // Provider case — RouteServer wasn't previously exercised at the
+        // daemon/route level, only via the term-count table.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::RouteServer)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(1)));
+        assert!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
+            "OTC from an RS-Client must always be rejected as a leak"
+        );
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "198.51.100.0/24", None));
+        let route = state
+            .rib
+            .loc_rib
+            .best(&nlri("198.51.100.0/24"))
+            .expect("clean route from RS-Client must be accepted");
+        assert_eq!(
+            route.otc(),
+            None,
+            "no ingress attach for RouteServer role (only Customer/Peer/RsClient attach)"
+        );
+    }
+
+    #[test]
+    fn test_rs_client_role_attaches_peer_asn_on_ingress() {
+        // session_role = RsClient: the peer is our RouteServer. Mirrors the
+        // Customer case — RsClient wasn't previously exercised at the
+        // daemon/route level, only via the term-count table.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::RsClient)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", None));
+
+        let route = state
+            .rib
+            .loc_rib
+            .best(&nlri("10.0.0.0/8"))
+            .expect("route from RouteServer must be accepted");
+        assert_eq!(route.otc(), Some(Asn::new(65002)));
+    }
+
+    #[test]
+    fn test_peer_role_accepts_and_preserves_matching_otc() {
+        // session_role = Peer, OTC present and matching the peer's own ASN —
+        // not a leak per RFC 9234 §5 rule 2. Must be accepted, and SetOtc
+        // must not overwrite the already-correct value.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Peer)]);
+        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+
+        state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(65002)));
+
+        let route = state
+            .rib
+            .loc_rib
+            .best(&nlri("10.0.0.0/8"))
+            .expect("OTC matching the peer's own ASN must not be treated as a leak");
+        assert_eq!(route.otc(), Some(Asn::new(65002)));
+    }
+
+    #[test]
+    fn test_peer_role_egress_blocks_leaked_route_and_attaches_clean_one() {
+        // session_role = Peer on egress: a route that already carries OTC
+        // (learned from peer_provider, a Customer-role session on our side)
+        // must never reach a Peer-role destination — RFC 9234 §6 rule 2
+        // treats Peer the same as Provider/RS on the block side. A separate,
+        // clean route (no OTC yet) must be advertised to the Peer-role
+        // destination *with* OTC attached — §6 rule 1 also treats Peer the
+        // same as Provider/RS on the attach side. Both rules apply to the
+        // same Peer-role session simultaneously.
+        let peer_provider: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_lateral: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_state_with_roles(
+            65001,
+            &[
+                (peer_provider, 65002, config::PeerRole::Customer),
+                (peer_lateral, 65003, config::PeerRole::Peer),
+            ],
+        );
+        state.on_established(
+            peer_provider,
+            peer_provider,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            peer_lateral,
+            peer_lateral,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        drain_all(&mut receivers);
+
+        // Learned from peer_provider (our Provider) with no OTC — gets
+        // attached (session_role = Customer is in the ingress-attach set).
+        state.on_route_update(peer_provider, announce_with_otc(65002, "10.0.0.0/8", None));
+        state.flush_pending();
+        assert_eq!(
+            state.rib.loc_rib.best(&nlri("10.0.0.0/8")).unwrap().otc(),
+            Some(Asn::new(65002))
+        );
+        assert!(
+            receivers
+                .get_mut(&peer_lateral)
+                .unwrap()
+                .try_recv()
+                .is_err(),
+            "a route already carrying OTC must never reach a Peer-role destination"
+        );
+
+        // A second, clean route learned from the same Provider stays clean
+        // only until it crosses to peer_lateral, where it must get OTC
+        // attached (session_role = Peer is also in the egress-attach set).
+        // Use a peer with no attach-on-ingress applicable here by importing
+        // directly via a peer with no configured role instead, to isolate
+        // the egress-attach behavior from ingress-attach.
+        let peer_plain: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        state.add_peer(
+            &config::PeerConfig {
+                address: peer_plain,
+                port: 179,
+                remote_as: 65004,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+                connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
+                role: None,
+            },
+            mpsc::channel(64).0,
+        );
+        state.on_established(
+            peer_plain,
+            peer_plain,
+            PeerType::External,
+            65004,
+            90,
+            &[],
+            None,
+        );
+        drain_all(&mut receivers);
+
+        state.on_route_update(
+            peer_plain,
+            announce_with_otc(65004, "198.51.100.0/24", None),
+        );
+        state.flush_pending();
+        assert_eq!(
+            state
+                .rib
+                .loc_rib
+                .best(&nlri("198.51.100.0/24"))
+                .unwrap()
+                .otc(),
+            None,
+            "no configured role on peer_plain means no ingress attach"
+        );
+        let msg = receivers
+            .get_mut(&peer_lateral)
+            .unwrap()
+            .try_recv()
+            .expect("clean route must reach the Peer-role destination");
+        assert!(
+            msg.attributes.iter().any(
+                |a| matches!(a, PathAttribute::OnlyToCustomer(asn) if *asn == Asn::new(65001))
+            ),
+            "OTC = local ASN must be attached on egress toward a Peer-role destination"
+        );
+    }
+
+    #[test]
+    fn test_ipv6_ingress_otc_extraction_and_leak_rejection() {
+        // The daemon-level OTC tests above all exercise the IPv4 ingress
+        // path only; this confirms the IPv6 MP_REACH_NLRI path (route.rs's
+        // second RouteBuilder + `.otc(asn)` call) is actually wired, not
+        // just compiling.
+        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) =
+            make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Provider)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+        state.on_established(
+            peer_ip,
+            peer_ip,
+            PeerType::External,
+            65002,
+            90,
+            &[Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)],
+            None,
+        );
+
+        let leaked_v6: Nlri<Ipv6Addr> = "2001:db8:dead::/48".parse().unwrap();
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::2".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(leaked_v6)],
+                    }),
+                    PathAttribute::OnlyToCustomer(Asn::new(65100)),
+                ],
+                announced: vec![],
+            },
+        );
+        assert!(
+            state.rib.loc_rib_v6.best(&leaked_v6).is_none(),
+            "IPv6 route leaked with OTC from a Customer must be rejected"
+        );
+
+        let clean_v6: Nlri<Ipv6Addr> = "2001:db8:beef::/48".parse().unwrap();
+        state.on_route_update(
+            peer_ip,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::2".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(clean_v6)],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+        let route = state
+            .rib
+            .loc_rib_v6
+            .best(&clean_v6)
+            .expect("clean IPv6 route from Customer must be accepted");
+        assert_eq!(
+            route.otc(),
+            None,
+            "Provider role does not ingress-attach OTC"
+        );
+    }
+
     // ── test wrappers ─────────────────────────────────────────────────────────
 
     /// Wrapper for IPv4-only `handle_update` calls — passes fresh v6 stubs.
@@ -12364,6 +12628,29 @@ mod test_build_local_capabilities {
         );
     }
 
+    /// RFC 9234: when `role` is `Some`, `Capability::Role` must be present in
+    /// the output with the matching wire value.
+    #[test]
+    fn test_build_local_capabilities_includes_role_when_configured() {
+        let caps = build_local_capabilities(65001, 0, false, Some(Role::Customer));
+        assert!(
+            caps.iter()
+                .any(|c| matches!(c, Capability::Role(Role::Customer))),
+            "Capability::Role(Customer) must be present when role is configured"
+        );
+    }
+
+    /// RFC 9234's own non-strict default: omitting `role` must omit the
+    /// capability entirely, not send some default/placeholder role value.
+    #[test]
+    fn test_build_local_capabilities_omits_role_when_none() {
+        let caps = build_local_capabilities(65001, 0, false, None);
+        assert!(
+            !caps.iter().any(|c| matches!(c, Capability::Role(_))),
+            "Capability::Role must be absent when role is not configured"
+        );
+    }
+
     fn spawn_cfg(
         gr_time: u16,
         configured_restarting: bool,
@@ -12416,6 +12703,24 @@ mod test_build_local_capabilities {
             flags & 0x08,
             0x00,
             "R-bit must not be set when configured_restarting=false"
+        );
+    }
+
+    /// RFC 9234: `SpawnConfig::capabilities()` — the same entry point used at
+    /// every session spawn, including on reconnect — must carry `role`
+    /// through to the output exactly like `build_local_capabilities` does.
+    /// This is the exact seam the reconnect capability-refresh fix touches
+    /// (`s.rib.peer_roles.get(&peer_ip).copied()` fed into this call); a
+    /// regression here would silently drop Role on every reconnect, the same
+    /// class of bug the R-bit lifetime fix (above) closed for GR.
+    #[test]
+    fn spawn_config_capabilities_includes_role_when_configured() {
+        let cfg = spawn_cfg(0, false, std::time::Duration::from_secs(0));
+        let caps = cfg.capabilities(Some(Role::Provider));
+        assert!(
+            caps.iter()
+                .any(|c| matches!(c, Capability::Role(Role::Provider))),
+            "Capability::Role(Provider) must be present"
         );
     }
 }
