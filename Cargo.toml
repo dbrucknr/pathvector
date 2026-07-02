@@ -5,6 +5,7 @@ members = [
     "pathvector-rib",
     "pathvector-session",
     "pathvector-bmp",
+    "pathvector-rpki",
     "pathvector-client",
     "pathvectord",
     "pathvector",
@@ -32,6 +33,7 @@ pathvector-policy  = { path = "pathvector-policy",  version = "0.1.0" }
 pathvector-rib     = { path = "pathvector-rib",     version = "0.1.0" }
 pathvector-session = { path = "pathvector-session", version = "0.1.0" }
 pathvector-bmp     = { path = "pathvector-bmp",     version = "0.1.0" }
+pathvector-rpki    = { path = "pathvector-rpki",    version = "0.1.0" }
 pathvector-client  = { path = "pathvector-client",  version = "0.1.0" }
 
 # External dependencies

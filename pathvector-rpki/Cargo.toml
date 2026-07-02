@@ -1,0 +1,26 @@
+[package]
+name = "pathvector-rpki"
+version = "0.1.0"
+description = "RPKI-to-Router (RTR) protocol client: RFC 8210 (v1) / RFC 6810 (v0) with ROA validity cache"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pathvector-types = { workspace = true }
+ipnetx            = { workspace = true }
+routemap          = { workspace = true }
+tokio             = { workspace = true, features = ["io-util"] }
+tracing           = "0.1"
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio    = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

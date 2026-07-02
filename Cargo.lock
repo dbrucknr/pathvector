@@ -1847,6 +1847,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathvector-rpki"
+version = "0.1.0"
+dependencies = [
+ "ipnetx",
+ "pathvector-types",
+ "proptest",
+ "routemap",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pathvector-session"
 version = "0.1.0"
 dependencies = [
