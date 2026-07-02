@@ -32,6 +32,7 @@ use error::{ClientError, ConnectError};
 use proto::{
     origination_service_client::OriginationServiceClient, peer_service_client::PeerServiceClient,
     policy_service_client::PolicyServiceClient, rib_service_client::RibServiceClient,
+    rpki_service_client::RpkiServiceClient,
 };
 use types::OriginateRouteParams;
 
@@ -53,6 +54,7 @@ pub struct PathvectorClient {
     rib: RibServiceClient<Channel>,
     policy: PolicyServiceClient<Channel>,
     origination: OriginationServiceClient<Channel>,
+    rpki: RpkiServiceClient<Channel>,
 }
 
 impl PathvectorClient {
@@ -76,7 +78,8 @@ impl PathvectorClient {
             peers: PeerServiceClient::new(channel.clone()),
             rib: RibServiceClient::new(channel.clone()),
             policy: PolicyServiceClient::new(channel.clone()),
-            origination: OriginationServiceClient::new(channel),
+            origination: OriginationServiceClient::new(channel.clone()),
+            rpki: RpkiServiceClient::new(channel),
         })
     }
 

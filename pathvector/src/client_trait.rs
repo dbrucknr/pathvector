@@ -262,6 +262,36 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+
+        async fn get_rpki_status(
+            &mut self,
+        ) -> Result<pathvector_client::types::RpkiStatus, pathvector_client::error::ClientError>
+        {
+            if let Some(e) = self.check_error() {
+                return Err(e);
+            }
+            Ok(pathvector_client::types::RpkiStatus {
+                enabled: false,
+                connected: false,
+                rtr_version: String::new(),
+                serial: None,
+                roa_count: 0,
+                last_update_unix: None,
+                last_error: None,
+            })
+        }
+
+        async fn validate_roa(
+            &mut self,
+            _prefix: &str,
+            _origin_as: u32,
+        ) -> Result<pathvector_client::types::RoaValidity, pathvector_client::error::ClientError>
+        {
+            if let Some(e) = self.check_error() {
+                return Err(e);
+            }
+            Ok(pathvector_client::types::RoaValidity::NotFound)
+        }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────

@@ -66,6 +66,15 @@
 //!     fn soft_reset(&mut self, _: IpAddr, _: &str) -> impl Future<Output = Result<(), ClientError>> + Send {
 //!         async { Ok(()) }
 //!     }
+//!     fn get_rpki_status(&mut self) -> impl Future<Output = Result<pathvector_client::types::RpkiStatus, ClientError>> + Send {
+//!         async { Ok(pathvector_client::types::RpkiStatus {
+//!             enabled: false, connected: false, rtr_version: String::new(),
+//!             serial: None, roa_count: 0, last_update_unix: None, last_error: None,
+//!         }) }
+//!     }
+//!     fn validate_roa(&mut self, _: &str, _: u32) -> impl Future<Output = Result<pathvector_client::types::RoaValidity, ClientError>> + Send {
+//!         async { Ok(pathvector_client::types::RoaValidity::NotFound) }
+//!     }
 //! }
 //! ```
 
@@ -77,13 +86,17 @@ use crate::{
     BoxStream, PathvectorClient,
     error::ClientError,
     proto::{
-        AddPeerRequest, GetBestRouteRequest, GetPeerRequest, ListCandidatesRequest,
-        ListOriginatedRoutesRequest, ListPeersRequest, ListRoutesRequest, OriginateRouteRequest,
-        OriginateRoutesRequest, PolicyAction, RemovePeerRequest, SetExportDefaultRequest,
-        SetImportDefaultRequest, SoftResetRequest, WatchPeersRequest, WatchRoutesRequest,
-        WithdrawOriginatedRouteRequest, WithdrawOriginatedRoutesRequest,
+        AddPeerRequest, GetBestRouteRequest, GetPeerRequest, GetRpkiStatusRequest,
+        ListCandidatesRequest, ListOriginatedRoutesRequest, ListPeersRequest, ListRoutesRequest,
+        OriginateRouteRequest, OriginateRoutesRequest, PolicyAction, RemovePeerRequest,
+        SetExportDefaultRequest, SetImportDefaultRequest, SoftResetRequest, ValidateRoaRequest,
+        WatchPeersRequest, WatchRoutesRequest, WithdrawOriginatedRouteRequest,
+        WithdrawOriginatedRoutesRequest,
     },
-    types::{AddPeerParams, OriginateRouteParams, PeerEvent, PeerState, Route, RouteEvent},
+    types::{
+        AddPeerParams, OriginateRouteParams, PeerEvent, PeerState, RoaValidity, Route, RouteEvent,
+        RpkiStatus,
+    },
 };
 
 /// Abstracts the seven gRPC calls used to manage a running `pathvectord` daemon.
@@ -268,6 +281,27 @@ pub trait DaemonClient {
         address: IpAddr,
         afi_safi: &str,
     ) -> impl Future<Output = Result<(), ClientError>> + Send;
+
+    /// Return RTR session status and ROA cache statistics.
+    ///
+    /// `enabled: false` if `[daemon.rpki]` is not configured on the daemon —
+    /// this is not an error, just an empty/disabled status.
+    fn get_rpki_status(&mut self) -> impl Future<Output = Result<RpkiStatus, ClientError>> + Send;
+
+    /// Validate a single `(prefix, origin AS)` pair against the daemon's
+    /// live ROA cache (RFC 6811 §2). Read-only — does not affect route
+    /// processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with `FAILED_PRECONDITION` if RPKI is not
+    /// configured on the daemon, or `INVALID_ARGUMENT` if `prefix` is not
+    /// valid CIDR notation.
+    fn validate_roa(
+        &mut self,
+        prefix: &str,
+        origin_as: u32,
+    ) -> impl Future<Output = Result<RoaValidity, ClientError>> + Send;
 }
 
 // ── Implementation for the real client ───────────────────────────────────────
@@ -632,6 +666,45 @@ impl DaemonClient for PathvectorClient {
             .await?;
         Ok(())
     }
+
+    /// Return RTR session status and ROA cache statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] on gRPC failure.
+    async fn get_rpki_status(&mut self) -> Result<RpkiStatus, ClientError> {
+        let resp = self
+            .rpki
+            .get_rpki_status(GetRpkiStatusRequest {})
+            .await?
+            .into_inner();
+        Ok(RpkiStatus::from(resp))
+    }
+
+    /// Validate a single `(prefix, origin AS)` pair against the daemon's live
+    /// ROA cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Rpc`] with `FAILED_PRECONDITION` if RPKI is not
+    /// configured on the daemon, `INVALID_ARGUMENT` if `prefix` is not valid
+    /// CIDR notation, or [`ClientError::Convert`] if the server returns an
+    /// unrecognized validity state.
+    async fn validate_roa(
+        &mut self,
+        prefix: &str,
+        origin_as: u32,
+    ) -> Result<RoaValidity, ClientError> {
+        let resp = self
+            .rpki
+            .validate_roa(ValidateRoaRequest {
+                prefix: prefix.to_string(),
+                origin_as,
+            })
+            .await?
+            .into_inner();
+        RoaValidity::try_from(resp.state).map_err(ClientError::from)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -736,6 +809,22 @@ mod tests {
 
         async fn soft_reset(&mut self, _: IpAddr, _: &str) -> Result<(), ClientError> {
             Ok(())
+        }
+
+        async fn get_rpki_status(&mut self) -> Result<RpkiStatus, ClientError> {
+            Ok(RpkiStatus {
+                enabled: false,
+                connected: false,
+                rtr_version: String::new(),
+                serial: None,
+                roa_count: 0,
+                last_update_unix: None,
+                last_error: None,
+            })
+        }
+
+        async fn validate_roa(&mut self, _: &str, _: u32) -> Result<RoaValidity, ClientError> {
+            Ok(RoaValidity::NotFound)
         }
     }
 
@@ -919,6 +1008,14 @@ mod tests {
                 .await,
             Err(ClientError::Rpc(_))
         ));
+        assert!(matches!(
+            c.get_rpki_status().await,
+            Err(ClientError::Rpc(_))
+        ));
+        assert!(matches!(
+            c.validate_roa("10.0.0.0/8", 65001).await,
+            Err(ClientError::Rpc(_))
+        ));
     }
 
     /// `list_all_routes` can be called through the trait bound and accumulates
@@ -1007,6 +1104,20 @@ mod tests {
             }
             async fn soft_reset(&mut self, _: IpAddr, _: &str) -> Result<(), ClientError> {
                 Ok(())
+            }
+            async fn get_rpki_status(&mut self) -> Result<RpkiStatus, ClientError> {
+                Ok(RpkiStatus {
+                    enabled: false,
+                    connected: false,
+                    rtr_version: String::new(),
+                    serial: None,
+                    roa_count: 0,
+                    last_update_unix: None,
+                    last_error: None,
+                })
+            }
+            async fn validate_roa(&mut self, _: &str, _: u32) -> Result<RoaValidity, ClientError> {
+                Ok(RoaValidity::NotFound)
             }
         }
 

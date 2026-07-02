@@ -68,8 +68,33 @@ pub enum Commands {
         command: WatchCommands,
     },
 
+    /// Inspect RPKI Route Origin Validation state (read-only in this release).
+    Rpki {
+        #[command(subcommand)]
+        command: RpkiCommands,
+    },
+
     /// Live-updating TUI dashboard showing peers and routes (press q to quit).
     Dashboard,
+}
+
+// ── rpki subcommands ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Subcommand)]
+pub enum RpkiCommands {
+    /// Show RTR session status and ROA cache statistics.
+    Status,
+
+    /// Validate a single prefix + origin AS pair against the current ROA cache.
+    Validate {
+        /// Prefix in CIDR notation, e.g. "192.0.2.0/24".
+        #[arg(value_name = "PREFIX")]
+        prefix: String,
+
+        /// Origin AS number to validate.
+        #[arg(value_name = "ASN")]
+        origin_as: u32,
+    },
 }
 
 // ── peer subcommands ──────────────────────────────────────────────────────────
