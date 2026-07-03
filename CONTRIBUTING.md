@@ -50,12 +50,23 @@ cargo test --workspace --exclude pathvector-e2e --doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
-rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
+CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
+CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
 ```
 
 This catches the vast majority of issues before pushing. Run it before every
 commit.
+
+**`just msrv` uses a separate `target/msrv` directory**, not the same
+`target/debug` that `just test` uses. Cargo's build fingerprints include the
+exact rustc version, so alternating between the stable toolchain and 1.88
+against one shared target directory forces a full workspace rebuild (all
+~150+ dependencies) on every single switch — measured at ~19 minutes locally.
+A separate target dir per toolchain avoids that entirely: the first `just
+msrv` run is still a full cold build, but every run after that is
+incremental and takes single-digit seconds, matching `just test`. This costs
+extra disk space (`target/msrv` is a full second copy of the dependency
+build artifacts) but is worth it if you run `just msrv` more than once.
 
 ---
 

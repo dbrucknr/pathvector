@@ -54,10 +54,17 @@ test:
     cargo nextest run --workspace --exclude pathvector-e2e
     cargo test --workspace --exclude pathvector-e2e --doc
 
+# Uses a separate target dir (target/msrv) so this never shares build
+# artifacts with `just test`'s stable-toolchain target/debug — cargo's
+# fingerprints include the exact rustc version, so alternating toolchains
+# against one shared target dir forces a full workspace rebuild (all ~150+
+# dependencies) on every switch. Costs extra disk space; the first run into
+# target/msrv is still a full cold build, but every run after that is
+# incremental, matching `just test`'s speed instead of always paying ~19 min.
 # Test against the minimum supported Rust version (mirrors the msrv CI job)
 msrv:
-    rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
-    rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
+    CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
+    CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
 
 # Configure git to use the committed hooks in .githooks/.
 # Run once after cloning: just install-hooks
