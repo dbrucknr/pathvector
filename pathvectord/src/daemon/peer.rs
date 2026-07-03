@@ -27,19 +27,28 @@ impl DaemonState {
         self.adj_ribs_out.insert(peer.address, adj_out);
         self.adj_ribs_out_v6.insert(peer.address, adj_out_v6);
         self.peer_config_types.insert(peer.address, pt);
-        self.import_policies.insert(
-            peer.address,
-            Policy::new(resolve_import_default(peer.import_default, is_ebgp)),
-        );
+
+        let mut import_policy = Policy::new(resolve_import_default(peer.import_default, is_ebgp));
         let default_v6 = peer.import_default_v6.or(peer.import_default);
-        self.import_policies_v6.insert(
-            peer.address,
-            Policy::new(resolve_import_default(default_v6, is_ebgp)),
-        );
-        self.export_policies.insert(
-            peer.address,
-            Policy::new(resolve_export_default(peer.export_default, is_ebgp)),
-        );
+        let mut import_policy_v6 = Policy::new(resolve_import_default(default_v6, is_ebgp));
+        let mut export_policy = Policy::new(resolve_export_default(peer.export_default, is_ebgp));
+        // No separate `export_default_v6` knob — see the matching comment in
+        // `DaemonState::new`.
+        let mut export_policy_v6 =
+            Policy::new(resolve_export_default(peer.export_default, is_ebgp));
+        let resolved_role: Option<Role> = effective_role(peer, local_as).inspect(|&role| {
+            let peer_asn = Asn::new(peer.remote_as);
+            install_otc_import_term(&mut import_policy, role, peer_asn);
+            install_otc_import_term(&mut import_policy_v6, role, peer_asn);
+            install_otc_export_term(&mut export_policy, role, Asn::new(local_as));
+            install_otc_export_term(&mut export_policy_v6, role, Asn::new(local_as));
+        });
+        self.import_policies.insert(peer.address, import_policy);
+        self.import_policies_v6
+            .insert(peer.address, import_policy_v6);
+        self.export_policies.insert(peer.address, export_policy);
+        self.export_policies_v6
+            .insert(peer.address, export_policy_v6);
         self.update_senders.insert(peer.address, update_sender);
         if let Some(msg) = peer.shutdown_message.clone() {
             self.shutdown_messages.insert(peer.address, msg);
@@ -57,6 +66,9 @@ impl DaemonState {
         rib.peer_remote_as.insert(peer.address, peer.remote_as);
         if peer.next_hop_self {
             rib.next_hop_self_peers.insert(peer.address);
+        }
+        if let Some(role) = resolved_role {
+            rib.peer_roles.insert(peer.address, role);
         }
         true
     }
@@ -78,6 +90,7 @@ impl DaemonState {
         self.import_policies.remove(&peer_ip);
         self.import_policies_v6.remove(&peer_ip);
         self.export_policies.remove(&peer_ip);
+        self.export_policies_v6.remove(&peer_ip);
         self.update_senders.remove(&peer_ip);
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
@@ -104,6 +117,8 @@ impl DaemonState {
         rib.local_addrs.remove(&peer_ip);
         rib.peer_bgp_ids.remove(&peer_ip);
         rib.next_hop_self_peers.remove(&peer_ip);
+        rib.peer_roles.remove(&peer_ip);
+        rib.negotiated_roles.remove(&peer_ip);
         true
     }
 
@@ -328,6 +343,17 @@ impl DaemonState {
             self.four_byte_peers.remove(&peer_ip);
         }
 
+        // RFC 9234: extract the peer's negotiated BGP Role, if any, for later
+        // gRPC/CLI visibility. Role-pair compatibility was already enforced by
+        // the FSM's `validate_open` before the session could reach Established
+        // — this is read-only bookkeeping, not a second enforcement point.
+        // The actual `rib_mut()` write is deferred until after `update_tx` is
+        // fully consumed below, matching `peer_gr_time`'s handling.
+        let peer_role = peer_capabilities.iter().find_map(|c| match c {
+            Capability::Role(r) => Some(*r),
+            _ => None,
+        });
+
         // RFC 2918: track whether this peer negotiated Route Refresh.
         // Both sides must advertise the capability for ROUTE-REFRESH to be valid.
         let peer_route_refresh = peer_capabilities.contains(&Capability::RouteRefresh)
@@ -387,6 +413,7 @@ impl DaemonState {
         if !stalled
             && peer_supports_ipv6
             && !all_nlris_v6.is_empty()
+            && let Some(export_policy_v6) = self.export_policies_v6.get(&peer_ip)
             && let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip)
         {
             let loc_rib_v6 = &self.rib.loc_rib_v6;
@@ -411,6 +438,7 @@ impl DaemonState {
                         nlri,
                         loc_rib_v6,
                         adj_rib_out_v6,
+                        export_policy_v6,
                         peer_type,
                         local_as,
                         local_ipv6,
@@ -446,6 +474,11 @@ impl DaemonState {
                 rib.gr_capable_peers.insert(peer_ip, t);
             } else {
                 rib.gr_capable_peers.remove(&peer_ip);
+            }
+            if let Some(role) = peer_role {
+                rib.negotiated_roles.insert(peer_ip, role);
+            } else {
+                rib.negotiated_roles.remove(&peer_ip);
             }
         }
         if peer_gr_time.is_some() {
@@ -597,6 +630,7 @@ impl DaemonState {
             rib.peer_bgp_ids.remove(&peer_ip);
             rib.eor_received.remove(&peer_ip);
             rib.eor_received_v6.remove(&peer_ip);
+            rib.negotiated_roles.remove(&peer_ip);
         }
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
@@ -857,7 +891,7 @@ pub(super) async fn run_command_processor<H, F>(
                     local_as: cfg.local_as,
                     local_bgp_id: cfg.local_bgp_id,
                     hold_time: peer.hold_time.unwrap_or(cfg.hold_time),
-                    capabilities: cfg.capabilities(),
+                    capabilities: cfg.capabilities(effective_role(&peer, cfg.local_as)),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
                     peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),

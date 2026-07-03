@@ -1,6 +1,7 @@
 use crate::route::BgpRoute;
 use pathvector_types::{
-    AsPath, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop, Nlri, Origin,
+    AsPath, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop, Nlri,
+    Origin,
 };
 use std::net::Ipv4Addr;
 
@@ -20,13 +21,14 @@ pub struct TestRoute {
     pub large_communities: Vec<LargeCommunity>,
     pub extended_communities: Vec<ExtendedCommunity>,
     pub next_hop: Option<NextHop>,
+    pub otc: Option<Asn>,
 }
 
 impl TestRoute {
     /// Creates a minimal test route for the given CIDR prefix string.
     ///
     /// Defaults: ORIGIN IGP, no `LOCAL_PREF`, no MED, empty AS path,
-    /// no communities, no `NEXT_HOP`.
+    /// no communities, no `NEXT_HOP`, no `OTC`.
     #[must_use]
     pub fn new(prefix: &str) -> Self {
         Self {
@@ -39,6 +41,7 @@ impl TestRoute {
             large_communities: Vec::new(),
             extended_communities: Vec::new(),
             next_hop: None,
+            otc: None,
         }
     }
 
@@ -82,6 +85,9 @@ impl BgpRoute for TestRoute {
     fn next_hop(&self) -> Option<NextHop> {
         self.next_hop
     }
+    fn otc(&self) -> Option<Asn> {
+        self.otc
+    }
 
     fn set_origin(&mut self, origin: Origin) {
         self.origin = origin;
@@ -106,6 +112,9 @@ impl BgpRoute for TestRoute {
     }
     fn set_next_hop(&mut self, nh: Option<NextHop>) {
         self.next_hop = nh;
+    }
+    fn set_otc(&mut self, otc: Option<Asn>) {
+        self.otc = otc;
     }
 }
 

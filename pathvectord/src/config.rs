@@ -312,6 +312,51 @@ impl From<ExportDefault> for DefaultAction {
     }
 }
 
+/// TOML representation of a peer's RFC 9234 BGP Role.
+///
+/// Declares the local speaker's role *on this specific session* — not a
+/// property of the AS itself. The same AS can be a `provider` on one session
+/// and a `customer` on another. When set, pathvectord advertises the BGP
+/// Role capability and enforces RFC 9234's `ONLY_TO_CUSTOMER` route-leak
+/// prevention for this peer; when omitted, neither happens (matches the
+/// RFC's own non-strict default of not requiring Role at all).
+///
+/// ```toml
+/// [[peers]]
+/// address   = "10.0.0.1"
+/// remote_as = 65001
+/// role      = "customer"   # this peer is our customer — we are their provider
+/// ```
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerRole {
+    /// We provide transit to this peer.
+    Provider,
+    /// We operate a route server (typically at an IXP) and this peer is a
+    /// participant, not our route-server-client.
+    #[serde(rename = "rs")]
+    RouteServer,
+    /// This peer is a route-server-client of ours.
+    #[serde(rename = "rs_client")]
+    RsClient,
+    /// This peer provides transit to us.
+    Customer,
+    /// Lateral peering — neither side provides transit to the other.
+    Peer,
+}
+
+impl From<PeerRole> for pathvector_types::Role {
+    fn from(r: PeerRole) -> Self {
+        match r {
+            PeerRole::Provider => Self::Provider,
+            PeerRole::RouteServer => Self::RouteServer,
+            PeerRole::RsClient => Self::RsClient,
+            PeerRole::Customer => Self::Customer,
+            PeerRole::Peer => Self::Peer,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PeerConfig {
     pub address: Ipv4Addr,
@@ -482,6 +527,18 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub max_prefixes_restart: Option<u16>,
+    /// RFC 9234 BGP Role for this session. Omit to disable Role capability
+    /// negotiation and OTC-based route-leak prevention entirely for this
+    /// peer (the RFC's own non-strict default).
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address   = "10.0.0.1"
+    /// remote_as = 65001
+    /// role      = "customer"
+    /// ```
+    #[serde(default)]
+    pub role: Option<PeerRole>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -603,6 +660,7 @@ mod sidecar_tests {
             max_prefixes_v4: None,
             max_prefixes_v6: None,
             max_prefixes_restart: None,
+            role: None,
         }
     }
 
@@ -685,6 +743,7 @@ mod sidecar_tests {
             max_prefixes_v4: Some(500_000),
             max_prefixes_v6: Some(100_000),
             max_prefixes_restart: Some(300),
+            role: Some(PeerRole::Provider),
         };
         store.upsert(full_peer.clone()).await;
 
@@ -713,6 +772,7 @@ mod sidecar_tests {
             Some(300),
             "max_prefixes_restart must round-trip"
         );
+        assert_eq!(got.role, Some(PeerRole::Provider), "role must round-trip");
     }
 
     #[tokio::test]

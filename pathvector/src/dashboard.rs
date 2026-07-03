@@ -430,6 +430,8 @@ mod tests {
             eor_ipv4_received: false,
             eor_ipv6_received: false,
             peer_gr_restart_time: 0,
+            configured_role: None,
+            negotiated_role: None,
         }
     }
 

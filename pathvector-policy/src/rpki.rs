@@ -187,6 +187,9 @@ mod tests {
         fn next_hop(&self) -> Option<pathvector_types::NextHop> {
             None
         }
+        fn otc(&self) -> Option<Asn> {
+            None
+        }
         fn set_origin(&mut self, _origin: pathvector_types::Origin) {}
         fn set_local_pref(&mut self, _lp: Option<pathvector_types::LocalPref>) {}
         fn set_med(&mut self, _med: Option<pathvector_types::Med>) {}
@@ -197,6 +200,7 @@ mod tests {
         fn set_large_communities(&mut self, _c: Vec<pathvector_types::LargeCommunity>) {}
         fn set_extended_communities(&mut self, _c: Vec<pathvector_types::ExtendedCommunity>) {}
         fn set_next_hop(&mut self, _nh: Option<pathvector_types::NextHop>) {}
+        fn set_otc(&mut self, _otc: Option<Asn>) {}
     }
 
     #[test]
@@ -248,6 +252,64 @@ mod tests {
 
         let mut not_found = route_with_origin("203.0.113.0/24", 65001);
         assert_eq!(policy.evaluate(&mut not_found), Decision::Accept);
+    }
+
+    /// Exercises every `BgpRoute` stub method on `V6Route` besides
+    /// `nlri()`/`as_path()`/`set_as_path()`, which the tests above already
+    /// cover. Asserts the documented fixed contract of each stub (constant
+    /// `Origin::Igp`, no `LOCAL_PREF`/`MED`/communities/`NEXT_HOP`/OTC, and that
+    /// every non-`as_path` setter is a true no-op) so a typo here — this
+    /// crate's ROV correctness surface — would be caught.
+    #[test]
+    fn v6route_stub_methods_have_the_documented_fixed_contract() {
+        let mut route = V6Route {
+            nlri: "2001:db8::/32".parse().unwrap(),
+            as_path: AsPath::new(),
+        };
+
+        assert_eq!(route.origin(), pathvector_types::Origin::Igp);
+        assert_eq!(route.local_pref(), None);
+        assert_eq!(route.med(), None);
+        assert!(route.communities().is_empty());
+        assert!(route.large_communities().is_empty());
+        assert!(route.extended_communities().is_empty());
+        assert_eq!(route.next_hop(), None);
+        assert_eq!(route.otc(), None);
+
+        route.set_origin(pathvector_types::Origin::Egp);
+        route.set_local_pref(Some(pathvector_types::LocalPref::new(100)));
+        route.set_med(Some(pathvector_types::Med::new(50)));
+        route.set_communities(vec![pathvector_types::Community::from_parts(65001, 1)]);
+        route.set_large_communities(vec![pathvector_types::LargeCommunity::new(65001, 1, 1)]);
+        route.set_extended_communities(vec![]);
+        route.set_next_hop(Some(pathvector_types::NextHop::V6(
+            "2001:db8::1".parse().unwrap(),
+        )));
+        route.set_otc(Some(Asn::new(65099)));
+
+        // set_as_path is the one real, storage-backed setter on this double
+        // (RoaValidityCondition reads the origin AS through it).
+        let new_path = AsPath::from_sequence(vec![Asn::new(65001)]);
+        route.set_as_path(new_path.clone());
+        assert_eq!(route.as_path(), &new_path);
+
+        assert_eq!(
+            route.origin(),
+            pathvector_types::Origin::Igp,
+            "set_origin must be a no-op on this stub"
+        );
+        assert_eq!(route.local_pref(), None, "set_local_pref must be a no-op");
+        assert_eq!(route.med(), None, "set_med must be a no-op");
+        assert!(
+            route.communities().is_empty(),
+            "set_communities must be a no-op"
+        );
+        assert!(
+            route.large_communities().is_empty(),
+            "set_large_communities must be a no-op"
+        );
+        assert_eq!(route.next_hop(), None, "set_next_hop must be a no-op");
+        assert_eq!(route.otc(), None, "set_otc must be a no-op on this stub");
     }
 
     #[test]

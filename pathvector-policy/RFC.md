@@ -52,3 +52,36 @@ in `pathvectord`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | `BlackholeCondition` matches routes carrying BLACKHOLE community (0xFFFF029A) | `src/condition.rs` | ✅ | `test_blackhole_condition_matches`, `test_blackhole_condition_no_match` |
+
+---
+
+## RFC 9234 — Route Leak Prevention Using Roles in UPDATE and OPEN Messages
+
+**Owns:** `OtcLeakCondition` (RFC 9234 §5 ingress leak detection),
+`OtcPropagationCondition` (§6 egress block), and `SetOtc` (§5/§6 attach-if-absent,
+used at both the ingress and egress call sites with different ASN arguments) — all
+in `src/otc.rs`.  
+**Boundary:** OTC wire encode/decode and role-pair OPEN validation are in
+`pathvector-session`. OTC storage on `Route<A>` is in `pathvector-rib`. Deciding
+*which* peers get these terms installed, and with what `session_role`/ASN
+arguments, is in `pathvectord`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9234
+
+All three types are keyed off `session_role` — the role the local speaker plays on
+a given session (configured per peer, not per-AS). `session_role` describes *our*
+role; the peer's implied role is always the complement. RFC 9234's own rule text is
+phrased in terms of the peer's role ("route from Customer", "advertised to
+Provider") — every doc comment in `src/otc.rs` translates that into `session_role`
+explicitly, since getting this backwards silently inverts the whole leak-prevention
+mechanism (caught and corrected during this feature's own development — see
+`src/otc.rs`'s module doc comment).
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Ingress leak detection: `session_role` Provider/RouteServer + OTC present → leak | `src/otc.rs` | ✅ | `provider_role_with_otc_present_is_a_leak_regardless_of_value`, `route_server_role_with_otc_present_is_a_leak` |
+| Ingress leak detection: `session_role` Peer + OTC present with wrong ASN → leak | `src/otc.rs` | ✅ | `peer_role_with_wrong_otc_asn_is_a_leak`, `peer_role_with_matching_otc_asn_is_not_a_leak` |
+| OTC absent, or `session_role` Customer/RsClient with OTC present, never flagged as a leak | `src/otc.rs` | ✅ | `provider_or_route_server_role_without_otc_is_not_a_leak`, `peer_role_without_otc_is_not_a_leak`, `customer_and_rs_client_roles_with_otc_present_are_not_flagged` |
+| Egress block: route already carrying OTC matches `OtcPropagationCondition` | `src/otc.rs` | ✅ | `propagation_condition_matches_iff_otc_present` |
+| `SetOtc` attaches when absent, is idempotent (never overwrites an existing value) | `src/otc.rs` | ✅ | `set_otc_attaches_when_absent`, `set_otc_is_idempotent_never_overwrites_existing_value` |
+| End-to-end through a `Policy`: ingress reject/attach, egress block/attach | `src/otc.rs` | ✅ | `ingress_policy_rejects_leak_accepts_and_attaches_otherwise`, `ingress_policy_attaches_peer_asn_when_session_role_is_customer`, `egress_policy_blocks_propagation_to_provider_when_otc_already_set`, `egress_policy_attaches_local_asn_when_session_role_is_provider` |
+| Generic over any `BgpRoute` impl — works for IPv6 routes, not just the IPv4 `TestRoute` | `src/otc.rs` | ✅ | `v6_leak_detection_and_attach_work_identically` |

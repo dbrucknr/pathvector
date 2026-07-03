@@ -3,7 +3,7 @@ use std::{net::Ipv4Addr, sync::Arc};
 use ipnetx::interfaces::IpAddress;
 use pathvector_policy::BgpRoute;
 use pathvector_types::{
-    Aggregator, AsPath, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop,
+    Aggregator, AsPath, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop,
     Nlri, Origin, PeerType,
 };
 
@@ -65,6 +65,11 @@ pub struct RareAttrs {
     /// BGP Identifier of the router that first introduced this route into the
     /// iBGP mesh via a route reflector (RFC 4456 `ORIGINATOR_ID`, type 9).
     pub originator_id: Option<Ipv4Addr>,
+    /// `ONLY_TO_CUSTOMER` (RFC 9234 §3) — route-leak prevention marker. Once
+    /// set (either by the peer we received it from, or by us on ingress
+    /// per RFC 9234 §5), must be preserved unchanged and must not be
+    /// forwarded to a Provider, Peer, or Route Server.
+    pub otc: Option<Asn>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +139,7 @@ static RARE_DEFAULT: RareAttrs = RareAttrs {
     atomic_aggregate: false,
     aggregator: None,
     originator_id: None,
+    otc: None,
 };
 
 impl<A: IpAddress> BgpRoute for Route<A> {
@@ -165,6 +171,9 @@ impl<A: IpAddress> BgpRoute for Route<A> {
     }
     fn next_hop(&self) -> Option<NextHop> {
         self.next_hop
+    }
+    fn otc(&self) -> Option<Asn> {
+        self.rare_or_default().otc
     }
 
     fn set_origin(&mut self, origin: Origin) {
@@ -208,6 +217,12 @@ impl<A: IpAddress> BgpRoute for Route<A> {
     }
     fn set_next_hop(&mut self, nh: Option<NextHop>) {
         self.next_hop = nh;
+    }
+    fn set_otc(&mut self, otc: Option<Asn>) {
+        if otc.is_none() && self.rare.is_none() {
+            return; // no allocation needed to represent "already absent"
+        }
+        self.rare_mut().otc = otc;
     }
 }
 
@@ -372,6 +387,13 @@ impl<A: IpAddress> RouteBuilder<A> {
         self
     }
 
+    /// Sets the `ONLY_TO_CUSTOMER` attribute (RFC 9234 §3).
+    #[must_use]
+    pub fn otc(mut self, asn: Asn) -> Self {
+        self.rare.get_or_insert_with(Box::default).otc = Some(asn);
+        self
+    }
+
     /// Sets the peer type (iBGP or eBGP) for this route.
     ///
     /// Defaults to [`PeerType::External`] if not called. Set to
@@ -482,6 +504,51 @@ mod tests {
 
         route.set_as_path(AsPath::from_sequence(vec![Asn::new(65001)]));
         assert_eq!(route.as_path().path_length(), 1);
+    }
+
+    #[test]
+    fn test_route_builder_otc_defaults_to_none_and_lazily_allocates() {
+        use pathvector_types::Asn;
+
+        let bare = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
+        assert!(
+            bare.rare.is_none(),
+            "no rare attrs set — box stays unallocated"
+        );
+        assert_eq!(bare.rare_or_default().otc, None);
+
+        let with_otc = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .otc(Asn::new(65001))
+            .build();
+        assert_eq!(with_otc.rare_or_default().otc, Some(Asn::new(65001)));
+    }
+
+    #[test]
+    fn test_route_bgproute_otc_getter_and_setter() {
+        use pathvector_policy::BgpRoute;
+        use pathvector_types::Asn;
+
+        let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
+        assert_eq!(route.otc(), None);
+
+        route.set_otc(Some(Asn::new(65099)));
+        assert_eq!(route.otc(), Some(Asn::new(65099)));
+
+        route.set_otc(None);
+        assert_eq!(route.otc(), None);
+    }
+
+    #[test]
+    fn test_route_set_otc_none_on_unallocated_rare_does_not_allocate() {
+        use pathvector_policy::BgpRoute;
+
+        let mut route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new()).build();
+        assert!(route.rare.is_none());
+        route.set_otc(None);
+        assert!(
+            route.rare.is_none(),
+            "setting OTC to None on a route with no rare attrs must not allocate"
+        );
     }
 
     #[test]

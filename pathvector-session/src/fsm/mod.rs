@@ -695,6 +695,27 @@ impl Fsm {
             ));
         }
 
+        // RFC 9234 §5.1: if both sides advertise a BGP Role, the pair must be
+        // complementary (Provider↔Customer, RouteServer↔RsClient, Peer↔Peer).
+        // Per the RFC's own non-strict default, a side that doesn't advertise
+        // Role at all is *not* a mismatch — only an incompatible pair is.
+        let local_role = self.config.capabilities.iter().find_map(|c| match c {
+            Capability::Role(r) => Some(*r),
+            _ => None,
+        });
+        let peer_role = peer.capabilities.iter().find_map(|c| match c {
+            Capability::Role(r) => Some(*r),
+            _ => None,
+        });
+        if let (Some(local), Some(peer_role)) = (local_role, peer_role)
+            && !local.is_compatible_with(peer_role)
+        {
+            return Err((
+                NotificationError::OpenMessage(OpenMsgError::RoleMismatch),
+                vec![],
+            ));
+        }
+
         // If either side proposes 0, the result is 0 (timer disabled).
         let negotiated = if self.config.hold_time == 0 || peer.hold_time == 0 {
             0
@@ -2041,6 +2062,112 @@ mod tests {
             State::OpenConfirm,
             "session should proceed to OpenConfirm"
         );
+    }
+
+    // ── RFC 9234 role-pair validation ──────────────────────────────────────────
+
+    /// Drives an FSM configured with `local_role` (in addition to the default
+    /// `FourByteAsn` capability) through `ManualStart`/`TcpConnected`, then
+    /// feeds a peer OPEN advertising `peer_role` (if `Some`). Returns the
+    /// resulting FSM state and outputs for the caller to assert on.
+    fn negotiate_role(
+        local_role: pathvector_types::Role,
+        peer_role: Option<pathvector_types::Role>,
+    ) -> (State, Vec<FsmOutput>) {
+        let mut capabilities = vec![Capability::FourByteAsn(65001)];
+        capabilities.push(Capability::Role(local_role));
+        let config = FsmConfig {
+            capabilities,
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        let mut peer_capabilities = vec![Capability::FourByteAsn(65002)];
+        if let Some(role) = peer_role {
+            peer_capabilities.push(Capability::Role(role));
+        }
+        let peer_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: peer_capabilities,
+        });
+        let out = fsm.process(FsmInput::MessageReceived(peer_open));
+        (fsm.state(), out)
+    }
+
+    #[test]
+    fn test_role_pair_matrix() {
+        use pathvector_types::Role::{Customer, Peer, Provider, RouteServer, RsClient};
+
+        let roles = [Provider, RouteServer, RsClient, Customer, Peer];
+        let compatible = [
+            (Provider, Customer),
+            (Customer, Provider),
+            (RouteServer, RsClient),
+            (RsClient, RouteServer),
+            (Peer, Peer),
+        ];
+        for &local in &roles {
+            for &peer_role in &roles {
+                let (state, out) = negotiate_role(local, Some(peer_role));
+                if compatible.contains(&(local, peer_role)) {
+                    assert_eq!(
+                        state,
+                        State::OpenConfirm,
+                        "{local:?} vs {peer_role:?} should be compatible"
+                    );
+                } else {
+                    assert_eq!(
+                        state,
+                        State::Idle,
+                        "{local:?} vs {peer_role:?} should be rejected"
+                    );
+                    let n = find_notification(&out).expect("expected RoleMismatch NOTIFICATION");
+                    assert_eq!(
+                        n.error,
+                        NotificationError::OpenMessage(OpenMsgError::RoleMismatch)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_role_absent_on_peer_side_is_not_a_mismatch() {
+        // RFC 9234's non-strict default: we advertise a Role, the peer
+        // advertises none at all — this must NOT be treated as a mismatch.
+        let (state, _) = negotiate_role(pathvector_types::Role::Provider, None);
+        assert_eq!(state, State::OpenConfirm);
+    }
+
+    #[test]
+    fn test_role_absent_locally_is_not_a_mismatch() {
+        // Symmetric case: peer advertises a Role, we don't advertise one at
+        // all (no Capability::Role in our own config.capabilities).
+        let config = FsmConfig {
+            capabilities: vec![Capability::FourByteAsn(65001)], // no Role
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        let peer_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![
+                Capability::FourByteAsn(65002),
+                Capability::Role(pathvector_types::Role::Customer),
+            ],
+        });
+        fsm.process(FsmInput::MessageReceived(peer_open));
+        assert_eq!(fsm.state(), State::OpenConfirm);
     }
 
     // ── RFC 4271 §6.8 collision detection ─────────────────────────────────────

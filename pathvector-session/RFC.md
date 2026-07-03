@@ -272,3 +272,32 @@ The FSM restart behavior is deferred.
 **Platform note:** Linux only. `apply_tcp_md5sig` is a no-op with a `warn!` log on
 non-Linux platforms (macOS dev environment). Key rotation and per-AFI MD5 for IPv6
 peers are not yet supported.
+
+---
+
+## RFC 9234 — Route Leak Prevention Using Roles in UPDATE and OPEN Messages
+
+**Owns:** BGP Role capability (code 9) encode/decode; role-pair correctness
+validation during OPEN exchange (`validate_open`); NOTIFICATION subcode 11
+(Role Mismatch); the `ONLY_TO_CUSTOMER` path attribute (type 35) encode/decode.  
+**Boundary:** Per-peer `Role` configuration lives in `pathvectord`. OTC-driven
+route-leak *policy* (reject-on-leak, attach-on-ingress/egress) lives in
+`pathvector-policy`; this crate only carries the role/attribute on the wire and
+enforces role-pair compatibility at session-establishment time.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9234
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| BGP Role capability (code 9): 1-byte value, roles 0–4 | `src/message/open.rs` | ✅ | `test_role_capability_roundtrip_all_defined_values` |
+| Unrecognized role value (5–255) decodes without erroring | `src/message/open.rs` | ✅ | `test_role_capability_unrecognized_value_decodes_as_unknown` |
+| Truncated Role capability body is a decode error, not a panic | `src/message/open.rs` | ✅ | `test_truncated_role_capability_is_error` |
+| Role-pair correctness at OPEN exchange (Provider↔Customer, RS↔RS-Client, Peer↔Peer) | `src/fsm/mod.rs` `validate_open` | ✅ | `test_role_pair_matrix` (25 combinations) |
+| Non-strict default: Role absent on either side is not a mismatch | `src/fsm/mod.rs` `validate_open` | ✅ | `test_role_absent_on_peer_side_is_not_a_mismatch`, `test_role_absent_locally_is_not_a_mismatch` |
+| NOTIFICATION code 2 subcode 11 (Role Mismatch) on incompatible pairs | `src/message/notification.rs` | ✅ | `test_role_mismatch_encodes_as_code_2_subcode_11` |
+| `ONLY_TO_CUSTOMER` attribute (type 35), optional+transitive (flags `0xC0`), 4-byte ASN | `src/message/update.rs` | ✅ | `test_only_to_customer_roundtrip`, `test_only_to_customer_encodes_as_optional_transitive` |
+| Malformed-length OTC falls through to RFC 7606 `AttributeDiscard` (default arm) | `src/message/update.rs` | ✅ | existing `ATTRIBUTE_DISCARD_CASES` table |
+
+**Deferred:** Strict mode (reject when only one side advertises Role) — the RFC makes
+this optional and non-default; tracked as a non-blocking follow-up in `TODO.md`.
+AS-confederation-aware OTC — the RFC itself says NOT RECOMMENDED, matching this
+project's existing confederation scope boundary.

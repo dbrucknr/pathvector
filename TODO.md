@@ -22,15 +22,17 @@ peer's import policy by `pathvectord`, gated by `[daemon.rpki].reject_invalid`
 optimization remains, tracked in the General section below:
 `routemap::covering_matches()`.
 
-**Route leak prevention (RFC 9234)**
-Route leaks (a customer re-advertising a provider's routes to another provider)
-are responsible for a large class of BGP incidents. RFC 9234 defines a `ROLE`
-OPEN capability (`provider`, `customer`, `rs`, `rs-client`, `peer`) and an
-`ONLY_TO_CUSTOMER` community that together allow automatic leak detection at the
-session layer. Without it, pathvectord has no mechanism to detect or reject a
-leaking peer. Requires role config per peer and NOTIFICATION on violation.
-Already listed in `Remaining` below; promoted here because it gates
-production eBGP peering on untrusted links.
+**Route leak prevention (RFC 9234)** — shipped. BGP Role capability (code 9,
+`provider`/`rs`/`rs_client`/`customer`/`peer` via `PeerConfig.role`), role-pair
+correctness at OPEN (NOTIFICATION on mismatch), and the `ONLY_TO_CUSTOMER`
+attribute's full ingress/egress leak-detection and attach/block semantics are
+implemented across `pathvector-session`, `pathvector-rib`, `pathvector-policy`,
+and `pathvectord`, with a real e2e proof over an actual BGP session (see
+`pathvector-e2e/tests/role.rs` and the per-crate `RFC.md` files). OTC egress
+enforcement now applies to both IPv4 and IPv6 routes (the IPv6 export-policy
+gap this depended on was closed — see the General section below). One
+non-blocking follow-up remains, tracked in the General section below: strict
+mode (reject when only one side advertises Role).
 
 ---
 
@@ -358,12 +360,15 @@ What remains as optional future work:
 ### Remaining
 
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
-- BGP Role attribute / route leak prevention (RFC 9234) — `ROLE` OPEN capability and `ONLY_TO_CUSTOMER` community; automatic leak detection at the session layer; requires role config per peer (`provider`, `customer`, `rs`, `rs-client`, `peer`)
+- RFC 9234 strict mode — reject a session at OPEN when only one side advertises the
+  Role capability. The RFC makes this optional and non-default (absence on either
+  side is not a mismatch); implemented behavior matches the non-strict default.
+  Add if an operator needs to enforce Role negotiation as a hard requirement.
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
 
 RFC 8538 (2026-06-24), RFC 4724 Phase 1+2 (2026-06-22), RFC 7313 (2026-06-18), RFC 9003
-(2026-06-18), per-peer hold timer (2026-06-18), and outbound ROUTE-REFRESH trigger
-(2026-06-18) are all complete — see CHANGELOG.md.
+(2026-06-18), per-peer hold timer (2026-06-18), outbound ROUTE-REFRESH trigger
+(2026-06-18), and RFC 9234 (2026-07-02) are all complete — see CHANGELOG.md.
 
 ---
 
@@ -478,6 +483,26 @@ pathvectord currently logs a warning but still advertises its own GR capability.
 RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
 overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
 
+**6. `on_gr_deadline_expired` never re-propagates IPv6 withdrawals to other peers**
+
+Found in passing while closing the IPv6 export-policy gap (`src/outbound.rs`,
+see CHANGELOG.md 2026-07-02). `on_gr_deadline_expired` (`src/daemon/gr.rs`)
+computes both `rib_withdraw_peer_v4` and `rib_withdraw_peer_v6` FIB changes when
+a peer's GR window expires without re-establishment, and applies both to the
+kernel FIB — but the re-propagation loop that notifies *other BGP peers* of the
+withdrawal only iterates `prev_prefixes` (IPv4) and calls `propagate_prefix`
+(IPv4-only). There is no equivalent IPv6 loop calling `propagate_prefix_v6`.
+Other peers therefore never receive a BGP WITHDRAW for IPv6 routes that were
+only reachable via the expired peer — they keep believing those routes are
+still valid until their own hold timer or a future full update corrects it,
+even though the kernel FIB and this daemon's own Loc-RIB are already correct.
+Contrast with `prune_stale_nlri`/`prune_stale_nlri_v6` (the EOR-prune path,
+same file) which already have matching v4/v6 re-propagation loops — this is
+the one GR flush path that never got its v6 counterpart. Fix: add a v6
+re-propagation loop to `on_gr_deadline_expired` mirroring
+`repropagate_after_stale_mark_v6`/`prune_stale_nlri_v6`'s existing shape
+(now export-policy-aware after the fix above).
+
 ### Remaining
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
@@ -518,6 +543,19 @@ overhead of a feature the peer cannot use. Low priority — correctness is unaff
 
 - **IPv6 import policy per-AFI config** — currently IPv6 import policy is accept-all;
   per-AFI policy config (per-peer `import_default_v6`) is deferred.
+
+IPv6 export policy gap — `propagate_prefix_v6` never consulted `export_policies`,
+unlike `propagate_prefix` (IPv4) — resolved 2026-07-02 — see CHANGELOG.md.
+`propagate_prefix_v6` now takes an `export_policy: &Policy<Route<Ipv6Addr>>`
+parameter and evaluates it exactly like the IPv4 path, via a new
+`export_policies_v6` map (mirroring `import_policies_v6`; there is still no
+separate `export_default_v6` config knob — the single `export_default` value
+governs both families). This also closes the matching RFC 9234 gap: OTC egress
+block/attach now applies to IPv6 routes, not just IPv4.
+
+Event-loop integration test for the reconnect capability-refresh path (both the
+RFC 4724 R-bit and RFC 9234 Role surviving reconnect via
+`SessionCommand::SetCapabilities`) resolved 2026-07-02 — see CHANGELOG.md.
 
 `reapply_import_policy` IPv6 counterpart and `cluster_id` configuration guidance
 resolved 2026-06-19 — see CHANGELOG.md.

@@ -5,6 +5,7 @@ mod route;
 
 pub mod action;
 pub mod condition;
+pub mod otc;
 pub mod rpki;
 pub mod term;
 
@@ -28,6 +29,9 @@ pub use condition::{
 
 // RPKI Route Origin Validation
 pub use rpki::RoaValidityCondition;
+
+// RFC 9234 route-leak prevention
+pub use otc::{OtcLeakCondition, OtcPropagationCondition, SetOtc};
 
 // Actions
 pub use action::{

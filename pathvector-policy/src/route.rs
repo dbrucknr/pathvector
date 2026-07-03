@@ -1,6 +1,7 @@
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::{
-    AsPath, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop, Nlri, Origin,
+    AsPath, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop, Nlri,
+    Origin,
 };
 
 /// A BGP route that can be inspected and modified by a [`Policy`](crate::Policy).
@@ -60,6 +61,9 @@ pub trait BgpRoute {
     /// The `NEXT_HOP` attribute, if present.
     fn next_hop(&self) -> Option<NextHop>;
 
+    /// The `ONLY_TO_CUSTOMER` attribute (RFC 9234 §3), if present.
+    fn otc(&self) -> Option<Asn>;
+
     // ── setters — called by actions ────────────────────────────────────────
 
     /// Sets the `ORIGIN` attribute.
@@ -85,4 +89,7 @@ pub trait BgpRoute {
 
     /// Sets or clears the `NEXT_HOP` attribute.
     fn set_next_hop(&mut self, nh: Option<NextHop>);
+
+    /// Sets or clears the `ONLY_TO_CUSTOMER` attribute (RFC 9234 §3).
+    fn set_otc(&mut self, otc: Option<Asn>);
 }

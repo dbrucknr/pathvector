@@ -4,6 +4,159 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (IPv6 export policy)
+
+### [pathvectord] Close the IPv6 export-policy gap — `propagate_prefix_v6` now evaluates export policy
+
+Found during a follow-up bug/confidence pass on the RFC 9234 branch: `propagate_prefix_v6`
+(`src/outbound.rs`) never consulted any export policy at all, unlike the IPv4 path
+(`propagate_prefix`), which does. This meant every export policy an operator configured —
+including RFC 9234's OTC egress block/attach terms, installed correctly into a policy that
+was simply never evaluated — had zero effect on IPv6 UPDATEs. A dual-stack deployment would
+correctly block a v4 route leak to a Provider while leaking the identical route over v6.
+IPv6 route *attributes* already present (including OTC) were still correctly preserved and
+re-emitted on egress; only policy *enforcement* was skipped.
+
+Fixed by adding a new `export_policies_v6: HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>` map
+to `DaemonState` (built in `DaemonState::new()`, `add_peer`, and `remove_peer`, mirroring
+`import_policies_v6`'s lifecycle — there is still no separate `export_default_v6` config
+knob, so the single `export_default` value governs both families), giving
+`propagate_prefix_v6` an `export_policy` parameter that it now evaluates exactly like
+`propagate_prefix` does. Wired into all four call sites that build IPv6 UPDATEs:
+`propagate_to_all_peers_v6` (incremental propagation), `on_established`'s IPv6 full-table
+dump, and GR's `repropagate_after_stale_mark_v6`/`prune_stale_nlri_v6`. `set_export_default`
+(gRPC `PolicyService`) now updates and re-evaluates both families instead of only IPv4.
+Extended the existing `assert_consistent` proptest invariant (`daemon/mod.rs`) to also
+check `export_policies_v6` key-set consistency across arbitrary add/remove sequences, to
+catch a future maintainer forgetting to keep the two maps in sync.
+
+---
+
+## 2026-07-02 (RFC 9234 bug audit)
+
+### [pathvector-policy, pathvectord] Fix two real bugs found during a dedicated bug/confidence audit
+
+Prompted by "do you have high confidence this is correct, and what about performance" —
+a deliberate audit pass looking specifically for bugs, not just missing test coverage.
+
+**Bug 1 — policy replacement silently disabled leak protection.** The gRPC-triggered
+`PolicyService::set_import_default`/`set_export_default` handlers did
+`self.import_policies.insert(peer_ip, Policy::new(action))` — a full replacement of the
+peer's `Policy`, discarding any installed terms. Proved with a throwaway reproduction
+before fixing: an RFC 9234 OTC leak-detection term count dropped from 1 to 0 after a
+single `set_import_default` call, no warning, no error. This also silently disabled the
+pre-existing RFC 6811 ROV reject term via the same code path — not unique to RFC 9234.
+Fixed by adding `Policy::set_default` (changes only the default action, in
+`pathvector-policy/src/term.rs`) and using it in both handlers instead of `Policy::new`.
+
+**Bug 2 — no eBGP guard on Role/OTC.** RFC 9234 is eBGP-only by definition, and the
+original implementation plan's own Non-goals section called for guarding Role/OTC
+application on `PeerType::External` — but the guard was never actually implemented.
+Confirmed via direct code inspection: no `is_ebgp` check existed anywhere near the
+`role` handling. An operator who set `role` on an iBGP peer (even by mistake) would get
+`Capability::Role` sent in OPEN to an internal router and OTC leak-detection applied to
+iBGP-learned routes, which could incorrectly reject a route that legitimately carries
+OTC from its original eBGP ingestion elsewhere in the network. Fixed with a new
+`effective_role()` helper (`pathvectord/src/daemon/mod.rs`) that returns `None` — with a
+one-time `tracing::warn!` — when `role` is configured on a peer where
+`remote_as == local_as`; wired into every call site that previously read `peer.role`
+directly (`DaemonState::new`, `add_peer`, `build_daemon`'s static-peer spawn loop, and
+the dynamic `AddPeer` command handler).
+
+**Performance:** re-benchmarked `pathvector-rib`'s full suite (`select_best`,
+`loc_rib_insert`, `outbound_pipeline`) against a clean `main` checkout in an isolated
+`git worktree` — all within ~1-2% of `main` (noise), no regression. Matches the
+architectural expectation that OTC storage (lazily allocated on `RareAttrs`) adds only
+O(1) checks on the hot path.
+
+---
+
+## 2026-07-02 (RFC 9234 correctness reflection)
+
+### [pathvectord] Close test-coverage gaps found during a post-implementation review
+
+Prompted by a deliberate "did we actually prove this correct" pass on the RFC 9234
+work above, rather than new feature scope. Independently re-checked the OTC
+ingress/egress role mapping against the RFC 9234 datatracker text directly (not
+from memory of the feature's own earlier development) — confirmed correct,
+including the Peer role's simultaneous ingress-attach/egress-attach/egress-block
+handling. Ran the grown `pathvector-fuzz` targets (`session_framing`,
+`session_message`) for 60s each, ~10M executions apiece, no crashes — called for
+in the original plan but never actually executed until now.
+
+Closed five real daemon-level test-coverage gaps: RouteServer and RsClient roles
+had zero route-behavior tests (only a term-count assertion); Peer role's egress
+interaction (simultaneous block-if-leaked and attach-if-absent) was untested;
+Peer role's "OTC present and correct" accept path was untested; IPv6 ingress OTC
+extraction was only proven to compile, never exercised by a real v6 UPDATE;
+`build_local_capabilities`/`SpawnConfig::capabilities` had no test touching the
+`role` parameter at all.
+
+Also closed a real, larger gap: no test exercised the actual event-loop
+reconnect capability-refresh path (`SessionEvent::Terminated` →
+`SessionCommand::SetCapabilities`) — nothing in the suite referenced
+`SetCapabilities` at all, meaning neither RFC 9234 Role nor the pre-existing
+RFC 4724 R-bit reconnect fix had integration-level coverage, only unit tests on
+the pure functions underneath. New test drives `run_event_loop` through
+Established → Terminated (unclean) via the existing `MockSessionHandle`
+infrastructure and asserts on the actual `Vec<Capability>` resent — proving both
+survive a real reconnect, not just that the function that computes them is
+correct in isolation.
+
+---
+
+## 2026-07-02 (RFC 9234)
+
+### [pathvector-types, pathvector-session, pathvector-rib, pathvector-policy, pathvectord] RFC 9234 — BGP Role + `ONLY_TO_CUSTOMER` route-leak prevention
+
+Closes `TODO.md`'s last remaining Tier-1 ("blocks operating safely on the internet")
+item. Route leaks — a customer re-advertising a provider's route to another
+provider — are responsible for a large class of real-world BGP incidents (the 2019
+Verizon/Allegheny/Cloudflare leak being the canonical example). RFC 9234 closes this
+mechanically: each eBGP session gets an explicit configured role (Provider / Customer
+/ Peer / Route-Server / RS-Client), and an `ONLY_TO_CUSTOMER` (OTC) path attribute
+prevents a leaked route from ever being re-advertised somewhere it shouldn't go — no
+manual filter-list maintenance required.
+
+Added a shared `Role` enum to `pathvector-types`. `pathvector-session` gained the BGP
+Role capability (code 9), role-pair correctness validation during OPEN exchange
+(NOTIFICATION subcode 11 on an incompatible pair; RFC 9234's own non-strict default —
+absence of Role on either side is not a mismatch), and the OTC path attribute (type
+35, optional+transitive). `pathvector-rib` gained lazily-allocated OTC storage on
+`Route<A>`. `pathvector-policy` gained `OtcLeakCondition` (ingress leak detection),
+`OtcPropagationCondition` (egress block), and `SetOtc` (attach-if-absent, shared
+between the ingress and egress call sites) — all keyed off `session_role`, the role
+*we* play on a given session (RFC 9234's own rule text is phrased in terms of the
+peer's role, which is easy to misapply directly; every doc comment translates it
+explicitly, since getting this backwards silently inverts the whole mechanism — a bug
+caught and fixed during this feature's own development, before it reached daemon
+wiring).
+
+`pathvectord` gained `PeerConfig.role`, threaded the configured Role into each
+session's OPEN capabilities (rebuilt per-session-spawn, including on reconnect — the
+same lesson learned from the GR R-bit lifetime bug), and installs the OTC policy terms
+into every peer's import/export policy for both static and dynamically-added peers.
+Configured and negotiated Role are exposed via `PeerState.configured_role`/
+`negotiated_role` over gRPC and in `pathvector peer get`'s detail output.
+
+**Real e2e proof, not just unit tests:** a new `pathvector-e2e/tests/role.rs` proves
+the full pipeline over an actual BGP session using a small custom mock BGP peer
+(`pathvector-e2e/src/bin/mock_bgp_peer.rs`) rather than a real router — FRR 8.4.4 (the
+version pinned in `Dockerfile.frr`) does fully support RFC 9234, but a well-behaved,
+RFC-9234-conformant router will never produce a genuine leak by construction: role-pair
+validation at OPEN time makes it structurally impossible for two correctly configured
+routers to leak between each other. Reproducing a real leak over the wire requires a
+peer willing to send one on purpose.
+
+**Two non-blocking follow-ups tracked in `TODO.md`:** strict mode (the RFC makes it
+optional and non-default), and OTC egress *enforcement* for IPv6 routes — discovered
+along the way that `propagate_prefix_v6` never consults `export_policies` at all, a
+pre-existing gap unrelated to this feature. IPv6 OTC attributes are still correctly
+preserved and re-emitted on egress; only the block/attach policy terms can't run for
+IPv6 until that gap closes.
+
+---
+
 ## 2026-07-02 (Phase 2)
 
 ### [pathvector-policy, pathvector-rpki, pathvectord] RPKI Phase 2 — automatic route filtering on ROA validity

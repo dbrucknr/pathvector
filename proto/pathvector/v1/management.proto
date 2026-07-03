@@ -191,6 +191,15 @@ message PeerState {
   /// Zero means the peer either did not advertise GracefulRestart or advertised
   /// `restart_time = 0` (EOR-only mode, no stale-route window).
   uint32 peer_gr_restart_time = 13;
+  /// This peer's configured RFC 9234 BGP Role (`"provider"`, `"rs"`,
+  /// `"rs_client"`, `"customer"`, or `"peer"`). Empty string when no role is
+  /// configured for this peer — matches the RFC's own non-strict default of
+  /// not requiring Role negotiation at all.
+  string configured_role = 14;
+  /// The peer's negotiated RFC 9234 BGP Role, from their advertised Role
+  /// capability in OPEN. Empty string if the session is not established or
+  /// the peer did not advertise a Role capability.
+  string negotiated_role = 15;
 }
 
 /// Event type for WatchPeers stream.
