@@ -74,8 +74,12 @@ install-hooks:
     @echo "Skip with: git push --no-verify"
 
 # Clippy across all targets (warnings promoted to errors, matching CI)
+# pathvector-e2e is excluded here (matching test/msrv) since it pulls in
+# testcontainers, a heavy compile-time dependency, for no benefit -- e2e code
+# still gets linted, just as part of `just e2e` below where the Docker/compile
+# cost is already being paid.
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings -A clippy::similar_names
+    cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
 
 # Run clippy inside a Linux container — catches #[cfg(target_os = "linux")]
 # warnings invisible on macOS. Requires Docker.
@@ -100,7 +104,7 @@ lint-linux:
         rust:1.88-slim \
         sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler make >/dev/null \
             && rustup component add clippy 2>/dev/null \
-            && cargo clippy --workspace --all-targets -- -D warnings \
+            && cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings \
                 -A clippy::similar_names"
 
 # Verify rustfmt formatting (does not modify files)
@@ -204,6 +208,7 @@ e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _buil
 # limits make runs flaky. Requires cargo-nextest — see CONTRIBUTING.md.
 # Run end-to-end tests against Docker containers (requires Docker + cargo-nextest)
 e2e: e2e-images
+    cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
     cargo nextest run -p pathvector-e2e --test-threads 8
 
 # Start the compose dev environment (manual inspection / debugging).

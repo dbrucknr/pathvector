@@ -39,7 +39,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::similar_names
+      # pathvector-e2e is excluded here (matching the test/msrv jobs) since it
+      # pulls in testcontainers for no benefit -- it's linted in the e2e job
+      # instead, where the Docker/compile cost is already being paid.
+      - run: cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
       - run: cargo fmt --check
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
@@ -90,6 +93,8 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: e2e
@@ -164,6 +169,9 @@ jobs:
           tags: pathvector-mock-bgp-peer-test:latest
           cache-from: type=gha,scope=mock-bgp-peer
           cache-to: type=gha,mode=max,scope=mock-bgp-peer
+
+      - name: Lint pathvector-e2e
+        run: cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
 
       - name: Run e2e tests
         run: cargo nextest run -p pathvector-e2e --test-threads 4

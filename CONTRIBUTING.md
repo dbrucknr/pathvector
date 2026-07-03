@@ -47,7 +47,7 @@ just lint-linux  # Run clippy inside a Linux/amd64 container (see below)
 ```
 cargo nextest run --workspace --exclude pathvector-e2e
 cargo test --workspace --exclude pathvector-e2e --doc
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
@@ -124,9 +124,13 @@ Any time you touch:
 just lint-linux
 ```
 
-This runs `cargo clippy --workspace --all-targets -- -D warnings` inside a
+This runs `cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings` inside a
 `rust:latest` Docker container pinned to `linux/amd64` — the same environment
-as CI.
+as CI. `pathvector-e2e` is excluded here for the same reason it's excluded
+from `just test`/`just msrv`: it pulls in `testcontainers`, a heavy
+compile-time dependency, for no benefit in this recipe. It's still linted —
+`just e2e` runs `cargo clippy -p pathvector-e2e` before the test suite,
+where the Docker/compile cost is already being paid.
 
 **First run is slow.** On an M2 Mac, the initial compile takes 15–30 minutes:
 - Docker pulls the `linux/amd64` image (once)
