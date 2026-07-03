@@ -85,6 +85,13 @@ at internet scale. Testing in pathvector reflects that seriousness:
 | End-to-end tests | Full session + route lifecycle against real GoBGP | `just e2e` |
 | Dependency inversion | CLI commands tested via `MockDaemonClient`, no network | `cargo test` |
 
+`cargo test` examples below work as shown for a single crate or a single test
+name. For the full workspace (what `just test`/`just ci`/CI itself run), use
+`cargo nextest run` instead — it's dramatically faster and is the project's
+standard runner; see CONTRIBUTING.md's "Why cargo-nextest" section for setup
+and rationale. Doctests aren't part of that speedup (nextest doesn't run
+them) and still run via a separate `cargo test --doc` step.
+
 ---
 
 ## Unit tests

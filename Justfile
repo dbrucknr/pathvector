@@ -46,13 +46,18 @@ exchange:
 # Note: e2e is not included here — run `just e2e` separately (requires Docker).
 ci: test lint lint-linux fmt-check doc msrv
 
+# nextest runs each test in its own process for much better parallelism than
+# the built-in harness, but it does not support doctests, so those still run
+# as a second, separate step. Requires cargo-nextest — see CONTRIBUTING.md.
 # Run the full test suite (excludes pathvector-e2e, which requires Docker images)
 test:
-    cargo test --workspace --exclude pathvector-e2e
+    cargo nextest run --workspace --exclude pathvector-e2e
+    cargo test --workspace --exclude pathvector-e2e --doc
 
 # Test against the minimum supported Rust version (mirrors the msrv CI job)
 msrv:
-    rustup run 1.88 cargo test --workspace --exclude pathvector-e2e
+    rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
+    rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
 
 # Configure git to use the committed hooks in .githooks/.
 # Run once after cloning: just install-hooks
@@ -184,8 +189,15 @@ e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _buil
 # network per test.  BGP is container-to-container — the macOS Docker Desktop
 # TCP proxy never touches it.  Only pathvectord's gRPC port is mapped to the
 # host (for PathvectorClient), and HTTP/2 is unaffected by the proxy.
+#
+# Each test allocates its own bridge network name and host ports
+# (alloc_grpc_port/alloc_metrics_port), so tests are safe to run concurrently —
+# CI already does (`--test-threads=4`). --test-threads=8 here assumes a
+# reasonably powerful local machine; lower it if Docker Desktop's resource
+# limits make runs flaky. Requires cargo-nextest — see CONTRIBUTING.md.
+# Run end-to-end tests against Docker containers (requires Docker + cargo-nextest)
 e2e: e2e-images
-    cargo test -p pathvector-e2e -- --test-threads=1 --nocapture
+    cargo nextest run -p pathvector-e2e --test-threads 8
 
 # Start the compose dev environment (manual inspection / debugging).
 e2e-up:

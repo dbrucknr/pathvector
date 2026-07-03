@@ -29,6 +29,7 @@ pain points. Read it before your first pull request.
 | Rust 1.88 | `rustup toolchain install 1.88` | Required for `just msrv` |
 | protoc | `brew install protobuf` | Required to compile gRPC proto files |
 | just | `cargo install just` | Task runner; all recipes in `Justfile` |
+| cargo-nextest | `cargo install cargo-nextest --locked` | Required for `just test`, `just msrv`, `just e2e` — see below |
 | Docker | [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Required for `just e2e` and `just lint-linux` |
 
 ---
@@ -44,15 +45,49 @@ just lint-linux  # Run clippy inside a Linux/amd64 container (see below)
 ### What `just ci` runs
 
 ```
-cargo test --workspace --exclude pathvector-e2e
+cargo nextest run --workspace --exclude pathvector-e2e
+cargo test --workspace --exclude pathvector-e2e --doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-rustup run 1.88 cargo test --workspace --exclude pathvector-e2e
+rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
+rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
 ```
 
 This catches the vast majority of issues before pushing. Run it before every
 commit.
+
+---
+
+## Why cargo-nextest
+
+`just test`, `just msrv`, and `just e2e` run tests through
+[cargo-nextest](https://nexte.st/) instead of the built-in `cargo test`
+harness. nextest runs each test in its own process, which schedules across
+CPU cores far more aggressively than `cargo test`'s in-binary thread pool —
+on this workspace's ~1,100 unit/integration tests it's the difference between
+several minutes and a few seconds of actual test-execution time. CI uses it
+too (`.github/workflows/ci.yml`), so a slow local `cargo test` habit will look
+noticeably slower than CI.
+
+**Install once:** `cargo install cargo-nextest --locked`. Without it, `just
+test`/`just msrv`/`just e2e` fail immediately with "no such subcommand:
+`nextest`".
+
+**Doctests still run separately.** nextest does not execute doctests at all
+(no flag enables it — this is a known, permanent nextest limitation, not a
+config gap). Every recipe that used to run `cargo test` (which implicitly
+included doctests) now runs `cargo nextest run` followed by a second
+`cargo test --workspace ... --doc` step. Doctests are kept because they're
+real, compiled, runnable examples in doc comments — the fast-but-incomplete
+option would be dropping them, and we're not doing that.
+
+**`just e2e` runs at `--test-threads 8` locally**, higher than CI's `4`,
+because each e2e test already allocates its own isolated Docker bridge
+network and host ports (see `pathvector-e2e/src/lib.rs`), so concurrent runs
+are safe by construction — the number is a hardware-appropriate guess, not a
+correctness requirement. Lower it if Docker Desktop's resource limits make
+local e2e runs flaky.
 
 ---
 
