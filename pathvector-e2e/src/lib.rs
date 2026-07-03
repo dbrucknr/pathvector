@@ -33,7 +33,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -84,28 +84,66 @@ pub const PATHVECTORD_METRICS_PORT: u16 = 51_300;
 
 // ── Port / ID allocation ──────────────────────────────────────────────────────
 
-/// Per-test unique ID — used to name Docker networks and containers so
+/// Per-test unique ID — used to name Docker networks and containers, and to
+/// derive per-test subnets (see `fib_test_subnet` and friends below), so
 /// concurrent (or back-to-back) tests never collide.
+///
+/// This is a per-*process* counter, which matters: nextest runs many test
+/// binaries concurrently as separate OS processes (unlike `cargo test`,
+/// which runs one integration-test binary at a time), so each process gets
+/// its own independent copy of this static, all starting at 0. Without the
+/// PID-based offset in `alloc_test_id` below, two concurrently-running test
+/// binaries would both allocate test_id 0 and collide on the same Docker
+/// network name / subnet — this happened in practice switching to nextest.
 static NEXT_TEST_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Host-side port base for pathvectord's gRPC mapping.
-static NEXT_GRPC_PORT: AtomicU16 = AtomicU16::new(51_200);
-
-/// Host-side port base for pathvectord's metrics mapping. A separate range
-/// from `NEXT_GRPC_PORT` so the two allocators never hand out the same host
-/// port to concurrent tests.
-static NEXT_METRICS_PORT: AtomicU16 = AtomicU16::new(59_300);
-
 pub fn alloc_test_id() -> u32 {
-    NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+    let counter = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    // Fold in the OS PID (unique among concurrently-running processes on
+    // this host) so different *processes* get disjoint id sequences instead
+    // of every process starting at the same 0, 1, 2, ... Multiplying by a
+    // large odd constant before XOR-ing spreads the PID across the full u32
+    // range, so callers that mask down to 8 or 16 bits (fib_test_subnet's
+    // `% 256`, the IPv6 subnet's `& 0xffff`) still see good separation
+    // between processes, not just the low few bits of a raw PID. XOR with a
+    // fixed per-process value is a bijection, so sequential counter values
+    // within one process (0, 1, 2, ...) still map to distinct ids — only
+    // the mapping is process-specific, not the guarantee of within-process
+    // uniqueness.
+    let pid_component = std::process::id().wrapping_mul(2_654_435_761);
+    pid_component ^ counter
 }
 
+/// Asks the OS for a genuinely free TCP port by binding to port 0 and
+/// reading back what the kernel assigned, then immediately releasing it.
+///
+/// This replaced a static incrementing counter for the same reason
+/// `alloc_test_id` now folds in the PID: a counter that always starts at
+/// 51_200 (or 59_300) in every process nextest spawns guarantees a
+/// collision the moment two test binaries run concurrently — this happened
+/// in practice ("port is already allocated" in CI). Querying the OS's live
+/// port table instead means two concurrent processes essentially never get
+/// told the same port. There's a small window between this check and
+/// Docker actually binding the port where another process could grab it —
+/// an accepted, standard tradeoff for this pattern (the same one used by
+/// most "give me a free port" test helpers); a collision here is now a
+/// rare, transient race rather than a guaranteed failure.
+fn alloc_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("OS must be able to bind an ephemeral port")
+        .local_addr()
+        .expect("bound socket must have a local address")
+        .port()
+}
+
+#[must_use]
 pub fn alloc_grpc_port() -> u16 {
-    NEXT_GRPC_PORT.fetch_add(1, Ordering::Relaxed)
+    alloc_free_port()
 }
 
+#[must_use]
 pub fn alloc_metrics_port() -> u16 {
-    NEXT_METRICS_PORT.fetch_add(1, Ordering::Relaxed)
+    alloc_free_port()
 }
 
 // ── Binary / workspace paths ──────────────────────────────────────────────────
@@ -1164,13 +1202,32 @@ pub fn wait_container_healthy(container_id: &str, timeout: Duration) {
 
 // ── Md5Harness ────────────────────────────────────────────────────────────────
 
-/// Fixed container IPs for TCP MD5SIG tests.
-///
-/// A dedicated subnet is used so both IPs are known before either container
-/// starts — a prerequisite for pre-configuring `TCP_MD5SIG` on both sides.
-pub const MD5_TEST_SUBNET: &str = "172.31.42.0/24";
-pub const MD5_GOBGP_IP: &str = "172.31.42.10";
-pub const MD5_PATHVECTORD_IP: &str = "172.31.42.20";
+/// Per-test subnet and fixed container IPs for TCP MD5SIG tests, keyed by
+/// `test_id` — both IPs must be known before either container starts (a
+/// prerequisite for pre-configuring `TCP_MD5SIG` on both sides), but they
+/// still need to vary per test/process the same way `bird_test_subnet` and
+/// `fib_test_subnet` do. A shared, un-keyed constant here meant any two
+/// concurrently-running MD5 tests (or an MD5 test overlapping with another
+/// family sharing the same subnet range) would collide creating the Docker
+/// network. Uses its own `172.29.x.x` range, distinct from `fib_test_subnet`
+/// (172.30) and `bird_test_subnet` (172.31).
+#[must_use]
+pub fn md5_test_subnet(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.29.{third}.0/24")
+}
+
+#[must_use]
+pub fn md5_gobgp_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.29.{third}.10")
+}
+
+#[must_use]
+pub fn md5_pathvectord_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.29.{third}.20")
+}
 
 /// A test environment for RFC 2385 TCP MD5 authentication tests.
 ///
@@ -1205,15 +1262,18 @@ impl Md5Harness {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
         let network_name = format!("pathvector-md5-test-{test_id}");
+        let subnet = md5_test_subnet(test_id);
+        let gobgp_ip_str = md5_gobgp_ip(test_id);
+        let pathvectord_ip_str = md5_pathvectord_ip(test_id);
 
-        let network = DockerNetwork::create_with_subnet(network_name.clone(), MD5_TEST_SUBNET);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
         // Both IPs are known before either container starts — write configs now.
-        let gobgpd_config = write_gobgp_config_md5(MD5_PATHVECTORD_IP, key);
+        let gobgpd_config = write_gobgp_config_md5(&pathvectord_ip_str, key);
         let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
 
         let pathvectord_config =
-            write_daemon_config_md5(&[(MD5_GOBGP_IP.parse().unwrap(), 65001)], key);
+            write_daemon_config_md5(&[(gobgp_ip_str.parse().unwrap(), 65001)], key);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         // Start GoBGP with a fixed IP and CAP_NET_ADMIN (needed for TCP_MD5SIG
@@ -1222,7 +1282,7 @@ impl Md5Harness {
             &format!("gobgpd-md5-{test_id}"),
             GOBGPD_IMAGE,
             &network_name,
-            Some(MD5_GOBGP_IP),
+            Some(&gobgp_ip_str),
             true,
             &gobgpd_config_path,
             "/etc/gobgp/gobgpd.conf",
@@ -1240,7 +1300,7 @@ impl Md5Harness {
             &format!("pathvectord-md5-{test_id}"),
             PATHVECTORD_IMAGE,
             &network_name,
-            Some(MD5_PATHVECTORD_IP),
+            Some(&pathvectord_ip_str),
             true,
             &pathvectord_config_path,
             "/etc/pathvectord.toml",
@@ -1251,13 +1311,10 @@ impl Md5Harness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient for Md5Harness");
 
-        wait_for_established(
-            &mut client,
-            MD5_GOBGP_IP.parse().unwrap(),
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("MD5-authenticated BGP session did not reach Established within 30 s");
+        let gobgp_ip: Ipv4Addr = gobgp_ip_str.parse().unwrap();
+        wait_for_established(&mut client, gobgp_ip, Duration::from_secs(30))
+            .await
+            .expect("MD5-authenticated BGP session did not reach Established within 30 s");
 
         Self {
             _gobgpd: gobgpd,
@@ -1265,7 +1322,7 @@ impl Md5Harness {
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,
-            gobgp_ip: MD5_GOBGP_IP.parse().unwrap(),
+            gobgp_ip,
             _network: network,
         }
     }
