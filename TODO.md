@@ -483,25 +483,11 @@ pathvectord currently logs a warning but still advertises its own GR capability.
 RFC 4724 §3 says we SHOULD suppress our advertisement in this case to avoid the
 overhead of a feature the peer cannot use. Low priority — correctness is unaffected.
 
-**6. `on_gr_deadline_expired` never re-propagates IPv6 withdrawals to other peers**
-
-Found in passing while closing the IPv6 export-policy gap (`src/outbound.rs`,
-see CHANGELOG.md 2026-07-02). `on_gr_deadline_expired` (`src/daemon/gr.rs`)
-computes both `rib_withdraw_peer_v4` and `rib_withdraw_peer_v6` FIB changes when
-a peer's GR window expires without re-establishment, and applies both to the
-kernel FIB — but the re-propagation loop that notifies *other BGP peers* of the
-withdrawal only iterates `prev_prefixes` (IPv4) and calls `propagate_prefix`
-(IPv4-only). There is no equivalent IPv6 loop calling `propagate_prefix_v6`.
-Other peers therefore never receive a BGP WITHDRAW for IPv6 routes that were
-only reachable via the expired peer — they keep believing those routes are
-still valid until their own hold timer or a future full update corrects it,
-even though the kernel FIB and this daemon's own Loc-RIB are already correct.
-Contrast with `prune_stale_nlri`/`prune_stale_nlri_v6` (the EOR-prune path,
-same file) which already have matching v4/v6 re-propagation loops — this is
-the one GR flush path that never got its v6 counterpart. Fix: add a v6
-re-propagation loop to `on_gr_deadline_expired` mirroring
-`repropagate_after_stale_mark_v6`/`prune_stale_nlri_v6`'s existing shape
-(now export-policy-aware after the fix above).
+`on_gr_deadline_expired` never re-propagating IPv6 withdrawals to other peers
+(found while closing the IPv6 export-policy gap) — resolved 2026-07-03, see
+CHANGELOG.md. Added a v6 re-propagation loop mirroring
+`repropagate_after_stale_mark_v6`/`prune_stale_nlri_v6`'s existing shape,
+export-policy-aware, gated on `ipv6_capable_peers`.
 
 ### Remaining
 

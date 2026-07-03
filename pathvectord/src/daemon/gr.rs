@@ -529,6 +529,8 @@ impl DaemonState {
         }
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
+        let prev_prefixes_v6: Vec<Nlri<Ipv6Addr>> =
+            self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
         let fib_changes_v4 = self.rib_withdraw_peer_v4(&expired_peer);
         let fib_changes_v6 = self.rib_withdraw_peer_v6(&expired_peer);
         if let Some(fm) = &self.fib_manager {
@@ -612,6 +614,73 @@ impl DaemonState {
             }
             self.sync_advertised(other_ip);
         }
+
+        // IPv6 counterpart of the v4 re-propagation loop above — mirrors
+        // `prune_stale_nlri_v6`'s shape. Without this, other peers never
+        // received a BGP WITHDRAW for IPv6 routes that were only reachable
+        // via the expired peer, even though the kernel FIB and this
+        // daemon's own Loc-RIB were already correct (see TODO.md item 6).
+        let other_peers_v6: Vec<Ipv4Addr> = self
+            .rib
+            .peer_types
+            .keys()
+            .copied()
+            .filter(|&ip| ip != peer_ip)
+            .collect();
+        let local_ipv6 = self.rib.local_ipv6;
+        for other_ip in other_peers_v6 {
+            if !self.ipv6_capable_peers.contains(&other_ip) {
+                continue;
+            }
+            let other_type = self
+                .rib
+                .peer_types
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(PeerType::External);
+            let max_len = self
+                .negotiated_max_len
+                .get(&other_ip)
+                .copied()
+                .unwrap_or(MAX_LEN);
+            let Some(export_policy_v6) = self.export_policies_v6.get(&other_ip) else {
+                continue;
+            };
+            let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
+                continue;
+            };
+            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+                continue;
+            };
+            let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
+            let other_four_byte = self.four_byte_peers.contains(&other_ip);
+            let decisions_v6: Vec<PrefixDecisionV6> = prev_prefixes_v6
+                .iter()
+                .map(|&nlri| {
+                    propagate_prefix_v6(
+                        nlri,
+                        &self.rib.loc_rib_v6,
+                        adj_rib_out_v6,
+                        export_policy_v6,
+                        other_type,
+                        local_as,
+                        local_ipv6,
+                        other_next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates_v6(
+                decisions_v6,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
+                self.stalled_peers.push(other_ip);
+            }
+            self.sync_advertised(other_ip);
+        }
+
         self.emit_route_events(&prev_prefixes);
         let _ = self.peer_tx.send(proto::PeerEvent {
             r#type: proto::PeerEventType::Changed as i32,

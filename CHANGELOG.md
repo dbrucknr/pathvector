@@ -4,6 +4,30 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-03 (GR deadline IPv6 re-propagation)
+
+### [pathvectord] `on_gr_deadline_expired` now re-propagates IPv6 withdrawals to other peers
+
+Found while closing the IPv6 export-policy gap (previous entry): when a GR-capable
+peer's restart window expires without re-establishment, `on_gr_deadline_expired`
+(`src/daemon/gr.rs`) correctly withdrew both v4 and v6 routes from the kernel FIB
+and this daemon's own Loc-RIB, but the loop that notifies *other* BGP peers of the
+withdrawal only iterated IPv4 prefixes and called `propagate_prefix`. Other peers
+never received a BGP WITHDRAW for IPv6 routes that were only reachable via the
+expired peer — they kept believing those routes were still valid until their own
+hold timer or a future full update corrected it, even though the kernel FIB and
+Loc-RIB were already correct.
+
+Fixed by capturing `prev_prefixes_v6` (mirroring the existing `prev_prefixes`
+snapshot-before-withdraw pattern) and adding a second re-propagation loop over
+IPv6-capable peers that calls `propagate_prefix_v6` with each peer's
+`export_policies_v6` entry, mirroring `prune_stale_nlri_v6`'s existing shape
+(the EOR-prune path, which already had this). New regression test
+`deadline_expiry_propagates_v6_withdrawal_to_observer` mirrors the existing v4
+test `deadline_expiry_propagates_withdrawal_to_observer`.
+
+---
+
 ## 2026-07-02 (IPv6 export policy)
 
 ### [pathvectord] Close the IPv6 export-policy gap — `propagate_prefix_v6` now evaluates export policy

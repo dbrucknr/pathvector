@@ -13982,6 +13982,53 @@ mod test_gr_phase2 {
         );
     }
 
+    /// `on_gr_deadline_expired` must propagate withdrawals to other
+    /// established IPv6-capable peers for IPv6 routes that were only
+    /// reachable via the expired peer — regression guard for the gap where
+    /// only the v4 side was re-propagated (TODO.md GR known-gaps item 6,
+    /// closed 2026-07-03; mirrors `deadline_expiry_propagates_withdrawal_
+    /// to_observer` above, for IPv6).
+    #[test]
+    fn deadline_expiry_propagates_v6_withdrawal_to_observer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 8);
+        const OBS_AS: u32 = 65008;
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)],
+            None,
+        );
+
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:dead::/48"]));
+        let obs_rx = rxs.get_mut(&OBS_IP).unwrap();
+        while obs_rx.try_recv().is_ok() {}
+
+        // Unclean disconnect — GR window opens.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        while obs_rx.try_recv().is_ok() {}
+
+        // Simulate deadline expiry.
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+
+        assert_eq!(
+            state.rib.loc_rib_v6.len(),
+            0,
+            "LocRib_v6 must be empty after deadline expiry"
+        );
+        assert!(
+            obs_rx.try_recv().is_ok(),
+            "observer must receive an IPv6 withdrawal UPDATE after deadline expiry"
+        );
+    }
+
     /// RFC 4724 §4.2 SHOULD — on unclean termination routes must be marked
     /// stale in LocRib so a fresh route from a second peer immediately wins
     /// best-path selection.
