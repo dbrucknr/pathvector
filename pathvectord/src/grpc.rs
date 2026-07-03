@@ -241,7 +241,7 @@ struct PeerServiceImpl {
     stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
 }
 
-/// Renders an RFC 9234 [`Role`] the same way as `PeerConfig.role`'s TOML
+/// Renders an RFC 9234 [`pathvector_types::Role`] the same way as `PeerConfig.role`'s TOML
 /// values (`"provider"`, `"rs"`, `"rs_client"`, `"customer"`, `"peer"`), so
 /// gRPC/CLI output matches what an operator wrote in config.
 fn role_to_str(role: pathvector_types::Role) -> &'static str {
