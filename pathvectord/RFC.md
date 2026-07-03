@@ -353,6 +353,7 @@ in `pathvector-rib`.
 | `peer_roles`/`remove_peer` lifecycle keeps Role config consistent across dynamic add/remove | `src/daemon/peer.rs` | ✅ | `add_peer_with_role_installs_otc_terms_and_peer_roles`, `remove_peer_clears_peer_roles` |
 | Ingress: `PathAttribute::OnlyToCustomer` extracted into `Route.otc`, both v4 and v6 | `src/daemon/route.rs` | ✅ | `test_ipv6_ingress_otc_extraction_and_leak_rejection` (v6); the route-leak tests above (v4) |
 | Egress: `Route.otc` re-emitted as `PathAttribute::OnlyToCustomer`, both v4 and v6 | `src/outbound.rs` | ✅ | `test_route_leak_prevented_across_two_provider_peers` (asserts the wire attribute) |
+| OTC egress terms (propagation-block + attach-if-absent) actually enforced for IPv6, not just IPv4 — `propagate_prefix_v6` now evaluates `export_policies_v6` the same way `propagate_prefix` evaluates `export_policies` | `src/outbound.rs`, `src/daemon/mod.rs`, `src/daemon/policy.rs` | ✅ | `test_ipv6_egress_otc_block_and_attach` |
 | Configured/negotiated Role exposed via gRPC `PeerState.configured_role`/`negotiated_role` | `src/grpc.rs` | ✅ | `test_build_peer_state_includes_configured_and_negotiated_role`, `test_build_peer_state_role_absent_by_default` |
 | Real e2e proof: a route pre-carrying OTC from a peer configured `role = "provider"` is rejected; a clean route is accepted | `pathvector-e2e/tests/role.rs` | ✅ | `leaked_route_is_rejected_clean_route_is_accepted` |
 | `set_import_default`/`set_export_default` (gRPC `PolicyService`) preserve installed OTC terms | `src/daemon/policy.rs`, `pathvector-policy/src/term.rs` `Policy::set_default` | ✅ | `test_set_import_and_export_default_preserve_otc_terms` (OTC); `test_set_import_default_preserves_rpki_rov_term` (same code path, the pre-existing RFC 6811 exposure) |
@@ -361,12 +362,6 @@ in `pathvector-rib`.
 **Deferred:**
 - Strict mode (reject when only one side advertises Role) — the RFC makes this
   optional and non-default; tracked as a non-blocking follow-up in `TODO.md`.
-- OTC egress *enforcement* (block/attach) is only applied to IPv4 routes —
-  `propagate_prefix_v6` does not consult `export_policies` at all, a pre-existing
-  gap unrelated to this feature (see `TODO.md`'s IPv6 export-policy entry). OTC
-  attributes already present on an IPv6 route are still correctly preserved and
-  re-emitted on egress; only the block/attach *policy terms* can't run for IPv6
-  until that gap closes.
 - The e2e proof uses a custom mock BGP peer (`pathvector-e2e/src/bin/mock_bgp_peer.rs`)
   rather than FRR. FRR 8.4.4 (the version pinned in `Dockerfile.frr`) does fully
   support RFC 9234 (`neighbor <addr> local-role <role>`, confirmed directly against

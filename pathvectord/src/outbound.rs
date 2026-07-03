@@ -319,10 +319,12 @@ pub(crate) enum PrefixDecisionV6 {
 /// For eBGP peers, `local_ipv6` must be `Some` for an announcement to be
 /// generated; if `None`, eBGP routes are silently suppressed (no next-hop to
 /// rewrite) but any previously advertised route is withdrawn.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn propagate_prefix_v6(
     nlri: Nlri<Ipv6Addr>,
     loc_rib: &LocRib<Ipv6Addr>,
     adj_rib_out: &mut AdjRibOut<Ipv6Addr>,
+    export_policy: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
     local_as: u32,
     local_ipv6: Option<Ipv6Addr>,
@@ -343,18 +345,27 @@ pub(crate) fn propagate_prefix_v6(
                     PrefixDecisionV6::NoChange
                 };
             }
-            let route =
+            let mut route =
                 prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6, next_hop_self);
-            match adj_rib_out.insert(route.clone()) {
-                InsertOutcome::Accepted(prev) => {
-                    if prev.as_ref() == Some(&route) {
-                        PrefixDecisionV6::NoChange
+            match export_policy.evaluate(&mut route) {
+                Decision::Accept => match adj_rib_out.insert(route.clone()) {
+                    InsertOutcome::Accepted(prev) => {
+                        if prev.as_ref() == Some(&route) {
+                            PrefixDecisionV6::NoChange
+                        } else {
+                            PrefixDecisionV6::Announce(route)
+                        }
+                    }
+                    InsertOutcome::Filtered(Some(_)) => PrefixDecisionV6::Withdraw(nlri),
+                    InsertOutcome::Filtered(None) => PrefixDecisionV6::NoChange,
+                },
+                Decision::Reject | Decision::Next => {
+                    if adj_rib_out.withdraw(&nlri).is_some() {
+                        PrefixDecisionV6::Withdraw(nlri)
                     } else {
-                        PrefixDecisionV6::Announce(route)
+                        PrefixDecisionV6::NoChange
                     }
                 }
-                InsertOutcome::Filtered(Some(_)) => PrefixDecisionV6::Withdraw(nlri),
-                InsertOutcome::Filtered(None) => PrefixDecisionV6::NoChange,
             }
         }
         _ => {
@@ -1689,6 +1700,14 @@ mod propagate_tests {
         Policy::new(DefaultAction::Accept)
     }
 
+    fn accept_policy_v6() -> Policy<pathvector_rib::Route<Ipv6Addr>> {
+        Policy::new(DefaultAction::Accept)
+    }
+
+    fn reject_policy_v6() -> Policy<pathvector_rib::Route<Ipv6Addr>> {
+        Policy::new(DefaultAction::Reject)
+    }
+
     // ── propagate_prefix ─────────────────────────────────────────────────────
 
     /// Split-horizon Withdraw: when the best route came from the target peer and
@@ -1739,6 +1758,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &accept_policy_v6(),
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
@@ -1747,6 +1767,81 @@ mod propagate_tests {
         assert!(
             matches!(decision, PrefixDecisionV6::Withdraw(_)),
             "split-horizon must produce Withdraw for v6 when route was previously advertised"
+        );
+    }
+
+    /// Regression guard for the IPv6 export-policy gap: `propagate_prefix_v6`
+    /// used to take no `export_policy` parameter at all, so a Reject policy
+    /// had no effect on IPv6 UPDATEs. A rejecting policy must suppress the
+    /// announcement (NoChange, since nothing was previously advertised).
+    #[test]
+    fn test_propagate_prefix_v6_reject_policy_suppresses_announcement() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(src, route_v6(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &reject_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+        );
+        assert!(
+            matches!(decision, PrefixDecisionV6::NoChange),
+            "a rejecting export policy must suppress the v6 announcement, not send it"
+        );
+    }
+
+    /// Regression guard for the IPv6 export-policy gap: a previously
+    /// announced route must be withdrawn once the export policy starts
+    /// rejecting it (e.g. an operator flips `export_default` to reject, or
+    /// an RFC 9234 OTC-propagation-block term now matches).
+    #[test]
+    fn test_propagate_prefix_v6_reject_policy_withdraws_previously_announced() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(src, route_v6(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+
+        // First call with an accepting policy: Announce, recorded in AdjRibOut.
+        let first = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+        );
+        assert!(matches!(first, PrefixDecisionV6::Announce(_)));
+
+        // Second call with a rejecting policy: must withdraw the route it
+        // previously announced, not silently leave it advertised.
+        let second = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &reject_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+        );
+        assert!(
+            matches!(second, PrefixDecisionV6::Withdraw(_)),
+            "a route must be withdrawn once the export policy starts rejecting it"
         );
     }
 
@@ -1766,6 +1861,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &accept_policy_v6(),
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
@@ -1777,6 +1873,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &accept_policy_v6(),
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
@@ -1825,6 +1922,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &accept_policy_v6(),
             PeerType::Internal,
             65001,
             None,
@@ -1858,6 +1956,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &accept_policy_v6(),
             PeerType::Internal,
             65001,
             None,

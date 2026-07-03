@@ -247,6 +247,9 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(MAX_LEN);
+            let Some(export_policy_v6) = self.export_policies_v6.get(&other_ip) else {
+                continue;
+            };
             let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
                 continue;
             };
@@ -262,6 +265,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib_v6,
                         adj_rib_out_v6,
+                        export_policy_v6,
                         other_type,
                         local_as,
                         local_ipv6,
@@ -461,6 +465,9 @@ impl DaemonState {
             if !self.ipv6_capable_peers.contains(&other_ip) {
                 continue;
             }
+            let Some(export_policy_v6) = self.export_policies_v6.get(&other_ip) else {
+                continue;
+            };
             let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
                 continue;
             };
@@ -476,6 +483,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib_v6,
                         adj_rib_out_v6,
+                        export_policy_v6,
                         other_type,
                         local_as,
                         local_ipv6,

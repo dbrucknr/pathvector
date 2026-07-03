@@ -4,6 +4,34 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-02 (IPv6 export policy)
+
+### [pathvectord] Close the IPv6 export-policy gap — `propagate_prefix_v6` now evaluates export policy
+
+Found during a follow-up bug/confidence pass on the RFC 9234 branch: `propagate_prefix_v6`
+(`src/outbound.rs`) never consulted any export policy at all, unlike the IPv4 path
+(`propagate_prefix`), which does. This meant every export policy an operator configured —
+including RFC 9234's OTC egress block/attach terms, installed correctly into a policy that
+was simply never evaluated — had zero effect on IPv6 UPDATEs. A dual-stack deployment would
+correctly block a v4 route leak to a Provider while leaking the identical route over v6.
+IPv6 route *attributes* already present (including OTC) were still correctly preserved and
+re-emitted on egress; only policy *enforcement* was skipped.
+
+Fixed by adding a new `export_policies_v6: HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>` map
+to `DaemonState` (built in `DaemonState::new()`, `add_peer`, and `remove_peer`, mirroring
+`import_policies_v6`'s lifecycle — there is still no separate `export_default_v6` config
+knob, so the single `export_default` value governs both families), giving
+`propagate_prefix_v6` an `export_policy` parameter that it now evaluates exactly like
+`propagate_prefix` does. Wired into all four call sites that build IPv6 UPDATEs:
+`propagate_to_all_peers_v6` (incremental propagation), `on_established`'s IPv6 full-table
+dump, and GR's `repropagate_after_stale_mark_v6`/`prune_stale_nlri_v6`. `set_export_default`
+(gRPC `PolicyService`) now updates and re-evaluates both families instead of only IPv4.
+Extended the existing `assert_consistent` proptest invariant (`daemon/mod.rs`) to also
+check `export_policies_v6` key-set consistency across arbitrary add/remove sequences, to
+catch a future maintainer forgetting to keep the two maps in sync.
+
+---
+
 ## 2026-07-02 (RFC 9234 bug audit)
 
 ### [pathvector-policy, pathvectord] Fix two real bugs found during a dedicated bug/confidence audit

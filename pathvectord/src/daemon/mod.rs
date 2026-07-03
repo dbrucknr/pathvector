@@ -244,6 +244,7 @@ pub(crate) struct DaemonState {
     pub(crate) import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
     pub(crate) import_policies_v6: HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>,
     pub(crate) export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
+    pub(crate) export_policies_v6: HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>,
     pub(crate) adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
     pub(crate) adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
     pub(crate) adj_ribs_in_v6: HashMap<Ipv4Addr, AdjRibIn<Ipv6Addr>>,
@@ -429,12 +430,24 @@ impl DaemonState {
             })
             .collect();
 
-        // RFC 9234 §6 egress terms only apply here — export policy is currently
-        // only evaluated for IPv4 routes (`propagate_prefix`); `propagate_prefix_v6`
-        // does not consult `export_policies` at all (see TODO.md, IPv6 export
-        // policy gap). Until that's closed, OTC egress enforcement for IPv6
-        // routes is unavailable regardless of role configuration.
         let export_policies = peers
+            .iter()
+            .map(|p| {
+                let is_ebgp = p.remote_as != local_as;
+                let mut policy = Policy::new(resolve_export_default(p.export_default, is_ebgp));
+                if let Some(role) = peer_roles.get(&p.address).copied() {
+                    install_otc_export_term(&mut policy, role, Asn::new(local_as));
+                }
+                (p.address, policy)
+            })
+            .collect();
+
+        // There is no separate `export_default_v6` config knob (unlike import,
+        // which has `import_default_v6`) — the same `export_default` value
+        // governs both address families, mirrored here into its own
+        // `Policy<Route<Ipv6Addr>>` since the policy engine is generic per
+        // route type, not per peer.
+        let export_policies_v6 = peers
             .iter()
             .map(|p| {
                 let is_ebgp = p.remote_as != local_as;
@@ -537,6 +550,7 @@ impl DaemonState {
             import_policies,
             import_policies_v6,
             export_policies,
+            export_policies_v6,
             adj_ribs_in,
             adj_ribs_out,
             adj_ribs_in_v6,
@@ -3432,6 +3446,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_ipv6_egress_otc_block_and_attach() {
+        // IPv6 counterpart of `test_peer_role_egress_blocks_leaked_route_and_
+        // attaches_clean_one` — regression guard for the IPv6 export-policy
+        // gap: `propagate_prefix_v6` used to never consult any export policy
+        // at all, so RFC 9234's OTC egress block/attach terms (installed
+        // correctly into `export_policies_v6`) had zero effect on IPv6
+        // UPDATEs. Same scenario as the v4 test, over IPv6 NLRIs.
+        let peer_provider: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_lateral: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_state_with_roles(
+            65001,
+            &[
+                (peer_provider, 65002, config::PeerRole::Customer),
+                (peer_lateral, 65003, config::PeerRole::Peer),
+            ],
+        );
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+        let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
+        state.on_established(
+            peer_provider,
+            peer_provider,
+            PeerType::External,
+            65002,
+            90,
+            &v6_caps,
+            None,
+        );
+        state.on_established(
+            peer_lateral,
+            peer_lateral,
+            PeerType::External,
+            65003,
+            90,
+            &v6_caps,
+            None,
+        );
+        drain_all(&mut receivers);
+
+        // Learned from peer_provider (our Provider) with no OTC — gets
+        // attached on ingress (session_role = Customer is in the
+        // ingress-attach set), so it already carries OTC by the time it's
+        // considered for export.
+        let leaked_v6: Nlri<Ipv6Addr> = "2001:db8:dead::/48".parse().unwrap();
+        state.on_route_update(
+            peer_provider,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::2".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(leaked_v6)],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+        state.flush_pending();
+        assert_eq!(
+            state.rib.loc_rib_v6.best(&leaked_v6).unwrap().otc(),
+            Some(Asn::new(65002))
+        );
+        assert!(
+            receivers
+                .get_mut(&peer_lateral)
+                .unwrap()
+                .try_recv()
+                .is_err(),
+            "an IPv6 route already carrying OTC must never reach a Peer-role destination"
+        );
+
+        // A second, clean IPv6 route from a peer with no configured role
+        // (so no ingress attach) crosses to peer_lateral, where it must get
+        // OTC attached on egress (session_role = Peer is in the
+        // egress-attach set too).
+        let peer_plain: Ipv4Addr = "10.0.0.4".parse().unwrap();
+        state.add_peer(
+            &config::PeerConfig {
+                address: peer_plain,
+                port: 179,
+                remote_as: 65004,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+                connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
+                role: None,
+            },
+            mpsc::channel(64).0,
+        );
+        state.on_established(
+            peer_plain,
+            peer_plain,
+            PeerType::External,
+            65004,
+            90,
+            &v6_caps,
+            None,
+        );
+        drain_all(&mut receivers);
+
+        let clean_v6: Nlri<Ipv6Addr> = "2001:db8:beef::/48".parse().unwrap();
+        state.on_route_update(
+            peer_plain,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65004)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: NextHop::V6("2001:db8::4".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(clean_v6)],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+        state.flush_pending();
+        assert_eq!(
+            state.rib.loc_rib_v6.best(&clean_v6).unwrap().otc(),
+            None,
+            "no configured role on peer_plain means no ingress attach"
+        );
+        let msg = receivers
+            .get_mut(&peer_lateral)
+            .unwrap()
+            .try_recv()
+            .expect("clean IPv6 route must reach the Peer-role destination");
+        assert!(
+            msg.attributes.iter().any(
+                |a| matches!(a, PathAttribute::OnlyToCustomer(asn) if *asn == Asn::new(65001))
+            ),
+            "OTC = local ASN must be attached on IPv6 egress toward a Peer-role destination"
+        );
+    }
+
     // ── test wrappers ─────────────────────────────────────────────────────────
 
     /// Wrapper for IPv4-only `handle_update` calls — passes fresh v6 stubs.
@@ -4662,6 +4823,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &accept_all_v6(),
             PeerType::Internal,
             65001,
             None, // no local_ipv6 — OK for iBGP
@@ -4689,6 +4851,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &accept_all_v6(),
             PeerType::External,
             65001,
             Some(local_v6),
@@ -4721,6 +4884,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &accept_all_v6(),
             PeerType::External,
             65001,
             None, // no local_ipv6 — eBGP must NOT announce
@@ -4748,6 +4912,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &accept_all_v6(),
             PeerType::Internal,
             65001,
             None,
@@ -4760,6 +4925,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &accept_all_v6(),
             PeerType::Internal,
             65001,
             None,
@@ -11551,13 +11717,15 @@ mod dynamic_peer_prop_tests {
 
     /// A `DaemonState` is self-consistent when every key present in
     /// `adj_ribs_in` also appears in `peer_remote_as`, `adj_ribs_out`,
-    /// `import_policies`, and `export_policies` — and vice-versa.
+    /// `import_policies`, `export_policies`, and `export_policies_v6` — and
+    /// vice-versa.
     fn assert_consistent(s: &DaemonState, label: &str) {
         let ribs_in: std::collections::HashSet<_> = s.adj_ribs_in.keys().collect();
         let remote_as: std::collections::HashSet<_> = s.rib.peer_remote_as.keys().collect();
         let ribs_out: std::collections::HashSet<_> = s.adj_ribs_out.keys().collect();
         let import: std::collections::HashSet<_> = s.import_policies.keys().collect();
         let export: std::collections::HashSet<_> = s.export_policies.keys().collect();
+        let export_v6: std::collections::HashSet<_> = s.export_policies_v6.keys().collect();
 
         assert_eq!(
             ribs_in, remote_as,
@@ -11574,6 +11742,10 @@ mod dynamic_peer_prop_tests {
         assert_eq!(
             ribs_in, export,
             "{label}: adj_ribs_in keys must equal export_policies keys"
+        );
+        assert_eq!(
+            ribs_in, export_v6,
+            "{label}: adj_ribs_in keys must equal export_policies_v6 keys"
         );
     }
 

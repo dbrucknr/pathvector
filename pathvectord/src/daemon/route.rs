@@ -611,6 +611,10 @@ impl DaemonState {
                 .get(&peer_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
+            let Some(export_policy_v6) = self.export_policies_v6.get(&peer_ip) else {
+                tracing::error!(peer = %peer_ip, "export_policies_v6 missing peer — skipping v6 propagation");
+                continue;
+            };
             let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip) else {
                 tracing::error!(peer = %peer_ip, "adj_ribs_out_v6 missing peer — skipping v6 propagation");
                 continue;
@@ -641,6 +645,7 @@ impl DaemonState {
                         nlri,
                         loc_rib_v6,
                         adj_rib_out_v6,
+                        export_policy_v6,
                         peer_type,
                         local_as,
                         local_ipv6,

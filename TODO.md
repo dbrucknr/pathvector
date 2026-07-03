@@ -28,11 +28,11 @@ correctness at OPEN (NOTIFICATION on mismatch), and the `ONLY_TO_CUSTOMER`
 attribute's full ingress/egress leak-detection and attach/block semantics are
 implemented across `pathvector-session`, `pathvector-rib`, `pathvector-policy`,
 and `pathvectord`, with a real e2e proof over an actual BGP session (see
-`pathvector-e2e/tests/role.rs` and the per-crate `RFC.md` files). Two
-non-blocking follow-ups remain, tracked in the General section below: strict
-mode (reject when only one side advertises Role) and OTC egress enforcement
-for IPv6 routes (blocked on the pre-existing IPv6 export-policy gap, also
-tracked below).
+`pathvector-e2e/tests/role.rs` and the per-crate `RFC.md` files). OTC egress
+enforcement now applies to both IPv4 and IPv6 routes (the IPv6 export-policy
+gap this depended on was closed — see the General section below). One
+non-blocking follow-up remains, tracked in the General section below: strict
+mode (reject when only one side advertises Role).
 
 ---
 
@@ -524,17 +524,14 @@ overhead of a feature the peer cannot use. Low priority — correctness is unaff
 - **IPv6 import policy per-AFI config** — currently IPv6 import policy is accept-all;
   per-AFI policy config (per-peer `import_default_v6`) is deferred.
 
-- **IPv6 export policy is not evaluated at all** — `propagate_prefix_v6`
-  (`src/outbound.rs`) never consults `export_policies`, unlike `propagate_prefix`
-  (IPv4), which does. Discovered while wiring RFC 9234's OTC egress terms: the
-  `OtcPropagationCondition`/`SetOtc` egress terms are installed into
-  `export_policies` correctly, but since nothing calls `export_policy.evaluate(...)`
-  on the v6 path, they (and any other export policy an operator configures) have no
-  effect for IPv6 routes. IPv6 route *attributes* already present (including OTC)
-  are still correctly preserved and re-emitted on egress — only policy
-  *enforcement* is skipped. Needs `propagate_prefix_v6` to take an
-  `export_policy: &Policy<Route<Ipv6Addr>>` parameter and apply it the same way
-  the IPv4 path does.
+IPv6 export policy gap — `propagate_prefix_v6` never consulted `export_policies`,
+unlike `propagate_prefix` (IPv4) — resolved 2026-07-02 — see CHANGELOG.md.
+`propagate_prefix_v6` now takes an `export_policy: &Policy<Route<Ipv6Addr>>`
+parameter and evaluates it exactly like the IPv4 path, via a new
+`export_policies_v6` map (mirroring `import_policies_v6`; there is still no
+separate `export_default_v6` config knob — the single `export_default` value
+governs both families). This also closes the matching RFC 9234 gap: OTC egress
+block/attach now applies to IPv6 routes, not just IPv4.
 
 Event-loop integration test for the reconnect capability-refresh path (both the
 RFC 4724 R-bit and RFC 9234 Role surviving reconnect via

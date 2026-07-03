@@ -106,11 +106,12 @@ impl DaemonState {
         self.propagate_to_all_peers_v6(&nlris_v6);
     }
 
-    /// Replaces the export-policy default for `peer_ip` (leaving any
-    /// installed terms — e.g. RFC 9234 OTC block/attach — untouched) and
-    /// re-evaluates the entire Loc-RIB against the updated policy for that
-    /// peer.  Newly accepted prefixes are sent as UPDATEs; newly rejected
-    /// ones trigger WITHDRAWs.
+    /// Replaces the export-policy default for `peer_ip` — both address
+    /// families, since there is no separate `export_default_v6` config knob
+    /// (leaving any installed terms — e.g. RFC 9234 OTC block/attach —
+    /// untouched in either) — and re-evaluates the entire Loc-RIB against
+    /// the updated policy for that peer. Newly accepted prefixes are sent as
+    /// UPDATEs; newly rejected ones trigger WITHDRAWs.
     ///
     /// Has no effect on the wire if the peer is not currently established — the
     /// new policy will be applied on the next session's opening table dump.
@@ -120,6 +121,10 @@ impl DaemonState {
             return;
         }
         self.export_policies
+            .get_mut(&peer_ip)
+            .unwrap()
+            .set_default(action);
+        self.export_policies_v6
             .get_mut(&peer_ip)
             .unwrap()
             .set_default(action);
@@ -149,36 +154,64 @@ impl DaemonState {
             .unwrap_or(MAX_LEN);
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
-        let Some(export_policy) = self.export_policies.get(&peer_ip) else {
-            return;
-        };
-        let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
-            return;
-        };
-        let Some(update_tx) = self.update_senders.get(&peer_ip) else {
-            return;
-        };
-
-        let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
-        let decisions: Vec<PrefixDecision> = nlris
-            .into_iter()
-            .map(|nlri| {
-                propagate_prefix(
-                    nlri,
-                    &self.rib.loc_rib,
-                    adj_rib_out,
-                    export_policy,
-                    peer_type,
-                    local_as,
-                    local_bgp_id,
-                    next_hop_self,
-                )
-            })
-            .collect();
         let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
-        if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
-            self.stalled_peers.push(peer_ip);
+        let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
+
+        if let (Some(export_policy), Some(adj_rib_out), Some(update_tx)) = (
+            self.export_policies.get(&peer_ip),
+            self.adj_ribs_out.get_mut(&peer_ip),
+            self.update_senders.get(&peer_ip),
+        ) {
+            let decisions: Vec<PrefixDecision> = nlris
+                .into_iter()
+                .map(|nlri| {
+                    propagate_prefix(
+                        nlri,
+                        &self.rib.loc_rib,
+                        adj_rib_out,
+                        export_policy,
+                        peer_type,
+                        local_as,
+                        local_bgp_id,
+                        next_hop_self,
+                    )
+                })
+                .collect();
+            if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
+                self.stalled_peers.push(peer_ip);
+            }
         }
+
+        if self.ipv6_capable_peers.contains(&peer_ip) {
+            let nlris_v6: Vec<Nlri<Ipv6Addr>> =
+                self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
+            let local_ipv6 = self.rib.local_ipv6;
+            if let (Some(export_policy_v6), Some(adj_rib_out_v6), Some(update_tx)) = (
+                self.export_policies_v6.get(&peer_ip),
+                self.adj_ribs_out_v6.get_mut(&peer_ip),
+                self.update_senders.get(&peer_ip),
+            ) {
+                let decisions_v6: Vec<PrefixDecisionV6> = nlris_v6
+                    .into_iter()
+                    .map(|nlri| {
+                        propagate_prefix_v6(
+                            nlri,
+                            &self.rib.loc_rib_v6,
+                            adj_rib_out_v6,
+                            export_policy_v6,
+                            peer_type,
+                            local_as,
+                            local_ipv6,
+                            next_hop_self,
+                        )
+                    })
+                    .collect();
+                if !flush_updates_v6(decisions_v6, max_len, update_tx, peer_type, peer_four_byte) {
+                    self.stalled_peers.push(peer_ip);
+                }
+            }
+        }
+
         self.sync_advertised(peer_ip);
     }
 }

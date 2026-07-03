@@ -31,21 +31,24 @@ impl DaemonState {
         let mut import_policy = Policy::new(resolve_import_default(peer.import_default, is_ebgp));
         let default_v6 = peer.import_default_v6.or(peer.import_default);
         let mut import_policy_v6 = Policy::new(resolve_import_default(default_v6, is_ebgp));
-        // RFC 9234 §6: export policy is only evaluated for IPv4 routes (see
-        // the matching comment in `DaemonState::new` — `propagate_prefix_v6`
-        // doesn't consult `export_policies` at all), so OTC egress terms are
-        // only installed on the v4 export policy.
         let mut export_policy = Policy::new(resolve_export_default(peer.export_default, is_ebgp));
+        // No separate `export_default_v6` knob — see the matching comment in
+        // `DaemonState::new`.
+        let mut export_policy_v6 =
+            Policy::new(resolve_export_default(peer.export_default, is_ebgp));
         let resolved_role: Option<Role> = effective_role(peer, local_as).inspect(|&role| {
             let peer_asn = Asn::new(peer.remote_as);
             install_otc_import_term(&mut import_policy, role, peer_asn);
             install_otc_import_term(&mut import_policy_v6, role, peer_asn);
             install_otc_export_term(&mut export_policy, role, Asn::new(local_as));
+            install_otc_export_term(&mut export_policy_v6, role, Asn::new(local_as));
         });
         self.import_policies.insert(peer.address, import_policy);
         self.import_policies_v6
             .insert(peer.address, import_policy_v6);
         self.export_policies.insert(peer.address, export_policy);
+        self.export_policies_v6
+            .insert(peer.address, export_policy_v6);
         self.update_senders.insert(peer.address, update_sender);
         if let Some(msg) = peer.shutdown_message.clone() {
             self.shutdown_messages.insert(peer.address, msg);
@@ -87,6 +90,7 @@ impl DaemonState {
         self.import_policies.remove(&peer_ip);
         self.import_policies_v6.remove(&peer_ip);
         self.export_policies.remove(&peer_ip);
+        self.export_policies_v6.remove(&peer_ip);
         self.update_senders.remove(&peer_ip);
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
@@ -409,6 +413,7 @@ impl DaemonState {
         if !stalled
             && peer_supports_ipv6
             && !all_nlris_v6.is_empty()
+            && let Some(export_policy_v6) = self.export_policies_v6.get(&peer_ip)
             && let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip)
         {
             let loc_rib_v6 = &self.rib.loc_rib_v6;
@@ -433,6 +438,7 @@ impl DaemonState {
                         nlri,
                         loc_rib_v6,
                         adj_rib_out_v6,
+                        export_policy_v6,
                         peer_type,
                         local_as,
                         local_ipv6,
