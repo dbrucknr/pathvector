@@ -3503,9 +3503,6 @@ pub fn bird_pathvectord_ip(test_id: u32) -> String {
     format!("172.31.{third}.20")
 }
 
-/// Retained for any call-sites that still use the old constants.
-pub const BIRD_PATHVECTORD_IP: &str = "172.31.50.20";
-
 /// Writes the pathvectord config for the BIRD interop harness.
 ///
 /// Uses the standard `bgp_id = "10.0.0.2"` (the router ID, not the interface
