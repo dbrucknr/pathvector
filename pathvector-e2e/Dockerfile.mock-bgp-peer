@@ -19,9 +19,12 @@ FROM rust:1.88-slim-bookworm AS builder
 
 # protoc is required by prost-build's code-generation step (pathvector-client
 # is a dependency of pathvector-e2e).
+# mold speeds up the final link step of the cargo build below (CI-only,
+# not used locally — see CHANGELOG.md).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler make \
+    && apt-get install -y --no-install-recommends protobuf-compiler make mold \
     && rm -rf /var/lib/apt/lists/*
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
 WORKDIR /workspace
 

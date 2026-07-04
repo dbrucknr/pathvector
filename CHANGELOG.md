@@ -4,6 +4,44 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-04 (mold linker in CI)
+
+### [ci] Use mold as the linker in GitHub Actions to cut CI wall-clock time
+
+CI runs (nextest + doctests + clippy + fmt + doc + MSRV + e2e Docker builds) were
+taking 10-15+ minutes per push, driven mostly by the `Test`/`Lint`/`MSRV` jobs'
+final link step and the e2e job's three Rust-compiling Docker image builds
+(`pathvectord`, `mock_rtr_server`, `mock_bgp_peer`). Added `mold` (installed via
+apt) as the linker for those jobs and Docker builds — Linux-only, via a
+job-scoped `RUSTFLAGS` env var in `ci.yml` and `ENV RUSTFLAGS` in each affected
+Dockerfile's builder stage. No committed `.cargo/config.toml`, so this has zero
+effect on local development, which stays on whatever linker macOS/the
+contributor's own machine already uses.
+
+Verified locally first in a container matching CI's exact base image
+(`rust:1.88-slim-bookworm`): confirmed via the linked binary's `.comment`
+section that mold actually performed the link, not a silent fallback to the
+default linker.
+
+Measured on two real GitHub Actions runs on this PR, compared against the last
+pre-mold `main` CI run:
+- `Lint` and `MSRV` jobs: ~25% faster once `Swatinem/rust-cache` warmed up for
+  the new `RUSTFLAGS` fingerprint (first run after the change is a cold
+  rebuild — expected, since changing `RUSTFLAGS` invalidates that cache).
+- e2e job's three Docker image builds: ~15-17% faster, consistent across
+  the cold-rebuild run (~83s saved combined).
+- e2e job's own `pathvector-e2e` compile (before the Docker-based tests run):
+  reproduced consistently across both runs (193s, 195s) vs. 361s pre-mold —
+  a real, repeatable win, not noise (testcontainers is a heavy compile-time
+  dependency here per `CONTRIBUTING.md`).
+- Total workflow wall-clock time: 16m15s (pre-mold baseline) → 4m52s on the
+  second (cache-warm) run. Part of that drop is Docker's own layer cache
+  reusing an unchanged image build (unrelated to mold — the second run was
+  an empty commit, so nothing in the three Rust-compiling images actually
+  needed rebuilding), so the honest, mold-attributable number is the
+  Lint/MSRV/e2e-test-compile improvements above, not the full 3.3x headline
+  figure.
+
 ## 2026-07-04 (IPv6 GR e2e coverage + two incidental fixes)
 
 ### [pathvector-e2e] Add missing IPv6 e2e coverage for GR deadline expiry and export-policy reject
