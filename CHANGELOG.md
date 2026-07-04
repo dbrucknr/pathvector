@@ -4,6 +4,51 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-04 (IPv6 GR e2e coverage + two incidental fixes)
+
+### [pathvector-e2e] Add missing IPv6 e2e coverage for GR deadline expiry and export-policy reject
+
+The previous entry's fix (`on_gr_deadline_expired` IPv6 re-propagation) and the
+export-policy IPv6 gap fix (2026-07-02) both shipped without an e2e test proving
+they work over a real BGP session. Added `GrIpv6ObserverHarness`
+(`pathvector-e2e/src/lib.rs`) — a three-container topology (GoBGP-source,
+GoBGP-observer, pathvectord) — and two new tests:
+`gr_deadline_expiry_sends_v6_withdrawal_to_observer`
+(`tests/graceful_restart_ipv6.rs`) and
+`export_default_reject_blocks_ipv6_propagation_to_peer` (`tests/policy.rs`).
+
+GoBGP-observer uses a distinct AS (65003) rather than reusing GoBGP-source's AS
+65001 — sharing an AS was tried first and produced a confusing failure where
+pathvectord correctly re-advertised the route but GoBGP-observer's own AS_PATH
+loop-prevention silently discarded it on receipt, since the AS_PATH already
+contained 65001 from the originating hop (RFC 4271 §9.1.2 working as designed).
+
+### [pathvectord] Fix `prefixes_advertised` staleness after IPv6-only propagation
+
+Found while instrumenting the above e2e test: `propagate_to_all_peers_v6` never
+called `sync_advertised` itself, relying on `propagate_to_all_peers` (the v4
+path) to do it. Since the v4 call runs first and reads `adj_ribs_out_v6` before
+`propagate_to_all_peers_v6` has a chance to mutate it, an UPDATE that only
+carried IPv6 NLRIs left `prefixes_advertised` stale until an unrelated v4 event
+happened to resync it. Fixed by adding the same sync loop to
+`propagate_to_all_peers_v6`; regression test
+`test_v6_only_propagation_syncs_prefixes_advertised`.
+
+### [pathvector-e2e, pathvector-stress] Fix `cargo test`/`cargo nextest run` hanging on non-test-harness binaries
+
+`mock_rtr_server`, `mock_bgp_peer` (`pathvector-e2e`), and `stress`
+(`pathvector-stress`) are long-lived servers / load generators, not test
+harnesses. Without an explicit `test = false`, Cargo treats every `[[bin]]`
+(including auto-discovered `src/bin/*.rs` targets) as testable by default and
+invokes the compiled binary with `--list --format terse` during test discovery.
+None of these three understand that flag — their real `main` just runs
+unconditionally, hanging the whole `nextest run`/`nextest list` phase
+indefinitely with no error output. `pathvector` and `pathvector-mrt`'s bin
+targets were left untouched — both have real `#[test]`s compiled through the
+same harness and correctly handle `--list` today.
+
+---
+
 ## 2026-07-03 (GR deadline IPv6 re-propagation)
 
 ### [pathvectord] `on_gr_deadline_expired` now re-propagates IPv6 withdrawals to other peers
