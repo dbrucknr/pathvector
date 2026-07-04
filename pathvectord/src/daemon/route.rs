@@ -658,6 +658,17 @@ impl DaemonState {
                 .or_default()
                 .extend(decisions);
         }
+        // Sync advertised counts after all v6 propagation is complete. Needed
+        // here too (not just in `propagate_to_all_peers`): `sync_advertised`
+        // reads both `adj_ribs_out` and `adj_ribs_out_v6`, but a caller may
+        // invoke this v6 path without a preceding/following v4 call (e.g.
+        // `on_route_update` when only `affected_v6` is non-empty) — without
+        // this, `prefixes_advertised` would stay stale after a v6-only
+        // propagation until some unrelated v4 event happened to resync it.
+        let peers: Vec<Ipv4Addr> = self.adj_ribs_out_v6.keys().copied().collect();
+        for peer_ip in peers {
+            self.sync_advertised(peer_ip);
+        }
     }
 
     /// Drains all per-peer coalescing buffers and sends the accumulated
