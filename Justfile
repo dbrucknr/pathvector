@@ -57,28 +57,14 @@ ci: check-test-bins test lint lint-linux fmt-check doc msrv
 # `pathvector-e2e`'s `mock_rtr_server`/`mock_bgp_peer` (see CHANGELOG.md
 # 2026-07-04) before `test = false` was added to each. Runs in seconds —
 # purely `cargo metadata` + a grep, no compilation.
+#
+# Lives in scripts/ rather than inline so CI can call it directly with plain
+# bash — invoking it via `just` would eagerly evaluate every top-level
+# backtick-assigned Justfile variable, including nightly-bin/cargo-fuzz-bin
+# (used only by the fuzz recipes), which fail on a runner that hasn't
+# installed cargo-fuzz/nightly.
 check-test-bins:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    failed=0
-    while IFS=$'\t' read -r name manifest src_path; do
-        pkg_dir=$(dirname "$manifest")
-        if ! grep -rq '#\[test\]' "$pkg_dir/src" 2>/dev/null; then
-            echo "ERROR: bin target '$name' ($src_path) has no #[test] anywhere in its crate's src/, but is not marked test = false in $manifest."
-            echo "  cargo test / cargo nextest run will invoke this binary with --list --format terse during discovery."
-            echo "  If its main() does real work unconditionally, this hangs the whole test run indefinitely with no error output."
-            echo "  Fix: add '[[bin]]' with 'name = \"$name\"' and 'test = false' to $manifest (unless you're adding real #[test]s to this crate)."
-            failed=1
-        fi
-    done < <(cargo metadata --format-version 1 --no-deps | jq -r '
-        .packages[] | .manifest_path as $manifest | .targets[] |
-        select(.kind[] == "bin") | select(.test == true) |
-        "\(.name)\t\($manifest)\t\(.src_path)"
-    ')
-    if [ "$failed" -eq 1 ]; then
-        exit 1
-    fi
-    echo "OK: every bin target with test=true has real #[test]s in its crate."
+    ./scripts/check-test-bins.sh
 
 # nextest runs each test in its own process for much better parallelism than
 # the built-in harness, but it does not support doctests, so those still run
