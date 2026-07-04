@@ -173,6 +173,20 @@ pathvector-e2e` directly against a stale image is the most common source of
 confusing e2e failures — the old binary silently ignores new TOML fields added
 with `#[serde(default)]`.
 
+**If a test topology has pathvectord re-advertise a route between two GoBGP
+(or BIRD/FRR) peers, give them distinct ASes.** Reusing one peer's AS for
+another looks harmless — pathvectord only cares about peer IP, not AS — but
+the *receiving* peer runs its own independent BGP implementation with its own
+AS_PATH loop-prevention (RFC 4271 §9.1.2): once pathvectord prepends its own
+AS and re-advertises, the AS_PATH already contains the originating peer's AS.
+If the receiving peer happens to share that same AS, it silently discards the
+route as a routing loop. This looks exactly like an export-policy bug from
+pathvectord's side (the route is correctly queued and sent) and cost real
+debugging time in `GrIpv6ObserverHarness`
+(`pathvector-e2e/src/lib.rs`) before the cause was found — give every peer in
+a multi-peer topology its own AS unless the test specifically needs to share
+one.
+
 ---
 
 ## Test layers
