@@ -20,6 +20,21 @@ futures            = { workspace = true }
 tempfile           = "3"
 testcontainers     = "0.23"
 
+# Both binaries run as long-lived servers inside test-fixture Docker
+# containers (see Dockerfile.mock-rtr / Dockerfile.mock-bgp-peer) — they are
+# not test harnesses. Without `test = false`, `cargo test`/`cargo nextest run`
+# treat them as testable targets and invoke the compiled binary with
+# `--list --format terse`; since neither binary understands those args, its
+# real `main` just starts the server loop and blocks forever waiting for a
+# connection, hanging the entire nextest discovery phase.
+[[bin]]
+name = "mock_rtr_server"
+test = false
+
+[[bin]]
+name = "mock_bgp_peer"
+test = false
+
 [lints.rust]
 unsafe_code = "forbid"
 
