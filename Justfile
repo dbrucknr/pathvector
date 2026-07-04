@@ -44,15 +44,47 @@ exchange:
 
 # Run every check that CI runs, in the same order.  Green here = green on push.
 # Note: e2e is not included here — run `just e2e` separately (requires Docker).
-ci: test lint lint-linux fmt-check doc msrv
+ci: check-test-bins test lint lint-linux fmt-check doc msrv
 
+# Guards against a `[[bin]]` (including auto-discovered src/bin/*.rs targets)
+# that Cargo will treat as testable (the `test` field defaults to `true`) but
+# isn't a real test harness. Without an explicit `test = false`, `cargo test`/
+# `cargo nextest run` invoke the compiled binary with `--list --format terse`
+# during discovery; if the binary's real `main` doesn't understand that flag
+# and does real work unconditionally (spawns a server, connects somewhere,
+# runs a workload), the whole test run hangs indefinitely with no error
+# output. This bit `pathvector-stress`'s `stress` binary and
+# `pathvector-e2e`'s `mock_rtr_server`/`mock_bgp_peer` (see CHANGELOG.md
+# 2026-07-04) before `test = false` was added to each. Runs in seconds —
+# purely `cargo metadata` + a grep, no compilation.
+#
+# Lives in scripts/ rather than inline so CI can call it directly with plain
+# bash — invoking it via `just` would eagerly evaluate every top-level
+# backtick-assigned Justfile variable, including nightly-bin/cargo-fuzz-bin
+# (used only by the fuzz recipes), which fail on a runner that hasn't
+# installed cargo-fuzz/nightly.
+check-test-bins:
+    ./scripts/check-test-bins.sh
+
+# nextest runs each test in its own process for much better parallelism than
+# the built-in harness, but it does not support doctests, so those still run
+# as a second, separate step. Requires cargo-nextest — see CONTRIBUTING.md.
 # Run the full test suite (excludes pathvector-e2e, which requires Docker images)
 test:
-    cargo test --workspace --exclude pathvector-e2e
+    cargo nextest run --workspace --exclude pathvector-e2e
+    cargo test --workspace --exclude pathvector-e2e --doc
 
+# Uses a separate target dir (target/msrv) so this never shares build
+# artifacts with `just test`'s stable-toolchain target/debug — cargo's
+# fingerprints include the exact rustc version, so alternating toolchains
+# against one shared target dir forces a full workspace rebuild (all ~150+
+# dependencies) on every switch. Costs extra disk space; the first run into
+# target/msrv is still a full cold build, but every run after that is
+# incremental, matching `just test`'s speed instead of always paying ~19 min.
 # Test against the minimum supported Rust version (mirrors the msrv CI job)
 msrv:
-    rustup run 1.88 cargo test --workspace --exclude pathvector-e2e
+    CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
+    CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
 
 # Configure git to use the committed hooks in .githooks/.
 # Run once after cloning: just install-hooks
@@ -62,8 +94,12 @@ install-hooks:
     @echo "Skip with: git push --no-verify"
 
 # Clippy across all targets (warnings promoted to errors, matching CI)
+# pathvector-e2e is excluded here (matching test/msrv) since it pulls in
+# testcontainers, a heavy compile-time dependency, for no benefit -- e2e code
+# still gets linted, just as part of `just e2e` below where the Docker/compile
+# cost is already being paid.
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings -A clippy::similar_names
+    cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
 
 # Run clippy inside a Linux container — catches #[cfg(target_os = "linux")]
 # warnings invisible on macOS. Requires Docker.
@@ -88,7 +124,7 @@ lint-linux:
         rust:1.88-slim \
         sh -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler make >/dev/null \
             && rustup component add clippy 2>/dev/null \
-            && cargo clippy --workspace --all-targets -- -D warnings \
+            && cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings \
                 -A clippy::similar_names"
 
 # Verify rustfmt formatting (does not modify files)
@@ -184,8 +220,16 @@ e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _buil
 # network per test.  BGP is container-to-container — the macOS Docker Desktop
 # TCP proxy never touches it.  Only pathvectord's gRPC port is mapped to the
 # host (for PathvectorClient), and HTTP/2 is unaffected by the proxy.
+#
+# Each test allocates its own bridge network name and host ports
+# (alloc_grpc_port/alloc_metrics_port), so tests are safe to run concurrently —
+# CI already does (`--test-threads=4`). --test-threads=8 here assumes a
+# reasonably powerful local machine; lower it if Docker Desktop's resource
+# limits make runs flaky. Requires cargo-nextest — see CONTRIBUTING.md.
+# Run end-to-end tests against Docker containers (requires Docker + cargo-nextest)
 e2e: e2e-images
-    cargo test -p pathvector-e2e -- --test-threads=1 --nocapture
+    cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
+    cargo nextest run -p pathvector-e2e --test-threads 8
 
 # Start the compose dev environment (manual inspection / debugging).
 e2e-up:

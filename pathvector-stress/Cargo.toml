@@ -11,6 +11,13 @@ publish = false
 [[bin]]
 name = "stress"
 path = "src/main.rs"
+# Not a test harness: `main` unconditionally spawns a real pathvectord child
+# and runs a full stress workload regardless of argv. Without `test = false`,
+# `cargo test`/`cargo nextest run` invoke this binary with `--list --format
+# terse` during discovery, and since it ignores that arg entirely, it just
+# runs the whole stress test instead of listing (zero) tests — hanging the
+# workspace-wide test run indefinitely.
+test = false
 
 [dependencies]
 pathvector-client = { workspace = true }

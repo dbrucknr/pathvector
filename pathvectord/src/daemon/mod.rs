@@ -8419,6 +8419,64 @@ mod tests {
         );
     }
 
+    // Regression test: propagate_to_all_peers_v6 must sync prefixes_advertised
+    // itself. Before the fix, only propagate_to_all_peers (v4) called
+    // sync_advertised, so a v6-only propagation event (no preceding or
+    // following v4 call) left prefixes_advertised with no entry at all for
+    // the receiving peer, even though the route was correctly queued for
+    // the wire in adj_ribs_out_v6.
+    #[test]
+    fn test_v6_only_propagation_syncs_prefixes_advertised() {
+        // Both peers are eBGP (distinct remote AS from local_as and from each
+        // other) so the scenario can't be confused with iBGP full-mesh
+        // split-horizon, which would otherwise block source → dest here
+        // regardless of this test's fix.
+        let cluster_id: u32 = 9;
+        let source: Ipv4Addr = "10.0.0.20".parse().unwrap();
+        let dest: Ipv4Addr = "10.0.0.21".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[], &[source, dest]);
+
+        state.on_established(source, source, PeerType::External, 65099, 90, &[], None);
+        state.on_established(dest, dest, PeerType::External, 65098, 90, &[], None);
+        drain_all(&mut receivers);
+
+        state.ipv6_capable_peers.insert(source);
+        state.ipv6_capable_peers.insert(dest);
+        // eBGP peers need a local IPv6 next-hop to announce to (propagate_prefix_v6
+        // silently suppresses eBGP announcements without one — see its doc comment).
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        assert_eq!(
+            state.rib.prefixes_advertised.get(&dest),
+            Some(&0),
+            "sanity check: prefixes_advertised must start at 0 for dest \
+             (set by on_established's own sync, before the v6 route exists)"
+        );
+
+        // Inject a v6 route sourced from `source` and propagate it — no v4
+        // call before or after, matching the on_route_update code path when
+        // an UPDATE carries only IPv6 NLRIs (affected_v6 non-empty, affected
+        // empty).
+        let peer_id = PeerId::new(IpAddr::V4(source));
+        let route = RouteBuilder::new(
+            nlri_v6_rr("2001:db8::/32"),
+            pathvector_types::Origin::Igp,
+            pathvector_types::AsPath::new(),
+        )
+        .peer_type(PeerType::External)
+        .build();
+        state.rib_insert_v6(peer_id, route);
+        state.propagate_to_all_peers_v6(&[nlri_v6_rr("2001:db8::/32")]);
+
+        assert_eq!(
+            state.rib.prefixes_advertised.get(&dest),
+            Some(&1),
+            "prefixes_advertised for dest must reflect the queued v6 route \
+             immediately after a v6-only propagate_to_all_peers_v6 call, \
+             without needing a separate v4 event to resync it"
+        );
+    }
+
     // RFC 4456 §8: on_established full-table dump must apply split-horizon for v6.
     #[test]
     fn test_rr_v6_established_dump_applies_split_horizon() {
@@ -13979,6 +14037,53 @@ mod test_gr_phase2 {
                 .best(&nlri_v6("2001:db8:2::/48"))
                 .is_none(),
             "stale v6 route must be pruned on EOR"
+        );
+    }
+
+    /// `on_gr_deadline_expired` must propagate withdrawals to other
+    /// established IPv6-capable peers for IPv6 routes that were only
+    /// reachable via the expired peer — regression guard for the gap where
+    /// only the v4 side was re-propagated (TODO.md GR known-gaps item 6,
+    /// closed 2026-07-03; mirrors `deadline_expiry_propagates_withdrawal_
+    /// to_observer` above, for IPv6).
+    #[test]
+    fn deadline_expiry_propagates_v6_withdrawal_to_observer() {
+        const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 8);
+        const OBS_AS: u32 = 65008;
+
+        let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+        establish_with_gr_v6(&mut state, 120);
+        state.on_established(
+            OBS_IP,
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)],
+            None,
+        );
+
+        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:dead::/48"]));
+        let obs_rx = rxs.get_mut(&OBS_IP).unwrap();
+        while obs_rx.try_recv().is_ok() {}
+
+        // Unclean disconnect — GR window opens.
+        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        while obs_rx.try_recv().is_ok() {}
+
+        // Simulate deadline expiry.
+        state.gr.deadlines.remove(&PEER_IP);
+        state.on_gr_deadline_expired(PEER_IP);
+
+        assert_eq!(
+            state.rib.loc_rib_v6.len(),
+            0,
+            "LocRib_v6 must be empty after deadline expiry"
+        );
+        assert!(
+            obs_rx.try_recv().is_ok(),
+            "observer must receive an IPv6 withdrawal UPDATE after deadline expiry"
         );
     }
 

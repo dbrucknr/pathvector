@@ -243,6 +243,51 @@ async fn import_default_v6_reject_blocks_ipv6_allows_ipv4() {
     );
 }
 
+// ── IPv6 export policy ─────────────────────────────────────────────────────────
+
+/// Regression test for the IPv6 export-policy fix (CHANGELOG.md 2026-07-02):
+/// `propagate_prefix_v6` previously never consulted any export policy at
+/// all, so `export_default = "reject"` correctly blocked IPv4 routes but
+/// had no effect on IPv6 routes — a real dual-stack deployment would leak
+/// an IPv6 route the equivalent IPv4 route was correctly blocked from
+/// sending. This proves the v6 path is enforced too, over a real BGP
+/// session.
+#[tokio::test]
+async fn export_default_reject_blocks_ipv6_propagation_to_peer() {
+    let mut h = Harness::new_v6_export_reject().await;
+
+    h.client
+        .originate_route(pathvector_client::types::OriginateRouteParams {
+            prefix: "2001:db8:dead::/48".to_owned(),
+            next_hop: "::".parse().unwrap(),
+            origin: pathvector_client::types::Origin::Igp,
+            communities: vec![],
+            large_communities: vec![],
+            extended_communities: vec![],
+            local_pref: None,
+            med: None,
+        })
+        .await
+        .expect("originate_route RPC failed");
+
+    // The route is originated directly into pathvectord's own Loc-RIB, so it
+    // had every opportunity to be sent to the peer by now if export policy
+    // permitted it — a generous margin before asserting absence.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let out = std::process::Command::new("docker")
+        .args(["exec", &h.gobgpd_id, "gobgp", "global", "rib", "-a", "ipv6"])
+        .output()
+        .expect("docker exec gobgp global rib -a ipv6");
+    let rib_text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !rib_text.contains("2001:db8:dead::/48"),
+        "IPv6 export-policy regression: 2001:db8:dead::/48 appeared in the \
+         peer's RIB despite export_default = \"reject\"\nPeer RIB:\n{rib_text}"
+    );
+}
+
 /// Runtime export-policy reload: start with RFC 8212 reject default (import
 /// accept, export reject), confirm the route reaches Loc-RIB but is NOT
 /// forwarded to the sink, then call `SetExportDefault(Accept)` via gRPC and

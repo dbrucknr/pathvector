@@ -4,6 +4,75 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-04 (IPv6 GR e2e coverage + two incidental fixes)
+
+### [pathvector-e2e] Add missing IPv6 e2e coverage for GR deadline expiry and export-policy reject
+
+The previous entry's fix (`on_gr_deadline_expired` IPv6 re-propagation) and the
+export-policy IPv6 gap fix (2026-07-02) both shipped without an e2e test proving
+they work over a real BGP session. Added `GrIpv6ObserverHarness`
+(`pathvector-e2e/src/lib.rs`) — a three-container topology (GoBGP-source,
+GoBGP-observer, pathvectord) — and two new tests:
+`gr_deadline_expiry_sends_v6_withdrawal_to_observer`
+(`tests/graceful_restart_ipv6.rs`) and
+`export_default_reject_blocks_ipv6_propagation_to_peer` (`tests/policy.rs`).
+
+GoBGP-observer uses a distinct AS (65003) rather than reusing GoBGP-source's AS
+65001 — sharing an AS was tried first and produced a confusing failure where
+pathvectord correctly re-advertised the route but GoBGP-observer's own AS_PATH
+loop-prevention silently discarded it on receipt, since the AS_PATH already
+contained 65001 from the originating hop (RFC 4271 §9.1.2 working as designed).
+
+### [pathvectord] Fix `prefixes_advertised` staleness after IPv6-only propagation
+
+Found while instrumenting the above e2e test: `propagate_to_all_peers_v6` never
+called `sync_advertised` itself, relying on `propagate_to_all_peers` (the v4
+path) to do it. Since the v4 call runs first and reads `adj_ribs_out_v6` before
+`propagate_to_all_peers_v6` has a chance to mutate it, an UPDATE that only
+carried IPv6 NLRIs left `prefixes_advertised` stale until an unrelated v4 event
+happened to resync it. Fixed by adding the same sync loop to
+`propagate_to_all_peers_v6`; regression test
+`test_v6_only_propagation_syncs_prefixes_advertised`.
+
+### [pathvector-e2e, pathvector-stress] Fix `cargo test`/`cargo nextest run` hanging on non-test-harness binaries
+
+`mock_rtr_server`, `mock_bgp_peer` (`pathvector-e2e`), and `stress`
+(`pathvector-stress`) are long-lived servers / load generators, not test
+harnesses. Without an explicit `test = false`, Cargo treats every `[[bin]]`
+(including auto-discovered `src/bin/*.rs` targets) as testable by default and
+invokes the compiled binary with `--list --format terse` during test discovery.
+None of these three understand that flag — their real `main` just runs
+unconditionally, hanging the whole `nextest run`/`nextest list` phase
+indefinitely with no error output. `pathvector` and `pathvector-mrt`'s bin
+targets were left untouched — both have real `#[test]`s compiled through the
+same harness and correctly handle `--list` today.
+
+---
+
+## 2026-07-03 (GR deadline IPv6 re-propagation)
+
+### [pathvectord] `on_gr_deadline_expired` now re-propagates IPv6 withdrawals to other peers
+
+Found while closing the IPv6 export-policy gap (previous entry): when a GR-capable
+peer's restart window expires without re-establishment, `on_gr_deadline_expired`
+(`src/daemon/gr.rs`) correctly withdrew both v4 and v6 routes from the kernel FIB
+and this daemon's own Loc-RIB, but the loop that notifies *other* BGP peers of the
+withdrawal only iterated IPv4 prefixes and called `propagate_prefix`. Other peers
+never received a BGP WITHDRAW for IPv6 routes that were only reachable via the
+expired peer — they kept believing those routes were still valid until their own
+hold timer or a future full update corrected it, even though the kernel FIB and
+Loc-RIB were already correct.
+
+Fixed by capturing `prev_prefixes_v6` (mirroring the existing `prev_prefixes`
+snapshot-before-withdraw pattern) and adding a second re-propagation loop over
+IPv6-capable peers that calls `propagate_prefix_v6` with each peer's
+`export_policies_v6` entry, mirroring `prune_stale_nlri_v6`'s existing shape
+(the EOR-prune path, which already had this). New regression test
+`deadline_expiry_propagates_v6_withdrawal_to_observer` mirrors the existing v4
+test `deadline_expiry_propagates_withdrawal_to_observer`.
+
+---
+
 ## 2026-07-02 (IPv6 export policy)
 
 ### [pathvectord] Close the IPv6 export-policy gap — `propagate_prefix_v6` now evaluates export policy

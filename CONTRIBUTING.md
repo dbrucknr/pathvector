@@ -29,7 +29,9 @@ pain points. Read it before your first pull request.
 | Rust 1.88 | `rustup toolchain install 1.88` | Required for `just msrv` |
 | protoc | `brew install protobuf` | Required to compile gRPC proto files |
 | just | `cargo install just` | Task runner; all recipes in `Justfile` |
+| cargo-nextest | `cargo install cargo-nextest --locked` | Required for `just test`, `just msrv`, `just e2e` — see below |
 | Docker | [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Required for `just e2e` and `just lint-linux` |
+| jq | `brew install jq` | Required for `just check-test-bins` (part of `just ci`) |
 
 ---
 
@@ -44,15 +46,68 @@ just lint-linux  # Run clippy inside a Linux/amd64 container (see below)
 ### What `just ci` runs
 
 ```
-cargo test --workspace --exclude pathvector-e2e
-cargo clippy --workspace --all-targets -- -D warnings
+just check-test-bins   # cargo metadata + jq — no compilation, seconds
+cargo nextest run --workspace --exclude pathvector-e2e
+cargo test --workspace --exclude pathvector-e2e --doc
+cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-rustup run 1.88 cargo test --workspace --exclude pathvector-e2e
+CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo nextest run --workspace --exclude pathvector-e2e
+CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo test --workspace --exclude pathvector-e2e --doc
 ```
 
 This catches the vast majority of issues before pushing. Run it before every
 commit.
+
+**`just check-test-bins` runs first because it's cheap and catches a specific,
+easy-to-reintroduce mistake:** any `[[bin]]` target (including auto-discovered
+`src/bin/*.rs` files) that Cargo treats as testable by default but isn't
+actually a test harness. See the Justfile recipe's own comment, or CHANGELOG.md
+2026-07-04, for the exact failure mode this guards against — it previously
+hung `cargo nextest run` indefinitely with no error output.
+
+**`just msrv` uses a separate `target/msrv` directory**, not the same
+`target/debug` that `just test` uses. Cargo's build fingerprints include the
+exact rustc version, so alternating between the stable toolchain and 1.88
+against one shared target directory forces a full workspace rebuild (all
+~150+ dependencies) on every single switch — measured at ~19 minutes locally.
+A separate target dir per toolchain avoids that entirely: the first `just
+msrv` run is still a full cold build, but every run after that is
+incremental and takes single-digit seconds, matching `just test`. This costs
+extra disk space (`target/msrv` is a full second copy of the dependency
+build artifacts) but is worth it if you run `just msrv` more than once.
+
+---
+
+## Why cargo-nextest
+
+`just test`, `just msrv`, and `just e2e` run tests through
+[cargo-nextest](https://nexte.st/) instead of the built-in `cargo test`
+harness. nextest runs each test in its own process, which schedules across
+CPU cores far more aggressively than `cargo test`'s in-binary thread pool —
+on this workspace's ~1,100 unit/integration tests it's the difference between
+several minutes and a few seconds of actual test-execution time. CI uses it
+too (`.github/workflows/ci.yml`), so a slow local `cargo test` habit will look
+noticeably slower than CI.
+
+**Install once:** `cargo install cargo-nextest --locked`. Without it, `just
+test`/`just msrv`/`just e2e` fail immediately with "no such subcommand:
+`nextest`".
+
+**Doctests still run separately.** nextest does not execute doctests at all
+(no flag enables it — this is a known, permanent nextest limitation, not a
+config gap). Every recipe that used to run `cargo test` (which implicitly
+included doctests) now runs `cargo nextest run` followed by a second
+`cargo test --workspace ... --doc` step. Doctests are kept because they're
+real, compiled, runnable examples in doc comments — the fast-but-incomplete
+option would be dropping them, and we're not doing that.
+
+**`just e2e` runs at `--test-threads 8` locally**, higher than CI's `4`,
+because each e2e test already allocates its own isolated Docker bridge
+network and host ports (see `pathvector-e2e/src/lib.rs`), so concurrent runs
+are safe by construction — the number is a hardware-appropriate guess, not a
+correctness requirement. Lower it if Docker Desktop's resource limits make
+local e2e runs flaky.
 
 ---
 
@@ -78,9 +133,13 @@ Any time you touch:
 just lint-linux
 ```
 
-This runs `cargo clippy --workspace --all-targets -- -D warnings` inside a
+This runs `cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings` inside a
 `rust:latest` Docker container pinned to `linux/amd64` — the same environment
-as CI.
+as CI. `pathvector-e2e` is excluded here for the same reason it's excluded
+from `just test`/`just msrv`: it pulls in `testcontainers`, a heavy
+compile-time dependency, for no benefit in this recipe. It's still linted —
+`just e2e` runs `cargo clippy -p pathvector-e2e` before the test suite,
+where the Docker/compile cost is already being paid.
 
 **First run is slow.** On an M2 Mac, the initial compile takes 15–30 minutes:
 - Docker pulls the `linux/amd64` image (once)
@@ -122,6 +181,20 @@ e2e tests.** `just e2e` does this automatically. Running `cargo test -p
 pathvector-e2e` directly against a stale image is the most common source of
 confusing e2e failures — the old binary silently ignores new TOML fields added
 with `#[serde(default)]`.
+
+**If a test topology has pathvectord re-advertise a route between two GoBGP
+(or BIRD/FRR) peers, give them distinct ASes.** Reusing one peer's AS for
+another looks harmless — pathvectord only cares about peer IP, not AS — but
+the *receiving* peer runs its own independent BGP implementation with its own
+AS_PATH loop-prevention (RFC 4271 §9.1.2): once pathvectord prepends its own
+AS and re-advertises, the AS_PATH already contains the originating peer's AS.
+If the receiving peer happens to share that same AS, it silently discards the
+route as a routing loop. This looks exactly like an export-policy bug from
+pathvectord's side (the route is correctly queued and sent) and cost real
+debugging time in `GrIpv6ObserverHarness`
+(`pathvector-e2e/src/lib.rs`) before the cause was found — give every peer in
+a multi-peer topology its own AS unless the test specifically needs to share
+one.
 
 ---
 

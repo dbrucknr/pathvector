@@ -33,7 +33,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -84,28 +84,66 @@ pub const PATHVECTORD_METRICS_PORT: u16 = 51_300;
 
 // ── Port / ID allocation ──────────────────────────────────────────────────────
 
-/// Per-test unique ID — used to name Docker networks and containers so
+/// Per-test unique ID — used to name Docker networks and containers, and to
+/// derive per-test subnets (see `fib_test_subnet` and friends below), so
 /// concurrent (or back-to-back) tests never collide.
+///
+/// This is a per-*process* counter, which matters: nextest runs many test
+/// binaries concurrently as separate OS processes (unlike `cargo test`,
+/// which runs one integration-test binary at a time), so each process gets
+/// its own independent copy of this static, all starting at 0. Without the
+/// PID-based offset in `alloc_test_id` below, two concurrently-running test
+/// binaries would both allocate test_id 0 and collide on the same Docker
+/// network name / subnet — this happened in practice switching to nextest.
 static NEXT_TEST_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Host-side port base for pathvectord's gRPC mapping.
-static NEXT_GRPC_PORT: AtomicU16 = AtomicU16::new(51_200);
-
-/// Host-side port base for pathvectord's metrics mapping. A separate range
-/// from `NEXT_GRPC_PORT` so the two allocators never hand out the same host
-/// port to concurrent tests.
-static NEXT_METRICS_PORT: AtomicU16 = AtomicU16::new(59_300);
-
 pub fn alloc_test_id() -> u32 {
-    NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+    let counter = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    // Fold in the OS PID (unique among concurrently-running processes on
+    // this host) so different *processes* get disjoint id sequences instead
+    // of every process starting at the same 0, 1, 2, ... Multiplying by a
+    // large odd constant before XOR-ing spreads the PID across the full u32
+    // range, so callers that mask down to 8 or 16 bits (fib_test_subnet's
+    // `% 256`, the IPv6 subnet's `& 0xffff`) still see good separation
+    // between processes, not just the low few bits of a raw PID. XOR with a
+    // fixed per-process value is a bijection, so sequential counter values
+    // within one process (0, 1, 2, ...) still map to distinct ids — only
+    // the mapping is process-specific, not the guarantee of within-process
+    // uniqueness.
+    let pid_component = std::process::id().wrapping_mul(2_654_435_761);
+    pid_component ^ counter
 }
 
+/// Asks the OS for a genuinely free TCP port by binding to port 0 and
+/// reading back what the kernel assigned, then immediately releasing it.
+///
+/// This replaced a static incrementing counter for the same reason
+/// `alloc_test_id` now folds in the PID: a counter that always starts at
+/// 51_200 (or 59_300) in every process nextest spawns guarantees a
+/// collision the moment two test binaries run concurrently — this happened
+/// in practice ("port is already allocated" in CI). Querying the OS's live
+/// port table instead means two concurrent processes essentially never get
+/// told the same port. There's a small window between this check and
+/// Docker actually binding the port where another process could grab it —
+/// an accepted, standard tradeoff for this pattern (the same one used by
+/// most "give me a free port" test helpers); a collision here is now a
+/// rare, transient race rather than a guaranteed failure.
+fn alloc_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("OS must be able to bind an ephemeral port")
+        .local_addr()
+        .expect("bound socket must have a local address")
+        .port()
+}
+
+#[must_use]
 pub fn alloc_grpc_port() -> u16 {
-    NEXT_GRPC_PORT.fetch_add(1, Ordering::Relaxed)
+    alloc_free_port()
 }
 
+#[must_use]
 pub fn alloc_metrics_port() -> u16 {
-    NEXT_METRICS_PORT.fetch_add(1, Ordering::Relaxed)
+    alloc_free_port()
 }
 
 // ── Binary / workspace paths ──────────────────────────────────────────────────
@@ -335,6 +373,62 @@ pub fn write_gobgp_config() -> NamedTempFile {
 "#
     )
     .expect("write gobgp config");
+    f
+}
+
+/// Like [`write_gobgp_config`] but with a configurable local AS.
+///
+/// Needed whenever a test topology has pathvectord re-advertise a route
+/// between two GoBGP peers: if both peers ran the hardcoded AS 65001,
+/// the receiving peer's own AS_PATH loop-prevention would (correctly, per
+/// RFC 4271 §9.1.2) discard the re-advertised route, since the AS_PATH
+/// already contains 65001 from the originating hop.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_with_as(as_number: u32) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = {as_number}
+  router-id = "1.0.0.1"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = 65002
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  # RFC 4724: enable graceful restart so GoBGP sends End-of-RIB markers
+  # after its initial table dump.  pathvectord parses but defers the stale-
+  # route timer; enabling this on GoBGP's side is harmless for all tests.
+  [peer-groups.graceful-restart.config]
+    enabled      = true
+    restart-time = 120
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp config with custom AS");
     f
 }
 
@@ -759,6 +853,51 @@ export_default    = "accept"
     f
 }
 
+/// Writes a pathvectord config with `export_default = "reject"` and
+/// `local_ipv6` set.
+///
+/// Regression coverage for the IPv6 export-policy fix (CHANGELOG.md
+/// 2026-07-02): `propagate_prefix_v6` previously never consulted any export
+/// policy at all, so `export_default = "reject"` correctly blocked IPv4
+/// routes but had no effect on IPv6 routes. This config isolates the IPv6
+/// export path so a real BGP session can prove the fix.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_v6_export_reject(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord v6-export-reject config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as   = 65002
+bgp_id     = "10.0.0.2"
+local_ipv6 = "2001:db8::2"
+hold_time  = 9
+grpc_port  = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "reject"
+"#
+        )
+        .expect("write pathvectord per-peer config");
+    }
+    f
+}
+
 /// Writes a GoBGP config with a **static neighbor** and TCP MD5 authentication.
 ///
 /// Dynamic neighbors cannot be used with TCP MD5SIG: the Linux kernel requires
@@ -841,6 +980,57 @@ export_default = "accept"
         )
         .expect("write pathvectord GR peer config");
     }
+    f
+}
+
+/// Writes a pathvectord config for [`GrIpv6ObserverHarness`]: two eBGP peers
+/// (a GR-capable source and a plain observer) plus `local_ipv6` so IPv6 NLRI
+/// can be exchanged with both.
+///
+/// Regression coverage for the `on_gr_deadline_expired` IPv6 fix
+/// (CHANGELOG.md 2026-07-03): the source peer's restart window expiring
+/// must produce a real BGP WITHDRAW to the observer peer, not just remove
+/// the route from pathvectord's own Loc-RIB.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_gr_v6_observer(
+    source_ip: Ipv4Addr,
+    source_as: u32,
+    restart_time: u16,
+    observer_ip: Ipv4Addr,
+    observer_as: u32,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord GR v6 observer config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as              = 65002
+bgp_id                = "10.0.0.2"
+local_ipv6            = "2001:db8::2"
+hold_time             = 9
+grpc_port             = {PATHVECTORD_GRPC_PORT}
+graceful_restart_time = {restart_time}
+
+[[peers]]
+address        = "{source_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {source_as}
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address        = "{observer_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {observer_as}
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord GR v6 observer config");
     f
 }
 
@@ -1164,13 +1354,32 @@ pub fn wait_container_healthy(container_id: &str, timeout: Duration) {
 
 // ── Md5Harness ────────────────────────────────────────────────────────────────
 
-/// Fixed container IPs for TCP MD5SIG tests.
-///
-/// A dedicated subnet is used so both IPs are known before either container
-/// starts — a prerequisite for pre-configuring `TCP_MD5SIG` on both sides.
-pub const MD5_TEST_SUBNET: &str = "172.31.42.0/24";
-pub const MD5_GOBGP_IP: &str = "172.31.42.10";
-pub const MD5_PATHVECTORD_IP: &str = "172.31.42.20";
+/// Per-test subnet and fixed container IPs for TCP MD5SIG tests, keyed by
+/// `test_id` — both IPs must be known before either container starts (a
+/// prerequisite for pre-configuring `TCP_MD5SIG` on both sides), but they
+/// still need to vary per test/process the same way `bird_test_subnet` and
+/// `fib_test_subnet` do. A shared, un-keyed constant here meant any two
+/// concurrently-running MD5 tests (or an MD5 test overlapping with another
+/// family sharing the same subnet range) would collide creating the Docker
+/// network. Uses its own `172.29.x.x` range, distinct from `fib_test_subnet`
+/// (172.30) and `bird_test_subnet` (172.31).
+#[must_use]
+pub fn md5_test_subnet(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.29.{third}.0/24")
+}
+
+#[must_use]
+pub fn md5_gobgp_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.29.{third}.10")
+}
+
+#[must_use]
+pub fn md5_pathvectord_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.29.{third}.20")
+}
 
 /// A test environment for RFC 2385 TCP MD5 authentication tests.
 ///
@@ -1205,15 +1414,18 @@ impl Md5Harness {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
         let network_name = format!("pathvector-md5-test-{test_id}");
+        let subnet = md5_test_subnet(test_id);
+        let gobgp_ip_str = md5_gobgp_ip(test_id);
+        let pathvectord_ip_str = md5_pathvectord_ip(test_id);
 
-        let network = DockerNetwork::create_with_subnet(network_name.clone(), MD5_TEST_SUBNET);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
         // Both IPs are known before either container starts — write configs now.
-        let gobgpd_config = write_gobgp_config_md5(MD5_PATHVECTORD_IP, key);
+        let gobgpd_config = write_gobgp_config_md5(&pathvectord_ip_str, key);
         let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
 
         let pathvectord_config =
-            write_daemon_config_md5(&[(MD5_GOBGP_IP.parse().unwrap(), 65001)], key);
+            write_daemon_config_md5(&[(gobgp_ip_str.parse().unwrap(), 65001)], key);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         // Start GoBGP with a fixed IP and CAP_NET_ADMIN (needed for TCP_MD5SIG
@@ -1222,7 +1434,7 @@ impl Md5Harness {
             &format!("gobgpd-md5-{test_id}"),
             GOBGPD_IMAGE,
             &network_name,
-            Some(MD5_GOBGP_IP),
+            Some(&gobgp_ip_str),
             true,
             &gobgpd_config_path,
             "/etc/gobgp/gobgpd.conf",
@@ -1240,7 +1452,7 @@ impl Md5Harness {
             &format!("pathvectord-md5-{test_id}"),
             PATHVECTORD_IMAGE,
             &network_name,
-            Some(MD5_PATHVECTORD_IP),
+            Some(&pathvectord_ip_str),
             true,
             &pathvectord_config_path,
             "/etc/pathvectord.toml",
@@ -1251,13 +1463,10 @@ impl Md5Harness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient for Md5Harness");
 
-        wait_for_established(
-            &mut client,
-            MD5_GOBGP_IP.parse().unwrap(),
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("MD5-authenticated BGP session did not reach Established within 30 s");
+        let gobgp_ip: Ipv4Addr = gobgp_ip_str.parse().unwrap();
+        wait_for_established(&mut client, gobgp_ip, Duration::from_secs(30))
+            .await
+            .expect("MD5-authenticated BGP session did not reach Established within 30 s");
 
         Self {
             _gobgpd: gobgpd,
@@ -1265,7 +1474,7 @@ impl Md5Harness {
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,
-            gobgp_ip: MD5_GOBGP_IP.parse().unwrap(),
+            gobgp_ip,
             _network: network,
         }
     }
@@ -2243,6 +2452,20 @@ impl Harness {
         Self::new_inner(write_daemon_config_ipv4_accept_ipv6_reject).await
     }
 
+    /// Same as [`Self::new_v6`] but with `export_default = "reject"` on the peer.
+    ///
+    /// Regression coverage for the IPv6 export-policy fix (CHANGELOG.md
+    /// 2026-07-02): use this harness to verify that `export_default = "reject"`
+    /// actually blocks IPv6 route propagation over a real BGP session, not
+    /// just at the unit-test level.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_v6_export_reject() -> Self {
+        Self::new_inner_v6(write_daemon_config_v6_export_reject).await
+    }
+
     /// Same as [`Self::new`] but with **no** import or export policy on the peer.
     ///
     /// For an eBGP peer this activates RFC 8212 defaults: both import and
@@ -2795,6 +3018,41 @@ pub async fn wait_for_gobgp_rib_withdrawn(
     }
 }
 
+/// Polls `gobgp global rib -a ipv6` until `prefix` is absent (withdrawn).
+///
+/// IPv6-specific variant of [`wait_for_gobgp_rib_withdrawn`].
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix disappears.
+pub async fn wait_for_gobgp_rib_withdrawn_v6(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for IPv6 prefix {prefix} to be withdrawn from GoBGP global RIB"
+            ));
+        }
+        let out = Command::new("docker")
+            .args(["exec", container_id, "gobgp", "global", "rib", "-a", "ipv6"])
+            .output();
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if !text.contains(prefix) {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()), // container gone — route is certainly absent
+        }
+    }
+}
+
 // ── TwoPeerHarness ────────────────────────────────────────────────────────────
 
 /// A two-peer test environment for verifying outbound advertisement:
@@ -3279,6 +3537,179 @@ pub fn get_gobgp_next_hop(container_id: &str, prefix: &str) -> Option<std::net::
     None
 }
 
+// ── GrIpv6ObserverHarness ─────────────────────────────────────────────────────
+
+/// Test harness for RFC 4724 §4.2 IPv6 GR deadline-expiry re-propagation.
+///
+/// Topology:
+///
+/// ```text
+/// GoBGP-source (AS 65001, GR-capable, restart_time=N) ──eBGP──► pathvectord (AS 65002)
+///                                                                       │
+///                                                                    eBGP
+///                                                                       │
+///                                                             GoBGP-observer (AS 65003)
+/// ```
+///
+/// GoBGP-source announces an IPv6-only prefix; pathvectord installs it and
+/// re-advertises it to GoBGP-observer over a real BGP session. When
+/// GoBGP-source is killed uncleanly and its GR restart window expires,
+/// pathvectord must send a real BGP WITHDRAW for that prefix to
+/// GoBGP-observer — not just remove it from its own Loc-RIB (regression
+/// coverage for the `on_gr_deadline_expired` IPv6 fix, CHANGELOG.md
+/// 2026-07-03).
+///
+/// GoBGP-observer uses a distinct AS (65003, via [`write_gobgp_config_with_as`])
+/// rather than reusing GoBGP-source's AS 65001. Both peers sharing 65001 was
+/// tried first and produced a confusing failure: pathvectord correctly
+/// re-advertised the route (confirmed via its own outbound decision and
+/// `flush_pending` logs), but GoBGP-observer's own AS_PATH loop-prevention
+/// silently discarded it on receipt, since the AS_PATH already contained
+/// 65001 from the originating hop — RFC 4271 §9.1.2 working as designed, not
+/// a pathvectord bug. A distinct AS avoids that entirely.
+///
+/// # Panics
+///
+/// [`GrIpv6ObserverHarness::new`] panics if Docker is not running, either
+/// image is missing, or either BGP session does not reach `Established`
+/// within 30 seconds.
+pub struct GrIpv6ObserverHarness {
+    _source: ContainerAsync<GenericImage>,
+    _observer: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _source_config: NamedTempFile,
+    _observer_config: NamedTempFile,
+    _daemon_config: NamedTempFile,
+    /// Container ID of GoBGP-source — killed with SIGKILL to trigger the GR window.
+    pub source_id: String,
+    /// Container ID of GoBGP-observer — polled to verify the real WITHDRAW.
+    pub observer_id: String,
+    /// IP of GoBGP-observer as seen by pathvectord — use with `get_peer` to
+    /// query pathvectord's own view of that session.
+    pub observer_addr: Ipv4Addr,
+    /// Container ID of pathvectord — used to dump logs on test failure.
+    pub pathvectord_id: String,
+    pub client: PathvectorClient,
+    _network: DockerNetwork,
+}
+
+impl GrIpv6ObserverHarness {
+    /// Stand up both eBGP sessions and wait for both to reach Established.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new(restart_secs: u16) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-gr-v6-obs-test-{test_id}");
+        let ipv6_subnet = format!("fd00:{:x}::/48", test_id & 0xffff);
+        let network = DockerNetwork::create_with_ipv6(network_name.clone(), &ipv6_subnet);
+
+        // ── GoBGP-source (GR-capable, will be killed) ────────────────────────
+        let source_config = write_gobgp_config_with_restart_time(restart_secs);
+        let source_config_path = source_config
+            .path()
+            .to_str()
+            .expect("source config path is valid UTF-8")
+            .to_owned();
+
+        let source = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-gr-v6-source-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                source_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-gr-v6-source container");
+        let source_id = source.id().to_owned();
+        let source_addr = container_network_ip(&source_id, &network_name);
+
+        // ── GoBGP-observer (distinct AS, observes the withdrawal) ────────────
+        // AS 65003, not the source's 65001 — see struct docs for why sharing
+        // an AS breaks this test via GoBGP's own AS_PATH loop-prevention.
+        let observer_config = write_gobgp_config_with_as(65003);
+        let observer_config_path = observer_config
+            .path()
+            .to_str()
+            .expect("observer config path is valid UTF-8")
+            .to_owned();
+
+        let observer = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-gr-v6-observer-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                observer_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd-gr-v6-observer container");
+        let observer_id = observer.id().to_owned();
+        let observer_addr = container_network_ip(&observer_id, &network_name);
+
+        // ── pathvectord ───────────────────────────────────────────────────────
+        let daemon_config = write_daemon_config_gr_v6_observer(
+            source_addr,
+            65001,
+            restart_secs,
+            observer_addr,
+            65003,
+        );
+        let daemon_config_path = daemon_config
+            .path()
+            .to_str()
+            .expect("daemon config path is valid UTF-8")
+            .to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-gr-v6-obs-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                daemon_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord gr-v6-observer container");
+
+        let pathvectord_id = pathvectord.id().to_owned();
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for GrIpv6ObserverHarness");
+
+        wait_for_established(&mut client, source_addr, Duration::from_secs(30))
+            .await
+            .expect("GR-source session did not reach Established within 30 s");
+        wait_for_established(&mut client, observer_addr, Duration::from_secs(30))
+            .await
+            .expect("observer session did not reach Established within 30 s");
+
+        Self {
+            _source: source,
+            _observer: observer,
+            _pathvectord: pathvectord,
+            pathvectord_id,
+            _source_config: source_config,
+            _observer_config: observer_config,
+            _daemon_config: daemon_config,
+            source_id,
+            observer_id,
+            observer_addr,
+            client,
+            _network: network,
+        }
+    }
+}
+
 fn write_daemon_config_rr_nhs(
     client_ip: Ipv4Addr,
     non_client_ip: Ipv4Addr,
@@ -3445,9 +3876,6 @@ pub fn bird_pathvectord_ip(test_id: u32) -> String {
     let third = test_id % 256;
     format!("172.31.{third}.20")
 }
-
-/// Retained for any call-sites that still use the old constants.
-pub const BIRD_PATHVECTORD_IP: &str = "172.31.50.20";
 
 /// Writes the pathvectord config for the BIRD interop harness.
 ///
