@@ -4,6 +4,30 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-04 (pathvectord event-loop proptest)
+
+### [pathvectord] Close the "event-loop transitions have no proptests" gap
+
+`TODO.md`'s testing-strategy notes flagged that `pathvectord`'s `DaemonState`
+update/withdraw/originate methods had no property tests, unlike
+`pathvector-rib`/`pathvector-session`/`pathvector-policy`, which all do.
+
+Added `rib_consistency_prop_tests::prop_adj_rib_out_always_subset_of_loc_rib`
+(`daemon/mod.rs`): drives a random sequence of up to 30 operations (peer
+announce/withdraw over both IPv4 and IPv6, local originate/withdraw) against a
+3-peer `DaemonState`, asserting after every single operation that every prefix
+each peer's `AdjRibOut` (v4 and v6) is currently advertising is also present in
+`LocRib`. `AdjRibOut` only ever holds routes derived from `LocRib`'s best path,
+so this invariant must hold continuously — a violation means a peer is being
+told about a route pathvectord itself no longer considers valid.
+
+Verified the test has real teeth (not vacuously passing) by temporarily
+disabling the `propagate_to_all_peers` call in `on_route_update` and
+confirming the test fails and shrinks to a clean 3-operation minimal
+reproduction, then restoring the real code and confirming it passes again.
+
+---
+
 ## 2026-07-04 (mold linker in CI)
 
 ### [ci] Use mold as the linker in GitHub Actions to cut CI wall-clock time

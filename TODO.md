@@ -172,9 +172,10 @@ integration rather than direct unit tests.
 - `pathvector-session`: codec round-trips for all BGP message types + capabilities.
 - `pathvector-rib`: all 8 best-path decision-step invariants + structural RIB invariants.
 - `pathvector-policy`: determinism + first-match-wins + 8 action invariants.
-- _Gap_: `pathvectord` event-loop transitions don't have proptests yet. The `DaemonState`
-  update/withdraw/originate methods are good candidates — adding property tests for the
-  consistency invariant "every prefix in `AdjRibOut` is also in `LocRib`" would close this.
+- `pathvectord`: `rib_consistency_prop_tests::prop_adj_rib_out_always_subset_of_loc_rib`
+  (`daemon/mod.rs`) drives random sequences of peer announce/withdraw (v4 + v6) and local
+  originate/withdraw against a 3-peer `DaemonState` and asserts every prefix in each peer's
+  `AdjRibOut` is present in `LocRib` after every operation — closed 2026-07-04.
 
 **Layer 3 — Integration / session tests**
 - `pathvectord` unit tests (460+ across `daemon.rs` and `outbound.rs`) drive the full `run_event_loop` via
