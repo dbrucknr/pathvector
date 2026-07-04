@@ -15,12 +15,16 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # CI-only mold linker (see CHANGELOG.md) — has no effect on local
+    # macOS dev; mold is installed below and only used in this job's env.
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
       - uses: taiki-e/install-action@cargo-nextest
       # Cheap (cargo metadata + jq, no compilation) — catches a [[bin]] target
       # that Cargo treats as testable but isn't a real test harness before it
@@ -40,14 +44,18 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # CI-only mold linker (see CHANGELOG.md) — has no effect on local
+    # macOS dev; mold is installed below and only used in this job's env.
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
       # pathvector-e2e is excluded here (matching the test/msrv jobs) since it
       # pulls in testcontainers for no benefit -- it's linted in the e2e job
       # instead, where the Docker/compile cost is already being paid.
@@ -58,14 +66,18 @@ jobs:
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
+    # CI-only mold linker (see CHANGELOG.md) — has no effect on local
+    # macOS dev; mold is installed below and only used in this job's env.
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
       - uses: taiki-e/install-action@cargo-nextest
       # pathvector-e2e requires pre-built Docker images and runs in its own job.
       # nextest doesn't support doctests, so those run as a separate step.

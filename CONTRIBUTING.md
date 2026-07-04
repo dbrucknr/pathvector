@@ -66,6 +66,16 @@ actually a test harness. See the Justfile recipe's own comment, or CHANGELOG.md
 2026-07-04, for the exact failure mode this guards against — it previously
 hung `cargo nextest run` indefinitely with no error output.
 
+**GitHub Actions uses `mold` as the linker; local dev doesn't.** The `Test`/
+`Lint`/`MSRV` jobs and the e2e job's three Rust-compiling Docker images
+(`pathvectord`, `mock_rtr_server`, `mock_bgp_peer`) set `RUSTFLAGS=-C
+link-arg=-fuse-ld=mold` and install `mold` via apt — Linux-only, and only
+inside CI/those Dockerfiles. There's no committed `.cargo/config.toml`, so
+this has zero effect on `just ci` or any other local build regardless of
+platform. If CI's build/link timing looks meaningfully different from your
+own `just ci` run, this is why — see CHANGELOG.md 2026-07-04 for the measured
+numbers.
+
 **`just msrv` uses a separate `target/msrv` directory**, not the same
 `target/debug` that `just test` uses. Cargo's build fingerprints include the
 exact rustc version, so alternating between the stable toolchain and 1.88
