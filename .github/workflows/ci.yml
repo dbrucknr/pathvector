@@ -22,6 +22,12 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: taiki-e/install-action@cargo-nextest
+      - uses: extractions/setup-just@v2
+      # Cheap (cargo metadata + jq, no compilation) — catches a [[bin]] target
+      # that Cargo treats as testable but isn't a real test harness before it
+      # can hang the nextest run below with no error output. See the Justfile
+      # recipe's own comment / CHANGELOG.md 2026-07-04.
+      - run: just check-test-bins
       # pathvector-e2e requires pre-built Docker images and runs in its own job.
       # nextest doesn't support doctests, so those run as a separate step.
       - run: cargo nextest run --workspace --exclude pathvector-e2e

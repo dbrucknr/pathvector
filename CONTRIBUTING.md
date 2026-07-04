@@ -31,6 +31,7 @@ pain points. Read it before your first pull request.
 | just | `cargo install just` | Task runner; all recipes in `Justfile` |
 | cargo-nextest | `cargo install cargo-nextest --locked` | Required for `just test`, `just msrv`, `just e2e` — see below |
 | Docker | [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Required for `just e2e` and `just lint-linux` |
+| jq | `brew install jq` | Required for `just check-test-bins` (part of `just ci`) |
 
 ---
 
@@ -45,6 +46,7 @@ just lint-linux  # Run clippy inside a Linux/amd64 container (see below)
 ### What `just ci` runs
 
 ```
+just check-test-bins   # cargo metadata + jq — no compilation, seconds
 cargo nextest run --workspace --exclude pathvector-e2e
 cargo test --workspace --exclude pathvector-e2e --doc
 cargo clippy --workspace --exclude pathvector-e2e --all-targets -- -D warnings
@@ -56,6 +58,13 @@ CARGO_TARGET_DIR=target/msrv rustup run 1.88 cargo test --workspace --exclude pa
 
 This catches the vast majority of issues before pushing. Run it before every
 commit.
+
+**`just check-test-bins` runs first because it's cheap and catches a specific,
+easy-to-reintroduce mistake:** any `[[bin]]` target (including auto-discovered
+`src/bin/*.rs` files) that Cargo treats as testable by default but isn't
+actually a test harness. See the Justfile recipe's own comment, or CHANGELOG.md
+2026-07-04, for the exact failure mode this guards against — it previously
+hung `cargo nextest run` indefinitely with no error output.
 
 **`just msrv` uses a separate `target/msrv` directory**, not the same
 `target/debug` that `just test` uses. Cargo's build fingerprints include the
