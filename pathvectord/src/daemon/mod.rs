@@ -8419,6 +8419,64 @@ mod tests {
         );
     }
 
+    // Regression test: propagate_to_all_peers_v6 must sync prefixes_advertised
+    // itself. Before the fix, only propagate_to_all_peers (v4) called
+    // sync_advertised, so a v6-only propagation event (no preceding or
+    // following v4 call) left prefixes_advertised with no entry at all for
+    // the receiving peer, even though the route was correctly queued for
+    // the wire in adj_ribs_out_v6.
+    #[test]
+    fn test_v6_only_propagation_syncs_prefixes_advertised() {
+        // Both peers are eBGP (distinct remote AS from local_as and from each
+        // other) so the scenario can't be confused with iBGP full-mesh
+        // split-horizon, which would otherwise block source → dest here
+        // regardless of this test's fix.
+        let cluster_id: u32 = 9;
+        let source: Ipv4Addr = "10.0.0.20".parse().unwrap();
+        let dest: Ipv4Addr = "10.0.0.21".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[], &[source, dest]);
+
+        state.on_established(source, source, PeerType::External, 65099, 90, &[], None);
+        state.on_established(dest, dest, PeerType::External, 65098, 90, &[], None);
+        drain_all(&mut receivers);
+
+        state.ipv6_capable_peers.insert(source);
+        state.ipv6_capable_peers.insert(dest);
+        // eBGP peers need a local IPv6 next-hop to announce to (propagate_prefix_v6
+        // silently suppresses eBGP announcements without one — see its doc comment).
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+
+        assert_eq!(
+            state.rib.prefixes_advertised.get(&dest),
+            Some(&0),
+            "sanity check: prefixes_advertised must start at 0 for dest \
+             (set by on_established's own sync, before the v6 route exists)"
+        );
+
+        // Inject a v6 route sourced from `source` and propagate it — no v4
+        // call before or after, matching the on_route_update code path when
+        // an UPDATE carries only IPv6 NLRIs (affected_v6 non-empty, affected
+        // empty).
+        let peer_id = PeerId::new(IpAddr::V4(source));
+        let route = RouteBuilder::new(
+            nlri_v6_rr("2001:db8::/32"),
+            pathvector_types::Origin::Igp,
+            pathvector_types::AsPath::new(),
+        )
+        .peer_type(PeerType::External)
+        .build();
+        state.rib_insert_v6(peer_id, route);
+        state.propagate_to_all_peers_v6(&[nlri_v6_rr("2001:db8::/32")]);
+
+        assert_eq!(
+            state.rib.prefixes_advertised.get(&dest),
+            Some(&1),
+            "prefixes_advertised for dest must reflect the queued v6 route \
+             immediately after a v6-only propagate_to_all_peers_v6 call, \
+             without needing a separate v4 event to resync it"
+        );
+    }
+
     // RFC 4456 §8: on_established full-table dump must apply split-horizon for v6.
     #[test]
     fn test_rr_v6_established_dump_applies_split_horizon() {
