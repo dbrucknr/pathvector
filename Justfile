@@ -212,8 +212,17 @@ _build-mock-bgp-peer-image:
         -t pathvector-mock-bgp-peer-test:latest \
         .
 
+_build-mock-bgp-dialer-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-mock-bgp-dialer-test:latest..."
+    docker build \
+        -f pathvector-e2e/Dockerfile.mock-bgp-dialer \
+        -t pathvector-mock-bgp-dialer-test:latest \
+        .
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image _build-mock-bgp-dialer-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge
