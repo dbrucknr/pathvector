@@ -358,6 +358,11 @@ pub fn container_network_ipv6(container_id: &str, network: &str) -> Ipv6Addr {
 ///
 /// The container uses port 179 (default; no `port =` key needed).
 /// gRPC defaults to `0.0.0.0:50051` which is accessible via `docker exec`.
+/// Two dynamic-neighbor prefixes are configured — `0.0.0.0/0` and `::/0` —
+/// so GoBGP accepts a dial-in from pathvectord regardless of which address
+/// family the connection arrives over; this is what lets a native-IPv6-
+/// transport session (see `container_network_ipv6`) reach Established
+/// alongside every existing IPv4-transport test using this same config.
 ///
 /// # Panics
 ///
@@ -400,6 +405,11 @@ pub fn write_gobgp_config() -> NamedTempFile {
 [[dynamic-neighbors]]
   [dynamic-neighbors.config]
     prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "::/0"
     peer-group = "pathvector-peers"
 "#
     )
