@@ -106,7 +106,7 @@ pub enum PeerCommands {
 
     /// Show detailed state for a single peer.
     Get {
-        /// Peer IP address in dotted-decimal notation.
+        /// Peer IPv4 or IPv6 address.
         #[arg(value_name = "ADDRESS")]
         peer: String,
     },
@@ -119,7 +119,7 @@ pub enum PeerCommands {
     /// Import and export policy default to RFC 8212 behaviour when omitted:
     /// reject-by-default for eBGP peers, accept-by-default for iBGP peers.
     Add {
-        /// Peer IPv4 address in dotted-decimal notation.
+        /// Peer IPv4 or IPv6 address.
         #[arg(long, value_name = "ADDRESS")]
         address: String,
 
@@ -153,7 +153,7 @@ pub enum PeerCommands {
     /// All routes learned from this peer are withdrawn from the Loc-RIB before
     /// state is cleaned up. Other established sessions are unaffected.
     Remove {
-        /// Peer IPv4 address in dotted-decimal notation.
+        /// Peer IPv4 or IPv6 address.
         #[arg(value_name = "ADDRESS")]
         address: String,
     },
@@ -257,7 +257,7 @@ pub enum PolicyCommands {
     /// Re-evaluates the peer's Adj-RIB-In against the new policy and propagates
     /// any Loc-RIB changes to all established peers — no session reset required.
     SetImport {
-        /// Peer IP address in dotted-decimal notation.
+        /// Peer IPv4 or IPv6 address.
         #[arg(value_name = "ADDRESS")]
         peer: String,
         /// New default action.
@@ -270,7 +270,7 @@ pub enum PolicyCommands {
     /// receives UPDATEs for newly accepted prefixes and WITHDRAWs for rejected
     /// ones — no session reset required.
     SetExport {
-        /// Peer IP address in dotted-decimal notation.
+        /// Peer IPv4 or IPv6 address.
         #[arg(value_name = "ADDRESS")]
         peer: String,
         /// New default action.
