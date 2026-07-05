@@ -19,6 +19,7 @@ pathvector-session = { workspace = true }
 pathvector-sys     = { workspace = true }
 pathvector-types   = { workspace = true }
 tokio              = { workspace = true }
+socket2            = { workspace = true }
 tonic              = { workspace = true }
 tonic-prost        = { workspace = true }
 tonic-reflection   = { workspace = true }

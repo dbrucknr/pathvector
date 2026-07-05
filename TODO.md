@@ -505,12 +505,14 @@ export-policy-aware, gated on `ipv6_capable_peers`.
   `AddPeer` / `RemovePeer` / `UpdatePeer` commands. Thin wrapper around the gRPC
   command path; `UpdatePeer` is the prerequisite.
 
-- **IPv6 BGP transport** — TCP sessions over IPv6 (bind listener on `[::]:179`,
-  dial peers at IPv6 addresses). Distinct from IPv6 NLRI (MP_REACH_NLRI over IPv4
-  sessions), which already works. Requires `IpAddr::V6` support throughout
-  `PeerConfig`, `DaemonState`, and the TCP listener. MD5 auth for IPv6 peers is
-  also currently `Unsupported` in `pathvector-sys` and would need a separate ABI
-  path (`sockaddr_in6` in the `TcpMd5Sig` struct).
+- **MD5 auth for IPv6 peers** — `pathvector-sys`'s `TcpMd5Sig` struct is built on
+  `sockaddr_in` and returns `Unsupported` for an IPv6 peer; needs a separate
+  `sockaddr_in6`-based ABI path. Split out from the now-shipped IPv6 BGP
+  transport work (2026-07-05): the listener binds and dials both families,
+  `PeerConfig`/`DaemonState`/gRPC/CLI are all dual-stack, and
+  `pathvector-e2e/tests/ipv6_transport.rs` proves a session reaches
+  Established over a real IPv6 TCP connection — but an IPv6 peer configured
+  with `md5_password` will currently fail to apply the signature.
 
 - **Dynamic neighbors** — accept BGP sessions from peers not explicitly configured,
   filtered by a source prefix range (e.g. `dynamic_peer_prefix = "10.0.0.0/24"`).

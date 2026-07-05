@@ -22,7 +22,7 @@
 // stale zeroed series per removed peer for the lifetime of the process. See
 // TODO.md for the tracked follow-up (prune series on RemovePeer).
 
-use std::{collections::HashMap, net::Ipv4Addr};
+use std::{collections::HashMap, net::IpAddr};
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use pathvector_session::transport::TerminationReason;
@@ -51,7 +51,7 @@ pub fn install(port: u16) -> Result<(), metrics_exporter_prometheus::BuildError>
     Ok(())
 }
 
-pub fn on_session_established(peer: Ipv4Addr) {
+pub fn on_session_established(peer: IpAddr) {
     let p = peer.to_string();
     metrics::counter!("pathvectord_bgp_sessions_established_total", "peer" => p.clone())
         .increment(1);
@@ -67,7 +67,7 @@ pub fn on_session_established(peer: Ipv4Addr) {
     .set(ts);
 }
 
-pub fn on_session_terminated(peer: Ipv4Addr, reason: &TerminationReason) {
+pub fn on_session_terminated(peer: IpAddr, reason: &TerminationReason) {
     let p = peer.to_string();
     let reason_label = match reason {
         TerminationReason::Unclean => "unclean",
@@ -89,7 +89,7 @@ pub fn on_session_terminated(peer: Ipv4Addr, reason: &TerminationReason) {
 // Route/prefix counts are RIB sizes (well under 2^52), so the usize -> f64
 // casts below never lose precision; Prometheus gauges are f64 by wire format.
 #[allow(clippy::cast_precision_loss)]
-pub fn on_route_update(peer: Ipv4Addr, adj_rib_in: usize) {
+pub fn on_route_update(peer: IpAddr, adj_rib_in: usize) {
     let p = peer.to_string();
     metrics::counter!("pathvectord_bgp_updates_received_total", "peer" => p.clone()).increment(1);
     metrics::gauge!("pathvectord_bgp_adj_rib_in_prefixes", "peer" => p).set(adj_rib_in as f64);
@@ -101,7 +101,7 @@ pub fn on_route_update(peer: Ipv4Addr, adj_rib_in: usize) {
 pub fn update_rib_sizes(
     loc_rib_v4: usize,
     loc_rib_v6: usize,
-    prefixes_advertised: &HashMap<Ipv4Addr, usize>,
+    prefixes_advertised: &HashMap<IpAddr, usize>,
 ) {
     metrics::gauge!("pathvectord_bgp_loc_rib_prefixes", "afi" => "ipv4").set(loc_rib_v4 as f64);
     metrics::gauge!("pathvectord_bgp_loc_rib_prefixes", "afi" => "ipv6").set(loc_rib_v6 as f64);
@@ -120,8 +120,8 @@ mod tests {
 
     use super::*;
 
-    fn peer(n: u8) -> Ipv4Addr {
-        Ipv4Addr::new(10, 0, 0, n)
+    fn peer(n: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, n))
     }
 
     /// Runs `f` against a fresh, isolated recorder and returns every emitted

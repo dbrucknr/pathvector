@@ -1,13 +1,28 @@
-# pathvectord image for pathvector-e2e tests.
+# Rust test-fixture images for pathvector-e2e, all sharing one compile stage.
 #
-# Multi-stage build: Stage 1 compiles pathvectord inside a Rust toolchain
-# container (linux/arm64 on Apple Silicon — native speed, no QEMU).
-# Stage 2 copies only the binary into a slim runtime image.
+# pathvectord itself, plus the three mock binaries used by specific e2e
+# scenarios (mock_rtr_server, mock_bgp_peer, mock_bgp_dialer), all live in the
+# same workspace and — for the three mocks — the same pathvector-e2e crate.
+# Building each as its own independent `docker build` (as this repo used to
+# do, one Dockerfile per binary) meant compiling most of the ~15-crate
+# dependency graph up to four times over. Instead, one shared `builder` stage
+# compiles all four binaries in a single `cargo build` invocation, and each
+# runtime stage below just copies its own binary out — BuildKit's layer cache
+# means the second, third, and fourth `docker build --target ...` in the same
+# job reuse the builder stage almost for free instead of recompiling.
 #
-# Built from the workspace root so all crate members are in context:
-#   docker build -f pathvector-e2e/Dockerfile.pathvectord -t pathvector-e2e:latest .
+# `docker build` with no --target builds the LAST stage in the file, which is
+# `pathvectord` — this is deliberate: .github/workflows/publish.yml builds
+# this same file (with an explicit `target: pathvectord`) to produce the
+# published release image, so that stage's behavior must not change. Every
+# e2e-only stage above it must be built with an explicit
+# `--target <stage-name>` (see Justfile / ci.yml).
+#
+# Built from the workspace root so all crate members are in context, e.g.:
+#   docker build --target pathvectord -f pathvector-e2e/Dockerfile.pathvectord -t pathvector-e2e:latest .
+#   docker build --target mock-rtr -f pathvector-e2e/Dockerfile.pathvectord -t pathvector-mock-rtr-test:latest .
 
-# ── Stage 1: compile ──────────────────────────────────────────────────────────
+# ── Stage 1: compile (shared by every stage below) ────────────────────────────
 
 FROM rust:1.88-slim-bookworm AS builder
 
@@ -21,7 +36,9 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
 WORKDIR /workspace
 
-# CARGO_PROFILE: "debug" (default, used by e2e tests) or "release" (published image).
+# CARGO_PROFILE: "debug" (default, used by e2e tests) or "release" (published
+# pathvectord image only — the mock binaries are never published, and always
+# build in whichever profile is requested here for consistency).
 ARG CARGO_PROFILE=debug
 
 # Copy workspace manifest and lock file first so dependency fetching is
@@ -44,15 +61,94 @@ COPY pathvector-mrt/      pathvector-mrt/
 COPY pathvector-e2e/                 pathvector-e2e/
 COPY proto/               proto/
 
+# --bin selects target names across every -p package given; omitting
+# --bin pathvectord here would silently build only the three mock binaries
+# (pathvectord's own bin target doesn't share any of those names, and cargo
+# does not error when a --bin name simply doesn't apply to a given package).
 RUN if [ "$CARGO_PROFILE" = "release" ]; then \
-        cargo build --release -p pathvectord; \
+        cargo build --release -p pathvectord -p pathvector-e2e \
+            --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer; \
     else \
-        cargo build -p pathvectord; \
+        cargo build -p pathvectord -p pathvector-e2e \
+            --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer; \
     fi
 
-# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+# ── mock-rtr runtime ───────────────────────────────────────────────────────────
+#
+# Mock RTR (RPKI-to-Router Protocol) server for the pathvector-e2e RPKI test.
+# Serves a fixed, deterministic pair of ROAs over the real RFC 8210 v1 wire
+# protocol — hand-encoded independently of pathvector-rpki's own encoder, so
+# this test proves pathvector-rpki's *decoder* against bytes it didn't
+# produce itself. See src/bin/mock_rtr_server.rs for the exact scenario.
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS mock-rtr
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_rtr_server /usr/local/bin/mock_rtr_server
+
+# 3323 — RTR (RFC 8210), container-to-container only, never mapped to host.
+EXPOSE 3323
+
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 3323 || exit 1
+
+ENTRYPOINT ["mock_rtr_server"]
+
+# ── mock-bgp-peer runtime ──────────────────────────────────────────────────────
+#
+# Mock BGP peer for the pathvector-e2e RFC 9234 route-leak-prevention test.
+# Speaks real BGP (OPEN/KEEPALIVE/UPDATE) via pathvector-session's own codec,
+# then sends one route carrying a deliberately pre-attached ONLY_TO_CUSTOMER
+# attribute (simulating an upstream leak) and one clean route. See
+# src/bin/mock_bgp_peer.rs for the exact scenario and why reusing
+# pathvector-session's encoder here is the right call (unlike mock-rtr,
+# which hand-rolls its wire format for decoder-independence reasons).
+
+FROM debian:bookworm-slim AS mock-bgp-peer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_peer /usr/local/bin/mock_bgp_peer
+
+# 179 — BGP, container-to-container only, never mapped to host.
+EXPOSE 179
+
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 179 || exit 1
+
+ENTRYPOINT ["mock_bgp_peer"]
+
+# ── mock-bgp-dialer runtime ────────────────────────────────────────────────────
+#
+# Mock BGP dialer for the pathvector-e2e native-IPv6-transport accept test.
+# The mirror image of mock-bgp-peer: connects OUT to a target address instead
+# of listening, so pathvectord's *listener* accepts a real inbound connection
+# and completes the BGP handshake through the accept path rather than its own
+# outbound dial. See src/bin/mock_bgp_dialer.rs for why this exists — no
+# other e2e topology in this crate exercises pathvectord's accept path
+# through a full handshake, since GoBGP is always configured passive-mode.
+#
+# This binary never listens on a port, so there's no TCP healthcheck to run —
+# the test drives synchronization by polling pathvectord's own gRPC state
+# instead of a container healthcheck.
+
+FROM debian:bookworm-slim AS mock-bgp-dialer
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_dialer /usr/local/bin/mock_bgp_dialer
+
+ENTRYPOINT ["mock_bgp_dialer"]
+
+# ── pathvectord runtime (default stage — see the note at the top of this file) ─
+
+FROM debian:bookworm-slim AS pathvectord
 
 # netcat-openbsd: nc for HEALTHCHECK TCP probe.
 # iproute2: ip-route(8) for FIB e2e tests (verify RTPROT_BGP routes installed).

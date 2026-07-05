@@ -4,6 +4,118 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-05 (e2e CI: fix flaky port race, cut Docker build time ~4x)
+
+### [pathvector-e2e] [ci] Two CI reliability/speed fixes surfaced by the IPv6 migration's CI run
+
+- **Flaky port allocation.** `alloc_free_port()` (used by every harness to
+  pick a host port for pathvectord's mapped gRPC port) asks the OS for a
+  free ephemeral port, then releases it before Docker actually binds the
+  same port number — a documented, accepted TOCTOU race. Under CI's 4-way
+  test parallelism the gap between "OS says this port is free" and "Docker
+  binds it" (which can span an entire peer container's startup + healthcheck
+  wait) occasionally lets two tests get handed the same port, failing one
+  with "port is already allocated". Added `.config/nextest.toml` with a
+  `package(pathvector-e2e)`-scoped retry override (2 retries) so this class
+  of transient infra flake self-heals; every other crate stays at 0 retries
+  so a real regression still fails immediately.
+- **Redundant Docker compiles.** `Dockerfile.pathvectord`,
+  `Dockerfile.mock-rtr`, `Dockerfile.mock-bgp-peer`, and
+  `Dockerfile.mock-bgp-dialer` each independently ran their own
+  `cargo build -p X` against the full ~15-crate workspace from a cold
+  `rust:1.88-slim-bookworm` base — up to 4x redundant compilation of the
+  same dependency graph, since three of the four binaries live in
+  `pathvector-e2e` itself. Merged into one `Dockerfile.pathvectord` with a
+  shared `builder` stage that compiles all four binaries in a single
+  `cargo build` invocation, plus four thin named final stages
+  (`pathvectord`, `mock-rtr`, `mock-bgp-peer`, `mock-bgp-dialer`) each
+  copying their own binary out. `docker build` with no `--target` still
+  resolves to the `pathvectord` stage (used unchanged by
+  `.github/workflows/publish.yml`'s release build); the three mock images
+  now require an explicit `--target`. Local verification: first image
+  (`pathvectord`) built in ~45s (full compile); the three mock images that
+  follow it built in ~1.3–1.5s each (reusing the cached builder layer)
+  instead of a full recompile — confirmed all four resulting images are
+  functionally correct by re-running `rpki.rs`, `role.rs`, and
+  `ipv6_accept.rs` (the tests that exercise mock-rtr, mock-bgp-peer, and
+  mock-bgp-dialer respectively) against the freshly-built images.
+
+---
+
+## 2026-07-05 (IPv6 migration: close remaining confidence gaps)
+
+### [pathvectord] [pathvector-e2e] Prove the IPv6 peer-identity migration end to end, not just by absence of a `V4`/`V6` branch
+
+The IPv6 BGP transport migration below shipped with every e2e test still
+configuring the peer as passive (pathvectord always dials), so the daemon's
+listener had only ever accepted IPv4-sourced connections in practice, and no
+test constructed a peer whose *identity* was a genuine `Ipv6Addr` rather than
+an `Ipv4Addr`-shaped literal typed `IpAddr`. This closes both gaps, plus two
+smaller ones surfaced by the same review.
+
+- **Accept path**: new `pathvector-e2e/src/bin/mock_bgp_dialer.rs` and
+  `Ipv6AcceptHarness` configure pathvectord's own outbound dial to an
+  unreachable port while the dialer's inbound connection uses a
+  `docker run --ip6`-assigned static address, so the only way the session in
+  `pathvector-e2e/tests/ipv6_accept.rs`
+  (`session_establishes_over_ipv6_accept_path`) can reach Established is
+  through pathvectord's listener accepting a real inbound IPv6 connection —
+  the dial path is structurally disabled, not just unused.
+- **v6-identified peer**: `test_ipv6_peer_identity` in
+  `pathvectord/src/daemon/mod.rs` drives a peer keyed by a real `Ipv6Addr`
+  through route acceptance/propagation, export-policy enforcement, and
+  RFC 4724 GR stale-route retention on unclean termination — the combination
+  no prior test exercised.
+- **ORIGINATOR_ID fallback regression**: the migration changed the RR
+  ORIGINATOR_ID-injection fallback from `peer_ip` to
+  `self.rib.local_bgp_id` (`peer_ip` could now be IPv6, which isn't a valid
+  4-byte BGP Identifier). `test_rr_originator_id_falls_back_to_local_bgp_id_when_peer_bgp_id_unknown`
+  proves this directly.
+- **Flakiness / regressions**: the full `pathvector-e2e` suite (20 test
+  files) re-run clean (0 failures), and both new IPv6 e2e tests were run 4
+  times each with no failures, beyond the single pass each got when the
+  gap analysis first landed.
+
+All four new/extended tests were verified to have real teeth — each was
+confirmed to fail against a deliberately broken version of the code under
+test before the fix was restored and re-verified passing.
+
+---
+
+## 2026-07-05 (native IPv6 BGP transport)
+
+### [pathvectord] Peers can now be configured with an IPv6 transport address
+
+Closes the `TODO.md` "IPv6 BGP transport" gap — distinct from IPv6 *NLRI*
+(MP_REACH_NLRI over an IPv4 session), which already worked. `PeerConfig`,
+`DaemonState`'s ~40 peer-identity-keyed collections (`RibSnapshot`,
+`import_policies`/`export_policies`, capability/role maps, GR state,
+stalled/pending-removal sets, prefix counters), `DaemonCommand::RemovePeer`,
+and the gRPC `PeerService`/`PolicyService` handlers (`get_peer`, `add_peer`,
+`remove_peer`, `soft_reset`, `set_import_default`, `set_export_default`,
+the `list_routes`/`watch_routes` peer filter) all migrated from `Ipv4Addr` to
+`IpAddr`. The BGP listener already binds both `0.0.0.0:<port>` and
+`[::]:<port>` unconditionally (prior work); this closes the gap between that
+listener and the rest of the daemon actually treating an IPv6 peer identity
+correctly end to end.
+
+`peer_bgp_ids`/`local_bgp_id`/ORIGINATOR_ID remain `Ipv4Addr` throughout —
+the BGP Identifier is always 4 bytes regardless of transport family, per
+RFC 4271/6286.
+
+New e2e test `pathvector-e2e/tests/ipv6_transport.rs`
+(`session_establishes_over_ipv6_transport`): pathvectord dials a GoBGP peer
+at its routable (global-scope ULA) IPv6 address on a Docker `--ipv6` bridge
+network and reaches Established over a real IPv6 TCP connection — the first
+e2e test in this project where the BGP session's own transport is IPv6, not
+just its NLRI payload. `get_peer`/`list_peers` correctly report the peer's
+address back as IPv6.
+
+Not in scope: MD5 authentication for IPv6 peers (`pathvector-sys`'s
+`TcpMd5Sig` is `sockaddr_in`-based; tracked separately in `TODO.md`).
+
+---
+
 ## 2026-07-04 (pathvectord event-loop proptest)
 
 ### [pathvectord] Close the "event-loop transitions have no proptests" gap

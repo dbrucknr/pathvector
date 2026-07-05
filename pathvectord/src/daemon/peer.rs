@@ -78,7 +78,7 @@ impl DaemonState {
     /// Returns `true` if the peer existed and was removed, `false` if it was
     /// not found.  Callers must also send `SessionCommand::Stop` to the peer's
     /// session handle and update the BGP listener map.
-    pub(crate) fn remove_peer(&mut self, peer_ip: Ipv4Addr) -> bool {
+    pub(crate) fn remove_peer(&mut self, peer_ip: IpAddr) -> bool {
         if !self.adj_ribs_in.contains_key(&peer_ip) {
             return false;
         }
@@ -140,7 +140,7 @@ impl DaemonState {
     // sees two independent borrows of `self` (oracle_v4 vs rib) rather than one
     // mutable borrow of the entire struct.
 
-    pub(crate) fn sync_received(&mut self, peer_ip: Ipv4Addr) {
+    pub(crate) fn sync_received(&mut self, peer_ip: IpAddr) {
         let v4 = self.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
         let v6 = self.adj_ribs_in_v6.get(&peer_ip).map_or(0, AdjRibIn::len);
         self.rib_mut().prefixes_received.insert(peer_ip, v4 + v6);
@@ -148,7 +148,7 @@ impl DaemonState {
 
     /// Syncs the derived `prefixes_advertised` count for `peer_ip` from the
     /// current `adj_ribs_out` length.
-    pub(super) fn sync_advertised(&mut self, peer_ip: Ipv4Addr) {
+    pub(super) fn sync_advertised(&mut self, peer_ip: IpAddr) {
         let v4 = self.adj_ribs_out.get(&peer_ip).map_or(0, AdjRibOut::len);
         let v6 = self.adj_ribs_out_v6.get(&peer_ip).map_or(0, AdjRibOut::len);
         self.rib_mut().prefixes_advertised.insert(peer_ip, v4 + v6);
@@ -160,7 +160,7 @@ impl DaemonState {
     /// The event loop calls this after each event and sends
     /// [`SessionCommand::Stop`] to each returned peer so the session can
     /// re-establish and perform a fresh full-table dump.
-    pub(super) fn take_stalled_peers(&mut self) -> Vec<Ipv4Addr> {
+    pub(super) fn take_stalled_peers(&mut self) -> Vec<IpAddr> {
         std::mem::take(&mut self.stalled_peers)
     }
 
@@ -173,13 +173,13 @@ impl DaemonState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_established(
         &mut self,
-        peer_ip: Ipv4Addr,
+        peer_ip: IpAddr,
         peer_bgp_id: Ipv4Addr,
         peer_type: PeerType,
         peer_as: u32,
         hold_time: u16,
         peer_capabilities: &[Capability],
-        local_addr: Option<Ipv4Addr>,
+        local_addr: Option<IpAddr>,
     ) {
         let peer_id = PeerId::from(peer_ip);
 
@@ -292,7 +292,12 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
-        let local_next_hop = local_addr.unwrap_or(local_bgp_id);
+        let local_next_hop = local_addr
+            .and_then(|a| match a {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .unwrap_or(local_bgp_id);
         let local_ipv6 = self.rib.local_ipv6;
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
 
@@ -314,8 +319,9 @@ impl DaemonState {
                     && let Some(src) = loc_rib.best_peer(&nlri)
                     && let IpAddr::V4(src_ip) = src.ip()
                 {
-                    let src_is_client = rr_clients.contains(&src_ip);
-                    let src_is_ibgp = peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                    let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
+                    let src_is_ibgp =
+                        peer_types.get(&IpAddr::V4(src_ip)).copied() == Some(PeerType::Internal);
                     if src_is_ibgp && !src_is_client && !dest_is_client {
                         return PrefixDecision::NoChange;
                     }
@@ -427,9 +433,9 @@ impl DaemonState {
                         && let Some(src) = loc_rib_v6.best_peer(&nlri)
                         && let IpAddr::V4(src_ip) = src.ip()
                     {
-                        let src_is_client = rr_clients.contains(&src_ip);
-                        let src_is_ibgp =
-                            peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
+                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
+                            == Some(PeerType::Internal);
                         if src_is_ibgp && !src_is_client && !dest_is_client {
                             return PrefixDecisionV6::NoChange;
                         }
@@ -523,7 +529,7 @@ impl DaemonState {
     /// Must be called before any `adj_ribs_in.clear()` on session teardown,
     /// GR deadline expiry, or stale-route pruning — BLACKHOLE routes bypass
     /// LocRib and are therefore invisible to `rib_withdraw_peer_v4/v6`.
-    pub(super) fn withdraw_peer_blackhole_kernel_routes_v4(&self, peer_ip: Ipv4Addr) {
+    pub(super) fn withdraw_peer_blackhole_kernel_routes_v4(&self, peer_ip: IpAddr) {
         let Some(fm) = &self.fib_manager else { return };
         if let Some(ari) = self.adj_ribs_in.get(&peer_ip) {
             for (nlri, route) in ari.routes() {
@@ -539,7 +545,7 @@ impl DaemonState {
         }
     }
 
-    pub(super) fn withdraw_peer_blackhole_kernel_routes_v6(&self, peer_ip: Ipv4Addr) {
+    pub(super) fn withdraw_peer_blackhole_kernel_routes_v6(&self, peer_ip: IpAddr) {
         let Some(fm) = &self.fib_manager else { return };
         if let Some(ari) = self.adj_ribs_in_v6.get(&peer_ip) {
             for (nlri, route) in ari.routes() {
@@ -555,7 +561,7 @@ impl DaemonState {
         }
     }
 
-    pub(super) fn withdraw_peer_blackhole_kernel_routes(&self, peer_ip: Ipv4Addr) {
+    pub(super) fn withdraw_peer_blackhole_kernel_routes(&self, peer_ip: IpAddr) {
         self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
         self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
     }
@@ -570,7 +576,7 @@ impl DaemonState {
     /// when the caller will send a more specific event (e.g. `Removed`) instead.
     pub(crate) fn on_terminated(
         &mut self,
-        peer_ip: Ipv4Addr,
+        peer_ip: IpAddr,
         reason: TerminationReason,
         notify: bool,
     ) {
@@ -746,7 +752,7 @@ impl DaemonState {
         // BGP event processing (including KEEPALIVE handling) for tens of
         // milliseconds.  A stall warning is emitted below if the loop exceeds
         // 100 ms.  See TODO.md (dynamic peer gap #5) for the tracking item.
-        let other_peers: Vec<Ipv4Addr> = self
+        let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -791,7 +797,10 @@ impl DaemonState {
                         .rib
                         .local_addrs
                         .get(&other_ip)
-                        .copied()
+                        .and_then(|a| match a {
+                            IpAddr::V4(v4) => Some(*v4),
+                            IpAddr::V6(_) => None,
+                        })
                         .unwrap_or(local_bgp_id);
                     propagate_prefix(
                         nlri,
@@ -848,9 +857,9 @@ impl DaemonState {
 pub(super) async fn run_command_processor<H, F>(
     mut cmd_rx: mpsc::Receiver<DaemonCommand>,
     state: Arc<RwLock<DaemonState>>,
-    stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+    stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
-    event_tx: mpsc::Sender<(Ipv4Addr, SessionEvent)>,
+    event_tx: mpsc::Sender<(IpAddr, SessionEvent)>,
     spawn_fn: F,
     cfg: SpawnConfig,
     peer_store: Option<Arc<config::DynamicPeerStore>>,
@@ -894,7 +903,7 @@ pub(super) async fn run_command_processor<H, F>(
                     capabilities: cfg.capabilities(effective_role(&peer, cfg.local_as)),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
-                    peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
+                    peer_addr: SocketAddr::new(peer.address, peer.port),
                     md5_password: peer.md5_password.clone(),
                     connect_retry_time: peer
                         .connect_retry_time
@@ -914,7 +923,7 @@ pub(super) async fn run_command_processor<H, F>(
                 incoming_senders
                     .write()
                     .await
-                    .insert(IpAddr::V4(peer.address), handle.incoming_sender());
+                    .insert(peer.address, handle.incoming_sender());
 
                 // Register all per-peer RIB / policy state.
                 state.write().await.add_peer(&peer, update_sender);
@@ -955,7 +964,7 @@ pub(super) async fn run_command_processor<H, F>(
                 }
 
                 // Stop accepting new inbound connections from this peer.
-                incoming_senders.write().await.remove(&IpAddr::V4(peer_ip));
+                incoming_senders.write().await.remove(&peer_ip);
 
                 // Send Cease NOTIFICATION; the session will emit Terminated which
                 // triggers full state cleanup in the event loop.
@@ -999,6 +1008,32 @@ pub(super) async fn run_command_processor<H, F>(
     }
 }
 
+/// Builds and binds a `tokio::net::TcpListener` for `addr`.
+///
+/// For an IPv6 address, explicitly sets `IPV6_V6ONLY` via `socket2` before
+/// binding, so this listener never also claims IPv4-mapped traffic — whether
+/// an IPv6 "any" bind is dual-stack by default is an OS setting, not
+/// something to rely on when a separate IPv4 listener is bound to the same
+/// port. IPv4 addresses are bound directly with no extra socket options.
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
 /// Sets up BGP sessions for every configured peer and constructs the initial
 /// [`DaemonState`].
 ///
@@ -1014,19 +1049,31 @@ pub(super) async fn run_command_processor<H, F>(
 ///
 /// Extracted from `run_with()` so it can be driven in tests by supplying a
 /// mock `spawn_fn` — no real TCP sockets needed.
+///
+/// Binds a single address family (`bind_addr`'s own family). Callers that
+/// want both IPv4 and IPv6 inbound connections run two instances of this
+/// function concurrently — one bound to `0.0.0.0:<port>`, one to
+/// `[::]:<port>` — rather than relying on one dual-stack socket, since
+/// whether an IPv6 "any" bind also accepts IPv4-mapped connections is an OS
+/// default that varies by platform (Linux historically dual-stack, macOS/
+/// Windows historically v6-only). An IPv6 `bind_addr` always gets
+/// `IPV6_V6ONLY` set explicitly via `socket2`, so it never competes with a
+/// concurrently-bound IPv4 listener on the same port regardless of OS
+/// default. Each listener's bind failure is independent — if only one
+/// family fails to bind, the other keeps running (dial-only for the failed
+/// family, matching the existing single-family fallback behavior).
 pub(super) async fn run_bgp_listener(
-    bgp_port: u16,
+    bind_addr: std::net::SocketAddr,
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     _md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>>,
 ) {
-    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], bgp_port));
-    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+    let listener = match bind_listener(bind_addr) {
         Ok(l) => {
-            tracing::info!(port = bgp_port, "BGP listener started");
+            tracing::info!(addr = %bind_addr, "BGP listener started");
             l
         }
         Err(e) => {
-            tracing::error!(port = bgp_port, error = %e, "BGP listener failed to bind; operating in dial-only mode");
+            tracing::error!(addr = %bind_addr, error = %e, "BGP listener failed to bind; operating in dial-only mode for this address family");
             return;
         }
     };
@@ -1057,7 +1104,7 @@ pub(super) async fn run_bgp_listener(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
     use pathvector_policy::DefaultAction;
@@ -1095,14 +1142,22 @@ mod tests {
     /// for the non-GR path (peer.rs lines 569-576).
     #[test]
     fn on_terminated_clean_notifies_fib_manager() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         let fib = with_recording_fib(&mut state);
 
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce("10.0.0.0/8"));
+        state.on_established(
+            IpAddr::V4(PEER_IP),
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce("10.0.0.0/8"));
         fib.v4.lock().unwrap().clear();
 
-        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::OperatorStop, true);
 
         let changes = fib.v4_changes();
         assert!(
@@ -1118,14 +1173,14 @@ mod tests {
     /// non-GR path (peer.rs lines 573-575).
     #[test]
     fn on_terminated_clean_v6_notifies_fib_manager() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         let fib = with_recording_fib(&mut state);
         Arc::make_mut(&mut state.rib).local_ipv6 =
             Some("2001:db8::ff".parse::<Ipv6Addr>().unwrap());
 
         let v6_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -1134,10 +1189,10 @@ mod tests {
             None,
         );
 
-        state.set_import_default(PEER_IP, DefaultAction::Accept);
+        state.set_import_default(IpAddr::V4(PEER_IP), DefaultAction::Accept);
         let nlri_v6: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
         state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -1154,7 +1209,7 @@ mod tests {
         );
         fib.v6.lock().unwrap().clear();
 
-        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::OperatorStop, true);
 
         let v6_changes = fib.v6.lock().unwrap().clone();
         assert!(

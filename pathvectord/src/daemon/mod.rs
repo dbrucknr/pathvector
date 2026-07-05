@@ -79,7 +79,7 @@ pub(crate) enum DaemonCommand {
     AddPeer(config::PeerConfig),
     /// Remove an existing peer at runtime.  The event loop sends a Cease
     /// NOTIFICATION, withdraws all received routes, and cleans up all state.
-    RemovePeer(Ipv4Addr),
+    RemovePeer(IpAddr),
 }
 
 fn resolve_import_default(opt: Option<config::ImportDefault>, is_ebgp: bool) -> DefaultAction {
@@ -165,33 +165,37 @@ pub(crate) struct RibSnapshot {
     /// Immutable after startup.
     pub(crate) local_ipv6: Option<Ipv6Addr>,
     /// Remote AS number for each configured peer; immutable after startup.
-    pub(crate) peer_remote_as: HashMap<Ipv4Addr, u32>,
+    pub(crate) peer_remote_as: HashMap<IpAddr, u32>,
     /// Live session state: present while a peer is Established.
-    pub(crate) peer_types: HashMap<Ipv4Addr, PeerType>,
+    pub(crate) peer_types: HashMap<IpAddr, PeerType>,
     /// Wall-clock instant at which each peer last reached Established.
-    pub(crate) established_at: HashMap<Ipv4Addr, std::time::Instant>,
+    pub(crate) established_at: HashMap<IpAddr, std::time::Instant>,
     /// Negotiated hold-timer value per established peer.
-    pub(crate) hold_times: HashMap<Ipv4Addr, u16>,
+    pub(crate) hold_times: HashMap<IpAddr, u16>,
     /// Derived from `adj_ribs_in[peer].len()`; synced after each mutation.
-    pub(crate) prefixes_received: HashMap<Ipv4Addr, usize>,
+    pub(crate) prefixes_received: HashMap<IpAddr, usize>,
     /// Derived from `adj_ribs_out[peer].len()`; synced after each propagation.
-    pub(crate) prefixes_advertised: HashMap<Ipv4Addr, usize>,
+    pub(crate) prefixes_advertised: HashMap<IpAddr, usize>,
     /// Local TCP address per established peer, captured at connect time.
     ///
     /// Used as the eBGP NEXT_HOP (RFC 4271 §5.1.3) instead of `local_bgp_id`
     /// so the NEXT_HOP is the interface address reachable by the peer.
-    pub(crate) local_addrs: HashMap<Ipv4Addr, Ipv4Addr>,
+    /// Stores the full `IpAddr` (v4 or v6, matching that peer's transport
+    /// session) — consumers extract the v4 variant specifically for IPv4
+    /// NEXT_HOP rewrite, falling back to `local_bgp_id` when the session's
+    /// local address is v6-only.
+    pub(crate) local_addrs: HashMap<IpAddr, IpAddr>,
     /// Peers configured with `next_hop_self = true`.
     ///
     /// When a peer is in this set, `NEXT_HOP` is rewritten to the local
     /// session address before the route is forwarded, even for iBGP peers.
     /// Immutable after startup.
-    pub(crate) next_hop_self_peers: HashSet<Ipv4Addr>,
+    pub(crate) next_hop_self_peers: HashSet<IpAddr>,
     /// Set of configured Route Reflector clients (RFC 4456).
     ///
     /// Empty when this daemon is not acting as a Route Reflector.
     /// Immutable after startup.
-    pub(crate) rr_clients: std::collections::HashSet<Ipv4Addr>,
+    pub(crate) rr_clients: std::collections::HashSet<IpAddr>,
     /// Cluster identifier used in `CLUSTER_LIST` when reflecting routes (RFC 4456).
     ///
     /// Defaults to the 32-bit representation of `bgp_id` when not explicitly
@@ -201,19 +205,19 @@ pub(crate) struct RibSnapshot {
     ///
     /// Used to set `ORIGINATOR_ID` when reflecting routes from a client (RFC 4456
     /// §8). Populated on `Established`; removed on `Terminated`.
-    pub(crate) peer_bgp_ids: HashMap<Ipv4Addr, Ipv4Addr>,
+    pub(crate) peer_bgp_ids: HashMap<IpAddr, Ipv4Addr>,
     /// Peers that have sent us an IPv4 End-of-RIB marker (RFC 4724 §2).
     /// Cleared on session termination. Used to signal initial sync complete.
-    pub(crate) eor_received: HashSet<Ipv4Addr>,
+    pub(crate) eor_received: HashSet<IpAddr>,
     /// Peers that have sent us an IPv6 unicast EOR marker (RFC 4724 §2).
-    pub(crate) eor_received_v6: HashSet<Ipv4Addr>,
+    pub(crate) eor_received_v6: HashSet<IpAddr>,
     /// Peers that advertised RFC 4724 `GracefulRestart` with a non-zero
     /// `restart_time`. Value is the peer's advertised `restart_time` in seconds.
     ///
     /// Populated on `Established`; removed on `Terminated`. Zero means the peer
     /// either did not advertise the capability or advertised `restart_time = 0`
     /// (EOR-only mode, no stale-route window).
-    pub(crate) gr_capable_peers: HashMap<Ipv4Addr, u16>,
+    pub(crate) gr_capable_peers: HashMap<IpAddr, u16>,
     /// RFC 9234 BGP Role configured for each peer, if any. Present only for
     /// peers with `role` set in `PeerConfig` — absent means Role capability
     /// negotiation and OTC leak prevention are disabled for that peer
@@ -223,11 +227,11 @@ pub(crate) struct RibSnapshot {
     /// and when installing this peer's OTC policy terms. Immutable after
     /// startup for static peers; updated by `add_peer`/`remove_peer` for
     /// dynamic peers — mirrors `peer_remote_as`'s lifecycle exactly.
-    pub(crate) peer_roles: HashMap<Ipv4Addr, Role>,
+    pub(crate) peer_roles: HashMap<IpAddr, Role>,
     /// The peer's negotiated RFC 9234 BGP Role, extracted from their
     /// advertised Role capability in OPEN. Populated on `Established`;
     /// removed on `Terminated` — mirrors `peer_bgp_ids`'s lifecycle exactly.
-    pub(crate) negotiated_roles: HashMap<Ipv4Addr, Role>,
+    pub(crate) negotiated_roles: HashMap<IpAddr, Role>,
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -241,17 +245,17 @@ pub(crate) struct RibSnapshot {
 pub(crate) struct DaemonState {
     /// Read-heavy routing state; cloned cheaply by gRPC handlers.
     pub(crate) rib: Arc<RibSnapshot>,
-    pub(crate) import_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
-    pub(crate) import_policies_v6: HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>,
-    pub(crate) export_policies: HashMap<Ipv4Addr, Policy<Route<Ipv4Addr>>>,
-    pub(crate) export_policies_v6: HashMap<Ipv4Addr, Policy<Route<Ipv6Addr>>>,
-    pub(crate) adj_ribs_in: HashMap<Ipv4Addr, AdjRibIn<Ipv4Addr>>,
-    pub(crate) adj_ribs_out: HashMap<Ipv4Addr, AdjRibOut<Ipv4Addr>>,
-    pub(crate) adj_ribs_in_v6: HashMap<Ipv4Addr, AdjRibIn<Ipv6Addr>>,
-    pub(crate) adj_ribs_out_v6: HashMap<Ipv4Addr, AdjRibOut<Ipv6Addr>>,
+    pub(crate) import_policies: HashMap<IpAddr, Policy<Route<Ipv4Addr>>>,
+    pub(crate) import_policies_v6: HashMap<IpAddr, Policy<Route<Ipv6Addr>>>,
+    pub(crate) export_policies: HashMap<IpAddr, Policy<Route<Ipv4Addr>>>,
+    pub(crate) export_policies_v6: HashMap<IpAddr, Policy<Route<Ipv6Addr>>>,
+    pub(crate) adj_ribs_in: HashMap<IpAddr, AdjRibIn<Ipv4Addr>>,
+    pub(crate) adj_ribs_out: HashMap<IpAddr, AdjRibOut<Ipv4Addr>>,
+    pub(crate) adj_ribs_in_v6: HashMap<IpAddr, AdjRibIn<Ipv6Addr>>,
+    pub(crate) adj_ribs_out_v6: HashMap<IpAddr, AdjRibOut<Ipv6Addr>>,
     /// Static peer type derived from config; used to reset `AdjRibOut` on reconnect.
-    pub(crate) peer_config_types: HashMap<Ipv4Addr, PeerType>,
-    pub(crate) update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+    pub(crate) peer_config_types: HashMap<IpAddr, PeerType>,
+    pub(crate) update_senders: HashMap<IpAddr, mpsc::Sender<UpdateMessage>>,
     /// Local capabilities advertised in OPEN messages; used to determine the
     /// negotiated message size limit after `Established`.
     pub(crate) config_capabilities: Vec<Capability>,
@@ -260,34 +264,34 @@ pub(crate) struct DaemonState {
     /// Set to [`MAX_LEN_EXTENDED`] (65535) when both sides negotiated
     /// `Capability::ExtendedMessage`; otherwise [`MAX_LEN`] (4096).
     /// Removed when the peer transitions out of Established.
-    pub(crate) negotiated_max_len: HashMap<Ipv4Addr, usize>,
+    pub(crate) negotiated_max_len: HashMap<IpAddr, usize>,
     /// Peers that negotiated the IPv6 unicast Multi-Protocol capability (RFC 4760).
     ///
     /// Only these peers receive IPv6 MP_REACH_NLRI / MP_UNREACH_NLRI.
-    pub(crate) ipv6_capable_peers: HashSet<Ipv4Addr>,
+    pub(crate) ipv6_capable_peers: HashSet<IpAddr>,
     /// Peers that negotiated RFC 6793 `FourByteAsn` capability.
     ///
     /// AS_PATH is sent unchanged to these peers. For absent peers, AS_PATH is
     /// downgraded (4-byte ASNs replaced with AS_TRANS) and AS4_PATH is added.
-    pub(crate) four_byte_peers: HashSet<Ipv4Addr>,
+    pub(crate) four_byte_peers: HashSet<IpAddr>,
     /// Peers that negotiated RFC 2918 `RouteRefresh` capability.
     ///
     /// `SoftReset` (gRPC) may only send a ROUTE-REFRESH message to peers in
     /// this set. RFC 2918 §4: a router MUST NOT send ROUTE-REFRESH without
     /// having received the corresponding capability from the peer.
-    pub(crate) route_refresh_peers: HashSet<Ipv4Addr>,
+    pub(crate) route_refresh_peers: HashSet<IpAddr>,
     /// RFC 4271 §9.2.1.1: Minimum Route Advertisement Interval.
     ///
     /// Tracks when each prefix was last announced to each eBGP peer so that
     /// re-announcements are suppressed within the MRAI window (default: 30 s).
     /// Withdrawals bypass MRAI — they must be sent immediately.
-    mrai_last_sent: HashMap<Ipv4Addr, HashMap<Nlri<Ipv4Addr>, Instant>>,
+    mrai_last_sent: HashMap<IpAddr, HashMap<Nlri<Ipv4Addr>, Instant>>,
     /// NLRIs suppressed by MRAI that have not yet been sent.
     ///
     /// When an MRAI window elapses, the pending NLRIs for that peer are
     /// re-propagated. Uses a `HashSet` so repeated updates to the same prefix
     /// within one suppression window collapse to a single deferred flush.
-    pub(crate) mrai_pending: HashMap<Ipv4Addr, HashSet<Nlri<Ipv4Addr>>>,
+    pub(crate) mrai_pending: HashMap<IpAddr, HashSet<Nlri<Ipv4Addr>>>,
     /// Peers whose outbound UPDATE channel overflowed during the current event.
     ///
     /// The event loop drains this list after each event via [`take_stalled_peers`]
@@ -295,23 +299,23 @@ pub(crate) struct DaemonState {
     /// re-establish and perform a clean full-table dump.
     ///
     /// [`take_stalled_peers`]: DaemonState::take_stalled_peers
-    stalled_peers: Vec<Ipv4Addr>,
+    stalled_peers: Vec<IpAddr>,
     /// Per-peer coalescing buffers for outbound IPv4 prefix decisions.
     ///
     /// `on_route_update` accumulates decisions here instead of calling
     /// `flush_updates` immediately. The event loop calls `flush_pending` when
     /// the event channel drains (natural quiescence), batching all decisions
     /// that arrived during one burst into the fewest possible UPDATE messages.
-    pub(crate) pending_decisions: HashMap<Ipv4Addr, Vec<PrefixDecision>>,
+    pub(crate) pending_decisions: HashMap<IpAddr, Vec<PrefixDecision>>,
     /// Per-peer coalescing buffers for outbound IPv6 prefix decisions.
-    pub(crate) pending_decisions_v6: HashMap<Ipv4Addr, Vec<PrefixDecisionV6>>,
+    pub(crate) pending_decisions_v6: HashMap<IpAddr, Vec<PrefixDecisionV6>>,
     /// Peers that have been removed via [`DaemonCommand::RemovePeer`] but whose
     /// session has not yet sent `Terminated`.
     ///
     /// When `Terminated` arrives for a peer in this set, the event loop calls
     /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
     /// resetting it for a reconnect.
-    pub(crate) pending_removal: HashSet<Ipv4Addr>,
+    pub(crate) pending_removal: HashSet<IpAddr>,
     /// RFC 4724 §4.2 GR state: active windows, stale-NLRI snapshots, peer families.
     ///
     /// See [`GracefulRestartState`] for field-level documentation.
@@ -321,7 +325,7 @@ pub(crate) struct DaemonState {
     /// Populated when a peer is added (static or dynamic) and has a
     /// `shutdown_message` configured. Used by `RemovePeer` to send a
     /// CEASE/AdministrativeShutdown NOTIFICATION with the reason attached.
-    pub(crate) shutdown_messages: HashMap<Ipv4Addr, String>,
+    pub(crate) shutdown_messages: HashMap<IpAddr, String>,
     /// Per-peer IPv4 prefix limit for RFC 4486 §4 enforcement.
     ///
     /// When a peer's `adj_rib_in.len()` (IPv4 only) exceeds this value after
@@ -329,24 +333,24 @@ pub(crate) struct DaemonState {
     /// CEASE/MaximumNumberOfPrefixesReached NOTIFICATION.
     ///
     /// Absent when no `max_prefixes_v4` was configured for the peer.
-    pub(crate) peer_max_prefixes_v4: HashMap<Ipv4Addr, u32>,
+    pub(crate) peer_max_prefixes_v4: HashMap<IpAddr, u32>,
     /// Per-peer IPv6 prefix limit for RFC 4486 §4 enforcement.
     ///
     /// Mirrors `peer_max_prefixes_v4` but checked against `adj_rib_in_v6.len()`.
     /// Either limit firing causes the session to be torn down.
-    pub(crate) peer_max_prefixes_v6: HashMap<Ipv4Addr, u32>,
+    pub(crate) peer_max_prefixes_v6: HashMap<IpAddr, u32>,
     /// Idle-hold duration (seconds) after a max-prefix CEASE.
     ///
     /// When non-zero, pathvectord blocks the peer from re-establishing for
     /// this many seconds after dropping the session. `0` means reconnect
     /// immediately according to the normal `connect_retry_time`.
-    pub(crate) peer_max_prefixes_restart: HashMap<Ipv4Addr, u16>,
+    pub(crate) peer_max_prefixes_restart: HashMap<IpAddr, u16>,
     /// Active max-prefix idle-hold deadlines, keyed by peer address.
     ///
     /// Inserted when a max-prefix CEASE is sent and `max_prefixes_restart > 0`.
     /// The event loop polls this map and blocks `SessionEvent::Established`
     /// until the deadline passes.
-    pub(crate) max_prefix_idle: HashMap<Ipv4Addr, Instant>,
+    pub(crate) max_prefix_idle: HashMap<IpAddr, Instant>,
     /// Broadcast channel for Loc-RIB events (announced / withdrawn).
     ///
     /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
@@ -379,15 +383,15 @@ impl DaemonState {
         local_ipv6: Option<Ipv6Addr>,
         cluster_id: Option<u32>,
         peers: &[config::PeerConfig],
-        update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>>,
+        update_senders: HashMap<IpAddr, mpsc::Sender<UpdateMessage>>,
         config_capabilities: Vec<Capability>,
     ) -> Self {
-        let rr_clients: HashSet<Ipv4Addr> = peers
+        let rr_clients: HashSet<IpAddr> = peers
             .iter()
             .filter(|p| p.is_rr_client && p.remote_as == local_as)
             .map(|p| p.address)
             .collect();
-        let next_hop_self_peers: HashSet<Ipv4Addr> = peers
+        let next_hop_self_peers: HashSet<IpAddr> = peers
             .iter()
             .filter(|p| p.next_hop_self)
             .map(|p| p.address)
@@ -398,7 +402,7 @@ impl DaemonState {
         // Computed once (rather than inline in each closure below) so the
         // iBGP-guard warning in `effective_role` fires at most once per peer,
         // not once per policy map built from it.
-        let peer_roles: HashMap<Ipv4Addr, Role> = peers
+        let peer_roles: HashMap<IpAddr, Role> = peers
             .iter()
             .filter_map(|p| effective_role(p, local_as).map(|r| (p.address, r)))
             .collect();
@@ -488,22 +492,22 @@ impl DaemonState {
 
         let peer_remote_as = peers.iter().map(|p| (p.address, p.remote_as)).collect();
 
-        let shutdown_messages: HashMap<Ipv4Addr, String> = peers
+        let shutdown_messages: HashMap<IpAddr, String> = peers
             .iter()
             .filter_map(|p| p.shutdown_message.as_ref().map(|m| (p.address, m.clone())))
             .collect();
 
-        let peer_max_prefixes_v4: HashMap<Ipv4Addr, u32> = peers
+        let peer_max_prefixes_v4: HashMap<IpAddr, u32> = peers
             .iter()
             .filter_map(|p| p.max_prefixes_v4.map(|n| (p.address, n)))
             .collect();
 
-        let peer_max_prefixes_v6: HashMap<Ipv4Addr, u32> = peers
+        let peer_max_prefixes_v6: HashMap<IpAddr, u32> = peers
             .iter()
             .filter_map(|p| p.max_prefixes_v6.map(|n| (p.address, n)))
             .collect();
 
-        let peer_max_prefixes_restart: HashMap<Ipv4Addr, u16> = peers
+        let peer_max_prefixes_restart: HashMap<IpAddr, u16> = peers
             .iter()
             .filter_map(|p| {
                 p.max_prefixes_restart
@@ -804,12 +808,25 @@ where
         );
     }
 
-    // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
+    // Spawn the BGP TCP listeners for inbound connections (RFC 4271 §6.8).
+    // Two independent listeners (IPv4 and IPv6) rather than one dual-stack
+    // socket — see run_bgp_listener's doc comment for why. Each family's
+    // bind failure is independent, so e.g. an environment with IPv6 disabled
+    // still gets a working IPv4 listener (dial-only for v6 in that case).
     {
         let incoming = Arc::clone(&incoming_senders);
         let md5 = Arc::clone(&md5_passwords);
+        let bind_addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bgp_port);
         tokio::spawn(async move {
-            run_bgp_listener(bgp_port, incoming, md5).await;
+            run_bgp_listener(bind_addr_v4, incoming, md5).await;
+        });
+    }
+    {
+        let incoming = Arc::clone(&incoming_senders);
+        let md5 = Arc::clone(&md5_passwords);
+        let bind_addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), bgp_port);
+        tokio::spawn(async move {
+            run_bgp_listener(bind_addr_v6, incoming, md5).await;
         });
     }
 
@@ -917,9 +934,9 @@ pub(crate) async fn build_daemon<H, F>(
     spawn_fn: F,
 ) -> (
     Arc<RwLock<DaemonState>>,
-    mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
-    mpsc::Sender<(Ipv4Addr, SessionEvent)>, // kept alive for AddPeer forwarding
-    Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+    mpsc::Receiver<(IpAddr, SessionEvent)>,
+    mpsc::Sender<(IpAddr, SessionEvent)>, // kept alive for AddPeer forwarding
+    Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     Arc<RwLock<HashMap<IpAddr, String>>>, // RFC 2385 MD5 passwords
 )
@@ -930,11 +947,11 @@ where
     let local_as = cfg.daemon.local_as;
     let local_bgp_id = cfg.daemon.bgp_id;
 
-    let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(256);
-    let mut update_senders: HashMap<Ipv4Addr, mpsc::Sender<UpdateMessage>> = HashMap::new();
+    let (event_tx, event_rx) = mpsc::channel::<(IpAddr, SessionEvent)>(256);
+    let mut update_senders: HashMap<IpAddr, mpsc::Sender<UpdateMessage>> = HashMap::new();
     // stop_senders: shared with the command processor so AddPeer/RemovePeer can
     // insert/remove without touching the event loop directly.
-    let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+    let stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     // incoming_senders: shared with the BGP listener so AddPeer immediately
     // accepts inbound connections from newly configured peers.
@@ -965,7 +982,7 @@ where
             capabilities,
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
-            peer_addr: SocketAddr::new(IpAddr::V4(peer.address), peer.port),
+            peer_addr: SocketAddr::new(peer.address, peer.port),
             md5_password: peer.md5_password.clone(),
             connect_retry_time: peer
                 .connect_retry_time
@@ -985,12 +1002,9 @@ where
         incoming_senders
             .write()
             .await
-            .insert(IpAddr::V4(peer.address), handle.incoming_sender());
+            .insert(peer.address, handle.incoming_sender());
         if let Some(pw) = &peer.md5_password {
-            md5_passwords
-                .write()
-                .await
-                .insert(IpAddr::V4(peer.address), pw.clone());
+            md5_passwords.write().await.insert(peer.address, pw.clone());
         }
 
         let peer_addr = peer.address;
@@ -1034,9 +1048,9 @@ where
 }
 
 pub(crate) async fn run_event_loop(
-    mut event_rx: mpsc::Receiver<(Ipv4Addr, SessionEvent)>,
+    mut event_rx: mpsc::Receiver<(IpAddr, SessionEvent)>,
     state: Arc<RwLock<DaemonState>>,
-    stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+    stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     mut fib_change_rx: Option<watch::Receiver<()>>,
 ) {
     // MRAI flush timer — fires every MRAI/2 so suppressed eBGP routes are
@@ -1204,7 +1218,7 @@ pub(crate) async fn run_event_loop(
                 // Peers that reconnected during a max-prefix idle-hold window;
                 // their Stop is sent after the drain loop alongside stalled peers
                 // to avoid dropping and re-acquiring the write lock mid-iteration.
-                let mut idle_hold_rejected: Vec<Ipv4Addr> = Vec::new();
+                let mut idle_hold_rejected: Vec<IpAddr> = Vec::new();
 
                 while let Ok((extra_ip, extra_event)) = event_rx.try_recv() {
                     match extra_event {
@@ -1341,7 +1355,7 @@ pub(crate) async fn run_event_loop(
                 }
             } => {
                 let now = Instant::now();
-                let expired: Vec<Ipv4Addr> = {
+                let expired: Vec<IpAddr> = {
                     let mut s = state.write().await;
                     let expired = s.gr.drain_expired(now);
                     for peer_ip in &expired {
@@ -1380,7 +1394,7 @@ pub(crate) async fn run_event_loop(
             } => {
                 let now = Instant::now();
                 let mut s = state.write().await;
-                let expired: Vec<Ipv4Addr> = s
+                let expired: Vec<IpAddr> = s
                     .max_prefix_idle
                     .iter()
                     .filter(|(_, deadline)| *deadline <= &now)
@@ -1426,6 +1440,18 @@ pub(crate) async fn run_event_loop(
                 }
             }
         }
+    }
+}
+
+/// Extracts the IPv4 address from a test fixture's `IpAddr`. Every peer
+/// address literal in this file's test modules is IPv4; this exists only to
+/// bridge the peer-identity `IpAddr` type to APIs (e.g. `on_established`'s
+/// `peer_bgp_id`) that require an `Ipv4Addr` specifically.
+#[cfg(test)]
+fn must_v4(addr: IpAddr) -> Ipv4Addr {
+    match addr {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => panic!("test fixture address must be IPv4"),
     }
 }
 
@@ -1495,11 +1521,8 @@ mod tests {
     /// Returns the state and a map of receivers for asserting on outbound messages.
     pub(super) fn make_state(
         local_as: u32,
-        peers: &[(Ipv4Addr, u32)],
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+        peers: &[(IpAddr, u32)],
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
         for &(ip, _) in peers {
@@ -1597,7 +1620,7 @@ mod tests {
     /// EOR marker the session setup now sends (RFC 4724 §2).  Tests that
     /// specifically verify the EOR shape should NOT call this helper — they
     /// should assert on the message content directly.
-    fn drain_all(receivers: &mut HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>) {
+    fn drain_all(receivers: &mut HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         for rx in receivers.values_mut() {
             while rx.try_recv().is_ok() {}
         }
@@ -1733,19 +1756,22 @@ mod tests {
     fn test_daemon_state_new_creates_maps_for_all_peers() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (state, _) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
         for ip in [peer_a, peer_b] {
-            assert!(state.import_policies.contains_key(&ip));
-            assert!(state.export_policies.contains_key(&ip));
-            assert!(state.adj_ribs_in.contains_key(&ip));
-            assert!(state.adj_ribs_out.contains_key(&ip));
-            assert!(state.update_senders.contains_key(&ip));
+            assert!(state.import_policies.contains_key(&IpAddr::V4(ip)));
+            assert!(state.export_policies.contains_key(&IpAddr::V4(ip)));
+            assert!(state.adj_ribs_in.contains_key(&IpAddr::V4(ip)));
+            assert!(state.adj_ribs_out.contains_key(&IpAddr::V4(ip)));
+            assert!(state.update_senders.contains_key(&IpAddr::V4(ip)));
         }
     }
 
     #[test]
     fn test_daemon_state_new_ebgp_gets_reject_default_when_omitted() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let peers = vec![config::PeerConfig {
             address: peer_ip,
@@ -1794,10 +1820,18 @@ mod tests {
 
     #[test]
     fn test_on_established_records_peer_type() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         assert!(!state.rib.peer_types.contains_key(&peer_ip));
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         assert_eq!(state.rib.peer_types[&peer_ip], PeerType::External);
     }
 
@@ -1805,9 +1839,17 @@ mod tests {
     fn test_on_established_empty_rib_sends_eor_only() {
         // RFC 4724 §2: the EOR MUST be sent even when the Adj-RIB-Out is
         // empty so the peer knows the initial sync window is closed.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         let eor = receivers
             .get_mut(&peer_ip)
@@ -1826,7 +1868,7 @@ mod tests {
 
     #[test]
     fn test_on_established_sends_full_table_dump() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
 
         // Pre-populate the RIB with a route from a third-party peer.
@@ -1841,7 +1883,15 @@ mod tests {
         .build();
         state.rib_insert_v4(src, route);
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         let msg = receivers
             .get_mut(&peer_ip)
@@ -1866,14 +1916,14 @@ mod tests {
     /// IPv6 EOR (empty MP_UNREACH_NLRI for IPv6 unicast) after the full-table dump.
     #[test]
     fn test_on_established_ipv6_capable_peer_receives_both_eors() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_state(65001, &[(peer_ip, 65002)]);
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::External,
             65002,
             90,
@@ -1928,7 +1978,7 @@ mod tests {
     fn test_on_established_ebgp_next_hop_uses_local_addr_not_router_id() {
         use pathvector_session::message::PathAttribute;
 
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let local_bgp_id: Ipv4Addr = "10.0.0.1".parse().unwrap(); // router ID (make_state uses this)
         let session_local_addr: Ipv4Addr = "172.31.50.20".parse().unwrap(); // TCP interface address
 
@@ -1950,12 +2000,12 @@ mod tests {
 
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::External,
             65002,
             90,
             &[],
-            Some(session_local_addr),
+            Some(IpAddr::V4(session_local_addr)),
         );
 
         let msg = receivers
@@ -1989,7 +2039,7 @@ mod tests {
     fn test_propagate_to_all_peers_ebgp_next_hop_uses_local_addr() {
         use pathvector_session::message::PathAttribute;
 
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let local_bgp_id: Ipv4Addr = "10.0.0.1".parse().unwrap();
         let session_local_addr: Ipv4Addr = "172.31.50.20".parse().unwrap();
 
@@ -1998,12 +2048,12 @@ mod tests {
         // Establish with a distinct local_addr so local_addrs is populated.
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::External,
             65002,
             90,
             &[],
-            Some(session_local_addr),
+            Some(IpAddr::V4(session_local_addr)),
         );
         // Drain the (empty) full-table dump; no routes pre-installed.
         while receivers.get_mut(&peer_ip).unwrap().try_recv().is_ok() {}
@@ -2053,7 +2103,7 @@ mod tests {
     fn test_propagate_to_all_peers_next_hop_self_rewrites_ibgp_next_hop() {
         use pathvector_session::message::PathAttribute;
 
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let local_bgp_id: Ipv4Addr = "10.0.0.1".parse().unwrap();
         let session_local_addr: Ipv4Addr = "172.16.0.1".parse().unwrap();
 
@@ -2090,12 +2140,12 @@ mod tests {
 
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::Internal,
             65001,
             90,
             &[],
-            Some(session_local_addr),
+            Some(IpAddr::V4(session_local_addr)),
         );
         // Drain the full-table dump (empty rib).
         while rx.try_recv().is_ok() {}
@@ -2137,7 +2187,7 @@ mod tests {
 
     #[test]
     fn test_on_established_export_reject_sends_nothing() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (tx, _rx) = mpsc::channel(64);
         let peers = vec![config::PeerConfig {
             address: peer_ip,
@@ -2179,7 +2229,15 @@ mod tests {
                 .build(),
         );
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         // Export policy rejects everything — no UPDATE should be queued.
         // (We can't assert on the receiver here since we dropped _rx, but the
         // important invariant is that no panic or error occurs, and the RIB is
@@ -2191,18 +2249,34 @@ mod tests {
 
     #[test]
     fn test_on_terminated_removes_peer_type() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         state.on_terminated(peer_ip, TerminationReason::Unclean, true);
         assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
 
     #[test]
     fn test_on_terminated_withdraws_peer_routes_from_rib() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.rib_insert_v4(
             PeerId::from(peer_ip),
@@ -2224,14 +2298,33 @@ mod tests {
     fn test_on_terminated_propagates_withdraw_to_other_established_peers() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // Announce a route from peer_a so it reaches peer_b's AdjRibOut.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -2243,14 +2336,22 @@ mod tests {
             },
         );
         // Drain the propagation messages sent during on_route_update.
-        receivers.get_mut(&peer_a).unwrap().try_recv().ok();
-        receivers.get_mut(&peer_b).unwrap().try_recv().ok();
+        receivers
+            .get_mut(&IpAddr::V4(peer_a))
+            .unwrap()
+            .try_recv()
+            .ok();
+        receivers
+            .get_mut(&IpAddr::V4(peer_b))
+            .unwrap()
+            .try_recv()
+            .ok();
 
         // Terminate peer_a — peer_b must receive a WITHDRAW.
-        state.on_terminated(peer_a, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(peer_a), TerminationReason::Unclean, true);
 
         let msg = receivers
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b should receive WITHDRAW after peer_a terminates");
@@ -2292,19 +2393,38 @@ mod tests {
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
         // Install a toggle oracle (both peers initially reachable).
         let oracle = ToggleOracle::reachable();
         state.set_oracles(oracle.clone(), oracle.clone());
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // Announce a route from peer_a with an explicit next-hop.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -2317,7 +2437,11 @@ mod tests {
         );
         // Drain initial propagation to peer_b.
         state.flush_pending();
-        receivers.get_mut(&peer_b).unwrap().try_recv().ok();
+        receivers
+            .get_mut(&IpAddr::V4(peer_b))
+            .unwrap()
+            .try_recv()
+            .ok();
 
         assert!(
             state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_some(),
@@ -2335,7 +2459,7 @@ mod tests {
         );
 
         let msg = receivers
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b must receive WITHDRAW when next-hop goes down");
@@ -2349,18 +2473,37 @@ mod tests {
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
         // Start with next-hop unreachable so the initial INSERT produces no best path.
         let oracle = ToggleOracle::reachable();
         oracle.set(false);
         state.set_oracles(oracle.clone(), oracle.clone());
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -2374,7 +2517,11 @@ mod tests {
         // No best path yet — nothing should have been sent to peer_b.
         assert!(state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none());
         state.flush_pending();
-        receivers.get_mut(&peer_b).unwrap().try_recv().ok(); // discard any spurious message
+        receivers
+            .get_mut(&IpAddr::V4(peer_b))
+            .unwrap()
+            .try_recv()
+            .ok(); // discard any spurious message
 
         // Next-hop recovers.
         oracle.set(true);
@@ -2387,7 +2534,7 @@ mod tests {
         );
 
         let msg = receivers
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b must receive UPDATE when next-hop recovers");
@@ -2399,15 +2546,40 @@ mod tests {
     fn test_on_fib_change_noop_when_nothing_changes() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // FIB change fires with empty RIB — should be a no-op.
         state.on_fib_change();
-        assert!(receivers.get_mut(&peer_b).unwrap().try_recv().is_err());
+        assert!(
+            receivers
+                .get_mut(&IpAddr::V4(peer_b))
+                .unwrap()
+                .try_recv()
+                .is_err()
+        );
     }
 
     /// When a FIB change evicts a best route, the FIB manager must receive a
@@ -2417,17 +2589,25 @@ mod tests {
         use pathvector_types::{AsPath, Asn, Origin};
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002)]);
+        let (mut state, mut receivers) = make_state(65001, &[(IpAddr::V4(peer_a), 65002)]);
         let fib = with_recording_fib(&mut state);
 
         let oracle = ToggleOracle::reachable();
         state.set_oracles(oracle.clone(), oracle.clone());
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -2461,7 +2641,7 @@ mod tests {
         use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin};
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002)]);
+        let (mut state, mut receivers) = make_state(65001, &[(IpAddr::V4(peer_a), 65002)]);
         let fib = with_recording_fib(&mut state);
 
         let oracle = ToggleOracle::reachable();
@@ -2470,7 +2650,7 @@ mod tests {
 
         let v6_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
-            peer_a,
+            IpAddr::V4(peer_a),
             peer_a,
             PeerType::External,
             65002,
@@ -2494,7 +2674,7 @@ mod tests {
             ],
             announced: vec![],
         };
-        state.on_route_update(peer_a, announce_v6);
+        state.on_route_update(IpAddr::V4(peer_a), announce_v6);
         fib.v6.lock().unwrap().clear();
 
         oracle.set(false);
@@ -2516,11 +2696,19 @@ mod tests {
         use pathvector_rib::BestPathChange;
         use pathvector_types::{AsPath, Asn, Origin};
 
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rxs) = make_state(65001, &[(peer_ip, 65002)]);
         let fib = with_recording_fib(&mut state);
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2548,9 +2736,17 @@ mod tests {
 
     #[test]
     fn test_on_route_update_inserts_route_into_rib() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2575,27 +2771,38 @@ mod tests {
     fn test_install_rpki_import_terms_adds_one_term_per_peer_v4_and_v6() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, _) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
         let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
 
         state.install_rpki_import_terms(&rtr);
 
         for ip in [peer_a, peer_b] {
-            assert_eq!(state.import_policies[&ip].len(), 1);
-            assert_eq!(state.import_policies_v6[&ip].len(), 1);
+            assert_eq!(state.import_policies[&IpAddr::V4(ip)].len(), 1);
+            assert_eq!(state.import_policies_v6[&IpAddr::V4(ip)].len(), 1);
         }
     }
 
     #[test]
     fn test_rov_accepts_route_with_valid_roa() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         let rtr = pathvector_rpki::for_testing(
             [(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 65002)],
             std::iter::empty(),
         );
         state.install_rpki_import_terms(&rtr);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2604,7 +2811,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                    PathAttribute::NextHop(peer_ip),
+                    PathAttribute::NextHop(must_v4(peer_ip)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2615,7 +2822,7 @@ mod tests {
 
     #[test]
     fn test_rov_rejects_route_with_invalid_roa_wrong_origin_asn() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         // ROA authorizes AS 99999 for this prefix, not AS 65002 — the peer's
         // announcement will be Invalid.
@@ -2624,7 +2831,15 @@ mod tests {
             std::iter::empty(),
         );
         state.install_rpki_import_terms(&rtr);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2633,7 +2848,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                    PathAttribute::NextHop(peer_ip),
+                    PathAttribute::NextHop(must_v4(peer_ip)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2644,13 +2859,21 @@ mod tests {
 
     #[test]
     fn test_rov_accepts_route_with_no_covering_roa() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         // Empty ROA table — every prefix is NotFound, which must be accepted
         // by default, not treated the same as Invalid.
         let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
         state.install_rpki_import_terms(&rtr);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2659,7 +2882,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                    PathAttribute::NextHop(peer_ip),
+                    PathAttribute::NextHop(must_v4(peer_ip)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2673,9 +2896,17 @@ mod tests {
         // Regression guard: without calling install_rpki_import_terms (the
         // `reject_invalid = false` config path), ROV must have zero effect —
         // an Invalid route is accepted exactly as it would be in Phase 1.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2684,7 +2915,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                    PathAttribute::NextHop(peer_ip),
+                    PathAttribute::NextHop(must_v4(peer_ip)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2700,11 +2931,19 @@ mod tests {
         // rejected once the cache actually reflects it as Invalid, without
         // needing a session reset. reevaluate_all_import_policies is what
         // makes that happen.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
         state.install_rpki_import_terms(&rtr);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         // Accepted now: the cache is empty, so this reads as NotFound.
         state.on_route_update(
@@ -2714,7 +2953,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                    PathAttribute::NextHop(peer_ip),
+                    PathAttribute::NextHop(must_v4(peer_ip)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -2737,7 +2976,7 @@ mod tests {
         // Regression guard: reevaluate_all_import_policies must never touch
         // the installed Policy itself (unlike set_import_default, which
         // replaces it) — calling it repeatedly must not grow the term list.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         let rtr = pathvector_rpki::for_testing(std::iter::empty(), std::iter::empty());
         state.install_rpki_import_terms(&rtr);
@@ -2753,14 +2992,33 @@ mod tests {
     fn test_on_route_update_propagates_to_other_established_peer() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut receivers) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -2774,7 +3032,7 @@ mod tests {
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b should receive UPDATE for the new route");
@@ -2783,9 +3041,17 @@ mod tests {
 
     #[test]
     fn test_on_route_update_withdraw_removes_route_from_rib() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
             peer_ip,
@@ -2816,11 +3082,8 @@ mod tests {
 
     fn make_state_with_roles(
         local_as: u32,
-        peers: &[(Ipv4Addr, u32, config::PeerRole)],
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+        peers: &[(IpAddr, u32, config::PeerRole)],
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
         for &(ip, _, _) in peers {
@@ -2890,7 +3153,7 @@ mod tests {
             (PeerRole::Peer, 2, 2),
         ];
         for (role, expected_import, expected_export) in cases {
-            let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+            let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
             let (state, _rx) = make_state_with_roles(65001, &[(peer_ip, 65002, role)]);
             assert_eq!(
                 state.import_policies[&peer_ip].len(),
@@ -2914,7 +3177,7 @@ mod tests {
     fn test_no_role_configured_installs_no_otc_terms() {
         // Regression guard: omitting `role` must have zero effect — matches
         // RFC 9234's own non-strict default of not requiring Role at all.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (state, _rx) = make_state(65001, &[(peer_ip, 65002)]);
         assert_eq!(state.import_policies[&peer_ip].len(), 0);
         assert_eq!(state.import_policies_v6[&peer_ip].len(), 0);
@@ -2929,7 +3192,7 @@ mod tests {
     /// eBGP ingestion elsewhere in the network.
     #[test]
     fn test_role_ignored_for_ibgp_peer() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65001, config::PeerRole::Provider)]);
 
@@ -2958,7 +3221,7 @@ mod tests {
     /// landed. `Policy::set_default` changes only the default action now.
     #[test]
     fn test_set_import_and_export_default_preserve_otc_terms() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Peer)]);
         // Peer role installs 2 import terms and 2 export terms (see
@@ -2997,7 +3260,15 @@ mod tests {
 
         // And the actual leak-rejection behavior must still function after
         // the default-action change, not just the term count.
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(99999)));
         assert!(
             state.rib.loc_rib.best(&nlri("10.0.0.0/8")).is_none(),
@@ -3015,7 +3286,7 @@ mod tests {
     /// role-independent) must still have its ROV term survive.
     #[test]
     fn test_set_import_default_preserves_rpki_rov_term() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) = make_state(65001, &[(peer_ip, 65002)]);
         let rtr = pathvector_rpki::for_testing(
             [(Ipv4Addr::new(10, 0, 0, 0), 8, 8, 99999)],
@@ -3033,7 +3304,15 @@ mod tests {
         );
 
         // And ROV rejection must still actually fire afterward.
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         state.on_route_update(
             peer_ip,
             UpdateMessage {
@@ -3041,7 +3320,7 @@ mod tests {
                 attributes: vec![
                     PathAttribute::Origin(Origin::Igp),
                     PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                    PathAttribute::NextHop(peer_ip),
+                    PathAttribute::NextHop(must_v4(peer_ip)),
                 ],
                 announced: vec![nlri("10.0.0.0/8")],
             },
@@ -3056,10 +3335,18 @@ mod tests {
     fn test_provider_role_rejects_route_leaked_with_otc_from_customer() {
         // session_role = Provider: the peer is our Customer. A well-behaved
         // Customer never sends OTC — receiving one at all is a leak.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Provider)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(1)));
 
@@ -3074,10 +3361,18 @@ mod tests {
         // session_role = Provider: a route without OTC from our Customer is
         // legitimate and accepted; no ingress attach happens on this side
         // (attach only applies when session_role is Customer/Peer/RsClient).
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Provider)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", None));
 
@@ -3094,10 +3389,18 @@ mod tests {
         // session_role = Customer: the peer is our Provider. No leak
         // detection applies here; the route gets OTC = peer's ASN attached
         // so downstream OTC enforcement (at the next hop) can work.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Customer)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", None));
 
@@ -3113,10 +3416,18 @@ mod tests {
     fn test_peer_role_rejects_route_with_mismatched_otc_asn() {
         // session_role = Peer: OTC present with a value other than the
         // peer's own ASN indicates a leak further upstream.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Peer)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(99999)));
 
@@ -3137,18 +3448,45 @@ mod tests {
         let (mut state, mut receivers) = make_state_with_roles(
             65001,
             &[
-                (peer_a, 65002, config::PeerRole::Customer),
-                (peer_b, 65003, config::PeerRole::Customer),
-                (peer_c, 65004, config::PeerRole::Provider),
+                (IpAddr::V4(peer_a), 65002, config::PeerRole::Customer),
+                (IpAddr::V4(peer_b), 65003, config::PeerRole::Customer),
+                (IpAddr::V4(peer_c), 65004, config::PeerRole::Provider),
             ],
         );
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        state.on_established(peer_c, peer_c, PeerType::External, 65004, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_c),
+            peer_c,
+            PeerType::External,
+            65004,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // Learned from peer_a (our Provider) with no OTC yet — gets attached.
-        state.on_route_update(peer_a, announce_with_otc(65002, "10.0.0.0/8", None));
+        state.on_route_update(
+            IpAddr::V4(peer_a),
+            announce_with_otc(65002, "10.0.0.0/8", None),
+        );
         state.flush_pending();
 
         let stored = state
@@ -3164,13 +3502,17 @@ mod tests {
 
         // Must NOT reach peer_b — another Provider. This is the leak.
         assert!(
-            receivers.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(peer_b))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "route already carrying OTC must never be advertised to another Provider"
         );
 
         // Must reach peer_c — our Customer — with OTC preserved on the wire.
         let msg = receivers
-            .get_mut(&peer_c)
+            .get_mut(&IpAddr::V4(peer_c))
             .unwrap()
             .try_recv()
             .expect("route must be advertised to our Customer");
@@ -3187,10 +3529,18 @@ mod tests {
         // session_role = RouteServer: the peer is our RS-Client. Mirrors the
         // Provider case — RouteServer wasn't previously exercised at the
         // daemon/route level, only via the term-count table.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::RouteServer)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(1)));
         assert!(
@@ -3216,10 +3566,18 @@ mod tests {
         // session_role = RsClient: the peer is our RouteServer. Mirrors the
         // Customer case — RsClient wasn't previously exercised at the
         // daemon/route level, only via the term-count table.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::RsClient)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", None));
 
@@ -3236,10 +3594,18 @@ mod tests {
         // session_role = Peer, OTC present and matching the peer's own ASN —
         // not a leak per RFC 9234 §5 rule 2. Must be accepted, and SetOtc
         // must not overwrite the already-correct value.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Peer)]);
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(peer_ip, announce_with_otc(65002, "10.0.0.0/8", Some(65002)));
 
@@ -3266,12 +3632,12 @@ mod tests {
         let (mut state, mut receivers) = make_state_with_roles(
             65001,
             &[
-                (peer_provider, 65002, config::PeerRole::Customer),
-                (peer_lateral, 65003, config::PeerRole::Peer),
+                (IpAddr::V4(peer_provider), 65002, config::PeerRole::Customer),
+                (IpAddr::V4(peer_lateral), 65003, config::PeerRole::Peer),
             ],
         );
         state.on_established(
-            peer_provider,
+            IpAddr::V4(peer_provider),
             peer_provider,
             PeerType::External,
             65002,
@@ -3280,7 +3646,7 @@ mod tests {
             None,
         );
         state.on_established(
-            peer_lateral,
+            IpAddr::V4(peer_lateral),
             peer_lateral,
             PeerType::External,
             65003,
@@ -3292,7 +3658,10 @@ mod tests {
 
         // Learned from peer_provider (our Provider) with no OTC — gets
         // attached (session_role = Customer is in the ingress-attach set).
-        state.on_route_update(peer_provider, announce_with_otc(65002, "10.0.0.0/8", None));
+        state.on_route_update(
+            IpAddr::V4(peer_provider),
+            announce_with_otc(65002, "10.0.0.0/8", None),
+        );
         state.flush_pending();
         assert_eq!(
             state.rib.loc_rib.best(&nlri("10.0.0.0/8")).unwrap().otc(),
@@ -3300,7 +3669,7 @@ mod tests {
         );
         assert!(
             receivers
-                .get_mut(&peer_lateral)
+                .get_mut(&IpAddr::V4(peer_lateral))
                 .unwrap()
                 .try_recv()
                 .is_err(),
@@ -3316,7 +3685,7 @@ mod tests {
         let peer_plain: Ipv4Addr = "10.0.0.4".parse().unwrap();
         state.add_peer(
             &config::PeerConfig {
-                address: peer_plain,
+                address: IpAddr::V4(peer_plain),
                 port: 179,
                 remote_as: 65004,
                 import_default: Some(config::ImportDefault::Accept),
@@ -3336,7 +3705,7 @@ mod tests {
             mpsc::channel(64).0,
         );
         state.on_established(
-            peer_plain,
+            IpAddr::V4(peer_plain),
             peer_plain,
             PeerType::External,
             65004,
@@ -3347,7 +3716,7 @@ mod tests {
         drain_all(&mut receivers);
 
         state.on_route_update(
-            peer_plain,
+            IpAddr::V4(peer_plain),
             announce_with_otc(65004, "198.51.100.0/24", None),
         );
         state.flush_pending();
@@ -3362,7 +3731,7 @@ mod tests {
             "no configured role on peer_plain means no ingress attach"
         );
         let msg = receivers
-            .get_mut(&peer_lateral)
+            .get_mut(&IpAddr::V4(peer_lateral))
             .unwrap()
             .try_recv()
             .expect("clean route must reach the Peer-role destination");
@@ -3380,13 +3749,13 @@ mod tests {
         // path only; this confirms the IPv6 MP_REACH_NLRI path (route.rs's
         // second RouteBuilder + `.otc(asn)` call) is actually wired, not
         // just compiling.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) =
             make_state_with_roles(65001, &[(peer_ip, 65002, config::PeerRole::Provider)]);
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::External,
             65002,
             90,
@@ -3459,14 +3828,14 @@ mod tests {
         let (mut state, mut receivers) = make_state_with_roles(
             65001,
             &[
-                (peer_provider, 65002, config::PeerRole::Customer),
-                (peer_lateral, 65003, config::PeerRole::Peer),
+                (IpAddr::V4(peer_provider), 65002, config::PeerRole::Customer),
+                (IpAddr::V4(peer_lateral), 65003, config::PeerRole::Peer),
             ],
         );
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
-            peer_provider,
+            IpAddr::V4(peer_provider),
             peer_provider,
             PeerType::External,
             65002,
@@ -3475,7 +3844,7 @@ mod tests {
             None,
         );
         state.on_established(
-            peer_lateral,
+            IpAddr::V4(peer_lateral),
             peer_lateral,
             PeerType::External,
             65003,
@@ -3491,7 +3860,7 @@ mod tests {
         // considered for export.
         let leaked_v6: Nlri<Ipv6Addr> = "2001:db8:dead::/48".parse().unwrap();
         state.on_route_update(
-            peer_provider,
+            IpAddr::V4(peer_provider),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -3513,7 +3882,7 @@ mod tests {
         );
         assert!(
             receivers
-                .get_mut(&peer_lateral)
+                .get_mut(&IpAddr::V4(peer_lateral))
                 .unwrap()
                 .try_recv()
                 .is_err(),
@@ -3527,7 +3896,7 @@ mod tests {
         let peer_plain: Ipv4Addr = "10.0.0.4".parse().unwrap();
         state.add_peer(
             &config::PeerConfig {
-                address: peer_plain,
+                address: IpAddr::V4(peer_plain),
                 port: 179,
                 remote_as: 65004,
                 import_default: Some(config::ImportDefault::Accept),
@@ -3547,7 +3916,7 @@ mod tests {
             mpsc::channel(64).0,
         );
         state.on_established(
-            peer_plain,
+            IpAddr::V4(peer_plain),
             peer_plain,
             PeerType::External,
             65004,
@@ -3559,7 +3928,7 @@ mod tests {
 
         let clean_v6: Nlri<Ipv6Addr> = "2001:db8:beef::/48".parse().unwrap();
         state.on_route_update(
-            peer_plain,
+            IpAddr::V4(peer_plain),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -3581,7 +3950,7 @@ mod tests {
             "no configured role on peer_plain means no ingress attach"
         );
         let msg = receivers
-            .get_mut(&peer_lateral)
+            .get_mut(&IpAddr::V4(peer_lateral))
             .unwrap()
             .try_recv()
             .expect("clean IPv6 route must reach the Peer-role destination");
@@ -3907,13 +4276,22 @@ mod tests {
     /// manager so the kernel programs a null route.
     #[test]
     fn blackhole_route_programs_kernel_null_route() {
-        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let (mut state, _rxs) =
+            make_state(65001, &[(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65002)]);
         let fib = with_recording_fib(&mut state);
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
-        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
 
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let announced_nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
@@ -3928,13 +4306,22 @@ mod tests {
     /// outbound — only the kernel null route is programmed.
     #[test]
     fn blackhole_route_not_in_loc_rib() {
-        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let (mut state, _rxs) =
+            make_state(65001, &[(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65002)]);
         with_recording_fib(&mut state);
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
-        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
 
         // LocRib must remain empty for the blackhole prefix.
         assert_eq!(
@@ -3948,16 +4335,25 @@ mod tests {
     /// `withdraw_blackhole_v4` must be called to remove the kernel null route.
     #[test]
     fn blackhole_route_withdrawal_removes_kernel_null_route() {
-        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let (mut state, _rxs) =
+            make_state(65001, &[(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65002)]);
         let fib = with_recording_fib(&mut state);
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
-        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
         fib.blackhole_v4.lock().unwrap().clear();
 
-        state.on_route_update(peer, blackhole_withdraw("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_withdraw("192.0.2.0/24"));
 
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let withdrawn_nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
@@ -3974,16 +4370,25 @@ mod tests {
     /// BLACKHOLE routes, leaking the kernel null route indefinitely.
     #[test]
     fn blackhole_route_removed_on_session_teardown() {
-        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let (mut state, _rxs) =
+            make_state(65001, &[(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65002)]);
         let fib = with_recording_fib(&mut state);
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
-        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
         fib.blackhole_v4.lock().unwrap().clear();
 
-        state.on_terminated(peer, TerminationReason::OperatorStop, false);
+        state.on_terminated(IpAddr::V4(peer), TerminationReason::OperatorStop, false);
 
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
@@ -3998,15 +4403,24 @@ mod tests {
     /// must be removed so a unicast kernel route and a null route don't coexist.
     #[test]
     fn blackhole_upgrade_evicts_unicast_from_loc_rib() {
-        let (mut state, _rxs) = make_state(65001, &[(Ipv4Addr::new(10, 0, 0, 2), 65002)]);
+        let (mut state, _rxs) =
+            make_state(65001, &[(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65002)]);
         with_recording_fib(&mut state);
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
         // First announce as unicast — enters LocRib.
         state.on_route_update(
-            peer,
+            IpAddr::V4(peer),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -4024,7 +4438,7 @@ mod tests {
         );
 
         // Now re-announce the same prefix with BLACKHOLE community.
-        state.on_route_update(peer, blackhole_announce("10.0.0.0/8"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("10.0.0.0/8"));
 
         assert_eq!(
             Arc::clone(&state.rib).loc_rib.len(),
@@ -4042,7 +4456,7 @@ mod tests {
         use pathvector_types::AfiSafi;
 
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        let (mut state, _rxs) = make_state(65001, &[(peer, 65002)]);
+        let (mut state, _rxs) = make_state(65001, &[(IpAddr::V4(peer), 65002)]);
         let fib = with_recording_fib(&mut state);
 
         let gr_family = GracefulRestartFamily {
@@ -4050,7 +4464,7 @@ mod tests {
             forwarding_preserved: true,
         };
         state.on_established(
-            peer,
+            IpAddr::V4(peer),
             peer,
             PeerType::External,
             65002,
@@ -4062,17 +4476,17 @@ mod tests {
             }],
             None,
         );
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
         // Install a BLACKHOLE kernel null route.
-        state.on_route_update(peer, blackhole_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
         fib.blackhole_v4.lock().unwrap().clear();
 
         // Session drops uncleanly — GR helper mode entered, stale routes kept.
-        state.on_terminated(peer, TerminationReason::Unclean, false);
+        state.on_terminated(IpAddr::V4(peer), TerminationReason::Unclean, false);
 
         // GR deadline expires — stale routes must be flushed.
-        state.on_gr_deadline_expired(peer);
+        state.on_gr_deadline_expired(IpAddr::V4(peer));
 
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let nlri: Nlri<Ipv4Addr> = "192.0.2.0/24".parse().unwrap();
@@ -4092,7 +4506,7 @@ mod tests {
         use pathvector_types::AfiSafi;
 
         let peer = Ipv4Addr::new(10, 0, 0, 2);
-        let (mut state, _rxs) = make_state(65001, &[(peer, 65002)]);
+        let (mut state, _rxs) = make_state(65001, &[(IpAddr::V4(peer), 65002)]);
         let fib = with_recording_fib(&mut state);
 
         // Peer advertises GR for IPv6 only — IPv4 is NOT covered.
@@ -4101,7 +4515,7 @@ mod tests {
             forwarding_preserved: true,
         };
         state.on_established(
-            peer,
+            IpAddr::V4(peer),
             peer,
             PeerType::External,
             65002,
@@ -4113,16 +4527,16 @@ mod tests {
             }],
             None,
         );
-        state.set_import_default(peer, DefaultAction::Accept);
+        state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
 
         // Peer announces an IPv4 BLACKHOLE prefix.
-        state.on_route_update(peer, blackhole_announce("192.0.5.0/24"));
+        state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.5.0/24"));
         fib.blackhole_v4.lock().unwrap().clear();
 
         // Unclean termination — enters GR helper mode for IPv6, but IPv4 is
         // NOT covered by GR, so IPv4 AdjRibIn is cleared immediately.
         // The kernel null route for 192.0.5.0/24 must be withdrawn first.
-        state.on_terminated(peer, TerminationReason::Unclean, false);
+        state.on_terminated(IpAddr::V4(peer), TerminationReason::Unclean, false);
 
         let bh = fib.blackhole_v4.lock().unwrap().clone();
         let nlri: Nlri<Ipv4Addr> = "192.0.5.0/24".parse().unwrap();
@@ -4143,27 +4557,49 @@ mod tests {
     fn blackhole_withdrawal_restores_surviving_peer_unicast_route() {
         let peer_a = Ipv4Addr::new(10, 0, 0, 2);
         let peer_b = Ipv4Addr::new(10, 0, 0, 3);
-        let (mut state, _rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, _rxs) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
         let fib = with_recording_fib(&mut state);
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        state.set_import_default(peer_a, DefaultAction::Accept);
-        state.set_import_default(peer_b, DefaultAction::Accept);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        state.set_import_default(IpAddr::V4(peer_a), DefaultAction::Accept);
+        state.set_import_default(IpAddr::V4(peer_b), DefaultAction::Accept);
 
         // Peer B announces a unicast route for the prefix.
-        state.on_route_update(peer_b, unicast_announce("10.2.0.0/24", "10.0.0.3"));
+        state.on_route_update(
+            IpAddr::V4(peer_b),
+            unicast_announce("10.2.0.0/24", "10.0.0.3"),
+        );
 
         // Peer A announces the same prefix with BLACKHOLE community.
         // This should program a kernel null route.
-        state.on_route_update(peer_a, blackhole_announce("10.2.0.0/24"));
+        state.on_route_update(IpAddr::V4(peer_a), blackhole_announce("10.2.0.0/24"));
 
         // Clear the recorded FIB events so we only observe what happens on withdrawal.
         fib.v4.lock().unwrap().clear();
         fib.blackhole_v4.lock().unwrap().clear();
 
         // Peer A withdraws the BLACKHOLE route.
-        state.on_route_update(peer_a, blackhole_withdraw("10.2.0.0/24"));
+        state.on_route_update(IpAddr::V4(peer_a), blackhole_withdraw("10.2.0.0/24"));
 
         let nlri: Nlri<Ipv4Addr> = "10.2.0.0/24".parse().unwrap();
 
@@ -4382,15 +4818,34 @@ mod tests {
         // change must reach all other established peers as a WITHDRAW UPDATE.
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut rxs) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut rxs);
 
         // Peer A announces 10.0.0.0/8 via traditional field.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -4403,11 +4858,11 @@ mod tests {
         );
         // Drain the announcement that went to peer B.
         state.flush_pending();
-        let _ = rxs.get_mut(&peer_b).unwrap().try_recv();
+        let _ = rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv();
 
         // Peer A now withdraws via MP_UNREACH_NLRI.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
@@ -4426,7 +4881,7 @@ mod tests {
         );
 
         let withdraw_msg = rxs
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer B should receive a WITHDRAW");
@@ -4584,7 +5039,7 @@ mod tests {
     fn test_import_default_v6_falls_back_to_import_default() {
         use std::collections::HashMap;
 
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let peers = vec![config::PeerConfig {
             address: peer_ip,
@@ -4633,7 +5088,7 @@ mod tests {
     fn test_import_default_v6_overrides_import_default() {
         use std::collections::HashMap;
 
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let peers = vec![config::PeerConfig {
             address: peer_ip,
@@ -4940,7 +5395,7 @@ mod tests {
 
     #[test]
     fn test_on_established_sends_v6_full_table_dump() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut rxs) = make_state(65001, &[(peer_ip, 65002)]);
 
         // Pre-populate the v6 RIB with a route from a third-party peer.
@@ -4959,7 +5414,15 @@ mod tests {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         let caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &caps, None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &caps,
+            None,
+        );
 
         // First message should be the MP_REACH_NLRI UPDATE for the v6 prefix.
         let msg = rxs
@@ -4980,14 +5443,17 @@ mod tests {
     fn test_on_route_update_v6_propagates_to_peer() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut rxs) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
         // Set local_ipv6 so eBGP next-hop rewrite works for peer_b.
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
-            peer_a,
+            IpAddr::V4(peer_a),
             peer_a,
             PeerType::External,
             65002,
@@ -4996,7 +5462,7 @@ mod tests {
             None,
         );
         state.on_established(
-            peer_b,
+            IpAddr::V4(peer_b),
             peer_b,
             PeerType::External,
             65003,
@@ -5008,7 +5474,7 @@ mod tests {
 
         // Peer A announces an IPv6 route via MP_REACH_NLRI.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -5028,7 +5494,7 @@ mod tests {
 
         // peer_b should receive an UPDATE with MP_REACH_NLRI for the v6 prefix.
         let msg = rxs
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b should receive a v6 UPDATE");
@@ -6487,17 +6953,19 @@ mod tests {
         let (mut state, mut rxs) = make_state(
             65001,
             &[
-                (non_client_a, 65001), // iBGP
-                (non_client_b, 65001), // iBGP
-                (client, 65001),       // iBGP
+                (IpAddr::V4(non_client_a), 65001), // iBGP
+                (IpAddr::V4(non_client_b), 65001), // iBGP
+                (IpAddr::V4(client), 65001),       // iBGP
             ],
         );
         // Designate client as an RR client.
-        Arc::make_mut(&mut state.rib).rr_clients.insert(client);
+        Arc::make_mut(&mut state.rib)
+            .rr_clients
+            .insert(IpAddr::V4(client));
 
         // non_client_b establishes and deposits a route.
         state.on_established(
-            non_client_b,
+            IpAddr::V4(non_client_b),
             non_client_b,
             PeerType::Internal,
             65001,
@@ -6513,11 +6981,16 @@ mod tests {
         state.rib_insert_v4(src, route);
 
         // Drain non_client_b's channel (its own establish dump).
-        while rxs.get_mut(&non_client_b).unwrap().try_recv().is_ok() {}
+        while rxs
+            .get_mut(&IpAddr::V4(non_client_b))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // non_client_a establishes — must NOT receive the route from non_client_b.
         state.on_established(
-            non_client_a,
+            IpAddr::V4(non_client_a),
             non_client_a,
             PeerType::Internal,
             65001,
@@ -6528,7 +7001,7 @@ mod tests {
         // Drain all EOR markers (RFC 4724 §2) from on_established, then verify no
         // actual route UPDATE was sent. EORs are either empty UpdateMessages (IPv4)
         // or UpdateMessages with empty MP_UNREACH_NLRI (IPv6, RFC 4724 §2).
-        let rx = rxs.get_mut(&non_client_a).unwrap();
+        let rx = rxs.get_mut(&IpAddr::V4(non_client_a)).unwrap();
         let mut route_received = false;
         while let Ok(m) = rx.try_recv() {
             let has_announced_nlri = !m.announced.is_empty();
@@ -6553,12 +7026,17 @@ mod tests {
         let non_client: Ipv4Addr = "10.0.0.4".parse().unwrap();
         let client: Ipv4Addr = "10.0.0.3".parse().unwrap();
 
-        let (mut state, mut rxs) = make_state(65001, &[(non_client, 65001), (client, 65001)]);
-        Arc::make_mut(&mut state.rib).rr_clients.insert(client);
+        let (mut state, mut rxs) = make_state(
+            65001,
+            &[(IpAddr::V4(non_client), 65001), (IpAddr::V4(client), 65001)],
+        );
+        Arc::make_mut(&mut state.rib)
+            .rr_clients
+            .insert(IpAddr::V4(client));
 
         // non_client deposits a route.
         state.on_established(
-            non_client,
+            IpAddr::V4(non_client),
             non_client,
             PeerType::Internal,
             65001,
@@ -6572,12 +7050,25 @@ mod tests {
             .peer_type(PeerType::Internal)
             .build();
         state.rib_insert_v4(src, route);
-        while rxs.get_mut(&non_client).unwrap().try_recv().is_ok() {}
+        while rxs
+            .get_mut(&IpAddr::V4(non_client))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // RR client establishes — MUST receive the route from the non-client.
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         assert!(
-            rxs.get_mut(&client).unwrap().try_recv().is_ok(),
+            rxs.get_mut(&IpAddr::V4(client)).unwrap().try_recv().is_ok(),
             "RR client must receive routes from non-client iBGP peers in full-table dump"
         );
     }
@@ -6589,14 +7080,17 @@ mod tests {
     fn test_ipv6_route_not_propagated_to_non_ipv6_capable_peer() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut rxs) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
+        let (mut state, mut rxs) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
 
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         // peer_a negotiated IPv6; peer_b did NOT.
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
-            peer_a,
+            IpAddr::V4(peer_a),
             peer_a,
             PeerType::External,
             65002,
@@ -6604,11 +7098,19 @@ mod tests {
             &v6_caps,
             None,
         );
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // peer_a announces an IPv6 prefix.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -6626,16 +7128,19 @@ mod tests {
 
         // peer_b (no IPv6 capability) gets an IPv4 EOR from on_established
         // but must not receive any MP_REACH_NLRI — drain the EOR first.
-        rxs.get_mut(&peer_b).unwrap().try_recv().ok(); // IPv4 EOR
+        rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv().ok(); // IPv4 EOR
         assert!(
-            rxs.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            rxs.get_mut(&IpAddr::V4(peer_b))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "peer without IPv6 capability must not receive MP_REACH_NLRI (RFC 4760)"
         );
     }
 
     #[test]
     fn test_ipv6_full_table_dump_not_sent_to_non_ipv6_capable_peer() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut rxs) = make_state(65001, &[(peer_ip, 65002)]);
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
@@ -6652,7 +7157,15 @@ mod tests {
         state.rib_insert_v6(src, v6_route);
 
         // Establish without IPv6 capability.
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         // Must receive exactly one message: the IPv4 EOR. No IPv6 dump, no IPv6 EOR.
         let eor = rxs
@@ -6895,10 +7408,18 @@ mod tests {
     #[test]
     fn test_exchange_lifecycle_final_rib_has_only_surviving_peer_route() {
         let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
-        let (mut state, mut rx_map) = make_state(65002, &[(gobgp, 65001)]);
+        let (mut state, mut rx_map) = make_state(65002, &[(IpAddr::V4(gobgp), 65001)]);
 
         // ── 1. Session establishes; GoBGP announces {10, 172, 192} ───────────
-        state.on_established(gobgp, gobgp, PeerType::External, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(gobgp),
+            gobgp,
+            PeerType::External,
+            65001,
+            90,
+            &[],
+            None,
+        );
 
         let gobgp_announces = UpdateMessage {
             withdrawn: vec![],
@@ -6913,11 +7434,16 @@ mod tests {
                 nlri("192.168.0.0/16"),
             ],
         };
-        state.on_route_update(gobgp, gobgp_announces);
+        state.on_route_update(IpAddr::V4(gobgp), gobgp_announces);
         state.flush_pending();
         // Drain the table-dump messages generated during on_established + propagation
         // (source-peer check suppresses re-advertisement back to GoBGP).
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
         assert_eq!(
             state.rib.loc_rib.len(),
             3,
@@ -6935,7 +7461,7 @@ mod tests {
         state.flush_pending();
 
         let mut announced_to_gobgp: Vec<Nlri<Ipv4Addr>> = Vec::new();
-        while let Ok(msg) = rx_map.get_mut(&gobgp).unwrap().try_recv() {
+        while let Ok(msg) = rx_map.get_mut(&IpAddr::V4(gobgp)).unwrap().try_recv() {
             announced_to_gobgp.extend(msg.announced);
         }
         assert!(
@@ -6953,9 +7479,14 @@ mod tests {
         );
 
         // ── 3. Import policy → reject; GoBGP routes leave LocRib ─────────────
-        state.set_import_default(gobgp, DefaultAction::Reject);
+        state.set_import_default(IpAddr::V4(gobgp), DefaultAction::Reject);
         state.flush_pending();
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
         assert_eq!(
             state.rib.loc_rib.len(),
             2,
@@ -6963,9 +7494,14 @@ mod tests {
         );
 
         // ── 4. Import policy → accept; GoBGP routes return ───────────────────
-        state.set_import_default(gobgp, DefaultAction::Accept);
+        state.set_import_default(IpAddr::V4(gobgp), DefaultAction::Accept);
         state.flush_pending();
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
         assert_eq!(
             state.rib.loc_rib.len(),
             5,
@@ -6978,9 +7514,14 @@ mod tests {
             attributes: vec![],
             announced: vec![],
         };
-        state.on_route_update(gobgp, gobgp_withdraws);
+        state.on_route_update(IpAddr::V4(gobgp), gobgp_withdraws);
         state.flush_pending();
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
         assert_eq!(
             state.rib.loc_rib.len(),
             3,
@@ -6991,7 +7532,7 @@ mod tests {
         state.withdraw_originated_routes(&[nlri("203.0.113.0/24"), nlri("198.51.100.0/24")]);
         state.flush_pending();
         let mut withdrawn_to_gobgp: Vec<Nlri<Ipv4Addr>> = Vec::new();
-        while let Ok(msg) = rx_map.get_mut(&gobgp).unwrap().try_recv() {
+        while let Ok(msg) = rx_map.get_mut(&IpAddr::V4(gobgp)).unwrap().try_recv() {
             withdrawn_to_gobgp.extend(msg.withdrawn);
         }
         assert!(
@@ -7019,9 +7560,22 @@ mod tests {
     fn test_originate_routes_v6_peer_receives_announces() {
         use pathvector_types::{AsPath, Origin};
         let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
-        let (mut state, mut rx_map) = make_state(65001, &[(gobgp, 65002)]);
-        state.on_established(gobgp, gobgp, PeerType::External, 65002, 90, &[], None);
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        let (mut state, mut rx_map) = make_state(65001, &[(IpAddr::V4(gobgp), 65002)]);
+        state.on_established(
+            IpAddr::V4(gobgp),
+            gobgp,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         let route = RouteBuilder::new(nlri_v6("2001:db8::/32"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
@@ -7049,9 +7603,22 @@ mod tests {
     fn test_withdraw_originated_routes_v6_removes_from_rib_and_notifies_peer() {
         use pathvector_types::{AsPath, Origin};
         let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
-        let (mut state, mut rx_map) = make_state(65001, &[(gobgp, 65002)]);
-        state.on_established(gobgp, gobgp, PeerType::External, 65002, 90, &[], None);
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        let (mut state, mut rx_map) = make_state(65001, &[(IpAddr::V4(gobgp), 65002)]);
+        state.on_established(
+            IpAddr::V4(gobgp),
+            gobgp,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         let route = RouteBuilder::new(nlri_v6("2001:db8:1::/48"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
@@ -7059,7 +7626,12 @@ mod tests {
         state.originate_route_v6(route);
 
         // Drain the ANNOUNCE
-        while rx_map.get_mut(&gobgp).unwrap().try_recv().is_ok() {}
+        while rx_map
+            .get_mut(&IpAddr::V4(gobgp))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
         assert!(
             state
                 .rib
@@ -7090,7 +7662,7 @@ mod tests {
     #[test]
     fn test_withdraw_originated_routes_v6_noop_for_unknown_prefix() {
         let gobgp: Ipv4Addr = "127.0.0.1".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(gobgp, 65002)]);
+        let (mut state, _) = make_state(65001, &[(IpAddr::V4(gobgp), 65002)]);
         // Should not panic on an unknown prefix.
         state.withdraw_originated_route_v6(nlri_v6("2001:db8:ff::/48"));
         assert!(
@@ -7433,11 +8005,19 @@ mod tests {
     /// logs an error and returns without panicking.
     #[test]
     fn test_on_established_unknown_peer_is_noop() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
 
         let unknown: Ipv4Addr = "10.0.0.99".parse().unwrap();
-        state.on_established(unknown, unknown, PeerType::External, 65099, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(unknown),
+            unknown,
+            PeerType::External,
+            65099,
+            90,
+            &[],
+            None,
+        );
         // Invariant: no state changes (the unknown IP is absent from maps).
         assert!(!state.rib.peer_types.contains_key(&peer_ip));
     }
@@ -7448,11 +8028,19 @@ mod tests {
     fn test_on_established_missing_adj_rib_out_logs_and_returns() {
         // export_policies is present but adj_ribs_out was removed — the second
         // let-else guard fires; must not panic and peer_type is still recorded.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.adj_ribs_out.remove(&peer_ip);
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         // peer_type is inserted before the guard, so it should be present.
         assert!(state.rib.peer_types.contains_key(&peer_ip));
@@ -7462,11 +8050,19 @@ mod tests {
     fn test_on_established_missing_update_sender_logs_and_returns() {
         // export_policies and adj_ribs_out are present but update_senders was
         // removed — the third let-else guard fires; must not panic.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.update_senders.remove(&peer_ip);
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         assert!(state.rib.peer_types.contains_key(&peer_ip));
     }
@@ -7479,15 +8075,34 @@ mod tests {
         // to peer B hits the adj_rib_out guard and continues — no panic.
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        state.adj_ribs_out.remove(&peer_b);
+        let (mut state, _) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        state.adj_ribs_out.remove(&IpAddr::V4(peer_b));
 
-        state.on_terminated(peer_a, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(peer_a), TerminationReason::Unclean, true);
 
-        assert!(!state.rib.peer_types.contains_key(&peer_a));
-        assert!(state.rib.peer_types.contains_key(&peer_b));
+        assert!(!state.rib.peer_types.contains_key(&IpAddr::V4(peer_a)));
+        assert!(state.rib.peer_types.contains_key(&IpAddr::V4(peer_b)));
     }
 
     #[test]
@@ -7496,14 +8111,33 @@ mod tests {
         // guard and continues — no panic.
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        state.update_senders.remove(&peer_b);
+        let (mut state, _) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        state.update_senders.remove(&IpAddr::V4(peer_b));
 
-        state.on_terminated(peer_a, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(peer_a), TerminationReason::Unclean, true);
 
-        assert!(!state.rib.peer_types.contains_key(&peer_a));
+        assert!(!state.rib.peer_types.contains_key(&IpAddr::V4(peer_a)));
     }
 
     // ── on_route_update error paths ───────────────────────────────────────────
@@ -7512,7 +8146,7 @@ mod tests {
     fn test_on_route_update_missing_adj_rib_in_logs_and_returns() {
         // import_policy is present but adj_ribs_in was removed — the second
         // let-else guard fires; must not panic and RIB stays empty.
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
         state.adj_ribs_in.remove(&peer_ip);
 
@@ -7537,13 +8171,32 @@ mod tests {
         // propagation to peer B hits the adj_rib_out guard and continues.
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        state.adj_ribs_out.remove(&peer_b);
+        let (mut state, _) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        state.adj_ribs_out.remove(&IpAddr::V4(peer_b));
 
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -7565,13 +8218,32 @@ mod tests {
         // guard and continues — no panic and route still lands.
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002), (peer_b, 65003)]);
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        state.update_senders.remove(&peer_b);
+        let (mut state, _) = make_state(
+            65001,
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+        );
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        state.update_senders.remove(&IpAddr::V4(peer_b));
 
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -7743,29 +8415,45 @@ mod tests {
     #[test]
     fn test_on_terminated_ghost_established_peer_does_not_panic() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002)]);
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        let (mut state, _) = make_state(65001, &[(IpAddr::V4(peer_a), 65002)]);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         // Inject a ghost peer into peer_types (never registered in config maps).
         let ghost: Ipv4Addr = "10.0.0.99".parse().unwrap();
-        state.on_established(ghost, ghost, PeerType::External, 65099, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(ghost),
+            ghost,
+            PeerType::External,
+            65099,
+            90,
+            &[],
+            None,
+        );
 
         // Terminating peer_a iterates established peers; ghost has no policy /
         // rib entries — the error branch logs and continues without panicking.
-        state.on_terminated(peer_a, TerminationReason::Unclean, true);
-        assert!(!state.rib.peer_types.contains_key(&peer_a));
+        state.on_terminated(IpAddr::V4(peer_a), TerminationReason::Unclean, true);
+        assert!(!state.rib.peer_types.contains_key(&IpAddr::V4(peer_a)));
     }
 
     /// Calling `on_route_update` with an unknown peer IP logs an error and
     /// returns without panicking.
     #[test]
     fn test_on_route_update_unknown_peer_is_noop() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
 
         let unknown: Ipv4Addr = "10.0.0.99".parse().unwrap();
         state.on_route_update(
-            unknown,
+            IpAddr::V4(unknown),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![],
@@ -7781,14 +8469,30 @@ mod tests {
     #[test]
     fn test_on_route_update_ghost_established_peer_does_not_panic() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
-        let (mut state, _) = make_state(65001, &[(peer_a, 65002)]);
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
+        let (mut state, _) = make_state(65001, &[(IpAddr::V4(peer_a), 65002)]);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         let ghost: Ipv4Addr = "10.0.0.99".parse().unwrap();
-        state.on_established(ghost, ghost, PeerType::External, 65099, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(ghost),
+            ghost,
+            PeerType::External,
+            65099,
+            90,
+            &[],
+            None,
+        );
 
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -7938,21 +8642,18 @@ mod tests {
         cluster_id: u32,
         clients: &[Ipv4Addr],
         non_clients: &[Ipv4Addr],
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
         for &ip in clients.iter().chain(non_clients.iter()) {
             let (tx, rx) = mpsc::channel(64);
-            senders.insert(ip, tx);
-            receivers.insert(ip, rx);
+            senders.insert(IpAddr::V4(ip), tx);
+            receivers.insert(IpAddr::V4(ip), rx);
         }
         let peer_configs: Vec<config::PeerConfig> = clients
             .iter()
             .map(|&address| config::PeerConfig {
-                address,
+                address: IpAddr::V4(address),
                 port: 179,
                 remote_as: local_as,
                 import_default: Some(config::ImportDefault::Accept),
@@ -7970,7 +8671,7 @@ mod tests {
                 role: None,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
-                address,
+                address: IpAddr::V4(address),
                 port: 179,
                 remote_as: local_as,
                 import_default: Some(config::ImportDefault::Accept),
@@ -8019,16 +8720,32 @@ mod tests {
         let client_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, 1, &[client_a, client_b], &[]);
 
-        state.on_established(client_a, client_a, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(client_b, client_b, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client_a),
+            client_a,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(client_b),
+            client_b,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // Client A sends a route; it should be reflected to Client B
-        state.on_route_update(client_a, update_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(client_a), update_announce("192.0.2.0/24"));
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&client_b)
+            .get_mut(&IpAddr::V4(client_b))
             .unwrap()
             .try_recv()
             .expect("route from client A must be reflected to client B");
@@ -8036,7 +8753,11 @@ mod tests {
 
         // Must NOT be sent back to Client A (split-horizon)
         assert!(
-            receivers.get_mut(&client_a).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(client_a))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "route must not be reflected back to originating client"
         );
     }
@@ -8047,15 +8768,23 @@ mod tests {
         let nc: Ipv4Addr = "10.0.0.4".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, 1, &[client], &[nc]);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(nc, nc, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(IpAddr::V4(nc), nc, PeerType::Internal, 65001, 90, &[], None);
         drain_all(&mut receivers);
 
-        state.on_route_update(client, update_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(client), update_announce("192.0.2.0/24"));
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&nc)
+            .get_mut(&IpAddr::V4(nc))
             .unwrap()
             .try_recv()
             .expect("route from client must be reflected to non-client iBGP");
@@ -8068,16 +8797,24 @@ mod tests {
         let nc: Ipv4Addr = "10.0.0.4".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, 1, &[client], &[nc]);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(nc, nc, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(IpAddr::V4(nc), nc, PeerType::Internal, 65001, 90, &[], None);
         drain_all(&mut receivers);
 
         // Non-client iBGP sends a route; it should be reflected to the client
-        state.on_route_update(nc, update_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(nc), update_announce("192.0.2.0/24"));
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&client)
+            .get_mut(&IpAddr::V4(client))
             .unwrap()
             .try_recv()
             .expect("route from non-client iBGP must be reflected to client");
@@ -8091,22 +8828,50 @@ mod tests {
         let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, 1, &[client], &[nc1, nc2]);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(nc1, nc1, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(nc2, nc2, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(nc1),
+            nc1,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(nc2),
+            nc2,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // Non-client nc1 sends a route; nc2 must NOT receive it
-        state.on_route_update(nc1, update_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(nc1), update_announce("192.0.2.0/24"));
         state.flush_pending();
 
         assert!(
-            receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(nc2))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "non-client iBGP routes must not be re-advertised to other non-client iBGP peers"
         );
         // But client should receive it
         receivers
-            .get_mut(&client)
+            .get_mut(&IpAddr::V4(client))
             .unwrap()
             .try_recv()
             .expect("non-client iBGP route must be reflected to client");
@@ -8119,8 +8884,24 @@ mod tests {
         let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client, other], &[]);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(other, other, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(other),
+            other,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // UPDATE from client containing our own cluster_id in CLUSTER_LIST
@@ -8134,12 +8915,16 @@ mod tests {
             ],
             announced: vec![nlri("192.0.2.0/24")],
         };
-        state.on_route_update(client, looped);
+        state.on_route_update(IpAddr::V4(client), looped);
 
         // Route must NOT be installed or propagated
         assert_eq!(state.rib.loc_rib.len(), 0, "looped route must be discarded");
         assert!(
-            receivers.get_mut(&other).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(other))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "looped route must not be propagated"
         );
     }
@@ -8154,17 +8939,33 @@ mod tests {
         // Simulate OPEN: client's BGP ID is 10.0.0.2
         Arc::make_mut(&mut state.rib)
             .peer_bgp_ids
-            .insert(client, client);
+            .insert(IpAddr::V4(client), client);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(other, other, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(other),
+            other,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
-        state.on_route_update(client, update_announce("192.0.2.0/24"));
+        state.on_route_update(IpAddr::V4(client), update_announce("192.0.2.0/24"));
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&other)
+            .get_mut(&IpAddr::V4(other))
             .unwrap()
             .try_recv()
             .expect("reflected UPDATE expected");
@@ -8188,6 +8989,69 @@ mod tests {
         );
     }
 
+    /// Regression test for the IPv6 peer-identity migration: `peer_bgp_ids`'s
+    /// fallback (when the peer's own BGP ID was never recorded) used to be
+    /// `peer_ip` — safe only because `peer_ip` was guaranteed `Ipv4Addr` at
+    /// the time. Now that peer identity is `IpAddr` (and could be IPv6), the
+    /// fallback is `self.rib.local_bgp_id` instead. This proves the injected
+    /// ORIGINATOR_ID is our own BGP ID in that fallback case, not the client's
+    /// transport address.
+    #[test]
+    fn test_rr_originator_id_falls_back_to_local_bgp_id_when_peer_bgp_id_unknown() {
+        let cluster_id: u32 = 99;
+        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client, other], &[]);
+
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(other),
+            other,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        drain_all(&mut receivers);
+
+        // Simulate the defensive case this fallback exists for: the client's
+        // BGP ID was never recorded (or was since evicted), even though the
+        // session is Established and routes are flowing.
+        Arc::make_mut(&mut state.rib)
+            .peer_bgp_ids
+            .remove(&IpAddr::V4(client));
+
+        state.on_route_update(IpAddr::V4(client), update_announce("192.0.2.0/24"));
+        state.flush_pending();
+
+        let msg = receivers
+            .get_mut(&IpAddr::V4(other))
+            .unwrap()
+            .try_recv()
+            .expect("reflected UPDATE expected");
+
+        let originator = msg.attributes.iter().find_map(|a| match a {
+            PathAttribute::OriginatorId(id) => Some(*id),
+            _ => None,
+        });
+        assert_eq!(
+            originator,
+            Some(local_bgp_id),
+            "with no recorded peer BGP ID, ORIGINATOR_ID must fall back to our own \
+             local_bgp_id, not the client's transport address"
+        );
+    }
+
     // RFC 4456 §8: discard when ORIGINATOR_ID == local BGP ID.
     #[test]
     fn test_rr_originator_id_loop_detection_discards_update() {
@@ -8198,8 +9062,24 @@ mod tests {
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client, other], &[]);
         Arc::make_mut(&mut state.rib).local_bgp_id = local_bgp_id;
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(other, other, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(other),
+            other,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // UPDATE carries ORIGINATOR_ID equal to our own BGP ID — routing loop.
@@ -8213,7 +9093,7 @@ mod tests {
             ],
             announced: vec![nlri("192.0.3.0/24")],
         };
-        state.on_route_update(client, looped);
+        state.on_route_update(IpAddr::V4(client), looped);
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -8221,7 +9101,11 @@ mod tests {
             "route with ORIGINATOR_ID == local BGP ID must be discarded (RFC 4456 §8)"
         );
         assert!(
-            receivers.get_mut(&other).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(other))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "looped route must not be propagated to other peers"
         );
     }
@@ -8235,9 +9119,17 @@ mod tests {
         // non_client is iBGP but not in the rr_clients set
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[non_client]);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(
-            non_client,
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(non_client),
             non_client,
             PeerType::Internal,
             65001,
@@ -8258,7 +9150,7 @@ mod tests {
             ],
             announced: vec![nlri("10.99.0.0/24")],
         };
-        state.on_route_update(non_client, looped);
+        state.on_route_update(IpAddr::V4(non_client), looped);
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -8266,7 +9158,11 @@ mod tests {
             "CLUSTER_LIST loop detection must apply to non-client iBGP peers (RFC 4456 §8)"
         );
         assert!(
-            receivers.get_mut(&client).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(client))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "looped route from non-client must not be reflected to client"
         );
     }
@@ -8281,11 +9177,19 @@ mod tests {
 
         Arc::make_mut(&mut state.rib)
             .peer_bgp_ids
-            .insert(non_client, non_client);
+            .insert(IpAddr::V4(non_client), non_client);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
         state.on_established(
-            non_client,
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(non_client),
             non_client,
             PeerType::Internal,
             65001,
@@ -8295,11 +9199,11 @@ mod tests {
         );
         drain_all(&mut receivers);
 
-        state.on_route_update(non_client, update_announce("172.16.0.0/24"));
+        state.on_route_update(IpAddr::V4(non_client), update_announce("172.16.0.0/24"));
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&client)
+            .get_mut(&IpAddr::V4(client))
             .unwrap()
             .try_recv()
             .expect("reflected UPDATE expected from non-client → client");
@@ -8343,7 +9247,7 @@ mod tests {
         state.rib_insert_v6(peer_id, route);
         Arc::make_mut(&mut state.rib)
             .peer_types
-            .insert(src_peer, PeerType::Internal);
+            .insert(IpAddr::V4(src_peer), PeerType::Internal);
     }
 
     // RFC 4456 §8: adj_ribs_out_v6 must use new_reflecting for all iBGP peers
@@ -8355,12 +9259,12 @@ mod tests {
         let non_client: Ipv4Addr = "10.0.0.10".parse().unwrap();
         let (state, _receivers) = make_rr_state(65001, cluster_id, &[client], &[non_client]);
 
-        let client_aro_v6 = state.adj_ribs_out_v6.get(&client).unwrap();
+        let client_aro_v6 = state.adj_ribs_out_v6.get(&IpAddr::V4(client)).unwrap();
         assert!(
             client_aro_v6.reflects(),
             "adj_ribs_out_v6 for RR client must use reflecting mode"
         );
-        let nc_aro_v6 = state.adj_ribs_out_v6.get(&non_client).unwrap();
+        let nc_aro_v6 = state.adj_ribs_out_v6.get(&IpAddr::V4(non_client)).unwrap();
         assert!(
             nc_aro_v6.reflects(),
             "adj_ribs_out_v6 for non-client iBGP peer must use reflecting mode when acting as RR"
@@ -8375,8 +9279,16 @@ mod tests {
         let (mut state, _receivers) = make_rr_state(65001, cluster_id, &[client], &[]);
 
         // Simulate a session teardown and re-establish.
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        let aro_v6 = state.adj_ribs_out_v6.get(&client).unwrap();
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        let aro_v6 = state.adj_ribs_out_v6.get(&IpAddr::V4(client)).unwrap();
         assert!(
             aro_v6.reflects(),
             "adj_ribs_out_v6 must be reflecting after reconnect when acting as RR"
@@ -8392,15 +9304,39 @@ mod tests {
         let nc2: Ipv4Addr = "10.0.0.11".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[nc1, nc2]);
 
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(nc1, nc1, PeerType::Internal, 65001, 90, &[], None);
-        state.on_established(nc2, nc2, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(nc1),
+            nc1,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(nc2),
+            nc2,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
         // Mark nc1 and nc2 as IPv6-capable so propagate_to_all_peers_v6 includes them.
-        state.ipv6_capable_peers.insert(nc1);
-        state.ipv6_capable_peers.insert(nc2);
-        state.ipv6_capable_peers.insert(client);
+        state.ipv6_capable_peers.insert(IpAddr::V4(nc1));
+        state.ipv6_capable_peers.insert(IpAddr::V4(nc2));
+        state.ipv6_capable_peers.insert(IpAddr::V4(client));
 
         // Inject a v6 route sourced from nc1 (non-client iBGP).
         inject_v6_route(&mut state, nc1, "2001:db8::/32");
@@ -8409,12 +9345,20 @@ mod tests {
 
         // nc2 (non-client iBGP) must NOT receive the route.
         assert!(
-            receivers.get_mut(&nc2).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(nc2))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "non-client iBGP → non-client iBGP must be blocked for IPv6 routes (RFC 4456 §8)"
         );
         // client MUST receive the route.
         assert!(
-            receivers.get_mut(&client).unwrap().try_recv().is_ok(),
+            receivers
+                .get_mut(&IpAddr::V4(client))
+                .unwrap()
+                .try_recv()
+                .is_ok(),
             "non-client iBGP → client must be allowed for IPv6 routes (RFC 4456 §8)"
         );
     }
@@ -8436,18 +9380,34 @@ mod tests {
         let dest: Ipv4Addr = "10.0.0.21".parse().unwrap();
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[], &[source, dest]);
 
-        state.on_established(source, source, PeerType::External, 65099, 90, &[], None);
-        state.on_established(dest, dest, PeerType::External, 65098, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(source),
+            source,
+            PeerType::External,
+            65099,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(dest),
+            dest,
+            PeerType::External,
+            65098,
+            90,
+            &[],
+            None,
+        );
         drain_all(&mut receivers);
 
-        state.ipv6_capable_peers.insert(source);
-        state.ipv6_capable_peers.insert(dest);
+        state.ipv6_capable_peers.insert(IpAddr::V4(source));
+        state.ipv6_capable_peers.insert(IpAddr::V4(dest));
         // eBGP peers need a local IPv6 next-hop to announce to (propagate_prefix_v6
         // silently suppresses eBGP announcements without one — see its doc comment).
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
 
         assert_eq!(
-            state.rib.prefixes_advertised.get(&dest),
+            state.rib.prefixes_advertised.get(&IpAddr::V4(dest)),
             Some(&0),
             "sanity check: prefixes_advertised must start at 0 for dest \
              (set by on_established's own sync, before the v6 route exists)"
@@ -8469,7 +9429,7 @@ mod tests {
         state.propagate_to_all_peers_v6(&[nlri_v6_rr("2001:db8::/32")]);
 
         assert_eq!(
-            state.rib.prefixes_advertised.get(&dest),
+            state.rib.prefixes_advertised.get(&IpAddr::V4(dest)),
             Some(&1),
             "prefixes_advertised for dest must reflect the queued v6 route \
              immediately after a v6-only propagate_to_all_peers_v6 call, \
@@ -8487,20 +9447,36 @@ mod tests {
         let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client], &[nc1, nc2]);
 
         // nc1 connects and we add a v6 route sourced from nc1.
-        state.on_established(nc1, nc1, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(nc1),
+            nc1,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         inject_v6_route(&mut state, nc1, "2001:db8:1::/48");
 
         // nc2 now connects — full-table dump should NOT send the nc1 route to nc2.
         // Pass MultiProtocol IPv6 capability so the v6 dump fires.
         let caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
-        state.on_established(nc2, nc2, PeerType::Internal, 65001, 90, &caps, None);
+        state.on_established(
+            IpAddr::V4(nc2),
+            nc2,
+            PeerType::Internal,
+            65001,
+            90,
+            &caps,
+            None,
+        );
 
         // on_established sends an IPv4 EOR (empty UpdateMessage) and for v6-capable
         // peers an IPv6 EOR (UpdateMessage with empty MP_UNREACH_NLRI, RFC 4724 §2).
         // Drain both EOR markers, then verify no actual route UPDATE arrived.
         // A route UPDATE would carry non-empty `announced` or non-empty prefixes in
         // MP_REACH_NLRI; a pure EOR has only empty MP_UNREACH_NLRI (or nothing).
-        let rx = receivers.get_mut(&nc2).unwrap();
+        let rx = receivers.get_mut(&IpAddr::V4(nc2)).unwrap();
         let mut route_received = false;
         while let Ok(m) = rx.try_recv() {
             let has_announced_nlri = !m.announced.is_empty();
@@ -8554,9 +9530,17 @@ mod tests {
         let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let nc: Ipv4Addr = "10.0.0.10".parse().unwrap();
         let (mut state, _) = make_rr_state(65001, cluster_id, &[client], &[nc]);
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         assert_reflects_parity(&state);
-        state.on_established(nc, nc, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(IpAddr::V4(nc), nc, PeerType::Internal, 65001, 90, &[], None);
         assert_reflects_parity(&state);
     }
 
@@ -8565,12 +9549,28 @@ mod tests {
         let cluster_id = 1;
         let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_rr_state(65001, cluster_id, &[client], &[]);
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         assert_reflects_parity(&state);
         // Simulate teardown then re-establish (on_terminated resets AdjRibOut)
-        state.on_terminated(client, TerminationReason::Unclean, false);
+        state.on_terminated(IpAddr::V4(client), TerminationReason::Unclean, false);
         // on_established rebuilds the tables for the next session
-        state.on_established(client, client, PeerType::Internal, 65001, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
         assert_reflects_parity(&state);
     }
 
@@ -8635,12 +9635,9 @@ mod stall_tests {
     /// Build a `DaemonState` where every peer's outbound channel has `capacity`.
     /// Returns the state and a map of receivers so the caller can drain channels.
     fn make_capped(
-        peers: &[(Ipv4Addr, u32)],
+        peers: &[(IpAddr, u32)],
         capacity: usize,
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
         for &(ip, _) in peers {
@@ -8682,7 +9679,7 @@ mod stall_tests {
     }
 
     /// Fill a channel with a dummy UPDATE so the next `try_send` fails.
-    fn fill_channel(state: &DaemonState, peer: Ipv4Addr) {
+    fn fill_channel(state: &DaemonState, peer: IpAddr) {
         let tx = state.update_senders.get(&peer).unwrap();
         tx.try_send(UpdateMessage {
             withdrawn: vec![nlri("0.0.0.0/0")],
@@ -8696,7 +9693,7 @@ mod stall_tests {
 
     #[test]
     fn take_stalled_peers_returns_and_clears() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_capped(&[(peer_ip, 64)], 64);
 
         assert!(state.take_stalled_peers().is_empty(), "initially empty");
@@ -8710,7 +9707,7 @@ mod stall_tests {
 
     #[test]
     fn on_established_marks_stalled_when_channel_full() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) = make_capped(&[(peer_ip, 1)], 1);
 
         // Pre-populate the Loc-RIB from a third-party peer so that on_established
@@ -8728,7 +9725,15 @@ mod stall_tests {
         // Saturate the channel; propagate_prefix's try_send will fail.
         fill_channel(&state, peer_ip);
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         assert!(
             !state.take_stalled_peers().is_empty(),
             "peer must be stalled when outbound channel is full during table dump"
@@ -8746,7 +9751,7 @@ mod stall_tests {
         let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
         let peer_configs = vec![
             config::PeerConfig {
-                address: peer_a,
+                address: IpAddr::V4(peer_a),
                 import_default_v6: None,
                 md5_password: None,
                 port: 179,
@@ -8766,7 +9771,7 @@ mod stall_tests {
             config::PeerConfig {
                 import_default_v6: None,
                 md5_password: None,
-                address: peer_b,
+                address: IpAddr::V4(peer_b),
                 port: 179,
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
@@ -8783,8 +9788,8 @@ mod stall_tests {
             },
         ];
         let mut senders = HashMap::new();
-        senders.insert(peer_a, tx_a);
-        senders.insert(peer_b, tx_b.clone());
+        senders.insert(IpAddr::V4(peer_a), tx_a);
+        senders.insert(IpAddr::V4(peer_b), tx_b.clone());
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -8795,12 +9800,28 @@ mod stall_tests {
             vec![],
         );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // Announce a route from peer_a → it ends up in Loc-RIB.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -8817,7 +9838,7 @@ mod stall_tests {
         state.flush_pending();
 
         // Terminate peer_a: the withdraw for peer_b's channel will fail (full).
-        state.on_terminated(peer_a, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(peer_a), TerminationReason::Unclean, true);
         assert!(
             !state.take_stalled_peers().is_empty(),
             "peer_b must be stalled when its channel is full during termination propagation"
@@ -8830,15 +9851,34 @@ mod stall_tests {
     fn set_import_default_propagates_to_established_peer() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_capped(&[(peer_a, 65002), (peer_b, 65003)], 64);
+        let (mut state, mut receivers) = make_capped(
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+            64,
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // Announce a route from peer_a via on_route_update so that it is
         // properly recorded in Adj-RIB-In, Loc-RIB, AND peer_b's Adj-RIB-Out.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -8852,16 +9892,24 @@ mod stall_tests {
 
         // Drain the UPDATE that on_route_update propagated so receivers are clear.
         state.flush_pending();
-        receivers.get_mut(&peer_b).unwrap().try_recv().ok();
-        receivers.get_mut(&peer_a).unwrap().try_recv().ok();
+        receivers
+            .get_mut(&IpAddr::V4(peer_b))
+            .unwrap()
+            .try_recv()
+            .ok();
+        receivers
+            .get_mut(&IpAddr::V4(peer_a))
+            .unwrap()
+            .try_recv()
+            .ok();
 
         // Flip the import policy to Reject — route evicted from Loc-RIB;
         // peer_b must receive a WITHDRAW.
-        state.set_import_default(peer_a, DefaultAction::Reject);
+        state.set_import_default(IpAddr::V4(peer_a), DefaultAction::Reject);
         state.flush_pending();
 
         receivers
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b must receive a WITHDRAW after set_import_default → Reject");
@@ -8877,7 +9925,7 @@ mod stall_tests {
         let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(1);
         let peer_configs = vec![
             config::PeerConfig {
-                address: peer_a,
+                address: IpAddr::V4(peer_a),
                 port: 179,
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
@@ -8895,7 +9943,7 @@ mod stall_tests {
                 role: None,
             },
             config::PeerConfig {
-                address: peer_b,
+                address: IpAddr::V4(peer_b),
                 port: 179,
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
@@ -8914,8 +9962,8 @@ mod stall_tests {
             },
         ];
         let mut senders = HashMap::new();
-        senders.insert(peer_a, tx_a);
-        senders.insert(peer_b, tx_b);
+        senders.insert(IpAddr::V4(peer_a), tx_a);
+        senders.insert(IpAddr::V4(peer_b), tx_b);
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -8926,12 +9974,28 @@ mod stall_tests {
             vec![],
         );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // Announce via on_route_update so adj_rib_out[peer_b] has the route.
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -8946,7 +10010,7 @@ mod stall_tests {
         state.flush_pending();
 
         // set_import_default tries to send WITHDRAW to peer_b but channel is full.
-        state.set_import_default(peer_a, DefaultAction::Reject);
+        state.set_import_default(IpAddr::V4(peer_a), DefaultAction::Reject);
         state.flush_pending();
         assert!(
             !state.take_stalled_peers().is_empty(),
@@ -8966,12 +10030,41 @@ mod stall_tests {
     fn flush_pending_coalesces_multi_update_burst() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_capped(&[(peer_a, 65002), (peer_b, 65003)], 64);
+        let (mut state, mut receivers) = make_capped(
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+            64,
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        while receivers.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
-        while receivers.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        while receivers
+            .get_mut(&IpAddr::V4(peer_a))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
+        while receivers
+            .get_mut(&IpAddr::V4(peer_b))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // Two separate on_route_update calls — simulating two BGP UPDATEs
         // arriving back-to-back from peer_a, each with a different prefix but
@@ -8982,7 +10075,7 @@ mod stall_tests {
             PathAttribute::NextHop(peer_a),
         ];
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: attrs.clone(),
@@ -8990,7 +10083,7 @@ mod stall_tests {
             },
         );
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: attrs,
@@ -9002,7 +10095,7 @@ mod stall_tests {
         state.flush_pending();
 
         let msg = receivers
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b must receive a batched UPDATE");
@@ -9018,7 +10111,11 @@ mod stall_tests {
 
         // Crucially: no second UPDATE message should be queued.
         assert!(
-            receivers.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(peer_b))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "coalescing must produce a single UPDATE, not two separate ones"
         );
     }
@@ -9029,16 +10126,45 @@ mod stall_tests {
     fn flush_pending_clears_on_terminated() {
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_capped(&[(peer_a, 65002), (peer_b, 65003)], 64);
+        let (mut state, mut receivers) = make_capped(
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+            64,
+        );
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        while receivers.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
-        while receivers.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        while receivers
+            .get_mut(&IpAddr::V4(peer_a))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
+        while receivers
+            .get_mut(&IpAddr::V4(peer_b))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // Announce a route from peer_a (buffered into peer_b's pending buffer).
         state.on_route_update(
-            peer_a,
+            IpAddr::V4(peer_a),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -9051,14 +10177,18 @@ mod stall_tests {
         );
 
         // Before flushing, terminate peer_b — its buffer must be cleared.
-        state.on_terminated(peer_b, TerminationReason::Unclean, false);
+        state.on_terminated(IpAddr::V4(peer_b), TerminationReason::Unclean, false);
 
         // Flush pending: peer_b has no update_sender now, so nothing is sent.
         state.flush_pending();
 
         // peer_b's channel must remain empty.
         assert!(
-            receivers.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            receivers
+                .get_mut(&IpAddr::V4(peer_b))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "terminated peer must not receive buffered decisions after on_terminated"
         );
     }
@@ -9073,7 +10203,7 @@ mod stall_tests {
     /// push `peer_ip` onto `stalled_peers`.
     #[test]
     fn eor_stall_when_channel_full_after_dump() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _receivers) = make_capped(&[(peer_ip, 1)], 1);
 
         let src = PeerId::new(IpAddr::V4("10.0.0.9".parse::<Ipv4Addr>().unwrap()));
@@ -9087,7 +10217,15 @@ mod stall_tests {
         );
 
         // The dump fills the single slot; EOR try_send fails → stall.
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         assert!(
             state.stalled_peers.contains(&peer_ip),
@@ -9103,7 +10241,7 @@ mod stall_tests {
     /// IPv6 EOR `try_send` has no slot and fails → stall.
     #[test]
     fn eor_stall_when_ipv6_eor_fails_after_ipv4_eor_succeeds() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         // Capacity 2: slot 1 = IPv4 dump, slot 2 = IPv4 EOR.
         // The IPv6 EOR has no slot and must trigger the stall path.
         let (mut state, _receivers) = make_capped(&[(peer_ip, 2)], 2);
@@ -9122,7 +10260,7 @@ mod stall_tests {
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::External,
             65002,
             90,
@@ -9141,7 +10279,7 @@ mod stall_tests {
     /// stall tests above.
     #[test]
     fn eor_no_stall_when_channel_has_capacity_for_dump_and_eors() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         // Capacity 3: slot 1 = IPv4 dump, slot 2 = IPv4 EOR, slot 3 = IPv6 EOR.
         let (mut state, _receivers) = make_capped(&[(peer_ip, 3)], 3);
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
@@ -9159,7 +10297,7 @@ mod stall_tests {
         let v6_caps = [Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         state.on_established(
             peer_ip,
-            peer_ip,
+            must_v4(peer_ip),
             PeerType::External,
             65002,
             90,
@@ -9177,7 +10315,7 @@ mod stall_tests {
 
     #[test]
     fn set_export_default_propagates_to_established_peer() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_capped(&[(peer_ip, 65002)], 64);
 
         // Populate Loc-RIB BEFORE establishing so the table dump sends the
@@ -9192,7 +10330,15 @@ mod stall_tests {
             ),
         );
 
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         // Drain the table-dump UPDATE so the receiver is clean.
         receivers.get_mut(&peer_ip).unwrap().try_recv().ok();
 
@@ -9208,7 +10354,7 @@ mod stall_tests {
 
     #[test]
     fn set_export_default_no_send_when_peer_not_established() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, mut receivers) = make_capped(&[(peer_ip, 65002)], 64);
 
         // Peer is configured but never established — set_export_default must
@@ -9232,7 +10378,7 @@ mod stall_tests {
 
     #[test]
     fn set_export_default_marks_stalled_when_channel_full() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _rx) = make_capped(&[(peer_ip, 65002)], 1);
 
         // Pre-populate Loc-RIB so the table dump fills the channel (cap 1).
@@ -9247,7 +10393,15 @@ mod stall_tests {
         );
 
         // on_established table-dumps the route → fills the cap-1 channel.
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         // Do NOT drain the channel — it is now full.
 
         // Reject forces a WITHDRAW for the route already in adj_rib_out.
@@ -9297,20 +10451,17 @@ mod coalescing_tests {
     /// Build a state with large channels and Accept-default policies.
     fn make_state(
         peers: &[(Ipv4Addr, u32)],
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let mut receivers = HashMap::new();
         let mut senders = HashMap::new();
         let peer_configs: Vec<_> = peers
             .iter()
             .map(|&(addr, remote_as)| {
                 let (tx, rx) = mpsc::channel::<UpdateMessage>(256);
-                senders.insert(addr, tx);
-                receivers.insert(addr, rx);
+                senders.insert(IpAddr::V4(addr), tx);
+                receivers.insert(IpAddr::V4(addr), rx);
                 config::PeerConfig {
-                    address: addr,
+                    address: IpAddr::V4(addr),
                     port: 179,
                     remote_as,
                     import_default: Some(config::ImportDefault::Accept),
@@ -9364,20 +10515,36 @@ mod coalescing_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        while rxs.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
-        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        while rxs.get_mut(&IpAddr::V4(peer_a)).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv().is_ok() {}
 
         // Two separate BGP UPDATEs with identical path attributes.
-        state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
-        state.on_route_update(peer_a, announce(peer_a, &["172.16.0.0/12"]));
+        state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &["172.16.0.0/12"]));
 
         // A single flush must send both prefixes in one UpdateMessage.
         state.flush_pending();
 
         let msg = rxs
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b must receive a coalesced UPDATE");
@@ -9392,7 +10559,10 @@ mod coalescing_tests {
 
         // No second UpdateMessage — both prefixes arrived in one wire frame.
         assert!(
-            rxs.get_mut(&peer_b).unwrap().try_recv().is_err(),
+            rxs.get_mut(&IpAddr::V4(peer_b))
+                .unwrap()
+                .try_recv()
+                .is_err(),
             "coalescing must produce exactly one outbound UpdateMessage for identical attrs"
         );
     }
@@ -9406,19 +10576,35 @@ mod coalescing_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // 20 separate on_route_update calls — one per prefix.
         let prefixes: Vec<String> = (0u8..20).map(|i| format!("10.{i}.0.0/16")).collect();
         for prefix in &prefixes {
-            state.on_route_update(peer_a, announce(peer_a, &[prefix.as_str()]));
+            state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &[prefix.as_str()]));
         }
         state.flush_pending();
 
         let mut total_messages = 0usize;
         let mut total_prefixes = 0usize;
-        while let Ok(msg) = rxs.get_mut(&peer_b).unwrap().try_recv() {
+        while let Ok(msg) = rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv() {
             total_messages += 1;
             total_prefixes += msg.announced.len();
         }
@@ -9442,9 +10628,17 @@ mod coalescing_tests {
     fn regression_originate_routes_sends_without_manual_flush() {
         let peer: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, mut rxs) = make_state(&[(peer, 65002)]);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         // Drain the empty table dump from on_established.
-        while rxs.get_mut(&peer).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(peer)).unwrap().try_recv().is_ok() {}
 
         let route = RouteBuilder::new(nlri("203.0.113.0/24"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
@@ -9453,7 +10647,7 @@ mod coalescing_tests {
         // originate_routes must self-flush — no explicit flush_pending() call.
         state.originate_routes(vec![route]);
 
-        rxs.get_mut(&peer)
+        rxs.get_mut(&IpAddr::V4(peer))
             .unwrap()
             .try_recv()
             .expect("originate_routes must send immediately without a manual flush_pending call");
@@ -9465,20 +10659,28 @@ mod coalescing_tests {
     fn regression_withdraw_originated_routes_sends_without_manual_flush() {
         let peer: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let (mut state, mut rxs) = make_state(&[(peer, 65002)]);
-        state.on_established(peer, peer, PeerType::External, 65002, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         let route = RouteBuilder::new(nlri("203.0.113.0/24"), Origin::Igp, AsPath::new())
             .next_hop(NextHop::V4("10.0.0.1".parse().unwrap()))
             .build();
         state.originate_routes(vec![route]);
         // Drain the announcement.
-        while rxs.get_mut(&peer).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(peer)).unwrap().try_recv().is_ok() {}
 
         // Withdraw — must self-flush.
         state.withdraw_originated_routes(&[nlri("203.0.113.0/24")]);
 
         let msg = rxs
-            .get_mut(&peer)
+            .get_mut(&IpAddr::V4(peer))
             .unwrap()
             .try_recv()
             .expect("withdraw_originated_routes must send immediately without a manual flush");
@@ -9497,19 +10699,35 @@ mod coalescing_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
-        state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &["10.0.0.0/8"]));
         state.flush_pending();
         // Drain initial announcement.
-        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv().is_ok() {}
 
         // Flip import policy to Reject — must self-flush without caller needing flush_pending.
-        state.set_import_default(peer_a, pathvector_policy::DefaultAction::Reject);
+        state.set_import_default(IpAddr::V4(peer_a), pathvector_policy::DefaultAction::Reject);
 
         let msg = rxs
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("set_import_default must send WITHDRAW immediately without manual flush");
@@ -9534,10 +10752,26 @@ mod coalescing_tests {
         // peer_b is eBGP so MRAI applies.
         let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-        while rxs.get_mut(&peer_a).unwrap().try_recv().is_ok() {}
-        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        while rxs.get_mut(&IpAddr::V4(peer_a)).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv().is_ok() {}
 
         // Announce a route that is first suppressed by MRAI, then add it to
         // mrai_pending manually so flush_mrai_pending picks it up.
@@ -9557,14 +10791,18 @@ mod coalescing_tests {
 
         // Manufacture an mrai_pending entry for peer_b so flush_mrai_pending
         // has something to process.
-        state.mrai_pending.entry(peer_b).or_default().insert(prefix);
+        state
+            .mrai_pending
+            .entry(IpAddr::V4(peer_b))
+            .or_default()
+            .insert(prefix);
 
         // Call flush_mrai_pending without the subsequent flush_pending.
         state.flush_mrai_pending();
 
         // Without flush_pending, nothing should be in peer_b's channel yet
         // (decisions sit in pending_decisions[peer_b]).
-        let before_flush = rxs.get_mut(&peer_b).unwrap().try_recv();
+        let before_flush = rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv();
         assert!(
             before_flush.is_err(),
             "flush_mrai_pending alone must NOT send to channel — decisions remain buffered"
@@ -9574,7 +10812,7 @@ mod coalescing_tests {
         state.flush_pending();
 
         let msg =
-            rxs.get_mut(&peer_b).unwrap().try_recv().expect(
+            rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv().expect(
                 "flush_pending after flush_mrai_pending must deliver the MRAI-released route",
             );
         assert!(
@@ -9607,7 +10845,7 @@ mod coalescing_tests {
         let (tx_b, _rx_b) = mpsc::channel::<UpdateMessage>(64);
         let peer_configs = vec![
             config::PeerConfig {
-                address: peer_a,
+                address: IpAddr::V4(peer_a),
                 port: 179,
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
@@ -9625,7 +10863,7 @@ mod coalescing_tests {
                 role: None,
             },
             config::PeerConfig {
-                address: peer_b,
+                address: IpAddr::V4(peer_b),
                 port: 179,
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
@@ -9644,8 +10882,8 @@ mod coalescing_tests {
             },
         ];
         let mut senders = HashMap::new();
-        senders.insert(peer_a, tx_a);
-        senders.insert(peer_b, tx_b);
+        senders.insert(IpAddr::V4(peer_a), tx_a);
+        senders.insert(IpAddr::V4(peer_b), tx_b);
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -9659,18 +10897,34 @@ mod coalescing_tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-            s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(peer_a),
+                peer_a,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+            s.on_established(
+                IpAddr::V4(peer_b),
+                peer_b,
+                PeerType::External,
+                65003,
+                90,
+                &[],
+                None,
+            );
         }
 
-        let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(16);
+        let (event_tx, event_rx) = mpsc::channel::<(IpAddr, SessionEvent)>(16);
 
         // Stop-command channels: we capture peer_b's receiver to check for NOTIFICATION.
         let (stop_a_tx, _stop_a_rx) = mpsc::channel::<SessionCommand>(4);
         let (stop_b_tx, mut stop_b_rx) = mpsc::channel::<SessionCommand>(4);
-        let mut stop_map: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
-        stop_map.insert(peer_a, stop_a_tx);
-        stop_map.insert(peer_b, stop_b_tx);
+        let mut stop_map: HashMap<IpAddr, mpsc::Sender<SessionCommand>> = HashMap::new();
+        stop_map.insert(IpAddr::V4(peer_a), stop_a_tx);
+        stop_map.insert(IpAddr::V4(peer_b), stop_b_tx);
         let stop_senders = Arc::new(std::sync::Mutex::new(stop_map));
 
         let loop_handle = tokio::spawn(run_event_loop(
@@ -9684,7 +10938,7 @@ mod coalescing_tests {
         // Event 1 (valid): wakes the loop.
         event_tx
             .send((
-                peer_a,
+                IpAddr::V4(peer_a),
                 SessionEvent::RouteUpdate(UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -9701,7 +10955,7 @@ mod coalescing_tests {
         // Event 2 (malformed — missing Origin): arrives while loop is processing event 1.
         event_tx
             .send((
-                peer_b,
+                IpAddr::V4(peer_b),
                 SessionEvent::RouteUpdate(UpdateMessage {
                     withdrawn: vec![],
                     // Missing Origin → RFC 4271 §6.3 → NOTIFICATION
@@ -9762,7 +11016,7 @@ mod coalescing_tests {
 
         let peer_configs = vec![
             config::PeerConfig {
-                address: peer_a,
+                address: IpAddr::V4(peer_a),
                 port: 179,
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
@@ -9780,7 +11034,7 @@ mod coalescing_tests {
                 role: None,
             },
             config::PeerConfig {
-                address: peer_b,
+                address: IpAddr::V4(peer_b),
                 port: 179,
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
@@ -9799,8 +11053,8 @@ mod coalescing_tests {
             },
         ];
         let mut update_senders = HashMap::new();
-        update_senders.insert(peer_a, tx_a);
-        update_senders.insert(peer_b, tx_b);
+        update_senders.insert(IpAddr::V4(peer_a), tx_a);
+        update_senders.insert(IpAddr::V4(peer_b), tx_b);
 
         let state = DaemonState::new(
             65001,
@@ -9815,12 +11069,28 @@ mod coalescing_tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-            s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(peer_a),
+                peer_a,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+            s.on_established(
+                IpAddr::V4(peer_b),
+                peer_b,
+                PeerType::External,
+                65003,
+                90,
+                &[],
+                None,
+            );
         }
 
-        let (event_tx, event_rx) = tmp::channel::<(Ipv4Addr, SessionEvent)>(64);
-        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, tmp::Sender<SessionCommand>>>> =
+        let (event_tx, event_rx) = tmp::channel::<(IpAddr, SessionEvent)>(64);
+        let stop_senders: Arc<Mutex<HashMap<IpAddr, tmp::Sender<SessionCommand>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let loop_handle = tokio::spawn(run_event_loop(
@@ -9840,7 +11110,7 @@ mod coalescing_tests {
             let nlri_parsed: Nlri<Ipv4Addr> = prefix.parse().unwrap();
             event_tx
                 .send((
-                    peer_a,
+                    IpAddr::V4(peer_a),
                     SessionEvent::RouteUpdate(UpdateMessage {
                         withdrawn: vec![],
                         attributes: vec![
@@ -9892,25 +11162,41 @@ mod coalescing_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (mut state, mut rxs) = make_state(&[(peer_a, 65002), (peer_b, 65003)]);
 
-        state.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-        state.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_a),
+            peer_a,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(peer_b),
+            peer_b,
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
 
         // Announce a route and buffer it (do NOT call flush_pending yet).
-        state.on_route_update(peer_a, announce(peer_a, &["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &["10.0.0.0/8"]));
 
         // `pending_decisions[peer_b]` now has one entry.  Call set_export_default
         // (which writes directly to the channel, bypassing the pending buffer).
         // In production this is always serialized by the write lock — the event
         // loop always flushes before releasing — but we simulate the direct call
         // here to verify the buffer is not corrupted.
-        state.set_export_default(peer_b, pathvector_policy::DefaultAction::Accept);
+        state.set_export_default(IpAddr::V4(peer_b), pathvector_policy::DefaultAction::Accept);
 
         // set_export_default fires first (direct channel write), then flush_pending
         // sends the buffered decision.  Peer_b must receive both.
         state.flush_pending();
 
         let mut received_prefixes = std::collections::HashSet::new();
-        while let Ok(msg) = rxs.get_mut(&peer_b).unwrap().try_recv() {
+        while let Ok(msg) = rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv() {
             for nlri in msg.announced {
                 received_prefixes.insert(nlri);
             }
@@ -9949,8 +11235,8 @@ mod event_loop_tests {
 
     type StateBundle = (
         Arc<RwLock<DaemonState>>,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-        Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+        HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>,
+        Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     );
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
@@ -9989,11 +11275,11 @@ mod event_loop_tests {
 
     /// Build a `DaemonState` + receivers for a set of peers with accept-all
     /// policies and channels of the given capacity.
-    fn make_state(peers: &[(Ipv4Addr, u32)], channel_cap: usize) -> StateBundle {
+    fn make_state(peers: &[(IpAddr, u32)], channel_cap: usize) -> StateBundle {
         let mut update_senders = HashMap::new();
         let mut update_receivers = HashMap::new();
-        let mut stop_map: HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>> = HashMap::new();
-        let mut stop_receivers: HashMap<Ipv4Addr, mpsc::Receiver<SessionCommand>> = HashMap::new();
+        let mut stop_map: HashMap<IpAddr, mpsc::Sender<SessionCommand>> = HashMap::new();
+        let mut stop_receivers: HashMap<IpAddr, mpsc::Receiver<SessionCommand>> = HashMap::new();
 
         for &(ip, _) in peers {
             let (tx, rx) = mpsc::channel(channel_cap);
@@ -10044,7 +11330,7 @@ mod event_loop_tests {
 
     #[tokio::test]
     async fn event_loop_dispatches_established() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
 
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -10067,13 +11353,21 @@ mod event_loop_tests {
 
     #[tokio::test]
     async fn event_loop_dispatches_terminated() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
 
         // Establish first so there is state to tear down.
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                peer_ip,
+                must_v4(peer_ip),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
         }
 
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -10099,12 +11393,20 @@ mod event_loop_tests {
 
     #[tokio::test]
     async fn event_loop_dispatches_route_update() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                peer_ip,
+                must_v4(peer_ip),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
         }
 
         let update = UpdateMessage {
@@ -10112,7 +11414,7 @@ mod event_loop_tests {
             attributes: vec![
                 PathAttribute::Origin(Origin::Igp),
                 PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                PathAttribute::NextHop(peer_ip),
+                PathAttribute::NextHop(must_v4(peer_ip)),
             ],
             announced: vec![nlri("10.0.0.0/8")],
         };
@@ -10149,7 +11451,7 @@ mod event_loop_tests {
 
         let peer_configs = vec![
             config::PeerConfig {
-                address: peer_a,
+                address: IpAddr::V4(peer_a),
                 port: 179,
                 remote_as: 65002,
                 import_default: Some(config::ImportDefault::Accept),
@@ -10167,7 +11469,7 @@ mod event_loop_tests {
                 role: None,
             },
             config::PeerConfig {
-                address: peer_b,
+                address: IpAddr::V4(peer_b),
                 port: 179,
                 remote_as: 65003,
                 import_default: Some(config::ImportDefault::Accept),
@@ -10186,8 +11488,8 @@ mod event_loop_tests {
             },
         ];
         let mut update_senders = HashMap::new();
-        update_senders.insert(peer_a, update_tx_a);
-        update_senders.insert(peer_b, stall_tx);
+        update_senders.insert(IpAddr::V4(peer_a), update_tx_a);
+        update_senders.insert(IpAddr::V4(peer_b), stall_tx);
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -10198,15 +11500,31 @@ mod event_loop_tests {
             vec![],
         )));
         let mut stop_map = HashMap::new();
-        stop_map.insert(peer_a, sess_stop_a);
-        stop_map.insert(peer_b, sess_stop_b);
+        stop_map.insert(IpAddr::V4(peer_a), sess_stop_a);
+        stop_map.insert(IpAddr::V4(peer_b), sess_stop_b);
         let stop_senders = Arc::new(Mutex::new(stop_map));
 
         // Establish both peers.
         {
             let mut s = state.write().await;
-            s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-            s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(peer_a),
+                peer_a,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+            s.on_established(
+                IpAddr::V4(peer_b),
+                peer_b,
+                PeerType::External,
+                65003,
+                90,
+                &[],
+                None,
+            );
         }
 
         // Drain the EOR marker that on_established sent to peer_b (RFC 4724 §2)
@@ -10216,7 +11534,7 @@ mod event_loop_tests {
         // Pre-fill peer_b's cap-1 UPDATE channel so the propagation try_send fails.
         {
             let s = state.read().await;
-            s.update_senders[&peer_b]
+            s.update_senders[&IpAddr::V4(peer_b)]
                 .try_send(UpdateMessage {
                     withdrawn: vec![nlri("0.0.0.0/0")],
                     attributes: vec![],
@@ -10230,7 +11548,7 @@ mod event_loop_tests {
         let (event_tx, event_rx) = mpsc::channel(8);
         event_tx
             .send((
-                peer_a,
+                IpAddr::V4(peer_a),
                 SessionEvent::RouteUpdate(UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -10265,17 +11583,36 @@ mod event_loop_tests {
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (state, mut rxs, stop_senders) = make_state(&[(peer_a, 65002), (peer_b, 65003)], 64);
+        let (state, mut rxs, stop_senders) = make_state(
+            &[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)],
+            64,
+        );
 
         // Install a ToggleOracle (initially reachable).
         let oracle = ToggleOracle::reachable();
         {
             let mut s = state.write().await;
             s.set_oracles(oracle.clone(), oracle.clone());
-            s.on_established(peer_a, peer_a, PeerType::External, 65002, 90, &[], None);
-            s.on_established(peer_b, peer_b, PeerType::External, 65003, 90, &[], None);
-            s.on_route_update(
+            s.on_established(
+                IpAddr::V4(peer_a),
                 peer_a,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+            s.on_established(
+                IpAddr::V4(peer_b),
+                peer_b,
+                PeerType::External,
+                65003,
+                90,
+                &[],
+                None,
+            );
+            s.on_route_update(
+                IpAddr::V4(peer_a),
                 UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -10289,7 +11626,7 @@ mod event_loop_tests {
             s.flush_pending();
         }
         // Drain EOR marker and initial route propagation.
-        while rxs.get_mut(&peer_b).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(peer_b)).unwrap().try_recv().is_ok() {}
 
         // Simulate next-hop going down.
         oracle.0.store(false, Ordering::Relaxed);
@@ -10297,7 +11634,7 @@ mod event_loop_tests {
         // Keep the event channel open so the loop does not exit via the event
         // arm before it has a chance to process the FIB change.  Both arms
         // could otherwise be immediately ready and select! is non-deterministic.
-        let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
+        let (event_tx, event_rx) = mpsc::channel::<(IpAddr, SessionEvent)>(8);
         let (fib_tx, fib_rx) = watch::channel(());
 
         // Spawn the loop as a background task, then signal the FIB change.
@@ -10325,7 +11662,7 @@ mod event_loop_tests {
 
         // peer_b must have received a WITHDRAW.
         let msg = rxs
-            .get_mut(&peer_b)
+            .get_mut(&IpAddr::V4(peer_b))
             .unwrap()
             .try_recv()
             .expect("peer_b must receive WITHDRAW via FIB change");
@@ -10345,7 +11682,7 @@ mod event_loop_tests {
     #[tokio::test]
     async fn event_loop_exits_when_channel_closes() {
         let (state, _rxs, stop_senders) = make_state(&[], 64);
-        let (event_tx, event_rx) = mpsc::channel::<(Ipv4Addr, SessionEvent)>(8);
+        let (event_tx, event_rx) = mpsc::channel::<(IpAddr, SessionEvent)>(8);
         // Drop the sender immediately — the loop must exit without hanging.
         drop(event_tx);
         tokio::time::timeout(
@@ -10358,7 +11695,7 @@ mod event_loop_tests {
 
     // ── DaemonState::add_peer / remove_peer ───────────────────────────────────
 
-    fn peer_cfg(address: Ipv4Addr, remote_as: u32) -> config::PeerConfig {
+    fn peer_cfg(address: IpAddr, remote_as: u32) -> config::PeerConfig {
         config::PeerConfig {
             address,
             port: 179,
@@ -10382,7 +11719,7 @@ mod event_loop_tests {
     #[tokio::test]
     async fn add_peer_inserts_all_state_maps() {
         let (state, _rxs, _stop) = make_state(&[], 8);
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (update_tx, _update_rx) = mpsc::channel(8);
 
         let added = state
@@ -10405,7 +11742,7 @@ mod event_loop_tests {
     #[tokio::test]
     async fn add_peer_is_idempotent() {
         let (state, _rxs, _stop) = make_state(&[], 8);
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (tx1, _) = mpsc::channel(8);
         let (tx2, _) = mpsc::channel(8);
 
@@ -10418,7 +11755,7 @@ mod event_loop_tests {
 
     #[tokio::test]
     async fn remove_peer_clears_all_state_maps() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
 
         let removed = state.write().await.remove_peer(peer_ip);
@@ -10437,7 +11774,7 @@ mod event_loop_tests {
     #[tokio::test]
     async fn remove_peer_returns_false_when_not_found() {
         let (state, _rxs, _stop) = make_state(&[], 8);
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
 
         let removed = state.write().await.remove_peer(peer_ip);
 
@@ -10451,7 +11788,7 @@ mod event_loop_tests {
     #[tokio::test]
     async fn add_peer_with_role_installs_otc_terms_and_peer_roles() {
         let (state, _rxs, _stop) = make_state(&[], 8);
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (update_tx, _update_rx) = mpsc::channel(8);
 
         let mut cfg = peer_cfg(peer_ip, 65099);
@@ -10474,7 +11811,7 @@ mod event_loop_tests {
     #[tokio::test]
     async fn add_peer_ignores_role_for_ibgp_peer() {
         let (state, _rxs, _stop) = make_state(&[], 8);
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (update_tx, _update_rx) = mpsc::channel(8);
 
         let mut cfg = peer_cfg(peer_ip, 65001); // local_as in this harness is 65001
@@ -10496,7 +11833,7 @@ mod event_loop_tests {
     /// reconnect capability-refresh path.
     #[tokio::test]
     async fn remove_peer_clears_peer_roles() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, _stop) = make_state(&[], 8);
         let (update_tx, _update_rx) = mpsc::channel(8);
         let mut cfg = peer_cfg(peer_ip, 65099);
@@ -10513,7 +11850,7 @@ mod event_loop_tests {
     /// (not just reset it for reconnect).
     #[tokio::test]
     async fn terminated_with_pending_removal_calls_remove_peer() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
         // Mark as pending removal.
@@ -10582,12 +11919,12 @@ mod event_loop_tests {
             async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         // Build state with the peer but deliberately provide an empty stop_senders
         // map — simulates the window where the session actor has exited and its
         // stop sender has been dropped.
         let (state, _rxs, _orig_stop) = make_state(&[(peer_ip, 65099)], 8);
-        let empty_stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+        let empty_stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -10644,7 +11981,7 @@ mod event_loop_tests {
     /// the peer from `adj_ribs_in` — it should be ready for reconnect.
     #[tokio::test]
     async fn terminated_without_pending_removal_keeps_peer_state() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
         let (event_tx, event_rx) = mpsc::channel(4);
@@ -10684,7 +12021,7 @@ mod event_loop_tests {
     /// returns silently.
     #[tokio::test]
     async fn double_terminated_second_is_no_op() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
         state.write().await.pending_removal.insert(peer_ip);
@@ -10752,7 +12089,7 @@ mod event_loop_tests {
             async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
         // Mark the peer as being removed — teardown is in progress.
@@ -10833,7 +12170,7 @@ mod event_loop_tests {
             async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
-        let peer_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.1.1".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65010)], 8);
 
         // Register a real stop sender so we can observe what command is sent.
@@ -10909,7 +12246,7 @@ mod event_loop_tests {
             async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
-        let peer_ip: Ipv4Addr = "10.0.1.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.1.2".parse().unwrap();
 
         // Build state with shutdown_message set.
         let mut senders = HashMap::new();
@@ -10945,7 +12282,7 @@ mod event_loop_tests {
 
         // Register a real stop sender so we can observe what command is sent.
         let (session_stop_tx, mut session_stop_rx) = mpsc::channel(8);
-        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+        let stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
             Arc::new(Mutex::new(HashMap::from([(peer_ip, session_stop_tx)])));
 
         let (event_tx, _event_rx) = mpsc::channel(8);
@@ -11006,7 +12343,7 @@ mod event_loop_tests {
     /// both sides negotiated `Capability::RouteRefresh`.
     #[tokio::test]
     async fn on_established_tracks_route_refresh_when_both_sides_negotiated() {
-        let peer_ip: Ipv4Addr = "10.0.2.1".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.2.1".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65020)], 8);
 
         // Simulate the daemon advertising RouteRefresh (as build_daemon now does).
@@ -11045,7 +12382,7 @@ mod event_loop_tests {
     /// not advertise `Capability::RouteRefresh`, even if we did.
     #[tokio::test]
     async fn on_established_does_not_track_route_refresh_when_peer_omits_capability() {
-        let peer_ip: Ipv4Addr = "10.0.2.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.2.2".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65021)], 8);
 
         {
@@ -11082,7 +12419,7 @@ mod event_loop_tests {
     /// `on_terminated` must remove the peer from `route_refresh_peers`.
     #[tokio::test]
     async fn on_terminated_clears_route_refresh_peers() {
-        let peer_ip: Ipv4Addr = "10.0.2.3".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.2.3".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65022)], 8);
 
         {
@@ -11204,7 +12541,7 @@ mod event_loop_tests {
 
         let global_hold_time: u16 = 180;
         let per_peer_hold_time: u16 = 45;
-        let peer_ip: Ipv4Addr = "10.0.5.1".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.5.1".parse().unwrap();
 
         // Start with no pre-configured peers so AddPeer isn't treated as idempotent.
         let (state, _rxs, stop_senders) = make_state(&[], 8);
@@ -11285,7 +12622,7 @@ mod event_loop_tests {
     /// identity fields before `on_terminated` / `remove_peer` run.
     #[tokio::test]
     async fn terminated_with_pending_removal_broadcasts_removed_event_with_correct_fields() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let remote_as = 65099_u32;
         let local_as = 65001_u32;
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, remote_as)], 8);
@@ -11345,7 +12682,7 @@ mod event_loop_tests {
     /// reconnect path must still send its notification.
     #[tokio::test]
     async fn terminated_without_pending_removal_broadcasts_changed_not_removed() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
@@ -11388,7 +12725,7 @@ mod event_loop_tests {
     /// ever dropped or inverted, this test will catch the regression.
     #[tokio::test]
     async fn on_terminated_notify_false_sends_no_broadcast() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
@@ -11409,7 +12746,7 @@ mod event_loop_tests {
     /// `Changed(peer: None)` broadcast on `peer_tx`.
     #[tokio::test]
     async fn on_terminated_notify_true_sends_changed_broadcast() {
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
 
         let mut peer_rx = state.read().await.peer_tx.subscribe();
@@ -11464,18 +12801,17 @@ mod event_loop_tests {
             async fn set_capabilities(&self, _caps: Vec<pathvector_session::message::Capability>) {}
         }
 
-        let peer_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, _stop) = make_state(&[(peer_ip, 65099)], 8);
 
         // Pre-populate incoming_senders as if AddPeer had already run.
         let (incoming_tx, _incoming_rx) = mpsc::channel::<SessionCommand>(1);
-        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> = Arc::new(
-            RwLock::new(HashMap::from([(IpAddr::V4(peer_ip), incoming_tx)])),
-        );
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::from([(peer_ip, incoming_tx)])));
 
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
-        let stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> =
+        let stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(run_command_processor::<NeverSpawned, _>(
@@ -11497,7 +12833,7 @@ mod event_loop_tests {
         ));
 
         assert!(
-            incoming.read().await.contains_key(&IpAddr::V4(peer_ip)),
+            incoming.read().await.contains_key(&peer_ip),
             "pre-condition: incoming_senders must contain the peer before RemovePeer"
         );
 
@@ -11510,7 +12846,7 @@ mod event_loop_tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         assert!(
-            !incoming.read().await.contains_key(&IpAddr::V4(peer_ip)),
+            !incoming.read().await.contains_key(&peer_ip),
             "incoming_senders must not contain the peer after RemovePeer — \
              new inbound TCP connections must be rejected immediately"
         );
@@ -11540,8 +12876,9 @@ mod event_loop_tests {
 
         let incoming_clone = Arc::clone(&incoming);
         let md5_clone = Arc::clone(&md5);
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
         tokio::spawn(async move {
-            run_bgp_listener(port, incoming_clone, md5_clone).await;
+            run_bgp_listener(bind_addr, incoming_clone, md5_clone).await;
         });
 
         // Give the listener a moment to bind.
@@ -11564,6 +12901,67 @@ mod event_loop_tests {
             n, 0,
             "listener must send no data and close the connection for an unlisted peer"
         );
+    }
+
+    /// An IPv4 listener and an IPv6 listener bound to the *same* port must
+    /// coexist without EADDRINUSE, and each must independently accept
+    /// connections from its own address family. Proves the
+    /// `IPV6_V6ONLY`-via-`socket2` fix in `bind_listener`: without it, an
+    /// IPv6 "any" bind can be dual-stack on some platforms and collide with
+    /// a same-port IPv4 listener.
+    #[tokio::test]
+    async fn bgp_listener_v4_and_v6_coexist_on_same_port() {
+        use std::net::SocketAddr;
+
+        // Pick a free port via a throwaway IPv4 bind, then drop it so both
+        // real listeners can claim that exact port on their own family.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let peer_v4: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let peer_v6: Ipv6Addr = "::1".parse().unwrap();
+        let (tx_v4, mut rx_v4) = mpsc::channel(1);
+        let (tx_v6, mut rx_v6) = mpsc::channel(1);
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::from([
+                (IpAddr::V4(peer_v4), tx_v4),
+                (IpAddr::V6(peer_v6), tx_v6),
+            ])));
+        let md5: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let bind_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let bind_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+        let (incoming_v4, md5_v4) = (Arc::clone(&incoming), Arc::clone(&md5));
+        tokio::spawn(async move {
+            run_bgp_listener(bind_v4, incoming_v4, md5_v4).await;
+        });
+        let (incoming_v6, md5_v6) = (Arc::clone(&incoming), Arc::clone(&md5));
+        tokio::spawn(async move {
+            run_bgp_listener(bind_v6, incoming_v6, md5_v6).await;
+        });
+
+        // Give both listeners a moment to bind.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let _conn_v4 = tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V4(peer_v4), port))
+            .await
+            .expect("IPv4 connect must succeed — the IPv4 listener must have bound cleanly");
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), rx_v4.recv())
+            .await
+            .expect("must receive an IncomingConnection within 2 s")
+            .expect("channel must not be closed");
+
+        let _conn_v6 = tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V6(peer_v6), port))
+            .await
+            .expect(
+                "IPv6 connect must succeed — the IPv6 listener must have bound cleanly \
+                 alongside the IPv4 one on the same port",
+            );
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), rx_v6.recv())
+            .await
+            .expect("must receive an IncomingConnection within 2 s")
+            .expect("channel must not be closed");
     }
 }
 
@@ -11734,7 +13132,7 @@ mod dynamic_peer_prop_tests {
     use super::*;
     use crate::config;
 
-    fn peer_cfg(address: Ipv4Addr, remote_as: u32) -> config::PeerConfig {
+    fn peer_cfg(address: IpAddr, remote_as: u32) -> config::PeerConfig {
         config::PeerConfig {
             address,
             port: 179,
@@ -11759,9 +13157,12 @@ mod dynamic_peer_prop_tests {
         let mut senders = HashMap::new();
         for &(ip, _) in peers {
             let (tx, _rx) = mpsc::channel(8);
-            senders.insert(ip, tx);
+            senders.insert(IpAddr::V4(ip), tx);
         }
-        let cfgs: Vec<config::PeerConfig> = peers.iter().map(|&(a, r)| peer_cfg(a, r)).collect();
+        let cfgs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(a, r)| peer_cfg(IpAddr::V4(a), r))
+            .collect();
         DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -11841,11 +13242,11 @@ mod dynamic_peer_prop_tests {
                             let ip = Ipv4Addr::new(10, 0, 0, *octet);
                             let remote_as = 65000 + u32::from(*octet);
                             let (tx, _rx) = mpsc::channel(8);
-                            state.add_peer(&peer_cfg(ip, remote_as), tx);
+                            state.add_peer(&peer_cfg(IpAddr::V4(ip), remote_as), tx);
                         }
                         Op::Remove(octet) => {
                             let ip = Ipv4Addr::new(10, 0, 0, *octet);
-                            state.remove_peer(ip); // may return false — that's fine
+                            state.remove_peer(IpAddr::V4(ip)); // may return false — that's fine
                         }
                     }
                     assert_consistent(&state, &format!("after op {i}: {op:?}"));
@@ -11877,8 +13278,8 @@ mod dynamic_peer_prop_tests {
                 let mut state_after = fresh_state(&[]);
 
                 let (tx, _rx) = mpsc::channel(8);
-                state_after.add_peer(&peer_cfg(ip, remote_as), tx);
-                state_after.remove_peer(ip);
+                state_after.add_peer(&peer_cfg(IpAddr::V4(ip), remote_as), tx);
+                state_after.remove_peer(IpAddr::V4(ip));
 
                 // Key sets must match: after add+remove, no peer should remain.
                 prop_assert_eq!(
@@ -11918,7 +13319,7 @@ mod rib_consistency_prop_tests {
     use super::*;
     use crate::config;
 
-    fn peer_cfg(address: Ipv4Addr, remote_as: u32) -> config::PeerConfig {
+    fn peer_cfg(address: IpAddr, remote_as: u32) -> config::PeerConfig {
         config::PeerConfig {
             address,
             port: 179,
@@ -11964,9 +13365,12 @@ mod rib_consistency_prop_tests {
         let mut senders = HashMap::new();
         for &(ip, _) in &peers {
             let (tx, _rx) = mpsc::channel(64);
-            senders.insert(ip, tx);
+            senders.insert(IpAddr::V4(ip), tx);
         }
-        let cfgs: Vec<config::PeerConfig> = peers.iter().map(|&(a, r)| peer_cfg(a, r)).collect();
+        let cfgs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(a, r)| peer_cfg(IpAddr::V4(a), r))
+            .collect();
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -11981,7 +13385,7 @@ mod rib_consistency_prop_tests {
         let v6_caps = vec![Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)];
         for i in 0u8..3 {
             state.on_established(
-                peer_ip(i),
+                IpAddr::V4(peer_ip(i)),
                 peer_ip(i),
                 PeerType::External,
                 peer_as(i),
@@ -12069,7 +13473,7 @@ mod rib_consistency_prop_tests {
                             ],
                             announced: vec![v4_prefix(*prefix)],
                         };
-                        state.on_route_update(peer_ip(*peer), msg);
+                        state.on_route_update(IpAddr::V4(peer_ip(*peer)), msg);
                         state.flush_pending();
                     }
                     Op::WithdrawV4 { peer, prefix } => {
@@ -12078,7 +13482,7 @@ mod rib_consistency_prop_tests {
                             attributes: vec![],
                             announced: vec![],
                         };
-                        state.on_route_update(peer_ip(*peer), msg);
+                        state.on_route_update(IpAddr::V4(peer_ip(*peer)), msg);
                         state.flush_pending();
                     }
                     Op::AnnounceV6 { peer, prefix } => {
@@ -12095,7 +13499,7 @@ mod rib_consistency_prop_tests {
                             ],
                             announced: vec![],
                         };
-                        state.on_route_update(peer_ip(*peer), msg);
+                        state.on_route_update(IpAddr::V4(peer_ip(*peer)), msg);
                         state.flush_pending();
                     }
                     Op::WithdrawV6 { peer, prefix } => {
@@ -12107,7 +13511,7 @@ mod rib_consistency_prop_tests {
                             })],
                             announced: vec![],
                         };
-                        state.on_route_update(peer_ip(*peer), msg);
+                        state.on_route_update(IpAddr::V4(peer_ip(*peer)), msg);
                         state.flush_pending();
                     }
                     Op::OriginateV4 { prefix } => {
@@ -12137,7 +13541,7 @@ mod rib_consistency_prop_tests {
 
 #[cfg(test)]
 mod mrai_tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -12168,7 +13572,7 @@ mod mrai_tests {
     fn backdate(state: &mut DaemonState, peer: Ipv4Addr, n: Nlri<Ipv4Addr>, ago: Duration) {
         let entry = state
             .mrai_last_sent
-            .entry(peer)
+            .entry(IpAddr::V4(peer))
             .or_default()
             .entry(n)
             .or_insert_with(Instant::now);
@@ -12190,14 +13594,14 @@ mod mrai_tests {
         // Prime last_sent to "just now" so the MRAI window hasn't elapsed.
         state
             .mrai_last_sent
-            .entry(peer)
+            .entry(IpAddr::V4(peer))
             .or_default()
             .insert(n, Instant::now());
 
         // Simulate the MRAI gating logic directly — call the inner logic used
         // in propagate_to_all_peers for an eBGP peer.
         let now = Instant::now();
-        let last_sent = state.mrai_last_sent.get(&peer).unwrap();
+        let last_sent = state.mrai_last_sent.get(&IpAddr::V4(peer)).unwrap();
         let elapsed = last_sent
             .get(&n)
             .map_or(MRAI, |t| now.saturating_duration_since(*t));
@@ -12214,7 +13618,7 @@ mod mrai_tests {
         backdate(&mut state, peer, n, MRAI + Duration::from_secs(1));
 
         let now = Instant::now();
-        let last_sent = state.mrai_last_sent.get(&peer).unwrap();
+        let last_sent = state.mrai_last_sent.get(&IpAddr::V4(peer)).unwrap();
         let elapsed = last_sent
             .get(&n)
             .map_or(MRAI, |t| now.saturating_duration_since(*t));
@@ -12232,7 +13636,11 @@ mod mrai_tests {
         let mut state = make_state();
         let peer = peer_ip(2);
         let n = nlri("10.0.0.0/24");
-        state.mrai_pending.entry(peer).or_default().insert(n);
+        state
+            .mrai_pending
+            .entry(IpAddr::V4(peer))
+            .or_default()
+            .insert(n);
         assert!(state.has_mrai_pending());
     }
 
@@ -12243,7 +13651,11 @@ mod mrai_tests {
         let n = nlri("10.0.0.0/24");
 
         // Mark as pending and back-date so window is elapsed.
-        state.mrai_pending.entry(peer).or_default().insert(n);
+        state
+            .mrai_pending
+            .entry(IpAddr::V4(peer))
+            .or_default()
+            .insert(n);
         backdate(&mut state, peer, n, MRAI + Duration::from_secs(1));
 
         // flush_mrai_pending calls propagate_to_all_peers which needs a
@@ -12268,7 +13680,7 @@ mod mrai_tests {
 
 #[cfg(test)]
 mod run_with_tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -12356,7 +13768,7 @@ mod run_with_tests {
         (spawn_fn, peers)
     }
 
-    fn make_config(peer_ips: &[(Ipv4Addr, u32)]) -> config::Config {
+    fn make_config(peer_ips: &[(IpAddr, u32)]) -> config::Config {
         config::Config {
             daemon: config::DaemonConfig {
                 local_as: 65001,
@@ -12451,7 +13863,7 @@ mod run_with_tests {
     /// responsible for proving pathvectord's reaction to a cache change.
     #[tokio::test]
     async fn rpki_reactive_task_reevaluates_on_cache_change() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (spawn_fn, _peers) = make_mock_spawn();
         let mut cfg = make_config(&[(peer_ip, 65002)]);
         // RFC 8212 default-rejects eBGP peers with no explicit import policy —
@@ -12466,7 +13878,15 @@ mod run_with_tests {
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         {
             let mut guard = state.write().await;
-            guard.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+            guard.on_established(
+                peer_ip,
+                must_v4(peer_ip),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             guard.on_route_update(
                 peer_ip,
                 UpdateMessage {
@@ -12474,7 +13894,7 @@ mod run_with_tests {
                     attributes: vec![
                         PathAttribute::Origin(Origin::Igp),
                         PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                        PathAttribute::NextHop(peer_ip),
+                        PathAttribute::NextHop(must_v4(peer_ip)),
                     ],
                     announced: vec![nlri],
                 },
@@ -12519,7 +13939,7 @@ mod run_with_tests {
     /// watch-notification path instead of the eager catch-up check).
     #[tokio::test]
     async fn install_rpki_catches_up_when_first_sync_precedes_subscribe() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (spawn_fn, _peers) = make_mock_spawn();
         let mut cfg = make_config(&[(peer_ip, 65002)]);
         cfg.peers[0].import_default = Some(config::ImportDefault::Accept);
@@ -12528,7 +13948,15 @@ mod run_with_tests {
         let nlri: pathvector_types::Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         {
             let mut guard = state.write().await;
-            guard.on_established(peer_ip, peer_ip, PeerType::External, 65002, 90, &[], None);
+            guard.on_established(
+                peer_ip,
+                must_v4(peer_ip),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             guard.on_route_update(
                 peer_ip,
                 UpdateMessage {
@@ -12536,7 +13964,7 @@ mod run_with_tests {
                     attributes: vec![
                         PathAttribute::Origin(Origin::Igp),
                         PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
-                        PathAttribute::NextHop(peer_ip),
+                        PathAttribute::NextHop(must_v4(peer_ip)),
                     ],
                     announced: vec![nlri],
                 },
@@ -12567,8 +13995,8 @@ mod run_with_tests {
     async fn build_daemon_calls_spawn_once_per_peer() {
         let (spawn_fn, peers) = make_mock_spawn();
         let cfg = make_config(&[
-            (Ipv4Addr::new(10, 0, 0, 1), 65002),
-            (Ipv4Addr::new(10, 0, 0, 2), 65003),
+            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 65002),
+            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65003),
         ]);
         let _ = build_daemon(&cfg, spawn_fn).await;
         assert_eq!(peers.lock().unwrap().len(), 2);
@@ -12579,8 +14007,8 @@ mod run_with_tests {
     async fn build_daemon_starts_each_session() {
         let (spawn_fn, peers) = make_mock_spawn();
         let cfg = make_config(&[
-            (Ipv4Addr::new(10, 0, 0, 1), 65002),
-            (Ipv4Addr::new(10, 0, 0, 2), 65003),
+            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 65002),
+            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 65003),
         ]);
         let _ = build_daemon(&cfg, spawn_fn).await;
         for peer in peers.lock().unwrap().iter() {
@@ -12594,10 +14022,20 @@ mod run_with_tests {
         let peer_a = Ipv4Addr::new(10, 0, 0, 1);
         let peer_b = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, _peers) = make_mock_spawn();
-        let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
+        let cfg = make_config(&[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)]);
         let (_state, _rx, _event_tx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
-        assert!(stop_senders.lock().unwrap().contains_key(&peer_a));
-        assert!(stop_senders.lock().unwrap().contains_key(&peer_b));
+        assert!(
+            stop_senders
+                .lock()
+                .unwrap()
+                .contains_key(&IpAddr::V4(peer_a))
+        );
+        assert!(
+            stop_senders
+                .lock()
+                .unwrap()
+                .contains_key(&IpAddr::V4(peer_b))
+        );
     }
 
     /// An event injected through a mock peer's sender appears on the returned
@@ -12606,7 +14044,7 @@ mod run_with_tests {
     async fn build_daemon_forwards_events_to_receiver() {
         let peer_a = Ipv4Addr::new(10, 0, 0, 1);
         let (spawn_fn, peers) = make_mock_spawn();
-        let cfg = make_config(&[(peer_a, 65002)]);
+        let cfg = make_config(&[(IpAddr::V4(peer_a), 65002)]);
         let (_state, mut event_rx, _event_tx, _stop, _, _) = build_daemon(&cfg, spawn_fn).await;
 
         let event_tx = peers.lock().unwrap()[0].event_tx.clone();
@@ -12627,11 +14065,11 @@ mod run_with_tests {
         let peer_a = Ipv4Addr::new(10, 0, 0, 1);
         let peer_b = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, _peers) = make_mock_spawn();
-        let cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
+        let cfg = make_config(&[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)]);
         let (state, _rx, _event_tx, _stop, _, _) = build_daemon(&cfg, spawn_fn).await;
         let s = state.read().await;
-        assert!(s.update_senders.contains_key(&peer_a));
-        assert!(s.update_senders.contains_key(&peer_b));
+        assert!(s.update_senders.contains_key(&IpAddr::V4(peer_a)));
+        assert!(s.update_senders.contains_key(&IpAddr::V4(peer_b)));
     }
 
     /// With no configured peers `build_daemon` succeeds and the event receiver
@@ -12655,7 +14093,7 @@ mod run_with_tests {
     /// the listener socket before any SYN arrives.
     #[tokio::test]
     async fn build_daemon_md5_password_present_in_map() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (spawn_fn, _peers) = make_mock_spawn();
 
         let mut cfg = make_config(&[(peer_ip, 65002)]);
@@ -12665,11 +14103,7 @@ mod run_with_tests {
             build_daemon(&cfg, spawn_fn).await;
 
         assert_eq!(
-            md5_passwords
-                .read()
-                .await
-                .get(&IpAddr::V4(peer_ip))
-                .map(String::as_str),
+            md5_passwords.read().await.get(&peer_ip).map(String::as_str),
             Some("s3cr3t"),
             "MD5 password must be present in the listener key map"
         );
@@ -12678,7 +14112,7 @@ mod run_with_tests {
     /// A peer without `md5_password` must not appear in the password map.
     #[tokio::test]
     async fn build_daemon_no_md5_password_absent_from_map() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (spawn_fn, _peers) = make_mock_spawn();
         let cfg = make_config(&[(peer_ip, 65002)]); // md5_password = None
 
@@ -12699,7 +14133,7 @@ mod run_with_tests {
         let peer_b: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let (spawn_fn, _peers) = make_mock_spawn();
 
-        let mut cfg = make_config(&[(peer_a, 65002), (peer_b, 65003)]);
+        let mut cfg = make_config(&[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)]);
         cfg.peers[0].md5_password = Some("key-for-a".to_string());
         // peer_b has no password
 
@@ -12722,7 +14156,7 @@ mod run_with_tests {
     /// reaches the spawned session config.
     #[tokio::test]
     async fn build_daemon_md5_password_reaches_session_config() {
-        let peer_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
 
         // Capture the SessionConfig that build_daemon passes to spawn_fn.
         let captured: std::sync::Arc<
@@ -12819,7 +14253,7 @@ mod run_with_tests {
 
         let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, peers) = make_mock_spawn_capturing_stop();
-        let cfg = make_config(&[(peer_ip, 65002)]);
+        let cfg = make_config(&[(IpAddr::V4(peer_ip), 65002)]);
         let (state, event_rx, _event_tx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
 
         // Run the event loop in the background; inject events via the mock peer.
@@ -12903,7 +14337,7 @@ mod run_with_tests {
     async fn reconnect_resends_role_and_gr_capabilities_via_set_capabilities() {
         let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, peers) = make_mock_spawn_capturing_stop();
-        let mut cfg = make_config(&[(peer_ip, 65002)]);
+        let mut cfg = make_config(&[(IpAddr::V4(peer_ip), 65002)]);
         cfg.daemon.graceful_restart_time = 120;
         cfg.peers[0].role = Some(config::PeerRole::Provider);
         let (state, event_rx, _event_tx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
@@ -13017,7 +14451,7 @@ mod run_with_tests {
         let peer_ip = Ipv4Addr::new(10, 0, 0, 5);
         store
             .upsert(config::PeerConfig {
-                address: peer_ip,
+                address: IpAddr::V4(peer_ip),
                 port: 179,
                 remote_as: 65099,
                 import_default: None,
@@ -13072,7 +14506,7 @@ mod run_with_tests {
         let peer_ip = Ipv4Addr::new(10, 0, 0, 5);
         store
             .upsert(config::PeerConfig {
-                address: peer_ip,
+                address: IpAddr::V4(peer_ip),
                 port: 179,
                 remote_as: 65099,
                 import_default: None,
@@ -13092,7 +14526,7 @@ mod run_with_tests {
             .await;
 
         // Same peer already in the static config — dedup must skip the sidecar entry.
-        let mut cfg = make_config(&[(peer_ip, 65099)]);
+        let mut cfg = make_config(&[(IpAddr::V4(peer_ip), 65099)]);
         for p in store.load() {
             if !cfg.peers.iter().any(|x| x.address == p.address) {
                 cfg.peers.push(p);
@@ -13131,7 +14565,7 @@ mod run_with_tests {
 
 #[cfg(test)]
 mod eor_receive_tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use pathvector_session::message::{MpUnreachNlri, PathAttribute, UpdateMessage};
     use pathvector_session::transport::TerminationReason;
@@ -13145,7 +14579,15 @@ mod eor_receive_tests {
     const LOCAL_AS: u32 = 65001;
 
     fn establish_peer(state: &mut super::DaemonState) {
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(PEER_IP),
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
     }
 
     fn ipv4_eor() -> UpdateMessage {
@@ -13170,13 +14612,13 @@ mod eor_receive_tests {
     // Test 1: IPv4 EOR is detected and state is recorded.
     #[test]
     fn test_ipv4_eor_received_is_recorded() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         establish_peer(&mut state);
 
-        let result = state.on_route_update(PEER_IP, ipv4_eor());
+        let result = state.on_route_update(IpAddr::V4(PEER_IP), ipv4_eor());
         assert!(result.is_none(), "EOR must not return a NOTIFICATION");
         assert!(
-            state.rib.eor_received.contains(&PEER_IP),
+            state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)),
             "eor_received must contain peer after IPv4 EOR"
         );
     }
@@ -13184,13 +14626,13 @@ mod eor_receive_tests {
     // Test 2: IPv6 EOR is detected and state is recorded.
     #[test]
     fn test_ipv6_eor_received_is_recorded() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         establish_peer(&mut state);
 
-        let result = state.on_route_update(PEER_IP, ipv6_eor());
+        let result = state.on_route_update(IpAddr::V4(PEER_IP), ipv6_eor());
         assert!(result.is_none(), "EOR must not return a NOTIFICATION");
         assert!(
-            state.rib.eor_received_v6.contains(&PEER_IP),
+            state.rib.eor_received_v6.contains(&IpAddr::V4(PEER_IP)),
             "eor_received_v6 must contain peer after IPv6 EOR"
         );
     }
@@ -13198,14 +14640,14 @@ mod eor_receive_tests {
     // Test 3: IPv4 EOR must return early and not insert into Adj-RIB-In.
     #[test]
     fn test_ipv4_eor_does_not_insert_route() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         establish_peer(&mut state);
 
-        state.on_route_update(PEER_IP, ipv4_eor());
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv4_eor());
 
         let ari_len = state
             .adj_ribs_in
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(ari_len, 0, "EOR must not insert a route into Adj-RIB-In");
     }
@@ -13213,15 +14655,15 @@ mod eor_receive_tests {
     // Test 4: EOR state is cleared when the session terminates.
     #[test]
     fn test_eor_state_cleared_on_termination() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         establish_peer(&mut state);
-        state.on_route_update(PEER_IP, ipv4_eor());
-        assert!(state.rib.eor_received.contains(&PEER_IP));
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv4_eor());
+        assert!(state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)));
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, false);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, false);
 
         assert!(
-            !state.rib.eor_received.contains(&PEER_IP),
+            !state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)),
             "eor_received must be cleared after session termination"
         );
     }
@@ -13230,7 +14672,7 @@ mod eor_receive_tests {
     #[test]
     fn test_update_with_attributes_is_not_eor() {
         use pathvector_types::{AsPath, Origin};
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         establish_peer(&mut state);
 
         // Build an UPDATE that has attributes but no NLRI — NOT an IPv4 EOR.
@@ -13243,10 +14685,10 @@ mod eor_receive_tests {
             ],
             announced: vec![],
         };
-        state.on_route_update(PEER_IP, msg);
+        state.on_route_update(IpAddr::V4(PEER_IP), msg);
 
         assert!(
-            !state.rib.eor_received.contains(&PEER_IP),
+            !state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)),
             "UPDATE with attributes must not be recorded as IPv4 EOR"
         );
     }
@@ -13254,16 +14696,16 @@ mod eor_receive_tests {
     // Test 6: Stale EOR state from a previous session is cleared on re-establish.
     #[test]
     fn test_eor_state_cleared_on_re_establish() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         establish_peer(&mut state);
-        state.on_route_update(PEER_IP, ipv4_eor());
-        assert!(state.rib.eor_received.contains(&PEER_IP));
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv4_eor());
+        assert!(state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)));
 
         // Simulate reconnect without explicit termination by calling on_established again.
         establish_peer(&mut state);
 
         assert!(
-            !state.rib.eor_received.contains(&PEER_IP),
+            !state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)),
             "eor_received must be cleared on session re-establishment"
         );
     }
@@ -13510,7 +14952,7 @@ mod test_build_local_capabilities {
 #[cfg(test)]
 mod test_gr_peer_capability {
     use std::collections::HashMap;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use pathvector_session::message::{Capability, GracefulRestartFamily};
     use pathvector_types::AfiSafi;
@@ -13550,15 +14992,15 @@ mod test_gr_peer_capability {
     /// in gr_capable_peers with the correct time value.
     #[test]
     fn gr_capable_peer_is_recorded_on_established() {
-        let mut gr_capable_peers: HashMap<Ipv4Addr, u16> = HashMap::new();
+        let mut gr_capable_peers: HashMap<IpAddr, u16> = HashMap::new();
         let caps = vec![gr_cap(120)];
         if let Some(t) = extract_gr_time(&caps) {
-            gr_capable_peers.insert(peer(), t);
+            gr_capable_peers.insert(IpAddr::V4(peer()), t);
         } else {
-            gr_capable_peers.remove(&peer());
+            gr_capable_peers.remove(&IpAddr::V4(peer()));
         }
         assert_eq!(
-            gr_capable_peers.get(&peer()).copied(),
+            gr_capable_peers.get(&IpAddr::V4(peer())).copied(),
             Some(120),
             "gr_capable_peers must store the peer's advertised restart_time"
         );
@@ -13568,16 +15010,16 @@ mod test_gr_peer_capability {
     /// recorded in gr_capable_peers (restart_time = 0 means EOR-only, no GR window).
     #[test]
     fn gr_eor_only_peer_not_recorded() {
-        let mut gr_capable_peers: HashMap<Ipv4Addr, u16> = HashMap::new();
-        gr_capable_peers.insert(peer(), 30); // pre-existing value from prior session
+        let mut gr_capable_peers: HashMap<IpAddr, u16> = HashMap::new();
+        gr_capable_peers.insert(IpAddr::V4(peer()), 30); // pre-existing value from prior session
         let caps = vec![gr_cap(0)];
         if let Some(t) = extract_gr_time(&caps) {
-            gr_capable_peers.insert(peer(), t);
+            gr_capable_peers.insert(IpAddr::V4(peer()), t);
         } else {
-            gr_capable_peers.remove(&peer());
+            gr_capable_peers.remove(&IpAddr::V4(peer()));
         }
         assert!(
-            !gr_capable_peers.contains_key(&peer()),
+            !gr_capable_peers.contains_key(&IpAddr::V4(peer())),
             "peer with restart_time = 0 must not be in gr_capable_peers; \
              prior session value must be cleared"
         );
@@ -13615,12 +15057,12 @@ mod test_gr_peer_capability {
     /// influence future sessions.
     #[test]
     fn gr_capable_peers_cleared_on_terminated() {
-        let mut gr_capable_peers: HashMap<Ipv4Addr, u16> = HashMap::new();
-        gr_capable_peers.insert(peer(), 120);
+        let mut gr_capable_peers: HashMap<IpAddr, u16> = HashMap::new();
+        gr_capable_peers.insert(IpAddr::V4(peer()), 120);
         // Simulate on_terminated cleanup.
-        gr_capable_peers.remove(&peer());
+        gr_capable_peers.remove(&IpAddr::V4(peer()));
         assert!(
-            !gr_capable_peers.contains_key(&peer()),
+            !gr_capable_peers.contains_key(&IpAddr::V4(peer())),
             "gr_capable_peers must be empty after peer terminates"
         );
     }
@@ -13631,7 +15073,7 @@ mod test_gr_peer_capability {
 #[cfg(test)]
 mod test_gr_phase2 {
     use std::collections::HashMap;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_rib::BestPathChange;
     use pathvector_session::message::{
@@ -13655,20 +15097,17 @@ mod test_gr_phase2 {
 
     fn make_state_gr(
         peers: &[(Ipv4Addr, u32)],
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let mut receivers = HashMap::new();
         let mut senders = HashMap::new();
         let peer_configs: Vec<_> = peers
             .iter()
             .map(|&(addr, remote_as)| {
                 let (tx, rx) = mpsc::channel::<UpdateMessage>(256);
-                senders.insert(addr, tx);
-                receivers.insert(addr, rx);
+                senders.insert(IpAddr::V4(addr), tx);
+                receivers.insert(IpAddr::V4(addr), rx);
                 config::PeerConfig {
-                    address: addr,
+                    address: IpAddr::V4(addr),
                     port: 179,
                     remote_as,
                     import_default: Some(config::ImportDefault::Accept),
@@ -13714,7 +15153,7 @@ mod test_gr_phase2 {
     fn establish_with_gr(state: &mut DaemonState, restart_time: u16) {
         let caps = gr_caps(restart_time);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -13753,17 +15192,17 @@ mod test_gr_phase2 {
     fn unclean_termination_of_gr_peer_retains_routes() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         assert_eq!(
             state.rib.loc_rib.len(),
             1,
             "route must be in LocRib before termination"
         );
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         assert!(
-            state.adj_ribs_in[&PEER_IP]
+            state.adj_ribs_in[&IpAddr::V4(PEER_IP)]
                 .get(&nlri("10.0.0.0/8"))
                 .is_some(),
             "AdjRibIn route must be retained during GR window"
@@ -13774,7 +15213,7 @@ mod test_gr_phase2 {
             "LocRib route must be retained during GR window"
         );
         assert!(
-            state.gr.deadlines.contains_key(&PEER_IP),
+            state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "gr_deadlines must be armed for the peer"
         );
     }
@@ -13785,9 +15224,9 @@ mod test_gr_phase2 {
     fn clean_termination_flushes_immediately() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::OperatorStop, true);
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -13795,7 +15234,7 @@ mod test_gr_phase2 {
             "LocRib must be flushed immediately on clean termination"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "gr_deadlines must not be armed on clean termination"
         );
     }
@@ -13805,10 +15244,18 @@ mod test_gr_phase2 {
     #[test]
     fn non_gr_peer_always_flushes_on_unclean_termination() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_established(
+            IpAddr::V4(PEER_IP),
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -13816,7 +15263,7 @@ mod test_gr_phase2 {
             "LocRib must be flushed for a non-GR peer even on unclean termination"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "gr_deadlines must not be armed for a non-GR peer"
         );
     }
@@ -13828,11 +15275,14 @@ mod test_gr_phase2 {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
         // Announce two routes.
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["10.0.0.0/8", "192.168.0.0/24"]),
+        );
         assert_eq!(state.rib.loc_rib.len(), 2);
 
         // Simulate unclean disconnect (GR window opens).
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         assert_eq!(
             state.rib.loc_rib.len(),
             2,
@@ -13843,10 +15293,10 @@ mod test_gr_phase2 {
         establish_with_gr(&mut state, 120);
 
         // Peer re-announces only 10.0.0.0/8.
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
         // EOR arrives — 192.168.0.0/24 was not re-announced, must be pruned.
-        state.on_route_update(PEER_IP, ipv4_eor());
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv4_eor());
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -13869,19 +15319,19 @@ mod test_gr_phase2 {
     fn gr_deadline_expiry_flushes_stale_routes() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         assert_eq!(
             state.rib.loc_rib.len(),
             1,
             "route retained during GR window"
         );
-        assert!(state.gr.deadlines.contains_key(&PEER_IP));
+        assert!(state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)));
 
         // Simulate deadline expiry.
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -13897,23 +15347,23 @@ mod test_gr_phase2 {
     fn gr_re_termination_during_window_resets_deadline_and_holds_routes() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 30);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
         // First unclean disconnect — opens GR window.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         let first_deadline = *state
             .gr
             .deadlines
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .expect("deadline must be set after first unclean disconnect");
 
         // Re-establish, then disconnect again without re-announcing anything.
         establish_with_gr(&mut state, 30);
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         let second_deadline = *state
             .gr
             .deadlines
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .expect("deadline must still be set after second unclean disconnect");
 
         // The window is reset — second deadline must be >= the first.
@@ -13929,7 +15379,7 @@ mod test_gr_phase2 {
             "routes must be retained after re-termination during GR window"
         );
         assert!(
-            state.gr.deadlines.contains_key(&PEER_IP),
+            state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "gr_deadlines must remain armed after re-termination"
         );
     }
@@ -13941,16 +15391,16 @@ mod test_gr_phase2 {
     fn gr_clean_termination_during_window_flushes_immediately() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 30);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
         // First disconnect is unclean — GR window opens.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         assert_eq!(state.rib.loc_rib.len(), 1, "route held during GR window");
-        assert!(state.gr.deadlines.contains_key(&PEER_IP));
+        assert!(state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)));
 
         // Peer re-establishes, then we tear it down (operator stop).
         establish_with_gr(&mut state, 30);
-        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::OperatorStop, true);
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -13958,7 +15408,7 @@ mod test_gr_phase2 {
             "clean termination during GR window must flush routes immediately"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "gr_deadlines must be cleared on clean termination"
         );
     }
@@ -13971,9 +15421,9 @@ mod test_gr_phase2 {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         let fib = with_recording_fib(&mut state);
         establish_with_gr(&mut state, 120);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         let changes = fib.v4_changes();
         assert!(
@@ -13990,14 +15440,14 @@ mod test_gr_phase2 {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         let fib = with_recording_fib(&mut state);
         establish_with_gr(&mut state, 120);
-        state.on_route_update(PEER_IP, announce(&["192.0.2.0/24"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["192.0.2.0/24"]));
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         // Clear stale-mark FIB notifications so we only count the expiry ones.
         fib.v4.lock().unwrap().clear();
 
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
 
         let changes = fib.v4_changes();
         assert!(
@@ -14019,8 +15469,8 @@ mod test_gr_phase2 {
         let future = Instant::now() + std::time::Duration::from_secs(300);
         let expired_ip = Ipv4Addr::new(10, 0, 0, 1);
         let live_ip = Ipv4Addr::new(10, 0, 0, 2);
-        gr.deadlines.insert(expired_ip, past);
-        gr.deadlines.insert(live_ip, future);
+        gr.deadlines.insert(IpAddr::V4(expired_ip), past);
+        gr.deadlines.insert(IpAddr::V4(live_ip), future);
 
         let drained = gr.drain_expired(Instant::now());
 
@@ -14030,11 +15480,11 @@ mod test_gr_phase2 {
             "only the past deadline must be returned"
         );
         assert!(
-            !gr.deadlines.contains_key(&expired_ip),
+            !gr.deadlines.contains_key(&IpAddr::V4(expired_ip)),
             "expired entry must be removed"
         );
         assert!(
-            gr.deadlines.contains_key(&live_ip),
+            gr.deadlines.contains_key(&IpAddr::V4(live_ip)),
             "live entry must remain"
         );
     }
@@ -14050,17 +15500,25 @@ mod test_gr_phase2 {
 
         let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
 
         // PEER_IP is the only source of the prefix; OBS_IP observes.
-        state.on_route_update(PEER_IP, announce(&["198.51.100.0/24"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["198.51.100.0/24"]));
 
         // Drain the initial advertisement so the channel is quiet.
-        let obs_rx = rxs.get_mut(&OBS_IP).unwrap();
+        let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
         // Unclean disconnect — stale marking should propagate to OBS_IP.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         // The observer must have received an UPDATE (withdrawal of the now-stale prefix).
         assert!(
@@ -14078,23 +15536,34 @@ mod test_gr_phase2 {
 
         let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
 
-        state.on_route_update(PEER_IP, announce(&["203.0.113.0/24", "203.0.113.1/32"]));
-        let obs_rx = rxs.get_mut(&OBS_IP).unwrap();
+        state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["203.0.113.0/24", "203.0.113.1/32"]),
+        );
+        let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
         // Unclean disconnect then re-establish.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         while obs_rx.try_recv().is_ok() {}
         establish_with_gr(&mut state, 120);
 
         // Peer only re-announces 203.0.113.0/24; 203.0.113.1/32 stays stale.
-        state.on_route_update(PEER_IP, announce(&["203.0.113.0/24"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["203.0.113.0/24"]));
         while obs_rx.try_recv().is_ok() {}
 
         // EOR triggers prune of 203.0.113.1/32.
-        state.on_route_update(PEER_IP, ipv4_eor());
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv4_eor());
 
         assert!(
             obs_rx.try_recv().is_ok(),
@@ -14115,19 +15584,27 @@ mod test_gr_phase2 {
 
         let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
 
-        state.on_route_update(PEER_IP, announce(&["192.0.2.0/24"]));
-        let obs_rx = rxs.get_mut(&OBS_IP).unwrap();
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["192.0.2.0/24"]));
+        let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
         // Unclean disconnect — GR window opens.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         while obs_rx.try_recv().is_ok() {}
 
         // Simulate deadline expiry.
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
 
         assert_eq!(
             state.rib.loc_rib.len(),
@@ -14184,7 +15661,7 @@ mod test_gr_phase2 {
     fn establish_with_gr_v6(state: &mut DaemonState, restart_time: u16) {
         let caps = gr_caps_v6(restart_time);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14213,21 +15690,21 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
 
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
         assert_eq!(
             state.rib.loc_rib_v6.len(),
             1,
             "v6 route must be in LocRib_v6"
         );
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         assert_eq!(
             state.rib.loc_rib_v6.len(),
             1,
             "v6 LocRib must be retained during GR window"
         );
-        assert!(state.gr.deadlines.contains_key(&PEER_IP));
+        assert!(state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)));
     }
 
     /// EOR prune on IPv6 must withdraw routes not re-announced before the
@@ -14239,20 +15716,20 @@ mod test_gr_phase2 {
         establish_with_gr_v6(&mut state, 120);
 
         state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
         );
         assert_eq!(state.rib.loc_rib_v6.len(), 2);
 
         // Unclean disconnect, then re-establish.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         establish_with_gr_v6(&mut state, 120);
 
         // Peer re-announces only 2001:db8:1::/48.
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:1::/48"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8:1::/48"]));
 
         // IPv6 EOR — 2001:db8:2::/48 was not refreshed, must be pruned.
-        state.on_route_update(PEER_IP, ipv6_eor());
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv6_eor());
 
         assert_eq!(
             state.rib.loc_rib_v6.len(),
@@ -14292,7 +15769,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -14301,17 +15778,17 @@ mod test_gr_phase2 {
             None,
         );
 
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:dead::/48"]));
-        let obs_rx = rxs.get_mut(&OBS_IP).unwrap();
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8:dead::/48"]));
+        let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
         // Unclean disconnect — GR window opens.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         while obs_rx.try_recv().is_ok() {}
 
         // Simulate deadline expiry.
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
 
         assert_eq!(
             state.rib.loc_rib_v6.len(),
@@ -14337,7 +15814,7 @@ mod test_gr_phase2 {
         // Establish both peers (only PEER_IP supports GR).
         establish_with_gr(&mut state, 120);
         state.on_established(
-            PEER2_IP,
+            IpAddr::V4(PEER2_IP),
             PEER2_IP,
             PeerType::External,
             PEER2_AS,
@@ -14347,9 +15824,9 @@ mod test_gr_phase2 {
         );
 
         // Both peers announce the same prefix; PEER_IP wins (lower IP address tie-breaker).
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         // Same attributes as PEER_IP — tie-breaker (lower peer IP) decides winner.
-        state.on_route_update(PEER2_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER2_IP), announce(&["10.0.0.0/8"]));
 
         let winner_before = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
         assert!(
@@ -14358,7 +15835,7 @@ mod test_gr_phase2 {
         );
 
         // PEER_IP disconnects uncleanly — its route is marked stale.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         // PEER2's fresh route must now be the best path.
         let best_after = state.rib.loc_rib.best(&nlri("10.0.0.0/8"));
@@ -14399,7 +15876,7 @@ mod test_gr_phase2 {
 
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14413,7 +15890,7 @@ mod test_gr_phase2 {
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         ];
         state.on_established(
-            COMPETING_IP,
+            IpAddr::V4(COMPETING_IP),
             COMPETING_IP,
             PeerType::External,
             COMPETING_AS,
@@ -14427,7 +15904,7 @@ mod test_gr_phase2 {
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         ];
         state.on_established(
-            OBSERVER_IP,
+            IpAddr::V4(OBSERVER_IP),
             OBSERVER_IP,
             PeerType::External,
             OBSERVER_AS,
@@ -14437,13 +15914,18 @@ mod test_gr_phase2 {
         );
 
         // Both PEER_IP and COMPETING_IP advertise the same v6 prefix.
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        state.on_route_update(COMPETING_IP, announce_v6(&["2001:db8::/32"]));
-        while rxs.get_mut(&OBSERVER_IP).unwrap().try_recv().is_ok() {}
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
+        state.on_route_update(IpAddr::V4(COMPETING_IP), announce_v6(&["2001:db8::/32"]));
+        while rxs
+            .get_mut(&IpAddr::V4(OBSERVER_IP))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // Unclean termination of PEER_IP — COMPETING_IP's route must now win and
         // repropagate_after_stale_mark_v6 must iterate over observer.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.flush_pending();
 
         // Observer should receive an UPDATE (re-announce from COMPETING_IP winning).
@@ -14471,7 +15953,7 @@ mod test_gr_phase2 {
 
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14485,7 +15967,7 @@ mod test_gr_phase2 {
             Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
         ];
         state.on_established(
-            OBSERVER_IP,
+            IpAddr::V4(OBSERVER_IP),
             OBSERVER_IP,
             PeerType::External,
             OBSERVER_AS,
@@ -14496,15 +15978,20 @@ mod test_gr_phase2 {
 
         // Announce two v6 prefixes.
         state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
         );
-        while rxs.get_mut(&OBSERVER_IP).unwrap().try_recv().is_ok() {}
+        while rxs
+            .get_mut(&IpAddr::V4(OBSERVER_IP))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // Unclean disconnect, then re-establish.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14512,16 +15999,26 @@ mod test_gr_phase2 {
             &peer_caps,
             None,
         );
-        while rxs.get_mut(&OBSERVER_IP).unwrap().try_recv().is_ok() {}
+        while rxs
+            .get_mut(&IpAddr::V4(OBSERVER_IP))
+            .unwrap()
+            .try_recv()
+            .is_ok()
+        {}
 
         // Peer re-announces only the first prefix, then sends EOR.
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:1::/48"]));
-        state.on_route_update(PEER_IP, ipv6_eor());
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8:1::/48"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv6_eor());
         state.flush_pending();
 
         // Observer must receive a WITHDRAW for the stale 2001:db8:2::/48.
-        let msgs: Vec<UpdateMessage> =
-            std::iter::from_fn(|| rxs.get_mut(&OBSERVER_IP).unwrap().try_recv().ok()).collect();
+        let msgs: Vec<UpdateMessage> = std::iter::from_fn(|| {
+            rxs.get_mut(&IpAddr::V4(OBSERVER_IP))
+                .unwrap()
+                .try_recv()
+                .ok()
+        })
+        .collect();
         let has_prune = msgs.iter().any(|m| {
             m.attributes.iter().any(|a| {
                 if let PathAttribute::MpUnreachNlri(u) = a {
@@ -14546,14 +16043,14 @@ mod test_gr_phase2 {
     fn prune_stale_nlri_skips_missing_adj_rib_in() {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         let stale_set = std::collections::HashSet::from([nlri]);
 
         // Remove adj_ribs_in so the `if let Some(ari)` branch is skipped.
-        state.adj_ribs_in.remove(&PEER_IP);
+        state.adj_ribs_in.remove(&IpAddr::V4(PEER_IP));
         // Must not panic.
-        state.prune_stale_nlri(PEER_IP, &stale_set);
+        state.prune_stale_nlri(IpAddr::V4(PEER_IP), &stale_set);
     }
 
     /// When observer's export policy is missing during `prune_stale_nlri`, the
@@ -14565,17 +16062,25 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         establish_with_gr(&mut state, 120);
 
         // Remove observer's export policy — defensive `continue` must fire.
-        state.export_policies.remove(&OBS_IP);
+        state.export_policies.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         let stale_set = std::collections::HashSet::from([nlri]);
-        state.prune_stale_nlri(PEER_IP, &stale_set);
+        state.prune_stale_nlri(IpAddr::V4(PEER_IP), &stale_set);
     }
 
     /// When the observer's update channel is closed during `prune_stale_nlri`,
@@ -14587,21 +16092,29 @@ mod test_gr_phase2 {
 
         let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         establish_with_gr(&mut state, 120);
         // Drop observer's receiver so the EOR prune send fails.
-        drop(rxs.remove(&OBS_IP).unwrap());
+        drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
         let stale_set = std::collections::HashSet::from([nlri]);
-        state.prune_stale_nlri(PEER_IP, &stale_set);
+        state.prune_stale_nlri(IpAddr::V4(PEER_IP), &stale_set);
 
         assert!(
-            state.take_stalled_peers().contains(&OBS_IP),
+            state.take_stalled_peers().contains(&IpAddr::V4(OBS_IP)),
             "stalled_peers must record observer when prune send fails"
         );
     }
@@ -14615,19 +16128,27 @@ mod test_gr_phase2 {
 
         let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         // Drop observer's receiver so the deadline expiry send fails.
-        drop(rxs.remove(&OBS_IP).unwrap());
+        drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
 
         assert!(
-            state.take_stalled_peers().contains(&OBS_IP),
+            state.take_stalled_peers().contains(&IpAddr::V4(OBS_IP)),
             "stalled_peers must record observer when deadline expiry send fails"
         );
     }
@@ -14640,7 +16161,7 @@ mod test_gr_phase2 {
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
         establish_with_gr(&mut state, 120);
         // No routes announced — stale_v4 will be empty.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         assert_eq!(state.rib.loc_rib.len(), 0);
     }
 
@@ -14653,7 +16174,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
         // No v6 routes announced — stale_v6 will be empty.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         assert_eq!(state.rib.loc_rib_v6.len(), 0);
     }
 
@@ -14666,10 +16187,10 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         let fib = with_recording_fib(&mut state);
         establish_with_gr_v6(&mut state, 120);
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
         fib.v6.lock().unwrap().clear();
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         let changes = fib.v6.lock().unwrap().clone();
         assert!(
@@ -14688,19 +16209,22 @@ mod test_gr_phase2 {
         establish_with_gr(&mut state, 120);
 
         // Announce two routes; only one will survive after re-establishment.
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.0.2.0/24"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["10.0.0.0/8", "192.0.2.0/24"]),
+        );
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         establish_with_gr(&mut state, 120);
         fib.v4.lock().unwrap().clear();
 
         // Re-announce only the first; EOR prunes the second.
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         let eor = UpdateMessage {
             withdrawn: vec![],
             attributes: vec![],
             announced: vec![],
         };
-        state.on_route_update(PEER_IP, eor);
+        state.on_route_update(IpAddr::V4(PEER_IP), eor);
 
         let changes = fib.v4_changes();
         assert!(
@@ -14722,7 +16246,7 @@ mod test_gr_phase2 {
 
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14731,12 +16255,12 @@ mod test_gr_phase2 {
             None,
         );
         state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
         );
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14746,8 +16270,8 @@ mod test_gr_phase2 {
         );
         fib.v6.lock().unwrap().clear();
 
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8:1::/48"]));
-        state.on_route_update(PEER_IP, ipv6_eor());
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8:1::/48"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), ipv6_eor());
 
         let changes = fib.v6.lock().unwrap().clone();
         assert!(
@@ -14770,13 +16294,21 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
         // Observer has NO v6 capability → not in ipv6_capable_peers.
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
 
         // Termination triggers repropagate_after_stale_mark_v6 which must skip OBS_IP.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         // Must not panic; stalled_peers must not include observer.
-        assert!(!state.take_stalled_peers().contains(&OBS_IP));
+        assert!(!state.take_stalled_peers().contains(&IpAddr::V4(OBS_IP)));
     }
 
     /// When the observer's adj_ribs_out_v6 is missing, repropagate_after_stale_mark_v6
@@ -14791,7 +16323,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -14799,10 +16331,10 @@ mod test_gr_phase2 {
             &obs_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
 
-        state.adj_ribs_out_v6.remove(&OBS_IP);
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.adj_ribs_out_v6.remove(&IpAddr::V4(OBS_IP));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
     }
 
     /// When the observer's update channel is closed during repropagate_v6,
@@ -14817,7 +16349,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -14825,14 +16357,14 @@ mod test_gr_phase2 {
             &obs_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
+        while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
-        drop(rxs.remove(&OBS_IP).unwrap());
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         assert!(
-            state.take_stalled_peers().contains(&OBS_IP),
+            state.take_stalled_peers().contains(&IpAddr::V4(OBS_IP)),
             "stalled_peers must include observer when v6 repropagate send fails"
         );
     }
@@ -14846,14 +16378,25 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         establish_with_gr(&mut state, 120);
 
-        state.adj_ribs_out.remove(&OBS_IP);
+        state.adj_ribs_out.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        state.prune_stale_nlri(PEER_IP, &std::collections::HashSet::from([nlri]));
+        state.prune_stale_nlri(
+            IpAddr::V4(PEER_IP),
+            &std::collections::HashSet::from([nlri]),
+        );
     }
 
     /// When `prune_stale_nlri_v6` encounters a peer without adj_ribs_in_v6, it must
@@ -14865,7 +16408,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14873,13 +16416,13 @@ mod test_gr_phase2 {
             &peer_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
 
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
         let stale_set = std::collections::HashSet::from([nlri]);
         // Remove adj_ribs_in_v6 so the `if let Some(ari_v6)` branch is skipped.
-        state.adj_ribs_in_v6.remove(&PEER_IP);
-        state.prune_stale_nlri_v6(PEER_IP, &stale_set);
+        state.adj_ribs_in_v6.remove(&IpAddr::V4(PEER_IP));
+        state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &stale_set);
     }
 
     /// When the v6 observer's update channel is closed during prune_stale_nlri_v6,
@@ -14894,7 +16437,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14903,7 +16446,7 @@ mod test_gr_phase2 {
             None,
         );
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -14912,14 +16455,14 @@ mod test_gr_phase2 {
             None,
         );
         state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             announce_v6(&["2001:db8:1::/48", "2001:db8:2::/48"]),
         );
-        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+        while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -14927,14 +16470,14 @@ mod test_gr_phase2 {
             &peer_caps,
             None,
         );
-        drop(rxs.remove(&OBS_IP).unwrap());
+        drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 
         let nlri: Nlri<Ipv6Addr> = "2001:db8:2::/48".parse().unwrap();
         let stale_set = std::collections::HashSet::from([nlri]);
-        state.prune_stale_nlri_v6(PEER_IP, &stale_set);
+        state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &stale_set);
 
         assert!(
-            state.take_stalled_peers().contains(&OBS_IP),
+            state.take_stalled_peers().contains(&IpAddr::V4(OBS_IP)),
             "stalled_peers must include observer when v6 prune send fails"
         );
     }
@@ -14948,11 +16491,19 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.adj_ribs_out.remove(&OBS_IP);
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.adj_ribs_out.remove(&IpAddr::V4(OBS_IP));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
     }
 
     /// When the observer's update_senders is missing, repropagate_after_stale_mark_v4
@@ -14964,11 +16515,19 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
-        state.update_senders.remove(&OBS_IP);
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.update_senders.remove(&IpAddr::V4(OBS_IP));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
     }
 
     /// When the observer's update_senders is missing in repropagate_after_stale_mark_v6,
@@ -14983,7 +16542,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         establish_with_gr_v6(&mut state, 120);
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -14991,10 +16550,10 @@ mod test_gr_phase2 {
             &obs_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
 
-        state.update_senders.remove(&OBS_IP);
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.update_senders.remove(&IpAddr::V4(OBS_IP));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
     }
 
     /// When the observer's update_senders is missing in prune_stale_nlri v4,
@@ -15006,14 +16565,25 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         establish_with_gr(&mut state, 120);
 
-        state.update_senders.remove(&OBS_IP);
+        state.update_senders.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        state.prune_stale_nlri(PEER_IP, &std::collections::HashSet::from([nlri]));
+        state.prune_stale_nlri(
+            IpAddr::V4(PEER_IP),
+            &std::collections::HashSet::from([nlri]),
+        );
     }
 
     /// When the observer's export_policy is missing in prune_stale_nlri_v6,
@@ -15028,7 +16598,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15037,7 +16607,7 @@ mod test_gr_phase2 {
             None,
         );
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -15045,10 +16615,10 @@ mod test_gr_phase2 {
             &obs_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15057,9 +16627,12 @@ mod test_gr_phase2 {
             None,
         );
 
-        state.export_policies.remove(&OBS_IP);
+        state.export_policies.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        state.prune_stale_nlri_v6(PEER_IP, &std::collections::HashSet::from([nlri]));
+        state.prune_stale_nlri_v6(
+            IpAddr::V4(PEER_IP),
+            &std::collections::HashSet::from([nlri]),
+        );
     }
 
     /// When the observer's adj_ribs_out_v6 is missing in prune_stale_nlri_v6,
@@ -15074,7 +16647,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15083,7 +16656,7 @@ mod test_gr_phase2 {
             None,
         );
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -15091,10 +16664,10 @@ mod test_gr_phase2 {
             &obs_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15103,9 +16676,12 @@ mod test_gr_phase2 {
             None,
         );
 
-        state.adj_ribs_out_v6.remove(&OBS_IP);
+        state.adj_ribs_out_v6.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        state.prune_stale_nlri_v6(PEER_IP, &std::collections::HashSet::from([nlri]));
+        state.prune_stale_nlri_v6(
+            IpAddr::V4(PEER_IP),
+            &std::collections::HashSet::from([nlri]),
+        );
     }
 
     /// When the observer's update_senders is missing in prune_stale_nlri_v6,
@@ -15120,7 +16696,7 @@ mod test_gr_phase2 {
         Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::ff".parse().unwrap());
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15129,7 +16705,7 @@ mod test_gr_phase2 {
             None,
         );
         state.on_established(
-            OBS_IP,
+            IpAddr::V4(OBS_IP),
             OBS_IP,
             PeerType::External,
             OBS_AS,
@@ -15137,10 +16713,10 @@ mod test_gr_phase2 {
             &obs_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15149,9 +16725,12 @@ mod test_gr_phase2 {
             None,
         );
 
-        state.update_senders.remove(&OBS_IP);
+        state.update_senders.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        state.prune_stale_nlri_v6(PEER_IP, &std::collections::HashSet::from([nlri]));
+        state.prune_stale_nlri_v6(
+            IpAddr::V4(PEER_IP),
+            &std::collections::HashSet::from([nlri]),
+        );
     }
 
     /// When the observer's export_policy is missing during deadline expiry,
@@ -15163,13 +16742,21 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        state.export_policies.remove(&OBS_IP);
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.export_policies.remove(&IpAddr::V4(OBS_IP));
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
     }
 
     /// When the observer's adj_ribs_out is missing during deadline expiry,
@@ -15181,13 +16768,21 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        state.adj_ribs_out.remove(&OBS_IP);
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.adj_ribs_out.remove(&IpAddr::V4(OBS_IP));
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
     }
 
     /// When the observer's update_senders is missing during deadline expiry,
@@ -15199,13 +16794,21 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        state.update_senders.remove(&OBS_IP);
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.update_senders.remove(&IpAddr::V4(OBS_IP));
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
     }
 
     /// When the observer's update channel is closed, `repropagate_after_stale_mark_v4`
@@ -15218,18 +16821,26 @@ mod test_gr_phase2 {
 
         let (mut state, mut rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
-        while rxs.get_mut(&OBS_IP).unwrap().try_recv().is_ok() {}
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+        while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
         // Drop the observer's receiver so the next send fails.
-        drop(rxs.remove(&OBS_IP).unwrap());
+        drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
         let stalled = state.take_stalled_peers();
         assert!(
-            stalled.contains(&OBS_IP),
+            stalled.contains(&IpAddr::V4(OBS_IP)),
             "stalled_peers must include observer when its channel is closed"
         );
     }
@@ -15243,13 +16854,21 @@ mod test_gr_phase2 {
 
         let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS), (OBS_IP, OBS_AS)]);
         establish_with_gr(&mut state, 120);
-        state.on_established(OBS_IP, OBS_IP, PeerType::External, OBS_AS, 90, &[], None);
-        state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"]));
+        state.on_established(
+            IpAddr::V4(OBS_IP),
+            OBS_IP,
+            PeerType::External,
+            OBS_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
 
         // Remove observer's export policy — defensive `continue` must fire.
-        state.export_policies.remove(&OBS_IP);
+        state.export_policies.remove(&IpAddr::V4(OBS_IP));
         // Must not panic.
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
     }
 
     /// When `fib_manager` is set and the GR deadline expires for a peer with v6
@@ -15263,7 +16882,7 @@ mod test_gr_phase2 {
 
         let peer_caps = gr_caps_v6(120);
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15271,12 +16890,12 @@ mod test_gr_phase2 {
             &peer_caps,
             None,
         );
-        state.on_route_update(PEER_IP, announce_v6(&["2001:db8::/32"]));
-        state.on_terminated(PEER_IP, TerminationReason::Unclean, true);
+        state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         fib.v6.lock().unwrap().clear();
 
-        state.gr.deadlines.remove(&PEER_IP);
-        state.on_gr_deadline_expired(PEER_IP);
+        state.gr.deadlines.remove(&IpAddr::V4(PEER_IP));
+        state.on_gr_deadline_expired(IpAddr::V4(PEER_IP));
 
         let changes = fib.v6.lock().unwrap().clone();
         assert!(
@@ -15288,11 +16907,302 @@ mod test_gr_phase2 {
     }
 }
 
+// ── IPv6-identified peer: route/policy/GR ────────────────────────────────────
+//
+// Every other IPv6-flavored test in this file (v6_tests, test_gr_phase2's own
+// IPv6 coverage, etc.) exercises IPv6 *NLRI* — a route whose prefix or
+// next-hop is an IPv6 address — carried by a peer whose own identity happens
+// to be an `Ipv4Addr`-shaped literal (just typed `IpAddr`, per the peer-
+// identity migration). None of them construct a peer whose identity is a
+// genuine `Ipv6Addr`. Since every peer-identity-keyed collection in
+// `DaemonState`/`RibSnapshot` is now `IpAddr`-keyed uniformly (no code path
+// pattern-matches on `IpAddr::V4` vs `V6` for peer identity), there's good
+// structural reason to expect this already works — these tests turn that
+// expectation into a verified fact for the three code paths a v6-transport
+// peer runs through as both an import source and an export destination: RIB
+// insertion + propagation, export-policy filtering, and RFC 4724 GR.
+
+#[cfg(test)]
+mod test_ipv6_peer_identity {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use pathvector_session::message::{
+        Capability, GracefulRestartFamily, PathAttribute, UpdateMessage,
+    };
+    use pathvector_session::transport::TerminationReason;
+    use pathvector_types::{AfiSafi, AsPath, Asn, Nlri, Origin, PeerType};
+
+    use super::*;
+    use crate::config;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn drain_all(receivers: &mut HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
+        for rx in receivers.values_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+    }
+
+    fn make_state(
+        local_as: u32,
+        peers: &[(IpAddr, u32)],
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+        for &(addr, _) in peers {
+            let (tx, rx) = mpsc::channel(64);
+            senders.insert(addr, tx);
+            receivers.insert(addr, rx);
+        }
+        let peer_configs: Vec<config::PeerConfig> = peers
+            .iter()
+            .map(|&(address, remote_as)| config::PeerConfig {
+                address,
+                port: 179,
+                remote_as,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+                connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
+                role: None,
+            })
+            .collect();
+        let state = DaemonState::new(
+            local_as,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+        (state, receivers)
+    }
+
+    fn announce(prefix: &str, origin_as: u32) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(origin_as)])),
+                PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
+            ],
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    /// A peer identified by a genuine `Ipv6Addr` (not an `Ipv4Addr` literal
+    /// wearing an `IpAddr` type) announces a route; it must be accepted into
+    /// LocRib and propagated to a second, v4-identified peer exactly as if
+    /// the source peer's transport were IPv4. Peer *transport* family and
+    /// NLRI family are independent — this proves the daemon doesn't
+    /// accidentally conflate them for the source side.
+    #[test]
+    fn route_from_ipv6_identified_peer_is_accepted_and_propagated() {
+        let peer_v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+        let peer_v4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let (mut state, mut receivers) = make_state(65001, &[(peer_v6, 65002), (peer_v4, 65003)]);
+
+        state.on_established(
+            peer_v6,
+            Ipv4Addr::new(10, 0, 0, 2), // BGP Identifier is always 4 bytes (RFC 6286)
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            peer_v4,
+            Ipv4Addr::new(10, 0, 0, 3),
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        drain_all(&mut receivers);
+
+        state.on_route_update(peer_v6, announce("192.0.2.0/24", 65002));
+        state.flush_pending();
+
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "route from the IPv6-identified peer must land in LocRib"
+        );
+
+        let msg = receivers
+            .get_mut(&peer_v4)
+            .unwrap()
+            .try_recv()
+            .expect("v4-identified peer should receive the propagated UPDATE");
+        assert_eq!(msg.announced, vec![nlri("192.0.2.0/24")]);
+    }
+
+    /// `export_default = "reject"` on an IPv6-identified peer must actually
+    /// block propagation to it, exactly as it would for a v4-identified
+    /// peer — proving export-policy enforcement doesn't silently bypass
+    /// itself for a v6 destination.
+    #[test]
+    fn export_reject_blocks_propagation_to_ipv6_identified_peer() {
+        let peer_v4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let peer_v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 3));
+
+        let peer_configs = vec![
+            config::PeerConfig {
+                address: peer_v4,
+                port: 179,
+                remote_as: 65002,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Accept),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+                connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
+                role: None,
+            },
+            config::PeerConfig {
+                address: peer_v6,
+                port: 179,
+                remote_as: 65003,
+                import_default: Some(config::ImportDefault::Accept),
+                export_default: Some(config::ExportDefault::Reject),
+                import_default_v6: None,
+                md5_password: None,
+                is_rr_client: false,
+                next_hop_self: false,
+                hold_time: None,
+                shutdown_message: None,
+                connect_retry_time: None,
+                max_prefixes_v4: None,
+                max_prefixes_v6: None,
+                max_prefixes_restart: None,
+                role: None,
+            },
+        ];
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+        for &addr in &[peer_v4, peer_v6] {
+            let (tx, rx) = mpsc::channel(64);
+            senders.insert(addr, tx);
+            receivers.insert(addr, rx);
+        }
+        let mut state = DaemonState::new(
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            None,
+            None,
+            &peer_configs,
+            senders,
+            vec![],
+        );
+
+        state.on_established(
+            peer_v4,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            peer_v6,
+            Ipv4Addr::new(10, 0, 0, 3),
+            PeerType::External,
+            65003,
+            90,
+            &[],
+            None,
+        );
+        drain_all(&mut receivers);
+
+        state.on_route_update(peer_v4, announce("198.51.100.0/24", 65002));
+        state.flush_pending();
+
+        assert!(
+            receivers.get_mut(&peer_v6).unwrap().try_recv().is_err(),
+            "export_default = reject must block propagation to the IPv6-identified peer"
+        );
+    }
+
+    /// RFC 4724 §4.2 — an unclean termination from a GR-capable peer whose
+    /// identity is IPv6 must retain routes in AdjRibIn/LocRib exactly as it
+    /// would for a v4-identified peer.
+    #[test]
+    fn unclean_termination_of_ipv6_identified_gr_peer_retains_routes() {
+        let peer_v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+        let (mut state, _rxs) = make_state(65001, &[(peer_v6, 65002)]);
+
+        let caps = vec![
+            Capability::FourByteAsn(65002),
+            Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    forwarding_preserved: false,
+                }],
+            },
+        ];
+        state.on_established(
+            peer_v6,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerType::External,
+            65002,
+            90,
+            &caps,
+            None,
+        );
+        state.on_route_update(peer_v6, announce("192.0.2.0/24", 65002));
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "route must be in LocRib before termination"
+        );
+
+        state.on_terminated(peer_v6, TerminationReason::Unclean, true);
+
+        assert!(
+            state.adj_ribs_in[&peer_v6]
+                .get(&nlri("192.0.2.0/24"))
+                .is_some(),
+            "AdjRibIn route must be retained during the GR window"
+        );
+        assert_eq!(
+            state.rib.loc_rib.len(),
+            1,
+            "LocRib route must be retained during the GR window"
+        );
+        assert!(
+            state.gr.deadlines.contains_key(&peer_v6),
+            "gr_deadlines must be armed for the IPv6-identified peer"
+        );
+    }
+}
+
 // ── RFC 8538: Notification Support for Graceful Restart ──────────────────────
 
 #[cfg(test)]
 mod test_rfc8538 {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use pathvector_session::message::{
         Capability, CeaseError, GracefulRestartFamily, NotificationError, NotificationMessage,
@@ -15339,7 +17249,7 @@ mod test_rfc8538 {
     fn make_state() -> DaemonState {
         let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
         let peer = config::PeerConfig {
-            address: PEER_IP,
+            address: IpAddr::V4(PEER_IP),
             port: 179,
             remote_as: PEER_AS,
             import_default: Some(config::ImportDefault::Accept),
@@ -15365,7 +17275,7 @@ mod test_rfc8538 {
             None,
             None,
             &[peer],
-            [(PEER_IP, tx)].into(),
+            [(IpAddr::V4(PEER_IP), tx)].into(),
             local_caps,
         )
     }
@@ -15386,7 +17296,7 @@ mod test_rfc8538 {
 
     fn establish(state: &mut DaemonState, caps: &[Capability]) {
         state.on_established(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             PEER_IP,
             PeerType::External,
             PEER_AS,
@@ -15414,19 +17324,19 @@ mod test_rfc8538 {
         // drives this — any non-zero gr_restart_time means we have the N-bit).
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
         assert_eq!(
-            state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"])),
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
             None,
             "unexpected CEASE on route announce"
         );
 
         // Peer sends a non-HardReset NOTIFICATION (e.g. Hold Timer Expired).
         let reason = notification(NotificationError::HoldTimerExpired);
-        state.on_terminated(PEER_IP, reason, false);
+        state.on_terminated(IpAddr::V4(PEER_IP), reason, false);
 
         // GR window must be open: stale route still present in AdjRibIn.
         let adj_len = state
             .adj_ribs_in
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .expect("AdjRibIn must still exist")
             .len();
         assert_eq!(
@@ -15436,7 +17346,7 @@ mod test_rfc8538 {
 
         // A GR deadline must be scheduled.
         assert!(
-            state.gr.deadlines.contains_key(&PEER_IP),
+            state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "GR deadline must be set after non-HardReset NOTIFICATION from N-capable peer"
         );
     }
@@ -15448,24 +17358,24 @@ mod test_rfc8538 {
         let mut state = make_state();
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
         assert_eq!(
-            state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"])),
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
             None,
             "unexpected CEASE on route announce"
         );
 
         let reason = notification(NotificationError::Cease(CeaseError::HardReset));
-        state.on_terminated(PEER_IP, reason, false);
+        state.on_terminated(IpAddr::V4(PEER_IP), reason, false);
 
         let adj_len = state
             .adj_ribs_in
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
             adj_len, 0,
             "CEASE/HardReset must flush routes immediately, even with N-bit"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "no GR deadline must be set after HardReset"
         );
     }
@@ -15478,25 +17388,25 @@ mod test_rfc8538 {
         // Peer has GR but NOT the N-bit.
         establish(&mut state, &[gr_cap_without_n_bit(120)]);
         assert_eq!(
-            state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"])),
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
             None,
             "unexpected CEASE on route announce"
         );
 
         // Non-HardReset notification, but peer didn't negotiate N-bit.
         let reason = notification(NotificationError::HoldTimerExpired);
-        state.on_terminated(PEER_IP, reason, false);
+        state.on_terminated(IpAddr::V4(PEER_IP), reason, false);
 
         let adj_len = state
             .adj_ribs_in
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
             adj_len, 0,
             "NOTIFICATION from non-N-capable peer must flush routes (RFC 4724 §4.2)"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "no GR deadline when peer has no N-bit"
         );
     }
@@ -15507,23 +17417,23 @@ mod test_rfc8538 {
         let mut state = make_state();
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
         assert_eq!(
-            state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"])),
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
             None,
             "unexpected CEASE on route announce"
         );
 
-        state.on_terminated(PEER_IP, TerminationReason::OperatorStop, false);
+        state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::OperatorStop, false);
 
         let adj_len = state
             .adj_ribs_in
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
             adj_len, 0,
             "OperatorStop must always flush routes immediately"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "no GR deadline on OperatorStop"
         );
     }
@@ -15586,7 +17496,10 @@ mod test_rfc8538 {
         let mut state = make_state();
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
         assert!(
-            state.gr.notification_capable_peers.contains(&PEER_IP),
+            state
+                .gr
+                .notification_capable_peers
+                .contains(&IpAddr::V4(PEER_IP)),
             "peer advertising N-bit must be in notification_capable_peers"
         );
     }
@@ -15597,7 +17510,10 @@ mod test_rfc8538 {
         let mut state = make_state();
         establish(&mut state, &[gr_cap_without_n_bit(120)]);
         assert!(
-            !state.gr.notification_capable_peers.contains(&PEER_IP),
+            !state
+                .gr
+                .notification_capable_peers
+                .contains(&IpAddr::V4(PEER_IP)),
             "peer without N-bit must not be in notification_capable_peers"
         );
     }
@@ -15607,12 +17523,20 @@ mod test_rfc8538 {
     fn n_bit_cleared_when_peer_re_establishes_without_it() {
         let mut state = make_state();
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
-        assert!(state.gr.notification_capable_peers.contains(&PEER_IP));
+        assert!(
+            state
+                .gr
+                .notification_capable_peers
+                .contains(&IpAddr::V4(PEER_IP))
+        );
 
         // Re-establish without N-bit.
         establish(&mut state, &[gr_cap_without_n_bit(120)]);
         assert!(
-            !state.gr.notification_capable_peers.contains(&PEER_IP),
+            !state
+                .gr
+                .notification_capable_peers
+                .contains(&IpAddr::V4(PEER_IP)),
             "N-bit tracking must be cleared when peer re-establishes without it"
         );
     }
@@ -15625,7 +17549,7 @@ mod test_rfc8538 {
     fn notification_flushes_when_local_daemon_has_no_gr() {
         let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
         let peer = config::PeerConfig {
-            address: PEER_IP,
+            address: IpAddr::V4(PEER_IP),
             port: 179,
             remote_as: PEER_AS,
             import_default: Some(config::ImportDefault::Accept),
@@ -15649,30 +17573,30 @@ mod test_rfc8538 {
             None,
             None,
             &[peer],
-            [(PEER_IP, tx)].into(),
+            [(IpAddr::V4(PEER_IP), tx)].into(),
             build_local_capabilities(LOCAL_AS, 0, false, None),
         );
         // Peer advertises N-bit, but we don't → notification mode must NOT engage.
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
         assert_eq!(
-            state.on_route_update(PEER_IP, announce(&["10.0.0.0/8"])),
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
             None,
             "unexpected CEASE on announce"
         );
 
         let reason = notification(NotificationError::HoldTimerExpired);
-        state.on_terminated(PEER_IP, reason, false);
+        state.on_terminated(IpAddr::V4(PEER_IP), reason, false);
 
         let adj_len = state
             .adj_ribs_in
-            .get(&PEER_IP)
+            .get(&IpAddr::V4(PEER_IP))
             .map_or(0, pathvector_rib::AdjRibIn::len);
         assert_eq!(
             adj_len, 0,
             "NOTIFICATION must flush when local daemon has no N-bit (graceful_restart_time = 0)"
         );
         assert!(
-            !state.gr.deadlines.contains_key(&PEER_IP),
+            !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "no GR deadline when local daemon has no N-bit"
         );
     }
@@ -15682,10 +17606,18 @@ mod test_rfc8538 {
     fn n_bit_cleared_on_remove_peer() {
         let mut state = make_state();
         establish(&mut state, &[gr_cap_with_n_bit(120)]);
-        assert!(state.gr.notification_capable_peers.contains(&PEER_IP));
-        state.remove_peer(PEER_IP);
         assert!(
-            !state.gr.notification_capable_peers.contains(&PEER_IP),
+            state
+                .gr
+                .notification_capable_peers
+                .contains(&IpAddr::V4(PEER_IP))
+        );
+        state.remove_peer(IpAddr::V4(PEER_IP));
+        assert!(
+            !state
+                .gr
+                .notification_capable_peers
+                .contains(&IpAddr::V4(PEER_IP)),
             "N-bit tracking must be cleared on remove_peer"
         );
     }
@@ -15696,7 +17628,7 @@ mod test_rfc8538 {
 #[cfg(test)]
 mod test_max_prefix {
     use std::collections::HashMap;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use pathvector_session::fsm::SessionInfo;
     use pathvector_session::message::{
@@ -15719,15 +17651,12 @@ mod test_max_prefix {
     fn make_state_with_limit(
         limit: u32,
         restart_secs: u16,
-    ) -> (
-        DaemonState,
-        HashMap<Ipv4Addr, mpsc::Receiver<UpdateMessage>>,
-    ) {
+    ) -> (DaemonState, HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>) {
         let (tx, rx) = mpsc::channel::<UpdateMessage>(256);
         let mut receivers = HashMap::new();
-        receivers.insert(PEER_IP, rx);
+        receivers.insert(IpAddr::V4(PEER_IP), rx);
         let peer_configs = vec![config::PeerConfig {
-            address: PEER_IP,
+            address: IpAddr::V4(PEER_IP),
             port: 179,
             remote_as: PEER_AS,
             import_default: Some(config::ImportDefault::Accept),
@@ -15749,7 +17678,7 @@ mod test_max_prefix {
             role: None,
         }];
         let mut senders = HashMap::new();
-        senders.insert(PEER_IP, tx);
+        senders.insert(IpAddr::V4(PEER_IP), tx);
         let state = DaemonState::new(
             LOCAL_AS,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -15763,7 +17692,15 @@ mod test_max_prefix {
     }
 
     fn establish(state: &mut DaemonState) {
-        state.on_established(PEER_IP, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(PEER_IP),
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
     }
 
     fn announce(prefixes: &[&str]) -> UpdateMessage {
@@ -15783,7 +17720,10 @@ mod test_max_prefix {
     fn no_cease_when_under_limit() {
         let (mut state, _rxs) = make_state_with_limit(5, 0);
         establish(&mut state);
-        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        let result = state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["10.0.0.0/8", "192.168.0.0/24"]),
+        );
         assert!(
             result.is_none(),
             "no notification expected when prefix count is below the limit"
@@ -15795,7 +17735,10 @@ mod test_max_prefix {
     fn no_cease_at_exact_limit() {
         let (mut state, _rxs) = make_state_with_limit(2, 0);
         establish(&mut state);
-        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        let result = state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["10.0.0.0/8", "192.168.0.0/24"]),
+        );
         assert!(
             result.is_none(),
             "no notification expected when prefix count equals the limit"
@@ -15808,7 +17751,7 @@ mod test_max_prefix {
         let (mut state, _rxs) = make_state_with_limit(2, 0);
         establish(&mut state);
         let result = state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             announce(&["10.0.0.0/8", "192.168.0.0/24", "172.16.0.0/12"]),
         );
         let notification =
@@ -15827,13 +17770,16 @@ mod test_max_prefix {
     fn idle_hold_inserted_when_restart_configured() {
         let (mut state, _rxs) = make_state_with_limit(1, 60);
         establish(&mut state);
-        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        let result = state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["10.0.0.0/8", "192.168.0.0/24"]),
+        );
         assert!(result.is_some(), "CEASE must be returned");
         assert!(
-            state.max_prefix_idle.contains_key(&PEER_IP),
+            state.max_prefix_idle.contains_key(&IpAddr::V4(PEER_IP)),
             "max_prefix_idle must be set for the peer when restart_secs > 0"
         );
-        let deadline = state.max_prefix_idle[&PEER_IP];
+        let deadline = state.max_prefix_idle[&IpAddr::V4(PEER_IP)];
         assert!(deadline > Instant::now(), "deadline must be in the future");
     }
 
@@ -15842,10 +17788,13 @@ mod test_max_prefix {
     fn no_idle_hold_without_restart() {
         let (mut state, _rxs) = make_state_with_limit(1, 0);
         establish(&mut state);
-        let result = state.on_route_update(PEER_IP, announce(&["10.0.0.0/8", "192.168.0.0/24"]));
+        let result = state.on_route_update(
+            IpAddr::V4(PEER_IP),
+            announce(&["10.0.0.0/8", "192.168.0.0/24"]),
+        );
         assert!(result.is_some(), "CEASE must be returned");
         assert!(
-            !state.max_prefix_idle.contains_key(&PEER_IP),
+            !state.max_prefix_idle.contains_key(&IpAddr::V4(PEER_IP)),
             "max_prefix_idle must NOT be set when max_prefixes_restart is not configured"
         );
     }
@@ -15855,7 +17804,7 @@ mod test_max_prefix {
     fn no_limit_when_unconfigured() {
         let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
         let peer_configs = vec![config::PeerConfig {
-            address: PEER_IP,
+            address: IpAddr::V4(PEER_IP),
             port: 179,
             remote_as: PEER_AS,
             import_default: Some(config::ImportDefault::Accept),
@@ -15873,7 +17822,7 @@ mod test_max_prefix {
             role: None,
         }];
         let mut senders = HashMap::new();
-        senders.insert(PEER_IP, tx);
+        senders.insert(IpAddr::V4(PEER_IP), tx);
         let mut state = DaemonState::new(
             LOCAL_AS,
             Ipv4Addr::new(10, 0, 0, 1),
@@ -15887,7 +17836,7 @@ mod test_max_prefix {
         // Send 100 prefixes — no limit should fire.
         let prefixes: Vec<String> = (0u8..100).map(|i| format!("10.{i}.0.0/24")).collect();
         let prefix_strs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let result = state.on_route_update(PEER_IP, announce(&prefix_strs));
+        let result = state.on_route_update(IpAddr::V4(PEER_IP), announce(&prefix_strs));
         assert!(
             result.is_none(),
             "no limit when max_prefixes is not configured"
@@ -15899,7 +17848,7 @@ mod test_max_prefix {
     fn add_peer_populates_max_prefix_maps() {
         let (tx, _rx) = mpsc::channel::<UpdateMessage>(256);
         let peer_cfg = config::PeerConfig {
-            address: PEER_IP,
+            address: IpAddr::V4(PEER_IP),
             port: 179,
             remote_as: PEER_AS,
             import_default: None,
@@ -15926,10 +17875,25 @@ mod test_max_prefix {
             vec![],
         );
         state.add_peer(&peer_cfg, tx);
-        assert_eq!(state.peer_max_prefixes_v4.get(&PEER_IP).copied(), Some(50));
-        assert_eq!(state.peer_max_prefixes_v6.get(&PEER_IP).copied(), Some(200));
         assert_eq!(
-            state.peer_max_prefixes_restart.get(&PEER_IP).copied(),
+            state
+                .peer_max_prefixes_v4
+                .get(&IpAddr::V4(PEER_IP))
+                .copied(),
+            Some(50)
+        );
+        assert_eq!(
+            state
+                .peer_max_prefixes_v6
+                .get(&IpAddr::V4(PEER_IP))
+                .copied(),
+            Some(200)
+        );
+        assert_eq!(
+            state
+                .peer_max_prefixes_restart
+                .get(&IpAddr::V4(PEER_IP))
+                .copied(),
             Some(30)
         );
     }
@@ -15942,7 +17906,7 @@ mod test_max_prefix {
         establish(&mut state);
         // Trigger idle-hold by exceeding limit.
         state.on_route_update(
-            PEER_IP,
+            IpAddr::V4(PEER_IP),
             announce(&[
                 "10.0.0.0/8",
                 "192.168.0.0/24",
@@ -15958,24 +17922,30 @@ mod test_max_prefix {
             ]),
         );
         // max_prefix_idle should now be set.
-        assert!(state.max_prefix_idle.contains_key(&PEER_IP));
+        assert!(state.max_prefix_idle.contains_key(&IpAddr::V4(PEER_IP)));
 
-        state.remove_peer(PEER_IP);
+        state.remove_peer(IpAddr::V4(PEER_IP));
 
         assert!(
-            !state.peer_max_prefixes_v4.contains_key(&PEER_IP),
+            !state
+                .peer_max_prefixes_v4
+                .contains_key(&IpAddr::V4(PEER_IP)),
             "peer_max_prefixes_v4 cleared"
         );
         assert!(
-            !state.peer_max_prefixes_v6.contains_key(&PEER_IP),
+            !state
+                .peer_max_prefixes_v6
+                .contains_key(&IpAddr::V4(PEER_IP)),
             "peer_max_prefixes_v6 cleared"
         );
         assert!(
-            !state.peer_max_prefixes_restart.contains_key(&PEER_IP),
+            !state
+                .peer_max_prefixes_restart
+                .contains_key(&IpAddr::V4(PEER_IP)),
             "peer_max_prefixes_restart cleared"
         );
         assert!(
-            !state.max_prefix_idle.contains_key(&PEER_IP),
+            !state.max_prefix_idle.contains_key(&IpAddr::V4(PEER_IP)),
             "max_prefix_idle cleared"
         );
         drop(tx); // silence unused variable warning
@@ -16000,12 +17970,12 @@ mod test_max_prefix {
 
     type EventLoopFixture = (
         Arc<RwLock<DaemonState>>,
-        Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+        Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
         mpsc::Receiver<SessionCommand>,
     );
 
     fn make_state_for_loop(
-        peer_ip: Ipv4Addr,
+        peer_ip: IpAddr,
         peer_as: u32,
         limit: u32,
         restart_secs: u16,
@@ -16056,10 +18026,11 @@ mod test_max_prefix {
     #[tokio::test]
     async fn event_loop_sends_cease_when_limit_exceeded() {
         let peer_ip = PEER_IP;
-        let (state, stop_senders, mut stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 2, 0);
+        let (state, stop_senders, mut stop_rx) =
+            make_state_for_loop(IpAddr::V4(peer_ip), PEER_AS, 2, 0);
 
         state.write().await.on_established(
-            peer_ip,
+            IpAddr::V4(peer_ip),
             peer_ip,
             PeerType::External,
             PEER_AS,
@@ -16072,7 +18043,7 @@ mod test_max_prefix {
         // 3 prefixes exceed limit of 2.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::RouteUpdate(announce(&[
                     "10.0.0.0/8",
                     "192.168.0.0/24",
@@ -16114,10 +18085,11 @@ mod test_max_prefix {
     #[tokio::test]
     async fn over_limit_routes_flushed_after_termination() {
         let peer_ip = PEER_IP;
-        let (state, stop_senders, _stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 2, 0);
+        let (state, stop_senders, _stop_rx) =
+            make_state_for_loop(IpAddr::V4(peer_ip), PEER_AS, 2, 0);
 
         state.write().await.on_established(
-            peer_ip,
+            IpAddr::V4(peer_ip),
             peer_ip,
             PeerType::External,
             PEER_AS,
@@ -16130,7 +18102,7 @@ mod test_max_prefix {
         // 3 prefixes exceed limit of 2.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::RouteUpdate(announce(&[
                     "10.0.0.0/8",
                     "192.168.0.0/24",
@@ -16142,7 +18114,7 @@ mod test_max_prefix {
         // Session layer responds to CEASE with a Terminated event.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::Terminated(TerminationReason::OperatorStop),
             ))
             .await
@@ -16171,10 +18143,11 @@ mod test_max_prefix {
     async fn event_loop_idle_hold_blocks_reconnect() {
         let peer_ip = PEER_IP;
         // 300-second idle-hold so it does not expire during the test.
-        let (state, stop_senders, mut stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 1, 300);
+        let (state, stop_senders, mut stop_rx) =
+            make_state_for_loop(IpAddr::V4(peer_ip), PEER_AS, 1, 300);
 
         state.write().await.on_established(
-            peer_ip,
+            IpAddr::V4(peer_ip),
             peer_ip,
             PeerType::External,
             PEER_AS,
@@ -16187,7 +18160,7 @@ mod test_max_prefix {
         // 2 prefixes exceed limit of 1 → CEASE + idle-hold inserted.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::RouteUpdate(announce(&["10.0.0.0/8", "192.168.0.0/24"])),
             ))
             .await
@@ -16195,7 +18168,7 @@ mod test_max_prefix {
         // Session terminates.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::Terminated(TerminationReason::OperatorStop),
             ))
             .await
@@ -16203,7 +18176,7 @@ mod test_max_prefix {
         // Peer reconnects immediately — must be blocked.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::Established(peer_established_info(PEER_AS)),
             ))
             .await
@@ -16244,7 +18217,7 @@ mod test_max_prefix {
         // Peer must not be established (no peer_type entry).
         let s = state.read().await;
         assert!(
-            !s.rib.peer_types.contains_key(&peer_ip),
+            !s.rib.peer_types.contains_key(&IpAddr::V4(peer_ip)),
             "peer must not be established while idle-hold is active"
         );
     }
@@ -16259,13 +18232,18 @@ mod test_max_prefix {
     #[tokio::test]
     async fn event_loop_idle_hold_timer_clears_expired_deadline() {
         let peer_ip = PEER_IP;
-        let (state, stop_senders, _stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 100, 0);
+        let (state, stop_senders, _stop_rx) =
+            make_state_for_loop(IpAddr::V4(peer_ip), PEER_AS, 100, 0);
 
         // Insert an idle-hold deadline that is already in the past.
         let expired = Instant::now()
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap();
-        state.write().await.max_prefix_idle.insert(peer_ip, expired);
+        state
+            .write()
+            .await
+            .max_prefix_idle
+            .insert(IpAddr::V4(peer_ip), expired);
 
         // Run the event loop with a single no-op event then close the channel.
         // The loop will see both the expired timer and the closed channel on
@@ -16284,13 +18262,22 @@ mod test_max_prefix {
         // Give the spawned loop time to enter select! and fire the timer.
         for _ in 0..20 {
             tokio::task::yield_now().await;
-            if !state.read().await.max_prefix_idle.contains_key(&peer_ip) {
+            if !state
+                .read()
+                .await
+                .max_prefix_idle
+                .contains_key(&IpAddr::V4(peer_ip))
+            {
                 break;
             }
         }
 
         assert!(
-            !state.read().await.max_prefix_idle.contains_key(&peer_ip),
+            !state
+                .read()
+                .await
+                .max_prefix_idle
+                .contains_key(&IpAddr::V4(peer_ip)),
             "timer branch must remove an expired idle-hold deadline"
         );
 
@@ -16303,10 +18290,11 @@ mod test_max_prefix {
     #[tokio::test]
     async fn event_loop_idle_hold_blocks_reconnect_in_drain_loop() {
         let peer_ip = PEER_IP;
-        let (state, stop_senders, mut stop_rx) = make_state_for_loop(peer_ip, PEER_AS, 1, 300);
+        let (state, stop_senders, mut stop_rx) =
+            make_state_for_loop(IpAddr::V4(peer_ip), PEER_AS, 1, 300);
 
         state.write().await.on_established(
-            peer_ip,
+            IpAddr::V4(peer_ip),
             peer_ip,
             PeerType::External,
             PEER_AS,
@@ -16321,21 +18309,21 @@ mod test_max_prefix {
         // in the try_recv drain. The Established arrives in the drain loop.
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::RouteUpdate(announce(&["10.0.0.0/8", "192.168.0.0/24"])),
             ))
             .await
             .unwrap();
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::Terminated(TerminationReason::OperatorStop),
             ))
             .await
             .unwrap();
         event_tx
             .send((
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 SessionEvent::Established(peer_established_info(PEER_AS)),
             ))
             .await
@@ -16378,7 +18366,12 @@ mod test_max_prefix {
             "peer must receive Stop for reconnect during idle-hold (drain-loop path)"
         );
         assert!(
-            !state.read().await.rib.peer_types.contains_key(&peer_ip),
+            !state
+                .read()
+                .await
+                .rib
+                .peer_types
+                .contains_key(&IpAddr::V4(peer_ip)),
             "peer must not be established while idle-hold is active"
         );
     }
@@ -16397,19 +18390,19 @@ mod test_max_prefix {
     const AS_A: u32 = 65100;
     const AS_B: u32 = 65200;
 
-    fn announce_from(peer_ip: Ipv4Addr, peer_as: u32, prefixes: &[&str]) -> UpdateMessage {
+    fn announce_from(peer_ip: IpAddr, peer_as: u32, prefixes: &[&str]) -> UpdateMessage {
         UpdateMessage {
             withdrawn: vec![],
             attributes: vec![
                 PathAttribute::Origin(Origin::Igp),
                 PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(peer_as)])),
-                PathAttribute::NextHop(peer_ip),
+                PathAttribute::NextHop(must_v4(peer_ip)),
             ],
             announced: prefixes.iter().map(|s| nlri(s)).collect(),
         }
     }
 
-    fn peer_cfg(address: Ipv4Addr, remote_as: u32, v4_limit: Option<u32>) -> config::PeerConfig {
+    fn peer_cfg(address: IpAddr, remote_as: u32, v4_limit: Option<u32>) -> config::PeerConfig {
         config::PeerConfig {
             address,
             port: 179,
@@ -16438,8 +18431,8 @@ mod test_max_prefix {
         let (tx_a, rx_a) = tokio::sync::mpsc::channel::<UpdateMessage>(256);
         let (tx_b, rx_b) = tokio::sync::mpsc::channel::<UpdateMessage>(256);
         let mut senders = HashMap::new();
-        senders.insert(PEER_A, tx_a);
-        senders.insert(PEER_B, tx_b);
+        senders.insert(IpAddr::V4(PEER_A), tx_a);
+        senders.insert(IpAddr::V4(PEER_B), tx_b);
 
         let mut state = DaemonState::new(
             LOCAL_AS,
@@ -16447,14 +18440,30 @@ mod test_max_prefix {
             None,
             None,
             &[
-                peer_cfg(PEER_A, AS_A, None),
-                peer_cfg(PEER_B, AS_B, Some(1)),
+                peer_cfg(IpAddr::V4(PEER_A), AS_A, None),
+                peer_cfg(IpAddr::V4(PEER_B), AS_B, Some(1)),
             ],
             senders,
             vec![],
         );
-        state.on_established(PEER_A, PEER_A, PeerType::External, AS_A, 90, &[], None);
-        state.on_established(PEER_B, PEER_B, PeerType::External, AS_B, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(PEER_A),
+            PEER_A,
+            PeerType::External,
+            AS_A,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(PEER_B),
+            PEER_B,
+            PeerType::External,
+            AS_B,
+            90,
+            &[],
+            None,
+        );
         (state, rx_a, rx_b)
     }
 
@@ -16473,7 +18482,10 @@ mod test_max_prefix {
         let peer_a_id = PeerId::new(IpAddr::V4(PEER_A));
 
         // Step 1: Peer A owns 10.0.0.0/8.
-        let r = state.on_route_update(PEER_A, announce_from(PEER_A, AS_A, &["10.0.0.0/8"]));
+        let r = state.on_route_update(
+            IpAddr::V4(PEER_A),
+            announce_from(IpAddr::V4(PEER_A), AS_A, &["10.0.0.0/8"]),
+        );
         assert!(r.is_none(), "Peer A must not trigger a CEASE");
         assert_eq!(
             state.rib.loc_rib.best_peer(&shared),
@@ -16485,8 +18497,8 @@ mod test_max_prefix {
         // handle_update runs fully — LocRib may swap best path to Peer B —
         // but on_route_update returns CEASE without applying FIB changes.
         let r = state.on_route_update(
-            PEER_B,
-            announce_from(PEER_B, AS_B, &["10.0.0.0/8", "192.168.0.0/24"]),
+            IpAddr::V4(PEER_B),
+            announce_from(IpAddr::V4(PEER_B), AS_B, &["10.0.0.0/8", "192.168.0.0/24"]),
         );
         assert!(
             r.as_ref().is_some_and(|n| matches!(
@@ -16497,7 +18509,7 @@ mod test_max_prefix {
         );
 
         // Step 3: Terminate Peer B. LocRib must revert fully to Peer A's world.
-        state.on_terminated(PEER_B, TerminationReason::OperatorStop, true);
+        state.on_terminated(IpAddr::V4(PEER_B), TerminationReason::OperatorStop, true);
 
         assert_eq!(
             state.rib.loc_rib.best_peer(&shared),
@@ -16508,7 +18520,10 @@ mod test_max_prefix {
             state.rib.loc_rib.best_peer(&b_only).is_none(),
             "192.168.0.0/24 must be absent — Peer B was the only contributor"
         );
-        let adj_b = state.adj_ribs_in.get(&PEER_B).map_or(0, AdjRibIn::len);
+        let adj_b = state
+            .adj_ribs_in
+            .get(&IpAddr::V4(PEER_B))
+            .map_or(0, AdjRibIn::len);
         assert_eq!(adj_b, 0, "Peer B AdjRibIn must be empty after termination");
     }
 
@@ -16522,10 +18537,10 @@ mod test_max_prefix {
         let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
         let (tx, _rx) = tokio::sync::mpsc::channel::<UpdateMessage>(256);
         let mut senders = HashMap::new();
-        senders.insert(peer_ip, tx);
+        senders.insert(IpAddr::V4(peer_ip), tx);
 
         let cfg = config::PeerConfig {
-            address: peer_ip,
+            address: IpAddr::V4(peer_ip),
             port: 179,
             remote_as: 65099,
             import_default: None,
@@ -16551,7 +18566,15 @@ mod test_max_prefix {
             senders,
             vec![],
         );
-        state.on_established(peer_ip, peer_ip, PeerType::External, 65099, 90, &[], None);
+        state.on_established(
+            IpAddr::V4(peer_ip),
+            peer_ip,
+            PeerType::External,
+            65099,
+            90,
+            &[],
+            None,
+        );
 
         let v6_nh: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let pfx1: Nlri<std::net::Ipv6Addr> = "2001:db8::/32".parse().unwrap();
@@ -16571,7 +18594,7 @@ mod test_max_prefix {
             announced: vec![],
         };
 
-        let result = state.on_route_update(peer_ip, update);
+        let result = state.on_route_update(IpAddr::V4(peer_ip), update);
         assert!(
             result.as_ref().is_some_and(|n| matches!(
                 n.error,
@@ -16581,7 +18604,10 @@ mod test_max_prefix {
         );
         // The UPDATE carried no IPv4 NLRI, so the IPv4 Adj-RIB-In must be
         // empty — confirming the limits are checked independently, not combined.
-        let v4_count = state.adj_ribs_in.get(&peer_ip).map_or(0, AdjRibIn::len);
+        let v4_count = state
+            .adj_ribs_in
+            .get(&IpAddr::V4(peer_ip))
+            .map_or(0, AdjRibIn::len);
         assert_eq!(
             v4_count, 0,
             "IPv4 Adj-RIB-In must be empty when only IPv6 prefixes were sent"

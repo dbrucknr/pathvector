@@ -164,11 +164,15 @@ _build-gobgpd-image:
         .
 
 # Build the pathvectord test image (multi-stage Rust build inside Docker).
+# Shares its builder stage with the three mock-* images below (all four
+# binaries are compiled in one `cargo build` — see Dockerfile.pathvectord's
+# header comment), so build this one first for the others to reuse its cache.
 _build-pathvectord-image:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building pathvector-e2e:latest..."
     docker build \
+        --target pathvectord \
         -f pathvector-e2e/Dockerfile.pathvectord \
         -t pathvector-e2e:latest \
         .
@@ -192,28 +196,45 @@ _build-frr-image:
         -t pathvector-frr-test:latest \
         pathvector-e2e/
 
-# Build the mock RTR server test image (multi-stage Rust build, like pathvectord's).
+# Build the mock RTR server test image — shares Dockerfile.pathvectord's
+# builder stage, so this reuses the compile from _build-pathvectord-image
+# almost for free instead of recompiling the workspace.
 _build-mock-rtr-image:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building pathvector-mock-rtr-test:latest..."
     docker build \
-        -f pathvector-e2e/Dockerfile.mock-rtr \
+        --target mock-rtr \
+        -f pathvector-e2e/Dockerfile.pathvectord \
         -t pathvector-mock-rtr-test:latest \
         .
 
-# Build the mock BGP peer test image (multi-stage Rust build, like pathvectord's).
+# Build the mock BGP peer test image — shares Dockerfile.pathvectord's
+# builder stage (see _build-mock-rtr-image).
 _build-mock-bgp-peer-image:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building pathvector-mock-bgp-peer-test:latest..."
     docker build \
-        -f pathvector-e2e/Dockerfile.mock-bgp-peer \
+        --target mock-bgp-peer \
+        -f pathvector-e2e/Dockerfile.pathvectord \
         -t pathvector-mock-bgp-peer-test:latest \
         .
 
+# Build the mock BGP dialer test image — shares Dockerfile.pathvectord's
+# builder stage (see _build-mock-rtr-image).
+_build-mock-bgp-dialer-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-mock-bgp-dialer-test:latest..."
+    docker build \
+        --target mock-bgp-dialer \
+        -f pathvector-e2e/Dockerfile.pathvectord \
+        -t pathvector-mock-bgp-dialer-test:latest \
+        .
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image _build-mock-bgp-dialer-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge

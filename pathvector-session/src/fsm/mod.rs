@@ -5,7 +5,7 @@
 //! The FSM holds no timers, no sockets, and performs no I/O — the transport
 //! layer owns those resources and drives the FSM.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use pathvector_types::PeerType;
@@ -136,7 +136,9 @@ pub struct SessionInfo {
     ///
     /// Set by the transport layer from `TcpStream::local_addr()` at connect
     /// time. `None` for injected (test) transports that bypass real TCP.
-    pub local_addr: Option<Ipv4Addr>,
+    /// Carries the full address family (v4 or v6, matching the session's own
+    /// transport) — the daemon decides how to use it per address family.
+    pub local_addr: Option<IpAddr>,
 }
 
 // ── States ────────────────────────────────────────────────────────────────────
