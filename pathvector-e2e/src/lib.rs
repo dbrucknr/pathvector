@@ -30,7 +30,7 @@
 
 use std::{
     io::Write as _,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
@@ -319,6 +319,37 @@ pub fn container_network_ip(container_id: &str, network: &str) -> Ipv4Addr {
     ip_str
         .parse()
         .unwrap_or_else(|_| panic!("docker inspect returned non-IPv4 address: {ip_str:?}"))
+}
+
+/// Returns the global-scope IPv6 address assigned to `container_id` on
+/// `network`.
+///
+/// Only meaningful for a network created with [`DockerNetwork::create_with_ipv6`]
+/// and an explicit `--subnet`: Docker assigns a routable address in that
+/// subnet (`GlobalIPv6Address`) in addition to the kernel-autoconfigured
+/// `fe80::` link-local address that every container on an `--ipv6` bridge
+/// gets regardless of subnet config (see [`Harness::gobgp_link_local_v6`]).
+/// Use this address (not the link-local one) as a peer's transport address —
+/// dialing a link-local destination requires a zone/interface index that a
+/// plain `TcpStream::connect` can't express.
+///
+/// # Panics
+///
+/// Panics if `docker inspect` fails or the output is not a valid IPv6 address.
+#[must_use]
+pub fn container_network_ipv6(container_id: &str, network: &str) -> Ipv6Addr {
+    let fmt = format!(r#"{{{{(index .NetworkSettings.Networks "{network}").GlobalIPv6Address}}}}"#);
+    let output = Command::new("docker")
+        .args(["inspect", container_id, "--format", &fmt])
+        .output()
+        .expect("docker inspect");
+    let ip_str = std::str::from_utf8(&output.stdout)
+        .expect("docker inspect output is UTF-8")
+        .trim()
+        .to_owned();
+    ip_str
+        .parse()
+        .unwrap_or_else(|_| panic!("docker inspect returned non-IPv6 address: {ip_str:?}"))
 }
 
 // ── Config generation ─────────────────────────────────────────────────────────
