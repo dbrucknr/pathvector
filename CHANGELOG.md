@@ -4,6 +4,40 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-05 (native IPv6 BGP transport)
+
+### [pathvectord] Peers can now be configured with an IPv6 transport address
+
+Closes the `TODO.md` "IPv6 BGP transport" gap — distinct from IPv6 *NLRI*
+(MP_REACH_NLRI over an IPv4 session), which already worked. `PeerConfig`,
+`DaemonState`'s ~40 peer-identity-keyed collections (`RibSnapshot`,
+`import_policies`/`export_policies`, capability/role maps, GR state,
+stalled/pending-removal sets, prefix counters), `DaemonCommand::RemovePeer`,
+and the gRPC `PeerService`/`PolicyService` handlers (`get_peer`, `add_peer`,
+`remove_peer`, `soft_reset`, `set_import_default`, `set_export_default`,
+the `list_routes`/`watch_routes` peer filter) all migrated from `Ipv4Addr` to
+`IpAddr`. The BGP listener already binds both `0.0.0.0:<port>` and
+`[::]:<port>` unconditionally (prior work); this closes the gap between that
+listener and the rest of the daemon actually treating an IPv6 peer identity
+correctly end to end.
+
+`peer_bgp_ids`/`local_bgp_id`/ORIGINATOR_ID remain `Ipv4Addr` throughout —
+the BGP Identifier is always 4 bytes regardless of transport family, per
+RFC 4271/6286.
+
+New e2e test `pathvector-e2e/tests/ipv6_transport.rs`
+(`session_establishes_over_ipv6_transport`): pathvectord dials a GoBGP peer
+at its routable (global-scope ULA) IPv6 address on a Docker `--ipv6` bridge
+network and reaches Established over a real IPv6 TCP connection — the first
+e2e test in this project where the BGP session's own transport is IPv6, not
+just its NLRI payload. `get_peer`/`list_peers` correctly report the peer's
+address back as IPv6.
+
+Not in scope: MD5 authentication for IPv6 peers (`pathvector-sys`'s
+`TcpMd5Sig` is `sockaddr_in`-based; tracked separately in `TODO.md`).
+
+---
+
 ## 2026-07-04 (pathvectord event-loop proptest)
 
 ### [pathvectord] Close the "event-loop transitions have no proptests" gap
