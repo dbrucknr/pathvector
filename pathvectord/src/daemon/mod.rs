@@ -778,14 +778,25 @@ where
     // management and route propagation do not depend on it — so we log and
     // continue rather than crash the daemon, matching the FIB integration's
     // failure-handling pattern above.
-    if let Some(port) = metrics_port
-        && let Err(e) = crate::metrics::install(port)
-    {
-        tracing::warn!(
-            port,
-            error = %e,
-            "metrics endpoint unavailable — running without Prometheus export"
-        );
+    if let Some(port) = metrics_port {
+        match crate::metrics::install(port) {
+            Ok(()) => {
+                // Pre-register every statically-configured peer so a peer
+                // that never reaches Established (misconfigured, unreachable)
+                // is still visible as "down" rather than having no metrics
+                // series at all — see metrics.rs's `register_peer` doc comment.
+                for peer in &cfg.peers {
+                    crate::metrics::register_peer(peer.address);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    port,
+                    error = %e,
+                    "metrics endpoint unavailable — running without Prometheus export"
+                );
+            }
+        }
     }
 
     // Spawn the RPKI RTR client when configured. Unlike FibWriter::new (sync,
@@ -7205,8 +7216,9 @@ mod tests {
         bgp_id: Ipv4Addr,
         tx: &mpsc::Sender<UpdateMessage>,
     ) -> bool {
+        let peer_ip = aro.peer().ip();
         let decision = propagate_prefix(nlri, rib, aro, policy, peer_type, local_as, bgp_id, false);
-        flush_updates(vec![decision], MAX_LEN, tx, peer_type, true)
+        flush_updates(peer_ip, vec![decision], MAX_LEN, tx, peer_type, true)
     }
 
     fn ebgp_out_peer() -> (PeerId, AdjRibOut<Ipv4Addr>) {

@@ -177,7 +177,14 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte) {
+            if !flush_updates(
+                peer_ip,
+                decisions,
+                max_len,
+                update_tx,
+                peer_type,
+                peer_four_byte,
+            ) {
                 self.stalled_peers.push(peer_ip);
             }
         }
@@ -206,7 +213,14 @@ impl DaemonState {
                         )
                     })
                     .collect();
-                if !flush_updates_v6(decisions_v6, max_len, update_tx, peer_type, peer_four_byte) {
+                if !flush_updates_v6(
+                    peer_ip,
+                    decisions_v6,
+                    max_len,
+                    update_tx,
+                    peer_type,
+                    peer_four_byte,
+                ) {
                     self.stalled_peers.push(peer_ip);
                 }
             }

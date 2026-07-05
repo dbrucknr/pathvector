@@ -209,7 +209,14 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+            if !flush_updates(
+                other_ip,
+                decisions,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -272,6 +279,7 @@ impl DaemonState {
                 })
                 .collect();
             if !flush_updates_v6(
+                other_ip,
                 decisions_v6,
                 max_len,
                 update_tx,
@@ -388,7 +396,14 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+            if !flush_updates(
+                other_ip,
+                decisions,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -489,6 +504,7 @@ impl DaemonState {
                 })
                 .collect();
             if !flush_updates_v6(
+                other_ip,
                 decisions_v6,
                 max_len,
                 update_tx,
@@ -609,7 +625,14 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+            if !flush_updates(
+                other_ip,
+                decisions,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -670,6 +693,7 @@ impl DaemonState {
                 })
                 .collect();
             if !flush_updates_v6(
+                other_ip,
                 decisions_v6,
                 max_len,
                 update_tx,

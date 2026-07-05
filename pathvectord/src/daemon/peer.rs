@@ -400,7 +400,14 @@ impl DaemonState {
                 }
             })
             .map_or((None, vec![], false), |(t, f, n)| (Some(t), f, n));
-        let mut stalled = !flush_updates(decisions, max_len, update_tx, peer_type, peer_four_byte);
+        let mut stalled = !flush_updates(
+            peer_ip,
+            decisions,
+            max_len,
+            update_tx,
+            peer_type,
+            peer_four_byte,
+        );
         if stalled {
             self.stalled_peers.push(peer_ip);
         }
@@ -452,7 +459,14 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(decisions_v6, max_len, update_tx, peer_type, peer_four_byte) {
+            if !flush_updates_v6(
+                peer_ip,
+                decisions_v6,
+                max_len,
+                update_tx,
+                peer_type,
+                peer_four_byte,
+            ) {
                 stalled = true;
                 self.stalled_peers.push(peer_ip);
             }
@@ -815,7 +829,14 @@ impl DaemonState {
                 })
                 .collect();
             let other_four_byte = self.four_byte_peers.contains(&other_ip);
-            if !flush_updates(decisions, max_len, update_tx, other_type, other_four_byte) {
+            if !flush_updates(
+                other_ip,
+                decisions,
+                max_len,
+                update_tx,
+                other_type,
+                other_four_byte,
+            ) {
                 self.stalled_peers.push(other_ip);
             }
             self.sync_advertised(other_ip);
@@ -927,6 +948,10 @@ pub(super) async fn run_command_processor<H, F>(
 
                 // Register all per-peer RIB / policy state.
                 state.write().await.add_peer(&peer, update_sender);
+                // Pre-register metrics gauges before the session-event forwarding
+                // task (spawned below) can possibly deliver an Established event —
+                // see metrics.rs's `register_peer` doc comment for why this matters.
+                crate::metrics::register_peer(peer.address);
 
                 // Forward session events to the main event channel.
                 let peer_addr = peer.address;

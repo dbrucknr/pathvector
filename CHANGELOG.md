@@ -4,6 +4,40 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-05 (metrics: fix stale adj_rib_out, add updates_sent counter, pre-register peers)
+
+### [pathvectord] Close two Prometheus observability gaps surfaced by real downstream usage
+
+Found using pathvectord from BlockingArbiter-RS (a project consuming the daemon's
+published Docker image): Grafana panels showed nothing for a peer until route churn
+happened to touch it, and there was no way to graph outbound UPDATE activity at all.
+
+- **`adj_rib_out_prefixes` could stay stale after Established.** `update_rib_sizes`
+  previously only fired from route-update/flush call sites — a peer that reached
+  Established but then saw no further route churn from *anyone* could sit with a
+  stale or missing outbound gauge indefinitely. Fixed by calling `update_rib_sizes`
+  immediately after `on_established` (`daemon/mod.rs`), which is safe because
+  `on_established` already calls `sync_advertised(peer_ip)` synchronously after the
+  full-table dump and EOR send completes.
+- **No outbound UPDATE counter.** `pathvectord_bgp_updates_received_total{peer}`
+  existed but had no outbound counterpart — `adj_rib_out_prefixes` is a point-in-time
+  gauge, so a withdraw immediately followed by a re-announce was invisible as churn.
+  Added `pathvectord_bgp_updates_sent_total{peer}`, incremented once per real UPDATE
+  message (not once per `flush_updates`/`flush_updates_v6` call — a batch that splits
+  into several wire messages increments once per message, verified by a dedicated
+  test that counts actual channel sends and asserts the counter matches).
+- **No metrics at all for a peer that never establishes.** Every peer-labeled gauge
+  was created lazily on its first Established/Terminated/route-update event, so a
+  misconfigured or unreachable peer — the case an operator most needs visibility
+  into — had no series whatsoever, indistinguishable from an unconfigured peer on a
+  dashboard. Added `register_peer`, which pre-creates `session_up`/
+  `adj_rib_in_prefixes`/`adj_rib_out_prefixes` at zero; called for every
+  statically-configured peer at startup (after the metrics endpoint installs) and
+  from the dynamic-peer `AddPeer` handler, before that peer's session task is
+  spawned.
+
+---
+
 ## 2026-07-05 (release: fix aarch64-unknown-linux-musl binary build)
 
 ### [ci] `cross`'s aarch64-musl release build was compiling against a stale `protoc`

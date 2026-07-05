@@ -13,6 +13,7 @@
 //     pathvectord_bgp_sessions_established_total{peer}
 //     pathvectord_bgp_sessions_terminated_total{peer, reason}       — reason: clean|notification|operator_stop|unclean
 //     pathvectord_bgp_updates_received_total{peer}
+//     pathvectord_bgp_updates_sent_total{peer}
 //
 // Cardinality note: series are keyed by peer IP and are never removed, only
 // zeroed, when a peer is deconfigured (RemovePeer). For a static peer set
@@ -21,6 +22,13 @@
 // dynamic-peer gRPC API, this means the Prometheus registry accumulates one
 // stale zeroed series per removed peer for the lifetime of the process. See
 // TODO.md for the tracked follow-up (prune series on RemovePeer).
+//
+// Registration note: every gauge/counter above is created lazily — the first
+// time a peer's label value is used. A peer that is *configured* but never
+// reaches Established therefore has no series at all (not even
+// `session_up=0`), which is indistinguishable from an unconfigured peer on a
+// dashboard. `register_peer` (below) pre-creates the peer-state gauges at
+// zero so a configured-but-never-established peer is still visible.
 
 use std::{collections::HashMap, net::IpAddr};
 
@@ -49,6 +57,25 @@ pub fn install(port: u16) -> Result<(), metrics_exporter_prometheus::BuildError>
         "Prometheus metrics listening on http://0.0.0.0:{port}/metrics"
     );
     Ok(())
+}
+
+/// Pre-creates the peer-state gauges at zero so a configured peer that never
+/// reaches Established is still visible on a dashboard (as "down"), rather
+/// than having no series at all until its first Established/Terminated
+/// event. Call once per peer, after `install` — at daemon startup for every
+/// statically-configured peer, and from the dynamic-peer `AddPeer` handler,
+/// before that peer's session task is spawned (so there is no session yet
+/// that could have already set `session_up` to a nonzero value).
+pub fn register_peer(peer: IpAddr) {
+    let p = peer.to_string();
+    metrics::gauge!("pathvectord_bgp_session_up", "peer" => p.clone()).set(0.0_f64);
+    metrics::gauge!("pathvectord_bgp_adj_rib_in_prefixes", "peer" => p.clone()).set(0.0_f64);
+    metrics::gauge!("pathvectord_bgp_adj_rib_out_prefixes", "peer" => p).set(0.0_f64);
+}
+
+pub fn on_update_sent(peer: IpAddr) {
+    metrics::counter!("pathvectord_bgp_updates_sent_total", "peer" => peer.to_string())
+        .increment(1);
 }
 
 pub fn on_session_established(peer: IpAddr) {
@@ -279,6 +306,44 @@ mod tests {
             Some(&DebugValue::Gauge(0.0.into())),
             "a peer with zero advertised routes still gets an explicit 0 gauge, \
              not a missing metric"
+        );
+    }
+
+    #[test]
+    fn register_peer_creates_zeroed_gauges_for_a_peer_with_no_prior_events() {
+        let snap = capture(|| register_peer(peer(3)));
+
+        let labels = vec![("peer".to_string(), "10.0.0.3".to_string())];
+        assert_eq!(
+            snap.get(&("pathvectord_bgp_session_up".to_string(), labels.clone())),
+            Some(&DebugValue::Gauge(0.0.into())),
+            "a configured-but-never-established peer must show as down, not be absent"
+        );
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_adj_rib_in_prefixes".to_string(),
+                labels.clone()
+            )),
+            Some(&DebugValue::Gauge(0.0.into()))
+        );
+        assert_eq!(
+            snap.get(&("pathvectord_bgp_adj_rib_out_prefixes".to_string(), labels)),
+            Some(&DebugValue::Gauge(0.0.into()))
+        );
+    }
+
+    #[test]
+    fn on_update_sent_increments_counter_once_per_call() {
+        let snap = capture(|| {
+            on_update_sent(peer(4));
+            on_update_sent(peer(4));
+            on_update_sent(peer(4));
+        });
+
+        let labels = vec![("peer".to_string(), "10.0.0.4".to_string())];
+        assert_eq!(
+            snap.get(&("pathvectord_bgp_updates_sent_total".to_string(), labels)),
+            Some(&DebugValue::Counter(3))
         );
     }
 }

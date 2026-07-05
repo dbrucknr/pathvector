@@ -3,7 +3,7 @@
 //! Functions for building path attributes, computing per-peer prefix decisions,
 //! and flushing batched UPDATE messages for both IPv4 and IPv6.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use pathvector_policy::{Decision, Policy};
 use pathvector_rib::{
@@ -197,7 +197,9 @@ pub(crate) fn propagate_prefix(
 // (encoded-attribute-bytes, attribute-list, nlris-to-announce)
 type AnnounceGroup = (Vec<u8>, Vec<PathAttribute>, Vec<Nlri<Ipv4Addr>>);
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_updates(
+    peer_ip: IpAddr,
     decisions: Vec<PrefixDecision>,
     max_len: usize,
     update_tx: &mpsc::Sender<UpdateMessage>,
@@ -236,31 +238,28 @@ pub(crate) fn flush_updates(
     for nlri in withdrawals {
         let nlen = nlri_encoded_len(&nlri);
         if !batch.is_empty() && batch_bytes + nlen > max_len {
-            if update_tx
-                .try_send(UpdateMessage {
-                    withdrawn: std::mem::take(&mut batch),
-                    attributes: vec![],
-                    announced: vec![],
-                })
-                .is_err()
-            {
-                return false;
+            match update_tx.try_send(UpdateMessage {
+                withdrawn: std::mem::take(&mut batch),
+                attributes: vec![],
+                announced: vec![],
+            }) {
+                Ok(()) => crate::metrics::on_update_sent(peer_ip),
+                Err(_) => return false,
             }
             batch_bytes = withdraw_overhead;
         }
         batch.push(nlri);
         batch_bytes += nlen;
     }
-    if !batch.is_empty()
-        && update_tx
-            .try_send(UpdateMessage {
-                withdrawn: batch,
-                attributes: vec![],
-                announced: vec![],
-            })
-            .is_err()
-    {
-        return false;
+    if !batch.is_empty() {
+        match update_tx.try_send(UpdateMessage {
+            withdrawn: batch,
+            attributes: vec![],
+            announced: vec![],
+        }) {
+            Ok(()) => crate::metrics::on_update_sent(peer_ip),
+            Err(_) => return false,
+        }
     }
 
     // ── Send announcements ────────────────────────────────────────────────────
@@ -273,31 +272,28 @@ pub(crate) fn flush_updates(
         for nlri in nlris {
             let nlen = nlri_encoded_len(&nlri);
             if !batch.is_empty() && batch_bytes + nlen > max_len {
-                if update_tx
-                    .try_send(UpdateMessage {
-                        withdrawn: vec![],
-                        attributes: attrs.clone(),
-                        announced: std::mem::take(&mut batch),
-                    })
-                    .is_err()
-                {
-                    return false;
+                match update_tx.try_send(UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: attrs.clone(),
+                    announced: std::mem::take(&mut batch),
+                }) {
+                    Ok(()) => crate::metrics::on_update_sent(peer_ip),
+                    Err(_) => return false,
                 }
                 batch_bytes = base;
             }
             batch.push(nlri);
             batch_bytes += nlen;
         }
-        if !batch.is_empty()
-            && update_tx
-                .try_send(UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: attrs,
-                    announced: batch,
-                })
-                .is_err()
-        {
-            return false;
+        if !batch.is_empty() {
+            match update_tx.try_send(UpdateMessage {
+                withdrawn: vec![],
+                attributes: attrs,
+                announced: batch,
+            }) {
+                Ok(()) => crate::metrics::on_update_sent(peer_ip),
+                Err(_) => return false,
+            }
         }
     }
 
@@ -387,7 +383,9 @@ pub(crate) fn propagate_prefix_v6(
 ///
 /// Returns `true` if all sends succeeded; `false` on the first channel-full
 /// error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_updates_v6(
+    peer_ip: IpAddr,
     decisions: Vec<PrefixDecisionV6>,
     max_len: usize,
     update_tx: &mpsc::Sender<UpdateMessage>,
@@ -444,7 +442,7 @@ pub(crate) fn flush_updates_v6(
         // MP_UNREACH_NLRI attribute header: 4 bytes (flags+type+ext-len) + 3 afi/safi.
         let mp_hdr = if batch.is_empty() { 4 + 3 } else { 0 };
         if !batch.is_empty() && batch_bytes + mp_hdr + nlen > max_len {
-            if !send_mp_unreach_v6(std::mem::take(&mut batch), update_tx) {
+            if !send_mp_unreach_v6(peer_ip, std::mem::take(&mut batch), update_tx) {
                 return false;
             }
             batch_bytes = base_withdraw;
@@ -455,7 +453,7 @@ pub(crate) fn flush_updates_v6(
         batch.push(nlri);
         batch_bytes += nlen;
     }
-    if !batch.is_empty() && !send_mp_unreach_v6(batch, update_tx) {
+    if !batch.is_empty() && !send_mp_unreach_v6(peer_ip, batch, update_tx) {
         return false;
     }
 
@@ -465,15 +463,13 @@ pub(crate) fn flush_updates_v6(
     // above; here we just pack and send them as-is (splitting is uncommon for
     // v6 since the NLRI encoding is larger).
     for (_, attrs, _) in announce_groups {
-        if update_tx
-            .try_send(UpdateMessage {
-                withdrawn: vec![],
-                attributes: attrs,
-                announced: vec![],
-            })
-            .is_err()
-        {
-            return false;
+        match update_tx.try_send(UpdateMessage {
+            withdrawn: vec![],
+            attributes: attrs,
+            announced: vec![],
+        }) {
+            Ok(()) => crate::metrics::on_update_sent(peer_ip),
+            Err(_) => return false,
         }
     }
 
@@ -481,11 +477,12 @@ pub(crate) fn flush_updates_v6(
 }
 
 pub(crate) fn send_mp_unreach_v6(
+    peer_ip: IpAddr,
     nlris: Vec<Nlri<Ipv6Addr>>,
     update_tx: &mpsc::Sender<UpdateMessage>,
 ) -> bool {
     let prefixes = nlris.into_iter().map(Prefix::V6).collect();
-    update_tx
+    let sent = update_tx
         .try_send(UpdateMessage {
             withdrawn: vec![],
             attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
@@ -494,7 +491,11 @@ pub(crate) fn send_mp_unreach_v6(
             })],
             announced: vec![],
         })
-        .is_ok()
+        .is_ok();
+    if sent {
+        crate::metrics::on_update_sent(peer_ip);
+    }
+    sent
 }
 
 /// Sends an IPv4 unicast End-of-RIB marker to `update_tx`.
@@ -621,7 +622,7 @@ pub(crate) fn route_v6_to_attributes(
 
 #[cfg(test)]
 mod flush_updates_tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use pathvector_rib::{Route, RouteBuilder};
     use pathvector_session::message::{MAX_LEN, UpdateMessage};
@@ -629,6 +630,8 @@ mod flush_updates_tests {
     use tokio::sync::mpsc;
 
     use super::{PrefixDecision, flush_updates};
+
+    const TEST_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -645,6 +648,7 @@ mod flush_updates_tests {
         let decisions = vec![PrefixDecision::Announce(route)];
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -667,6 +671,7 @@ mod flush_updates_tests {
             .collect();
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -691,6 +696,7 @@ mod flush_updates_tests {
         let decisions = vec![PrefixDecision::Announce(r1), PrefixDecision::Announce(r2)];
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -727,6 +733,7 @@ mod flush_updates_tests {
 
         let (tx, mut rx) = mpsc::channel(128);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -756,6 +763,7 @@ mod flush_updates_tests {
             .collect();
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -777,6 +785,7 @@ mod flush_updates_tests {
         ];
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -795,6 +804,7 @@ mod flush_updates_tests {
         let decisions = vec![PrefixDecision::NoChange, PrefixDecision::NoChange];
         let (tx, mut rx) = mpsc::channel(16);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -818,6 +828,7 @@ mod flush_updates_tests {
 
         let decisions = vec![PrefixDecision::Withdraw(nlri("10.0.0.0/8"))];
         assert!(!flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -833,6 +844,7 @@ mod flush_updates_tests {
         drop(rx);
         let decisions = vec![PrefixDecision::Announce(base_route("10.0.0.0/8"))];
         assert!(!flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -859,6 +871,7 @@ mod flush_updates_tests {
 
         let (tx, mut rx) = mpsc::channel(128);
         assert!(flush_updates(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -898,7 +911,14 @@ mod flush_updates_tests {
             PrefixDecision::Withdraw(nlri("10.0.0.0/8")),
             PrefixDecision::Withdraw(nlri("11.0.0.0/8")),
         ];
-        assert!(!flush_updates(decisions, 26, &tx, PeerType::External, true));
+        assert!(!flush_updates(
+            TEST_PEER,
+            decisions,
+            26,
+            &tx,
+            PeerType::External,
+            true
+        ));
     }
 
     /// Returns false when channel fills during a mid-batch announce overflow.
@@ -920,13 +940,84 @@ mod flush_updates_tests {
             PrefixDecision::Announce(base_route("10.0.0.0/8")),
             PrefixDecision::Announce(base_route("11.0.0.0/8")),
         ];
-        assert!(!flush_updates(decisions, 50, &tx, PeerType::External, true));
+        assert!(!flush_updates(
+            TEST_PEER,
+            decisions,
+            50,
+            &tx,
+            PeerType::External,
+            true
+        ));
+    }
+
+    /// `on_update_sent` fires once per real UPDATE message on the wire, not
+    /// once per `flush_updates` call — a batch that splits into several
+    /// messages (see `test_flush_splits_when_exceeding_max_len`) must
+    /// increment the counter once per message, matching the number of
+    /// messages actually received on `rx`.
+    #[test]
+    fn flush_updates_increments_sent_counter_once_per_actual_message() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let decisions: Vec<PrefixDecision> = (0u32..1500)
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let a = (i / 256) as u8;
+                #[allow(clippy::cast_possible_truncation)]
+                let b = (i % 256) as u8;
+                let route = RouteBuilder::new(
+                    Nlri::new(Ipv4Addr::new(10, a, b, 0), 24).unwrap(),
+                    Origin::Igp,
+                    AsPath::new(),
+                )
+                .build();
+                PrefixDecision::Announce(route)
+            })
+            .collect();
+
+        let (tx, mut rx) = mpsc::channel(128);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            assert!(flush_updates(
+                TEST_PEER,
+                decisions,
+                MAX_LEN,
+                &tx,
+                PeerType::External,
+                true
+            ));
+        });
+
+        let mut message_count = 0usize;
+        while rx.try_recv().is_ok() {
+            message_count += 1;
+        }
+        assert!(
+            message_count > 1,
+            "this batch must actually split into multiple UPDATE messages \
+             for this test to prove anything"
+        );
+
+        let sent_total =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "pathvectord_bgp_updates_sent_total").then_some(value)
+                });
+        assert_eq!(
+            sent_total,
+            Some(DebugValue::Counter(message_count as u64)),
+            "counter must equal the real number of UPDATE messages sent, not 1 per call"
+        );
     }
 }
 
 #[cfg(test)]
 mod v6_tests {
-    use std::net::Ipv6Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_rib::RouteBuilder;
     use pathvector_session::message::{MAX_LEN, PathAttribute, UpdateMessage};
@@ -937,6 +1028,8 @@ mod v6_tests {
     use tokio::sync::mpsc;
 
     use super::{PrefixDecisionV6, flush_updates_v6, route_v6_to_attributes};
+
+    const TEST_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
     fn nlri6(s: &str) -> Nlri<Ipv6Addr> {
         s.parse().unwrap()
@@ -1129,6 +1222,7 @@ mod v6_tests {
         drop(rx);
         let decisions = vec![PrefixDecisionV6::Announce(base_route_v6("2001:db8::/32"))];
         assert!(!flush_updates_v6(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -1144,6 +1238,7 @@ mod v6_tests {
         drop(rx);
         let decisions = vec![PrefixDecisionV6::Withdraw(nlri6("2001:db8::/32"))];
         assert!(!flush_updates_v6(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -1171,6 +1266,7 @@ mod v6_tests {
             PrefixDecisionV6::Withdraw(nlri6("2001:db8:1::/32")),
         ];
         assert!(!flush_updates_v6(
+            TEST_PEER,
             decisions,
             35,
             &tx,
@@ -1198,6 +1294,7 @@ mod v6_tests {
 
         let (tx, mut rx) = mpsc::channel(128);
         assert!(flush_updates_v6(
+            TEST_PEER,
             decisions,
             MAX_LEN,
             &tx,
@@ -1270,7 +1367,7 @@ mod v6_tests {
 
 #[cfg(test)]
 mod prop_tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_rib::RouteBuilder;
     use pathvector_session::message::{BgpMessage, MAX_LEN, PathAttribute, Prefix};
@@ -1279,6 +1376,8 @@ mod prop_tests {
     use tokio::sync::mpsc;
 
     use super::{PrefixDecision, PrefixDecisionV6, flush_updates, flush_updates_v6};
+
+    const TEST_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
     // ── Arbitrary generators ─────────────────────────────────────────────────
 
@@ -1344,7 +1443,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let _ = flush_updates(TEST_PEER, decisions, MAX_LEN, &tx, PeerType::External, true);
                 while let Ok(msg) = rx.try_recv() {
                     let wire = BgpMessage::Update(msg).encode();
                     prop_assert!(wire.len() <= MAX_LEN,
@@ -1367,7 +1466,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let _ = flush_updates(TEST_PEER, decisions, MAX_LEN, &tx, PeerType::External, true);
                 let mut sent: Vec<Nlri<Ipv4Addr>> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     sent.extend(msg.announced);
@@ -1395,7 +1494,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let _ = flush_updates(TEST_PEER, decisions, MAX_LEN, &tx, PeerType::External, true);
                 let mut sent: Vec<Nlri<Ipv4Addr>> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     sent.extend(msg.withdrawn);
@@ -1423,7 +1522,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let _ = flush_updates_v6(TEST_PEER, decisions, MAX_LEN, &tx, PeerType::External, true);
                 while let Ok(msg) = rx.try_recv() {
                     let wire = BgpMessage::Update(msg).encode();
                     prop_assert!(wire.len() <= MAX_LEN,
@@ -1446,7 +1545,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let _ = flush_updates_v6(TEST_PEER, decisions, MAX_LEN, &tx, PeerType::External, true);
                 let mut sent: Vec<Nlri<Ipv6Addr>> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     for attr in &msg.attributes {
@@ -1482,7 +1581,7 @@ mod prop_tests {
                 .build().unwrap();
             rt.block_on(async {
                 let (tx, mut rx) = mpsc::channel(512);
-                let _ = flush_updates_v6(decisions, MAX_LEN, &tx, PeerType::External, true);
+                let _ = flush_updates_v6(TEST_PEER, decisions, MAX_LEN, &tx, PeerType::External, true);
                 let mut sent: Vec<Nlri<Ipv6Addr>> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     for attr in &msg.attributes {

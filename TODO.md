@@ -43,7 +43,11 @@ mode (reject when only one side advertises Role).
 A Prometheus `/metrics` endpoint shipped 2026-07-01 (see CHANGELOG.md), covering
 session state, uptime timestamps, per-peer prefix counts, and session termination
 reasons. See `pathvectord/README.md` Observability section for the full metric
-reference. Remaining gaps:
+reference. Two real-world usage gaps closed 2026-07-05 (found via
+BlockingArbiter-RS's Grafana dashboard, see CHANGELOG.md): a configured-but-never-
+established peer now gets zeroed gauges at startup/`AddPeer` instead of no series at
+all (`register_peer`), and `pathvectord_bgp_updates_sent_total{peer}` now exists as
+the outbound counterpart to `updates_received_total`. Remaining gaps:
 
 - **Series pruning on `RemovePeer`.** Metric series are labeled by peer IP and are
   zeroed but never removed when a peer is deconfigured. Fine for static peer sets;
