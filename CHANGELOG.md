@@ -4,6 +4,36 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-05 (release: fix aarch64-unknown-linux-musl binary build)
+
+### [ci] `cross`'s aarch64-musl release build was compiling against a stale `protoc`
+
+The `v0.1.0` release run's `aarch64-unknown-linux-musl` job failed at
+`pathvectord`'s build script with `protoc failed: ... Explicit 'optional'
+labels are disallowed in the Proto3 syntax` — not a defect in
+`management.proto` (its `optional` fields are deliberate; prost maps them to
+`Option<T>` for real presence-tracking on fields like `local_pref`/`med`/
+`aggregator`, and proto3 `optional` support has been standard since protoc
+3.15, 2021). The actual cause: `Cross.toml`'s `pre-build` hook installed
+`protoc` via `apt-get install protobuf-compiler`, and the `cross` tool's
+`aarch64-unknown-linux-musl` base image is old enough that its apt repo only
+has a pre-3.15 protoc. The native `x86_64-unknown-linux-musl` release job
+(no `cross`, runs directly on `ubuntu-latest`) was unaffected since that
+runner's apt repo has a modern protoc.
+
+Fixed by pinning a specific upstream protoc release (v35.1) downloaded
+directly in the `pre-build` hook instead of relying on the container's apt
+package. Verified the actual root cause directly: running protoc v35.1
+against `management.proto` compiles cleanly with zero errors (confirmed
+locally via `PROTOC=<v35.1 binary> cargo build --release -p pathvectord`).
+A full local `cross build --target aarch64-unknown-linux-musl` could not be
+reproduced end-to-end on Apple Silicon — `cross`'s base image for that
+target has no `arm64` manifest variant, an unrelated limitation of running
+`cross` locally on an M-series Mac, not something that affects CI (which
+runs on an x86_64 GitHub runner where that image resolves natively).
+
+---
+
 ## 2026-07-05 (e2e CI: fix flaky port race, cut Docker build time ~4x)
 
 ### [pathvector-e2e] [ci] Two CI reliability/speed fixes surfaced by the IPv6 migration's CI run
