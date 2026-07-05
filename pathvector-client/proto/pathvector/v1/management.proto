@@ -101,7 +101,7 @@ service PeerService {
   /// Returns the state of a single peer identified by its IP address.
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   INVALID_ARGUMENT — address is not a valid IP address
   ///   NOT_FOUND        — address is not a configured peer
   rpc GetPeer(GetPeerRequest) returns (PeerState);
   /// Streams peer state changes. Sends the current state of all peers first
@@ -116,7 +116,7 @@ service PeerService {
   /// returns OK without modifying the existing session.
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — address is not a valid IPv4 address, remote_as is 0,
+  ///   INVALID_ARGUMENT — address is not a valid IP address, remote_as is 0,
   ///                      or remote_as is 23456 (AS_TRANS, RFC 6793)
   rpc AddPeer(AddPeerRequest) returns (AddPeerResponse);
 
@@ -128,7 +128,7 @@ service PeerService {
   /// resulting UPDATE messages before the peer entry is removed.
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   INVALID_ARGUMENT — address is not a valid IP address
   ///   NOT_FOUND        — address is not a configured peer
   rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
 
@@ -137,7 +137,7 @@ service PeerService {
   /// session.  This is the BGP inbound soft-reset operation.
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — address is not a valid IPv4 address, or afi_safi
+  ///   INVALID_ARGUMENT — address is not a valid IP address, or afi_safi
   ///                      is not a recognised address family
   ///   NOT_FOUND        — address is not a configured peer
   ///   FAILED_PRECONDITION — session is not currently established
@@ -151,7 +151,7 @@ message ListPeersResponse {
 }
 
 message GetPeerRequest {
-  /// Dotted-decimal IPv4 address of the peer to look up.
+  /// IPv4 or IPv6 address of the peer to look up.
   string address = 1;
 }
 
@@ -229,7 +229,7 @@ message PeerEvent {
 message WatchPeersRequest {}
 
 message AddPeerRequest {
-  /// Dotted-decimal IPv4 address of the new peer.
+  /// IPv4 or IPv6 address of the new peer.
   string address = 1;
   /// Remote AS number.  Must not be 0 or 23456 (AS_TRANS).
   uint32 remote_as = 2;
@@ -248,14 +248,14 @@ message AddPeerRequest {
 message AddPeerResponse {}
 
 message RemovePeerRequest {
-  /// Dotted-decimal IPv4 address of the peer to remove.
+  /// IPv4 or IPv6 address of the peer to remove.
   string address = 1;
 }
 
 message RemovePeerResponse {}
 
 message SoftResetRequest {
-  /// Dotted-decimal IPv4 address of the peer to soft-reset.
+  /// IPv4 or IPv6 address of the peer to soft-reset.
   string address = 1;
   /// Address family to refresh.  "ipv4" (default) or "ipv6".
   string afi_safi = 2;
@@ -278,7 +278,7 @@ service RibService {
   /// peer are returned.
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — peer_address is non-empty and not a valid IPv4 address
+  ///   INVALID_ARGUMENT — peer_address is non-empty and not a valid IP address
   rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
 
   /// Returns all candidate routes (from all peers) for a single prefix.
@@ -313,7 +313,7 @@ message RouteResponse {
 
 message ListRoutesRequest {
   /// If non-empty, return only routes whose best-path winner is this peer.
-  /// Dotted-decimal IPv4 address.
+  /// IPv4 or IPv6 address.
   string peer_address = 1;
 
   /// Maximum number of routes to return in this response.
@@ -364,7 +364,7 @@ message RouteEvent {
 
 message WatchRoutesRequest {
   /// If non-empty, the snapshot phase filters to routes won by this peer.
-  /// Dotted-decimal IPv4 address; use "local" for originated routes.
+  /// IPv4 or IPv6 address; use "local" for originated routes.
   string peer_address = 1;
 }
 
@@ -385,7 +385,7 @@ service PolicyService {
   /// and the resulting best-path changes are propagated to all established peers.
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   INVALID_ARGUMENT — address is not a valid IP address
   ///   NOT_FOUND        — address is not a configured peer
   rpc SetImportDefault(SetImportDefaultRequest) returns (SetImportDefaultResponse);
 
@@ -396,13 +396,13 @@ service PolicyService {
   /// currently established (changes apply on the next session).
   ///
   /// Status codes:
-  ///   INVALID_ARGUMENT — address is not a valid IPv4 address
+  ///   INVALID_ARGUMENT — address is not a valid IP address
   ///   NOT_FOUND        — address is not a configured peer
   rpc SetExportDefault(SetExportDefaultRequest) returns (SetExportDefaultResponse);
 }
 
 message SetImportDefaultRequest {
-  /// Dotted-decimal IPv4 address of the peer whose import policy to update.
+  /// IPv4 or IPv6 address of the peer whose import policy to update.
   string peer_address = 1;
   /// New default action.
   PolicyAction action = 2;
@@ -411,7 +411,7 @@ message SetImportDefaultRequest {
 message SetImportDefaultResponse {}
 
 message SetExportDefaultRequest {
-  /// Dotted-decimal IPv4 address of the peer whose export policy to update.
+  /// IPv4 or IPv6 address of the peer whose export policy to update.
   string peer_address = 1;
   /// New default action.
   PolicyAction action = 2;
