@@ -10,7 +10,7 @@ mod prop_tests;
 
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -441,8 +441,11 @@ struct Session<T: BgpTransport> {
     // (test) mode — any reconnect attempt is treated as TcpFailed instead.
     connect_factory: Option<Box<dyn Fn(TcpStream) -> T + Send>>,
     // Local TCP address captured at connect time; forwarded in SessionEstablished
-    // so the daemon can use it as the eBGP NEXT_HOP (RFC 4271 §5.1.3).
-    local_addr: Option<Ipv4Addr>,
+    // so the daemon can use it as the eBGP NEXT_HOP (RFC 4271 §5.1.3). Kept as
+    // the full IpAddr (not narrowed to Ipv4Addr) so a v6-transport session's
+    // local address isn't silently discarded -- the daemon decides how to use
+    // it per address family.
+    local_addr: Option<IpAddr>,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
     // Reason for the most recent (or current) session termination.  Set just
@@ -540,9 +543,7 @@ impl<T: BgpTransport> Session<T> {
                     self.connect_task = None;
                     return match result {
                         Ok(stream) => {
-                            self.local_addr = stream.local_addr().ok().and_then(|a| {
-                                if let std::net::IpAddr::V4(ip) = a.ip() { Some(ip) } else { None }
-                            });
+                            self.local_addr = stream.local_addr().ok().map(|a| a.ip());
                             // connect_task is only spawned when connect_factory is Some.
                             self.transport = Some(self.connect_factory.as_ref().unwrap()(stream));
                             FsmInput::TcpConnected
@@ -612,13 +613,7 @@ impl<T: BgpTransport> Session<T> {
         match self.fsm.state() {
             // No active outbound attempt — accept the incoming connection directly.
             State::Idle | State::Connect | State::Active => {
-                self.local_addr = stream.local_addr().ok().and_then(|a| {
-                    if let std::net::IpAddr::V4(ip) = a.ip() {
-                        Some(ip)
-                    } else {
-                        None
-                    }
-                });
+                self.local_addr = stream.local_addr().ok().map(|a| a.ip());
                 if let Some(factory) = &self.connect_factory {
                     self.transport = Some(factory(stream));
                 }
@@ -643,13 +638,7 @@ impl<T: BgpTransport> Session<T> {
                     );
                     let outputs = self.fsm.process(FsmInput::CollisionDetected);
                     self.execute(outputs).await;
-                    self.local_addr = stream.local_addr().ok().and_then(|a| {
-                        if let std::net::IpAddr::V4(ip) = a.ip() {
-                            Some(ip)
-                        } else {
-                            None
-                        }
-                    });
+                    self.local_addr = stream.local_addr().ok().map(|a| a.ip());
                     if let Some(factory) = &self.connect_factory {
                         self.transport = Some(factory(stream));
                     }
