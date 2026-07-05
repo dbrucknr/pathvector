@@ -179,7 +179,7 @@ impl DaemonState {
         peer_as: u32,
         hold_time: u16,
         peer_capabilities: &[Capability],
-        local_addr: Option<Ipv4Addr>,
+        local_addr: Option<IpAddr>,
     ) {
         let peer_id = PeerId::from(peer_ip);
 
@@ -292,7 +292,12 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
-        let local_next_hop = local_addr.unwrap_or(local_bgp_id);
+        let local_next_hop = local_addr
+            .and_then(|a| match a {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .unwrap_or(local_bgp_id);
         let local_ipv6 = self.rib.local_ipv6;
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
 
@@ -791,7 +796,10 @@ impl DaemonState {
                         .rib
                         .local_addrs
                         .get(&other_ip)
-                        .copied()
+                        .and_then(|a| match a {
+                            IpAddr::V4(v4) => Some(*v4),
+                            IpAddr::V6(_) => None,
+                        })
                         .unwrap_or(local_bgp_id);
                     propagate_prefix(
                         nlri,

@@ -192,7 +192,10 @@ impl DaemonState {
                 .rib
                 .local_addrs
                 .get(&other_ip)
-                .copied()
+                .and_then(|a| match a {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                })
                 .unwrap_or(local_bgp_id);
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
             let other_four_byte = self.four_byte_peers.contains(&other_ip);
@@ -368,7 +371,10 @@ impl DaemonState {
                 .rib
                 .local_addrs
                 .get(&other_ip)
-                .copied()
+                .and_then(|a| match a {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                })
                 .unwrap_or(local_bgp_id);
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
             let other_four_byte = self.four_byte_peers.contains(&other_ip);
@@ -591,7 +597,10 @@ impl DaemonState {
                 .rib
                 .local_addrs
                 .get(&other_ip)
-                .copied()
+                .and_then(|a| match a {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                })
                 .unwrap_or(local_bgp_id);
             let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions: Vec<PrefixDecision> = prev_prefixes

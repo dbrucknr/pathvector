@@ -180,7 +180,11 @@ pub(crate) struct RibSnapshot {
     ///
     /// Used as the eBGP NEXT_HOP (RFC 4271 §5.1.3) instead of `local_bgp_id`
     /// so the NEXT_HOP is the interface address reachable by the peer.
-    pub(crate) local_addrs: HashMap<Ipv4Addr, Ipv4Addr>,
+    /// Stores the full `IpAddr` (v4 or v6, matching that peer's transport
+    /// session) — consumers extract the v4 variant specifically for IPv4
+    /// NEXT_HOP rewrite, falling back to `local_bgp_id` when the session's
+    /// local address is v6-only.
+    pub(crate) local_addrs: HashMap<Ipv4Addr, IpAddr>,
     /// Peers configured with `next_hop_self = true`.
     ///
     /// When a peer is in this set, `NEXT_HOP` is rewritten to the local
@@ -1955,7 +1959,7 @@ mod tests {
             65002,
             90,
             &[],
-            Some(session_local_addr),
+            Some(IpAddr::V4(session_local_addr)),
         );
 
         let msg = receivers
@@ -2003,7 +2007,7 @@ mod tests {
             65002,
             90,
             &[],
-            Some(session_local_addr),
+            Some(IpAddr::V4(session_local_addr)),
         );
         // Drain the (empty) full-table dump; no routes pre-installed.
         while receivers.get_mut(&peer_ip).unwrap().try_recv().is_ok() {}
@@ -2095,7 +2099,7 @@ mod tests {
             65001,
             90,
             &[],
-            Some(session_local_addr),
+            Some(IpAddr::V4(session_local_addr)),
         );
         // Drain the full-table dump (empty rib).
         while rx.try_recv().is_ok() {}

@@ -253,7 +253,10 @@ impl DaemonState {
         let oracle_v4 = Arc::clone(&self.oracle_v4);
         let oracle_v6 = Arc::clone(&self.oracle_v6);
         let local_as = self.rib.local_as;
-        let local_v4_addr = self.rib.local_addrs.get(&peer_ip).copied();
+        let local_v4_addr = self.rib.local_addrs.get(&peer_ip).and_then(|a| match a {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        });
         let local_v6_addr = self.rib.local_ipv6;
         let rib = Arc::make_mut(&mut self.rib);
         let result = handle_update(
@@ -412,7 +415,10 @@ impl DaemonState {
                 .rib
                 .local_addrs
                 .get(&peer_ip)
-                .copied()
+                .and_then(|a| match a {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                })
                 .unwrap_or(local_bgp_id);
             let Some(export_policy) = self.export_policies.get(&peer_ip) else {
                 tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping propagation");
