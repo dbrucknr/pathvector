@@ -4,6 +4,44 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-05 (e2e CI: fix flaky port race, cut Docker build time ~4x)
+
+### [pathvector-e2e] [ci] Two CI reliability/speed fixes surfaced by the IPv6 migration's CI run
+
+- **Flaky port allocation.** `alloc_free_port()` (used by every harness to
+  pick a host port for pathvectord's mapped gRPC port) asks the OS for a
+  free ephemeral port, then releases it before Docker actually binds the
+  same port number — a documented, accepted TOCTOU race. Under CI's 4-way
+  test parallelism the gap between "OS says this port is free" and "Docker
+  binds it" (which can span an entire peer container's startup + healthcheck
+  wait) occasionally lets two tests get handed the same port, failing one
+  with "port is already allocated". Added `.config/nextest.toml` with a
+  `package(pathvector-e2e)`-scoped retry override (2 retries) so this class
+  of transient infra flake self-heals; every other crate stays at 0 retries
+  so a real regression still fails immediately.
+- **Redundant Docker compiles.** `Dockerfile.pathvectord`,
+  `Dockerfile.mock-rtr`, `Dockerfile.mock-bgp-peer`, and
+  `Dockerfile.mock-bgp-dialer` each independently ran their own
+  `cargo build -p X` against the full ~15-crate workspace from a cold
+  `rust:1.88-slim-bookworm` base — up to 4x redundant compilation of the
+  same dependency graph, since three of the four binaries live in
+  `pathvector-e2e` itself. Merged into one `Dockerfile.pathvectord` with a
+  shared `builder` stage that compiles all four binaries in a single
+  `cargo build` invocation, plus four thin named final stages
+  (`pathvectord`, `mock-rtr`, `mock-bgp-peer`, `mock-bgp-dialer`) each
+  copying their own binary out. `docker build` with no `--target` still
+  resolves to the `pathvectord` stage (used unchanged by
+  `.github/workflows/publish.yml`'s release build); the three mock images
+  now require an explicit `--target`. Local verification: first image
+  (`pathvectord`) built in ~45s (full compile); the three mock images that
+  follow it built in ~1.3–1.5s each (reusing the cached builder layer)
+  instead of a full recompile — confirmed all four resulting images are
+  functionally correct by re-running `rpki.rs`, `role.rs`, and
+  `ipv6_accept.rs` (the tests that exercise mock-rtr, mock-bgp-peer, and
+  mock-bgp-dialer respectively) against the freshly-built images.
+
+---
+
 ## 2026-07-05 (IPv6 migration: close remaining confidence gaps)
 
 ### [pathvectord] [pathvector-e2e] Prove the IPv6 peer-identity migration end to end, not just by absence of a `V4`/`V6` branch

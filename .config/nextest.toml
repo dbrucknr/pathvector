@@ -1,0 +1,19 @@
+[profile.default]
+# Keep the default at 0 retries workspace-wide — a flaky unit/proptest result
+# almost always means a real bug (e.g. a race in daemon logic), and silently
+# retrying it would hide that. Only pathvector-e2e gets retries below.
+retries = 0
+
+[[profile.default.overrides]]
+# pathvector-e2e's harnesses pre-allocate a host port by binding to port 0,
+# reading it back, then releasing it before Docker binds the *same* port
+# number for real (see `alloc_free_port`'s doc comment in
+# pathvector-e2e/src/lib.rs). That TOCTOU window can span an entire peer
+# container's startup + healthcheck wait, so under CI's multi-threaded e2e
+# run (many containers starting concurrently) two tests occasionally get
+# handed the same just-freed port, and Docker's `start container` call fails
+# with "port is already allocated" — a transient infra race, not a logic bug.
+# A couple of retries lets the harness re-roll a fresh port and self-heal
+# without masking a genuine regression (which would fail on every retry too).
+filter = "package(pathvector-e2e)"
+retries = 2
