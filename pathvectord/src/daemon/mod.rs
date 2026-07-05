@@ -808,12 +808,25 @@ where
         );
     }
 
-    // Spawn the BGP TCP listener for inbound connections (RFC 4271 §6.8).
+    // Spawn the BGP TCP listeners for inbound connections (RFC 4271 §6.8).
+    // Two independent listeners (IPv4 and IPv6) rather than one dual-stack
+    // socket — see run_bgp_listener's doc comment for why. Each family's
+    // bind failure is independent, so e.g. an environment with IPv6 disabled
+    // still gets a working IPv4 listener (dial-only for v6 in that case).
     {
         let incoming = Arc::clone(&incoming_senders);
         let md5 = Arc::clone(&md5_passwords);
+        let bind_addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bgp_port);
         tokio::spawn(async move {
-            run_bgp_listener(bgp_port, incoming, md5).await;
+            run_bgp_listener(bind_addr_v4, incoming, md5).await;
+        });
+    }
+    {
+        let incoming = Arc::clone(&incoming_senders);
+        let md5 = Arc::clone(&md5_passwords);
+        let bind_addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), bgp_port);
+        tokio::spawn(async move {
+            run_bgp_listener(bind_addr_v6, incoming, md5).await;
         });
     }
 
@@ -11544,8 +11557,9 @@ mod event_loop_tests {
 
         let incoming_clone = Arc::clone(&incoming);
         let md5_clone = Arc::clone(&md5);
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
         tokio::spawn(async move {
-            run_bgp_listener(port, incoming_clone, md5_clone).await;
+            run_bgp_listener(bind_addr, incoming_clone, md5_clone).await;
         });
 
         // Give the listener a moment to bind.
@@ -11568,6 +11582,67 @@ mod event_loop_tests {
             n, 0,
             "listener must send no data and close the connection for an unlisted peer"
         );
+    }
+
+    /// An IPv4 listener and an IPv6 listener bound to the *same* port must
+    /// coexist without EADDRINUSE, and each must independently accept
+    /// connections from its own address family. Proves the
+    /// `IPV6_V6ONLY`-via-`socket2` fix in `bind_listener`: without it, an
+    /// IPv6 "any" bind can be dual-stack on some platforms and collide with
+    /// a same-port IPv4 listener.
+    #[tokio::test]
+    async fn bgp_listener_v4_and_v6_coexist_on_same_port() {
+        use std::net::SocketAddr;
+
+        // Pick a free port via a throwaway IPv4 bind, then drop it so both
+        // real listeners can claim that exact port on their own family.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let peer_v4: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let peer_v6: Ipv6Addr = "::1".parse().unwrap();
+        let (tx_v4, mut rx_v4) = mpsc::channel(1);
+        let (tx_v6, mut rx_v6) = mpsc::channel(1);
+        let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
+            Arc::new(RwLock::new(HashMap::from([
+                (IpAddr::V4(peer_v4), tx_v4),
+                (IpAddr::V6(peer_v6), tx_v6),
+            ])));
+        let md5: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let bind_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let bind_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+        let (incoming_v4, md5_v4) = (Arc::clone(&incoming), Arc::clone(&md5));
+        tokio::spawn(async move {
+            run_bgp_listener(bind_v4, incoming_v4, md5_v4).await;
+        });
+        let (incoming_v6, md5_v6) = (Arc::clone(&incoming), Arc::clone(&md5));
+        tokio::spawn(async move {
+            run_bgp_listener(bind_v6, incoming_v6, md5_v6).await;
+        });
+
+        // Give both listeners a moment to bind.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let _conn_v4 = tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V4(peer_v4), port))
+            .await
+            .expect("IPv4 connect must succeed — the IPv4 listener must have bound cleanly");
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), rx_v4.recv())
+            .await
+            .expect("must receive an IncomingConnection within 2 s")
+            .expect("channel must not be closed");
+
+        let _conn_v6 = tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V6(peer_v6), port))
+            .await
+            .expect(
+                "IPv6 connect must succeed — the IPv6 listener must have bound cleanly \
+                 alongside the IPv4 one on the same port",
+            );
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), rx_v6.recv())
+            .await
+            .expect("must receive an IncomingConnection within 2 s")
+            .expect("channel must not be closed");
     }
 }
 

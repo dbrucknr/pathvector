@@ -1007,6 +1007,32 @@ pub(super) async fn run_command_processor<H, F>(
     }
 }
 
+/// Builds and binds a `tokio::net::TcpListener` for `addr`.
+///
+/// For an IPv6 address, explicitly sets `IPV6_V6ONLY` via `socket2` before
+/// binding, so this listener never also claims IPv4-mapped traffic — whether
+/// an IPv6 "any" bind is dual-stack by default is an OS setting, not
+/// something to rely on when a separate IPv4 listener is bound to the same
+/// port. IPv4 addresses are bound directly with no extra socket options.
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
 /// Sets up BGP sessions for every configured peer and constructs the initial
 /// [`DaemonState`].
 ///
@@ -1022,19 +1048,31 @@ pub(super) async fn run_command_processor<H, F>(
 ///
 /// Extracted from `run_with()` so it can be driven in tests by supplying a
 /// mock `spawn_fn` — no real TCP sockets needed.
+///
+/// Binds a single address family (`bind_addr`'s own family). Callers that
+/// want both IPv4 and IPv6 inbound connections run two instances of this
+/// function concurrently — one bound to `0.0.0.0:<port>`, one to
+/// `[::]:<port>` — rather than relying on one dual-stack socket, since
+/// whether an IPv6 "any" bind also accepts IPv4-mapped connections is an OS
+/// default that varies by platform (Linux historically dual-stack, macOS/
+/// Windows historically v6-only). An IPv6 `bind_addr` always gets
+/// `IPV6_V6ONLY` set explicitly via `socket2`, so it never competes with a
+/// concurrently-bound IPv4 listener on the same port regardless of OS
+/// default. Each listener's bind failure is independent — if only one
+/// family fails to bind, the other keeps running (dial-only for the failed
+/// family, matching the existing single-family fallback behavior).
 pub(super) async fn run_bgp_listener(
-    bgp_port: u16,
+    bind_addr: std::net::SocketAddr,
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     _md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>>,
 ) {
-    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], bgp_port));
-    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+    let listener = match bind_listener(bind_addr) {
         Ok(l) => {
-            tracing::info!(port = bgp_port, "BGP listener started");
+            tracing::info!(addr = %bind_addr, "BGP listener started");
             l
         }
         Err(e) => {
-            tracing::error!(port = bgp_port, error = %e, "BGP listener failed to bind; operating in dial-only mode");
+            tracing::error!(addr = %bind_addr, error = %e, "BGP listener failed to bind; operating in dial-only mode for this address family");
             return;
         }
     };

@@ -1933,6 +1933,7 @@ dependencies = [
  "prost",
  "prost-types",
  "serde",
+ "socket2",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
