@@ -94,7 +94,7 @@ async fn wait_for_established_respects_deadline() {
         Duration::from_secs(3),
         wait_for_established(
             &mut client,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
             Duration::from_secs(1),
         ),
     )

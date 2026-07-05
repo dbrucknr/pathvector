@@ -2284,6 +2284,10 @@ pub async fn wait_for_kernel_route_withdrawn(
 
 /// Polls until the BGP session with `peer` reaches `Established`.
 ///
+/// Accepts either address family — `Ipv4Addr`/`Ipv6Addr`/`IpAddr` all
+/// implement `Into<IpAddr>` — so this one function serves both IPv4-
+/// transport tests and IPv6-transport tests without a separate helper.
+///
 /// Callers that treat a timeout as a test failure should call `.expect("…")`
 /// on the return value.
 ///
@@ -2293,9 +2297,10 @@ pub async fn wait_for_kernel_route_withdrawn(
 /// `Established`.
 pub async fn wait_for_established(
     client: &mut PathvectorClient,
-    peer: Ipv4Addr,
+    peer: impl Into<IpAddr>,
     timeout: Duration,
 ) -> Result<(), String> {
+    let peer: IpAddr = peer.into();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2304,7 +2309,7 @@ pub async fn wait_for_established(
                 "timed out waiting for BGP session to reach Established with {peer}"
             ));
         }
-        if let Ok(p) = client.get_peer(IpAddr::V4(peer)).await
+        if let Ok(p) = client.get_peer(peer).await
             && p.session_state == SessionState::Established
         {
             return Ok(());
