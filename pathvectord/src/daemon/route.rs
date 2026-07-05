@@ -6,7 +6,7 @@ impl DaemonState {
     #[allow(clippy::similar_names)]
     pub(crate) fn on_route_update(
         &mut self,
-        peer_ip: Ipv4Addr,
+        peer_ip: IpAddr,
         mut msg: UpdateMessage,
     ) -> Option<NotificationMessage> {
         tracing::debug!(
@@ -124,7 +124,7 @@ impl DaemonState {
                     .peer_bgp_ids
                     .get(&peer_ip)
                     .copied()
-                    .unwrap_or(peer_ip);
+                    .unwrap_or(self.rib.local_bgp_id);
                 msg.attributes.push(PathAttribute::OriginatorId(bgp_id));
             }
 
@@ -400,7 +400,7 @@ impl DaemonState {
     /// `on_route_update`, `set_import_default`, `set_export_default`, and the
     /// origination methods.
     pub(super) fn propagate_to_all_peers(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
-        let established_peers: Vec<Ipv4Addr> = self.rib.peer_types.keys().copied().collect();
+        let established_peers: Vec<IpAddr> = self.rib.peer_types.keys().copied().collect();
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
         let is_rr = !self.rib.rr_clients.is_empty();
@@ -446,9 +446,9 @@ impl DaemonState {
                         && let Some(src) = loc_rib.best_peer(&nlri)
                         && let IpAddr::V4(src_ip) = src.ip()
                     {
-                        let src_is_client = rr_clients.contains(&src_ip);
-                        let src_is_ibgp =
-                            peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
+                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
+                            == Some(PeerType::Internal);
                         if src_is_ibgp && !src_is_client && !dest_is_client {
                             return PrefixDecision::NoChange;
                         }
@@ -509,7 +509,7 @@ impl DaemonState {
                 .extend(decisions);
         }
         // Sync advertised counts after all propagation is complete.
-        let peers: Vec<Ipv4Addr> = self.adj_ribs_out.keys().copied().collect();
+        let peers: Vec<IpAddr> = self.adj_ribs_out.keys().copied().collect();
         for peer_ip in peers {
             self.sync_advertised(peer_ip);
         }
@@ -530,7 +530,7 @@ impl DaemonState {
         // has elapsed. A bulk "max of all last_sent" check would incorrectly
         // suppress a pending NLRI if any *other* (non-pending) NLRI was sent
         // recently enough to make the max appear within the window.
-        let peers_with_pending: Vec<Ipv4Addr> = self
+        let peers_with_pending: Vec<IpAddr> = self
             .mrai_pending
             .iter()
             .filter(|(_, s)| !s.is_empty())
@@ -600,7 +600,7 @@ impl DaemonState {
     pub(super) fn propagate_to_all_peers_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
         // Only send IPv6 UPDATEs to peers that negotiated the Multi-Protocol
         // capability for IPv6 unicast (RFC 4760).
-        let established_peers: Vec<Ipv4Addr> = self
+        let established_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -640,9 +640,9 @@ impl DaemonState {
                         && let Some(src) = loc_rib_v6.best_peer(&nlri)
                         && let IpAddr::V4(src_ip) = src.ip()
                     {
-                        let src_is_client = rr_clients.contains(&src_ip);
-                        let src_is_ibgp =
-                            peer_types.get(&src_ip).copied() == Some(PeerType::Internal);
+                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
+                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
+                            == Some(PeerType::Internal);
                         if src_is_ibgp && !src_is_client && !dest_is_client {
                             return PrefixDecisionV6::NoChange;
                         }
@@ -671,7 +671,7 @@ impl DaemonState {
         // `on_route_update` when only `affected_v6` is non-empty) — without
         // this, `prefixes_advertised` would stay stale after a v6-only
         // propagation until some unrelated v4 event happened to resync it.
-        let peers: Vec<Ipv4Addr> = self.adj_ribs_out_v6.keys().copied().collect();
+        let peers: Vec<IpAddr> = self.adj_ribs_out_v6.keys().copied().collect();
         for peer_ip in peers {
             self.sync_advertised(peer_ip);
         }
@@ -689,7 +689,7 @@ impl DaemonState {
     /// RFC 4271 §9.2: "the speaker SHOULD try to combine as many feasible
     /// routes as possible in the UPDATE messages."
     pub(crate) fn flush_pending(&mut self) {
-        let peers: Vec<Ipv4Addr> = self
+        let peers: Vec<IpAddr> = self
             .pending_decisions
             .keys()
             .chain(self.pending_decisions_v6.keys())

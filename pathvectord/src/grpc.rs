@@ -15,7 +15,7 @@
 //! RIB state.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
@@ -238,7 +238,7 @@ struct PeerServiceImpl {
     /// Channel to the command processor for AddPeer / RemovePeer at runtime.
     cmd_tx: mpsc::Sender<DaemonCommand>,
     /// Per-peer command senders, used by SoftReset to send ROUTE-REFRESH.
-    stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+    stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
 }
 
 /// Renders an RFC 9234 [`pathvector_types::Role`] the same way as `PeerConfig.role`'s TOML
@@ -258,16 +258,16 @@ fn role_to_str(role: pathvector_types::Role) -> &'static str {
 ///
 /// Returns `None` if `addr` is not in `peer_remote_as` (i.e. not configured).
 fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
-    let remote_as = *snap.peer_remote_as.get(&addr)?;
+    let remote_as = *snap.peer_remote_as.get(&IpAddr::V4(addr))?;
     let peer_id = PeerId::from(addr);
 
     let (session_state, peer_type, hold_time, uptime_seconds) =
-        if let Some(&pt) = snap.peer_types.get(&addr) {
+        if let Some(&pt) = snap.peer_types.get(&IpAddr::V4(addr)) {
             let uptime = snap
                 .established_at
-                .get(&addr)
+                .get(&IpAddr::V4(addr))
                 .map_or(0, |t| t.elapsed().as_secs());
-            let ht = snap.hold_times.get(&addr).copied().unwrap_or(0);
+            let ht = snap.hold_times.get(&IpAddr::V4(addr)).copied().unwrap_or(0);
             (
                 proto::SessionState::Established as i32,
                 proto_peer_type(pt),
@@ -285,7 +285,7 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
 
     let prefixes_received = snap
         .prefixes_received
-        .get(&addr)
+        .get(&IpAddr::V4(addr))
         .copied()
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
@@ -299,7 +299,7 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
 
     let prefixes_advertised = snap
         .prefixes_advertised
-        .get(&addr)
+        .get(&IpAddr::V4(addr))
         .copied()
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
@@ -314,19 +314,19 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
         prefixes_received,
         prefixes_accepted,
         prefixes_advertised,
-        eor_ipv4_received: snap.eor_received.contains(&addr),
-        eor_ipv6_received: snap.eor_received_v6.contains(&addr),
+        eor_ipv4_received: snap.eor_received.contains(&IpAddr::V4(addr)),
+        eor_ipv6_received: snap.eor_received_v6.contains(&IpAddr::V4(addr)),
         peer_gr_restart_time: snap
             .gr_capable_peers
-            .get(&addr)
+            .get(&IpAddr::V4(addr))
             .map_or(0, |&t| u32::from(t)),
         configured_role: snap
             .peer_roles
-            .get(&addr)
+            .get(&IpAddr::V4(addr))
             .map_or_else(String::new, |&r| role_to_str(r).to_string()),
         negotiated_role: snap
             .negotiated_roles
-            .get(&addr)
+            .get(&IpAddr::V4(addr))
             .map_or_else(String::new, |&r| role_to_str(r).to_string()),
     })
 }
@@ -376,7 +376,10 @@ impl PeerService for PeerServiceImpl {
             .peer_remote_as
             .keys()
             .copied()
-            .filter_map(|addr| build_peer_state(&snap, addr))
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => build_peer_state(&snap, v4),
+                IpAddr::V6(_) => None,
+            })
             .collect();
         // Stable ordering by address for predictable CLI output.
         peers.sort_by_key(|p| p.address.clone());
@@ -412,7 +415,10 @@ impl PeerService for PeerServiceImpl {
             .peer_remote_as
             .keys()
             .copied()
-            .filter_map(|addr| build_peer_state(&snap, addr))
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => build_peer_state(&snap, v4),
+                IpAddr::V6(_) => None,
+            })
             .map(|ps| PeerEvent {
                 r#type: PeerEventType::Current as i32,
                 peer: Some(ps),
@@ -451,7 +457,10 @@ impl PeerService for PeerServiceImpl {
                             .peer_remote_as
                             .keys()
                             .copied()
-                            .filter_map(|addr| build_peer_state(&snap, addr))
+                            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => build_peer_state(&snap, v4),
+                IpAddr::V6(_) => None,
+            })
                             .map(|ps| PeerEvent {
                                 r#type: PeerEventType::Changed as i32,
                                 peer: Some(ps),
@@ -513,7 +522,7 @@ impl PeerService for PeerServiceImpl {
         };
 
         let peer = crate::config::PeerConfig {
-            address: addr,
+            address: IpAddr::V4(addr),
             port,
             remote_as: req.remote_as,
             import_default,
@@ -542,7 +551,7 @@ impl PeerService for PeerServiceImpl {
         // the peer is absent before retrying add_peer after a remove.
         {
             let s = self.state.read().await;
-            if s.pending_removal.contains(&addr) {
+            if s.pending_removal.contains(&IpAddr::V4(addr)) {
                 return Err(Status::failed_precondition(format!(
                     "peer {addr} removal is in progress; \
                      retry add_peer after the peer disappears from list_peers"
@@ -571,13 +580,13 @@ impl PeerService for PeerServiceImpl {
         // Verify the peer exists before sending the command so the caller gets a
         // NOT_FOUND immediately rather than silently doing nothing.
         let snap = self.state.read().await.snapshot();
-        if !snap.peer_remote_as.contains_key(&addr) {
+        if !snap.peer_remote_as.contains_key(&IpAddr::V4(addr)) {
             return Err(Status::not_found(format!("peer {addr} is not configured")));
         }
         drop(snap);
 
         self.cmd_tx
-            .send(DaemonCommand::RemovePeer(addr))
+            .send(DaemonCommand::RemovePeer(IpAddr::V4(addr)))
             .await
             .map_err(|_| Status::internal("daemon command channel closed"))?;
 
@@ -610,15 +619,15 @@ impl PeerService for PeerServiceImpl {
         {
             let s = self.state.read().await;
             let snap = s.snapshot();
-            if !snap.peer_remote_as.contains_key(&addr) {
+            if !snap.peer_remote_as.contains_key(&IpAddr::V4(addr)) {
                 return Err(Status::not_found(format!("peer {addr} is not configured")));
             }
-            if !snap.peer_types.contains_key(&addr) {
+            if !snap.peer_types.contains_key(&IpAddr::V4(addr)) {
                 return Err(Status::failed_precondition(format!(
                     "peer {addr} session is not established"
                 )));
             }
-            if !s.route_refresh_peers.contains(&addr) {
+            if !s.route_refresh_peers.contains(&IpAddr::V4(addr)) {
                 return Err(Status::failed_precondition(format!(
                     "peer {addr} did not negotiate Route Refresh capability (RFC 2918)"
                 )));
@@ -629,7 +638,7 @@ impl PeerService for PeerServiceImpl {
             .stop_senders
             .lock()
             .unwrap()
-            .get(&addr)
+            .get(&IpAddr::V4(addr))
             .cloned()
             .ok_or_else(|| {
                 Status::failed_precondition(format!("peer {addr} session is not established"))
@@ -926,13 +935,13 @@ impl PolicyService for PolicyServiceImpl {
         let action = parse_policy_action(req.action)?;
 
         let mut s = self.state.write().await;
-        if !s.import_policies.contains_key(&peer_ip) {
+        if !s.import_policies.contains_key(&IpAddr::V4(peer_ip)) {
             return Err(Status::not_found(format!(
                 "peer {peer_ip} is not configured"
             )));
         }
 
-        s.set_import_default(peer_ip, action);
+        s.set_import_default(IpAddr::V4(peer_ip), action);
         Ok(Response::new(SetImportDefaultResponse {}))
     }
 
@@ -945,7 +954,7 @@ impl PolicyService for PolicyServiceImpl {
         let action = parse_policy_action(req.action)?;
 
         let mut s = self.state.write().await;
-        if !s.export_policies.contains_key(&peer_ip) {
+        if !s.export_policies.contains_key(&IpAddr::V4(peer_ip)) {
             return Err(Status::not_found(format!(
                 "peer {peer_ip} is not configured"
             )));
@@ -956,7 +965,7 @@ impl PolicyService for PolicyServiceImpl {
             ?action,
             "SetExportDefault: replacing export policy and re-evaluating Loc-RIB for peer"
         );
-        s.set_export_default(peer_ip, action);
+        s.set_export_default(IpAddr::V4(peer_ip), action);
         Ok(Response::new(SetExportDefaultResponse {}))
     }
 }
@@ -1310,7 +1319,7 @@ pub(crate) async fn serve(
     state: Arc<tokio::sync::RwLock<DaemonState>>,
     port: u16,
     cmd_tx: mpsc::Sender<DaemonCommand>,
-    stop_senders: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>>,
+    stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
 ) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
@@ -1363,7 +1372,7 @@ pub(crate) async fn serve(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex};
 
     use pathvector_rib::{PeerId, RouteBuilder};
@@ -1392,7 +1401,7 @@ mod tests {
         tx
     }
 
-    fn noop_stop_senders() -> Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<SessionCommand>>>> {
+    fn noop_stop_senders() -> Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
@@ -1415,12 +1424,12 @@ mod tests {
         let mut senders = HashMap::new();
         for &(ip, _) in peers {
             let (tx, _rx) = mpsc::channel(64);
-            senders.insert(ip, tx);
+            senders.insert(IpAddr::V4(ip), tx);
         }
         let peer_configs: Vec<config::PeerConfig> = peers
             .iter()
             .map(|&(address, remote_as)| config::PeerConfig {
-                address,
+                address: IpAddr::V4(address),
                 port: 179,
                 remote_as,
                 import_default: Some(ImportDefault::Accept),
@@ -1503,7 +1512,15 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+        s.on_established(
+            IpAddr::V4(addr),
+            addr,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.session_state, proto::SessionState::Established as i32);
@@ -1519,16 +1536,27 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+        s.on_established(
+            IpAddr::V4(addr),
+            addr,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         // Insert a route so the counts are non-zero.
         let n = nlri("10.0.0.0/8");
         let route = RouteBuilder::new(n, Origin::Igp, AsPath::from_sequence(vec![Asn::new(65002)]))
             .peer_type(PeerType::External)
             .build();
-        s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+        s.adj_ribs_in
+            .get_mut(&IpAddr::V4(addr))
+            .unwrap()
+            .insert(route.clone());
         s.rib_insert_v4(peer("10.0.0.2"), route);
-        s.sync_received(addr);
+        s.sync_received(IpAddr::V4(addr));
 
         let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.prefixes_received, 1);
@@ -1550,8 +1578,12 @@ mod tests {
 
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.rib_mut().peer_roles.insert(addr, Role::Customer);
-        s.rib_mut().negotiated_roles.insert(addr, Role::Provider);
+        s.rib_mut()
+            .peer_roles
+            .insert(IpAddr::V4(addr), Role::Customer);
+        s.rib_mut()
+            .negotiated_roles
+            .insert(IpAddr::V4(addr), Role::Provider);
 
         let ps = build_peer_state(&s.rib, addr).unwrap();
         assert_eq!(ps.configured_role, "customer");
@@ -1736,10 +1768,15 @@ mod tests {
     async fn test_list_peers_established_peer_shows_established_state() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let state = arc_state(65001, &[(addr, 65002)]);
-        state
-            .write()
-            .await
-            .on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+        state.write().await.on_established(
+            IpAddr::V4(addr),
+            addr,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
 
         let svc = PeerServiceImpl {
             state,
@@ -1977,7 +2014,7 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
 
         // Mark the peer as mid-teardown.
-        state.write().await.pending_removal.insert(addr);
+        state.write().await.pending_removal.insert(IpAddr::V4(addr));
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let svc = PeerServiceImpl {
@@ -2025,12 +2062,13 @@ mod tests {
         {
             let mut s = state.write().await;
             let rib = Arc::make_mut(&mut s.rib);
-            rib.peer_types.insert(peer_ip, PeerType::External);
+            rib.peer_types
+                .insert(IpAddr::V4(peer_ip), PeerType::External);
             // route_refresh_peers deliberately NOT populated.
         }
 
         let (stop_tx, _stop_rx) = mpsc::channel(4);
-        let stop_senders = Arc::new(Mutex::new(HashMap::from([(peer_ip, stop_tx)])));
+        let stop_senders = Arc::new(Mutex::new(HashMap::from([(IpAddr::V4(peer_ip), stop_tx)])));
 
         let svc = PeerServiceImpl {
             state,
@@ -2062,12 +2100,13 @@ mod tests {
         {
             let mut s = state.write().await;
             let rib = Arc::make_mut(&mut s.rib);
-            rib.peer_types.insert(peer_ip, PeerType::External);
-            s.route_refresh_peers.insert(peer_ip);
+            rib.peer_types
+                .insert(IpAddr::V4(peer_ip), PeerType::External);
+            s.route_refresh_peers.insert(IpAddr::V4(peer_ip));
         }
 
         let (stop_tx, mut stop_rx) = mpsc::channel(4);
-        let stop_senders = Arc::new(Mutex::new(HashMap::from([(peer_ip, stop_tx)])));
+        let stop_senders = Arc::new(Mutex::new(HashMap::from([(IpAddr::V4(peer_ip), stop_tx)])));
 
         let svc = PeerServiceImpl {
             state,
@@ -2183,7 +2222,7 @@ mod tests {
         // Step 1: broadcast Removed — peer removed from state first.
         {
             let mut s = state.write().await;
-            s.remove_peer(addr);
+            s.remove_peer(IpAddr::V4(addr));
             let _ = s.peer_tx.send(proto::PeerEvent {
                 r#type: proto::PeerEventType::Removed as i32,
                 peer: Some(proto::PeerState {
@@ -2244,10 +2283,21 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(addr),
+                addr,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
-            s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(addr))
+                .unwrap()
+                .insert(route.clone());
             s.rib_insert_v4(peer("10.0.0.2"), route);
         }
 
@@ -2304,17 +2354,23 @@ mod tests {
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         {
             let mut s = state.write().await;
-            s.on_established(a1, a1, PeerType::External, 65002, 90, &[], None);
-            s.on_established(a2, a2, PeerType::External, 65003, 90, &[], None);
+            s.on_established(IpAddr::V4(a1), a1, PeerType::External, 65002, 90, &[], None);
+            s.on_established(IpAddr::V4(a2), a2, PeerType::External, 65003, 90, &[], None);
 
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
-            s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(a1))
+                .unwrap()
+                .insert(r1.clone());
             s.rib_insert_v4(peer("10.0.0.2"), r1);
 
             let n2 = nlri("192.168.0.0/24");
             let r2 = route_igp(n2, PeerType::External);
-            s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(a2))
+                .unwrap()
+                .insert(r2.clone());
             s.rib_insert_v4(peer("10.0.0.3"), r2);
         }
 
@@ -2337,17 +2393,23 @@ mod tests {
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         {
             let mut s = state.write().await;
-            s.on_established(a1, a1, PeerType::External, 65002, 90, &[], None);
-            s.on_established(a2, a2, PeerType::External, 65003, 90, &[], None);
+            s.on_established(IpAddr::V4(a1), a1, PeerType::External, 65002, 90, &[], None);
+            s.on_established(IpAddr::V4(a2), a2, PeerType::External, 65003, 90, &[], None);
 
             let n1 = nlri("10.0.0.0/8");
             let r1 = route_igp(n1, PeerType::External);
-            s.adj_ribs_in.get_mut(&a1).unwrap().insert(r1.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(a1))
+                .unwrap()
+                .insert(r1.clone());
             s.rib_insert_v4(peer("10.0.0.2"), r1);
 
             let n2 = nlri("192.168.0.0/24");
             let r2 = route_igp(n2, PeerType::External);
-            s.adj_ribs_in.get_mut(&a2).unwrap().insert(r2.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(a2))
+                .unwrap()
+                .insert(r2.clone());
             s.rib_insert_v4(peer("10.0.0.3"), r2);
         }
 
@@ -2389,8 +2451,8 @@ mod tests {
         let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
         let state = arc_state(65001, &[(a1, 65002), (a2, 65003)]);
         let mut s = state.write().await;
-        s.on_established(a1, a1, PeerType::External, 65002, 90, &[], None);
-        s.on_established(a2, a2, PeerType::External, 65003, 90, &[], None);
+        s.on_established(IpAddr::V4(a1), a1, PeerType::External, 65002, 90, &[], None);
+        s.on_established(IpAddr::V4(a2), a2, PeerType::External, 65003, 90, &[], None);
         for (prefix, addr) in [
             ("10.0.0.0/8", a1),
             ("172.16.0.0/12", a2),
@@ -2398,7 +2460,10 @@ mod tests {
         ] {
             let n = nlri(prefix);
             let r = route_igp(n, PeerType::External);
-            s.adj_ribs_in.get_mut(&addr).unwrap().insert(r.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(addr))
+                .unwrap()
+                .insert(r.clone());
             s.rib_insert_v4(peer(&addr.to_string()), r);
         }
         drop(s);
@@ -2506,10 +2571,21 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(addr),
+                addr,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             let n = nlri("10.0.0.0/8");
             let route = route_igp(n, PeerType::External);
-            s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+            s.adj_ribs_in
+                .get_mut(&IpAddr::V4(addr))
+                .unwrap()
+                .insert(route.clone());
             s.rib_insert_v4(peer("10.0.0.2"), route);
         }
 
@@ -2726,7 +2802,15 @@ mod tests {
         // Simulate BGP session reaching Established (GoBGP peer).
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(peer_ip),
+                peer_ip,
+                PeerType::External,
+                65001,
+                90,
+                &[],
+                None,
+            );
         }
 
         // Simulate GoBGP sending 3 routes (like exchange script phase 1).
@@ -2735,7 +2819,7 @@ mod tests {
             let nlri: Nlri<Ipv4Addr> = prefix.parse().unwrap();
             let mut s = state.write().await;
             s.on_route_update(
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -2794,14 +2878,22 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(peer_ip),
+                peer_ip,
+                PeerType::External,
+                65001,
+                90,
+                &[],
+                None,
+            );
         }
 
         // Inject a route into loc_rib via origination (simulates phase 2).
         {
             let mut s = state.write().await;
             s.on_route_update(
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -3086,7 +3178,15 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(addr),
+                addr,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             let n = nlri6("2001:db8::/32");
             s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n, PeerType::External));
         }
@@ -3113,7 +3213,15 @@ mod tests {
         // Both filter_map None branches (v4 line 558, v6 line 570) must be taken.
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
-        s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+        s.on_established(
+            IpAddr::V4(addr),
+            addr,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         let n4 = nlri("192.0.2.0/24");
         s.rib_insert_v4(peer("10.0.0.2"), route_igp(n4, PeerType::External));
         let n6 = nlri6("2001:db8::/32");
@@ -3279,7 +3387,15 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(addr),
+                addr,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             let n = nlri6("2001:db8::/32");
             s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n, PeerType::External));
         }
@@ -3307,7 +3423,15 @@ mod tests {
         let state = arc_state(65001, &[(addr, 65002)]);
         {
             let mut s = state.write().await;
-            s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(addr),
+                addr,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             let n = nlri6("2001:db8::/32");
             s.rib_insert_v6(PeerId::from(addr), route_v6_igp(n, PeerType::External));
         }
@@ -3711,7 +3835,7 @@ mod tests {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let mut s = make_state(65001, &[(addr, 65002)]);
         s.on_established(
-            addr,
+            IpAddr::V4(addr),
             addr,
             pathvector_types::PeerType::External,
             65002,
@@ -3761,11 +3885,19 @@ mod tests {
         let mut route_rx = state.read().await.route_tx.subscribe();
 
         let mut s = state.write().await;
-        s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
+        s.on_established(
+            IpAddr::V4(peer_ip),
+            peer_ip,
+            PeerType::External,
+            65001,
+            90,
+            &[],
+            None,
+        );
 
         let announced = vec![nlri("10.0.0.0/8"), nlri("172.16.0.0/12")];
         s.on_route_update(
-            peer_ip,
+            IpAddr::V4(peer_ip),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -3810,9 +3942,17 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
-            s.on_route_update(
+            s.on_established(
+                IpAddr::V4(peer_ip),
                 peer_ip,
+                PeerType::External,
+                65001,
+                90,
+                &[],
+                None,
+            );
+            s.on_route_update(
+                IpAddr::V4(peer_ip),
                 UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -3833,7 +3973,7 @@ mod tests {
         {
             let mut s = state.write().await;
             s.on_route_update(
-                peer_ip,
+                IpAddr::V4(peer_ip),
                 UpdateMessage {
                     withdrawn: vec![nlri("10.0.0.0/8")],
                     attributes: vec![],
@@ -3867,7 +4007,15 @@ mod tests {
         let mut peer_rx = state.read().await.peer_tx.subscribe();
 
         let mut s = state.write().await;
-        s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
+        s.on_established(
+            IpAddr::V4(peer_ip),
+            peer_ip,
+            PeerType::External,
+            65001,
+            90,
+            &[],
+            None,
+        );
 
         // Drain the PeerEvent fired by on_established.
         drop(s);
@@ -3875,7 +4023,7 @@ mod tests {
         let mut s = state.write().await;
 
         s.on_route_update(
-            peer_ip,
+            IpAddr::V4(peer_ip),
             UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![
@@ -3908,9 +4056,17 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
-            s.on_route_update(
+            s.on_established(
+                IpAddr::V4(peer_ip),
                 peer_ip,
+                PeerType::External,
+                65001,
+                90,
+                &[],
+                None,
+            );
+            s.on_route_update(
+                IpAddr::V4(peer_ip),
                 UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -4018,9 +4174,17 @@ mod tests {
         // works without hitting the RwLock deadlock.
         {
             let mut s = state.write().await;
-            s.on_established(peer_ip, peer_ip, PeerType::External, 65001, 90, &[], None);
-            s.on_route_update(
+            s.on_established(
+                IpAddr::V4(peer_ip),
                 peer_ip,
+                PeerType::External,
+                65001,
+                90,
+                &[],
+                None,
+            );
+            s.on_route_update(
+                IpAddr::V4(peer_ip),
                 UpdateMessage {
                     withdrawn: vec![],
                     attributes: vec![
@@ -4038,7 +4202,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            s.on_terminated(peer_ip, TerminationReason::Unclean, true);
+            s.on_terminated(IpAddr::V4(peer_ip), TerminationReason::Unclean, true);
         }
 
         let mut withdrawn: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4173,7 +4337,15 @@ mod tests {
         // Insert 10 routes across distinct /24 prefixes.
         {
             let mut s = state.write().await;
-            s.on_established(addr, addr, PeerType::External, 65002, 90, &[], None);
+            s.on_established(
+                IpAddr::V4(addr),
+                addr,
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
             for i in 0..10u8 {
                 let prefix: pathvector_types::Nlri<Ipv4Addr> =
                     format!("10.0.{i}.0/24").parse().unwrap();
@@ -4185,7 +4357,10 @@ mod tests {
                 .next_hop(pathvector_types::NextHop::V4("10.0.0.2".parse().unwrap()))
                 .peer_type(PeerType::External)
                 .build();
-                s.adj_ribs_in.get_mut(&addr).unwrap().insert(route.clone());
+                s.adj_ribs_in
+                    .get_mut(&IpAddr::V4(addr))
+                    .unwrap()
+                    .insert(route.clone());
                 s.rib_insert_v4(peer("10.0.0.2"), route);
             }
         }

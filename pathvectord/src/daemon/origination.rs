@@ -124,7 +124,7 @@ impl DaemonState {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_rib::BestPathChange;
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
@@ -153,7 +153,7 @@ mod tests {
     /// `originate_routes_v6` must notify the FIB manager when one is set.
     #[test]
     fn originate_v6_notifies_fib_manager() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         let fib = with_recording_fib(&mut state);
 
         state.originate_route_v6(route_v6("2001:db8::/32"));
@@ -170,7 +170,7 @@ mod tests {
     /// `withdraw_originated_routes` must notify the FIB manager for each withdrawn NLRI.
     #[test]
     fn withdraw_v4_notifies_fib_manager() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         let fib = with_recording_fib(&mut state);
 
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
@@ -191,7 +191,7 @@ mod tests {
     /// `withdraw_originated_routes_v6` must notify the FIB manager for each withdrawn NLRI.
     #[test]
     fn withdraw_v6_notifies_fib_manager() {
-        let (mut state, _rxs) = make_state(LOCAL_AS, &[(PEER_IP, PEER_AS)]);
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
         let fib = with_recording_fib(&mut state);
 
         state.originate_route_v6(route_v6("2001:db8::/32"));

@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
 
@@ -359,7 +359,11 @@ impl From<PeerRole> for pathvector_types::Role {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PeerConfig {
-    pub address: Ipv4Addr,
+    /// The peer's address — either IPv4 or IPv6. Determines which TCP
+    /// transport family the session dials/accepts over; independent of
+    /// which NLRI address families (IPv4/IPv6 unicast) are actually
+    /// exchanged once established (see RFC 4760).
+    pub address: IpAddr,
     #[serde(default = "default_bgp_port")]
     pub port: u16,
     pub remote_as: u32,
@@ -591,7 +595,7 @@ impl DynamicPeerStore {
     }
 
     /// Remove a peer from the sidecar by address.
-    pub async fn remove(&self, address: Ipv4Addr) {
+    pub async fn remove(&self, address: IpAddr) {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut peers = Self::load_sync(&path);
@@ -645,7 +649,7 @@ mod sidecar_tests {
 
     fn peer(octet: u8, remote_as: u32) -> PeerConfig {
         PeerConfig {
-            address: Ipv4Addr::new(10, 0, 0, octet),
+            address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, octet)),
             port: 179,
             remote_as,
             import_default: None,
@@ -704,7 +708,7 @@ mod sidecar_tests {
 
         store.upsert(peer(1, 65001)).await;
         store.upsert(peer(2, 65002)).await;
-        store.remove(Ipv4Addr::new(10, 0, 0, 1)).await;
+        store.remove(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))).await;
 
         let loaded = store.load();
         assert_eq!(loaded.len(), 1);
@@ -717,7 +721,7 @@ mod sidecar_tests {
         let store = DynamicPeerStore::new(dir.path().join("dynamic_peers.toml"));
 
         store.upsert(peer(1, 65001)).await;
-        store.remove(Ipv4Addr::new(10, 0, 0, 99)).await; // not in sidecar
+        store.remove(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99))).await; // not in sidecar
 
         assert_eq!(store.load().len(), 1);
     }

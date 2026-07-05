@@ -12,26 +12,26 @@ pub(crate) struct GracefulRestartState {
     ///
     /// Present while pathvectord holds stale routes from an uncleanly-terminated
     /// GR-capable peer.  Removed on re-establishment or deadline expiry.
-    pub(crate) deadlines: HashMap<Ipv4Addr, Instant>,
+    pub(crate) deadlines: HashMap<IpAddr, Instant>,
     /// NLRIs snapshotted from AdjRibIn at GR re-establishment time (IPv4).
     ///
     /// Routes that are not refreshed by the peer before its EOR are withdrawn on
     /// EOR receipt.  Cleared on EOR, deadline expiry, or peer removal.
-    pub(crate) stale_nlri: HashMap<Ipv4Addr, HashSet<Nlri<Ipv4Addr>>>,
+    pub(crate) stale_nlri: HashMap<IpAddr, HashSet<Nlri<Ipv4Addr>>>,
     /// IPv6 counterpart of `stale_nlri` — same lifecycle, v6 NLRIs only.
-    pub(crate) stale_nlri_v6: HashMap<Ipv4Addr, HashSet<Nlri<Ipv6Addr>>>,
+    pub(crate) stale_nlri_v6: HashMap<IpAddr, HashSet<Nlri<Ipv6Addr>>>,
     /// Per-family GR info from the most-recent peer OPEN.
     ///
     /// Retained across termination so `on_terminated` knows which AFI/SAFIs the
     /// peer declared GR support for.  Cleared only on `remove_peer`.
-    pub(crate) peer_families: HashMap<Ipv4Addr, Vec<GracefulRestartFamily>>,
+    pub(crate) peer_families: HashMap<IpAddr, Vec<GracefulRestartFamily>>,
     /// Peers that advertised the RFC 8538 N-bit in their GracefulRestart capability.
     ///
     /// When a peer is in this set AND we advertise a non-zero `graceful_restart_time`
     /// (meaning we also have the N-bit set), a received NOTIFICATION other than
     /// `CEASE/HardReset` is treated as Unclean — the GR window opens rather than
     /// flushing routes immediately.
-    pub(crate) notification_capable_peers: HashSet<Ipv4Addr>,
+    pub(crate) notification_capable_peers: HashSet<IpAddr>,
 }
 
 impl GracefulRestartState {
@@ -46,7 +46,7 @@ impl GracefulRestartState {
     }
 
     /// Remove all GR state for `peer_ip`.  Called from `remove_peer`.
-    pub(crate) fn remove_peer(&mut self, peer_ip: Ipv4Addr) {
+    pub(crate) fn remove_peer(&mut self, peer_ip: IpAddr) {
         self.deadlines.remove(&peer_ip);
         self.stale_nlri.remove(&peer_ip);
         self.stale_nlri_v6.remove(&peer_ip);
@@ -60,7 +60,7 @@ impl GracefulRestartState {
     }
 
     /// Drain all peers whose deadline has passed.  Returns their addresses.
-    pub(crate) fn drain_expired(&mut self, now: Instant) -> Vec<Ipv4Addr> {
+    pub(crate) fn drain_expired(&mut self, now: Instant) -> Vec<IpAddr> {
         let mut expired = Vec::new();
         self.deadlines.retain(|ip, &mut d| {
             if d <= now {
@@ -75,12 +75,7 @@ impl GracefulRestartState {
 }
 
 impl DaemonState {
-    pub(super) fn mark_stale_and_repropagate(
-        &mut self,
-        peer_ip: Ipv4Addr,
-        do_v4: bool,
-        do_v6: bool,
-    ) {
+    pub(super) fn mark_stale_and_repropagate(&mut self, peer_ip: IpAddr, do_v4: bool, do_v6: bool) {
         let stale_peer = PeerId::from(peer_ip);
 
         // v4 ─────────────────────────────────────────────────────────────────
@@ -140,7 +135,7 @@ impl DaemonState {
     /// Propagates v4 best-path changes caused by stale marking to other peers.
     fn repropagate_after_stale_mark_v4(
         &mut self,
-        peer_ip: Ipv4Addr,
+        peer_ip: IpAddr,
         prev_prefixes: &[Nlri<Ipv4Addr>],
     ) {
         // Use a HashSet for O(1) membership tests; the slice-based contains is O(n²).
@@ -158,7 +153,7 @@ impl DaemonState {
             )
             .collect();
 
-        let other_peers: Vec<Ipv4Addr> = self
+        let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -222,11 +217,11 @@ impl DaemonState {
     }
 
     /// Propagates v6 best-path changes caused by stale marking to other peers.
-    fn repropagate_after_stale_mark_v6(&mut self, peer_ip: Ipv4Addr) {
+    fn repropagate_after_stale_mark_v6(&mut self, peer_ip: IpAddr) {
         let affected: Vec<Nlri<Ipv6Addr>> =
             self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
 
-        let other_peers: Vec<Ipv4Addr> = self
+        let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -295,7 +290,7 @@ impl DaemonState {
     /// full table) or on GR deadline expiry (peer did not re-establish in time).
     /// Withdraws each NLRI from AdjRibIn and LocRib, then propagates the
     /// resulting best-path changes to all established peers.
-    pub(super) fn prune_stale_nlri(&mut self, peer_ip: Ipv4Addr, stale: &HashSet<Nlri<Ipv4Addr>>) {
+    pub(super) fn prune_stale_nlri(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv4Addr>>) {
         let stale_peer = PeerId::from(peer_ip);
 
         // Withdraw kernel null routes for any BLACKHOLE-tagged stale NLRIs before
@@ -336,7 +331,7 @@ impl DaemonState {
             }
         }
 
-        let other_peers: Vec<Ipv4Addr> = self
+        let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -402,11 +397,7 @@ impl DaemonState {
     }
 
     /// IPv6 counterpart of `prune_stale_nlri` — same semantics for IPv6 NLRIs.
-    pub(super) fn prune_stale_nlri_v6(
-        &mut self,
-        peer_ip: Ipv4Addr,
-        stale: &HashSet<Nlri<Ipv6Addr>>,
-    ) {
+    pub(super) fn prune_stale_nlri_v6(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv6Addr>>) {
         let stale_peer = PeerId::from(peer_ip);
 
         // Same as prune_stale_nlri: check for BLACKHOLE routes before removal.
@@ -446,7 +437,7 @@ impl DaemonState {
             }
         }
 
-        let other_peers: Vec<Ipv4Addr> = self
+        let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -515,7 +506,7 @@ impl DaemonState {
     /// Called from the event loop when a peer's GR window expires without
     /// re-establishment.  Equivalent to a clean `on_terminated` flush for
     /// just the stale NLRIs.
-    pub(crate) fn on_gr_deadline_expired(&mut self, peer_ip: Ipv4Addr) {
+    pub(crate) fn on_gr_deadline_expired(&mut self, peer_ip: IpAddr) {
         let expired_peer = PeerId::from(peer_ip);
         tracing::warn!(
             peer = %peer_ip,
@@ -562,7 +553,7 @@ impl DaemonState {
             *aro = new_aro_v6;
         }
         // Propagate to established peers.
-        let other_peers: Vec<Ipv4Addr> = self
+        let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
@@ -629,7 +620,7 @@ impl DaemonState {
         // received a BGP WITHDRAW for IPv6 routes that were only reachable
         // via the expired peer, even though the kernel FIB and this
         // daemon's own Loc-RIB were already correct (see TODO.md item 6).
-        let other_peers_v6: Vec<Ipv4Addr> = self
+        let other_peers_v6: Vec<IpAddr> = self
             .rib
             .peer_types
             .keys()
