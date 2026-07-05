@@ -66,6 +66,12 @@ pub const MOCK_RTR_IMAGE: &str = "pathvector-mock-rtr-test";
 /// `src/bin/mock_bgp_peer.rs` for the fixed RFC 9234 leak scenario it sends.
 pub const MOCK_BGP_PEER_IMAGE: &str = "pathvector-mock-bgp-peer-test";
 
+/// Mock BGP dialer image built by `just e2e` from
+/// `e2e/Dockerfile.mock-bgp-dialer`, used by [`Ipv6AcceptHarness`]. See
+/// `src/bin/mock_bgp_dialer.rs` — the mirror image of `mock_bgp_peer`, dials
+/// out instead of listening.
+pub const MOCK_BGP_DIALER_IMAGE: &str = "pathvector-mock-bgp-dialer-test";
+
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
@@ -3889,6 +3895,178 @@ impl Ipv6TransportHarness {
             client,
             _network: network,
         }
+    }
+}
+
+/// Writes a pathvectord config whose peer's `address` is an IPv6 literal and
+/// `port` is deliberately unreachable (the mock dialer never listens on any
+/// port), so pathvectord's own outbound dial can never succeed. Used by
+/// [`Ipv6AcceptHarness`] to force the accept path to be the only way the
+/// session reaches Established.
+fn write_daemon_config_v6_accept(peer: Ipv6Addr, remote_as: u32) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord v6-accept config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+
+[[peers]]
+address        = "{peer}"
+port           = 1
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord v6-accept config");
+    f
+}
+
+/// Proves pathvectord's BGP *listener* accepts a real inbound IPv6-sourced
+/// connection and completes the handshake to Established — the mirror image
+/// of [`Ipv6TransportHarness`], which proves the outbound dial path.
+///
+/// pathvectord always actively dials every configured peer (there's no
+/// "passive session" concept in `pathvector-session`), so simply pointing
+/// GoBGP at pathvectord would race pathvectord's own dial against GoBGP's —
+/// nondeterministic about which side's TCP connection actually wins RFC 4271
+/// §6.8 collision detection. This harness sidesteps that: pathvectord's own
+/// peer entry names the dialer's real address but a port nothing listens on
+/// (see [`write_daemon_config_v6_accept`]), so pathvectord's outbound dial
+/// can never succeed — `mock_bgp_dialer` actively connects to pathvectord's
+/// *real* listening port instead, so the accept path is the only way
+/// Established is ever reached.
+///
+/// Uses raw `docker run`/`docker rm` (not `testcontainers`) because both
+/// containers need a *predictable* IPv6 address assigned before either
+/// starts — pathvectord's config must name the dialer's address, and the
+/// dialer's argv must name pathvectord's address, a mutual dependency plain
+/// container-then-discover-IP can't satisfy. `docker run --ip6 <addr>` lets
+/// both be chosen up front instead of discovered afterward.
+pub struct Ipv6AcceptHarness {
+    pathvectord_id: String,
+    dialer_id: String,
+    _network: DockerNetwork,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// The dialer's static IPv6 address — `PeerConfig.address` in
+    /// pathvectord's config, and the address its inbound TCP connection
+    /// arrives from.
+    pub peer_v6: Ipv6Addr,
+}
+
+impl Ipv6AcceptHarness {
+    /// Stand up pathvectord and the mock dialer on an `--ipv6` Docker network
+    /// with statically-assigned addresses, and wait for the session to reach
+    /// Established via pathvectord's accept path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker run` fails for either container, or if the session
+    /// does not reach Established within 30 s.
+    #[must_use]
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-v6-accept-test-{test_id}");
+        let subnet_prefix = format!("fd00:{:x}", test_id & 0xffff);
+        let ipv6_subnet = format!("{subnet_prefix}::/48");
+        let network = DockerNetwork::create_with_ipv6(network_name.clone(), &ipv6_subnet);
+
+        let pathvectord_addr: Ipv6Addr = format!("{subnet_prefix}::10")
+            .parse()
+            .expect("valid IPv6 address");
+        let dialer_addr: Ipv6Addr = format!("{subnet_prefix}::20")
+            .parse()
+            .expect("valid IPv6 address");
+
+        let pathvectord_config = write_daemon_config_v6_accept(dialer_addr, 65099);
+        let pathvectord_config_path = pathvectord_config
+            .path()
+            .to_str()
+            .expect("pathvectord config path is valid UTF-8")
+            .to_owned();
+        let pathvectord_name = format!("pathvectord-v6-accept-{test_id}");
+
+        let status = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--network",
+                &network_name,
+                "--ip6",
+                &pathvectord_addr.to_string(),
+                "--name",
+                &pathvectord_name,
+                "-p",
+                &format!("{grpc_host_port}:{PATHVECTORD_GRPC_PORT}"),
+                "-v",
+                &format!("{pathvectord_config_path}:/etc/pathvectord.toml"),
+                PATHVECTORD_IMAGE,
+                "/etc/pathvectord.toml",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("docker run pathvectord");
+        assert!(status.success(), "docker run pathvectord failed");
+
+        let dialer_name = format!("mock-bgp-dialer-{test_id}");
+        let dial_target = format!("[{pathvectord_addr}]:{GOBGPD_BGP_PORT}");
+        let status = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--network",
+                &network_name,
+                "--ip6",
+                &dialer_addr.to_string(),
+                "--name",
+                &dialer_name,
+                MOCK_BGP_DIALER_IMAGE,
+                &dial_target,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("docker run mock_bgp_dialer");
+        assert!(status.success(), "docker run mock_bgp_dialer failed");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for Ipv6AcceptHarness");
+
+        wait_for_established(&mut client, dialer_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session over the accept path did not reach Established within 30 s");
+
+        Self {
+            pathvectord_id: pathvectord_name,
+            dialer_id: dialer_name,
+            _network: network,
+            _pathvectord_config: pathvectord_config,
+            client,
+            peer_v6: dialer_addr,
+        }
+    }
+}
+
+impl Drop for Ipv6AcceptHarness {
+    fn drop(&mut self) {
+        for id in [&self.pathvectord_id, &self.dialer_id] {
+            Command::new("docker")
+                .args(["rm", "-f", id])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok();
+        }
+        // `self.network`'s own Drop impl runs after this method returns
+        // (containers must be gone before the network can be removed).
     }
 }
 
