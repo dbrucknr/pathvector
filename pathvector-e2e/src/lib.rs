@@ -782,6 +782,34 @@ export_default = "accept"
     f
 }
 
+/// Writes a pathvectord config whose peer's `address` is itself an IPv6
+/// literal — the peer's TCP transport address, not just an NLRI/next-hop
+/// value carried over a v4 session (contrast with [`write_daemon_config_v6`]).
+/// Used by [`Ipv6TransportHarness`] to prove pathvectord actually dials a BGP
+/// session over IPv6.
+fn write_daemon_config_v6_transport(peer: Ipv6Addr, remote_as: u32) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord v6-transport config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+
+[[peers]]
+address        = "{peer}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord v6-transport config");
+    f
+}
+
 /// Writes a pathvectord config with **no** import or export policy on any peer.
 ///
 /// For eBGP peers this activates the RFC 8212 defaults: both import and export
@@ -3750,6 +3778,114 @@ impl GrIpv6ObserverHarness {
             source_id,
             observer_id,
             observer_addr,
+            client,
+            _network: network,
+        }
+    }
+}
+
+/// Proves pathvectord dials a BGP session whose own TCP transport is IPv6 —
+/// as opposed to [`Harness::new_v6`], which only carries IPv6 NLRI/next-hops
+/// over what is still an IPv4-transport session with GoBGP.
+///
+/// A dedicated struct rather than widening the shared [`Harness`] — its
+/// `peer`/`pathvectord_ip` fields are `Ipv4Addr` and referenced by ~30
+/// existing v4-transport tests, not worth destabilizing for this one
+/// scenario. Mirrors the shape of [`GrIpv6ObserverHarness`].
+pub struct Ipv6TransportHarness {
+    _gobgpd: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub gobgpd_id: String,
+    pub pathvectord_id: String,
+    /// GoBGP's routable (global-scope ULA) IPv6 address on the test network —
+    /// this is `PeerConfig.address` in pathvectord's config, and the address
+    /// the real TCP SYN is sent to.
+    pub peer_v6: Ipv6Addr,
+    pub client: PathvectorClient,
+    _network: DockerNetwork,
+}
+
+impl Ipv6TransportHarness {
+    /// Stand up gobgpd and pathvectord on an `--ipv6` Docker network, with
+    /// pathvectord's peer configured at GoBGP's global IPv6 address, and wait
+    /// for the session to reach Established.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-v6-transport-test-{test_id}");
+        // Use a per-test ULA prefix so parallel tests don't collide.
+        let ipv6_subnet = format!("fd00:{:x}::/48", test_id & 0xffff);
+        let network = DockerNetwork::create_with_ipv6(network_name.clone(), &ipv6_subnet);
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config
+            .path()
+            .to_str()
+            .expect("gobgpd config path is valid UTF-8")
+            .to_owned();
+
+        let gobgpd = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-v6-transport-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                gobgpd_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd container");
+
+        let gobgpd_container_id = gobgpd.id().to_owned();
+        // The global (ULA) address, not the auto-configured fe80:: link-local
+        // one — see container_network_ipv6's doc comment for why.
+        let peer_v6 = container_network_ipv6(&gobgpd_container_id, &network_name);
+
+        let pathvectord_config = write_daemon_config_v6_transport(peer_v6, 65001);
+        let pathvectord_config_path = pathvectord_config
+            .path()
+            .to_str()
+            .expect("pathvectord config path is valid UTF-8")
+            .to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-v6-transport-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for Ipv6TransportHarness");
+
+        wait_for_established(&mut client, peer_v6, Duration::from_secs(30))
+            .await
+            .expect("BGP session over IPv6 transport did not reach Established within 30 s");
+
+        let pathvectord_container_id = pathvectord.id().to_owned();
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            gobgpd_id: gobgpd_container_id,
+            pathvectord_id: pathvectord_container_id,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            peer_v6,
             client,
             _network: network,
         }
