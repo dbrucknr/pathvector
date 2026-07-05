@@ -257,17 +257,17 @@ fn role_to_str(role: pathvector_types::Role) -> &'static str {
 /// Build a `PeerState` proto message from daemon state for `addr`.
 ///
 /// Returns `None` if `addr` is not in `peer_remote_as` (i.e. not configured).
-fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
-    let remote_as = *snap.peer_remote_as.get(&IpAddr::V4(addr))?;
+fn build_peer_state(snap: &RibSnapshot, addr: IpAddr) -> Option<PeerState> {
+    let remote_as = *snap.peer_remote_as.get(&addr)?;
     let peer_id = PeerId::from(addr);
 
     let (session_state, peer_type, hold_time, uptime_seconds) =
-        if let Some(&pt) = snap.peer_types.get(&IpAddr::V4(addr)) {
+        if let Some(&pt) = snap.peer_types.get(&addr) {
             let uptime = snap
                 .established_at
-                .get(&IpAddr::V4(addr))
+                .get(&addr)
                 .map_or(0, |t| t.elapsed().as_secs());
-            let ht = snap.hold_times.get(&IpAddr::V4(addr)).copied().unwrap_or(0);
+            let ht = snap.hold_times.get(&addr).copied().unwrap_or(0);
             (
                 proto::SessionState::Established as i32,
                 proto_peer_type(pt),
@@ -285,7 +285,7 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
 
     let prefixes_received = snap
         .prefixes_received
-        .get(&IpAddr::V4(addr))
+        .get(&addr)
         .copied()
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
@@ -299,7 +299,7 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
 
     let prefixes_advertised = snap
         .prefixes_advertised
-        .get(&IpAddr::V4(addr))
+        .get(&addr)
         .copied()
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
@@ -314,19 +314,19 @@ fn build_peer_state(snap: &RibSnapshot, addr: Ipv4Addr) -> Option<PeerState> {
         prefixes_received,
         prefixes_accepted,
         prefixes_advertised,
-        eor_ipv4_received: snap.eor_received.contains(&IpAddr::V4(addr)),
-        eor_ipv6_received: snap.eor_received_v6.contains(&IpAddr::V4(addr)),
+        eor_ipv4_received: snap.eor_received.contains(&addr),
+        eor_ipv6_received: snap.eor_received_v6.contains(&addr),
         peer_gr_restart_time: snap
             .gr_capable_peers
-            .get(&IpAddr::V4(addr))
+            .get(&addr)
             .map_or(0, |&t| u32::from(t)),
         configured_role: snap
             .peer_roles
-            .get(&IpAddr::V4(addr))
+            .get(&addr)
             .map_or_else(String::new, |&r| role_to_str(r).to_string()),
         negotiated_role: snap
             .negotiated_roles
-            .get(&IpAddr::V4(addr))
+            .get(&addr)
             .map_or_else(String::new, |&r| role_to_str(r).to_string()),
     })
 }
@@ -376,10 +376,7 @@ impl PeerService for PeerServiceImpl {
             .peer_remote_as
             .keys()
             .copied()
-            .filter_map(|addr| match addr {
-                IpAddr::V4(v4) => build_peer_state(&snap, v4),
-                IpAddr::V6(_) => None,
-            })
+            .filter_map(|addr| build_peer_state(&snap, addr))
             .collect();
         // Stable ordering by address for predictable CLI output.
         peers.sort_by_key(|p| p.address.clone());
@@ -390,11 +387,11 @@ impl PeerService for PeerServiceImpl {
         &self,
         request: Request<GetPeerRequest>,
     ) -> Result<Response<PeerState>, Status> {
-        let addr: Ipv4Addr = request
+        let addr: IpAddr = request
             .into_inner()
             .address
             .parse()
-            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+            .map_err(|_| Status::invalid_argument("address must be a valid IP address"))?;
 
         let snap = self.state.read().await.snapshot();
         build_peer_state(&snap, addr)
@@ -415,10 +412,7 @@ impl PeerService for PeerServiceImpl {
             .peer_remote_as
             .keys()
             .copied()
-            .filter_map(|addr| match addr {
-                IpAddr::V4(v4) => build_peer_state(&snap, v4),
-                IpAddr::V6(_) => None,
-            })
+            .filter_map(|addr| build_peer_state(&snap, addr))
             .map(|ps| PeerEvent {
                 r#type: PeerEventType::Current as i32,
                 peer: Some(ps),
@@ -457,10 +451,7 @@ impl PeerService for PeerServiceImpl {
                             .peer_remote_as
                             .keys()
                             .copied()
-                            .filter_map(|addr| match addr {
-                IpAddr::V4(v4) => build_peer_state(&snap, v4),
-                IpAddr::V6(_) => None,
-            })
+                            .filter_map(|addr| build_peer_state(&snap, addr))
                             .map(|ps| PeerEvent {
                                 r#type: PeerEventType::Changed as i32,
                                 peer: Some(ps),
@@ -499,10 +490,10 @@ impl PeerService for PeerServiceImpl {
     ) -> Result<Response<AddPeerResponse>, Status> {
         let req = request.into_inner();
 
-        let addr: std::net::Ipv4Addr = req
+        let addr: std::net::IpAddr = req
             .address
             .parse()
-            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+            .map_err(|_| Status::invalid_argument("address must be a valid IP address"))?;
 
         validate_remote_as(req.remote_as)?;
 
@@ -522,7 +513,7 @@ impl PeerService for PeerServiceImpl {
         };
 
         let peer = crate::config::PeerConfig {
-            address: IpAddr::V4(addr),
+            address: addr,
             port,
             remote_as: req.remote_as,
             import_default,
@@ -551,7 +542,7 @@ impl PeerService for PeerServiceImpl {
         // the peer is absent before retrying add_peer after a remove.
         {
             let s = self.state.read().await;
-            if s.pending_removal.contains(&IpAddr::V4(addr)) {
+            if s.pending_removal.contains(&addr) {
                 return Err(Status::failed_precondition(format!(
                     "peer {addr} removal is in progress; \
                      retry add_peer after the peer disappears from list_peers"
@@ -571,22 +562,22 @@ impl PeerService for PeerServiceImpl {
         &self,
         request: Request<RemovePeerRequest>,
     ) -> Result<Response<RemovePeerResponse>, Status> {
-        let addr: std::net::Ipv4Addr = request
+        let addr: std::net::IpAddr = request
             .into_inner()
             .address
             .parse()
-            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+            .map_err(|_| Status::invalid_argument("address must be a valid IP address"))?;
 
         // Verify the peer exists before sending the command so the caller gets a
         // NOT_FOUND immediately rather than silently doing nothing.
         let snap = self.state.read().await.snapshot();
-        if !snap.peer_remote_as.contains_key(&IpAddr::V4(addr)) {
+        if !snap.peer_remote_as.contains_key(&addr) {
             return Err(Status::not_found(format!("peer {addr} is not configured")));
         }
         drop(snap);
 
         self.cmd_tx
-            .send(DaemonCommand::RemovePeer(IpAddr::V4(addr)))
+            .send(DaemonCommand::RemovePeer(addr))
             .await
             .map_err(|_| Status::internal("daemon command channel closed"))?;
 
@@ -599,10 +590,10 @@ impl PeerService for PeerServiceImpl {
     ) -> Result<Response<SoftResetResponse>, Status> {
         let req = request.into_inner();
 
-        let addr: Ipv4Addr = req
+        let addr: IpAddr = req
             .address
             .parse()
-            .map_err(|_| Status::invalid_argument("address must be a valid IPv4 address"))?;
+            .map_err(|_| Status::invalid_argument("address must be a valid IP address"))?;
 
         let afi_safi = match req.afi_safi.as_str() {
             "" | "ipv4" => AfiSafi::IPV4_UNICAST,
@@ -619,15 +610,15 @@ impl PeerService for PeerServiceImpl {
         {
             let s = self.state.read().await;
             let snap = s.snapshot();
-            if !snap.peer_remote_as.contains_key(&IpAddr::V4(addr)) {
+            if !snap.peer_remote_as.contains_key(&addr) {
                 return Err(Status::not_found(format!("peer {addr} is not configured")));
             }
-            if !snap.peer_types.contains_key(&IpAddr::V4(addr)) {
+            if !snap.peer_types.contains_key(&addr) {
                 return Err(Status::failed_precondition(format!(
                     "peer {addr} session is not established"
                 )));
             }
-            if !s.route_refresh_peers.contains(&IpAddr::V4(addr)) {
+            if !s.route_refresh_peers.contains(&addr) {
                 return Err(Status::failed_precondition(format!(
                     "peer {addr} did not negotiate Route Refresh capability (RFC 2918)"
                 )));
@@ -638,7 +629,7 @@ impl PeerService for PeerServiceImpl {
             .stop_senders
             .lock()
             .unwrap()
-            .get(&IpAddr::V4(addr))
+            .get(&addr)
             .cloned()
             .ok_or_else(|| {
                 Status::failed_precondition(format!("peer {addr} session is not established"))
@@ -738,9 +729,9 @@ impl RibService for RibServiceImpl {
         let peer_filter: Option<PeerId> = if peer_filter_str.is_empty() {
             None
         } else {
-            let addr: Ipv4Addr = peer_filter_str.parse().map_err(|_| {
-                Status::invalid_argument("peer_address must be a valid IPv4 address")
-            })?;
+            let addr: IpAddr = peer_filter_str
+                .parse()
+                .map_err(|_| Status::invalid_argument("peer_address must be a valid IP address"))?;
             Some(PeerId::from(addr))
         };
 
@@ -810,8 +801,8 @@ impl RibService for RibServiceImpl {
         } else if peer_filter_str == "local" {
             Some(PeerId::from(crate::LOCAL_ORIGIN_PEER))
         } else {
-            let addr: Ipv4Addr = peer_filter_str.parse().map_err(|_| {
-                Status::invalid_argument("peer_address must be a valid IPv4 address or \"local\"")
+            let addr: IpAddr = peer_filter_str.parse().map_err(|_| {
+                Status::invalid_argument("peer_address must be a valid IP address or \"local\"")
             })?;
             Some(PeerId::from(addr))
         };
@@ -905,11 +896,11 @@ struct PolicyServiceImpl {
     state: Arc<tokio::sync::RwLock<DaemonState>>,
 }
 
-/// Parse a dotted-decimal IPv4 address from a gRPC request field, returning a
+/// Parse an IPv4 or IPv6 peer address from a gRPC request field, returning a
 /// gRPC `INVALID_ARGUMENT` status on failure.
-fn parse_peer_address(raw: &str) -> Result<Ipv4Addr, Status> {
-    raw.parse::<Ipv4Addr>()
-        .map_err(|_| Status::invalid_argument(format!("'{raw}' is not a valid IPv4 address")))
+fn parse_peer_address(raw: &str) -> Result<IpAddr, Status> {
+    raw.parse::<IpAddr>()
+        .map_err(|_| Status::invalid_argument(format!("'{raw}' is not a valid IP address")))
 }
 
 /// Map a `PolicyAction` proto enum to a [`DefaultAction`], returning
@@ -935,13 +926,13 @@ impl PolicyService for PolicyServiceImpl {
         let action = parse_policy_action(req.action)?;
 
         let mut s = self.state.write().await;
-        if !s.import_policies.contains_key(&IpAddr::V4(peer_ip)) {
+        if !s.import_policies.contains_key(&peer_ip) {
             return Err(Status::not_found(format!(
                 "peer {peer_ip} is not configured"
             )));
         }
 
-        s.set_import_default(IpAddr::V4(peer_ip), action);
+        s.set_import_default(peer_ip, action);
         Ok(Response::new(SetImportDefaultResponse {}))
     }
 
@@ -954,7 +945,7 @@ impl PolicyService for PolicyServiceImpl {
         let action = parse_policy_action(req.action)?;
 
         let mut s = self.state.write().await;
-        if !s.export_policies.contains_key(&IpAddr::V4(peer_ip)) {
+        if !s.export_policies.contains_key(&peer_ip) {
             return Err(Status::not_found(format!(
                 "peer {peer_ip} is not configured"
             )));
@@ -965,7 +956,7 @@ impl PolicyService for PolicyServiceImpl {
             ?action,
             "SetExportDefault: replacing export policy and re-evaluating Loc-RIB for peer"
         );
-        s.set_export_default(IpAddr::V4(peer_ip), action);
+        s.set_export_default(peer_ip, action);
         Ok(Response::new(SetExportDefaultResponse {}))
     }
 }
@@ -1492,7 +1483,7 @@ mod tests {
     fn test_build_peer_state_idle_peer() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let s = make_state(65001, &[(addr, 65002)]);
-        let ps = build_peer_state(&s.rib, addr).unwrap();
+        let ps = build_peer_state(&s.rib, IpAddr::V4(addr)).unwrap();
 
         assert_eq!(ps.address, "10.0.0.2");
         assert_eq!(ps.remote_as, 65002);
@@ -1522,7 +1513,7 @@ mod tests {
             None,
         );
 
-        let ps = build_peer_state(&s.rib, addr).unwrap();
+        let ps = build_peer_state(&s.rib, IpAddr::V4(addr)).unwrap();
         assert_eq!(ps.session_state, proto::SessionState::Established as i32);
         assert_eq!(ps.peer_type, proto::PeerType::External as i32);
         assert_eq!(ps.hold_time, 90);
@@ -1558,7 +1549,7 @@ mod tests {
         s.rib_insert_v4(peer("10.0.0.2"), route);
         s.sync_received(IpAddr::V4(addr));
 
-        let ps = build_peer_state(&s.rib, addr).unwrap();
+        let ps = build_peer_state(&s.rib, IpAddr::V4(addr)).unwrap();
         assert_eq!(ps.prefixes_received, 1);
         assert_eq!(ps.prefixes_accepted, 1);
     }
@@ -1567,7 +1558,7 @@ mod tests {
     fn test_build_peer_state_role_absent_by_default() {
         let addr: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let s = make_state(65001, &[(addr, 65002)]);
-        let ps = build_peer_state(&s.rib, addr).unwrap();
+        let ps = build_peer_state(&s.rib, IpAddr::V4(addr)).unwrap();
         assert_eq!(ps.configured_role, "");
         assert_eq!(ps.negotiated_role, "");
     }
@@ -1585,7 +1576,7 @@ mod tests {
             .negotiated_roles
             .insert(IpAddr::V4(addr), Role::Provider);
 
-        let ps = build_peer_state(&s.rib, addr).unwrap();
+        let ps = build_peer_state(&s.rib, IpAddr::V4(addr)).unwrap();
         assert_eq!(ps.configured_role, "customer");
         assert_eq!(ps.negotiated_role, "provider");
     }
