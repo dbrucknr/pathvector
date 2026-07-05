@@ -4,6 +4,46 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-05 (IPv6 migration: close remaining confidence gaps)
+
+### [pathvectord] [pathvector-e2e] Prove the IPv6 peer-identity migration end to end, not just by absence of a `V4`/`V6` branch
+
+The IPv6 BGP transport migration below shipped with every e2e test still
+configuring the peer as passive (pathvectord always dials), so the daemon's
+listener had only ever accepted IPv4-sourced connections in practice, and no
+test constructed a peer whose *identity* was a genuine `Ipv6Addr` rather than
+an `Ipv4Addr`-shaped literal typed `IpAddr`. This closes both gaps, plus two
+smaller ones surfaced by the same review.
+
+- **Accept path**: new `pathvector-e2e/src/bin/mock_bgp_dialer.rs` and
+  `Ipv6AcceptHarness` configure pathvectord's own outbound dial to an
+  unreachable port while the dialer's inbound connection uses a
+  `docker run --ip6`-assigned static address, so the only way the session in
+  `pathvector-e2e/tests/ipv6_accept.rs`
+  (`session_establishes_over_ipv6_accept_path`) can reach Established is
+  through pathvectord's listener accepting a real inbound IPv6 connection —
+  the dial path is structurally disabled, not just unused.
+- **v6-identified peer**: `test_ipv6_peer_identity` in
+  `pathvectord/src/daemon/mod.rs` drives a peer keyed by a real `Ipv6Addr`
+  through route acceptance/propagation, export-policy enforcement, and
+  RFC 4724 GR stale-route retention on unclean termination — the combination
+  no prior test exercised.
+- **ORIGINATOR_ID fallback regression**: the migration changed the RR
+  ORIGINATOR_ID-injection fallback from `peer_ip` to
+  `self.rib.local_bgp_id` (`peer_ip` could now be IPv6, which isn't a valid
+  4-byte BGP Identifier). `test_rr_originator_id_falls_back_to_local_bgp_id_when_peer_bgp_id_unknown`
+  proves this directly.
+- **Flakiness / regressions**: the full `pathvector-e2e` suite (20 test
+  files) re-run clean (0 failures), and both new IPv6 e2e tests were run 4
+  times each with no failures, beyond the single pass each got when the
+  gap analysis first landed.
+
+All four new/extended tests were verified to have real teeth — each was
+confirmed to fail against a deliberately broken version of the code under
+test before the fix was restored and re-verified passing.
+
+---
+
 ## 2026-07-05 (native IPv6 BGP transport)
 
 ### [pathvectord] Peers can now be configured with an IPv6 transport address
