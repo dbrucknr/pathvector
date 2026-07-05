@@ -1104,6 +1104,13 @@ pub(crate) async fn run_event_loop(
                             info.local_addr,
                         );
                         crate::metrics::on_session_established(peer_ip);
+                        // Snapshot RIB sizes after the full-table dump so
+                        // adj_rib_out reflects the session bring-up immediately.
+                        crate::metrics::update_rib_sizes(
+                            s.rib.loc_rib.len(),
+                            s.rib.loc_rib_v6.len(),
+                            &s.rib.prefixes_advertised,
+                        );
                     }
                     SessionEvent::Terminated(termination_reason) => {
                         let is_removed = s.pending_removal.remove(&peer_ip);
