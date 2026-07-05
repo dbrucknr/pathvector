@@ -3936,7 +3936,7 @@ export_default = "accept"
 /// nondeterministic about which side's TCP connection actually wins RFC 4271
 /// §6.8 collision detection. This harness sidesteps that: pathvectord's own
 /// peer entry names the dialer's real address but a port nothing listens on
-/// (see [`write_daemon_config_v6_accept`]), so pathvectord's outbound dial
+/// (see `write_daemon_config_v6_accept`), so pathvectord's outbound dial
 /// can never succeed — `mock_bgp_dialer` actively connects to pathvectord's
 /// *real* listening port instead, so the accept path is the only way
 /// Established is ever reached.

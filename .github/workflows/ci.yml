@@ -191,6 +191,16 @@ jobs:
           cache-from: type=gha,scope=mock-bgp-peer
           cache-to: type=gha,mode=max,scope=mock-bgp-peer
 
+      - name: Build mock BGP dialer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pathvector-e2e/Dockerfile.mock-bgp-dialer
+          load: true
+          tags: pathvector-mock-bgp-dialer-test:latest
+          cache-from: type=gha,scope=mock-bgp-dialer
+          cache-to: type=gha,mode=max,scope=mock-bgp-dialer
+
       - name: Lint pathvector-e2e
         run: cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
 
