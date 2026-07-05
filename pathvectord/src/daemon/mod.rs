@@ -8989,6 +8989,69 @@ mod tests {
         );
     }
 
+    /// Regression test for the IPv6 peer-identity migration: `peer_bgp_ids`'s
+    /// fallback (when the peer's own BGP ID was never recorded) used to be
+    /// `peer_ip` — safe only because `peer_ip` was guaranteed `Ipv4Addr` at
+    /// the time. Now that peer identity is `IpAddr` (and could be IPv6), the
+    /// fallback is `self.rib.local_bgp_id` instead. This proves the injected
+    /// ORIGINATOR_ID is our own BGP ID in that fallback case, not the client's
+    /// transport address.
+    #[test]
+    fn test_rr_originator_id_falls_back_to_local_bgp_id_when_peer_bgp_id_unknown() {
+        let cluster_id: u32 = 99;
+        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client, other], &[]);
+
+        state.on_established(
+            IpAddr::V4(client),
+            client,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        state.on_established(
+            IpAddr::V4(other),
+            other,
+            PeerType::Internal,
+            65001,
+            90,
+            &[],
+            None,
+        );
+        drain_all(&mut receivers);
+
+        // Simulate the defensive case this fallback exists for: the client's
+        // BGP ID was never recorded (or was since evicted), even though the
+        // session is Established and routes are flowing.
+        Arc::make_mut(&mut state.rib)
+            .peer_bgp_ids
+            .remove(&IpAddr::V4(client));
+
+        state.on_route_update(IpAddr::V4(client), update_announce("192.0.2.0/24"));
+        state.flush_pending();
+
+        let msg = receivers
+            .get_mut(&IpAddr::V4(other))
+            .unwrap()
+            .try_recv()
+            .expect("reflected UPDATE expected");
+
+        let originator = msg.attributes.iter().find_map(|a| match a {
+            PathAttribute::OriginatorId(id) => Some(*id),
+            _ => None,
+        });
+        assert_eq!(
+            originator,
+            Some(local_bgp_id),
+            "with no recorded peer BGP ID, ORIGINATOR_ID must fall back to our own \
+             local_bgp_id, not the client's transport address"
+        );
+    }
+
     // RFC 4456 §8: discard when ORIGINATOR_ID == local BGP ID.
     #[test]
     fn test_rr_originator_id_loop_detection_discards_update() {
