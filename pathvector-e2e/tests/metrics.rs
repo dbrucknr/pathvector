@@ -10,7 +10,21 @@
 
 use std::time::Duration;
 
+use pathvector_client::types::{Origin, OriginateRouteParams};
 use pathvector_e2e::{MetricsHarness, scrape_metrics_text, wait_for_metric, wait_for_route};
+
+fn basic_originate_params(prefix: &str) -> OriginateRouteParams {
+    OriginateRouteParams {
+        prefix: prefix.to_owned(),
+        next_hop: "10.0.0.1".parse().unwrap(),
+        origin: Origin::Igp,
+        communities: vec![],
+        large_communities: vec![],
+        extended_communities: vec![],
+        local_pref: None,
+        med: None,
+    }
+}
 
 /// After a session reaches Established, `/metrics` must report
 /// `pathvectord_bgp_session_up{peer="..."} 1` — proving
@@ -103,6 +117,51 @@ async fn loc_rib_gauge_reflects_accepted_route() {
     wait_for_metric(
         h.metrics_host_port,
         "pathvectord_bgp_loc_rib_prefixes{afi=\"ipv4\"} 1",
+        Duration::from_secs(10),
+    )
+    .await;
+}
+
+// ── Originated-routes gauge ──────────────────────────────────────────────────
+
+/// `pathvectord_bgp_originated_routes{afi="ipv4"}` must track the real
+/// self-originated route count as `OriginateRoute`/`WithdrawOriginatedRoute`
+/// gRPC calls land — proving `update_originated_routes` is wired into the
+/// real `origination.rs` call sites, not just correct in isolation (covered
+/// by unit tests in `metrics.rs` and `origination.rs`).
+#[tokio::test]
+async fn originated_routes_gauge_tracks_originate_and_withdraw() {
+    let mut h = MetricsHarness::new().await;
+
+    // Daemon has originated nothing yet: gauge must read a real 0, not be
+    // absent, per the startup pre-set in `daemon/mod.rs`.
+    wait_for_metric(
+        h.metrics_host_port,
+        "pathvectord_bgp_originated_routes{afi=\"ipv4\"} 0",
+        Duration::from_secs(10),
+    )
+    .await;
+
+    h.client
+        .originate_route(basic_originate_params("198.51.100.0/24"))
+        .await
+        .expect("originate_route failed");
+
+    wait_for_metric(
+        h.metrics_host_port,
+        "pathvectord_bgp_originated_routes{afi=\"ipv4\"} 1",
+        Duration::from_secs(10),
+    )
+    .await;
+
+    h.client
+        .withdraw_originated_route("198.51.100.0/24")
+        .await
+        .expect("withdraw_originated_route failed");
+
+    wait_for_metric(
+        h.metrics_host_port,
+        "pathvectord_bgp_originated_routes{afi=\"ipv4\"} 0",
         Duration::from_secs(10),
     )
     .await;
