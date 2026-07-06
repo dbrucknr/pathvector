@@ -17,6 +17,7 @@
 //     pathvectord_bgp_updates_received_total{peer}
 //     pathvectord_bgp_updates_sent_total{peer}
 //     pathvectord_bgp_fib_write_failures_total{afi, op}             — op: install|blackhole|withdraw|withdraw_blackhole
+//     pathvectord_bgp_import_policy_rejected_total{peer}            — routes rejected by import policy (excludes RFC 7999 BLACKHOLE)
 //
 // Cardinality note: series are keyed by peer IP and are never removed, only
 // zeroed, when a peer is deconfigured (RemovePeer). For a static peer set
@@ -209,6 +210,30 @@ pub fn on_fib_write(afi: &'static str, op: FibOp, success: bool) {
         )
         .increment(1);
     }
+}
+
+/// Increment `pathvectord_bgp_import_policy_rejected_total{peer}` by `count`
+/// routes rejected by import policy (`Decision::Reject`/`Decision::Next`) in
+/// one batch.
+///
+/// Deliberately excludes: RFC 7999 BLACKHOLE-community routes (bypass policy
+/// entirely by design), RFC 4271 transport-level drops, and export-side
+/// policy rejects (not yet instrumented — see TODO.md). This metric answers
+/// "is my import policy rejecting routes I expect to accept," not "how many
+/// routes total did I not use."
+///
+/// `count` is a batch total (matches the granularity of the existing
+/// `tracing::info!(accepted, rejected, ...)` line these call sites already
+/// compute) and combines v4+v6 into one series, matching
+/// `adj_rib_in_prefixes{peer}`'s convention. A `count` of `0` is a no-op — it
+/// does not create a zero-delta series, matching `on_update_sent`'s "only
+/// call when something real happened" granularity.
+pub fn on_import_reject(peer: IpAddr, count: usize) {
+    if count == 0 {
+        return;
+    }
+    metrics::counter!("pathvectord_bgp_import_policy_rejected_total", "peer" => peer.to_string())
+        .increment(count as u64);
 }
 
 #[cfg(test)]
@@ -541,6 +566,49 @@ mod tests {
                 ]
             )),
             Some(&DebugValue::Counter(1))
+        );
+    }
+
+    #[test]
+    fn on_import_reject_increments_counter_by_count() {
+        let snap = capture(|| on_import_reject(peer(1), 3));
+        let labels = vec![("peer".to_string(), "10.0.0.1".to_string())];
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_import_policy_rejected_total".to_string(),
+                labels
+            )),
+            Some(&DebugValue::Counter(3))
+        );
+    }
+
+    #[test]
+    fn on_import_reject_accumulates_across_calls() {
+        let snap = capture(|| {
+            on_import_reject(peer(1), 2);
+            on_import_reject(peer(1), 5);
+        });
+        let labels = vec![("peer".to_string(), "10.0.0.1".to_string())];
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_import_policy_rejected_total".to_string(),
+                labels
+            )),
+            Some(&DebugValue::Counter(7)),
+            "counter accumulates, unlike a gauge"
+        );
+    }
+
+    #[test]
+    fn on_import_reject_zero_count_does_not_create_a_series() {
+        let snap = capture(|| on_import_reject(peer(1), 0));
+        let labels = vec![("peer".to_string(), "10.0.0.1".to_string())];
+        assert!(
+            !snap.contains_key(&(
+                "pathvectord_bgp_import_policy_rejected_total".to_string(),
+                labels
+            )),
+            "a batch that rejected nothing must not create a zero-delta series"
         );
     }
 }
