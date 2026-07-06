@@ -1389,6 +1389,60 @@ pub fn docker_start_with_metrics(
     ContainerGuard(id)
 }
 
+/// Like [`docker_start_with_caps`] but always grants `CAP_NET_ADMIN` and also
+/// publishes pathvectord's metrics port — for the metrics-enabled
+/// [`FibHarness`] variant that needs both real kernel FIB writes (netlink)
+/// and a scrapeable `/metrics` endpoint in the same container. Kept as a
+/// separate function rather than widening [`docker_start_with_caps`] or
+/// [`docker_start_with_metrics`], both of which have several existing call
+/// sites that don't need this exact combination.
+///
+/// # Panics
+///
+/// Panics if `docker run` exits non-zero.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn docker_start_with_net_admin_and_metrics(
+    name: &str,
+    image: &str,
+    network: &str,
+    ip: &str,
+    volume_src: &str,
+    volume_dst: &str,
+    host_grpc_port: u16,
+    host_metrics_port: u16,
+    cmd: &str,
+) -> ContainerGuard {
+    let args: Vec<String> = vec![
+        "run".into(),
+        "--detach".into(),
+        format!("--name={name}"),
+        format!("--network={network}"),
+        format!("--ip={ip}"),
+        "--cap-add=NET_ADMIN".into(),
+        format!("--volume={volume_src}:{volume_dst}"),
+        format!("--publish={host_grpc_port}:{PATHVECTORD_GRPC_PORT}"),
+        format!("--publish={host_metrics_port}:{PATHVECTORD_METRICS_PORT}"),
+        format!("{image}:latest"),
+        cmd.into(),
+    ];
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .expect("docker run");
+    assert!(
+        output.status.success(),
+        "docker run {image} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let id = std::str::from_utf8(&output.stdout)
+        .expect("docker run output is UTF-8")
+        .trim()
+        .to_owned();
+    ContainerGuard(id)
+}
+
 /// Block (synchronously, with short sleeps) until the container's Docker
 /// HEALTHCHECK reports `healthy`, or panic if `timeout` expires.
 ///
@@ -1599,6 +1653,9 @@ pub struct FibHarness {
     /// pathvectord container ID — used for `ip route` inspection.
     pub pathvectord_id: String,
     pub gobgp_ip: Ipv4Addr,
+    /// Host-mapped port for pathvectord's `/metrics` endpoint. Only `Some`
+    /// when constructed via [`FibHarness::new_with_metrics`].
+    pub metrics_host_port: Option<u16>,
     _network: DockerNetwork,
 }
 
@@ -1675,6 +1732,90 @@ impl FibHarness {
             gobgpd_id,
             pathvectord_id,
             gobgp_ip,
+            metrics_host_port: None,
+            _network: network,
+        }
+    }
+
+    /// Like [`FibHarness::new`] but also publishes pathvectord's metrics
+    /// port, for tests that need to correlate a real kernel FIB write with
+    /// the Prometheus-visible `pathvectord_bgp_fib_*`/
+    /// `pathvectord_bgp_import_policy_rejected_total` metrics in the same
+    /// session — `MetricsHarness` has no `CAP_NET_ADMIN`, so it can't observe
+    /// real kernel FIB state, and the plain `FibHarness::new` has no
+    /// `/metrics` endpoint at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing, or the BGP
+    /// session does not reach `Established` within 30 seconds.
+    pub async fn new_with_metrics() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let metrics_host_port = alloc_metrics_port();
+        let network_name = format!("pathvector-fib-metrics-test-{test_id}");
+
+        let subnet = fib_test_subnet(test_id);
+        let gobgp_ip_str = fib_gobgp_ip(test_id);
+        let pathvectord_ip_str = fib_pathvectord_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let gobgp_ip: Ipv4Addr = gobgp_ip_str.parse().unwrap();
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord_config = write_daemon_config_with_metrics(&[(gobgp_ip, 65001)]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let gobgpd = docker_start(
+            &format!("gobgpd-fib-metrics-{test_id}"),
+            GOBGPD_IMAGE,
+            &network_name,
+            Some(&gobgp_ip_str),
+            false,
+            &gobgpd_config_path,
+            "/etc/gobgp/gobgpd.conf",
+            None,
+            None,
+        );
+
+        wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
+
+        // CAP_NET_ADMIN is required for FibWriter to issue RTM_NEWROUTE via netlink.
+        let pathvectord = docker_start_with_net_admin_and_metrics(
+            &format!("pathvectord-fib-metrics-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            &pathvectord_ip_str,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            grpc_host_port,
+            metrics_host_port,
+            "/etc/pathvectord.toml",
+        );
+
+        let gobgpd_id = gobgpd.0.clone();
+        let pathvectord_id = pathvectord.0.clone();
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for FibHarness (metrics)");
+
+        wait_for_established(&mut client, gobgp_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session did not reach Established within 30 s");
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            gobgpd_id,
+            pathvectord_id,
+            gobgp_ip,
+            metrics_host_port: Some(metrics_host_port),
             _network: network,
         }
     }

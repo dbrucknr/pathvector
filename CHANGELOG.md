@@ -4,6 +4,63 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-06 (metrics: FIB write failures, originated-route count, import-policy rejects)
+
+### [pathvectord] Close three more Prometheus observability gaps surfaced by BlockingArbiter-RS
+
+Reviewing the 2026-07-05 metrics work raised a broader question: does
+pathvectord's `/metrics` endpoint actually expose the daemon's inner
+RIB/FIB/policy state, not just per-peer session status? A grep for every
+`crate::metrics::` call site showed three whole subsystems had zero
+instrumentation — confirmed against a real downstream consumer,
+BlockingArbiter-RS, whose own TODO documents a live gap this closes: its
+`desired_bgp_delta` health check has no way to cross-check pathvectord's
+actual reported state against its own internal bookkeeping.
+
+- **No visibility into kernel FIB write outcomes.** `fib::process_batch`
+  logged a `tracing::warn!` on a failed kernel write but exposed nothing to
+  Prometheus — an operator had to grep daemon logs to notice the kernel was
+  rejecting routes. Added `pathvectord_bgp_fib_write_failures_total{afi, op}`
+  (`op` ∈ `install`/`blackhole`/`withdraw`/`withdraw_blackhole`) and
+  `pathvectord_bgp_fib_routes_installed{afi}`, the ground-truth counterpart to
+  `loc_rib_prefixes{afi}` — persistent divergence between the two is itself a
+  signal that the kernel isn't converging with Loc-RIB. The gauge only moves
+  on a successful write; a failure leaves it untouched and increments the
+  counter instead, so the two never move together.
+- **No visibility into self-originated route count.** Origination bypasses
+  import policy by design, but pathvectord never exposed how many routes it
+  currently self-originates. Added `pathvectord_bgp_originated_routes{afi}`,
+  set from `rib.originated_routes.len()`/`originated_routes_v6.len()` after
+  every origination/withdrawal batch, and pre-set to `(0, 0)` at startup.
+- **No visibility into import-policy rejections.** Added
+  `pathvectord_bgp_import_policy_rejected_total{peer}`, incremented only for
+  routes where `Policy::evaluate` returns `Decision::Reject`/`Decision::Next`.
+  Deliberately excludes RFC 7999 BLACKHOLE-community routes (diverted to a
+  kernel null route before policy ever runs) and RFC 4271 transport-level
+  drops (invalid NEXT_HOP, AS-path loop) — both increment the existing
+  `rejected`/`rejected_v6` counters used for the daemon's own log line, but
+  counting them here would make policy look like it's rejecting routes it
+  never even evaluated. `handle_update` tracks a separate
+  `policy_rejected`/`policy_rejected_v6` counter to keep this distinction
+  correct; a regression test sending an all-BLACKHOLE UPDATE guards against
+  the two being conflated again. `reapply_import_policy`/`_v6` (full Adj-RIB-In
+  re-evaluation on policy reload or RPKI ROA cache update) also feed this
+  counter — a spike from that path means "this many routes are currently
+  rejected under the re-evaluated policy," not "this many new rejections just
+  happened," since the whole table is re-scored at once.
+
+**Deferred:** export-side policy rejects (would need the same
+wide-call-site + enum restructuring already deferred once for
+`updates_sent_total`, plus `PrefixDecision`'s variants don't yet distinguish
+"policy rejected" from other withdraw causes), a granular per-reason label for
+import-policy rejects (blocked on `Decision` carrying no information about
+which condition fired), and external reconciliation for
+`fib_routes_installed` (a silent kernel-side failure that never surfaces as
+an `Err` would drift the gauge with no self-correction — would need a
+periodic netlink route-table diff pass).
+
+---
+
 ## 2026-07-05 (metrics: fix stale adj_rib_out, add updates_sent counter, pre-register peers)
 
 ### [pathvectord] Close three Prometheus observability gaps surfaced by real downstream usage

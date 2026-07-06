@@ -779,6 +779,7 @@ pub(crate) fn reapply_import_policy(
         }
     }
 
+    crate::metrics::on_import_reject(peer.ip(), rejected);
     tracing::info!(
         peer = %peer,
         accepted,
@@ -819,6 +820,7 @@ pub(crate) fn reapply_import_policy_v6(
         }
     }
 
+    crate::metrics::on_import_reject(peer.ip(), rejected);
     tracing::info!(
         peer = %peer,
         accepted,
@@ -1107,6 +1109,12 @@ pub(super) fn handle_update(
     // (mandatory) and takes precedence when present.
     let mut accepted = 0usize;
     let mut rejected = 0usize;
+    // Tracks *only* routes rejected by an actual `Decision::Reject`/`Next`
+    // from import policy — unlike `rejected` above (used for the existing
+    // log line), this excludes the `skip_announces`/invalid-NEXT_HOP
+    // transport-level drops and the RFC 7999 BLACKHOLE special case, none of
+    // which are policy decisions. Feeds `pathvectord_bgp_import_policy_rejected_total`.
+    let mut policy_rejected = 0usize;
 
     // Wrap once; every route in this UPDATE shares the same Arc<AsPath>.
     let shared_as_path = Arc::new(as_path);
@@ -1207,6 +1215,7 @@ pub(super) fn handle_update(
             }
             Decision::Reject | Decision::Next => {
                 rejected += 1;
+                policy_rejected += 1;
             }
         }
     }
@@ -1231,6 +1240,9 @@ pub(super) fn handle_update(
     // explicit policy default to Reject via `policy_v6` default action.
     let mut accepted_v6 = 0usize;
     let mut rejected_v6 = 0usize;
+    // See `policy_rejected`'s comment above — same v4/v6 asymmetry between
+    // "rejected for any reason" (logging) and "rejected by policy" (metric).
+    let mut policy_rejected_v6 = 0usize;
     for (nlri, nh) in mp_v6_announced {
         // RFC 4271 §5.1.3 / RFC 4291 §2.5 / RFC 2545 §3: validate the IPv6 next-hop.
         // Own-address check: reject if global next-hop matches our configured IPv6 address.
@@ -1310,10 +1322,13 @@ pub(super) fn handle_update(
             }
             Decision::Reject | Decision::Next => {
                 rejected_v6 += 1;
+                policy_rejected_v6 += 1;
             }
         }
     }
 
+    crate::metrics::on_import_reject(peer.ip(), policy_rejected);
+    crate::metrics::on_import_reject(peer.ip(), policy_rejected_v6);
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
