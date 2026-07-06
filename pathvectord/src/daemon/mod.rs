@@ -798,6 +798,11 @@ where
                 // daemon that has not yet originated anything would
                 // otherwise show no series at all instead of a real 0.
                 crate::metrics::update_originated_routes(0, 0);
+                // Same reasoning again for the kernel FIB gauge: only touched
+                // by fib::process_batch's event-driven success arms, so a
+                // daemon that has not yet written anything to the kernel
+                // would otherwise show no series at all instead of a real 0.
+                crate::metrics::init_fib_routes_installed();
             }
             Err(e) => {
                 tracing::warn!(

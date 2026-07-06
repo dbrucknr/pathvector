@@ -188,6 +188,20 @@ impl FibOp {
     }
 }
 
+/// Pre-set `pathvectord_bgp_fib_routes_installed{afi}` to `0` at daemon
+/// startup, matching `update_rib_sizes`/`update_originated_routes`'s "always a
+/// real zero, never a missing series" convention — otherwise the gauge stays
+/// entirely absent until the first successful `on_fib_write` call, which is
+/// indistinguishable on a dashboard from "never checked."
+///
+/// This reflects only *this process's* FIB bookkeeping since startup; it does
+/// not reconcile against any kernel FIB state a prior pathvectord process may
+/// have left behind (see TODO.md's documented external-reconciliation gap).
+pub fn init_fib_routes_installed() {
+    metrics::gauge!("pathvectord_bgp_fib_routes_installed", "afi" => "ipv4").set(0.0);
+    metrics::gauge!("pathvectord_bgp_fib_routes_installed", "afi" => "ipv6").set(0.0);
+}
+
 /// Records the outcome of one kernel FIB write from `fib::process_batch`.
 ///
 /// On success, adjusts `pathvectord_bgp_fib_routes_installed{afi}` by +1
@@ -475,6 +489,37 @@ mod tests {
             )),
             Some(&DebugValue::Gauge(2.0.into())),
             "gauge must reflect the most recent set(), not accumulate"
+        );
+    }
+
+    #[test]
+    fn init_fib_routes_installed_sets_both_afi_gauges_to_zero() {
+        let snap = capture(init_fib_routes_installed);
+        for afi in ["ipv4", "ipv6"] {
+            assert_eq!(
+                snap.get(&(
+                    "pathvectord_bgp_fib_routes_installed".to_string(),
+                    vec![("afi".to_string(), afi.to_string())]
+                )),
+                Some(&DebugValue::Gauge(0.0.into())),
+                "afi={afi} must read a real 0 after init, not be missing"
+            );
+        }
+    }
+
+    #[test]
+    fn init_fib_routes_installed_then_on_fib_write_increments_from_zero() {
+        let snap = capture(|| {
+            init_fib_routes_installed();
+            on_fib_write("ipv4", FibOp::Install, true);
+        });
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_fib_routes_installed".to_string(),
+                vec![("afi".to_string(), "ipv4".to_string())]
+            )),
+            Some(&DebugValue::Gauge(1.0.into())),
+            "a startup set(0.0) followed by increment(+1.0) must read 1, not accumulate incorrectly"
         );
     }
 
