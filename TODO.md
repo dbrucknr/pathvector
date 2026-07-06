@@ -50,30 +50,30 @@ all (`register_peer`); `pathvectord_bgp_updates_sent_total{peer}` now exists as 
 outbound counterpart to `updates_received_total`; and the global
 `pathvectord_bgp_loc_rib_prefixes{afi}` gauges are now pre-set to 0 at startup
 instead of only appearing once the first peer establishes or flushes a route.
-Remaining gaps — also identified from a review of BlockingArbiter-RS's actual usage
-(a production BGP blackhole-advertisement consumer), not just in the abstract:
+Three further gaps — FIB write-failure visibility, self-originated route count,
+and import-policy-reject visibility — were closed 2026-07-06 (see CHANGELOG.md),
+also found via a review of BlockingArbiter-RS's actual usage. Remaining
+follow-ups from that work:
 
-- **No FIB (kernel route install) visibility at all.** `pathvectord/src/fib.rs`'s
-  `process_batch` logs a `tracing::warn!` on a netlink install/withdraw failure but
-  emits no metric — for a system whose entire purpose is "make sure this route is
-  actually enforced at the kernel level" (e.g. BlockingArbiter-RS blackholing
-  malicious IPs), a silent FIB write failure is invisible to Prometheus/Grafana.
-  Add a `pathvectord_bgp_fib_write_failures_total{afi}` counter (or similar) in
-  `process_batch`'s error arms, plus ideally a `pathvectord_bgp_fib_routes_installed`
-  gauge tracking actual kernel FIB size (as opposed to Loc-RIB/intended state).
-- **No origination-specific metrics.** `OriginationService::originate_route`
-  (`grpc.rs`) has no success/failure counters distinguishing "accepted and
-  in Loc-RIB" from "rejected by policy" — a consumer like BlockingArbiter-RS that
-  originates its own routes (e.g. `/32` blackhole routes) currently has to
-  self-track its own desired-vs-actual state client-side (see its own
-  `desired_bgp_delta` in `/system-metrics`, which already has a documented
-  transient-drift caveat) rather than cross-checking against pathvectord's own
-  reported state.
-- **No policy-rejection visibility.** A route rejected by import/export policy
-  (RPKI ROV, OTC leak detection, max-prefix limits) is silently absent from
-  Loc-RIB/Adj-RIB-Out — there is no `pathvectord_bgp_policy_rejects_total{peer,
-  reason}` counter to distinguish "no routes because none were sent" from
-  "routes sent but rejected," which matters for diagnosing a misconfigured policy.
+- **No export-side policy-rejection visibility.** The 2026-07-06 import-policy
+  counter has no export-side counterpart — a route dropped by export policy
+  (as opposed to withdrawn for some other reason) is silently absent from
+  Adj-RIB-Out with no metric to distinguish the two. Blocked on the same
+  wide-call-site problem already solved once for `updates_sent_total`
+  (`outbound.rs`'s `propagate_prefix`/`propagate_prefix_v6`, ~13 call sites),
+  plus `PrefixDecision`/`PrefixDecisionV6`'s 3 variants not yet distinguishing
+  "policy rejected" from other withdraw causes (e.g. split-horizon).
+- **No granular import-policy-reject reason label.**
+  `pathvectord_bgp_import_policy_rejected_total{peer}` cannot currently carry a
+  `reason` label (e.g. `rpki_invalid`, `otc_leak`) because
+  `pathvector_policy::Decision` is a bare 3-variant enum with no information
+  about which `Term`/`Condition` fired — would need a larger change to
+  `pathvector-policy`'s evaluation API.
+- **`fib_routes_installed` has no external reconciliation.** The gauge is purely
+  incremental from `fib::process_batch`'s own success/failure outcomes; a
+  silent kernel-side failure that never surfaces as an `Err` would drift the
+  gauge with no self-correction. A periodic netlink route-table dump/diff pass
+  would close this.
 
 - **Series pruning on `RemovePeer`.** Metric series are labeled by peer IP and are
   zeroed but never removed when a peer is deconfigured. Fine for static peer sets;

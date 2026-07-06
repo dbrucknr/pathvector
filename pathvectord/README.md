@@ -177,6 +177,11 @@ INFO pathvectord: Prometheus metrics listening on http://0.0.0.0:9179/metrics
 | `pathvectord_bgp_sessions_established_total` | Counter | `peer` | Number of times this peer reached Established |
 | `pathvectord_bgp_sessions_terminated_total` | Counter | `peer`, `reason` | Session terminations by cause: `unclean`, `notification`, `operator_stop` |
 | `pathvectord_bgp_updates_received_total` | Counter | `peer` | BGP UPDATE messages received from this peer |
+| `pathvectord_bgp_updates_sent_total` | Counter | `peer` | BGP UPDATE messages sent to this peer |
+| `pathvectord_bgp_originated_routes` | Gauge | `afi` | Routes this daemon self-originates (bypasses import policy; `afi=ipv4` or `afi=ipv6`) |
+| `pathvectord_bgp_fib_routes_installed` | Gauge | `afi` | Routes currently installed in the kernel FIB, per successful install/withdraw outcome |
+| `pathvectord_bgp_fib_write_failures_total` | Counter | `afi`, `op` | Kernel FIB write failures, by operation (`install`, `blackhole`, `withdraw`, `withdraw_blackhole`) |
+| `pathvectord_bgp_import_policy_rejected_total` | Counter | `peer` | Routes rejected by import policy (`Decision::Reject`/`Next`); excludes RFC 7999 BLACKHOLE routes and transport-level drops |
 
 ### Quick check
 
@@ -212,6 +217,23 @@ pathvectord_bgp_sessions_terminated_total{peer="10.0.0.1",reason="unclean"} 0
 
 # TYPE pathvectord_bgp_updates_received_total counter
 pathvectord_bgp_updates_received_total{peer="10.0.0.1"} 4
+
+# TYPE pathvectord_bgp_updates_sent_total counter
+pathvectord_bgp_updates_sent_total{peer="10.0.0.1"} 1
+
+# TYPE pathvectord_bgp_originated_routes gauge
+pathvectord_bgp_originated_routes{afi="ipv4"} 0
+pathvectord_bgp_originated_routes{afi="ipv6"} 0
+
+# TYPE pathvectord_bgp_fib_routes_installed gauge
+pathvectord_bgp_fib_routes_installed{afi="ipv4"} 4
+pathvectord_bgp_fib_routes_installed{afi="ipv6"} 0
+
+# TYPE pathvectord_bgp_fib_write_failures_total counter
+pathvectord_bgp_fib_write_failures_total{afi="ipv4",op="install"} 0
+
+# TYPE pathvectord_bgp_import_policy_rejected_total counter
+pathvectord_bgp_import_policy_rejected_total{peer="10.0.0.1"} 0
 ```
 
 ### Prometheus scrape config
@@ -242,6 +264,15 @@ pathvectord_bgp_adj_rib_out_prefixes
 
 # Total routes in Loc-RIB
 sum(pathvectord_bgp_loc_rib_prefixes)
+
+# Kernel FIB diverging from Loc-RIB (installed routes should track loc_rib size)
+pathvectord_bgp_fib_routes_installed - on(afi) pathvectord_bgp_loc_rib_prefixes
+
+# FIB write failure rate, by operation
+rate(pathvectord_bgp_fib_write_failures_total[5m])
+
+# Is import policy rejecting more than expected for a peer?
+rate(pathvectord_bgp_import_policy_rejected_total[5m])
 ```
 
 ### Security note
