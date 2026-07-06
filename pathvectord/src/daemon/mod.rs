@@ -788,6 +788,11 @@ where
                 for peer in &cfg.peers {
                     crate::metrics::register_peer(peer.address);
                 }
+                // Same reasoning for the global Loc-RIB gauges: update_rib_sizes
+                // is only called from event-driven sites (post-Established,
+                // post-flush), so a daemon with zero established peers would
+                // otherwise show no Loc-RIB size at all instead of a real 0.
+                crate::metrics::update_rib_sizes(0, 0, &HashMap::new());
             }
             Err(e) => {
                 tracing::warn!(

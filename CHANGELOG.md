@@ -6,7 +6,7 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-07-05 (metrics: fix stale adj_rib_out, add updates_sent counter, pre-register peers)
 
-### [pathvectord] Close two Prometheus observability gaps surfaced by real downstream usage
+### [pathvectord] Close three Prometheus observability gaps surfaced by real downstream usage
 
 Found using pathvectord from BlockingArbiter-RS (a project consuming the daemon's
 published Docker image): Grafana panels showed nothing for a peer until route churn
@@ -35,6 +35,12 @@ happened to touch it, and there was no way to graph outbound UPDATE activity at 
   statically-configured peer at startup (after the metrics endpoint installs) and
   from the dynamic-peer `AddPeer` handler, before that peer's session task is
   spawned.
+- **No Loc-RIB size at all until the first peer event.** `pathvectord_bgp_loc_rib_prefixes{afi}`
+  (a global, non-per-peer gauge) is only set by `update_rib_sizes`, which is only
+  called from event-driven sites (post-Established, post-flush) — a daemon with
+  zero established peers showed no Loc-RIB size at all, not a real `0`. Fixed by
+  calling `update_rib_sizes(0, 0, &HashMap::new())` right after the metrics
+  endpoint installs at startup, alongside `register_peer`'s loop.
 
 ---
 
