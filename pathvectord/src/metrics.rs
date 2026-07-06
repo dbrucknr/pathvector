@@ -8,12 +8,15 @@
 //     pathvectord_bgp_adj_rib_in_prefixes{peer}                     — routes received from peer
 //     pathvectord_bgp_adj_rib_out_prefixes{peer}                    — routes advertised to peer
 //     pathvectord_bgp_loc_rib_prefixes{afi}                         — best-path routes in Loc-RIB
+//     pathvectord_bgp_originated_routes{afi}                        — self-originated routes present in Loc-RIB
+//     pathvectord_bgp_fib_routes_installed{afi}                     — routes currently installed in the kernel FIB
 //
 //   Counters
 //     pathvectord_bgp_sessions_established_total{peer}
 //     pathvectord_bgp_sessions_terminated_total{peer, reason}       — reason: clean|notification|operator_stop|unclean
 //     pathvectord_bgp_updates_received_total{peer}
 //     pathvectord_bgp_updates_sent_total{peer}
+//     pathvectord_bgp_fib_write_failures_total{afi, op}             — op: install|blackhole|withdraw|withdraw_blackhole
 //
 // Cardinality note: series are keyed by peer IP and are never removed, only
 // zeroed, when a peer is deconfigured (RemovePeer). For a static peer set
@@ -138,6 +141,73 @@ pub fn update_rib_sizes(
             "peer" => peer.to_string()
         )
         .set(count as f64);
+    }
+}
+
+/// Update the self-originated route count after an origination or withdrawal
+/// batch. Call with the current `.len()` of `rib.originated_routes` /
+/// `rib.originated_routes_v6` — always an absolute `set()`, not a delta, since
+/// the exact count is already known at every call site in
+/// `daemon/origination.rs`. Also pre-set to `(0, 0)` at daemon startup
+/// (alongside `update_rib_sizes(0, 0, &HashMap::new())`) so a daemon that has
+/// originated nothing shows a real `0`, not a missing series.
+#[allow(clippy::cast_precision_loss)]
+pub fn update_originated_routes(originated_v4: usize, originated_v6: usize) {
+    metrics::gauge!("pathvectord_bgp_originated_routes", "afi" => "ipv4").set(originated_v4 as f64);
+    metrics::gauge!("pathvectord_bgp_originated_routes", "afi" => "ipv6").set(originated_v6 as f64);
+}
+
+/// Kernel FIB write operation, used only to label
+/// `pathvectord_bgp_fib_write_failures_total` and to select the sign of the
+/// `pathvectord_bgp_fib_routes_installed` adjustment in `on_fib_write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FibOp {
+    Install,
+    Blackhole,
+    Withdraw,
+    WithdrawBlackhole,
+}
+
+impl FibOp {
+    fn label(self) -> &'static str {
+        match self {
+            FibOp::Install => "install",
+            FibOp::Blackhole => "blackhole",
+            FibOp::Withdraw => "withdraw",
+            FibOp::WithdrawBlackhole => "withdraw_blackhole",
+        }
+    }
+
+    /// +1 for routes that add a kernel FIB entry, -1 for routes that remove one.
+    fn gauge_delta(self) -> f64 {
+        match self {
+            FibOp::Install | FibOp::Blackhole => 1.0,
+            FibOp::Withdraw | FibOp::WithdrawBlackhole => -1.0,
+        }
+    }
+}
+
+/// Records the outcome of one kernel FIB write from `fib::process_batch`.
+///
+/// On success, adjusts `pathvectord_bgp_fib_routes_installed{afi}` by +1
+/// (install/blackhole) or -1 (withdraw/withdraw_blackhole) — this gauge
+/// tracks actual kernel FIB state, as opposed to `loc_rib_prefixes`, which
+/// tracks intended state; persistent divergence between the two is itself a
+/// meaningful signal (the kernel is not converging with Loc-RIB). On failure,
+/// increments `pathvectord_bgp_fib_write_failures_total{afi, op}` and leaves
+/// the gauge untouched — nothing actually changed in the kernel.
+#[allow(clippy::cast_precision_loss)]
+pub fn on_fib_write(afi: &'static str, op: FibOp, success: bool) {
+    if success {
+        metrics::gauge!("pathvectord_bgp_fib_routes_installed", "afi" => afi)
+            .increment(op.gauge_delta());
+    } else {
+        metrics::counter!(
+            "pathvectord_bgp_fib_write_failures_total",
+            "afi" => afi,
+            "op" => op.label()
+        )
+        .increment(1);
     }
 }
 
@@ -344,6 +414,133 @@ mod tests {
         assert_eq!(
             snap.get(&("pathvectord_bgp_updates_sent_total".to_string(), labels)),
             Some(&DebugValue::Counter(3))
+        );
+    }
+
+    #[test]
+    fn update_originated_routes_sets_both_afi_gauges() {
+        let snap = capture(|| update_originated_routes(3, 1));
+
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_originated_routes".to_string(),
+                vec![("afi".to_string(), "ipv4".to_string())]
+            )),
+            Some(&DebugValue::Gauge(3.0.into()))
+        );
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_originated_routes".to_string(),
+                vec![("afi".to_string(), "ipv6".to_string())]
+            )),
+            Some(&DebugValue::Gauge(1.0.into()))
+        );
+    }
+
+    #[test]
+    fn update_originated_routes_reflects_latest_value_not_a_sum() {
+        let snap = capture(|| {
+            update_originated_routes(5, 5);
+            update_originated_routes(2, 0);
+        });
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_originated_routes".to_string(),
+                vec![("afi".to_string(), "ipv4".to_string())]
+            )),
+            Some(&DebugValue::Gauge(2.0.into())),
+            "gauge must reflect the most recent set(), not accumulate"
+        );
+    }
+
+    #[test]
+    fn on_fib_write_success_increments_routes_installed_gauge() {
+        let snap = capture(|| on_fib_write("ipv4", FibOp::Install, true));
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_fib_routes_installed".to_string(),
+                vec![("afi".to_string(), "ipv4".to_string())]
+            )),
+            Some(&DebugValue::Gauge(1.0.into()))
+        );
+        assert!(
+            !snap.contains_key(&(
+                "pathvectord_bgp_fib_write_failures_total".to_string(),
+                vec![
+                    ("afi".to_string(), "ipv4".to_string()),
+                    ("op".to_string(), "install".to_string())
+                ]
+            )),
+            "a success must not create a failure-counter series"
+        );
+    }
+
+    #[test]
+    fn on_fib_write_failure_increments_failure_counter_not_gauge() {
+        let snap = capture(|| on_fib_write("ipv6", FibOp::Withdraw, false));
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_fib_write_failures_total".to_string(),
+                vec![
+                    ("afi".to_string(), "ipv6".to_string()),
+                    ("op".to_string(), "withdraw".to_string())
+                ]
+            )),
+            Some(&DebugValue::Counter(1))
+        );
+        assert!(
+            !snap.contains_key(&(
+                "pathvectord_bgp_fib_routes_installed".to_string(),
+                vec![("afi".to_string(), "ipv6".to_string())]
+            )),
+            "a failure must not move the routes-installed gauge — nothing changed in the kernel"
+        );
+    }
+
+    #[test]
+    fn on_fib_write_withdraw_success_decrements_routes_installed_gauge() {
+        let snap = capture(|| {
+            on_fib_write("ipv4", FibOp::Install, true);
+            on_fib_write("ipv4", FibOp::Install, true);
+            on_fib_write("ipv4", FibOp::Withdraw, true);
+        });
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_fib_routes_installed".to_string(),
+                vec![("afi".to_string(), "ipv4".to_string())]
+            )),
+            Some(&DebugValue::Gauge(1.0.into())),
+            "2 installs then 1 withdraw must net to 1"
+        );
+    }
+
+    #[test]
+    fn on_fib_write_blackhole_ops_use_the_blackhole_label() {
+        let snap = capture(|| on_fib_write("ipv4", FibOp::Blackhole, false));
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_fib_write_failures_total".to_string(),
+                vec![
+                    ("afi".to_string(), "ipv4".to_string()),
+                    ("op".to_string(), "blackhole".to_string())
+                ]
+            )),
+            Some(&DebugValue::Counter(1))
+        );
+    }
+
+    #[test]
+    fn on_fib_write_withdraw_blackhole_ops_use_the_withdraw_blackhole_label() {
+        let snap = capture(|| on_fib_write("ipv6", FibOp::WithdrawBlackhole, false));
+        assert_eq!(
+            snap.get(&(
+                "pathvectord_bgp_fib_write_failures_total".to_string(),
+                vec![
+                    ("afi".to_string(), "ipv6".to_string()),
+                    ("op".to_string(), "withdraw_blackhole".to_string())
+                ]
+            )),
+            Some(&DebugValue::Counter(1))
         );
     }
 }

@@ -266,37 +266,61 @@ pub(crate) async fn process_batch<W: FibWrite>(
         let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
         match op {
             PendingV4::Install { gateway } => {
-                if let Err(e) = writer.install_v4(dst, prefix_len, gateway).await {
+                let result = writer.install_v4(dst, prefix_len, gateway).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         %gateway,
                         "FIB install failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv4",
+                    crate::metrics::FibOp::Install,
+                    result.is_ok(),
+                );
             }
             PendingV4::Blackhole => {
-                if let Err(e) = writer.install_blackhole_v4(dst, prefix_len).await {
+                let result = writer.install_blackhole_v4(dst, prefix_len).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB blackhole install failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv4",
+                    crate::metrics::FibOp::Blackhole,
+                    result.is_ok(),
+                );
             }
             PendingV4::Withdraw => {
-                if let Err(e) = writer.withdraw_v4(dst, prefix_len).await {
+                let result = writer.withdraw_v4(dst, prefix_len).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB withdraw failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv4",
+                    crate::metrics::FibOp::Withdraw,
+                    result.is_ok(),
+                );
             }
             PendingV4::WithdrawBlackhole => {
-                if let Err(e) = writer.withdraw_blackhole_v4(dst, prefix_len).await {
+                let result = writer.withdraw_blackhole_v4(dst, prefix_len).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB blackhole withdraw failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv4",
+                    crate::metrics::FibOp::WithdrawBlackhole,
+                    result.is_ok(),
+                );
             }
         }
     }
@@ -305,37 +329,61 @@ pub(crate) async fn process_batch<W: FibWrite>(
         let (dst, prefix_len) = (nlri.prefix().ip(), nlri.prefix_len());
         match op {
             PendingV6::Install { gateway } => {
-                if let Err(e) = writer.install_v6(dst, prefix_len, gateway).await {
+                let result = writer.install_v6(dst, prefix_len, gateway).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         %gateway,
                         "FIB install (v6) failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv6",
+                    crate::metrics::FibOp::Install,
+                    result.is_ok(),
+                );
             }
             PendingV6::Blackhole => {
-                if let Err(e) = writer.install_blackhole_v6(dst, prefix_len).await {
+                let result = writer.install_blackhole_v6(dst, prefix_len).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB blackhole install (v6) failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv6",
+                    crate::metrics::FibOp::Blackhole,
+                    result.is_ok(),
+                );
             }
             PendingV6::Withdraw => {
-                if let Err(e) = writer.withdraw_v6(dst, prefix_len).await {
+                let result = writer.withdraw_v6(dst, prefix_len).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB withdraw (v6) failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv6",
+                    crate::metrics::FibOp::Withdraw,
+                    result.is_ok(),
+                );
             }
             PendingV6::WithdrawBlackhole => {
-                if let Err(e) = writer.withdraw_blackhole_v6(dst, prefix_len).await {
+                let result = writer.withdraw_blackhole_v6(dst, prefix_len).await;
+                if let Err(e) = &result {
                     tracing::warn!(
                         prefix = %format!("{dst}/{prefix_len}"),
                         "FIB blackhole withdraw (v6) failed: {e}"
                     );
                 }
+                crate::metrics::on_fib_write(
+                    "ipv6",
+                    crate::metrics::FibOp::WithdrawBlackhole,
+                    result.is_ok(),
+                );
             }
         }
     }
@@ -369,11 +417,39 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use pathvector_rib::{BestPathChange, RouteBuilder};
     use pathvector_sys::FibWrite;
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
 
     use super::{ApplyFibChange, FibManager, PendingV4, PendingV6};
+
+    /// `(metric_name, sorted_labels) -> DebugValue`, as returned by `capture`.
+    type MetricsSnapshot = HashMap<(String, Vec<(String, String)>), DebugValue>;
+
+    /// Runs `f` against a fresh, isolated recorder and returns every emitted
+    /// metric. Duplicated from `metrics.rs`'s private `capture()` —
+    /// `metrics-util` is already a workspace dev-dependency, and this is
+    /// simpler than exporting a private test helper across module boundaries.
+    fn capture(f: impl FnOnce()) -> MetricsSnapshot {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, f);
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite_key, _unit, _desc, value)| {
+                let key = composite_key.key();
+                let mut labels: Vec<(String, String)> = key
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                ((key.name().to_string(), labels), value)
+            })
+            .collect()
+    }
 
     // ── MockFibWriter ─────────────────────────────────────────────────────────
 
@@ -394,6 +470,11 @@ mod tests {
         calls: Arc<Mutex<Calls>>,
         fail_v4: bool,
         fail_v6: bool,
+        /// Makes *every* op fail, including ones `fail_v4`/`fail_v6` don't
+        /// gate today (`withdraw_v4`, both blackhole install ops, both
+        /// blackhole withdraw ops) — used only by the `on_fib_write` metrics
+        /// tests, which need to force a failure on every op in isolation.
+        fail_all: bool,
     }
 
     impl MockFibWriter {
@@ -404,6 +485,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                     fail_v4: false,
                     fail_v6: false,
+                    fail_all: false,
                 },
                 calls,
             )
@@ -420,6 +502,12 @@ mod tests {
             w.fail_v6 = true;
             (w, calls)
         }
+
+        fn failing_all() -> (Self, Arc<Mutex<Calls>>) {
+            let (mut w, calls) = Self::new();
+            w.fail_all = true;
+            (w, calls)
+        }
     }
 
     impl FibWrite for MockFibWriter {
@@ -429,7 +517,7 @@ mod tests {
             prefix_len: u8,
             gateway: Ipv4Addr,
         ) -> std::io::Result<()> {
-            if self.fail_v4 {
+            if self.fail_all || self.fail_v4 {
                 return Err(std::io::Error::other("mock install_v4 failure"));
             }
             self.calls
@@ -441,6 +529,9 @@ mod tests {
         }
 
         async fn withdraw_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_all {
+                return Err(std::io::Error::other("mock withdraw_v4 failure"));
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -455,7 +546,7 @@ mod tests {
             prefix_len: u8,
             gateway: Ipv6Addr,
         ) -> std::io::Result<()> {
-            if self.fail_v6 {
+            if self.fail_all || self.fail_v6 {
                 return Err(std::io::Error::other("mock install_v6 failure"));
             }
             self.calls
@@ -467,7 +558,7 @@ mod tests {
         }
 
         async fn withdraw_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
-            if self.fail_v6 {
+            if self.fail_all || self.fail_v6 {
                 return Err(std::io::Error::other("mock withdraw_v6 failure"));
             }
             self.calls
@@ -479,6 +570,9 @@ mod tests {
         }
 
         async fn install_blackhole_v4(&self, dst: Ipv4Addr, prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_all {
+                return Err(std::io::Error::other("mock install_blackhole_v4 failure"));
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -492,6 +586,9 @@ mod tests {
             dst: Ipv4Addr,
             prefix_len: u8,
         ) -> std::io::Result<()> {
+            if self.fail_all {
+                return Err(std::io::Error::other("mock withdraw_blackhole_v4 failure"));
+            }
             // Reuse withdrawn_v4 for withdraw — distinguish by checking blackhole_v4 absence.
             self.calls
                 .lock()
@@ -502,6 +599,9 @@ mod tests {
         }
 
         async fn install_blackhole_v6(&self, dst: Ipv6Addr, prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_all {
+                return Err(std::io::Error::other("mock install_blackhole_v6 failure"));
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -515,6 +615,9 @@ mod tests {
             dst: Ipv6Addr,
             prefix_len: u8,
         ) -> std::io::Result<()> {
+            if self.fail_all {
+                return Err(std::io::Error::other("mock withdraw_blackhole_v6 failure"));
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -704,6 +807,188 @@ mod tests {
         assert_eq!(c.installed_v6.len(), 1);
         assert!(c.installed_v4.is_empty());
         assert!(c.withdrawn_v6.is_empty());
+    }
+
+    // ── on_fib_write metrics wiring (Gap 1) ─────────────────────────────────
+
+    fn fib_gauge<'a>(snap: &'a MetricsSnapshot, afi: &str) -> Option<&'a DebugValue> {
+        snap.get(&(
+            "pathvectord_bgp_fib_routes_installed".to_string(),
+            vec![("afi".to_string(), afi.to_string())],
+        ))
+    }
+
+    fn fib_failure_counter<'a>(
+        snap: &'a MetricsSnapshot,
+        afi: &str,
+        op: &str,
+    ) -> Option<&'a DebugValue> {
+        snap.get(&(
+            "pathvectord_bgp_fib_write_failures_total".to_string(),
+            vec![
+                ("afi".to_string(), afi.to_string()),
+                ("op".to_string(), op.to_string()),
+            ],
+        ))
+    }
+
+    /// `process_batch` is async, but `capture`'s closure must be synchronous
+    /// (`metrics::with_local_recorder` sets a thread-local only for the
+    /// duration of a plain `FnOnce`) — so every test below builds a local
+    /// current-thread runtime and `block_on`s inside that closure, matching
+    /// the pattern already used for async proptest bodies in
+    /// `outbound.rs`'s `prop_tests` module.
+    fn capture_batch(
+        mock: &MockFibWriter,
+        v4: HashMap<Nlri<Ipv4Addr>, PendingV4>,
+        v6: HashMap<Nlri<Ipv6Addr>, PendingV6>,
+    ) -> MetricsSnapshot {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        capture(|| {
+            rt.block_on(super::process_batch(mock, v4, v6));
+        })
+    }
+
+    #[test]
+    fn test_process_batch_install_v4_success_increments_fib_gauge() {
+        let (mock, _calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, v4_install("192.0.2.1"));
+        let snap = capture_batch(&mock, v4, HashMap::new());
+        assert_eq!(
+            fib_gauge(&snap, "ipv4"),
+            Some(&DebugValue::Gauge(1.0.into()))
+        );
+        assert_eq!(fib_failure_counter(&snap, "ipv4", "install"), None);
+    }
+
+    #[test]
+    fn test_process_batch_install_v4_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, v4_install("192.0.2.1"));
+        let snap = capture_batch(&mock, v4, HashMap::new());
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv4", "install"),
+            Some(&DebugValue::Counter(1))
+        );
+        assert_eq!(
+            fib_gauge(&snap, "ipv4"),
+            None,
+            "a failed install must not move the routes-installed gauge"
+        );
+    }
+
+    #[test]
+    fn test_process_batch_withdraw_v4_success_decrements_fib_gauge() {
+        let (mock, _calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::Withdraw);
+        let snap = capture_batch(&mock, v4, HashMap::new());
+        assert_eq!(
+            fib_gauge(&snap, "ipv4"),
+            Some(&DebugValue::Gauge((-1.0).into())),
+            "one withdraw with no prior install nets to -1 in this isolated recorder"
+        );
+    }
+
+    #[test]
+    fn test_process_batch_withdraw_v4_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing_all();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::Withdraw);
+        let snap = capture_batch(&mock, v4, HashMap::new());
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv4", "withdraw"),
+            Some(&DebugValue::Counter(1))
+        );
+        assert_eq!(fib_gauge(&snap, "ipv4"), None);
+    }
+
+    #[test]
+    fn test_process_batch_install_v6_success_increments_fib_gauge() {
+        let (mock, _calls) = MockFibWriter::new();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::Install { gateway: gw });
+        let snap = capture_batch(&mock, HashMap::new(), v6);
+        assert_eq!(
+            fib_gauge(&snap, "ipv6"),
+            Some(&DebugValue::Gauge(1.0.into()))
+        );
+    }
+
+    #[test]
+    fn test_process_batch_withdraw_v6_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing_v6();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::Withdraw);
+        let snap = capture_batch(&mock, HashMap::new(), v6);
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv6", "withdraw"),
+            Some(&DebugValue::Counter(1))
+        );
+        assert_eq!(fib_gauge(&snap, "ipv6"), None);
+    }
+
+    #[test]
+    fn test_process_batch_blackhole_v4_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing_all();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::Blackhole);
+        let snap = capture_batch(&mock, v4, HashMap::new());
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv4", "blackhole"),
+            Some(&DebugValue::Counter(1))
+        );
+    }
+
+    #[test]
+    fn test_process_batch_withdraw_blackhole_v4_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing_all();
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut v4 = HashMap::new();
+        v4.insert(nlri, PendingV4::WithdrawBlackhole);
+        let snap = capture_batch(&mock, v4, HashMap::new());
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv4", "withdraw_blackhole"),
+            Some(&DebugValue::Counter(1))
+        );
+    }
+
+    #[test]
+    fn test_process_batch_blackhole_v6_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing_all();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::Blackhole);
+        let snap = capture_batch(&mock, HashMap::new(), v6);
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv6", "blackhole"),
+            Some(&DebugValue::Counter(1))
+        );
+    }
+
+    #[test]
+    fn test_process_batch_withdraw_blackhole_v6_failure_increments_failure_counter() {
+        let (mock, _calls) = MockFibWriter::failing_all();
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let mut v6 = HashMap::new();
+        v6.insert(nlri, PendingV6::WithdrawBlackhole);
+        let snap = capture_batch(&mock, HashMap::new(), v6);
+        assert_eq!(
+            fib_failure_counter(&snap, "ipv6", "withdraw_blackhole"),
+            Some(&DebugValue::Counter(1))
+        );
     }
 
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {

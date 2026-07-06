@@ -793,6 +793,11 @@ where
                 // post-flush), so a daemon with zero established peers would
                 // otherwise show no Loc-RIB size at all instead of a real 0.
                 crate::metrics::update_rib_sizes(0, 0, &HashMap::new());
+                // Same reasoning again for self-originated routes: only
+                // touched by origination.rs's event-driven functions, so a
+                // daemon that has not yet originated anything would
+                // otherwise show no series at all instead of a real 0.
+                crate::metrics::update_originated_routes(0, 0);
             }
             Err(e) => {
                 tracing::warn!(

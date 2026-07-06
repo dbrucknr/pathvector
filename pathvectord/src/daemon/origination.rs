@@ -35,6 +35,10 @@ impl DaemonState {
         }
         self.propagate_to_all_peers(&nlris);
         self.flush_pending();
+        crate::metrics::update_originated_routes(
+            self.rib.originated_routes.len(),
+            self.rib.originated_routes_v6.len(),
+        );
     }
 
     /// Injects a single IPv6 route into `loc_rib_v6` and propagates it.
@@ -67,6 +71,10 @@ impl DaemonState {
         }
         self.propagate_to_all_peers_v6(&nlris);
         self.flush_pending();
+        crate::metrics::update_originated_routes(
+            self.rib.originated_routes.len(),
+            self.rib.originated_routes_v6.len(),
+        );
     }
 
     /// Withdraws a single locally originated route.
@@ -93,6 +101,10 @@ impl DaemonState {
         }
         self.propagate_to_all_peers(nlris);
         self.flush_pending();
+        crate::metrics::update_originated_routes(
+            self.rib.originated_routes.len(),
+            self.rib.originated_routes_v6.len(),
+        );
     }
 
     /// Withdraws a single locally originated IPv6 route.
@@ -119,6 +131,10 @@ impl DaemonState {
         }
         self.propagate_to_all_peers_v6(nlris);
         self.flush_pending();
+        crate::metrics::update_originated_routes(
+            self.rib.originated_routes.len(),
+            self.rib.originated_routes_v6.len(),
+        );
     }
 }
 
@@ -126,6 +142,7 @@ impl DaemonState {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use pathvector_rib::BestPathChange;
     use pathvector_types::{AsPath, NextHop, Nlri, Origin};
 
@@ -135,6 +152,34 @@ mod tests {
     const LOCAL_AS: u32 = 65001;
     const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
     const PEER_AS: u32 = 65002;
+
+    /// `(metric_name, sorted_labels) -> DebugValue`, as returned by `capture`.
+    type MetricsSnapshot = std::collections::HashMap<(String, Vec<(String, String)>), DebugValue>;
+
+    /// Runs `f` against a fresh, isolated recorder and returns every emitted
+    /// metric as `(metric_name, sorted_labels) -> DebugValue`. Duplicated from
+    /// `metrics.rs`'s private `capture()` — `metrics-util` is already a
+    /// workspace dev-dependency, and this is simpler than exporting a private
+    /// test helper across module boundaries.
+    fn capture(f: impl FnOnce()) -> MetricsSnapshot {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, f);
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite_key, _unit, _desc, value)| {
+                let key = composite_key.key();
+                let mut labels: Vec<(String, String)> = key
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                ((key.name().to_string(), labels), value)
+            })
+            .collect()
+    }
 
     fn route_v6(prefix: &str) -> Route<Ipv6Addr> {
         let nlri: Nlri<Ipv6Addr> = prefix.parse().unwrap();
@@ -206,6 +251,76 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, BestPathChange::Withdrawn(_))),
             "withdraw_originated_route_v6 must push a Withdrawn FIB change"
+        );
+    }
+
+    fn originated_routes_gauge<'a>(snap: &'a MetricsSnapshot, afi: &str) -> Option<&'a DebugValue> {
+        snap.get(&(
+            "pathvectord_bgp_originated_routes".to_string(),
+            vec![("afi".to_string(), afi.to_string())],
+        ))
+    }
+
+    #[test]
+    fn originate_routes_updates_originated_routes_gauge() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
+        let snap = capture(|| {
+            state.originate_routes(vec![route_v4("203.0.113.0/24")]);
+        });
+        assert_eq!(
+            originated_routes_gauge(&snap, "ipv4"),
+            Some(&DebugValue::Gauge(1.0.into())),
+            "originate_routes must update the originated-routes gauge"
+        );
+        assert_eq!(
+            originated_routes_gauge(&snap, "ipv6"),
+            Some(&DebugValue::Gauge(0.0.into())),
+            "the untouched family must still be (re-)reported, at its real count"
+        );
+    }
+
+    #[test]
+    fn originate_routes_v6_updates_originated_routes_gauge() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
+        let snap = capture(|| {
+            state.originate_routes_v6(vec![route_v6("2001:db8::/32")]);
+        });
+        assert_eq!(
+            originated_routes_gauge(&snap, "ipv6"),
+            Some(&DebugValue::Gauge(1.0.into())),
+            "originate_routes_v6 must update the originated-routes gauge"
+        );
+    }
+
+    #[test]
+    fn withdraw_originated_routes_updates_gauge_back_to_zero() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
+        state.originate_route(route_v4("203.0.113.0/24"));
+
+        let nlri: Nlri<Ipv4Addr> = "203.0.113.0/24".parse().unwrap();
+        let snap = capture(|| {
+            state.withdraw_originated_route(nlri);
+        });
+        assert_eq!(
+            originated_routes_gauge(&snap, "ipv4"),
+            Some(&DebugValue::Gauge(0.0.into())),
+            "withdraw_originated_routes must update the gauge back to 0"
+        );
+    }
+
+    #[test]
+    fn withdraw_originated_routes_v6_updates_gauge_back_to_zero() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
+        state.originate_route_v6(route_v6("2001:db8::/32"));
+
+        let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
+        let snap = capture(|| {
+            state.withdraw_originated_route_v6(nlri);
+        });
+        assert_eq!(
+            originated_routes_gauge(&snap, "ipv6"),
+            Some(&DebugValue::Gauge(0.0.into())),
+            "withdraw_originated_routes_v6 must update the gauge back to 0"
         );
     }
 }
