@@ -55,6 +55,16 @@ decides which Loc-RIB routes get advertised to each peer. pathvector defaults to
 
 **Prerequisites:** Rust ≥ 1.88 and `protoc` ≥ 3 (`brew install protobuf` / `apt install protobuf-compiler`).
 
+Sample Setup on a Linux machine:
+
+```bash
+sudo apt install protobuf-compiler
+
+cargo install cargo-fuzz
+cargo install --locked cargo-nextest
+cargo install just
+``
+
 ```toml
 # config.toml — minimal eBGP peer config
 [daemon]
@@ -77,6 +87,13 @@ cargo build --release -p pathvectord
 cargo run -p pathvector -- peer list
 cargo run -p pathvector -- route list
 cargo run -p pathvector -- dashboard        # live ratatui TUI
+```
+
+**Running MRT replay**
+
+```bash
+curl -O https://data.ris.ripe.net/rrc00/latest-bview.gz
+just mrt ./latest-bview.gz
 ```
 
 See [pathvectord/README.md](pathvectord/README.md) for the full configuration reference,
