@@ -356,6 +356,46 @@ here):
   call (find real justification, or reconsider the exemption), not a
   reflexive fix.
 
+**17. RFC 4724 (Graceful Restart) gaps found by a fresh systematic clause
+audit** — found 2026-07-16 (diagnostic only, not fixed here). The
+*Receiving Speaker* role (§4.2 — holding a peer's routes stale when the
+peer restarts) is genuinely solid and well-tested; these gaps are all in
+areas the existing test suite never covered:
+
+- **HIGH PRIORITY — Established-state collision doesn't recognize GR
+  restart.** RFC 4724 §5 overrides RFC 4271 §6.8's plain collision-handling
+  for GR-negotiated sessions: when a new incoming connection succeeds while
+  we still think we're `Established` with a peer, and GR was negotiated,
+  we're supposed to treat this as evidence the peer restarted — retain its
+  routes per §4.2, drop our *old* connection, and move to `Connect` to
+  accept the new one — not reject the new connection as an ordinary
+  collision. `handle_incoming_connection`'s `State::Established` arm
+  (`pathvector-session/src/transport/mod.rs:666-673`) doesn't check GR
+  status at all; it always rejects. Practical effect: a legitimately-
+  restarting GR-capable peer's reconnection attempt gets silently
+  rejected, likely forcing it to wait out our Hold Timer before we
+  notice anything's wrong — defeating much of the point of graceful
+  restart. Directly reinforces the severity of TODO #15 (the RFC 4271
+  §6.8 collision-resolution bug) — same code area, same audit pass. See
+  `RFC_AUDIT.md`'s RFC 4724 §5 section.
+- **MAJOR FEATURE GAP — no Restarting-Speaker route-selection deferral.**
+  RFC 4724 §4.1 requires deferring our *own* best-path decisions after
+  *our own* restart until either EOR is received from all GR-capable
+  peers or a configurable `Selection_Deferral_Timer` expires. No such
+  mechanism exists anywhere in the codebase — `handle_update`/`select_best`
+  run immediately per-UPDATE with no restart-in-progress awareness. This
+  could cause transient bad route selection or unnecessary churn right
+  after `pathvectord` itself restarts and peers begin reconnecting. This
+  is a substantial feature (new timer, EOR-tracking-since-our-restart,
+  a gate in front of the decision-process pipeline) — needs its own design
+  discussion, not a quick patch. See `RFC_AUDIT.md`'s RFC 4724 §4.1
+  section.
+- **Minor — duplicate GracefulRestart capability instances use first, not
+  last.** §3 says the receiver MUST ignore all but the *last* instance if
+  a peer sends 2+ (itself a sender-side RFC violation, so low real-world
+  likelihood). `peer.rs:383-402`'s `find_map` takes the first non-zero
+  instance instead. See `RFC_AUDIT.md`'s RFC 4724 §3 section.
+
 ---
 
 ## General

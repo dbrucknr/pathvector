@@ -36,11 +36,11 @@ one of three buckets:
 Prioritized by risk (state-machine-shaped code that's hard to test
 exhaustively) and blast radius, not by RFC number:
 
-1. **RFC 4271 (full)** — in progress. Core protocol; already proven to hide
-   bugs in exactly this way.
-2. RFC 4724 (Graceful Restart) — was audited once before (see project
-   history), but that pass predates this log and wasn't recorded
-   clause-by-clause; worth a fresh, logged pass.
+1. **RFC 4271 (full)** — substantially complete. Core protocol; already
+   proven to hide bugs in exactly this way.
+2. **RFC 4724 (Graceful Restart)** — substantially complete. Was audited
+   once before (see project history), but that pass predates this log and
+   wasn't recorded clause-by-clause; this fresh pass found 3 new gaps.
 3. RFC 9234 (Route Leak Prevention/Roles) — newest substantial feature,
    least battle-tested.
 4. RFC 7606 (revised UPDATE error handling) — directly adjacent to the
@@ -384,7 +384,131 @@ none fixed as part of this diagnostic audit.
 
 ---
 
-*(Sections §1–3 not covered — low value, mostly definitional. Per the
-roadmap, next up: RFC 4724 (Graceful Restart) fresh pass, then RFC 9234,
+*(Sections §1–3 not covered — low value, mostly definitional.)*
+
+**Cross-reference note:** the RFC 4271 §6.8 finding above ("A collision with
+an existing Established connection causes the new connection to be closed" —
+marked Confirmed correct) needs a caveat discovered during the RFC 4724 pass
+below: that verdict is only correct for **non-GR** sessions. RFC 4724 §5
+overrides this specific behavior for GR-negotiated sessions, and this
+implementation doesn't make that distinction at all. See the RFC 4724
+section's §5 finding below for detail — not re-litigated here to avoid
+duplicating the same evidence in two places.
+
+---
+
+# RFC 4724 — Graceful Restart Mechanism for BGP
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc4724 (843 lines,
+much shorter than RFC 4271), read in full; cross-checked against
+`pathvector-session` (capability codec, FSM), `pathvector-rib` (stale-route
+marking/best-path de-preference), and `pathvectord` (`daemon/gr.rs`,
+`daemon/peer.rs`, `daemon/capabilities.rs` — the bulk of the GR logic lives
+here). This project had already implemented substantial GR functionality
+across several earlier work sessions (R-bit lifetime, Phase 2 "Receiving
+Speaker" stale-route retention, EOR send/receive, per-family retention,
+GR-deadline-expiry flush) with an existing, extensive test suite — this
+pass re-verifies that work against the actual RFC text fresh, rather than
+trusting the existing `pathvectord/RFC.md` checklist at face value, and
+specifically looks for the class of requirement that's easy to miss
+entirely: things the checklist never had a row for in the first place.
+
+**Overall finding: the *Receiving Speaker* role (§4.2 — holding a peer's
+routes as stale when the peer restarts) is thoroughly implemented and
+well-tested. The *Restarting Speaker* role (§4.1 — deferring our own route
+selection when *we* restart) has no implementation at all.** These are two
+distinct, independent halves of the RFC that a full implementation needs
+both of, and the existing documentation's "helper role, speaker role"
+framing doesn't clearly separate them, which likely contributed to §4.1
+never being tracked as a gap.
+
+## §2 — Marker for End-of-RIB
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| IPv4 unicast EOR = minimum-length UPDATE; other AFI/SAFI EOR = UPDATE with only MP_UNREACH_NLRI, empty withdrawn, for that AFI/SAFI | Confirmed correct (cross-referenced, not re-derived fresh) | Already extensively tested per `pathvectord/RFC.md`: `test_on_established_empty_rib_sends_eor_only`, `test_on_established_ipv6_capable_peer_receives_both_eors`, `test_ipv4_eor_received_is_recorded`, `test_ipv6_eor_received_is_recorded` — this pass read the RFC text directly and confirms the format description matches what these tests exercise | Existing test suite |
+
+**§2 summary:** 1 clause reviewed, confirmed correct (well pre-existing
+test coverage).
+
+## §3 — Graceful Restart Capability
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| R-bit: set when the speaker has restarted; peer MUST NOT wait for EOR from a speaker with R=1 before advertising | Confirmed correct (cross-referenced) | R-bit lifetime already implemented and tested (`spawn_config_r_bit_set_within_restart_window`, etc.); the "peer must not wait for EOR from an R=1 speaker" half is a *receiving*-side behavior this project implements when *we* are the receiver — not independently re-verified this pass, but consistent with the existing `gr_capable_peers`/EOR-wait logic described in `pathvectord/RFC.md` | — |
+| F-bit: only set if forwarding state was genuinely preserved during restart | Confirmed correct (cross-referenced) | `test_build_local_capabilities_f_bit_false_when_restarting` / `f_bit_true_when_stable` — this project's architecture always wipes/rebuilds its FIB view on process restart, so F-bit is honestly always false for its own restarts, which is the conservative/correct choice given it doesn't attempt real forwarding-state persistence across a process restart | Existing test suite |
+| A BGP speaker MUST NOT include more than one instance of the Graceful Restart Capability; if the peer does anyway, the receiver **MUST ignore all but the *last* instance** | **Confirmed gap** | `peer.rs:383-402`'s `.find_map(\|c\| ...)` iterates the peer's advertised capabilities in wire order and returns the **first** `GracefulRestart` capability with `restart_time > 0` — the opposite of "ignore all but the last." The existing tests (`duplicate_gr_capabilities_do_not_panic_and_first_wins`, `zero_gr_then_nonzero_gr_uses_first_nonzero`) directly name and assert the current (non-compliant) "first wins" behavior. Real-world likelihood is low — a peer sending 2+ GR capability instances is itself an RFC violation on the sender's part — but the receiver-side handling is backwards when it happens. Corrected the misleading `pathvectord/RFC.md` row (which had claimed this as ✅) to ⚠️. | Reverse the `find_map` to take the last match instead of the first (e.g. iterate and overwrite rather than short-circuit on first `Some`), then rename the tests to describe correct ("last wins") behavior |
+| Zero <AFI,SAFI> tuples in the capability ⇒ sender can't preserve forwarding state for any family, but still supports Receiving-Speaker procedures; Restart Time is irrelevant in this case | Confirmed correct | `families: Vec<GracefulRestartFamily>` naturally supports an empty vec with no special-casing needed elsewhere in the pipeline; proptest fuzzing already covers arbitrary family lists including empty ones (`gr_capability_roundtrips`) | Existing proptest suite |
+
+**§3 summary:** 4 clauses reviewed — 3 confirmed correct, 1 confirmed gap.
+
+## §4.1 — Procedures for the Restarting Speaker
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| MUST retain forwarding state (if possible) and mark stale; MUST NOT differentiate stale vs. other info during forwarding | Confirmed correct — by architecture, not by a preservation feature | This project doesn't attempt to preserve forwarding state across its own process restart at all (FIB is rebuilt from scratch on startup, confirmed via the F-bit-always-false-on-restart behavior above) — so there's no stale/non-stale distinction to make in the forwarding plane for *our own* restart, satisfying "MUST NOT differentiate" vacuously. This is an honest, defensible architecture choice (don't claim preservation you don't do), not a violation. | — |
+| MUST set R-bit in OPEN after restart | Confirmed correct (already established, prior work) | `spawn_config_r_bit_set_within_restart_window` | Existing test suite |
+| F-bit set only if forwarding state was genuinely preserved | Confirmed correct (already covered under §3 above) | — | — |
+| **MUST defer route selection for an address family until (a) EOR received from all GR-capable peers (excluding restarting ones) or (b) the Selection_Deferral_Timer expires; an implementation MUST support a configurable timer for this** | **Confirmed gap — the largest unimplemented piece of RFC 4724 in this codebase** | Grepped the entire workspace for `Selection_Deferral`/`selection_deferral`/`SelectionDeferral`/any deferred-route-selection concept — zero matches anywhere in `pathvectord` or `pathvector-rib`. `handle_update`/`select_best` run immediately, synchronously, per-UPDATE with no notion of "our own restart is still settling, hold off on final decisions." **Practical consequence:** after `pathvectord` itself restarts and peers begin reconnecting and re-sending their routes, this daemon will start making best-path decisions and propagating routes to *other* peers as soon as the very first UPDATE arrives from *any* one peer — potentially well before all peers have finished re-sending their post-restart routing tables. This is exactly the premature/incomplete-information decision problem §4.1's deferral mechanism exists to prevent; it could cause transient bad route selection or unnecessary route churn (advertise a route, then immediately withdraw/replace it moments later as more complete information arrives from other peers) in the window right after a restart. This project's existing GR work covers the *Receiving Speaker* role (holding a *peer's* stale routes) extremely well, but the *Restarting Speaker* role (managing *our own* restart-time decisions) appears to have no code path at all. | This is a substantial feature, not a quick fix: a `Selection_Deferral_Timer` (configurable, RFC suggests sizing it generously), a way to track "have all GR-capable peers sent EOR since our own restart," and a gate in front of the decision-process/propagation pipeline that holds off on running `select_best`/`propagate_prefix` until either condition is met. Worth its own design discussion before scoping a fix — this significantly changes daemon startup behavior. |
+
+**§4.1 summary:** 4 clauses reviewed — 3 confirmed correct, 1 confirmed gap
+(a major, previously entirely-untracked one).
+
+## §4.2 — Procedures for the Receiving Speaker
+
+This is the half of RFC 4724 this project has invested the most engineering
+effort in, and it shows — this pass didn't find any new gaps here beyond
+what's already tracked, and confirms the existing extensive test suite
+(`pathvectord/RFC.md`'s ~15 rows under this section, all ✅, covering
+per-family retention, EOR-triggered pruning, GR-deadline-expiry flush,
+stale-route de-preference in best-path, and clean-vs-unclean termination
+handling) genuinely matches the RFC text on a fresh read.
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| On (undetected) TCP termination + new incoming connection from a GR-capable peer: MUST treat as termination of the old session, close old, keep new, **no NOTIFICATION sent** | See the §5 finding below — this is the FSM-level mechanism for this clause, and it's missing | — | See §5 below |
+| On detected TCP termination for a GR-capable peer: retain routes for all previously-negotiated families, mark stale; delete any *already*-stale routes from a prior restart (handles consecutive restarts) | Confirmed correct | `unclean_termination_of_gr_peer_retains_routes`, per-family `gr_v4`/`gr_v6` check in `on_terminated` (per `pathvectord/RFC.md`) | Existing test suite |
+| Our own R-bit MUST NOT be set unless we ourselves have restarted | Confirmed correct | Covered by the R-bit lifetime logic already verified under §3/§4.1 | — |
+| If session doesn't re-establish within peer's advertised Restart Time, MUST delete all stale routes from that peer | Confirmed correct | `gr_deadline_expiry_flushes_stale_routes`, e2e `gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry` | Existing test suite |
+| On re-establishment: if F-bit not set for a family, or family absent from the new capability, or GR capability absent entirely ⇒ MUST immediately remove all stale routes for that family | Confirmed correct (cross-referenced) | Per-family retention logic (`gr_v4`/`gr_v6` checks) already tested; this pass didn't re-derive the exact F-bit-check branch line-by-line but the described behavior matches the existing test names and the `pathvectord/RFC.md` narrative | Would benefit from an explicit test naming the F-bit-false-on-reconnect case specifically, if one doesn't already exist under a different name |
+| MUST send EOR after completing initial update (including the no-routes case) | Confirmed correct | Already covered under §2 | — |
+| MUST replace stale routes with new updates as they arrive; MUST immediately remove any still-stale routes once peer's EOR is received | Confirmed correct | `eor_prunes_stale_routes_not_refreshed_by_peer`, `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` (e2e) | Existing test suite |
+| MAY support a configurable upper-bound timer on stale-route retention (independent of Restart Time) | Confirmed correct | This is the GR-deadline timer already covered above — same mechanism serves both the Restart-Time-based deletion and this general upper bound | — |
+
+**§4.2 summary:** 8 clauses reviewed, all confirmed correct — genuinely one
+of the stronger, more thoroughly-tested corners of this codebase.
+
+## §5 — Changes to BGP Finite State Machine
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Idle state: resource initialization excludes whatever's needed to retain routes per §4.2 | Confirmed correct — by architecture | Route retention (`gr.rs`'s stale-tracking) lives entirely in `pathvectord`, independent of `pathvector-session`'s FSM state — Idle-state FSM resource cleanup in `pathvector-session` has no interaction with route retention at all, satisfying this by construction/separation of concerns | — |
+| NOTIFICATION or TcpConnectionFails when GR **not** negotiated: normal immediate flush (unchanged from base RFC 4271) | Confirmed correct | This is the pre-existing, non-GR default behavior, already covered generally | — |
+| **TcpConnectionFails specifically (not NOTIFICATION) when GR **was** negotiated: retain routes per §4.2 rather than deleting them outright** | Confirmed correct | This exact distinction (unclean/TCP-failure → retain for GR peers; NOTIFICATION/clean → flush immediately) is precisely what `unclean_termination_of_gr_peer_retains_routes` and `clean_termination_flushes_immediately` (RFC 8538-adjacent) already test and implement | Existing test suite |
+| **Established state, new incoming connection succeeds (Event 16/17) while GR **was** negotiated (≥1 AFI/SAFI): MUST retain routes per §4.2, release other resources, drop the *old* established connection, initialize fresh resources, reset ConnectRetryCounter, start ConnectRetryTimer, move to Connect state — i.e. treat the new connection as evidence of peer restart, NOT as an ordinary RFC 4271 §6.8 collision to reject** | **Confirmed gap — significant, directly connects to the RFC 4271 §6.8 audit above** | `handle_incoming_connection`'s `State::Established` arm (`pathvector-session/src/transport/mod.rs:666-673`, already quoted in the RFC 4271 §6.8 section above) unconditionally rejects any new incoming connection while Established — `tracing::warn!(...); drop(stream); None` — with **no check for whether GR capability was negotiated with this peer at all**. This is exactly backwards for the scenario RFC 4724 §5 is designed to handle: a peer that restarted, whose old TCP connection died without us noticing (still "Established" from our point of view), reconnecting to re-establish the session. Per RFC 4271 §6.8's plain-vanilla rule, rejecting a new connection while Established is correct — but RFC 4724 explicitly *overrides* that rule for GR-negotiated sessions specifically. Since this project doesn't check GR-negotiated status at all in this code path, it always applies the non-GR default, meaning **a legitimately-restarting GR-capable peer trying to reconnect while we still (incorrectly) believe the old session is Established would have its reconnection attempt silently rejected**, likely forcing it to wait out our side's own Hold Timer expiry before we notice anything is wrong — defeating a meaningful part of the point of graceful restart (fast, clean recovery from a peer restart). Added a new row to `pathvectord/RFC.md`'s Connection Collision Coordination table for this. | A test: establish a session with GR negotiated, simulate the "old TCP connection appears alive to us but the peer has actually restarted and opens a new connection" scenario (mirroring the existing `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming`-style harness but in `State::Established` with GR capability recorded), asserting the new connection is adopted (routes retained per §4.2, old connection dropped, state moves to Connect) rather than rejected. This is a meaningfully-sized fix — needs the `State::Established` arm to check GR-negotiated status and branch accordingly, plus wiring the retain/reset behavior described in the RFC's replacement FSM text. |
+
+**§5 summary:** 4 clauses reviewed — 3 confirmed correct, 1 confirmed gap
+(the Established-collision-override — directly relevant to, and reinforces,
+the severity of the RFC 4271 §6.8 collision-detection finding from the
+earlier pass).
+
+### RFC 4724 running total
+
+21 clauses reviewed — 18 confirmed correct, 3 confirmed gaps. **RFC 4724
+audit considered substantially complete.** The Receiving Speaker role
+(§4.2) — the half most directly exercised by this project's own restart
+scenarios in practice (peers restarting, not `pathvectord` itself) — is
+genuinely solid. The 3 gaps are real and filed in `TODO.md` (#17):
+duplicate-capability first-vs-last handling (minor, low real-world
+likelihood), the missing Restarting-Speaker Selection_Deferral_Timer (major
+feature gap, not yet scoped as a quick fix), and the missing
+Established-collision GR override (significant, directly ties into the
+RFC 4271 §6.8 finding's severity — a restarting GR-capable peer could have
+its reconnection attempt silently rejected).
+
+---
+
+*(Per the roadmap, next up: RFC 9234 (Route Leak Prevention/Roles), then
 RFC 7606, the already-flagged ⚠️ items, RPKI/BMP, then the encode-only
 RFCs.)*
