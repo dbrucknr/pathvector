@@ -232,6 +232,60 @@ decision to keep fixes in their own scoped PRs):
   (permissive, not corrupting), but a clear spec violation. See
   `RFC_AUDIT.md`'s "§4.1 — Message Header Format" for detail.
 
+**13. RFC 4271 §5 path-attribute gaps found by systematic clause audit** —
+found 2026-07-16, same `RFC_AUDIT.md` pass as #12 above (diagnostic only,
+not fixed here):
+
+- **LOCAL_PREF received from an eBGP peer is not ignored (highest-severity
+  finding of the audit so far).** §5.1.5 requires that LOCAL_PREF from an
+  external peer MUST be ignored by the receiving speaker — this exists
+  specifically so an eBGP peer can't manipulate our best-path selection.
+  `handle_update`'s attribute loop (`pathvectord/src/daemon/route.rs:944-964`)
+  captures `PathAttribute::LocalPref` with no `peer_type` check, and it flows
+  unfiltered into `best_path.rs`'s comparator (the *first* tie-break step in
+  the decision process). A malicious or misconfigured eBGP peer can send an
+  arbitrary LOCAL_PREF (e.g. `u32::MAX`) and force its route to win
+  best-path selection against routes we'd otherwise prefer. See
+  `RFC_AUDIT.md` §5 and the new ❌ row in `pathvectord/RFC.md`'s §9.2 table.
+  Fix: gate the `PathAttribute::LocalPref` capture (or its application to
+  the route builder) on `peer_type == PeerType::Internal`, plus a test
+  proving an eBGP-attached LOCAL_PREF is dropped, not honored.
+- **Unrecognized transitive optional attributes cannot survive a relay
+  through this router.** §5 requires unrecognized *transitive* optional
+  attributes to be passed along to other peers (with Partial bit set to 1);
+  `Route`/`RareAttrs` (`pathvector-rib/src/route.rs`) have no field for an
+  opaque/unknown attribute at all, so any such attribute is unconditionally
+  dropped on RIB ingest, transitive or not. This is a design gap (needs a
+  new field threaded through the whole route pipeline), not a one-line fix
+  — see `RFC_AUDIT.md` §5 for the full detail and what a fix would require.
+
+**14. RFC 4271 §6.2/§6.3 error-handling gaps found by systematic clause
+audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
+(diagnostic only, not fixed here):
+
+- **Unrecognized OPEN optional parameter types are silently skipped, not
+  rejected.** §6.2 requires NOTIFICATION(OPEN Error, Unsupported Optional
+  Parameters) for a parameter type the implementation doesn't recognize.
+  `decode_capabilities` (`pathvector-session/src/message/open.rs:91-108`)
+  has a comment saying as much: "Unknown parameter types are silently
+  skipped." See `RFC_AUDIT.md` §6.2.
+- **An unrecognized well-known attribute (Optional bit = 0) is accepted the
+  same as an ordinary unrecognized optional attribute.** §6.3 requires
+  NOTIFICATION(UPDATE Error, Unrecognized Well-known Attribute) for this
+  case specifically — distinct from the legitimate "accept an unrecognized
+  *optional* attribute" path. `decode_attr_value`'s fallback arm
+  (`pathvector-session/src/message/update.rs:534-541`) doesn't check the
+  Optional bit before treating any unrecognized type code as `Unknown`.
+  See `RFC_AUDIT.md` §6.3.
+- **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
+  semantic validation for one-hop eBGP peers is looser than §6.3's precise
+  criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only
+  rejects unspecified/loopback/multicast/broadcast/self. The RFC's own
+  remediation for this is lenient (log + ignore route, no NOTIFICATION), and
+  permissive third-party-next-hop acceptance is common/intentional in real
+  deployments, so tightening this may not be worth doing without a config
+  toggle. See `RFC_AUDIT.md` §6.3.
+
 ---
 
 ## General
