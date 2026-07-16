@@ -4,6 +4,58 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-16 (adversarial input / fault-injection testing)
+
+### [pathvector-session, pathvector-e2e] Close the chaos/adversarial testing gap, fix two real bugs found along the way
+
+TODO.md's Tier 3 item 11 ("Adversarial input / NOTIFICATION path testing") was
+blocked on RFC 7606, which shipped earlier. With that prerequisite in place,
+added `pathvector-e2e/tests/fault_injection.rs`: 6 scenarios driven by a new
+adversarial test double, `mock_bgp_fault_peer` (see
+`pathvector-e2e/src/bin/mock_bgp_fault_peer.rs`), against a real running
+pathvectord — corrupted BGP header (bad marker/length/type), truncated bytes
+during the OPEN exchange (both held-open and closed-immediately variants), a
+malformed UPDATE (invalid ORIGIN, RFC 7606 treat-as-withdraw), and a
+mid-session TCP reset via `disconnect_gobgp`/`reconnect_gobgp`. Every scenario
+asserts a GoBGP **control** peer's session stays healthy throughout — proving
+a fault on one connection can't wedge the rest of the daemon (each peer's
+session runs on its own independent `tokio::spawn`ed task).
+
+Writing these tests surfaced two real, previously-unnoticed bugs in
+`pathvector-session`, not just gaps in test coverage:
+
+- **RFC 4271 §6.1 non-compliance.** A corrupted header (bad marker, bad
+  length, or an unrecognized message type) was silently dropping the TCP
+  connection instead of sending the RFC-mandated NOTIFICATION first —
+  `transport/mod.rs`'s `recv_message` error arm treated a framing-layer
+  `CodecError` identically to a real TCP failure. Fixed by mapping
+  `CodecError::InvalidMarker`/`InvalidLength`/`UnknownMessageType` to the
+  correct `NotificationError::MessageHeader` subcode (with the erroneous
+  length/type byte in the NOTIFICATION's `data` field, per RFC 4271 §6.1) and
+  sending it before tearing down. Non-header `CodecError` variants (malformed
+  OPEN/NOTIFICATION bodies) remain unmapped — tracked as a follow-up in
+  TODO.md.
+- **FSM bug: a silently-partitioned peer never reconnected.** All three FSM
+  states that handle `HoldTimerExpired` (OpenSent, OpenConfirm, Established)
+  omitted `FsmOutput::StartConnectRetryTimer` from their output list — present
+  in the sibling `TcpFailed`/NOTIFICATION-received arms, but missing here. A
+  `docker network disconnect` produces no TCP-level error (no RST, no read
+  failure — packets just stop being delivered), so pathvectord only notices
+  via hold-timer expiry, not a socket error. That left the session stuck in
+  `Idle` forever, with zero further connection attempts — confirmed directly
+  via `ss -tn` inside the container showing no outbound activity at all,
+  requiring a full daemon restart or peer removal/re-add to recover in
+  production. The existing `test_hold_timer_expired_in_open_sent` /
+  `_in_open_confirm` / `_in_established` unit tests never asserted on the
+  retry timer, which is why this went unnoticed; all three now do, and the
+  e2e `mid_session_tcp_reset_recovers_cleanly` test exercises the real-world
+  path end-to-end.
+
+See `pathvector-session/RFC.md`'s new RFC 4271 §6.1 section and the updated
+§8 FSM table for the exact requirements and verifying tests.
+
+---
+
 ## 2026-07-06 (metrics: FIB write failures, originated-route count, import-policy rejects)
 
 ### [pathvectord] Close three more Prometheus observability gaps surfaced by BlockingArbiter-RS

@@ -174,10 +174,34 @@ Add once BIRD and FRR are solid. Requires an Arista account; cannot be pulled
 anonymously in public CI. Gate behind a `CI_ARISTA_IMAGE` env var so it runs only
 when the image is available.
 
-**11. Adversarial input / NOTIFICATION path testing**
-RFC 7606 (item 3) is the prerequisite — once the error handling architecture
-exists, injecting malformed UPDATEs and NOTIFICATIONs over real TCP becomes
-the natural way to verify it. Before RFC 7606 there is less to test.
+**11. Adversarial input / NOTIFICATION path testing** — shipped (chaos/adversarial
+scope) 2026-07-16. `pathvector-e2e`'s `mock_bgp_fault_peer` (see
+`src/bin/mock_bgp_fault_peer.rs`) drives 6 real-TCP scenarios against a running
+pathvectord — corrupted header (marker/length/type), truncated bytes during
+the OPEN exchange, and a malformed UPDATE (invalid ORIGIN) — with a GoBGP
+control peer proving the fault never wedges the rest of the daemon. This work
+found and fixed two real bugs, not just added tests around existing behavior:
+
+- **RFC 4271 §6.1 non-compliance**: a corrupted header (bad marker/length/type)
+  was silently dropping the connection instead of sending the RFC-mandated
+  NOTIFICATION first. Fixed in `pathvector-session/src/transport/mod.rs` — see
+  `pathvector-session/RFC.md`'s new §6.1 section.
+- **FSM bug: `HoldTimerExpired` never scheduled a reconnect.** In all three
+  states that handle it (OpenSent, OpenConfirm, Established), the
+  `HoldTimerExpired` output list omitted `StartConnectRetryTimer` — present in
+  the sibling `TcpFailed`/NOTIFICATION-received arms, but missing here. Since a
+  silent network partition (no TCP-level error, e.g. `docker network
+  disconnect`) is detected via hold-timer expiry rather than a socket error,
+  this left the session stuck in `Idle` forever with no further reconnect
+  attempt — requiring a full daemon restart or peer removal/re-add to recover.
+  Fixed in `pathvector-session/src/fsm/mod.rs`; existing
+  `test_hold_timer_expired_in_*` tests never asserted on the retry timer,
+  which is why this had gone unnoticed — all three now do.
+
+Backpressure/sustained-churn testing (the sibling item under "e2e / fault
+injection / chaos and backpressure tests" below) remains a separate, deferred
+item — different mechanism, different infra (ExaBGP-style replay), not
+blocked by anything.
 
 ---
 
@@ -850,10 +874,16 @@ applies here. A `bench/` crate (or a standalone binary) could:
 
 #### e2e / fault injection / chaos and backpressure tests
 
-- **Fault injection / chaos tests** — inject TCP resets mid-session, corrupt
-  bytes at the framing layer, and drop packets during the OPEN exchange; verify
-  the FSM recovers cleanly rather than wedging. Prerequisite: RFC 7606 error
-  handling so there is a defined response to malformed input.
+- **Fault injection / chaos tests** — shipped 2026-07-16 (see Tier 3 item 11
+  above): `pathvector-e2e/tests/fault_injection.rs` covers corrupted headers,
+  OPEN-exchange truncation, malformed UPDATE, and mid-session TCP reset, plus
+  two real bugs found and fixed along the way (RFC 4271 §6.1 NOTIFICATION,
+  hold-timer-expiry reconnect). Follow-ups deferred from that work:
+  - **No mapping for non-header `CodecError` variants** (`Truncated`,
+    `InvalidCapability`, `UnsupportedVersion`, etc. — reachable when an OPEN or
+    NOTIFICATION body itself fails to decode) to the RFC-precise
+    `NotificationError`; currently silently dropped. A larger audit-level task
+    since each needs its own correct subcode.
 - **Backpressure / sustained churn tests** — verify the channel-full stall
   detection and recovery under sustained route churn, not just a single crafted
   test case. Candidate scenario: ExaBGP replaying a partial MRT dump at high
