@@ -41,8 +41,9 @@ exhaustively) and blast radius, not by RFC number:
 2. **RFC 4724 (Graceful Restart)** — substantially complete. Was audited
    once before (see project history), but that pass predates this log and
    wasn't recorded clause-by-clause; this fresh pass found 3 new gaps.
-3. RFC 9234 (Route Leak Prevention/Roles) — newest substantial feature,
-   least battle-tested.
+3. **RFC 9234 (Route Leak Prevention/Roles)** — substantially complete.
+   Was the newest substantial feature going in; found 2 real gaps
+   alongside an otherwise well-built core leak-detection mechanism.
 4. RFC 7606 (revised UPDATE error handling) — directly adjacent to the
    §6.1 fix; worth confirming there's no similar gap between them.
 5. The already-flagged ⚠️ items in `RFC_REQUIREMENTS.md`: RFC 5492
@@ -509,6 +510,70 @@ its reconnection attempt silently rejected).
 
 ---
 
-*(Per the roadmap, next up: RFC 9234 (Route Leak Prevention/Roles), then
-RFC 7606, the already-flagged ⚠️ items, RPKI/BMP, then the encode-only
-RFCs.)*
+# RFC 9234 — Route Leak Prevention Using Roles in UPDATE and OPEN Messages
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc9234 (648 lines),
+read in full; cross-checked against `pathvector-session` (Role capability
+codec, `validate_open`), `pathvector-rib`/`pathvector-types` (OTC storage on
+`Route`), `pathvector-policy` (`OtcLeakCondition`, `OtcPropagationCondition`,
+`SetOtc`), and `pathvectord` (`install_otc_import_term`/`install_otc_export_term`
+wiring per session role).
+
+**Overall finding: the core OTC leak-detection/propagation logic is
+carefully and correctly built** — every ingress/egress rule in §5 was
+traced through the `session_role`-based wiring in `pathvectord/src/daemon/mod.rs`
+and matches the RFC's precise text, including the easy-to-get-backwards
+"session_role = our own role toward this peer" mapping (verified concretely
+for both directions before trusting it). Two real gaps found regardless,
+one of them security-relevant.
+
+## §4.1/§4.2 — BGP Role Capability and Role Correctness
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Role Capability: code 9, length 1, values 0-4 defined, 5-255 unassigned | Confirmed correct | `test_role_capability_roundtrip_all_defined_values`, `test_role_capability_unrecognized_value_decodes_as_unknown` (per `pathvector-session/RFC.md`) | Existing test suite |
+| We MUST NOT advertise multiple Role Capability instances ourselves | Confirmed correct | Our own `capabilities` list is built deterministically from config with at most one `Capability::Role` push — no code path could accidentally emit two | — |
+| Role-pair correctness: if both sides advertise, pair MUST be one of {Provider↔Customer, RS↔RS-Client, Peer↔Peer}, else MUST reject with Role Mismatch (code 2, subcode 11) | Confirmed correct | `validate_open` (`fsm/mod.rs:704-723`), `test_role_pair_matrix` (25 combinations) | Existing test suite |
+| Backward compatibility: Role sent but not received (or vice versa) is not a mismatch by default | Confirmed correct | `test_role_absent_on_peer_side_is_not_a_mismatch`, `test_role_absent_locally_is_not_a_mismatch` | Existing test suite |
+| Multiple **identical** Role Capabilities from peer ⇒ treat as one, proceed. Multiple Role Capabilities with **differing** values ⇒ MUST reject with Role Mismatch | **Confirmed gap** | `validate_open`'s peer-role extraction (`fsm/mod.rs:712-715`) is `peer.capabilities.iter().find_map(\|c\| match c { Capability::Role(r) => Some(*r), _ => None })` — takes the **first** `Capability::Role` instance and never looks at any subsequent ones. A peer sending two *different* Role values (e.g. `Role(Customer)` then `Role(Provider)`) would silently have only the first honored — the RFC-mandated detection-and-reject for conflicting duplicates never happens. **This is the exact same code shape as the RFC 4724 GR "first instance wins" bug found in the prior audit pass** (`peer.rs`'s GR capability `find_map`) — worth noting as a recurring pattern across this codebase: whenever a capability is theoretically singular but the wire format allows repetition, the natural `find_map`/`.iter().find(...)` idiom silently takes "whichever comes first" rather than validating uniqueness. A future pass auditing *other* capability types for the same shape (RFC 5492's capability negotiation in general) would be worthwhile. | A test with two `Capability::Role` entries carrying different values in one peer OPEN, asserting Role Mismatch NOTIFICATION rather than silent use of the first |
+| Strict mode (require peer to advertise Role) | Already correctly tracked as deferred | `pathvector-session/RFC.md` already documents this as an explicit, non-default, RFC-optional deferral — not re-litigated here | Already tracked |
+
+**§4.1/§4.2 summary:** 6 clauses reviewed — 5 confirmed correct, 1 confirmed
+gap (which directly echoes a pattern already found once in RFC 4724).
+
+## §5 — BGP Only to Customer (OTC) Attribute
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| OTC: optional transitive, type code 35, length 4 | Confirmed correct | `test_only_to_customer_roundtrip`, `test_only_to_customer_encodes_as_optional_transitive` (flags `0xC0` = optional+transitive) | Existing test suite |
+| Ingress rule 1: OTC present + received from a peer who is our Customer or RS-Client ⇒ leak, ineligible | Confirmed correct | `OtcLeakCondition::matches` (`pathvector-policy/src/otc.rs:46-54`): `(Role::Provider \| Role::RouteServer, Some(_)) => true` — "our role = Provider/RouteServer" means "the peer is our Customer/RS-Client," matching this rule exactly. Verified the role-mapping convention concretely (traced both directions) before trusting this, given how easy this exact kind of role-relative logic is to get backwards. | `OtcLeakCondition` unit tests |
+| Ingress rule 2: OTC present + received from a Peer + value ≠ peer's AS number ⇒ leak, ineligible | Confirmed correct | `(Role::Peer, Some(otc)) => otc != self.peer_asn` — matches exactly | Existing test suite |
+| Ingress rule 3: received from Provider/Peer/RS + OTC absent ⇒ MUST add OTC = remote AS | Confirmed correct | `install_otc_import_term` (`pathvectord/src/daemon/mod.rs:652-660`) installs `AnyCondition → SetOtc::new(peer_asn)` when `session_role` is `Customer\|Peer\|RsClient` (i.e. peer is our Provider/Peer/RS) — matches | Existing test suite |
+| Egress rule 1: advertising to Customer/Peer/RS-Client(-as-RS) + OTC absent ⇒ MUST add OTC = local AS | Confirmed correct | `install_otc_export_term` (`daemon/mod.rs:677-680`) installs the attach term when `session_role` is `Provider\|Peer\|RouteServer` (i.e. peer is our Customer/Peer/RS-Client) — matches | Existing test suite |
+| Egress rule 2: route already has OTC ⇒ MUST NOT be propagated to Providers/Peers/RSes | Confirmed correct | `install_otc_export_term` installs `OtcPropagationCondition → Reject` when `session_role` is `Customer\|Peer\|RsClient` (i.e. peer is our Provider/Peer/RS) — matches | Existing test suite |
+| Once OTC is set, MUST be preserved unchanged | Confirmed correct | `SetOtc`'s doc comment and implementation are explicitly idempotent — "never overwrites an existing OTC value" | — |
+| **Malformed OTC (length ≠ 4) SHALL be handled using treat-as-withdraw [RFC 7606]** | **Confirmed gap — security-relevant** | `rfc7606_policy()` (`pathvector-session/src/message/update.rs:60-71`) explicitly lists `ATTR_ORIGIN \| ATTR_AS_PATH \| ATTR_NEXT_HOP \| ATTR_LOCAL_PREF` and `ATTR_MP_REACH_NLRI` as `TreatAsWithdraw`; everything else — including `ATTR_ONLY_TO_CUSTOMER` — falls into the catch-all `_ => AttributeErrorPolicy::AttributeDiscard`. `AttributeDiscard` means "silently drop the malformed attribute; the UPDATE and route are otherwise processed normally" — i.e. a route with a malformed-length OTC is **accepted as if OTC had never been present at all**, rather than the whole route being withdrawn as the RFC requires. **Why this matters beyond strict-compliance pedantry:** OTC is the entire mechanism this RFC uses to detect and prevent route leaks. If a route that *should* carry OTC (and would be caught by `OtcLeakCondition` as a leak) instead arrives with a deliberately-malformed-length OTC, this implementation's current behavior discards the corrupt attribute and evaluates the route as if it had no OTC at all — bypassing the leak check entirely. This is a plausible, low-effort evasion path around the leak-detection guarantee the RFC exists to provide, not just a spec-conformance nitpick. The existing `pathvector-session/RFC.md` row previously claimed this behavior was ✅-correct (citing the `ATTRIBUTE_DISCARD_CASES` table) — corrected to ❌ as part of this pass. | A test constructing an UPDATE with a malformed-length (e.g. 3-byte) OTC attribute, asserting `AttributeErrorPolicy::TreatAsWithdraw` (route treated as withdrawn) rather than `AttributeDiscard` — then add `ATTR_ONLY_TO_CUSTOMER` to `rfc7606_policy()`'s `TreatAsWithdraw` arm alongside the other well-known/critical attributes. |
+| OTC procedures apply only to AFI=1/2, SAFI=1 (IPv4/IPv6 unicast); MUST NOT apply to other address families by default; operator MUST NOT be able to reconfigure these procedures | Confirmed correct | This project only supports IPv4/IPv6 unicast at all (no other AFI/SAFI implemented), so the scope restriction is trivially satisfied by the project's own architecture. Grepped for any OTC-related config toggle (mirroring RPKI's `reject_invalid` toggle) — none exists; OTC enforcement is unconditionally wired based on configured `Role`, matching "operator MUST NOT have the ability to modify" | — |
+| AS-Confederation-aware OTC handling | Already correctly tracked as deferred | RFC itself says NOT RECOMMENDED between confederation members; `pathvector-session/RFC.md` already notes this matches the project's existing confederation scope boundary | Already tracked |
+
+**§5 summary:** 9 clauses reviewed — 8 confirmed correct, 1 confirmed gap
+(security-relevant).
+
+### RFC 9234 running total
+
+15 clauses reviewed — 13 confirmed correct, 2 confirmed gaps. **RFC 9234
+audit considered complete.** The core leak-detection/propagation mechanism
+(§5's six ingress/egress rules) is genuinely well-built and matches the RFC
+precisely — a good example of this audit confirming quality rather than
+just finding defects. The 2 gaps: malformed-OTC handling uses the wrong
+RFC 7606 policy (security-relevant — a leak-detection evasion path), and
+peer-side duplicate/conflicting Role Capabilities aren't detected (same
+code shape as the earlier RFC 4724 finding — a pattern worth a dedicated
+look across other capability types someday). Both filed in `TODO.md` (#18),
+neither fixed as part of this diagnostic pass.
+
+---
+
+*(Per the roadmap, next up: RFC 7606 (revised UPDATE error handling), then
+the already-flagged ⚠️ items, RPKI/BMP, then the encode-only RFCs.)*

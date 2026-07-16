@@ -396,6 +396,36 @@ areas the existing test suite never covered:
   likelihood). `peer.rs:383-402`'s `find_map` takes the first non-zero
   instance instead. See `RFC_AUDIT.md`'s RFC 4724 §3 section.
 
+**18. RFC 9234 (Route Leak Prevention/Roles) gaps found by systematic
+clause audit** — found 2026-07-16 (diagnostic only, not fixed here). The
+core OTC leak-detection/propagation logic itself (§5's six ingress/egress
+rules) is well-built and matches the RFC precisely — these 2 gaps are
+narrower:
+
+- **Security-relevant — malformed-length OTC uses the wrong RFC 7606
+  policy.** §5 explicitly requires "treat-as-withdraw" for an OTC attribute
+  with length ≠ 4. `rfc7606_policy()` (`pathvector-session/src/message/update.rs:60-71`)
+  doesn't special-case `ATTR_ONLY_TO_CUSTOMER`, so it falls into the
+  generic `AttributeDiscard` arm — the malformed attribute is silently
+  dropped and the route is otherwise accepted normally, as if OTC had
+  never been present. Since OTC is the entire mechanism this RFC uses to
+  detect leaks, this is a plausible evasion path: a route that should be
+  caught by `OtcLeakCondition` could instead pass through untagged if its
+  OTC attribute is deliberately malformed, rather than the whole route
+  being withdrawn as the RFC requires. See `RFC_AUDIT.md`'s RFC 9234 §5
+  section. Fix: add `ATTR_ONLY_TO_CUSTOMER` to `rfc7606_policy()`'s
+  `TreatAsWithdraw` arm.
+- **Peer-side duplicate/conflicting Role Capabilities aren't detected.**
+  §4.2 requires rejecting the connection (Role Mismatch) if a peer sends
+  2+ Role Capabilities with *differing* values (identical duplicates are
+  fine). `validate_open`'s peer-role extraction (`pathvector-session/src/fsm/mod.rs:712-715`)
+  takes only the first `Capability::Role` instance via `find_map` and
+  never inspects subsequent ones — the exact same code shape as the RFC
+  4724 GR "first instance wins" bug (TODO #17) found in the prior audit
+  pass. Worth a dedicated look at whether other capability types (RFC
+  5492 in general) have the same recurring pattern. See `RFC_AUDIT.md`'s
+  RFC 9234 §4.2 section.
+
 ---
 
 ## General
