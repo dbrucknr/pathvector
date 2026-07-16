@@ -878,7 +878,7 @@ pub(super) struct UpdateResult {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn handle_update(
     peer: PeerId,
-    msg: UpdateMessage,
+    mut msg: UpdateMessage,
     adj_rib_in: &mut AdjRibIn<Ipv4Addr>,
     loc_rib: &mut LocRib<Ipv4Addr>,
     adj_rib_in_v6: &mut AdjRibIn<Ipv6Addr>,
@@ -1008,11 +1008,17 @@ pub(super) fn handle_update(
         }
     }
 
-    // ── RFC 4271 §6.3: mandatory well-known attribute check ───────────────
-    // When the UPDATE carries announcements, ORIGIN and AS_PATH MUST be present.
-    // For conventional IPv4 NLRI, NEXT_HOP is also mandatory.
-    // Violation → send NOTIFICATION (UpdateMessage/MissingWellKnownAttribute) and
-    // tear down the session. Withdraw-only UPDATEs are exempt.
+    // ── RFC 7606 §3(d): missing well-known mandatory attribute ────────────
+    // "If any of the well-known mandatory attributes are not present in an
+    // UPDATE message, then 'treat-as-withdraw' MUST be used." This revises
+    // RFC 4271 §6.3, which specified a NOTIFICATION/session reset here.
+    //
+    // Treat-as-withdraw (RFC 7606 §2): "the UPDATE message... MUST be
+    // treated as though all contained routes had been withdrawn just as if
+    // they had been listed in the WITHDRAWN ROUTES field... thus causing
+    // them to be removed from the Adj-RIB-In" — so any prefix this UPDATE
+    // would have announced is actively withdrawn (not merely left
+    // un-inserted), and the session stays up with no NOTIFICATION sent.
     let has_v4_announces = !msg.announced.is_empty() || !mp_v4_announced.is_empty();
     let has_any_announces = has_v4_announces || !mp_v6_announced.is_empty();
     if has_any_announces {
@@ -1030,23 +1036,39 @@ pub(super) fn handle_update(
             tracing::warn!(
                 peer = %peer,
                 attr_type,
-                "mandatory well-known attribute missing (RFC 4271 §6.3) — sending NOTIFICATION"
+                "mandatory well-known attribute missing (RFC 7606 §3(d)) — treat-as-withdraw"
             );
-            // RFC 4271 §6.3: data field MUST contain the type code of the missing attribute.
-            return UpdateResult {
-                fib_changes,
-                fib_changes_v6,
-                notification: Some(NotificationMessage {
-                    error: NotificationError::UpdateMessage(
-                        UpdateMsgError::MissingWellKnownAttribute,
-                    ),
-                    data: vec![attr_type],
-                }),
-                blackhole_announced_v4,
-                blackhole_announced_v6,
-                blackhole_withdrawn_v4,
-                blackhole_withdrawn_v6,
-            };
+            let treat_as_withdraw_v4: Vec<Nlri<Ipv4Addr>> = msg
+                .announced
+                .drain(..)
+                .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
+                .collect();
+            for nlri in treat_as_withdraw_v4 {
+                if adj_rib_in.get(&nlri).is_some_and(|r| {
+                    r.rare_or_default()
+                        .communities
+                        .iter()
+                        .any(|c| c.is_blackhole())
+                }) {
+                    blackhole_withdrawn_v4.push(nlri);
+                }
+                adj_rib_in.withdraw(&nlri);
+                fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
+            }
+            let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
+                mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
+            for nlri in treat_as_withdraw_v6 {
+                if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
+                    r.rare_or_default()
+                        .communities
+                        .iter()
+                        .any(|c| c.is_blackhole())
+                }) {
+                    blackhole_withdrawn_v6.push(nlri);
+                }
+                adj_rib_in_v6.withdraw(&nlri);
+                fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+            }
         }
     }
 
