@@ -8855,6 +8855,84 @@ mod tests {
         );
     }
 
+    /// The fix's treat-as-withdraw block drains `mp_v6_announced` alongside
+    /// the traditional-NLRI/`mp_v4_announced` paths (`route.rs`'s
+    /// `treat_as_withdraw_v6`), but every other test for this fix — unit and
+    /// e2e — exercises only the IPv4 traditional-NLRI path. This is the same
+    /// scenario as `missing_origin_withdraws_preexisting_route_for_same_prefix`
+    /// above, but via `MpReachNlri`/IPv6, using the full `DaemonState` (not
+    /// `handle_update` directly) so `on_established`'s MultiProtocol
+    /// capability wiring is exercised too.
+    #[test]
+    fn missing_origin_withdraws_preexisting_v6_route_for_same_prefix() {
+        use pathvector_session::message::{MpReachNlri, Prefix};
+        use pathvector_types::{AfiSafi, NextHop};
+
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let (mut state, _rx) = make_state(65001, &[(peer_ip, 65002)]);
+        Arc::make_mut(&mut state.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+        state.on_established(
+            peer_ip,
+            must_v4(peer_ip),
+            PeerType::External,
+            65002,
+            90,
+            &[Capability::MultiProtocol(AfiSafi::IPV6_UNICAST)],
+            None,
+        );
+
+        let n: Nlri<Ipv6Addr> = "2001:db8:beef::/48".parse().unwrap();
+        let mp_reach = |include_origin: bool| {
+            let mut attributes = vec![PathAttribute::AsPath(AsPath::from_sequence(vec![
+                Asn::new(65002),
+            ]))];
+            if include_origin {
+                attributes.insert(0, PathAttribute::Origin(Origin::Igp));
+            }
+            attributes.push(PathAttribute::MpReachNlri(MpReachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                next_hop: NextHop::V6("2001:db8::2".parse().unwrap()),
+                prefixes: vec![Prefix::V6(n)],
+            }));
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes,
+                announced: vec![],
+            }
+        };
+
+        // First, a well-formed UPDATE installs a v6 route for the prefix.
+        state.on_route_update(peer_ip, mp_reach(true));
+        assert!(
+            state.rib.loc_rib_v6.best(&n).is_some(),
+            "sanity check: v6 route must be installed by the well-formed UPDATE"
+        );
+
+        // Now a malformed UPDATE (missing ORIGIN) for the same v6 prefix.
+        let result = state.on_route_update(peer_ip, mp_reach(false));
+
+        assert!(
+            result.is_none(),
+            "RFC 7606 §3(d): missing ORIGIN on the MP_REACH_NLRI/IPv6 path \
+             must be treat-as-withdraw, not a NOTIFICATION"
+        );
+        assert!(
+            state.rib.loc_rib_v6.best(&n).is_none(),
+            "RFC 7606 §2: the previously-installed v6 route must be removed \
+             from LocRib_v6 when a later UPDATE for it is missing a \
+             mandatory attribute"
+        );
+        assert!(
+            state
+                .adj_ribs_in_v6
+                .get(&peer_ip)
+                .expect("adj_ribs_in_v6 entry for peer")
+                .get(&n)
+                .is_none(),
+            "RFC 7606 §2: the v6 route must also be removed from Adj-RIB-In"
+        );
+    }
+
     #[test]
     fn withdraw_only_update_no_notification_for_missing_attrs() {
         // Withdraw-only UPDATEs are exempt from mandatory attribute checks.
