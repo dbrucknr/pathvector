@@ -22,7 +22,7 @@ use pathvector_session::{
     message::{
         Capability, CeaseError, GracefulRestartFamily, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri,
         MpUnreachNlri, NotificationError, NotificationMessage, PathAttribute, Prefix,
-        UpdateMessage, UpdateMsgError, encode_shutdown_message,
+        UpdateMessage, encode_shutdown_message,
     },
     transport::{
         self, DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent,
@@ -1218,8 +1218,13 @@ pub(crate) async fn run_event_loop(
                         let notify_err = s.on_route_update(peer_ip, msg);
                         let adj_in = s.rib.prefixes_received.get(&peer_ip).copied().unwrap_or(0);
                         crate::metrics::on_route_update(peer_ip, adj_in);
-                        // RFC 4271 §6.3: mandatory attribute violation — send
-                        // specific NOTIFICATION before tearing down the session.
+                        // handle_update returns Some(NotificationMessage) only for
+                        // conditions RFC 7606 still classifies as session-reset-worthy
+                        // (e.g. duplicate MP_REACH/MP_UNREACH_NLRI — Malformed Attribute
+                        // List). A missing well-known mandatory attribute is no longer
+                        // one of them: RFC 7606 §3(d) requires treat-as-withdraw instead,
+                        // so handle_update now returns None for that case and this arm
+                        // simply never fires for it.
                         if let Some(err) = notify_err {
                             // Flush pending decisions for other peers before
                             // tearing this one down so they don't starve.
@@ -1302,10 +1307,11 @@ pub(crate) async fn run_event_loop(
                             }
                         }
                         SessionEvent::RouteUpdate(msg) => {
-                            // RFC 4271 §6.3: mandatory-attribute error
-                            // detected during drain — flush other peers'
-                            // decisions then send NOTIFICATION before
-                            // tearing down this session.
+                            // See the primary RouteUpdate arm above: this only
+                            // fires for the session-reset-worthy conditions RFC
+                            // 7606 still calls for (not a missing mandatory
+                            // attribute, which is now treat-as-withdraw and
+                            // returns None here).
                             if let Some(err) = s.on_route_update(extra_ip, msg) {
                                 s.flush_pending();
                                 let notify_stalled = s.take_stalled_peers();
@@ -8678,11 +8684,14 @@ mod tests {
         assert_eq!(state.rib.loc_rib.len(), 1);
     }
 
-    // ── RFC 4271 §6.3 mandatory attribute NOTIFICATION ───────────────────────
+    // ── RFC 7606 §3(d): missing well-known mandatory attribute ───────────────
     //
-    // handle_update must return Some(NotificationMessage) with the correct
-    // 1-byte type code in `data` when a mandatory attribute is absent from
-    // an UPDATE that carries announcements.
+    // RFC 7606 §3(d): "If any of the well-known mandatory attributes are not
+    // present in an UPDATE message, then 'treat-as-withdraw' MUST be used."
+    // This revises RFC 4271 §6.3's session-reset behavior — handle_update
+    // must NOT return a NOTIFICATION for this case, and any route the
+    // malformed UPDATE would have announced must be removed from Adj-RIB-In/
+    // LocRib exactly as if it had been explicitly withdrawn (RFC 7606 §2).
 
     fn handle_update_get_notification(msg: UpdateMessage) -> Option<NotificationMessage> {
         let p = peer();
@@ -8713,7 +8722,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_origin_returns_notification_data_type_code_1() {
+    fn missing_origin_treated_as_withdraw_no_notification() {
         let n = handle_update_get_notification(UpdateMessage {
             withdrawn: vec![],
             attributes: vec![
@@ -8722,23 +8731,14 @@ mod tests {
             ],
             announced: vec![nlri("10.0.0.0/8")],
         });
-        let msg = n.expect("NOTIFICATION must be returned when ORIGIN is absent");
         assert!(
-            matches!(
-                msg.error,
-                NotificationError::UpdateMessage(UpdateMsgError::MissingWellKnownAttribute)
-            ),
-            "error must be UpdateMessage/MissingWellKnownAttribute"
-        );
-        assert_eq!(
-            msg.data,
-            vec![1u8],
-            "data must contain ORIGIN type code (1)"
+            n.is_none(),
+            "RFC 7606 §3(d): missing ORIGIN must be treat-as-withdraw, not a NOTIFICATION"
         );
     }
 
     #[test]
-    fn missing_as_path_returns_notification_data_type_code_2() {
+    fn missing_as_path_treated_as_withdraw_no_notification() {
         let n = handle_update_get_notification(UpdateMessage {
             withdrawn: vec![],
             attributes: vec![
@@ -8747,16 +8747,14 @@ mod tests {
             ],
             announced: vec![nlri("10.0.0.0/8")],
         });
-        let msg = n.expect("NOTIFICATION must be returned when AS_PATH is absent");
-        assert_eq!(
-            msg.data,
-            vec![2u8],
-            "data must contain AS_PATH type code (2)"
+        assert!(
+            n.is_none(),
+            "RFC 7606 §3(d): missing AS_PATH must be treat-as-withdraw, not a NOTIFICATION"
         );
     }
 
     #[test]
-    fn missing_next_hop_for_traditional_ipv4_returns_notification_data_type_code_3() {
+    fn missing_next_hop_for_traditional_ipv4_treated_as_withdraw_no_notification() {
         let n = handle_update_get_notification(UpdateMessage {
             withdrawn: vec![],
             attributes: vec![
@@ -8766,11 +8764,94 @@ mod tests {
             ],
             announced: vec![nlri("10.0.0.0/8")],
         });
-        let msg = n.expect("NOTIFICATION must be returned when NEXT_HOP is absent");
-        assert_eq!(
-            msg.data,
-            vec![3u8],
-            "data must contain NEXT_HOP type code (3)"
+        assert!(
+            n.is_none(),
+            "RFC 7606 §3(d): missing NEXT_HOP must be treat-as-withdraw, not a NOTIFICATION"
+        );
+    }
+
+    /// RFC 7606 §2: "treat-as-withdraw"... "MUST be treated as though all
+    /// contained routes had been withdrawn... thus causing them to be
+    /// removed from the Adj-RIB-In" — this is the test that actually
+    /// distinguishes treat-as-withdraw from mere "attribute discard"/ignore:
+    /// a pre-existing route for the same prefix must be removed, not left
+    /// in place, when a later UPDATE for it arrives missing ORIGIN.
+    #[test]
+    fn missing_origin_withdraws_preexisting_route_for_same_prefix() {
+        let p = peer();
+        let mut ari = AdjRibIn::new(p);
+        let mut rib = LocRib::new();
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy = accept_all();
+        let policy_v6: Policy<Route<Ipv6Addr>> =
+            Policy::new(pathvector_policy::DefaultAction::Accept);
+        let n = nlri("10.0.0.0/8");
+
+        // First, a well-formed UPDATE installs a route for the prefix.
+        handle_update(
+            p,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![n],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &policy,
+            &policy_v6,
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65001,
+            None,
+            None,
+        );
+        assert!(
+            rib.best(&n).is_some(),
+            "sanity check: route must be installed by the well-formed UPDATE"
+        );
+
+        // Now a malformed UPDATE (missing ORIGIN) for the same prefix arrives.
+        let result = handle_update(
+            p,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![n],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &policy,
+            &policy_v6,
+            PeerType::External,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65001,
+            None,
+            None,
+        );
+
+        assert!(result.notification.is_none());
+        assert!(
+            rib.best(&n).is_none(),
+            "RFC 7606 §2: the previously-installed route must be removed from \
+             LocRib when a later UPDATE for it is missing a mandatory attribute"
+        );
+        assert!(
+            ari.get(&n).is_none(),
+            "RFC 7606 §2: the route must also be removed from Adj-RIB-In"
         );
     }
 
@@ -10602,8 +10683,9 @@ mod stall_tests {
 /// `flush_mrai_pending` or MRAI-released routes stay buffered.
 ///
 /// **Bug 3 (regression)** — mandatory-attribute errors in the `try_recv` drain
-/// loop must send a NOTIFICATION and skip to the next outer iteration, not be
-/// silently swallowed.
+/// loop must be treated as withdraw (RFC 7606 §2) for the erroring peer's own
+/// prefix and skip to the next outer iteration, not silently corrupt or block
+/// the rest of the batch.
 ///
 /// **Effectiveness** — two `on_route_update` calls with the same attribute set
 /// must produce fewer outbound `UpdateMessage`s than prefixes announced.
@@ -10993,20 +11075,22 @@ mod coalescing_tests {
         );
     }
 
-    // ── Bug 3 regression: notify_err in drain loop ────────────────────────────
+    // ── Bug 3 regression: missing-mandatory-attribute in drain loop ──────────
 
-    /// A mandatory-attribute error detected during the `try_recv` drain loop
-    /// must send a `SessionCommand::Notification` to the erroring peer.
-    /// Regression: before the fix, the error was silently dropped.
+    /// RFC 7606 §3(d): a mandatory-attribute error detected during the
+    /// `try_recv` drain loop must be treated as withdraw (RFC 7606 §2) for
+    /// the erroring peer's own prefix, without blocking the rest of the
+    /// batch — peer_a's valid update in the same drain batch must still be
+    /// processed, and peer_b must receive no `SessionCommand` (no
+    /// NOTIFICATION; the session stays up). Regression: an earlier version
+    /// of this code path silently dropped the malformed message without
+    /// continuing to the next iteration of the drain loop.
     ///
     /// This test drives `run_event_loop` directly and injects two events:
     /// 1. A valid RouteUpdate from peer_a (fills the drain loop).
-    /// 2. A malformed RouteUpdate from peer_b (missing Origin — triggers RFC 4271 §6.3).
-    ///
-    /// The stop sender for peer_b must receive a `SessionCommand::Notification`.
+    /// 2. A malformed RouteUpdate from peer_b (missing Origin — RFC 7606 §3(d)).
     #[tokio::test]
-    async fn regression_notify_err_in_drain_loop_sends_notification() {
-        use pathvector_session::message::NotificationError;
+    async fn regression_missing_mandatory_attr_in_drain_loop_treated_as_withdraw() {
         use tokio::sync::mpsc;
 
         let peer_a: Ipv4Addr = "10.0.0.2".parse().unwrap();
@@ -11146,18 +11230,37 @@ mod coalescing_tests {
             tokio::task::yield_now().await;
         }
 
-        // peer_b must have received a Notification (or Stop from stall handling).
-        // We accept either: the key invariant is that the error was NOT silently dropped.
-        let cmd = stop_b_rx
-            .try_recv()
-            .expect("peer_b must receive SessionCommand after malformed UPDATE in drain loop");
+        // peer_a's valid update in the same drain batch must still have been
+        // processed — proving the malformed message on peer_b didn't block
+        // or abort the rest of the batch.
         assert!(
-            matches!(
-                cmd,
-                SessionCommand::Notification(ref n)
-                    if matches!(n.error, NotificationError::UpdateMessage(_))
-            ) || matches!(cmd, SessionCommand::Stop),
-            "peer_b must receive a Notification or Stop command, not silence"
+            state
+                .read()
+                .await
+                .rib
+                .loc_rib
+                .best(&nlri("10.0.0.0/8"))
+                .is_some(),
+            "peer_a's valid update in the same drain batch must still be processed"
+        );
+
+        // RFC 7606 §2: peer_b's malformed announcement must not be installed.
+        assert!(
+            state
+                .read()
+                .await
+                .rib
+                .loc_rib
+                .best(&nlri("172.16.0.0/12"))
+                .is_none(),
+            "prefix from an UPDATE missing a mandatory attribute must not be installed"
+        );
+
+        // RFC 7606 §3(d): treat-as-withdraw keeps the session up — peer_b
+        // must receive no SessionCommand at all (in particular, no NOTIFICATION).
+        assert!(
+            stop_b_rx.try_recv().is_err(),
+            "peer_b must receive no SessionCommand after a treat-as-withdraw UPDATE"
         );
 
         // Shut down the loop.
@@ -14413,20 +14516,22 @@ mod run_with_tests {
         })
     }
 
-    /// A malformed UPDATE (missing ORIGIN) sent through the full event loop must
-    /// result in a SessionCommand::Notification on the peer's stop channel with:
-    ///  - error = UpdateMessage(MissingWellKnownAttribute)
-    ///  - data  = [1]  (ORIGIN type code, RFC 4271 §6.3)
+    /// RFC 7606 §3(d): "If any of the well-known mandatory attributes are
+    /// not present in an UPDATE message, then 'treat-as-withdraw' MUST be
+    /// used." A malformed UPDATE (missing ORIGIN) sent through the full
+    /// event loop must NOT result in a SessionCommand on the peer's stop
+    /// channel (no NOTIFICATION, session stays up), and the announced
+    /// prefix must not be installed in LocRib.
     #[tokio::test]
-    async fn malformed_update_missing_origin_sends_notification_to_session() {
-        use pathvector_session::message::{NotificationError, PathAttribute, UpdateMsgError};
-        use pathvector_session::transport::SessionCommand;
+    async fn malformed_update_missing_origin_no_notification_route_not_installed() {
+        use pathvector_session::message::PathAttribute;
         use pathvector_types::{AsPath, Asn};
 
         let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
         let (spawn_fn, peers) = make_mock_spawn_capturing_stop();
         let cfg = make_config(&[(IpAddr::V4(peer_ip), 65002)]);
         let (state, event_rx, _event_tx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
+        let state_check = Arc::clone(&state);
 
         // Run the event loop in the background; inject events via the mock peer.
         tokio::spawn(run_event_loop(event_rx, state, stop_senders, None));
@@ -14434,7 +14539,7 @@ mod run_with_tests {
         // Allow the spawned task to start.
         tokio::task::yield_now().await;
 
-        let (event_tx, stop_rx, _update_rx) = {
+        let (event_tx, mut stop_rx, _update_rx) = {
             let mut guard = peers.lock().unwrap();
             let p = guard.pop().expect("one peer spawned");
             (p.event_tx, p.stop_rx, p.update_rx)
@@ -14447,6 +14552,8 @@ mod run_with_tests {
             .unwrap();
         tokio::task::yield_now().await;
 
+        let n: pathvector_types::Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+
         // Send a malformed UPDATE: announced NLRI but ORIGIN is absent.
         event_tx
             .send(SessionEvent::RouteUpdate(UpdateMessage {
@@ -14456,38 +14563,28 @@ mod run_with_tests {
                     PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                     // No Origin!
                 ],
-                announced: vec!["10.0.0.0/8".parse().unwrap()],
+                announced: vec![n],
             }))
             .await
             .unwrap();
+        tokio::task::yield_now().await;
 
-        // The event loop must send a Notification command to the session.
-        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-            let mut stop_rx = stop_rx;
-            stop_rx.recv().await
-        })
-        .await
-        .expect("timed out waiting for SessionCommand")
-        .expect("stop channel closed without sending Notification");
+        // No SessionCommand (in particular, no Notification) must be sent —
+        // treat-as-withdraw keeps the session up, unlike the pre-fix
+        // session-reset behavior this test used to assert.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stop_rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "expected no SessionCommand after a treat-as-withdraw UPDATE, got {result:?}"
+        );
 
-        match cmd {
-            SessionCommand::Notification(msg) => {
-                assert!(
-                    matches!(
-                        msg.error,
-                        NotificationError::UpdateMessage(UpdateMsgError::MissingWellKnownAttribute)
-                    ),
-                    "error must be UpdateMessage/MissingWellKnownAttribute, got {:?}",
-                    msg.error
-                );
-                assert_eq!(
-                    msg.data,
-                    vec![1u8],
-                    "data must be [1] (ORIGIN type code per RFC 4271 §6.3)"
-                );
-            }
-            other => panic!("expected Notification, got {other:?}"),
-        }
+        // The malformed announcement must not have installed a route.
+        assert!(
+            state_check.read().await.rib.loc_rib.best(&n).is_none(),
+            "RFC 7606 §2: prefix from an UPDATE missing a mandatory attribute \
+             must not be installed in LocRib"
+        );
     }
 
     // ── Reconnect capability refresh ──────────────────────────────────────────
