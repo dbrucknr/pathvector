@@ -51,7 +51,7 @@ deferred.
 | Announcement allowed after MRAI window elapses | `src/daemon.rs` | ✅ | `mrai_passes_after_window_elapsed` |
 | Suppressed NLRIs tracked in `mrai_pending`; flushed by half-MRAI timer | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending`, `has_mrai_pending_true_when_set_nonempty` |
 | Per-NLRI readiness: only NLRIs whose individual window elapsed are flushed | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending` |
-| Withdrawals bypass MRAI (RFC 4271 §9.2.1.1 explicit exemption) | `src/daemon.rs` | ✅ | `mrai_withdrawal_bypasses_suppression` |
+| Withdrawals bypass MRAI | `src/daemon.rs` | ⚠️ | `mrai_withdrawal_bypasses_suppression` — **citation corrected 2026-07-16 by `RFC_AUDIT.md` §9.2.1.1: there is no "explicit exemption" for withdrawals in the actual RFC 4271 §9.2.1.1 text.** It says the opposite — "Two UPDATE messages... that advertise feasible routes **and/or withdrawal of unfeasible routes**... MUST be separated by at least MinRouteAdvertisementIntervalTimer." The behavior itself (send withdrawals immediately, unthrottled) is common, defensible real-world practice — delaying a withdrawal keeps a stale/blackholed route alive longer, a real safety cost — but it is not what the RFC's literal text says, and the previous ✅/"explicit exemption" framing overstated the RFC basis for this design choice. See `RFC_AUDIT.md` §9.2.1.1. |
 | iBGP MRAI (SHOULD ≥5 s per RFC 4271 §9.2.1.1) | — | ❌ | — |
 
 **Deferred:** iBGP MRAI. The RFC says SHOULD ≥5 s for iBGP; current implementation applies

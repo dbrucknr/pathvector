@@ -330,6 +330,32 @@ given its severity):
   connect race against GoBGP/BIRD/FRR to prove real-world interop, not
   just a unit-level fix.
 
+**16. RFC 4271 §9 gaps found by systematic clause audit** — found
+2026-07-16, same `RFC_AUDIT.md` pass as #12-#15 (diagnostic only, not fixed
+here):
+
+- **Best-path tie-break steps (f) and (g) are conflated.** §9.1.2.2's final
+  two tie-break criteria are (f) lowest BGP Identifier and (g) lowest peer
+  address — two *distinct* values that aren't always ordered the same way
+  (a router's BGP Identifier is commonly a loopback address unrelated to
+  its session/peer IP). `best_path.rs`'s "Step 10" (`best_path.rs:232-233`)
+  compares peer IP address only, skipping (f) entirely. Only matters on a
+  genuine full tie through IGP metric/route age, which is rare, but is a
+  real, demonstrable divergence from RFC 4271's literal algorithm when a
+  route's BGP-Identifier ordering and peer-IP ordering disagree. See
+  `RFC_AUDIT.md` §9.1.2 for the full worked example.
+- **(Documentation correction, not necessarily a code bug)** `pathvectord/RFC.md`
+  claimed withdrawals bypass MRAI per an "RFC 4271 §9.2.1.1 explicit
+  exemption" — there is no such exemption in the actual RFC text, which
+  says MRAI applies to "advertisement **and/or withdrawal**." The
+  underlying design choice (send withdrawals immediately, unthrottled) may
+  still be the right call for operational-safety reasons (a delayed
+  withdrawal keeps a stale route reachable longer), but the doc's citation
+  was simply wrong and has been corrected to stop claiming textual RFC
+  support it doesn't have. See `RFC_AUDIT.md` §9.2 — this needs a judgment
+  call (find real justification, or reconsider the exemption), not a
+  reflexive fix.
+
 ---
 
 ## General

@@ -268,8 +268,123 @@ collision BGP-ID comparison (§6.8) and the un-ignored eBGP LOCAL_PREF (§5.1.5)
 
 ---
 
-*(Sections §1–3 and §8–§10 not yet covered by this audit pass — §8's
-connection-collision-coordination sub-topic is already covered above under
-§6.8, so what remains of §8 is the FSM state-transition table itself, largely
-already battle-tested via the earlier fault-injection work; §9 (decision
-process/update-send/MRAI) and §10 (timers) are next per the roadmap.)*
+## §8 — BGP Finite State Machine
+
+**Scope this pass:** §8.1 (events — mostly optional/discretionary features,
+scanned rather than exhaustively derived) and a targeted check of `on_idle`,
+`on_connect`, `on_active` (the three states this audit hadn't yet looked at
+directly — `on_open_sent`/`on_open_confirm`/`on_established` were already
+covered by the fault-injection-testing work and the collision-detection deep
+dive above). The full ~1200-line §8.2.2 per-state event table was not
+re-derived clause-by-clause this pass — see the honesty note at the end of
+this section.
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| §8.1.2: only Event 1 (ManualStart) and Event 2 (ManualStop) are mandatory administrative events; Events 3-8 (Automatic* variants tied to DampPeerOscillations/IdleHoldTime/etc.) are all optional | Confirmed correct — scope choice, not a gap | This implementation has `ManualStart`/`ManualStop` and doesn't implement automatic start/stop, peer-oscillation damping, or delay-open — all legitimately optional per the RFC's own text, same category of deliberate scope choice as third-party NEXT_HOP (§5) and multi-version negotiation (§7) | — |
+| §8.1.3/8.1.4: mandatory timer/TCP events (ConnectRetryTimer_Expires, HoldTimer_Expires, KeepaliveTimer_Expires, TCP success, TcpConnectionFails) vs. optional ones tied to TrackTcpState/DelayOpen | Confirmed correct | All mandatory timer/TCP events have direct `FsmInput` equivalents (`ConnectRetryTimerExpired`, `HoldTimerExpired`, `KeepaliveTimerExpired`, `TcpConnected`, `TcpFailed`) already extensively tested; optional ones (DelayOpenTimer, granular TCP-state tracking) aren't modeled, consistent with not implementing DelayOpen | — |
+| `on_idle`: only `ManualStart`/`ConnectRetryTimerExpired` transition out (to Connect); everything else ignored | Confirmed correct | `fsm/mod.rs:245-256` — the `ConnectRetryTimerExpired` arm here is what makes the earlier `HoldTimerExpired` fix (fault-injection-testing work) actually complete a reconnect cycle: without `on_idle` handling this input, arming the retry timer on hold-timeout would be a no-op. Already proven end-to-end by `mid_session_tcp_reset_recovers_cleanly` (e2e). | — |
+| `on_connect`: TCP success → OpenSent; TCP failure → Active + restart ConnectRetryTimer; ConnectRetryTimer_Expires → re-initiate + restart timer; ManualStop → clean stop | Confirmed correct | `fsm/mod.rs:258-272` — matches the RFC's Connect-state behavior structurally | — |
+| `on_active`: TCP success → proceed; ConnectRetryTimer_Expires → back to Connect + re-initiate; ManualStop → clean stop | Confirmed correct | `fsm/mod.rs:274-287` | — |
+
+**Honesty note:** this pass did not re-derive the full §8.2.2 per-state event
+table (all 6 states × ~10 applicable events each) clause-by-clause against
+the RFC prose — that table is enormous (~1200 lines) and this codebase's
+core state-transition behavior (Idle→Connect→OpenSent→OpenConfirm→
+Established, hold/keepalive timers, NOTIFICATION-before-close) has already
+been extensively exercised by the fault-injection-testing work (which found
+and fixed the `HoldTimerExpired`/`ConnectRetryTimer` bug) and by this pass's
+own collision-detection deep dive (§6.8). Marking the remaining untouched
+corners "confirmed correct" without actually re-deriving them would defeat
+the point of this audit — they're left as an open item for a future pass
+rather than assumed.
+
+**§8 summary:** 5 clauses reviewed, all confirmed correct — plus the §6.8
+collision-detection findings (2 confirmed gaps) already logged above under
+§6.8, which this section doesn't re-count.
+
+## §9.1 — Decision Process
+
+### §9.1.1 — Phase 1: Calculation of Degree of Preference
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| iBGP-learned route: LOCAL_PREF attribute value is the degree of preference (or local policy overrides it) | Confirmed correct | Already covered under §5.1.5 above — LOCAL_PREF from iBGP peers is correctly honored | See §5 findings |
+| eBGP-learned route: degree of preference is computed from local policy, not taken from the wire; if the eBGP peer sent a LOCAL_PREF, it has no bearing here | This directly reinforces the existing §5.1.5 finding, not a new one | This is the same underlying issue as the already-logged §5.1.5 gap (eBGP LOCAL_PREF not ignored) — this clause adds confirmation that the RFC's *positive* requirement (compute preference from policy) exists alongside the *negative* one (ignore the wire value). Checked: `pathvector-policy` does have a `SetLocalPref` action (`action.rs:78-94`), so operators *can* assign a computed preference to eBGP routes via import policy — the mechanism for the "compute from local policy" half of this clause already exists and is unaffected by the wire-capture bug. | Same fix as the §5.1.5 finding closes this too |
+| The computed degree-of-preference value MUST be used as LOCAL_PREF in any iBGP re-advertisement | Needs investigation, minor | When policy explicitly sets `local_pref` via `SetLocalPref`, it correctly flows to `route_to_attributes` and gets attached on the wire to iBGP peers (`prepare_outbound`'s iBGP branch doesn't touch `local_pref` at all, so a policy-assigned value survives). When *no* policy sets it (the common/default case), the route's `local_pref` stays `None`, and no `LocalPref` attribute is attached to the iBGP-bound UPDATE at all — the receiving iBGP peer then defaults it to 100 on their own side, which happens to produce the same *numeric* outcome as an explicit `LocalPref(100)` would, but isn't literally "using the computed value as LOCAL_PREF in the readvertisement" as the RFC's text describes. Low practical impact given the numeric outcome matches in the default case. | Confirm whether any BGP interop test suite would actually observe a difference between "no LOCAL_PREF attribute, defaults to 100 on the far end" vs. "explicit LocalPref(100) attribute" — if not, this is arguably not worth changing |
+
+**§9.1.1 summary:** 3 clauses reviewed — 1 confirmed correct, 1 reinforcing
+an already-logged gap (not double-counted), 1 minor needs-investigation.
+
+### §9.1.2 / §9.1.2.1 / §9.1.2.2 — Phase 2: Route Selection, Resolvability, Tie-Breaking
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| §9.1.2.1: exclude routes with unresolvable NEXT_HOP from Phase 2 | Confirmed correct (cross-referenced, not re-derived fresh) | This is already extensively covered by the existing FIB-integration/oracle work (`NextHopOracle`, `is_valid_next_hop_v4/v6`, Step 1 of the comparator rejecting unreachable NEXT_HOP) tracked and tested elsewhere in this project (TODO.md history items on FIB write-failure counters, IGP metric oracle, etc.) | Existing test suite for `NextHopOracle`/Step 1 |
+| §9.1.2.2 tie-break order: (a) shortest AS_PATH, (b) lowest ORIGIN, (c) lowest MED same-neighbor-AS, (d) eBGP over iBGP, (e) lowest IGP metric, (f) lowest BGP Identifier, (g) lowest peer address | **Confirmed gap — (f) and (g) conflated** | `best_path.rs`'s comparator implements (a)-(e) correctly (Steps 4-8 in the existing table, already ✅), then has its own extra "Step 9: oldest eBGP route" (see next row), then a single final "Step 10: Lowest peer IP address" (`best_path.rs:232-233`, `peer_b.cmp(peer_a)`) — comparing **peer IP address only**. This conflates the RFC's two *distinct* final criteria: (f) lowest **BGP Identifier** (the router-id from the peer's OPEN message) and (g) lowest **peer address** (the session's source IP) into a single peer-IP-only comparison, skipping (f) entirely. These are not always the same value — a router's BGP Identifier is commonly a loopback address, unrelated to the physical/session IP used for a given peering — so whenever two candidate routes tie all the way down to this point but their BGP-Identifier ordering and peer-IP ordering *disagree* (concretely: peer A has session IP 10.0.0.5 but BGP Identifier 1.1.1.1; peer B has session IP 10.0.0.2 but BGP Identifier 9.9.9.9 — RFC's (f) prefers A, since 1.1.1.1 < 9.9.9.9, but a peer-IP-only comparison prefers B, since 10.0.0.2 < 10.0.0.5), this implementation would pick a different winner than RFC 4271's literal algorithm specifies. This only matters in the (rare) case of a genuine full tie through step (e); most route comparisons resolve earlier. | A test with two routes tied through IGP metric and route age, but with BGP Identifier ordering and peer-IP ordering deliberately set to disagree, asserting the RFC's (f)-then-(g) order is followed rather than peer-IP-only |
+| §9.1.2.2 note: "BGP implementations MAY use any algorithm that produces the same results" | Confirmed correct as a general principle, doesn't excuse the above | This MAY clause is about implementation technique (e.g. this codebase's single-pass comparator vs. the RFC's iterative "remove from consideration" pseudocode), not about skipping or reordering the criteria themselves — the (f)/(g) conflation above is a genuine divergence in *results* for the disagreeing-orderings case, not just a different-but-equivalent algorithm | — |
+| (Extra, non-RFC step) "Step 9: oldest eBGP route" inserted between (e) and (f)/(g) | Confirmed correct — deliberate, common real-world deviation, not a gap | This specific step does not appear anywhere in RFC 4271's literal (a)-(g) list — it's a widely-implemented real-world BGP practice (preferring the older/more-stable eBGP route to reduce oscillation) that several major vendor implementations include, generally regarded as an acceptable, intentional deviation rather than a compliance defect, similar in spirit to this project's existing MRAI-withdrawal design choice (see §9.2.1.1 below) | — |
+| §9.1.4 Overlapping Routes / ATOMIC_AGGREGATE "MUST NOT make NLRI more specific" | Not yet reviewed this pass | This project doesn't perform route aggregation (§9.2.2.2 not implemented, already noted under the §5 AGGREGATOR finding), so the specific "more specific NLRI" scenario this clause guards against has no applicable code path — tentatively N/A, but not independently confirmed this pass | Confirm there's no de-aggregation/more-specific-splitting logic anywhere that this would apply to |
+
+**§9.1.2 summary:** 4 clauses reviewed (plus 1 not yet reviewed) — 3
+confirmed correct (1 of those explicitly a deliberate non-RFC addition, not
+a violation), 1 confirmed gap (the (f)/(g) conflation).
+
+### §9.1.3 — Phase 3: Route Dissemination
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| A route SHALL NOT be installed in Adj-RIB-Out unless its destination and NEXT_HOP can be forwarded per the Routing Table; if excluded, the previously-advertised route MUST be withdrawn via UPDATE | Confirmed correct (cross-referenced) | Covered by the existing, extensively-tested FIB-reachability-change handling (`test_on_fib_change_withdraws_when_next_hop_goes_down`, `test_on_fib_change_reannounces_when_next_hop_recovers`, per `pathvector-rib/RFC.md`'s Step 1/Step 8 citations) — a NEXT_HOP going unreachable correctly triggers a withdrawal, not just a skip | Existing FIB-integration test suite |
+
+**§9.1.3 summary:** 1 clause reviewed, confirmed correct.
+
+## §9.2 — Update-Send Process
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| §9.2.1.1: MinRouteAdvertisementIntervalTimer applies to "advertisement **and/or withdrawal**" of routes to a common destination set — the RFC's literal text does *not* exempt withdrawals | **Confirmed gap — in the documentation's RFC citation, not necessarily in the design decision itself** | `pathvectord/RFC.md` (before this pass) asserted "Withdrawals bypass MRAI (RFC 4271 §9.2.1.1 **explicit exemption**)" — I fetched and read the actual §9.2.1.1 text directly rather than trusting this citation, and it says the opposite: "Two UPDATE messages sent by a BGP speaker to a peer that advertise feasible routes **and/or withdrawal of unfeasible routes** to some common set of destinations MUST be separated by at least MinRouteAdvertisementIntervalTimer." There is no "explicit exemption" language anywhere in this section. The underlying *design decision* (send withdrawals immediately, unthrottled) is defensible on real-world safety grounds — delaying a withdrawal keeps a stale/blackholed route reachable for longer, a real operational cost that arguably outweighs strict adherence here — but the documentation overstated its RFC basis, claiming an explicit textual exemption that doesn't exist. Corrected the citation in `pathvectord/RFC.md` (✅ → ⚠️) as part of this pass; the underlying behavior itself is left as "needs a documented rationale, not a code change" rather than "confirmed gap requiring a fix," since I can't rule out this is intentional, defensible, real-world-informed engineering — just not what the raw RFC text says. | Either (a) find the actual justification (operational-safety reasoning, a related errata, or common-practice citation) and rewrite the doc's claim honestly instead of citing a nonexistent "explicit exemption," or (b) reconsider whether withdrawals should in fact respect MRAI per the literal text — this is a judgment call, not an obvious bug, so it shouldn't be fixed reflexively |
+| MRAI enforcement itself (30s eBGP window, per-NLRI suppression/flush) | Confirmed correct | Already well-tested — `mrai_suppresses_ebgp_announcement_within_window`, `mrai_passes_after_window_elapsed`, `flush_mrai_pending_clears_elapsed_pending` (per `pathvectord/RFC.md`) | Same |
+| iBGP MRAI SHOULD be ≥5s (or SHOULD NOT apply the eBGP procedure to iBGP at all — RFC offers this as an explicit either/or) | Confirmed correct — already tracked as a known, deliberate deferral | `pathvectord/RFC.md` already documents this as deferred (❌), and `RFC_REQUIREMENTS.md`'s §9.1/§9.2 rows are already ⚠️ reflecting it — nothing new to add here, this pass just confirms the existing tracking is accurate | Already tracked |
+
+**§9.2 summary:** 3 clauses reviewed — 1 confirmed gap (documentation
+citation, not necessarily the underlying design), 2 confirmed correct
+(one an already-known, already-tracked deferral).
+
+## §10 — BGP Timers
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| ConnectRetryTimer, HoldTimer, KeepaliveTimer are all configurable per-connection; Hold Time of 0 disables Hold/Keepalive timers | Confirmed correct | Already extensively covered under §4.2/§6.2/§8 above and by the fault-injection-testing work — `test_hold_time_zero_disables_timers`, `DEFAULT_CONNECT_RETRY_TIME`, per-peer `connect_retry_time` config | Existing test suite, no new gaps found |
+| KeepaliveTimer recommended at 1/3 of Hold Time | Confirmed correct | `test_keepalive_interval_is_third_of_hold_time` (already ✅ per `pathvector-session/RFC.md`) | Same |
+
+**§10 summary:** 2 clauses reviewed, both confirmed correct — no new
+findings; this section is fully subsumed by work already covered elsewhere
+in this audit.
+
+### RFC 4271 running total (§4, §5, §6.2–§7, §8, §9, §10)
+
+42 clauses reviewed — 29 confirmed correct, 8 confirmed gaps, 5 needs
+investigation. **RFC 4271 audit considered substantially complete** —
+remaining unaudited: §1-§3 (definitional/overview, low value), the full
+§8.2.2 per-state event table (already extensively exercised by testing,
+explicitly not re-derived clause-by-clause — see honesty note above), and
+§9.1.4 (overlapping routes, tentatively N/A pending confirmation).
+
+**All 8 confirmed gaps, for reference:** (1) OPEN/ROUTE_REFRESH accept
+trailing padding (§4.1); (2) no Attribute Flags Error detection (§4.3);
+(3) unrecognized transitive-optional attributes can't survive a relay
+(§5); (4) eBGP LOCAL_PREF not ignored (§5.1.5 — most severe of the
+"silent policy corruption" class); (5) unrecognized OPEN optional
+parameters silently skipped (§6.2); (6) unrecognized well-known
+attributes accepted as ordinary unknowns (§6.3); (7) connection
+collision BGP-ID comparison inverted (§6.8 — most severe overall,
+interop-breaking in a specific race); (8) tie-break steps (f)/(g)
+conflated into peer-IP-only (§9.1.2.2). All filed in `TODO.md` (#12-#15),
+none fixed as part of this diagnostic audit.
+
+---
+
+*(Sections §1–3 not covered — low value, mostly definitional. Per the
+roadmap, next up: RFC 4724 (Graceful Restart) fresh pass, then RFC 9234,
+RFC 7606, the already-flagged ⚠️ items, RPKI/BMP, then the encode-only
+RFCs.)*
