@@ -955,7 +955,7 @@ mod tests {
     use pathvector_types::Nlri;
 
     use crate::message::{
-        AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CodecError,
+        AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CeaseError, CodecError,
         MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
         PathAttribute, UpdateMessage,
     };
@@ -1601,7 +1601,7 @@ mod tests {
     /// > exists (the one that is already in the OpenConfirm state), and
     /// > accepts the BGP connection initiated by the remote system.
     ///
-    /// local_bgp_id = 10.0.0.1 (`test_config()`), peer's BGP ID (from its
+    /// `local_bgp_id` = 10.0.0.1 (`test_config()`), peer's BGP ID (from its
     /// OPEN) = 10.0.0.2 — local < peer, so the *existing* (outbound,
     /// mock-backed) connection MUST be closed and the incoming one adopted.
     /// This is the corrected version of a test that used to assert the
@@ -1659,11 +1659,28 @@ mod tests {
             .unwrap();
 
         // local (10.0.0.1) < peer (10.0.0.2): the existing (mock-backed)
-        // outbound connection must be closed. `CloseTcpConnection` drops
-        // `self.transport` (see `drop_connection`), which drops the mock's
-        // `send_tx` half — so `peer.send_rx` must observe the channel
+        // outbound connection must be closed. The FSM's CollisionDetected
+        // arm sends a Cease/ConnectionCollisionResolution NOTIFICATION
+        // (RFC 4271 §8.2.2) before `CloseTcpConnection` drops `self.transport`
+        // (see `drop_connection`), which drops the mock's `send_tx` half — so
+        // `peer.send_rx` must observe the NOTIFICATION and then the channel
         // closing (`None`), proving the old connection was actually torn
         // down rather than kept alive.
+        let notification = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for the collision NOTIFICATION")
+            .expect("channel closed before the collision NOTIFICATION was sent");
+        assert!(
+            matches!(
+                notification,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::ConnectionCollisionResolution),
+                    ..
+                })
+            ),
+            "expected Cease/ConnectionCollisionResolution NOTIFICATION (RFC 4271 §8.2.2), got {notification:?}"
+        );
+
         let closed = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
             .await
             .expect("timed out waiting for the old outbound connection to close");
@@ -1681,7 +1698,7 @@ mod tests {
     /// > message), and continues to use the existing one (the one that is
     /// > already in the OpenConfirm state).
     ///
-    /// local_bgp_id = 10.0.0.1, peer's BGP ID = 10.0.0.0 (lower than local)
+    /// `local_bgp_id` = 10.0.0.1, peer's BGP ID = 10.0.0.0 (lower than local)
     /// — local > peer, so the *existing* (outbound) connection must be
     /// kept and the session must reach `Established` over it, exactly as
     /// it did before any incoming connection arrived.

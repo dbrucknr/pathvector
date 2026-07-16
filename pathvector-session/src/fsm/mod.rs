@@ -349,12 +349,23 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
-            // RFC 4271 §6.8: collision — close outbound, restart over incoming.
+            // RFC 4271 §8.2.2, OpenSent/Event 19: "If this connection is to
+            // be dropped due to connection collision, the local system
+            // sends a NOTIFICATION with a Cease" (subcode Connection
+            // Collision Resolution, RFC 4486 §4 subcode 7 — the same
+            // CeaseError variant this codebase already round-trips).
             // Transition to Active so the next TcpConnected is valid.
             FsmInput::CollisionDetected => {
                 self.peer_open = None;
                 self.state = State::Active;
-                vec![FsmOutput::StopHoldTimer, FsmOutput::CloseTcpConnection]
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                        error: NotificationError::Cease(CeaseError::ConnectionCollisionResolution),
+                        data: vec![],
+                    })),
+                    FsmOutput::CloseTcpConnection,
+                ]
             }
             // Any other message type in OpenSent is unexpected (RFC 4271 §6.5 subcode 1).
             FsmInput::MessageReceived(_) => {
@@ -442,7 +453,12 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
-            // RFC 4271 §6.8: collision — close outbound, restart over incoming.
+            // RFC 4271 §8.2.2, OpenConfirm/Event 23 (OpenCollisionDump):
+            // "the local system: sends a NOTIFICATION with a Cease... drops
+            // the TCP connection... changes its state to Idle" — this FSM
+            // returns to Active (not Idle) per this project's collision
+            // model (see the OpenSent arm above), but the NOTIFICATION is
+            // required regardless of the resulting state.
             FsmInput::CollisionDetected => {
                 self.peer_open = None;
                 self.negotiated_hold_time = 0;
@@ -450,6 +466,10 @@ impl Fsm {
                 vec![
                     FsmOutput::StopHoldTimer,
                     FsmOutput::StopKeepaliveTimer,
+                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+                        error: NotificationError::Cease(CeaseError::ConnectionCollisionResolution),
+                        data: vec![],
+                    })),
                     FsmOutput::CloseTcpConnection,
                 ]
             }
@@ -2233,6 +2253,8 @@ mod tests {
 
     #[test]
     fn test_collision_detected_in_open_sent_resets_to_active() {
+        // RFC 4271 §8.2.2 OpenSent/Event 19: a connection dropped due to
+        // collision "sends a NOTIFICATION with a Cease" before closing.
         let mut fsm = open_sent_fsm(Ipv4Addr::new(10, 0, 0, 2));
         let outputs = fsm.process(FsmInput::CollisionDetected);
         assert_eq!(fsm.state(), State::Active);
@@ -2241,10 +2263,18 @@ mod tests {
         assert!(outputs.contains(&FsmOutput::StopHoldTimer));
         assert!(outputs.contains(&FsmOutput::CloseTcpConnection));
         assert!(!outputs.contains(&FsmOutput::SessionTerminated));
+        let n = find_notification(&outputs)
+            .expect("collision resolution must send a Cease NOTIFICATION (RFC 4271 §8.2.2)");
+        assert_eq!(
+            n.error,
+            NotificationError::Cease(CeaseError::ConnectionCollisionResolution)
+        );
     }
 
     #[test]
     fn test_collision_detected_in_open_confirm_resets_to_active() {
+        // RFC 4271 §8.2.2 OpenConfirm/Event 23 (OpenCollisionDump): "sends a
+        // NOTIFICATION with a Cease" before dropping the connection.
         let mut fsm = open_confirm_fsm(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1));
         let outputs = fsm.process(FsmInput::CollisionDetected);
         assert_eq!(fsm.state(), State::Active);
@@ -2253,6 +2283,12 @@ mod tests {
         assert!(outputs.contains(&FsmOutput::StopKeepaliveTimer));
         assert!(outputs.contains(&FsmOutput::CloseTcpConnection));
         assert!(!outputs.contains(&FsmOutput::SessionTerminated));
+        let n = find_notification(&outputs)
+            .expect("collision resolution must send a Cease NOTIFICATION (RFC 4271 §8.2.2)");
+        assert_eq!(
+            n.error,
+            NotificationError::Cease(CeaseError::ConnectionCollisionResolution)
+        );
     }
 
     #[test]
