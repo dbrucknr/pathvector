@@ -92,10 +92,16 @@ is enforced in `pathvector-rib`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | COMMUNITY (type 8): 32-bit value written as `high:low` | `src/community.rs` | ✅ | `test_community_new`, `test_community_from_parts_roundtrip`, `test_community_display` |
-| Well-known community NO_EXPORT (0xFFFFFF01) | `src/community.rs` | ✅ | `test_community_well_known_no_export` |
-| Well-known community NO_ADVERTISE (0xFFFFFF02) | `src/community.rs` | ✅ | `test_community_well_known_no_advertise` |
-| Well-known community NO_EXPORT_SUBCONFED (0xFFFFFF03) | `src/community.rs` | ✅ | `test_community_well_known_no_export_subconfed` |
+| Well-known community NO_EXPORT (0xFFFFFF01) — value + `is_no_export()` predicate | `src/community.rs` | ✅ | `test_community_well_known_no_export` |
+| Well-known community NO_ADVERTISE (0xFFFFFF02) — value + `is_no_advertise()` predicate | `src/community.rs` | ✅ | `test_community_well_known_no_advertise` |
+| Well-known community NO_EXPORT_SUBCONFED (0xFFFFFF03) — value + predicate | `src/community.rs` | ✅ | `test_community_well_known_no_export_subconfed` |
 | Operator-assigned values do not collide with well-known range | `src/community.rs` | ✅ | `test_community_operator_not_well_known` |
+| **RFC 1997's mandated behavior** for these three values — "MUST NOT be advertised outside a BGP confederation boundary" (NO_EXPORT), "MUST NOT be advertised to other BGP peers" (NO_ADVERTISE), "MUST NOT be advertised to external BGP peers" (NO_EXPORT_SUBCONFED) | — | ❌ | Added 2026-07-16 by `RFC_AUDIT.md`. The predicates above exist and are correctly tested at the type level, but grepping `pathvectord/src/outbound.rs` and `pathvector-rib` for any call to `is_no_export()`/`is_no_advertise()`/`is_well_known()` in the actual propagation path turns up nothing — they're never used to gate whether a route is advertised. A route tagged with any of these three values propagates completely normally today. This is the same "wire format defined, behavior not wired up" pattern as the SAFI-constant RFCs below, but unlike those, this one wasn't previously flagged as such. |
+
+**Known gap (found 2026-07-16 by `RFC_AUDIT.md`):** see the row above — this
+crate correctly defines and can detect the three well-known community
+values, but nothing downstream currently enforces the RFC-mandated
+propagation restriction they carry.
 
 ---
 

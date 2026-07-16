@@ -65,7 +65,9 @@ and `strip_confed_segments()` helper live in `pathvector-types`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | Confederation segments (type 3, 4) count as 0 in AS path length for step 4 | `src/best_path.rs` | ✅ | `test_aspath_length_excludes_confed_segments` |
-| Confederation segments stripped from AS_PATH before advertising to eBGP peers | `src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_strips_confed_segments_for_ebgp` |
+| Confederation segments stripped from AS_PATH before advertising to eBGP peers (§4.1(c)(1)) | `src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_strips_confed_segments_for_ebgp` |
+| §4.1(c)(2)-(4): after stripping, prepend the Confederation Identifier into the now-external `AS_SEQUENCE` | — | ❌ | Added 2026-07-16 by `RFC_AUDIT.md` — `strip_confed_segments()` only removes the confed segments; nothing prepends the Confederation Identifier afterward, and `prepare_outbound`'s eBGP prepend uses `local_as` generically with no distinct Confederation-Identifier-vs-Member-AS concept |
+| §4.1(b): originate/relay as an actual confederation member (prepend Member-AS Number into `AS_CONFED_SEQUENCE` toward fellow members) | — | ❌ | Added 2026-07-16 — `PeerType` has no representation for "peer in a different Member-AS of the same confederation" at all; only `Internal`/`External`/`Local` exist. This project's RFC 5065 support is pass-through/interop only (correctly strips confed segments from routes that already have them from an upstream confederation), not full confederation-member participation. See `RFC_AUDIT.md`'s "audit-the-audit" section for the full writeup and the open question of whether this is in scope at all. |
 
 ---
 

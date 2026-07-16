@@ -845,6 +845,60 @@ to find anything in. Both new gaps filed in `TODO.md` (#21).
 
 ---
 
-*(Per the roadmap, next up: the encode-only RFCs — 1997, 4360, 8092,
-SAFI-constant RFCs, 6996, 1930, 5065 — lowest audit value, mostly static
-encode/decode already covered by round-trip tests and proptests.)*
+# Audit-the-audit: is anything not tracked that should be?
+
+**Prompted by the user asking directly** whether `RFC_REQUIREMENTS.md`
+itself might be missing RFCs, rather than only checking RFCs already on
+the list. This is a different, valuable question from everything above —
+this audit had only ever asked "is the code right for the RFCs we already
+claim to implement," never "are we claiming the right set of RFCs in the
+first place." Two real answers came out of asking it, on top of the
+originally-planned encode-only batch (below).
+
+| Finding | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| **RFC 7607 (Codification of AS 0 Processing) is genuinely implemented but has zero presence anywhere in `RFC_REQUIREMENTS.md` or any crate's `RFC.md`** | Confirmed gap in tracking, not in code | Grepped the workspace for "7607" — found real, working enforcement: `pathvectord/src/grpc.rs:355` rejects AS 0 / AS_TRANS in a peer's configured `remote_as`, and `pathvectord/src/daemon/route.rs:1053-1063` drops any UPDATE whose AS_PATH contains reserved AS 0 (with an explicit "Finding L" test at `daemon/mod.rs:6954-6982`). The *code* is correct and tested — this is purely a documentation/tracking gap, the exact inverse of most other findings in this audit (implemented-but-forgotten rather than assumed-but-wrong). | Add a row for RFC 7607 to `RFC_REQUIREMENTS.md` and `pathvectord/RFC.md` reflecting what's already true: ✅ |
+| **RFC 1997's well-known community *values* (`NO_EXPORT`, `NO_ADVERTISE`, `NO_EXPORT_SUBCONFED`) are defined and decodable, but their mandated *behavior* is never enforced anywhere in the outbound propagation path** | **Confirmed gap — overclaiming, not just untracked** | RFC 1997 itself (fetched and quoted directly, not assumed): "NO_EXPORT... containing this value MUST NOT be advertised outside a BGP confederation boundary"; "NO_ADVERTISE... MUST NOT be advertised to other BGP peers"; "NO_EXPORT_SUBCONFED... MUST NOT be advertised to external BGP peers." `pathvector-types/src/community.rs` has the constants and `is_no_export()`/`is_no_advertise()`/`is_well_known()` helper predicates — but grepping `pathvectord/src/outbound.rs` and all of `pathvector-rib` for any call to these predicates in the actual propagation path (`propagate_prefix`/`prepare_outbound`/`AdjRibOut::insert`) turns up **nothing** — they're only ever referenced in tests that check the predicate methods themselves return the right boolean, never used to gate whether a route actually gets advertised. A peer sending a route tagged `NO_EXPORT` or `NO_ADVERTISE` today would have it propagated completely normally. `RFC_REQUIREMENTS.md` currently marks RFC 1997 ✅ — this is the same "SAFI-constant/wire-format-only, behavior not wired up" pattern already seen for RFC 3107/4364/4761/7432/5575 (those are honestly marked as such in their own row's text; this one isn't). | Wire `is_no_export()`/`is_no_advertise()`/`is_well_known()` (with confederation-awareness for the SUBCONFED variant) into the outbound propagation decision, alongside a test sending a route with each well-known community and asserting it's correctly suppressed for the relevant peer types — then correct `RFC_REQUIREMENTS.md`'s row from ✅ to ⚠️ (or ❌, depending how the fix is scoped) until this lands |
+| **RFC 5065 confederation support is asymmetric: pass-through (strip confederation segments before external advertisement) is implemented and tested, but originating/relaying as an actual confederation member (prepending the Member-AS Number into `AS_CONFED_SEQUENCE` toward fellow confederation members, and the Confederation Identifier into `AS_SEQUENCE` toward genuine externals) has no representation at all in the peer-type model** | **Confirmed gap — significant, architectural, not a quick fix** | `PeerType` (`pathvector-types/src/peer_type.rs`) has exactly three variants: `Internal`, `External`, `Local` — there is no fourth category for "a peer in a different Member-AS of the same confederation," which RFC 5065 §4.1(b) treats as a distinct relationship with its own AS_PATH modification rules (prepend Member-AS into `AS_CONFED_SEQUENCE`, don't touch LOCAL_PREF/NEXT_HOP the way plain eBGP does). `prepare_outbound` (`pathvector-rib/src/outbound.rs`) only branches on `PeerType::External` vs. not — there's no code path that could apply confederation-member-specific treatment even if a peer were somehow marked as one. `AsPath::strip_confed_segments()` (`pathvector-types/src/aspath.rs:488-501`) correctly *removes* confed segments for the genuine-external case (§4.1(c)(1), tested), but never performs the RFC's next step for that same case — prepending the Confederation Identifier into the now-external-facing `AS_SEQUENCE` (§4.1(c)(2)-(4)) — and `prepare_outbound`'s eBGP prepend uses `local_as` generically, with no distinct "Confederation Identifier vs. Member-AS Number" config concept to prepend the *right* number in the *right* case. **Practical severity depends entirely on deployment shape**: if this daemon is only ever used to *interoperate* with someone else's confederation (receive/pass through routes that already carry confed segments from an upstream network), this gap has no practical effect — that specific case is what's tested and it's correct. It only matters if an operator tries to run *multiple instances* of this daemon as the actual member routers of *their own* confederation, which may not be this project's intended use case at all. Flagging honestly without assuming which way that cuts. | This is a genuine architecture question, not a bug fix — needs a decision on whether "be a confederation member" is in scope at all before any code changes. If yes: a fourth `PeerType` variant (or a separate `is_confederation_member` peer flag), a distinct config field for Confederation Identifier vs. local Member-AS, and the full §4.1(b)/(c) prepend logic. If the answer is "out of scope, interop-only is the intended scope," then correct `RFC_REQUIREMENTS.md`'s ✅ to reflect that explicit boundary rather than implying full RFC 5065 support. |
+| RFC 4360 (Extended Communities) and RFC 8092 (Large Communities): checked both for a similar "well-known value with mandated enforcement" trap (the same shape as the RFC 1997 finding above) | Confirmed correct — genuinely clean | Fetched both texts directly and grepped for "MUST NOT be advertised"/"well-known" — neither RFC defines any universally-reserved value with mandated router behavior the way RFC 1997 does; both are purely encode/decode format extensions with community-specific semantics (e.g. Route Target) that are themselves scoped to other, separately-tracked RFCs (VPN/EVPN, already correctly marked as out-of-scope elsewhere). Nothing further to find here. | — |
+| RFC 5575 (FlowSpec) is cited in this project's docs for a SAFI constant, but RFC 5575 was formally obsoleted by RFC 8955 in 2020 | Minor citation staleness, not a functional gap | This project's FlowSpec "support" is a SAFI constant only (already honestly documented as "encoding deferred" — no real FlowSpec NLRI parsing exists), so the obsoleted citation doesn't affect any actual behavior. Worth a citation update purely for hygiene, not worth a `TODO.md` item on its own. | Update the citation to RFC 8955 next time that row is touched |
+
+**Audit-the-audit summary:** asking "what's missing from the index itself"
+found one pure documentation gap (RFC 7607 — code's already right) and two
+real overclaiming cases (RFC 1997, RFC 5065) where the tracked ✅ status
+implies more than the code actually does. Both are filed in `TODO.md`
+(#22). This kind of check — auditing the tracking system's own coverage,
+not just re-verifying what's already on the list — seems worth repeating
+periodically rather than treating this RFC-by-RFC audit as ever fully
+"done."
+
+---
+
+# Encode-only RFCs (1997, 4360, 8092, SAFI constants, 6996, 1930)
+
+**Audited:** 2026-07-16
+**Method:** Spot-checked rather than exhaustively re-derived, per the
+roadmap's own framing of this tier as lowest-value (mostly static
+encode/decode already covered by round-trip tests and proptests). RFC
+1997/4360/8092 covered above under the audit-the-audit section (1997 had
+a real finding; 4360/8092 confirmed clean). RFC 5065 covered above as
+well (real finding). Remaining: the SAFI-constant RFCs (3107, 4364, 4761,
+7432, 5575) and RFC 6996/1930 (private/reserved AS number ranges).
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| SAFI constants for MPLS (3107), BGP/MPLS VPN (4364), VPLS (4761), EVPN (7432), FlowSpec (5575) | Confirmed correct — honestly scoped | All five are already explicitly documented in `pathvector-types/RFC.md` as "SAFI constants, encoding deferred" — this project defines the numeric constants for interop/round-trip purposes but doesn't implement any of the real NLRI semantics for these address families. This is an accurate, non-overclaiming existing description (unlike the RFC 1997/5065 cases above) — nothing to correct. | — |
+| RFC 6996 (private 4-byte AS reservation) and RFC 1930 (2-byte private AS range guidelines) | Confirmed correct | These are almost entirely declarative range-definition RFCs (which numbers are reserved for private use) rather than behavioral ones — the existing `Asn` type's range constants and associated tests already cover the numeric ranges correctly per the existing `pathvector-types/RFC.md` citations | Existing test suite |
+
+**Encode-only batch summary:** genuinely low-yield as expected for this
+tier on its own — but the audit-the-audit pass that accompanied it (RFC
+1997, RFC 5065) was the highest-value part of this round.
+
+---
+
+*(All items on the original roadmap have now been covered at least once:
+RFC 4271, RFC 4724, RFC 9234, RFC 7606, RFC 5492/6793/6396, RPKI/BMP, and
+the encode-only tier. Remaining open threads: the "needs investigation"
+rows scattered through earlier sections, the newly-found RFC 1997/5065
+gaps, and a possible future pass specifically hunting for more
+"tracked-but-overclaiming" cases the way this round found two.)*

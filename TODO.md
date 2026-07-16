@@ -537,6 +537,45 @@ honestly and completely unimplemented (every row ❌, explicit "Deferred:
 Everything" note) — no code exists to audit, so no findings possible.
 `RFC_REQUIREMENTS.md`'s ❌ status is accurate as-is.
 
+**22. "Audit-the-audit" pass — is anything not tracked that should be?**
+Prompted directly by the user asking whether `RFC_REQUIREMENTS.md` itself
+might be incomplete, rather than only re-checking RFCs already on the
+list. Found 2026-07-16, diagnostic only, not fixed here:
+
+- **RFC 7607 (AS 0 processing) was completely untracked despite being
+  correctly implemented and tested.** Pure documentation gap — added to
+  `RFC_REQUIREMENTS.md` and a new section in `pathvectord/RFC.md`; no code
+  change needed.
+- **RFC 1997's well-known communities (NO_EXPORT/NO_ADVERTISE/NO_EXPORT_SUBCONFED)
+  are defined and decodable, but their RFC-mandated propagation restriction
+  is never enforced anywhere.** RFC 1997 explicitly requires each of these
+  three values to suppress advertisement in a specific way (confederation
+  boundary / any peer / external peers respectively) — `is_no_export()`/
+  `is_no_advertise()`/`is_well_known()` exist as predicates but are never
+  called from the actual outbound propagation path (`outbound.rs`,
+  `pathvector-rib`). A route tagged with any of these today propagates
+  completely normally. `RFC_REQUIREMENTS.md` previously marked this ✅ —
+  corrected to ⚠️. See `RFC_AUDIT.md`'s audit-the-audit section.
+- **RFC 5065 (confederations) support is asymmetric — significant,
+  architectural, not a quick fix.** Pass-through/interop (stripping
+  confederation segments before advertising externally) works and is
+  tested. But actually *originating or relaying as a confederation
+  member* — prepending the Member-AS Number into `AS_CONFED_SEQUENCE`
+  toward fellow members, and the Confederation Identifier (not the
+  generic `local_as`) into `AS_SEQUENCE` toward genuine externals — has
+  no representation at all: `PeerType` only has `Internal`/`External`/`Local`,
+  with no fourth category for "peer in a different Member-AS of the same
+  confederation." Whether this matters depends entirely on deployment
+  shape (interop-only vs. actually running this daemon as confederation
+  member routers) — flagged as an open scope question, not asserted as a
+  bug, since it may be intentionally out of scope. `RFC_REQUIREMENTS.md`
+  corrected from ✅ to ⚠️ either way, since the current wording implied
+  more than what's actually there. See `RFC_AUDIT.md`'s audit-the-audit
+  section for the full writeup.
+- Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
+  for the same "well-known value with mandated enforcement" trap as the
+  RFC 1997 finding — both confirmed genuinely clean, no similar issue.
+
 ---
 
 ## General

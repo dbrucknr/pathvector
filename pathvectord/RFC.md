@@ -236,6 +236,22 @@ from/to eBGP peers. Accept all routes from/to iBGP peers.
 
 ---
 
+## RFC 7607 — Codification of AS 0 Processing
+
+**Added to this index 2026-07-16 by `RFC_AUDIT.md`** — genuinely implemented
+and tested, but had never been added to `RFC_REQUIREMENTS.md` or any crate's
+`RFC.md` until this audit noticed the gap in tracking (not in the code).  
+**Owns:** Rejecting AS 0 as a configured peer AS, and dropping any received
+UPDATE whose AS_PATH contains the reserved AS 0.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc7607
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| AS 0 and AS_TRANS (23456) rejected as a peer's configured `remote_as` | `src/grpc.rs:355` | ✅ | (see surrounding config-validation tests) |
+| UPDATE whose AS_PATH contains AS 0 is dropped (route ineligible) | `src/daemon/route.rs:1053-1063` | ✅ | "Finding L" test, `src/daemon/mod.rs:6954-6982` |
+
+---
+
 ## RFC 4456 — BGP Route Reflection
 
 **Owns:** Route Reflector configuration, inbound attribute processing (ORIGINATOR_ID,
