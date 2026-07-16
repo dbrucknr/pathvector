@@ -23,7 +23,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
 use crate::message::{
-    BgpMessage, Capability, MalformedUpdate, MpUnreachNlri, PathAttribute, UpdateMessage,
+    BgpMessage, Capability, CodecError, MalformedUpdate, MpUnreachNlri, MsgHeaderError,
+    NotificationError, NotificationMessage, PathAttribute, UpdateMessage,
 };
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -561,6 +562,11 @@ impl<T: BgpTransport> Session<T> {
                         Some(Ok(m)) => return FsmInput::MessageReceived(m),
                         Some(Err(e)) => {
                             tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
+                            if let Some(notif) = header_error_notification(&e)
+                                && let Some(t) = &mut self.transport
+                            {
+                                let _ = t.send(BgpMessage::Notification(notif)).await;
+                            }
                             self.drop_connection();
                             return FsmInput::TcpFailed;
                         }
@@ -787,6 +793,36 @@ impl<T: BgpTransport> Session<T> {
     }
 }
 
+/// Map an RFC 4271 §6.1 message-header framing error to the NOTIFICATION that
+/// must be sent before the connection is torn down.
+///
+/// Returns `None` for `CodecError` variants below the header layer (malformed
+/// OPEN/NOTIFICATION message bodies) — those aren't RFC 7606-eligible (that
+/// policy only applies to UPDATE attribute errors) and mapping each to its
+/// RFC-precise `NotificationError`/subcode is a separate follow-up (see
+/// TODO.md).
+fn header_error_notification(e: &FramingError) -> Option<NotificationMessage> {
+    let FramingError::Codec(codec_err) = e else {
+        return None;
+    };
+    let (error, data) = match codec_err {
+        CodecError::InvalidMarker => (
+            NotificationError::MessageHeader(MsgHeaderError::ConnectionNotSynchronized),
+            vec![],
+        ),
+        CodecError::InvalidLength(len) => (
+            NotificationError::MessageHeader(MsgHeaderError::BadMessageLength),
+            len.to_be_bytes().to_vec(),
+        ),
+        CodecError::UnknownMessageType(t) => (
+            NotificationError::MessageHeader(MsgHeaderError::BadMessageType),
+            vec![*t],
+        ),
+        _ => return None,
+    };
+    Some(NotificationMessage { error, data })
+}
+
 /// Convert an UPDATE with treat-as-withdraw errors into a withdrawal-only UPDATE.
 ///
 /// All announced IPv4 NLRIs are moved into `withdrawn`. Any `MP_REACH_NLRI`
@@ -904,8 +940,9 @@ mod tests {
     use pathvector_types::Nlri;
 
     use crate::message::{
-        AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, MalformedUpdate,
-        OpenMessage, PathAttribute, UpdateMessage,
+        AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CodecError,
+        MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
+        PathAttribute, UpdateMessage,
     };
 
     // ── MockTransport ─────────────────────────────────────────────────────────
@@ -1190,6 +1227,123 @@ mod tests {
         assert!(
             result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated(_))),
             "session must not terminate after a treat-as-withdraw malformed UPDATE"
+        );
+    }
+
+    // ── RFC 4271 §6.1 Message Header Error NOTIFICATION ───────────────────────
+
+    #[tokio::test]
+    async fn test_invalid_marker_sends_message_header_notification() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx
+            .send(Err(FramingError::Codec(CodecError::InvalidMarker)))
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for NOTIFICATION")
+            .expect("mock channel closed before NOTIFICATION");
+        assert_eq!(
+            msg,
+            BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::MessageHeader(MsgHeaderError::ConnectionNotSynchronized),
+                data: vec![],
+            }),
+            "expected a Message Header Error / Connection Not Synchronized NOTIFICATION, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_length_sends_message_header_notification_with_length_in_data() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx
+            .send(Err(FramingError::Codec(CodecError::InvalidLength(5000))))
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for NOTIFICATION")
+            .expect("mock channel closed before NOTIFICATION");
+        assert_eq!(
+            msg,
+            BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::MessageHeader(MsgHeaderError::BadMessageLength),
+                data: 5000u16.to_be_bytes().to_vec(),
+            }),
+            "expected a Message Header Error / Bad Message Length NOTIFICATION carrying the \
+             erroneous length in data, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_message_type_sends_message_header_notification_with_type_in_data() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx
+            .send(Err(FramingError::Codec(CodecError::UnknownMessageType(99))))
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for NOTIFICATION")
+            .expect("mock channel closed before NOTIFICATION");
+        assert_eq!(
+            msg,
+            BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::MessageHeader(MsgHeaderError::BadMessageType),
+                data: vec![99],
+            }),
+            "expected a Message Header Error / Bad Message Type NOTIFICATION carrying the \
+             erroneous type byte in data, got {msg:?}"
+        );
+    }
+
+    /// Documents the explicit scope boundary: a `CodecError` below the header
+    /// layer (e.g. a malformed OPEN/NOTIFICATION body) is not yet mapped to a
+    /// NOTIFICATION — the connection is dropped silently, matching
+    /// pre-existing behavior. See `header_error_notification`'s doc comment.
+    #[tokio::test]
+    async fn test_other_codec_errors_drop_connection_without_notification() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx
+            .send(Err(FramingError::Codec(CodecError::Truncated {
+                needed: 4,
+                available: 1,
+            })))
+            .unwrap();
+
+        // The connection is dropped without sending anything, which closes
+        // the mock's send channel — `recv()` therefore returns `Ok(None)`
+        // rather than timing out. Either that or a timeout is acceptable;
+        // only an actual sent message (`Ok(Some(_))`) is a failure.
+        let result = tokio::time::timeout(Duration::from_millis(100), peer.send_rx.recv()).await;
+        assert!(
+            !matches!(result, Ok(Some(_))),
+            "no message should be sent for a non-header CodecError, got {result:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Terminated")
+            .expect("session channel closed before Terminated");
+        assert!(
+            matches!(event, SessionEvent::Terminated(_)),
+            "expected Terminated after a non-header CodecError, got {event:?}"
         );
     }
 
