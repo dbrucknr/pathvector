@@ -72,6 +72,12 @@ pub const MOCK_BGP_PEER_IMAGE: &str = "pathvector-mock-bgp-peer-test";
 /// out instead of listening.
 pub const MOCK_BGP_DIALER_IMAGE: &str = "pathvector-mock-bgp-dialer-test";
 
+/// Mock adversarial BGP peer image built by `just e2e` from
+/// `e2e/Dockerfile.mock-bgp-fault-peer`, used by [`FaultInjectionHarness`].
+/// See `src/bin/mock_bgp_fault_peer.rs` for the full scenario list — the
+/// scenario to run is selected at container-start time via `.with_cmd(...)`.
+pub const MOCK_BGP_FAULT_PEER_IMAGE: &str = "pathvector-mock-bgp-fault-peer-test";
+
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
@@ -748,6 +754,43 @@ remote_as      = {peer_as}
 import_default = "accept"
 export_default = "accept"
 role           = "provider"
+"#
+    )
+    .expect("write pathvectord config");
+    f
+}
+
+/// Writes a pathvectord config with two peers for [`FaultInjectionHarness`]:
+/// a well-behaved GoBGP control peer (proves the daemon stays healthy
+/// throughout each scenario) and the adversarial `mock_bgp_fault_peer`
+/// (`remote_as` must match its `FAULT_PEER_AS` constant).
+fn write_daemon_config_fault_injection(
+    control_ip: Ipv4Addr,
+    fault_peer_ip: Ipv4Addr,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+
+[[peers]]
+address        = "{control_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address        = "{fault_peer_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65098
+import_default = "accept"
+export_default = "accept"
 "#
     )
     .expect("write pathvectord config");
@@ -2198,6 +2241,108 @@ impl RoleHarness {
     }
 }
 
+/// Harness for the adversarial-input / fault-injection e2e tests (TODO.md
+/// Tier 3 #11) — three containers: a well-behaved GoBGP **control** peer
+/// (proves pathvectord stays healthy throughout each scenario) and the
+/// adversarial [`MOCK_BGP_FAULT_PEER_IMAGE`] (see
+/// `src/bin/mock_bgp_fault_peer.rs`), plus pathvectord itself.
+pub struct FaultInjectionHarness {
+    _control_peer: ContainerAsync<GenericImage>,
+    _fault_peer: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    pub control_peer: Ipv4Addr,
+    pub fault_peer: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl FaultInjectionHarness {
+    /// Starts pathvectord, a GoBGP control peer, and the adversarial mock
+    /// peer running `scenario` (see `mock_bgp_fault_peer.rs`'s module doc for
+    /// the full scenario list), then waits for the control peer's session to
+    /// reach `Established`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or the control peer's session
+    /// doesn't reach `Established` within 30s.
+    pub async fn new(scenario: &str) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-fault-injection-test-{test_id}");
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let control_peer = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-fault-injection-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                gobgpd_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start GoBGP control peer container");
+        let control_peer_id = control_peer.id().to_owned();
+        let control_peer_ip = container_network_ip(&control_peer_id, &network_name);
+
+        let fault_peer = GenericImage::new(MOCK_BGP_FAULT_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd([scenario])
+            .with_network(&network_name)
+            .with_container_name(format!("mock-bgp-fault-peer-{test_id}"))
+            .start()
+            .await
+            .expect("start mock BGP fault peer container");
+        let fault_peer_id = fault_peer.id().to_owned();
+        let fault_peer_ip = container_network_ip(&fault_peer_id, &network_name);
+
+        let pathvectord_config =
+            write_daemon_config_fault_injection(control_peer_ip, fault_peer_ip);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-fault-injection-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for FaultInjectionHarness");
+
+        wait_for_established(&mut client, control_peer_ip, Duration::from_secs(30))
+            .await
+            .expect("control peer session did not reach Established within 30 s");
+
+        Self {
+            _control_peer: control_peer,
+            _fault_peer: fault_peer,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            control_peer: control_peer_ip,
+            fault_peer: fault_peer_ip,
+            _network: network,
+        }
+    }
+}
+
 /// Polls until pathvectord reports its RTR session as connected and synced
 /// (`roa_count > 0`).
 ///
@@ -2642,6 +2787,22 @@ impl Harness {
     /// See the struct-level documentation.
     pub async fn new() -> Self {
         Self::new_inner(write_daemon_config).await
+    }
+
+    /// Same as [`Self::new`] but with a short `connect_retry_time`, so
+    /// pathvectord reconnects quickly after a network-level disconnect
+    /// instead of waiting the RFC-default 120 s.
+    ///
+    /// Use this for tests that simulate a plain TCP reset / network
+    /// partition and need to observe re-establishment within a reasonable
+    /// test timeout — unlike [`Self::new_gr_peer_fast_retry`], no GR is
+    /// configured on either side.
+    ///
+    /// # Panics
+    ///
+    /// See the struct-level documentation.
+    pub async fn new_fast_retry(retry_secs: u16) -> Self {
+        Self::new_inner(move |peers| write_daemon_config_fast_retry(peers, retry_secs)).await
     }
 
     /// Same as [`Self::new`] but with `local_ipv6 = "2001:db8::2"` configured.
