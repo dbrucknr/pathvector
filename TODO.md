@@ -286,6 +286,50 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   deployments, so tightening this may not be worth doing without a config
   toggle. See `RFC_AUDIT.md` §6.3.
 
+**15. HIGH PRIORITY — RFC 4271 §6.8 connection collision resolution is
+inverted** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13/#14
+(diagnostic only, not fixed here, but this one deserves prompt attention
+given its severity):
+
+- **`handle_incoming_connection`'s BGP-ID comparison
+  (`pathvector-session/src/transport/mod.rs:634-637`,
+  `should_close_outbound = local_bgp_id > peer_id`) is backwards relative
+  to RFC 4271 §6.8.** The RFC says: retain the connection *initiated by*
+  the higher-ID speaker. This codebase's existing connection is always the
+  locally-initiated (outbound) one, so correctly: local ID lower than
+  peer's ⇒ close our outbound, adopt the peer-initiated incoming
+  connection; local ID higher ⇒ keep our outbound, reject the incoming.
+  The code does the *opposite* of both. Mechanically re-derived twice (see
+  `RFC_AUDIT.md` §6.8 for the full worked example) and cross-checked
+  against the existing test's own asserted outcome —
+  `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming`
+  sets up "peer ID higher" and asserts the *outbound* connection survives,
+  which is precisely backwards from the RFC; the test locks in the
+  inverted behavior as correct, which is why this was never caught.
+- **Consequence:** self-consistent (no flapping) when two `pathvectord`
+  instances collide with each other, since both sides invert the same way
+  and still converge on one connection — but against a correctly-behaving
+  peer (GoBGP, BIRD, FRR, or any standards-compliant implementation) in a
+  genuine simultaneous-connect race, each side computes a *different*
+  required survivor and closes the connection the other side is trying to
+  keep, which could prevent the session from ever establishing in that
+  race window. No existing e2e suite appears to exercise a genuine
+  simultaneous-connect collision against a real external peer, so this has
+  had no chance to surface.
+- **Also found in the same section:** neither `on_open_sent`'s nor
+  `on_open_confirm`'s `CollisionDetected` FSM arm sends the RFC-required
+  NOTIFICATION(Cease, ConnectionCollisionResolution) before closing — see
+  `RFC_AUDIT.md` §6.8 for detail. The corresponding `pathvectord/RFC.md`
+  rows (previously wrongly marked ✅, one with no test at all backing the
+  claim) have been corrected to ❌, and `RFC_REQUIREMENTS.md`'s §8 row
+  flipped from ✅ to ⚠️.
+- Fix: invert the `should_close_outbound` condition, rewrite the existing
+  test (whose name and assertion currently describe the wrong behavior),
+  add the missing NOTIFICATION output to both FSM arms, and — given the
+  severity — consider a real e2e test that forces a genuine simultaneous-
+  connect race against GoBGP/BIRD/FRR to prove real-world interop, not
+  just a unit-level fix.
+
 ---
 
 ## General

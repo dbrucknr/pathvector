@@ -288,8 +288,8 @@ to the `pathvector-session` transport layer via `SessionHandle`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | Detect when both the local and remote side open a connection to each other | `pathvector-session/src/transport/mod.rs` | ✅ | `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming` (in `pathvector-session`) |
-| Keep the connection initiated by the router with higher BGP Identifier | `pathvector-session/src/transport/mod.rs` | ✅ | `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming` (in `pathvector-session`) |
-| Send NOTIFICATION Cease / Connection Collision Resolution on dropped connection | `pathvector-session/src/transport/mod.rs` | ✅ | — |
+| Keep the connection initiated by the router with higher BGP Identifier | `pathvector-session/src/transport/mod.rs` | ❌ | **Corrected 2026-07-16 — this was wrong.** `handle_incoming_connection`'s `should_close_outbound = local_bgp_id > peer_id` is inverted: it closes *our own* outbound connection when *our* ID is higher, and keeps it when *our* ID is lower — the opposite of RFC 4271 §6.8, which says to retain the connection initiated by the higher-ID speaker. `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming`'s own scenario (peer ID higher) asserts the session reaches `Established` over the *outbound* connection — i.e. it locks in the inverted behavior as if it were correct, which is why this went uncaught. See `RFC_AUDIT.md` §6.8 for the full derivation. |
+| Send NOTIFICATION Cease / Connection Collision Resolution on dropped connection | `pathvector-session/src/fsm/mod.rs` | ❌ | None — corrected 2026-07-16 by `RFC_AUDIT.md` §6.8; the previous ✅ here was never backed by a test (see the `—` that used to be in this cell) and was wrong. Both `on_open_sent` and `on_open_confirm`'s `CollisionDetected` arms only emit `StopHoldTimer`/`StopKeepaliveTimer`/`CloseTcpConnection` — no `SendMessage` of any kind |
 
 ---
 

@@ -195,7 +195,81 @@ not assumed, in a follow-up pass.
 
 ---
 
-*(Sections §1–3, §6.4–§6.8, and §7–§10 not yet covered by this audit pass —
-continuing in subsequent sessions per the roadmap above. This file will be
-updated incrementally rather than all at once, so a partial, in-progress
-state here is expected, not a sign the audit was abandoned.)*
+## §6.4 — NOTIFICATION Message Error Handling
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| A received NOTIFICATION that itself has an error (e.g. unrecognized Error Code/Subcode) must NOT be answered with another NOTIFICATION — SHOULD be logged only | Confirmed correct | A malformed/undecodable NOTIFICATION hits the generic body-level `CodecError` path (`transport/mod.rs`'s `Some(Err(e))` arm), which — per the §6.1/§6.2 findings above — only maps the 3 header-layer errors to a reply NOTIFICATION and otherwise just `tracing::warn!`s and drops the connection; there's no code path that would construct a NOTIFICATION *in response to* a received NOTIFICATION regardless of what's wrong with it. A successfully-decoded NOTIFICATION with an unrecognized Error Code/Subcode also can't trigger a reply — receiving *any* `BgpMessage::Notification` just terminates the session (see the FSM's `NotificationReceived`-shaped inputs), it never dispatches to a "reply" path. This is actually a case where the already-known, already-deferred generic-CodecError behavior happens to be exactly RFC-correct for this specific clause, not a coincidence worth re-litigating. | — |
+
+**§6.4 summary:** 1 clause reviewed, confirmed correct.
+
+## §6.5 — Hold Timer Expired Error Handling
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Hold Timer expiry → NOTIFICATION with Error Code Hold Timer Expired, connection closed | Confirmed correct | All 3 `HoldTimerExpired` arms in `fsm/mod.rs` (lines 330, 421, 503) construct `NotificationError::HoldTimerExpired` specifically (not a generic/wrong code) before `CloseTcpConnection` | `test_hold_timer_expired_in_open_sent`, `test_hold_timer_expired_in_open_confirm`, `test_hold_timer_expired_in_established` (already well-established from the fault-injection-testing work) |
+
+**§6.5 summary:** 1 clause reviewed, confirmed correct.
+
+## §6.6 — Finite State Machine Error Handling
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Any FSM error (e.g. an unexpected event/message for the current state) → NOTIFICATION with Error Code Finite State Machine Error | Confirmed correct | `on_open_sent`'s catch-all `MessageReceived(_)` arm (`fsm/mod.rs:360-369`) sends `FsmErrorOpenSent` for any message type other than the one expected in that state; per RFC 6608 (already tracked ✅) the subcode is state-specific (`FsmErrorOpenSent`/`FsmErrorOpenConfirm`/`FsmErrorEstablished`) rather than the RFC 4271-only generic `FsmError`, which is a superset/refinement, not a violation | RFC 6608's existing test coverage (already ✅ in `pathvector-session/RFC.md`) |
+| (Secondary observation, not a gap) Non-message `FsmInput` variants that don't apply to a given state fall through to a silent `_ => vec![]` no-op in some state handlers | Confirmed correct, reasoned rather than gap | The RFC's "unexpected event" language is about receiving a *protocol message* that doesn't belong in the current state (which the message-reception catch-alls above already handle) — internal plumbing events like a stray timer tick that doesn't apply to the current state aren't "BGP events" in the sense this clause is concerned with, so a silent no-op there is a reasonable interpretation, not a violation | — |
+
+**§6.6 summary:** 2 clauses reviewed, both confirmed correct.
+
+## §6.7 — Cease
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Terminating a session because a locally-configured prefix-count upper bound was exceeded MUST send NOTIFICATION(Cease, MaximumNumberOfPrefixesReached) | Confirmed correct | `pathvectord/src/daemon/route.rs:288-328` checks `adj_rib_in.len() > limit` after each UPDATE and sends exactly this NOTIFICATION; this implementation goes further than the bare RFC requirement by also supporting an `max_prefixes_restart` idle-hold delay (a common real-world BGP extension beyond the RFC text) | `cease_when_limit_exceeded`, `cease_when_v6_limit_exceeded`, `idle_hold_inserted_when_restart_configured`, `no_idle_hold_without_restart`, `no_limit_when_unconfigured` (all per `pathvectord/RFC.md`) — this is one of the more thoroughly-tested corners of the codebase |
+| A BGP peer MAY close its connection at any time via NOTIFICATION(Cease) in the absence of a fatal error | Confirmed correct | Administrative shutdown already sends `NotificationError::Cease(CeaseError::AdministrativeShutdown)` on `ManualStop` (`fsm/mod.rs:341-350`, RFC 9003-covered elsewhere) | Existing RFC 9003 test coverage |
+
+**§6.7 summary:** 2 clauses reviewed, both confirmed correct — this is a
+genuinely solid corner of the codebase, worth noting since not every finding
+in this audit has been a gap.
+
+## §6.8 — BGP Connection Collision Detection
+
+**This section contains the most severe finding of the audit to date —
+verified with extra care (mechanical re-derivation from the RFC's literal
+numbered steps, cross-checked against the existing test's own behavior)
+given how surprising and consequential it is.**
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Detect simultaneous connections (collision) when both sides are in OpenConfirm (or OpenSent, optionally) for the same peer | Confirmed correct | `handle_incoming_connection` (`transport/mod.rs:617-675`) matches on `self.fsm.state()`, treating `OpenSent`/`OpenConfirm` as collision-candidate states and `Idle`/`Connect`/`Active` as not (matching the RFC's explicit "collision cannot be detected with connections in Idle, Connect, or Active" note) and `Established` as "always reject the new one" | — |
+| **Retain the connection *initiated by* the BGP speaker with the higher-valued BGP Identifier** | **Confirmed gap — inverted logic, high severity** | `handle_incoming_connection`'s `should_close_outbound = local_bgp_id > peer_id` (line 634-637) is backwards. Mechanically working through the RFC's own numbered procedure in this codebase's terms (where "the existing connection" is always the locally-*initiated*/outbound one, and "the newly received OPEN" is always the incoming one, confirmed via the function's own doc comment): Rule 2 says local_id < remote_id ⇒ close the *existing* (outbound), accept the *new* (incoming); Rule 3 says otherwise (local ≥ remote) ⇒ close the *new* (incoming), keep the *existing* (outbound). The code's condition does the **opposite of both**: it closes the outbound when *local* is higher (Rule 3 says keep it then) and keeps the outbound when *local* is lower (Rule 2 says close it then). This isn't a reading-comprehension slip on the implementer's part that happens to be harmless — I mechanically re-derived it twice, including working a concrete two-node example (A initiates Connection1 to B, B initiates Connection2 to A; whichever side has the lower ID should end up on Connection2 per RFC, but the code makes both sides converge on Connection1, initiated by the *lower*-ID side) and confirming it against the *existing test's own asserted outcome*: `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming` sets up a scenario where the **peer's** ID is higher, and asserts the session reaches `Established` over the **outbound** connection (see its final comment: "Complete the handshake — session keeps the outbound and reaches Established" — right after asserting `"expected Established after peer-wins collision"`). That is precisely backwards from the RFC: when the peer's ID is higher, the RFC says keep the **peer-initiated (incoming)** connection, not our own outbound one. The test locks in the inverted behavior as if it were the intended, correct outcome — which is exactly why this has never been caught. **Interop consequence, not just a labeling issue:** because the logic is self-consistent when two `pathvectord` instances talk to each other (both sides independently invert, and still agree on one surviving connection — see the worked derivation in the initial investigation), this would not show up as a crash or an obviously-broken session between two instances of this daemon. But against a *correctly*-implemented peer (GoBGP, BIRD, FRR, or any standards-compliant implementation) in a genuine simultaneous-connect race, each side would compute a *different* required survivor and each would close the connection the other side is trying to keep — a mutually-destructive collision resolution that could prevent the session from ever establishing in that specific race window, rather than gracefully converging on one connection as intended. Existing e2e interop suites don't appear to exercise a genuine simultaneous-connect race against GoBGP/BIRD/FRR specifically (the only test citing this is the in-process unit test above), so this has had no opportunity to surface. | Fix: invert the condition (`should_close_outbound` should be true when `local_bgp_id < peer_id`, matching RFC Rule 2) — then rewrite `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming`'s own assertion (its scenario, peer ID higher, should result in the **incoming** connection surviving, not the outbound one — the test's name will also need to change, since "peer_bgp_id_higher_rejects_incoming" describes the *current, wrong* behavior). A real-teeth verification (break the fix, confirm the corrected test fails, restore) is especially warranted here given how this exact kind of self-consistent-but-inverted bug can silently pass review. An e2e test with a genuine simultaneous-connect race against a real GoBGP/BIRD/FRR peer would give the strongest possible proof this actually interops correctly, beyond the unit level. |
+| Send NOTIFICATION(Cease, ConnectionCollisionResolution) on the connection closed as a result of collision resolution | **Confirmed gap** | Both `on_open_sent`'s and `on_open_confirm`'s `CollisionDetected` FSM arms (`fsm/mod.rs:354-358`, `446-454`) only emit `StopHoldTimer`/`StopKeepaliveTimer`/`CloseTcpConnection` — no `SendMessage` at all, let alone the `Cease`/`ConnectionCollisionResolution` NOTIFICATION (which does already exist as a codec-level type, `CeaseError::ConnectionCollisionResolution`, RFC 4486 subcode 7 — it's just never constructed anywhere outside tests/round-trip code). The existing `pathvectord/RFC.md` row claiming this was ✅ had `—` (no test) in its "Verified by" column, which should have been a signal — corrected to ❌ as part of this pass. | A test asserting `CollisionDetected` produces a `SendMessage(Notification(Cease/ConnectionCollisionResolution))` output before `CloseTcpConnection`, then wire up the missing `FsmOutput` in both arms |
+| Connection collision cannot be detected with connections in Idle, Connect, or Active states | Confirmed correct | Already covered above (first row) | — |
+| A collision with an existing `Established` connection causes the new connection to be closed (absent config otherwise) | Confirmed correct | `handle_incoming_connection`'s `State::Established` arm (line 666-673) unconditionally rejects the incoming connection — no config toggle exists to change this, which matches the RFC's default ("unless allowed via configuration") without needing to implement the optional override | — |
+
+**§6.8 summary:** 4 clauses reviewed — 2 confirmed correct, 2 confirmed gaps
+(one of which — the inverted BGP-ID comparison — is the most severe and
+highest-confidence finding of this audit so far, corrected in both
+`pathvectord/RFC.md` and the aggregate `RFC_REQUIREMENTS.md` §8 row).
+
+## §7 — BGP Version Negotiation
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Version negotiation itself (retrying with progressively lower version numbers on Unsupported Version Number) is a MAY-level feature; the only MUST is that future BGP versions retain the OPEN/NOTIFICATION message format | Confirmed correct — not applicable | This implementation only supports version 4 (`BGP_VERSION` constant, checked in `open.rs:39-43`) and makes no attempt at multi-version retry logic — since the retry mechanism itself is optional (MAY) and there is only one version to support, there's nothing to implement here. The one MUST (retain message format across versions) is trivially satisfied since there's only one version in play. This does compound with the already-noted §6.2 gap (Unsupported Version Number NOTIFICATION's Data field isn't populated), which would matter more if a real version-negotiation retry loop existed on either end — but since neither this implementation nor typical modern peers attempt version renegotiation in practice (BGP-4 has been the only deployed version for decades), this is low priority. | — |
+
+**§7 summary:** 1 clause reviewed, confirmed correct (not applicable).
+
+### RFC 4271 running total so far (§4, §5, §6.2–§6.8, §7)
+
+29 clauses reviewed — 20 confirmed correct, 6 confirmed gaps, 3 needs
+investigation. The two most severe findings are the inverted connection-
+collision BGP-ID comparison (§6.8) and the un-ignored eBGP LOCAL_PREF (§5.1.5)
+— both filed in `TODO.md`, neither fixed as part of this diagnostic pass.
+
+---
+
+*(Sections §1–3 and §8–§10 not yet covered by this audit pass — §8's
+connection-collision-coordination sub-topic is already covered above under
+§6.8, so what remains of §8 is the FSM state-transition table itself, largely
+already battle-tested via the earlier fault-injection work; §9 (decision
+process/update-send/MRAI) and §10 (timers) are next per the roadmap.)*
