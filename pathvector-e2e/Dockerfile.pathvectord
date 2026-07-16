@@ -68,11 +68,11 @@ COPY proto/               proto/
 RUN if [ "$CARGO_PROFILE" = "release" ]; then \
         cargo build --release -p pathvectord -p pathvector-e2e \
             --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer \
-            --bin mock_bgp_fault_peer; \
+            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer; \
     else \
         cargo build -p pathvectord -p pathvector-e2e \
             --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer \
-            --bin mock_bgp_fault_peer; \
+            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer; \
     fi
 
 # ── mock-rtr runtime ───────────────────────────────────────────────────────────
@@ -176,6 +176,37 @@ HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
     CMD nc -z 127.0.0.1 179 || exit 1
 
 ENTRYPOINT ["mock_bgp_fault_peer"]
+
+# ── mock-bgp-collision-peer runtime ─────────────────────────────────────────────
+#
+# A BGP peer that both listens *and* dials, used to force a real,
+# deliberately-sequenced TCP connection collision against pathvectord —
+# proving RFC 4271 §6.8 (connection collision resolution) and RFC 4724 §4.2
+# (Established-state Graceful-Restart override) against a genuine second TCP
+# connection, not just an in-process mock transport. Takes two CLI args
+# (pathvectord's dial target, then the scenario name — see
+# src/bin/mock_bgp_collision_peer.rs), passed at container-start time via
+# `.with_cmd([...])`.
+
+FROM debian:bookworm-slim AS mock-bgp-collision-peer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_collision_peer /usr/local/bin/mock_bgp_collision_peer
+
+# 179 — BGP, container-to-container only, never mapped to host.
+EXPOSE 179
+
+# The healthcheck only confirms the listener is bound — it passes regardless
+# of which scenario the container is running, since every scenario binds
+# :179 immediately at startup before any scenario-specific logic runs.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 179 || exit 1
+
+ENTRYPOINT ["mock_bgp_collision_peer"]
 
 # ── pathvectord runtime (default stage — see the note at the top of this file) ─
 
