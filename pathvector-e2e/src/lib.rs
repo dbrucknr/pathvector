@@ -4983,6 +4983,52 @@ pub async fn wait_for_frr_rib_entry(
     }
 }
 
+/// Polls `vtysh -c "show bgp neighbors <peer_ip> json"` until
+/// `gracefulRestartInfo.rBit` matches `expected`.
+///
+/// FRR updates this field asynchronously after receiving pathvectord's OPEN,
+/// independent of when pathvectord itself reports the session `Established` —
+/// so a single point-in-time check can race FRR's own internal state update.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before `rBit` reaches `expected`.
+pub async fn wait_for_frr_gr_rbit(
+    container_id: &str,
+    peer_ip: &str,
+    expected: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_json = String::new();
+    loop {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "vtysh",
+                "-c",
+                &format!("show bgp neighbors {peer_ip} json"),
+            ])
+            .output();
+        if let Ok(o) = output {
+            let json = String::from_utf8_lossy(&o.stdout).into_owned();
+            let has_rbit = json.contains(r#""rBit": true"#) || json.contains(r#""rBit":true"#);
+            if has_rbit == expected {
+                return Ok(());
+            }
+            last_json = json;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for FRR rBit={expected} for peer {peer_ip};\n\
+                 last gracefulRestartInfo from FRR:\n{last_json}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Extracts the NEXT_HOP FRR stores for `prefix` from `vtysh show bgp` output.
 ///
 /// Returns `None` if the prefix is absent or the next-hop line cannot be parsed.
