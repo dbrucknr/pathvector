@@ -172,11 +172,15 @@ list; NOTIFICATION for unsupported capabilities.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | Optional parameter type 2 TLV parsed as capability list | `src/message/` | ✅ | `test_capability_tlv_roundtrip` |
+| Multiple Capabilities Optional Parameters in one OPEN (not just one) MUST be accepted and processed identically to a single parameter | `src/message/open.rs` `decode_capabilities` | ✅ | Added 2026-07-16 by `RFC_AUDIT.md` — the outer loop over optional parameters appends every type-2 parameter's capability TLVs into the same flat `Vec`, regardless of how many separate type-2 parameters there are |
+| Peer capability we don't recognize MUST be silently ignored — no NOTIFICATION, no session termination | `src/message/open.rs`, `src/fsm/mod.rs` | ✅ | Added 2026-07-16 — unrecognized capability codes decode to `Capability::Unknown` (not an error); grepped the FSM/daemon for any special-casing of `Capability::Unknown` — none exists, it's inert data |
 | NOTIFICATION error code 2 subcode 7 (Unsupported Capability) on mismatch | `src/message/` | ✅ | `test_unsupported_capability_notification` |
-| Retry without capabilities (when peer sends Unsupported Capability NOTIFICATION) | `src/fsm/mod.rs` | ❌ | — |
+| §5: Data field of an Unsupported Capability NOTIFICATION MUST encode each capability "in the same way as it would be encoded in the OPEN message" (full Code/Length/Value, not just the code) | `src/fsm/mod.rs` `encode_unsupported_capabilities` | ❌ | Added 2026-07-16 by `RFC_AUDIT.md` — `encode_unsupported_capabilities` (`fsm/mod.rs:759-766`) deliberately encodes each capability as `[code, 0x00]`, explicitly omitting the actual Capability Value ("we only need the code to identify the capability"). This doesn't match the RFC's explicit wording, which calls for the full OPEN-style encoding (real length, real value bytes) — a real, if diagnostic-only-impact, gap: the peer receiving this NOTIFICATION can't see *which* variant of a multi-value capability (e.g. which AFI/SAFI) triggered the rejection, only the bare capability code. |
+| Retry without capabilities (when peer's TCP response indicates it doesn't support capabilities advertisement at all) | `src/fsm/mod.rs` | ❌ | — corrected citation 2026-07-16: this deferred item previously described the trigger as "NOTIFICATION error 2/7" (Unsupported Capability), but that's the *wrong* scenario — subcode 7 is what *we* send when *we* require a capability the peer lacks, and RFC 5492 §3 says explicitly "If terminated, such peering SHOULD NOT be re-established automatically" for that case. The retry-without-capabilities behavior is actually keyed on receiving subcode **4** (Unsupported Optional Parameter — RFC 4271's own pre-existing mechanism, triggered when the *peer* doesn't understand the Capabilities Optional Parameter at all): "the speaker SHOULD attempt to re-establish a BGP connection with the peer without sending... the Capabilities Optional Parameter." Still unimplemented either way, but the description now points at the right trigger for whoever picks this up. |
 
-**Deferred:** Retry-without-capabilities path: when the peer sends NOTIFICATION error 2/7,
-we should reconnect advertising no optional parameters. Not yet implemented.
+**Deferred:** Retry-without-capabilities path (see corrected description above,
+keyed on subcode 4, not 7) — not yet implemented. Full-value encoding for
+Unsupported Capability NOTIFICATION Data (see row above) — see `TODO.md`.
 
 ---
 

@@ -668,5 +668,99 @@ given how easily it's triggered in ordinary operation.
 
 ---
 
-*(Per the roadmap, next up: the already-flagged ⚠️ items — RFC 5492, RFC
-6793, RFC 6396 — then RPKI/BMP, then the encode-only RFCs.)*
+# RFC 5492 — Capabilities Advertisement with BGP-4
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc5492 (395 lines,
+short), read in full; cross-checked against `pathvector-session/src/message/open.rs`
+(`decode_capabilities`) and `fsm/mod.rs` (`encode_unsupported_capabilities`,
+required-capability check).
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Multiple Capabilities Optional Parameters (not just one) in a single OPEN MUST be accepted, processed identically to one parameter listing everything | Confirmed correct | `decode_capabilities`'s outer loop iterates every optional parameter and appends every type-2 parameter's TLVs into one flat `Vec` — naturally handles the split-across-parameters case with no special code needed | — |
+| A capability code the local speaker doesn't recognize MUST be silently ignored — no NOTIFICATION, no termination | Confirmed correct | Unrecognized codes decode to `Capability::Unknown` (not an error); grepped the FSM/daemon for any special-casing of `Capability::Unknown` — none exists anywhere, it's inert | — |
+| Genuinely identical duplicate capability instances MUST be accepted without special handling (differing-value duplicates are per-capability-specific, see the RFC 4724/9234 findings above) | Confirmed correct — clarifies, doesn't contradict, the two earlier findings | This RFC's own text explicitly defers "what differing-value duplicates mean" to *the document introducing the capability* — meaning the RFC 4724 GR "last wins" rule and the RFC 9234 Role "reject on differing values" rule aren't generic RFC 5492 requirements being violated in a new way; they're capability-specific rules this project's generic decode loop doesn't special-case for either capability. Not a new finding — just confirms the earlier two are correctly scoped. | Same fixes as the earlier findings |
+| §5: Data field of the Unsupported Capability NOTIFICATION MUST encode each capability "in the same way as it would be encoded in the OPEN message" | **Confirmed gap** | `encode_unsupported_capabilities` (`fsm/mod.rs:759-766`) builds the Data field as `[code, 0x00]` pairs for each unsupported capability — deliberately omitting the actual Capability Value ("we only need the code to identify the capability," per its own comment). This doesn't match "encoded the same way as in the OPEN message," where the same capability would carry its real length and value bytes. Diagnostic-quality impact only (the peer can see *that* a capability was rejected and which code, just not *which variant* — e.g. which specific AFI/SAFI — caused it), not a correctness/security issue. No test covers this specific encoding detail. | A test asserting the NOTIFICATION Data field for a rejected `MultiProtocol(AFI=2,SAFI=1)` capability contains the full `[code, len=4, afi, reserved, safi]` bytes, not just `[code, 0]` — then fix `encode_unsupported_capabilities` to re-encode the actual capability instead of a placeholder |
+| Existing deferred item: "retry without capabilities" trigger citation | Documentation correction, not a new gap | The existing `pathvector-session/RFC.md` deferred item described this as triggered by receiving subcode 7 (Unsupported Capability) — but subcode 7 is what *this* speaker sends when *it* requires a capability the peer lacks, and the RFC explicitly says peering terminated this way "SHOULD NOT be re-established automatically." The actual trigger for "retry without capabilities" is subcode **4** (Unsupported Optional Parameter — RFC 4271's pre-existing mechanism, for when the *peer* doesn't understand the Capabilities Optional Parameter at all). Corrected the citation so whoever eventually implements this builds the right behavior for the right subcode; still unimplemented either way. | — |
+
+**RFC 5492 summary:** 5 clauses reviewed — 4 confirmed correct (2 of which
+clarify/reinforce earlier findings rather than introduce new ones), 1
+confirmed gap (low severity, diagnostic-quality). Filed in `TODO.md` (#20).
+
+---
+
+# RFC 6793 — BGP Support for Four-Octet AS Number Space
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc6793 (675 lines),
+read in full (§3 protocol extensions, §4 operations including the §4.2.3
+reconstruction algorithm, §5 communities, §6 error handling); cross-checked
+against `pathvector-session` (codec + `AsPath::downgrade_for_two_byte_peer`)
+and `pathvectord/src/daemon/route.rs` (ingest attribute-processing loop).
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| NEW-NEW interaction: FourByteAsn capability negotiated → encode AS_PATH/AGGREGATOR with real 4-byte ASNs; AS4_PATH/AS4_AGGREGATOR MUST NOT be sent between two NEW speakers, and MUST be discarded (not error) if received anyway | Confirmed correct | `route_to_attributes` only emits `As4Path` when `!peer_four_byte` (downgrade case) — never between two 4-byte-capable peers. On ingest, `handle_update`'s attribute loop has no arm for `PathAttribute::As4Path`/`As4Aggregator` at all — they fall through a catch-all, silently discarded regardless of peer capability, which happens to satisfy "MUST discard, don't error" trivially (see the gap noted below for why this isn't fully correct for the *other* direction) | — |
+| NEW-OLD interaction (generating): 2-byte AS_PATH with AS_TRANS for non-mappable ASNs; AS4_PATH sent unless *all* ASNs are mappable | Confirmed correct | `AsPath::downgrade_for_two_byte_peer` (per `pathvectord/RFC.md`'s existing citations) implements exactly this | Existing test suite |
+| **NEW-OLD interaction (receiving): reconstruct the true AS path from AS_PATH + AS4_PATH (§4.2.3's length-comparison-and-prepend algorithm); reconcile AGGREGATOR/AS4_AGGREGATOR (§4.2.3)** | **Confirmed gap — already honestly tracked, not new, but now independently verified rather than trusted from the doc** | Grepped `pathvectord/src/daemon/route.rs`'s entire attribute-processing loop: no arm exists for `PathAttribute::As4Path` or `As4Aggregator` on ingest at all — they're silently discarded via the catch-all, meaning **the real 4-byte AS path information is never reconstructed or used** when this daemon (as a NEW speaker) receives an UPDATE from a genuinely 2-byte-ASN-only OLD peer. The existing `pathvector-session/RFC.md` row already says exactly this ("segment merging logic per RFC 6793 §4.2.3 is not complete") — this pass independently confirmed that description is accurate by reading the code directly, rather than taking the doc's word for it. Real-world impact is low and shrinking: genuinely 2-byte-ASN-only BGP speakers have been rare since around 2009; this project's own interop targets (GoBGP, BIRD, FRR) are all NEW speakers. Not filing a new TODO item since this is already tracked. | Implement the §4.2.3 algorithm: compare AS_PATH/AS4_PATH segment counts, prepend the leading AS_PATH segments to AS4_PATH when AS_PATH is longer, reconcile AGGREGATOR vs. AS4_AGGREGATOR based on whether AGGREGATOR's ASN is AS_TRANS |
+| AS_CONFED_SEQUENCE/AS_CONFED_SET MUST NOT appear in AS4_PATH; if received from an OLD peer, MUST discard those segments (not the whole attribute) and continue | Not independently verified — subsumed by the gap above | Since AS4_PATH isn't used at all on ingest, this specific sub-case can't be meaningfully checked independently of the larger reconstruction gap | Part of the same future reconstruction work |
+| §6 error handling: malformed AS4_PATH (bad length/segment) or AS4_AGGREGATOR (length ≠ 8) → attribute discard, not session reset | Confirmed correct (trivially, via the same fallthrough) | Since these attributes are never inspected for validity on ingest at all, they're unconditionally "discarded" regardless of whether they'd have been malformed — coincidentally satisfies this clause's prescribed remediation, for the same underlying reason (total absence of handling) that causes the reconstruction gap above | Same as the reconstruction work above |
+| §5: AS numbers in BGP Communities (RFC 1997) don't work for non-mappable 4-byte ASNs; such speakers should use 4-byte-ASN-specific extended communities instead | Not applicable / no finding | This is guidance about what *other* speakers with non-mappable ASNs should do when constructing communities, not a requirement on how this project processes communities it receives — no code path to check | — |
+
+**RFC 6793 summary:** 5 clauses reviewed — 3 confirmed correct (2 of those
+by the same coincidental fallthrough), 1 already-tracked gap now
+independently confirmed rather than assumed, 1 not independently
+verifiable given the larger gap. No new `TODO.md` item — the existing
+deferred entry in `pathvector-session/RFC.md` already accurately describes
+this.
+
+---
+
+# RFC 6396 — MRT Routing Information Export Format
+
+**Audited:** 2026-07-16 (scoped)
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc6396 (1851 lines);
+read §4.3 (TABLE_DUMP_V2, the only subtype this project implements) in
+detail rather than the full spec (OSPFv2/ISIS/OSPFv3 record types are
+entirely irrelevant to this project). Cross-checked against
+`pathvector-mrt/src/mrt.rs`.
+
+**Scope note, confirmed by reading the module's own doc comment before
+checking anything else:** `pathvector-mrt` is explicitly documented as "a
+minimal MRT TABLE_DUMP_V2 parser for RIB_IPV4_UNICAST entries... only the
+record types needed for IPv4 unicast replay are implemented; all others
+are silently skipped... the goal is prefix diversity, not per-peer
+attribute fidelity." This is a deliberately narrow test-data-extraction
+utility (feeding realistic prefixes into fuzz/stress targets), not an
+attempt at a general-purpose or fully-compliant MRT reader/writer. Given
+that explicitly-stated scope, auditing it against the full RFC (write
+side, PEER_INDEX_TABLE parsing, RIB_GENERIC, multicast/IPv6 subtypes) would
+be measuring it against a goal it never claimed — `RFC_REQUIREMENTS.md`'s
+existing ⚠️ ("parsing implemented, write/export side not started") already
+honestly describes this, and this pass didn't find anything to correct
+there.
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| RIB_IPV4_UNICAST record body: sequence_number(4) + prefix_len(1) + prefix(variable, `div_ceil(8)` bytes) + entry_count(2) + RIB Entries | Confirmed correct | `parse_rib_ipv4` (`mrt.rs:77-128`) decodes exactly this layout, field by field, matching RFC 6396 §4.3.2's Figure 8 precisely | Existing unit tests in `mrt.rs` |
+| RIB Entry format: peer_index(2) + originated_time(4) + attribute_length(2) + attrs | Confirmed correct | Matches RFC 6396 §4.3.4 exactly — peer_index and originated_time are correctly skipped (not needed for this tool's stated purpose of prefix/attribute extraction, not per-peer fidelity), attribute bytes correctly bounded by the declared length | Existing unit tests |
+| PEER_INDEX_TABLE, RIB_GENERIC, IPv6/multicast RIB subtypes, write/export side | Out of scope, already accurately tracked | Deliberately unimplemented per the module's own stated purpose — not re-litigated as a gap | Already tracked in `RFC_REQUIREMENTS.md` |
+
+**RFC 6396 summary:** 2 clauses reviewed for the implemented subtype, both
+confirmed correct. No new findings — the existing ⚠️ tracking is accurate
+and this pass didn't need to change anything.
+
+### Roadmap items #5 batch summary
+
+3 RFCs covered this round — 1 new confirmed gap (RFC 5492, low severity),
+2 RFCs where the pass confirmed existing tracking was already accurate
+(RFC 6793, RFC 6396) rather than finding anything new. Not every RFC in
+this audit needs to produce a discovery; confirming an existing ⚠️ is
+accurate (or correcting *why* it's ⚠️, as with the RFC 5492 subcode
+citation) is itself a useful outcome.
+
+---
+
+*(Per the roadmap, next up: RPKI (RFC 6810/6811/8210) and the BMP scaffold
+(RFC 7854), then the encode-only RFCs.)*

@@ -474,6 +474,29 @@ below deserves prompt attention):
   means AGGREGATOR data from 2-byte peers can never actually be
   retained. See `RFC_AUDIT.md`'s RFC 7606 §7.7.
 
+**20. RFC 5492 (Capabilities Advertisement) gap found by systematic clause
+audit** — found 2026-07-16 (diagnostic only, not fixed here). Low severity,
+diagnostic-quality only:
+
+- **Unsupported Capability NOTIFICATION's Data field omits the actual
+  capability value.** RFC 5492 §5 requires each rejected capability be
+  "encoded in the same way as it would be encoded in the OPEN message"
+  (full Code/Length/Value). `encode_unsupported_capabilities`
+  (`pathvector-session/src/fsm/mod.rs:759-766`) deliberately encodes
+  `[code, 0x00]` only, omitting the value. This means a peer receiving
+  this NOTIFICATION can see *that* a capability was rejected and its
+  code, but not *which variant* (e.g. which specific AFI/SAFI) caused
+  the rejection — a diagnostics/debuggability gap, not a correctness or
+  security issue. See `RFC_AUDIT.md`'s RFC 5492 section.
+
+RFC 6793 and RFC 6396 were also audited this round — no new gaps found;
+both RFCs' existing ⚠️ tracking in `RFC_REQUIREMENTS.md` was independently
+confirmed accurate rather than just trusted. See `RFC_AUDIT.md` for detail
+(RFC 6793's already-tracked §4.2.3 reconstruction gap was independently
+re-verified by reading the code directly; RFC 6396's `pathvector-mrt` is a
+deliberately narrow test-data utility, not a general MRT implementation,
+and its stated scope was confirmed accurate rather than treated as a gap).
+
 ---
 
 ## General
