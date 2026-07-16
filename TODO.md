@@ -497,6 +497,46 @@ re-verified by reading the code directly; RFC 6396's `pathvector-mrt` is a
 deliberately narrow test-data utility, not a general MRT implementation,
 and its stated scope was confirmed accurate rather than treated as a gap).
 
+**21. RPKI (RFC 8210/6810/6811) gaps found by systematic clause audit** —
+found 2026-07-16 (diagnostic only, not fixed here). `pathvector-rpki` is
+unusually mature (already has a documented bug-fix history from a prior
+audit pass); these 2 gaps are narrower than most other findings in this
+audit:
+
+- **RTR Error Code 2 ("No Data Available") is treated the same as the 8
+  genuinely fatal error codes.** RFC 8210 §12 explicitly marks code 2 as
+  the *one* non-fatal error, meaning the session shouldn't necessarily be
+  torn down for it — it signals a transient "cache still rebuilding"
+  condition, and the router should keep retrying with Reset Queries. The
+  `Pdu::ErrorReport` handling in `pathvector-rpki/src/client.rs` (lines
+  443-460) only special-cases `ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION`;
+  every other code, including 2, falls through to a uniform
+  `return Err(RtrError::ErrorReported {...})`. Likely still eventually
+  resyncs via the existing generic reconnect-with-backoff mechanism, so
+  low severity, but doesn't honor the RFC's specific intent. See
+  `RFC_AUDIT.md`'s RFC 8210 section.
+- **Route Origin ASN derivation doesn't apply RFC 6811's substitution
+  rule for AS_PATHs ending in a confederation segment (new finding, not
+  previously suspected).** RFC 6811 §2 defines a specific three-way rule
+  for deriving the ASN used in ROV lookups: AS_SEQUENCE-final uses its
+  rightmost ASN; AS_CONFED_SEQUENCE/AS_CONFED_SET-final (or empty path)
+  substitutes *the local speaker's own AS number*; any other final
+  segment type yields a "never matches" sentinel. `AsPath::origin_as()`
+  (`pathvector-types/src/aspath.rs:307-312`) instead searches backward
+  past confederation/Set segments for the nearest earlier plain
+  `Sequence` segment — a materially different AS number can end up
+  being checked against the VRP database in a confederation deployment
+  (this project supports RFC 5065 confederations), which could flip a
+  Valid/Invalid/NotFound verdict incorrectly. This function is shared
+  beyond ROV (`pathvector-rib/adj_rib_in.rs`, `pathvector-policy/action.rs`),
+  so a fix needs to thread the local ASN into its signature — a real API
+  change, not a one-line patch. See `RFC_AUDIT.md`'s RFC 6811 section.
+
+BMP (RFC 7854) was also checked this round: confirmed `pathvector-bmp` is
+honestly and completely unimplemented (every row ❌, explicit "Deferred:
+Everything" note) — no code exists to audit, so no findings possible.
+`RFC_REQUIREMENTS.md`'s ❌ status is accurate as-is.
+
 ---
 
 ## General

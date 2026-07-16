@@ -762,5 +762,89 @@ citation) is itself a useful outcome.
 
 ---
 
-*(Per the roadmap, next up: RPKI (RFC 6810/6811/8210) and the BMP scaffold
-(RFC 7854), then the encode-only RFCs.)*
+# RFC 8210 / RFC 6810 — The RPKI-to-Router Protocol (v1 / v0)
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc8210 (1963 lines);
+RFC 6810 (v0) treated as a subset per this project's own architecture (v0 is
+a decode/encode branch of the same code, not a separate implementation, per
+the existing `pathvector-rpki/RFC.md`). Read §8.3/§8.4 (protocol sequences
+for degraded-cache scenarios) and §12 (Error Codes) in detail, since those
+are the parts most likely to have an easy-to-miss distinction baked into
+the spec; cross-checked against `pathvector-rpki/src/client.rs`.
+
+**Overall finding: this crate is unusually mature** — it already has a
+documented bug-fix history from a prior audit (`pathvector-rpki/RFC.md`'s
+"Bug fixed 2026-07-02" note on `set_import_default` clobbering the ROV
+term), extensive proptest coverage cross-checked against a naive
+reference model, and honest tracking of what's deferred (SSH transport,
+ASPA). One real gap found regardless.
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| §12: Error Code 2 ("No Data Available") is explicitly **not** marked fatal — session should stay usable, router should issue periodic Reset Queries until the cache recovers. All 8 other error codes (0,1,3,4,5,6,7,8) are explicitly "(fatal): ... MUST cause the session to be dropped." | **Confirmed gap, low-to-moderate severity** | `client.rs`'s `Pdu::ErrorReport` handling (lines 443-460) has one special-cased arm for `ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION` (version-fallback logic) and a catch-all for every other `error_code` that uniformly `return Err(RtrError::ErrorReported {...})` — code 2 is not distinguished from the 8 genuinely fatal codes. In practice this likely still resyncs eventually: this client already has a general reconnect-with-backoff mechanism for transport failures, so an `Err` here probably routes into the same reconnect loop, which would re-issue a Reset Query on the new connection — a *coarser* version of "periodic Reset Queries" than the RFC's apparent intent (keep the session, just retry queries) but not a total failure to recover. The gap is real: the RFC explicitly singles out code 2 as non-fatal specifically so implementations *don't* need to tear down and re-establish the TCP session for what's expected to be a transient "cache still rebuilding after restart" condition, and this implementation doesn't make that distinction. | A test injecting an `ErrorReport` with `error_code = 2` in response to a Serial/Reset Query, asserting the session/connection is *not* torn down and a Reset Query is retried on a timer without a full reconnect — then add a dedicated match arm for code 2 that keeps the connection alive and schedules a retry, distinct from the generic fatal-error path |
+| §8.3: Cache Reset in response to Serial Query (cache lost state / can't serve incremental) → router MUST issue a Reset Query (full resync) | Confirmed correct | `cache_reset_mid_stream_triggers_full_resync_on_same_connection` (per `pathvector-rpki/RFC.md`) | Existing test suite |
+| §7: Protocol version negotiation, v1→v0 fallback on Unsupported Protocol Version error, and the "server silently answers at v0 without an ErrorReport" case | Confirmed correct | Both paths explicitly handled and tested (`server_silently_replies_at_v0_without_error_report`, `v1_rejected_falls_back_to_v0_and_completes_sync`) — this pass re-read the RFC 8210 §7 text and confirmed the code's own comments accurately describe the two distinct server behaviors this handles | Existing test suite |
+| Session ID validation, PDU length bound before allocation, Router Key PDU decode-and-discard (no BGPsec) | Confirmed correct (cross-referenced) | Already well-tested per existing `pathvector-rpki/RFC.md` citations; Router Key discard is a deliberate, correctly-scoped choice given this project has no BGPsec support anywhere | Existing test suite |
+| Client-side serial number handling: does this component need RFC 1982-style wraparound-aware serial comparison? | Confirmed correct — not applicable | This project is an RTR *client* only, not a cache/server. Wraparound-aware serial ordering is the *cache's* responsibility (deciding whether it can serve an incremental update from a given serial) — the client only remembers its own last-seen serial and asks for updates since then; it never needs to compare two arbitrary serials for recency itself. No wraparound-comparison logic exists, and none is needed. | — |
+
+**RFC 8210/6810 summary:** 5 clauses reviewed — 4 confirmed correct, 1
+confirmed gap. Filed in `TODO.md` (#21).
+
+---
+
+# RFC 6811 — BGP Prefix Origin Validation
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc6811 (563 lines),
+read in full including the §2.1 pseudo-code; cross-checked against
+`pathvector-types/src/aspath.rs` (`AsPath::origin_as`), `pathvector-policy/src/rpki.rs`,
+and `pathvector-rpki/src/table.rs`.
+
+**This section contains a genuinely new, previously-unnoticed finding,
+verified carefully given its subtlety.**
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| §2 validation algorithm (Covered/Matched/Valid/Invalid/NotFound, iterate all covering VRPs not just longest-match) | Confirmed correct | `roa_table.rs`'s validate logic already cross-checked against a naive reference model via `proptest: family_table_agrees_with_naive_model`, plus dedicated tests for the "less-specific ROA validates when more-specific doesn't" and "multiple overlapping ROAs, no match is Invalid not NotFound" cases the pseudo-code implies | Existing extensive test suite |
+| §3: MUST support four-octet AS numbers | Confirmed correct | ROA table and `Asn` type are 4-byte throughout (RFC 6793 already separately audited) | — |
+| §2: "Route Origin ASN" derivation — **final AS_PATH segment determines this, with a specific three-way rule, not a generic backward search**: (1) final segment is `AS_SEQUENCE` → rightmost ASN of that segment; (2) final segment is `AS_CONFED_SEQUENCE`/`AS_CONFED_SET`, **or the AS_PATH is empty** → substitute **the BGP speaker's own AS number**; (3) final segment is any other type (e.g. a terminal `AS_SET`) → the distinguished value "NONE" (can never Match any VRP) | **Confirmed gap — new finding, not previously tracked** | `AsPath::origin_as()` (`pathvector-types/src/aspath.rs:307-312`) is `self.segments.iter().rev().find_map(\|seg\| match seg { Sequence(asns) => asns.last().copied(), _ => None })` — this walks **backward through all segments looking for the first `Sequence`-type segment**, silently skipping over `Set`/`ConfedSequence`/`ConfedSet` segments if they're at the end, rather than applying the RFC's specific substitution rule for those cases. Concretely: (a) if the AS_PATH ends in a confederation segment (a real, supported scenario — this project implements RFC 5065 confederations), the RFC says use **this speaker's own AS number**, but the code instead returns whatever ASN is in the **nearest preceding plain `Sequence` segment** — a materially different (and likely wrong) AS number gets checked against the VRP database, which could flip a Valid/Invalid/NotFound verdict incorrectly in either direction. (b) if the AS_PATH ends in a plain (non-confederation) `Set` segment, the RFC says the result must be "NONE" (never matches any VRP), but the code again searches backward and may return an earlier segment's ASN instead of the required non-matching sentinel. (c) for an empty AS_PATH, the RFC says substitute the local ASN; the code returns `None` — lower practical impact since import-policy ROV is only invoked on peer-received routes, which structurally always carry at least one ASN in a real deployment, but still technically divergent from the RFC text. This function is not RPKI-specific — it's a shared `pathvector-types` utility also used by `pathvector-rib/adj_rib_in.rs` and `pathvector-policy/action.rs` — so this isn't confined to just the ROV path. | Three tests: (1) an AS_PATH ending in `ConfedSequence`, asserting `origin_as()` returns the *locally configured* ASN (this requires threading the local ASN into the function, which it currently doesn't take as a parameter — a real API change, not a one-line fix); (2) an AS_PATH ending in a plain `Set`, asserting `origin_as()` returns a value that can never Match any VRP (`None`, or a dedicated sentinel, rather than an earlier segment's ASN); (3) an empty AS_PATH, asserting the local-ASN substitution. This is a genuine, if narrow (confederation + ROV together), correctness gap worth its own scoped PR rather than a quick fix, since it changes the function's signature. |
+
+**RFC 6811 summary:** 3 clauses reviewed — 2 confirmed correct (one very
+thoroughly, via existing proptest-vs-naive-model coverage), 1 new confirmed
+gap. Filed in `TODO.md` (#21).
+
+---
+
+# RFC 7854 — BGP Monitoring Protocol (BMP)
+
+**Audited:** 2026-07-16 (confirmation only)
+**Method:** Read `pathvector-bmp/RFC.md` directly rather than the full RFC
+text, since the crate's own documentation is unambiguous and there is no
+code to check against the spec.
+
+**Finding: nothing to audit.** `pathvector-bmp` is honestly, completely
+unimplemented — every requirement row is ❌, with an explicit "Deferred:
+Everything" note and a numbered implementation plan already sketched for
+whenever this work is picked up. Fetching and reading the full RFC 7854
+text to produce a fresh clause-by-clause requirements list would just
+duplicate the existing, already-accurate stub document without finding
+anything, since there's no implementation to check it against. Confirmed
+`RFC_REQUIREMENTS.md`'s ❌ status is accurate; no changes needed.
+
+---
+
+### RPKI/BMP round summary
+
+RFC 8210/6810: 1 gap (Error Code 2 handling). RFC 6811: 1 gap (origin-ASN
+derivation for confederation/Set-terminal paths — genuinely new, not
+previously suspected, found by reading the RFC's precise definitions
+rather than assuming the "obvious" backward-search implementation was
+equivalent to them). RFC 7854 (BMP): confirmed already-accurate, no code
+to find anything in. Both new gaps filed in `TODO.md` (#21).
+
+---
+
+*(Per the roadmap, next up: the encode-only RFCs — 1997, 4360, 8092,
+SAFI-constant RFCs, 6996, 1930, 5065 — lowest audit value, mostly static
+encode/decode already covered by round-trip tests and proptests.)*
