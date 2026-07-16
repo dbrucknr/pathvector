@@ -428,8 +428,8 @@ narrower:
 
 **19. HIGHEST PRIORITY — RFC 7606 gaps found by systematic clause audit,
 including the most operationally severe finding of the entire audit** —
-found 2026-07-16 (diagnostic only, not fixed here, but the first item
-below deserves prompt attention):
+found 2026-07-16 (diagnostic only, not fixed here except the first item
+below, which deserved prompt attention):
 
 - **Missing well-known mandatory attribute (ORIGIN/AS_PATH/NEXT_HOP)
   tears down the whole session instead of treating just that route as
@@ -450,7 +450,25 @@ below deserves prompt attention):
   RFC 7606 exists to eliminate. See `RFC_AUDIT.md`'s RFC 7606 §3 section
   for full detail. Corrected the misleading `pathvector-session/RFC.md`
   row and the earlier RFC 4271 §5 verdict (left visible with a
-  correction note rather than silently edited).
+  correction note rather than silently edited). **Fixed 2026-07-16**
+  (`fix/rfc7606-missing-mandatory-attribute`): the mandatory-attribute
+  branch now withdraws the affected route (Adj-RIB-In and LocRib) instead
+  of returning a NOTIFICATION; every sibling test asserting the old
+  session-reset behavior (unit-level, the event-loop integration test,
+  and the drain-loop regression test) was rewritten, not just the one
+  named above. Proven at the wire level too: `pathvector-e2e`'s
+  `mock_bgp_fault_peer` gained a `missing-origin` scenario sending a
+  genuinely malformed UPDATE through pathvectord's real listener and
+  decode path, asserting both that the route is withdrawn and that the
+  fault peer's own session stays Established — real-teeth verified by
+  reverting the fix, rebuilding the actual Docker image, and confirming
+  that exact test fails first. The IPv6/MP_REACH_NLRI side of the same
+  fix (`treat_as_withdraw_v6` in `route.rs`) initially shipped with *zero*
+  test coverage — every test above used traditional IPv4 NLRI only; added
+  `missing_origin_withdraws_preexisting_v6_route_for_same_prefix`
+  (`pathvectord/src/daemon/mod.rs`) to close that gap, real-teeth verified
+  by reverting just the v6 drain block (not the already-covered v4 logic)
+  and confirming this specific test — and only this one — fails.
 - **Duplicate-attribute handling is wrong in both directions.**
   `decode_path_attributes`'s duplicate check treats every repeated
   attribute — regardless of type — as `TreatAsWithdraw`. RFC 7606 §3(g)
