@@ -137,7 +137,7 @@ rules). Cross-checked against `pathvector-session` (attribute codec),
 
 | Clause | Confidence | Notes | What would close this out |
 |---|---|---|---|
-| Mandatory table: ORIGIN/AS_PATH/NEXT_HOP mandatory for both eBGP and iBGP when NLRI present | Confirmed correct | `handle_update` (`pathvectord/src/daemon/route.rs:1011-1049`) checks `has_origin`/`has_as_path`/(NEXT_HOP for traditional v4) whenever any announce is present, regardless of peer type, and sends `MissingWellKnownAttribute` with the correct type code in Data | `missing_origin_returns_notification_data_type_code_1`, `missing_as_path_returns_notification_data_type_code_2`, `missing_next_hop_for_traditional_ipv4_returns_notification_data_type_code_3` (per `pathvectord/RFC.md`) |
+| Mandatory table: ORIGIN/AS_PATH/NEXT_HOP mandatory for both eBGP and iBGP when NLRI present | **Correction (2026-07-16): verdict revised from "Confirmed correct" to Confirmed gap** — see the RFC 7606 section below | `handle_update` (`pathvectord/src/daemon/route.rs:1011-1049`) checks `has_origin`/`has_as_path`/(NEXT_HOP for traditional v4) and sends `MissingWellKnownAttribute` with the correct type code in Data — this part is genuinely correct against the *raw RFC 4271 text*, which is why this row was originally marked confirmed-correct during the RFC 4271 pass. But RFC 7606 §3(d) (audited afterward, see below) explicitly revises this exact clause: a missing well-known mandatory attribute MUST now be handled via "treat-as-withdraw", not session-reset-via-NOTIFICATION. This project sends a NOTIFICATION and tears down the session, which was correct under RFC 4271 alone but is superseded and wrong once RFC 7606 (which this project otherwise heavily relies on and correctly implements for other attributes) is taken into account. Left visible here, not deleted, as a reminder that a "confirmed correct" verdict is only as good as the set of RFCs checked at the time — this is exactly why the roadmap always planned a dedicated RFC 7606 pass after RFC 4271, rather than treating RFC 4271 alone as sufficient. | See RFC 7606 section below for full detail |
 | Unrecognized transitive optional attributes SHOULD be accepted and MUST be passed to other peers with Partial bit set to 1; unrecognized non-transitive attributes MUST be quietly ignored and not passed along | **Confirmed gap** | `Route<A>` (`pathvector-rib/src/route.rs:76-117`) and its `RareAttrs` companion have no field of any kind for an opaque/unrecognized attribute — communities, cluster_list, aggregator, originator_id, otc are the only "rare" slots. `AdjRibIn`/`AdjRibOut` store the same `Route<A>` (confirmed via `adj_rib_in.rs:42`), and `route_to_attributes` (`pathvectord/src/outbound.rs:35-104`, the function that assembles the outbound attribute list for re-encoding) has no `PathAttribute::Unknown` arm. So *any* unrecognized attribute — transitive or not — is unconditionally dropped the moment a route is accepted into the RIB; there is no path by which a transitive-optional attribute this implementation doesn't know about could survive being relayed through this router. This is a real transit-correctness concern, not just a completeness gap: any future/foreign BGP path attribute riding through this router as a transit AS would be silently stripped. Note the *existing* `pathvector-session/RFC.md` row "Unknown optional transitive attributes preserved in Partial flag ✅" is accurate only at the codec round-trip level (decode a message, re-encode the *same* message object) — it says nothing about the RIB-pipeline path this finding is about, and shouldn't be read as covering it. | This is a real design gap, not a one-line fix — would need an `unknown_attrs: Vec<{flags, type_code, value}>` (or similar) field threaded through `Route`/`RareAttrs`, `RouteBuilder`, `handle_update`'s attribute loop, and `route_to_attributes`, plus a test that relays an UPDATE carrying a made-up transitive-optional attribute (e.g. type code 200) through pathvectord to a second peer and confirms it survives with Partial=1 set. Scoped as its own TODO item, not something to bundle into a quick fix. |
 | LOCAL_PREF received from an external (eBGP) peer MUST be ignored by the receiving speaker (§5.1.5) — distinct from the already-implemented "MUST NOT send LOCAL_PREF to eBGP peers" outbound rule | **Confirmed gap — highest severity finding so far** | `handle_update`'s attribute loop (`pathvectord/src/daemon/route.rs:944-964`) captures `PathAttribute::LocalPref(lp)` into a local variable with no `peer_type` check at all, and it's applied to the built route unconditionally (line 1154-1156: `if let Some(lp) = local_pref { builder = builder.local_pref(lp); }`). `RouteBuilder::build()` (`pathvector-rib/src/route.rs:409-422`) does not strip it based on peer type either — pure passthrough. `best_path.rs:167-169`'s comparator reads `.local_pref` uniformly for every route regardless of where it came from. **Practical impact:** an eBGP peer can attach an arbitrary LOCAL_PREF (e.g. `u32::MAX`) to a route it sends us, and since LOCAL_PREF is the *first* tie-break step in the decision process (RFC 4271 §9.1.1, ahead of AS_PATH length, ORIGIN, MED, etc.), that peer can force its own route to win best-path selection against routes we'd otherwise prefer — exactly the outcome this MUST exists to prevent. This is the class of bug the RFC calls out by name as a reason for the rule, not a theoretical edge case. `pathvectord/RFC.md` was updated to add this as a ❌ row (previously not tracked at all — the existing rows only covered the *outbound*, eBGP-peer-facing side of LOCAL_PREF handling). | A test sending an UPDATE from an eBGP-typed peer with an explicit LOCAL_PREF attribute, asserting the resulting route's `local_pref` is `None` (falls back to default) rather than the peer-supplied value — then gate the `PathAttribute::LocalPref` match arm (or the `builder.local_pref(lp)` call) on `peer_type == PeerType::Internal`. |
 | AS_PATH: iBGP speaker SHALL NOT modify AS_PATH when advertising to internal peers; eBGP speaker prepends own AS (with segment-type rules for AS_SET vs AS_SEQUENCE vs empty) | Confirmed correct | `prepare_outbound`/`prepare_outbound_v6` (`pathvector-rib/src/outbound.rs:27-73`) only call `.prepend()` inside the `PeerType::External` branch; the iBGP branch never touches `as_path` | `test_prepare_outbound_ebgp_prepends_local_as`, `test_prepare_outbound_ibgp_preserves_attributes` (per `pathvectord/RFC.md`) — note this pass didn't re-verify the AS_SET-vs-AS_SEQUENCE-vs-empty segment-type branching inside `AsPath::prepend` itself; that's in `pathvector-types`, out of scope for this pass |
@@ -364,18 +364,24 @@ in this audit.
 
 ### RFC 4271 running total (§4, §5, §6.2–§7, §8, §9, §10)
 
-42 clauses reviewed — 29 confirmed correct, 8 confirmed gaps, 5 needs
+42 clauses reviewed — **28** confirmed correct (revised down from 29 — see
+the missing-mandatory-attribute correction above, moved to confirmed gap
+after the RFC 7606 pass below), **9** confirmed gaps, 5 needs
 investigation. **RFC 4271 audit considered substantially complete** —
 remaining unaudited: §1-§3 (definitional/overview, low value), the full
 §8.2.2 per-state event table (already extensively exercised by testing,
 explicitly not re-derived clause-by-clause — see honesty note above), and
 §9.1.4 (overlapping routes, tentatively N/A pending confirmation).
 
-**All 8 confirmed gaps, for reference:** (1) OPEN/ROUTE_REFRESH accept
+**All 9 confirmed gaps, for reference:** (1) OPEN/ROUTE_REFRESH accept
 trailing padding (§4.1); (2) no Attribute Flags Error detection (§4.3);
 (3) unrecognized transitive-optional attributes can't survive a relay
 (§5); (4) eBGP LOCAL_PREF not ignored (§5.1.5 — most severe of the
-"silent policy corruption" class); (5) unrecognized OPEN optional
+"silent policy corruption" class); (4b) missing well-known mandatory
+attribute triggers session-reset instead of RFC 7606's treat-as-withdraw
+(§5/§6.3 — corrected after the RFC 7606 pass, see below; arguably the
+most operationally severe finding of the whole audit given how easily
+triggered it is); (5) unrecognized OPEN optional
 parameters silently skipped (§6.2); (6) unrecognized well-known
 attributes accepted as ordinary unknowns (§6.3); (7) connection
 collision BGP-ID comparison inverted (§6.8 — most severe overall,
@@ -575,5 +581,92 @@ neither fixed as part of this diagnostic pass.
 
 ---
 
-*(Per the roadmap, next up: RFC 7606 (revised UPDATE error handling), then
-the already-flagged ⚠️ items, RPKI/BMP, then the encode-only RFCs.)*
+# RFC 7606 — Revised Error Handling for BGP UPDATE Messages
+
+**Audited:** 2026-07-16
+**Method:** Full text fetched from rfc-editor.org/rfc/rfc7606 (1067 lines),
+read in full; cross-checked against `pathvector-session/src/message/update.rs`
+(`rfc7606_policy`, `decode_attr_value`, `decode_path_attributes`) and
+`pathvectord/src/daemon/route.rs`'s mandatory-attribute check. This RFC
+amends RFC 4271 §6.3 directly, so several findings here **correct verdicts
+already given during the RFC 4271 pass** — a "confirmed correct" verdict
+reached while auditing one RFC can be invalidated by a later RFC that
+revises the exact same clause, which is exactly what happened here. Rather
+than quietly editing the earlier verdict without a trace, that entry (RFC
+4271 §5's mandatory-attribute row, above) has been left visible with a
+correction note pointing here.
+
+**Overall finding: this is the highest-severity result of the audit so
+far, on a completeness basis** — three separate findings, one of which
+(missing-mandatory-attribute handling) is arguably the single most
+operationally significant bug found in this entire audit, since it's
+triggerable by any encoding quirk on *any* peer, not a rare race condition
+or a deliberately hostile actor.
+
+## §3 — Revision to BGP UPDATE Message Error Handling
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| (c) Attribute Flags conflict (Optional/Transitive bit mismatch) → treat-as-withdraw (revises the old "session reset" behavior) | Directly clarifies the existing RFC 4271 §4.3 finding, not a new one | The RFC 4271 pass already found that no Attribute Flags Error detection exists at all (`decode_attr_value` never validates flags against what a known type requires) and flagged the correct remediation as an open question pending this exact RFC 7606 check. That question is now answered: the fix is treat-as-withdraw. See the existing TODO.md item — no new item needed, just this clarification. | Same fix as the existing item, now with a confirmed target policy |
+| (d) **Missing well-known mandatory attribute → treat-as-withdraw MUST be used (revises RFC 4271 §6.3's session-reset requirement)** | **Confirmed gap — highest operational severity finding of this audit** | `pathvectord/src/daemon/route.rs:1011-1049` sends `NotificationMessage`/`UpdateMsgError::MissingWellKnownAttribute` and tears down the *entire session* when ORIGIN, AS_PATH, or (traditional IPv4) NEXT_HOP is absent from an UPDATE carrying announcements. This was correct under the original RFC 4271 text (and was verified as such during the RFC 4271 pass, before this RFC's revision was checked) but RFC 7606 §3(d) explicitly and unambiguously revises it: "If any of the well-known mandatory attributes are not present in an UPDATE message, then 'treat-as-withdraw' MUST be used." The existing `pathvector-session/RFC.md` row for this was even named `test_rfc7606_missing_mandatory_resets_session` — a test whose own name invokes RFC 7606 while asserting the exact behavior RFC 7606 revises away, which is how this went unnoticed. **Why this is the most severe finding of the audit:** unlike the collision-resolution bug (needs a rare simultaneous-connect race) or the LOCAL_PREF bug (needs a peer willing to send a bogus attribute), this can be triggered by an entirely ordinary, non-malicious condition — any bug or quirk in *any* peer's UPDATE encoding that happens to omit ORIGIN or AS_PATH once would tear down the whole session with that peer, rather than just dropping the one bad route. This is precisely the "minor attribute error causes disproportionate session reset, potentially cascading" operational problem RFC 7606 was written to solve, and this project currently reproduces it for exactly the cases RFC 7606 targets first. Corrected the `pathvector-session/RFC.md` row (✅ → ❌) and the earlier RFC 4271 §5 verdict (see correction note there). | A test constructing an UPDATE missing ORIGIN (or AS_PATH, or traditional-v4 NEXT_HOP) with announced NLRI, asserting the route is treated as withdrawn (session stays `Established`, no NOTIFICATION sent) rather than the session resetting — then change `handle_update`'s mandatory-attribute-missing branch from returning a `NotificationMessage` to withdrawing just the affected NLRIs. This is a meaningful behavior change (removes a NOTIFICATION path entirely for this case) and should get its own careful, scoped PR with full regression coverage, not a quick patch — per the standing "fixes get their own PR" discipline for this whole audit, doubly so here given the severity. |
+| (e) Treat-as-withdraw for ORIGIN, AS_PATH, NEXT_HOP, MED, LOCAL_PREF errors | Confirmed correct | `rfc7606_policy()`'s explicit `TreatAsWithdraw` arm lists exactly these five type codes | Existing `test_rfc7606_malformed_*_treat_as_withdraw` suite |
+| (f) Attribute discard for ATOMIC_AGGREGATE/AGGREGATOR errors | Confirmed correct (by fallthrough, not explicit handling) | Neither is listed in `rfc7606_policy()`'s `TreatAsWithdraw` arm, so both fall to the catch-all `_ => AttributeDiscard` — matches (f), though see the two narrower findings under §7.6/§7.7 below for real-but-smaller issues in how each attribute's own malformation is *detected* | — |
+| (g) MP_REACH_NLRI/MP_UNREACH_NLRI duplicated → session reset (Malformed Attribute List). **Any other attribute duplicated → discard all but the first occurrence, UPDATE continues processing normally — not an error at all** | **Confirmed gap — duplicate handling is wrong in both directions** | `decode_path_attributes` (`update.rs:291,307-316`) uses a single `seen: [bool; 256]` check that treats **every** duplicate attribute, regardless of type, as `AttributeErrorPolicy::TreatAsWithdraw` uniformly. This is wrong on both sides of the RFC's split rule: (1) a duplicated MP_REACH_NLRI/MP_UNREACH_NLRI — which the RFC says needs the *strongest* response, a full session reset — instead only gets treat-as-withdraw, an under-reaction to a structurally serious condition; (2) a duplicated ORDINARY attribute (e.g. two COMMUNITY attributes) — which the RFC says should be silently normalized to "keep the first, drop the rest, continue with **no error at all**" — instead causes the entire route to be treated as withdrawn, a significant over-reaction to something the RFC considers a complete non-event. Verified directly against the RFC text, not inferred: "If the MP_REACH_NLRI attribute or the MP_UNREACH_NLRI attribute appears more than once... a NOTIFICATION message MUST be sent... If any other attribute... appears more than once... all the occurrences of the attribute other than the first one SHALL be discarded and the UPDATE message will continue to be processed." | Two tests: (1) an UPDATE with two `MP_UNREACH_NLRI` attributes, asserting session-reset NOTIFICATION with Malformed Attribute List; (2) an UPDATE with two `COMMUNITY` attributes with different values, asserting the route is accepted normally with the *first* COMMUNITY value used and no error/withdrawal at all. Then rewrite `decode_path_attributes`'s duplicate-handling to special-case MP_REACH/UNREACH_NLRI (session reset) vs. everything else (silently keep first, drop rest, no error pushed to `errors` at all). |
+| (h) When multiple attribute errors exist with differing prescribed approaches, the *strongest* approach wins | Not independently verified this pass | `decode_path_attributes` collects all `errors` into a `Vec` and returns `UpdateDecodeOutcome::Partial` if any exist, with `treat_as_withdraw = errors.iter().any(policy == TreatAsWithdraw)` — this looked plausible on a quick read (a `SessionReset`-policy error would need to propagate as a hard error rather than accumulate in the `errors` vec at all, and structural/`?`-propagated errors already do this per the earlier RFC 4271 audit), but this pass didn't construct a test with two *simultaneous* attribute-level errors of different policies to confirm the "strongest wins" ordering holds exactly as described | A test with one UPDATE carrying both an `AttributeDiscard`-policy error (e.g. malformed AGGREGATOR) and a `TreatAsWithdraw`-policy error (e.g. malformed ORIGIN) simultaneously, asserting the overall outcome is `TreatAsWithdraw` (the stronger of the two) |
+| (i) Withdrawn Routes field MUST be checked for syntactic correctness the same way as NLRI | Confirmed correct (cross-referenced) | `decode_nlri_list_v4` is the same function used for both the withdrawn-routes fork and the announced-NLRI parsing (`update.rs:148-150` vs `:159`) — literally the same code path, so there's no way for the two to diverge | — |
+
+**§3 summary:** 7 clauses reviewed — 4 confirmed correct (1 by simple
+fallthrough), 2 confirmed gaps (one of them the most severe finding of the
+whole audit), 1 needs investigation.
+
+## §4 — Attribute Length Fields
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| Total Attribute Length conflicts (overrun / underrun while parsing attributes) → treat-as-withdraw, Total Attribute Length still used to locate NLRI | Confirmed correct (cross-referenced to the already-audited "deferred generic CodecError" bucket) | This class of structural error currently falls into the already-known-and-tracked deferred `CodecError` bucket from the RFC 4271 §6.1 pass (silent connection drop, no NOTIFICATION) rather than genuinely implementing treat-as-withdraw specifically — not re-litigated as a new finding here since it's the same already-tracked gap, just confirmed to also apply to this specific RFC 7606 clause | Same remediation as the existing deferred-CodecError item |
+| Only AS_PATH and ATOMIC_AGGREGATE may validly have attribute length zero; all others: length-zero is a syntax error | Mostly confirmed correct, with one related gap noted below | `decode_as_path_segments` naturally accepts a zero-length fork (empty segment list, no error) and ORIGIN/NEXT_HOP/MED/LOCAL_PREF all have explicit `remaining() < N` checks that reject zero length. ATOMIC_AGGREGATE's own zero-length allowance is real but its *non-zero*-length rejection is missing — see §7.6 below. | See §7.6 |
+
+**§4 summary:** 2 clauses reviewed, both confirmed correct at this level of
+detail (with one attribute-specific follow-on gap noted under §7.6).
+
+## §7 — Error-Handling Procedures for Existing Attributes (spot-checked)
+
+Given the size of this section (16 attributes, §7.1-§7.16), this pass
+spot-checked the attributes already central to other findings plus a couple
+of quick, cheap-to-verify checks, rather than deriving all 16 exhaustively.
+
+| Clause | Confidence | Notes | What would close this out |
+|---|---|---|---|
+| §7.5 LOCAL_PREF from an external neighbor: SHALL be discarded via attribute-discard, regardless of well-formedness | Directly reinforces the existing RFC 4271 §5.1.5 finding, not new | This is the same underlying requirement already found and filed (eBGP LOCAL_PREF must be ignored) restated in RFC 7606's revision language — not double-counted as a separate item | Same fix as the existing §5.1.5 item |
+| §7.5 LOCAL_PREF from an internal neighbor: malformed (length ≠ 4) → treat-as-withdraw | Confirmed correct | `rfc7606_policy()` maps `ATTR_LOCAL_PREF → TreatAsWithdraw` | Existing test suite |
+| §7.6 ATOMIC_AGGREGATE: malformed if length ≠ 0 → attribute discard | **Confirmed gap, minor** | `decode_attr_value`'s `ATTR_ATOMIC_AGGREGATE` arm (`update.rs:395`) is simply `Ok(PathAttribute::AtomicAggregate)` — it never checks that the attribute's actual length is 0. A peer sending a non-zero-length ATOMIC_AGGREGATE (e.g. with garbage trailing bytes) would have those bytes silently ignored and the attribute accepted as valid, rather than being flagged as malformed and discarded per this clause. Low real-world impact (ATOMIC_AGGREGATE carries no semantic value either way), but a real, clean gap. | A test with a 4-byte (non-zero-length) ATOMIC_AGGREGATE attribute, asserting `AttributeDiscard` policy (or equivalent malformed-detection) rather than silent acceptance |
+| §7.7 AGGREGATOR: malformed if length ≠ 6 (when 4-octet ASN capability not negotiated) or ≠ 8 (when negotiated) → attribute discard | **Confirmed gap, low severity — completeness, not security** | `decode_attr_value`'s `ATTR_AGGREGATOR` arm (`update.rs`) unconditionally requires 8 bytes ("AGGREGATOR must be 8 bytes (4-byte ASN mode)"), with no awareness of whether the 4-octet ASN capability (RFC 6793) was actually negotiated with this specific peer. A **legitimately well-formed** 6-byte AGGREGATOR from a peer that only negotiated 2-byte ASNs would be treated as malformed (length check fails) and discarded — the *practical outcome* (attribute discard) happens to coincidentally match what RFC 7606 prescribes for a genuinely malformed AGGREGATOR, so this doesn't cause incorrect session/route handling, but it means this implementation can never actually parse and retain AGGREGATOR data from a 2-byte-ASN-only peer — a data-completeness gap, not a correctness-of-outcome one. | A test with a well-formed 6-byte AGGREGATOR from a peer with no negotiated `FourByteAsn` capability, asserting it decodes successfully (not as an error) — then thread the negotiated-capability flag into `decode_attr_value`'s AGGREGATOR arm to pick 6 vs. 8 as the expected length |
+
+**§7 summary:** 5 clauses spot-checked — 2 confirmed correct, 1 reinforces
+an already-tracked finding, 2 confirmed gaps (both minor/low-severity,
+unlike §3's findings above).
+
+### RFC 7606 running total
+
+14 clauses reviewed across §3/§4/§7 (spot-checked) — 6 confirmed correct
+(1 by fallthrough), 4 confirmed gaps (1 of extreme severity, 1 of
+moderate/structural severity, 2 minor), 1 needs investigation, 2 directly
+reinforce already-tracked findings from earlier passes rather than
+introducing new ones. **RFC 7606 audit considered substantially complete**
+for the highest-value clauses (§3's core revisions); the remaining 11 of
+16 per-attribute subsections in §7 (Community done via cross-reference
+above only for the eBGP/LOCAL_PREF angle; ORIGINATOR_ID, CLUSTER_LIST,
+MP_REACH_NLRI, MP_UNREACH_NLRI, Extended Community, IPv6-specific
+Extended Community, ATTR_SET, Traffic Engineering Path Attribute) were not
+individually re-derived this pass — worth a follow-up if time allows,
+though the highest-risk, highest-blast-radius clauses (missing-mandatory,
+duplicate-attribute handling, attribute-flags) have already been covered.
+
+All 4 new/independent gaps filed in `TODO.md` (#19). The missing-mandatory-
+attribute finding is flagged as the audit's single highest-priority item
+given how easily it's triggered in ordinary operation.
+
+---
+
+*(Per the roadmap, next up: the already-flagged ⚠️ items — RFC 5492, RFC
+6793, RFC 6396 — then RPKI/BMP, then the encode-only RFCs.)*

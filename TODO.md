@@ -426,6 +426,54 @@ narrower:
   5492 in general) have the same recurring pattern. See `RFC_AUDIT.md`'s
   RFC 9234 §4.2 section.
 
+**19. HIGHEST PRIORITY — RFC 7606 gaps found by systematic clause audit,
+including the most operationally severe finding of the entire audit** —
+found 2026-07-16 (diagnostic only, not fixed here, but the first item
+below deserves prompt attention):
+
+- **Missing well-known mandatory attribute (ORIGIN/AS_PATH/NEXT_HOP)
+  tears down the whole session instead of treating just that route as
+  withdrawn.** RFC 7606 §3(d) explicitly revises RFC 4271 §6.3: "If any
+  of the well-known mandatory attributes are not present in an UPDATE
+  message, then 'treat-as-withdraw' MUST be used" — not session reset.
+  `pathvectord/src/daemon/route.rs:1011-1049` sends a NOTIFICATION
+  (`MissingWellKnownAttribute`) and tears down the session instead. The
+  existing test asserting this behavior, `test_rfc7606_missing_mandatory_resets_session`,
+  is itself misnamed — it invokes RFC 7606 while asserting exactly the
+  behavior RFC 7606 revises away. **Why this is the highest-priority
+  item in the whole audit:** unlike the collision-resolution bug (needs
+  a rare race) or the LOCAL_PREF bug (needs a peer willing to send a
+  bogus attribute), this is triggerable by an entirely ordinary condition
+  — any encoding bug or quirk in *any* peer's UPDATE that happens to
+  omit ORIGIN or AS_PATH once tears down the whole session, rather than
+  just dropping the one bad route. This is precisely the failure mode
+  RFC 7606 exists to eliminate. See `RFC_AUDIT.md`'s RFC 7606 §3 section
+  for full detail. Corrected the misleading `pathvector-session/RFC.md`
+  row and the earlier RFC 4271 §5 verdict (left visible with a
+  correction note rather than silently edited).
+- **Duplicate-attribute handling is wrong in both directions.**
+  `decode_path_attributes`'s duplicate check treats every repeated
+  attribute — regardless of type — as `TreatAsWithdraw`. RFC 7606 §3(g)
+  requires: a duplicated MP_REACH_NLRI/MP_UNREACH_NLRI needs a full
+  session reset (Malformed Attribute List) — stronger than what happens
+  now; any *other* duplicated attribute should be silently normalized
+  (keep the first, drop the rest, **no error at all**) — much weaker
+  than what happens now (currently withdraws the whole route for a
+  completely ordinary duplicate like two COMMUNITY attributes). See
+  `RFC_AUDIT.md`'s RFC 7606 §3 section.
+- **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
+  non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
+  than being flagged malformed. Low impact (no semantic value either
+  way). See `RFC_AUDIT.md`'s RFC 7606 §7.6.
+- **(Minor, completeness not correctness) AGGREGATOR decode always
+  expects 8 bytes**, not accounting for whether the peer negotiated the
+  4-octet ASN capability (RFC 6793) — a legitimate 6-byte AGGREGATOR
+  from a 2-byte-ASN-only peer is treated as malformed and discarded.
+  The *outcome* (discard) happens to match what RFC 7606 wants for a
+  genuinely malformed AGGREGATOR, so this doesn't misbehave, but it
+  means AGGREGATOR data from 2-byte peers can never actually be
+  retained. See `RFC_AUDIT.md`'s RFC 7606 §7.7.
+
 ---
 
 ## General
