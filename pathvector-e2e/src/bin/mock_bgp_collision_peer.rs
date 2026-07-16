@@ -22,12 +22,21 @@
 //!   NOTIFICATION on it first — and adopt connection #2, treating it like a
 //!   fresh dial (sending its own OPEN there first).
 //! - `gr-established-override` — this mock advertises the Graceful Restart
-//!   capability and completes a full handshake to Established on connection
-//!   #1, then goes silent on it (never reads, writes, or drops it — so no
+//!   capability (with IPv4 unicast forwarding-preserved, so RFC 4724 §4.2's
+//!   retention logic actually applies to the route below rather than
+//!   treating it as a not-GR-covered family to flush) and announces one
+//!   route, then completes a full handshake to Established on connection #1,
+//!   then goes silent on it (never reads, writes, or drops it — so no
 //!   FIN/RST is ever produced) before dialing pathvectord again to create
 //!   connection #2. Per RFC 4724 §4.2, pathvectord must silently drop
-//!   connection #1 (no NOTIFICATION, unlike the two scenarios above) and
-//!   adopt connection #2.
+//!   connection #1 (no NOTIFICATION, unlike the two scenarios above), adopt
+//!   connection #2, and — the part this scenario specifically proves beyond
+//!   the bare connection-adoption decision — the route announced on
+//!   connection #1 must still be present immediately after connection #2
+//!   reaches Established, proving retention survived this exact trigger
+//!   path rather than the daemon's pre-existing GR-retention machinery
+//!   (already tested elsewhere for a plain disconnect/reconnect) never
+//!   getting reached at all.
 //!
 //! For all three scenarios, connection #1 is always pathvectord's own
 //! outbound dial to this mock (accepted via the `TcpListener` started in
@@ -39,12 +48,19 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
-use pathvector_session::message::{BgpMessage, Capability, OpenMessage};
+use pathvector_session::message::{
+    BgpMessage, Capability, GracefulRestartFamily, OpenMessage, PathAttribute, UpdateMessage,
+};
+use pathvector_types::{AfiSafi, AsPath, Asn, Origin};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 const HOLD_TIME: u16 = 9;
 const MOCK_AS: u16 = 65099;
+
+/// Announced on connection #1 before the abandon-and-redial cycle, in the
+/// `gr-established-override` scenario only.
+const GR_TEST_PREFIX: &str = "10.88.0.0/24";
 
 /// Lower than pathvectord's hardcoded `10.0.0.2` (RFC 4271 §6.8 rule 3:
 /// local/pathvectord's ID is higher, so it keeps its outbound connection).
@@ -224,10 +240,18 @@ async fn gr_established_override(
     mut framed1: Framed<TcpStream, BgpCodec>,
     pathvectord_target: &str,
 ) {
+    // RFC 4724 §3: the family list (not just the bare capability) is what
+    // tells the receiving speaker which AFI/SAFIs it should actually retain
+    // routes for — an empty list means "GR-negotiated but nothing declared
+    // GR-covered," which would make the daemon's own §4.2 logic flush this
+    // route as not-covered rather than retain it.
     let gr_capability = vec![Capability::GracefulRestart {
         restart_flags: 0,
         restart_time: 120,
-        families: vec![],
+        families: vec![GracefulRestartFamily {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            forwarding_preserved: true,
+        }],
     }];
 
     if framed1
@@ -248,6 +272,28 @@ async fn gr_established_override(
         }
     }
     println!("connection #1: established with Graceful Restart negotiated");
+
+    // Announce one route before abandoning the connection — this is what
+    // lets the test prove RFC 4724 §4.2's retention promise actually held
+    // through the collision-triggered switchover below, not just that the
+    // connection bookkeeping worked.
+    let route = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(MOCK_AS))])),
+            PathAttribute::NextHop(BGP_ID_GR),
+        ],
+        announced: vec![GR_TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed1.send(BgpMessage::Update(route)).await.is_err() {
+        return;
+    }
+    println!("connection #1: announced {GR_TEST_PREFIX}");
+
+    // Give the test a window to observe the route installed before the
+    // abandon-and-redial cycle below.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Abandon connection #1 without closing it: move it into a task that
     // never touches it again. Dropping the stream here would send a FIN,

@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use pathvector_client::DaemonClient;
 use pathvector_client::types::SessionState;
-use pathvector_e2e::{CollisionHarness, wait_for_established};
+use pathvector_e2e::{CollisionHarness, wait_for_established, wait_for_route};
+
+/// Must match `GR_TEST_PREFIX` in `src/bin/mock_bgp_collision_peer.rs`.
+const GR_TEST_PREFIX: &str = "10.88.0.0/24";
 
 /// RFC 4271 §6.8 rule 3: "Otherwise, the local system closes the newly
 /// created BGP connection... and continues to use the existing one." The
@@ -81,10 +84,26 @@ async fn collision_peer_id_higher_pathvectord_adopts_incoming() {
 /// combined with `uptime_seconds` resetting to a small value once the new
 /// connection completes its handshake, is airtight proof this exact branch
 /// fired, not just that "GR recovery happened somehow."
+///
+/// The connection-adoption decision alone doesn't prove RFC 4724 §4.2's
+/// actual point — forwarding-state continuity. This test also announces a
+/// route on the first connection and confirms it's still present
+/// immediately after the second connection replaces it: if this exact
+/// trigger path failed to correctly route into the daemon's (separately
+/// well-tested) GR-retention machinery — e.g. by not setting
+/// `TerminationReason::Unclean`, or some other wiring mistake specific to
+/// this code path — the route would have been flushed, even though the
+/// *connection* switchover looked fine.
 #[tokio::test]
 async fn gr_established_collision_adopts_new_connection_silently() {
     let mut h = CollisionHarness::new("gr-established-override").await;
     let peer_addr = std::net::IpAddr::from(h.mock_peer);
+
+    // The mock announces this before ever abandoning connection #1 — confirm
+    // it landed before the switchover even begins.
+    wait_for_route(&mut h.client, GR_TEST_PREFIX, Duration::from_secs(5))
+        .await
+        .expect("route from connection #1 did not appear in Loc-RIB");
 
     // Established was already reached once (over the mock's first
     // connection) by the time `CollisionHarness::new` returned. Poll for
@@ -132,4 +151,15 @@ async fn gr_established_collision_adopts_new_connection_silently() {
     wait_for_established(&mut h.client, h.mock_peer, Duration::from_secs(5))
         .await
         .expect("session still Established at the end of the test");
+
+    // RFC 4724 §4.2: the route announced on the now-replaced connection #1
+    // must still be present — proving retention held through this specific
+    // collision-triggered switchover, not just that the connection itself
+    // recovered.
+    wait_for_route(&mut h.client, GR_TEST_PREFIX, Duration::from_secs(5))
+        .await
+        .expect(
+            "route from connection #1 was lost across the RFC 4724 §4.2 \
+             switchover — retention did not survive this trigger path",
+        );
 }
