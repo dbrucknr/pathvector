@@ -38,6 +38,27 @@ Decision-making on received routes lives in `pathvector-rib`.
 
 ---
 
+## RFC 4271 §6.1 — Message Header Error Handling
+
+**Owns:** Sending the RFC-mandated NOTIFICATION before closing the connection when the
+19-byte header itself is malformed (bad marker, bad length, unrecognized type) — distinct
+from RFC 7606, which only governs attribute-level errors within an otherwise well-framed
+UPDATE.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-6.1
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Bad marker (not all-ones) → NOTIFICATION(Message Header Error, Connection Not Synchronized) before close | `src/transport/mod.rs` | ✅ | `test_invalid_marker_sends_message_header_notification`; e2e:fault_injection `bad_marker_daemon_stays_healthy` |
+| Bad length (outside 19..=4096, or inconsistent) → NOTIFICATION(Message Header Error, Bad Message Length), Data = erroneous length | `src/transport/mod.rs` | ✅ | `test_invalid_length_sends_message_header_notification_with_length_in_data`; e2e:fault_injection `bad_length_daemon_stays_healthy` |
+| Unrecognized message type → NOTIFICATION(Message Header Error, Bad Message Type), Data = erroneous type | `src/transport/mod.rs` | ✅ | `test_unknown_message_type_sends_message_header_notification_with_type_in_data`; e2e:fault_injection `bad_type_daemon_stays_healthy` |
+| A fault on one peer's connection must not affect any other peer's session (one `tokio::spawn`ed task per peer) | `src/transport/mod.rs` | ✅ | e2e:fault_injection — every scenario asserts the control peer stays Established throughout |
+
+**Deferred:** `CodecError` variants below the header layer (malformed OPEN/NOTIFICATION
+bodies — not RFC 7606-eligible, since that policy is UPDATE-only) are not yet mapped to a
+NOTIFICATION; the connection is dropped silently, matching prior behavior. See TODO.md.
+
+---
+
 ## RFC 4271 §8 — BGP Finite State Machine
 
 **Owns:** The full 6-state FSM (Idle → Connect → Active → OpenSent → OpenConfirm → Established), timer logic (ConnectRetry, Hold, Keepalive), and event dispatch.  
@@ -53,6 +74,7 @@ keep.
 | OpenSent → OpenConfirm on valid OPEN received | `src/fsm/mod.rs` | ✅ | `test_receive_open_sends_keepalive_enters_open_confirm`, interop:gobgp, interop:bird |
 | OpenConfirm → Established on KEEPALIVE received | `src/fsm/mod.rs` | ✅ | `test_receive_keepalive_enters_established`, interop:gobgp, interop:bird |
 | Any state → Idle on Hold Timer expiry | `src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_established`, `test_hold_timer_expired_in_open_sent` |
+| Hold Timer expiry (OpenSent/OpenConfirm/Established) schedules automatic reconnect via ConnectRetryTimer | `src/fsm/mod.rs` | ✅ | `test_hold_timer_expired_in_open_sent`, `test_hold_timer_expired_in_open_confirm`, `test_hold_timer_expired_in_established`; e2e:fault_injection `mid_session_tcp_reset_recovers_cleanly` |
 | Keepalive timer fires at ⌊hold-time / 3⌋ seconds | `src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time` |
 | NOTIFICATION sent before session close | `src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification`, `test_unacceptable_hold_time_sends_notification` |
 | Hold time of 0 disables hold timer and keepalive | `src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |

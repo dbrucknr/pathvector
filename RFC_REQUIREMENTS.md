@@ -15,6 +15,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 3107 | MPLS Label in BGP (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
 | RFC 4271 §4 | BGP Message Formats | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-4--message-formats) |
 | RFC 4271 §5 | Path Attribute Types | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-4271-5--path-attribute-types) |
+| RFC 4271 §6.1 | Message Header Error Handling | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-61--message-header-error-handling) |
 | RFC 4271 §8 | BGP Finite State Machine | pathvector-session, pathvectord | ✅ | [session](pathvector-session/RFC.md#rfc-4271-8--bgp-finite-state-machine) · [daemon](pathvectord/RFC.md#rfc-4271-8--connection-collision-coordination) |
 | RFC 4271 §9.1 | Best-Path Decision Process (iBGP MRAI deferred) | pathvector-rib, pathvectord | ⚠️ | [rib](pathvector-rib/RFC.md#rfc-4271-91--decision-process-best-path-selection) · [mrai](pathvectord/RFC.md#rfc-4271-9211--minimum-route-advertisement-interval-mrai) |
 | RFC 4271 §9.2 | Update-Send Process / RIB Structures / MRAI | pathvector-rib, pathvectord | ⚠️ | [rib](pathvector-rib/RFC.md#rfc-4271-92--update-send-process-rib-structures) · [daemon](pathvectord/RFC.md#rfc-4271-92--update-send-process) · [mrai](pathvectord/RFC.md#rfc-4271-9211--minimum-route-advertisement-interval-mrai) |
