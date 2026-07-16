@@ -335,6 +335,7 @@ impl Fsm {
                         data: vec![],
                     })),
                     FsmOutput::CloseTcpConnection,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             FsmInput::ManualStop => {
@@ -426,6 +427,7 @@ impl Fsm {
                     })),
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             FsmInput::ManualStop => {
@@ -468,6 +470,7 @@ impl Fsm {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn on_established(&mut self, input: FsmInput) -> Vec<FsmOutput> {
         match input {
             FsmInput::MessageReceived(BgpMessage::Keepalive) => self.reset_hold_if_active(),
@@ -507,6 +510,7 @@ impl Fsm {
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
                     FsmOutput::SessionTerminated,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             FsmInput::ManualStop => {
@@ -1262,6 +1266,11 @@ mod tests {
             }))
         ));
         assert!(has_output(&out, |o| *o == FsmOutput::CloseTcpConnection));
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            "must schedule ConnectRetryTimer for automatic reconnect"
+        );
     }
 
     #[test]
@@ -1277,6 +1286,13 @@ mod tests {
             }))
         ));
         assert!(has_output(&out, |o| *o == FsmOutput::SessionTerminated));
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            "must schedule ConnectRetryTimer for automatic reconnect — a peer that goes \
+             silent (detected via hold-timer expiry, not a TCP-level error) must not leave \
+             the session stuck forever with no further reconnect attempts"
+        );
     }
 
     // ── Keepalive timer ───────────────────────────────────────────────────────
@@ -1721,6 +1737,11 @@ mod tests {
             }))
         ));
         assert!(has_output(&out, |o| *o == FsmOutput::StopKeepaliveTimer));
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            "must schedule ConnectRetryTimer for automatic reconnect"
+        );
     }
 
     #[test]
