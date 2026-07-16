@@ -203,6 +203,35 @@ injection / chaos and backpressure tests" below) remains a separate, deferred
 item — different mechanism, different infra (ExaBGP-style replay), not
 blocked by anything.
 
+**12. RFC 4271 §4 message-format gaps found by systematic clause audit** —
+found 2026-07-16 during the first pass of the new `RFC_AUDIT.md` clause-by-
+clause review (diagnostic only — not fixed as part of that audit, per
+decision to keep fixes in their own scoped PRs):
+
+- **No "Attribute Flags Error" detection on decode.** §4.3/§6.3 requires
+  that well-known attributes have Transitive=1, and well-known/optional-
+  non-transitive attributes have Partial=0; violations are UPDATE Message
+  Error subcode 4. `decode_attr_value` (`pathvector-session/src/message/update.rs`)
+  reads the flags byte but never validates it against the expected flags for
+  known attribute types (only stores it for the `Unknown`/unrecognized-type
+  fallback). `UpdateMsgError::AttributeFlagsError` exists in the enum but is
+  never constructed by our own decoder — only used in proptest generators
+  for round-tripping NOTIFICATIONs we might *receive*. See
+  `RFC_AUDIT.md`'s "§4.3 — UPDATE Message Format" for the full detail and
+  what a fix/test would look like. Check the separate RFC 7606 audit pass
+  first — it may change how this should be handled (session reset vs.
+  treat-as-withdraw) rather than just "add the RFC 4271 behavior verbatim."
+- **OPEN and ROUTE_REFRESH don't reject trailing padding within the
+  declared header Length.** §4.1 requires the Length field have "the
+  smallest value required... padding of extra data after the message is
+  not allowed." `decode_with_limit`'s `Keepalive` arm explicitly checks
+  `cur.remaining() != 0` after decode, but the `Open` and `RouteRefresh`
+  arms don't — a message with extra bytes inside the declared frame length
+  (beyond what OPEN's capabilities or ROUTE_REFRESH's fixed 4-byte body
+  need) is silently accepted with the padding discarded. Low severity
+  (permissive, not corrupting), but a clear spec violation. See
+  `RFC_AUDIT.md`'s "§4.1 — Message Header Format" for detail.
+
 ---
 
 ## General

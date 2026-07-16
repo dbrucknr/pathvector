@@ -23,7 +23,8 @@ Decision-making on received routes lives in `pathvector-rib`.
 | UPDATE message encode/decode: withdrawn-routes, path-attributes, NLRI | `src/message/` | ✅ | `test_update_roundtrip`, `test_update_empty`, interop:gobgp |
 | NOTIFICATION message encode/decode: error-code, error-subcode, data | `src/message/` | ✅ | `test_notification_roundtrip`, `test_notification_cease` |
 | KEEPALIVE message encode/decode (header only, no body) | `src/message/` | ✅ | `test_keepalive_roundtrip` |
-| Attribute flags: Optional, Transitive, Partial, Extended-Length | `src/message/` | ✅ | `test_attribute_flags_roundtrip`, `test_extended_length_attribute` |
+| Attribute flags: Optional, Transitive, Partial, Extended-Length — wire encode/decode round-trip | `src/message/` | ✅ | `test_attribute_flags_roundtrip`, `test_extended_length_attribute` |
+| Attribute flags: reject a *received* attribute whose flags don't match what its type requires (well-known ⇒ Transitive=1; well-known/optional-non-transitive ⇒ Partial=0) — "Attribute Flags Error", UPDATE Message Error subcode 4 | `src/message/update.rs` | ⚠️ | None — `decode_attr_value` reads but never validates flags for known attribute types; see `RFC_AUDIT.md` §4.3 |
 | ORIGIN (type 1) encode/decode | `src/message/` | ✅ | `test_attr_origin_roundtrip` |
 | AS_PATH (type 2) encode/decode with AS_SEQUENCE and AS_SET segments | `src/message/` | ✅ | `test_attr_aspath_roundtrip`, `test_attr_aspath_with_set` |
 | NEXT_HOP (type 3) encode/decode | `src/message/` | ✅ | `test_attr_next_hop_roundtrip` |
@@ -35,6 +36,17 @@ Decision-making on received routes lives in `pathvector-rib`.
 | EXTENDED_COMMUNITIES (type 16) encode/decode — RFC 4360 | `src/message/` | ✅ | `test_attr_extended_community_roundtrip` |
 | LARGE_COMMUNITY (type 32) encode/decode — RFC 8092 | `src/message/` | ✅ | `test_attr_large_community_roundtrip` |
 | Unknown optional transitive attributes preserved in Partial flag | `src/message/` | ✅ | `test_unknown_optional_transitive_preserved` |
+
+**Known gap (found by `RFC_AUDIT.md`, 2026-07-16):** §4.1's "Length field MUST
+have the smallest value required... padding of extra data after the message
+is not allowed" is enforced for KEEPALIVE (`decode_with_limit` checks
+`cur.remaining() != 0`) but not for OPEN or ROUTE_REFRESH — their decoders
+stop after reading known/declared-length fields without confirming the
+cursor is empty, so trailing padding within the declared header Length is
+silently discarded rather than rejected. UPDATE and NOTIFICATION are
+unaffected (their trailing fields are defined as "consume the rest of the
+message" by the RFC itself, so full consumption is correct there, not
+incidental). See `RFC_AUDIT.md` §4.1 for detail; not yet fixed.
 
 ---
 
