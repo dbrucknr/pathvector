@@ -1783,6 +1783,74 @@ mod tests {
         );
     }
 
+    /// RFC 4271 §6.8 rule 3 says the rejected connection is closed but
+    /// doesn't specify how — worth pinning down precisely, since a
+    /// rejected-but-unverified socket could in principle be left hanging
+    /// open, or (wrongly) sent a NOTIFICATION despite never having
+    /// completed a BGP handshake. This complements
+    /// `test_collision_in_open_confirm_local_id_higher_keeps_outbound_rejects_incoming`,
+    /// which only proves the *existing* connection survives to Established;
+    /// this test observes the *rejected* connection's own socket directly
+    /// and proves it's dropped outright — zero bytes written, then EOF —
+    /// rather than held open or handshaken.
+    #[tokio::test]
+    async fn test_collision_in_open_confirm_rejected_incoming_socket_closed_silently() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let (mock, mut peer) = MockTransport::pair();
+        let handle = spawn_with(test_config(), mock);
+        handle.start().await;
+
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("channel closed before OPEN");
+
+        // Peer OPEN with a BGP ID lower than local (10.0.0.0 < 10.0.0.1) —
+        // local wins, so the incoming connection below must be rejected.
+        let mut lower_id_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = lower_id_open {
+            open.bgp_id = "10.0.0.0".parse().unwrap();
+        }
+        peer.recv_tx.send(Ok(lower_id_open)).unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("channel closed before KEEPALIVE");
+
+        // Unlike the other collision tests, keep the peer's own end of the
+        // pair (rather than discarding it) so this test can observe what,
+        // if anything, arrives on the rejected socket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (incoming, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let incoming = incoming.unwrap();
+        let (mut peer_side, _) = accepted.unwrap();
+
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        // Expect exactly zero bytes (no OPEN, no NOTIFICATION — nothing)
+        // before EOF: proof the session dropped the incoming stream
+        // outright rather than attempting any part of a handshake on it.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), peer_side.read(&mut buf))
+            .await
+            .expect("timed out waiting for the rejected socket to close");
+        assert_eq!(
+            read.expect("read on rejected socket errored instead of a clean EOF"),
+            0,
+            "rejected incoming connection must be closed with zero bytes sent, \
+             not held open or handshaken"
+        );
+    }
+
     /// RFC 4724 §4.2: "the previous TCP session MUST be closed, and the new
     /// one retained... Since the previous connection is considered to be
     /// terminated, no NOTIFICATION message should be sent -- the previous
