@@ -227,6 +227,20 @@ impl Fsm {
         self.peer_open.as_ref().map(|o| o.bgp_id)
     }
 
+    /// Whether the peer advertised the Graceful Restart capability in its OPEN.
+    ///
+    /// `false` before the peer's OPEN has been validated. Used by the
+    /// transport layer to apply RFC 4724 §4.2's Established-state collision
+    /// override instead of RFC 4271 §6.8's default (reject) behavior.
+    #[must_use]
+    pub fn peer_has_graceful_restart(&self) -> bool {
+        self.peer_open.as_ref().is_some_and(|o| {
+            o.capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::GracefulRestart { .. }))
+        })
+    }
+
     /// Feed one input event, advance the FSM, and return the ordered list of
     /// actions to execute.
     pub fn process(&mut self, input: FsmInput) -> Vec<FsmOutput> {
@@ -583,6 +597,32 @@ impl Fsm {
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
                     FsmOutput::SessionTerminated,
+                ]
+            }
+            // RFC 4724 §4.2 (modifies RFC 4271 §8.2.2 Established): when the
+            // peer has advertised the Graceful Restart Capability, a new
+            // incoming TCP connection is treated as proof the old one died
+            // even though we never observed its failure. "Acting accordingly"
+            // means: "the previous TCP session MUST be closed, and the new
+            // one retained... no NOTIFICATION message should be sent -- the
+            // previous TCP session is simply closed." State goes to Connect
+            // (not Idle) so the caller can immediately adopt the incoming
+            // connection as if it were a fresh outbound one.
+            //
+            // The transport layer only sends this input here when
+            // `peer_has_graceful_restart()` is true — a non-GR peer keeps the
+            // plain RFC 4271 §6.8 behavior of rejecting the duplicate
+            // incoming connection outright.
+            FsmInput::CollisionDetected => {
+                self.peer_open = None;
+                self.negotiated_hold_time = 0;
+                self.state = State::Connect;
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
+                    FsmOutput::CloseTcpConnection,
+                    FsmOutput::SessionTerminated,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             // RFC 4271 §6.3: daemon detected a mandatory attribute error and
@@ -2297,6 +2337,90 @@ mod tests {
         let mut fsm = open_confirm_fsm(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1));
         fsm.process(FsmInput::CollisionDetected);
         assert_eq!(fsm.state(), State::Active);
+        let outputs = fsm.process(FsmInput::TcpConnected);
+        assert_eq!(fsm.state(), State::OpenSent);
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, FsmOutput::SendMessage(BgpMessage::Open(_))))
+        );
+    }
+
+    // ── RFC 4724 §4.2 — Established-state collision override ──────────────────
+
+    /// Establish a session where the peer's OPEN advertised the Graceful
+    /// Restart capability.
+    fn established_fsm_with_gr() -> Fsm {
+        let mut fsm = Fsm::new(default_config());
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        let peer = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![
+                Capability::FourByteAsn(65002),
+                Capability::GracefulRestart {
+                    restart_flags: 0,
+                    restart_time: 120,
+                    families: vec![],
+                },
+            ],
+        });
+        fsm.process(FsmInput::MessageReceived(peer));
+        fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        assert_eq!(fsm.state(), State::Established);
+        fsm
+    }
+
+    #[test]
+    fn test_peer_has_graceful_restart_false_without_capability() {
+        let (fsm, _info) = establish(default_config());
+        assert!(!fsm.peer_has_graceful_restart());
+    }
+
+    #[test]
+    fn test_peer_has_graceful_restart_true_with_capability() {
+        let fsm = established_fsm_with_gr();
+        assert!(fsm.peer_has_graceful_restart());
+    }
+
+    #[test]
+    fn test_collision_detected_in_established_with_gr_moves_to_connect_no_notification() {
+        // RFC 4724 §4.2: "the previous TCP session MUST be closed, and the
+        // new one retained... Since the previous connection is considered to
+        // be terminated, no NOTIFICATION message should be sent -- the
+        // previous TCP session is simply closed." And from the FSM-text
+        // replacement in the same section: "...changes its state to Connect."
+        let mut fsm = established_fsm_with_gr();
+        let outputs = fsm.process(FsmInput::CollisionDetected);
+        assert_eq!(fsm.state(), State::Connect);
+        assert!(fsm.peer_bgp_id().is_none());
+        assert!(
+            find_notification(&outputs).is_none(),
+            "RFC 4724 §4.2 requires no NOTIFICATION on this path, got {outputs:?}"
+        );
+        assert!(outputs.contains(&FsmOutput::StopHoldTimer));
+        assert!(outputs.contains(&FsmOutput::StopKeepaliveTimer));
+        assert!(outputs.contains(&FsmOutput::CloseTcpConnection));
+        assert!(outputs.contains(&FsmOutput::SessionTerminated));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_)))
+        );
+    }
+
+    #[test]
+    fn test_collision_detected_in_established_with_gr_followed_by_tcp_connected_reaches_open_sent()
+    {
+        // Mirrors test_collision_detected_followed_by_tcp_connected_reaches_open_sent
+        // for the Established/GR path: after moving to Connect, the adopted
+        // incoming connection's TcpConnected must drive the FSM forward.
+        let mut fsm = established_fsm_with_gr();
+        fsm.process(FsmInput::CollisionDetected);
+        assert_eq!(fsm.state(), State::Connect);
         let outputs = fsm.process(FsmInput::TcpConnected);
         assert_eq!(fsm.state(), State::OpenSent);
         assert!(

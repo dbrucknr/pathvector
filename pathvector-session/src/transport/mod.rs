@@ -677,7 +677,35 @@ impl<T: BgpTransport> Session<T> {
                 }
             }
 
-            // Already established — reject the incoming connection.
+            // RFC 4724 §4.2: if the peer advertised Graceful Restart, a new
+            // incoming connection while we still think we're Established is
+            // proof the old TCP session died without our noticing — adopt it
+            // (no NOTIFICATION, unlike RFC 4271 §6.8's default). Otherwise
+            // keep the plain §6.8 behavior: reject the duplicate outright.
+            State::Established if self.fsm.peer_has_graceful_restart() => {
+                tracing::info!(
+                    peer = %self.config.peer_addr,
+                    "BGP collision: peer has Graceful Restart, adopting incoming \
+                     connection over presumed-dead Established session"
+                );
+                // execute() reads self.termination_reason when it forwards
+                // FsmOutput::SessionTerminated — set it explicitly rather than
+                // relying on whatever the field last held, since this call
+                // bypasses run()'s normal set-before-process step. RFC 4724
+                // §4.2 treats an undetected old-connection death as the same
+                // "unclean" case the daemon's GR helper-mode entry already
+                // keys on (TerminationReason::Unclean).
+                self.termination_reason = TerminationReason::Unclean;
+                let outputs = self.fsm.process(FsmInput::CollisionDetected);
+                self.execute(outputs).await;
+                self.local_addr = stream.local_addr().ok().map(|a| a.ip());
+                if let Some(factory) = &self.connect_factory {
+                    self.transport = Some(factory(stream));
+                }
+                Some(FsmInput::TcpConnected)
+            }
+
+            // Already established, no Graceful Restart — reject the incoming connection.
             State::Established => {
                 tracing::warn!(
                     peer = %self.config.peer_addr,
@@ -1752,6 +1780,97 @@ mod tests {
             matches!(event, SessionEvent::Established(_)),
             "expected Established over the kept outbound connection \
              (RFC 4271 §6.8 rule 3), got {event:?}"
+        );
+    }
+
+    /// RFC 4724 §4.2: "the previous TCP session MUST be closed, and the new
+    /// one retained... Since the previous connection is considered to be
+    /// terminated, no NOTIFICATION message should be sent -- the previous
+    /// TCP session is simply closed."
+    ///
+    /// Establishes a session where the peer advertised Graceful Restart, then
+    /// injects a second incoming connection while the FSM still thinks it's
+    /// Established (simulating an undetected TCP failure). Verifies the
+    /// *decision*: the old mock connection closes with no NOTIFICATION, and
+    /// a `Terminated(Unclean)` event fires (the trigger the daemon's GR
+    /// helper-mode entry keys on). Like the OpenConfirm-collision tests
+    /// above, `MockTransport` has no `connect_factory` to bridge a raw
+    /// `TcpStream`, so completing a second real handshake over the adopted
+    /// incoming connection is out of scope for this unit test — that belongs
+    /// in a real e2e/interop test.
+    #[tokio::test]
+    async fn test_incoming_connection_while_established_with_gr_closes_old_no_notification() {
+        use tokio::net::TcpListener;
+
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+        handle.start().await;
+
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("channel closed before OPEN");
+
+        let mut gr_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = gr_open {
+            open.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        peer.recv_tx.send(Ok(gr_open)).unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("channel closed before KEEPALIVE");
+        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for initial Established")
+            .expect("session channel closed before Established");
+        assert!(matches!(event, SessionEvent::Established(_)));
+
+        // Simulate the peer's old TCP connection dying without us noticing:
+        // inject a brand-new incoming connection while still Established.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (incoming, _) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let incoming = incoming.unwrap();
+
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        // The old mock connection must be torn down with NO NOTIFICATION —
+        // just the channel closing (RFC 4724 §4.2, distinct from RFC 4271
+        // §6.8's default Cease-NOTIFICATION collision behavior).
+        let closed = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for the old connection to close");
+        assert!(
+            closed.is_none(),
+            "RFC 4724 §4.2 requires the old connection to simply close with \
+             no NOTIFICATION, got {closed:?}"
+        );
+
+        // The adopted incoming connection must complete a fresh handshake
+        // and reach Established again.
+        let terminated_event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Terminated event")
+            .expect("session channel closed");
+        assert!(
+            matches!(
+                terminated_event,
+                SessionEvent::Terminated(TerminationReason::Unclean)
+            ),
+            "expected Terminated(Unclean) for the presumed-dead old connection, \
+             got {terminated_event:?}"
         );
     }
 
