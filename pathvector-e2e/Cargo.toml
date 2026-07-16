@@ -39,6 +39,10 @@ test = false
 name = "mock_bgp_dialer"
 test = false
 
+[[bin]]
+name = "mock_bgp_fault_peer"
+test = false
+
 [lints.rust]
 unsafe_code = "forbid"
 
