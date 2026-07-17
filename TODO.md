@@ -517,7 +517,36 @@ below, which deserved prompt attention):
   (keep the first, drop the rest, **no error at all**) — much weaker
   than what happens now (currently withdraws the whole route for a
   completely ordinary duplicate like two COMMUNITY attributes). See
-  `RFC_AUDIT.md`'s RFC 7606 §3 section.
+  `RFC_AUDIT.md`'s RFC 7606 §3 section. **Fixed 2026-07-17**
+  (`fix/rfc7606-duplicate-attribute-handling`): `decode_path_attributes`
+  now branches on type code for a duplicate — `MP_REACH_NLRI`/
+  `MP_UNREACH_NLRI` gets the new `AttributeErrorPolicy::SessionReset`
+  (previously unused; the doc comment claiming "attribute-level errors
+  never produce this" was itself wrong and has been corrected), anything
+  else gets `AttributeDiscard`. `UpdateDecodeOutcome::Partial`/
+  `MalformedUpdate` gained a `session_reset: bool` field alongside the
+  existing `treat_as_withdraw`, computed independently so both can be
+  true for the same UPDATE (e.g. a malformed ORIGIN plus a duplicated
+  MP_REACH_NLRI) — §3(h)'s "strongest action wins" rule is then applied
+  by `handle_malformed_update`, which checks `session_reset` first and
+  sends a real `UpdateMessage(MalformedAttributeList)` NOTIFICATION
+  before tearing down the session, ahead of the treat-as-withdraw/discard
+  branch. The pre-existing test asserting the old behavior,
+  `test_duplicate_attribute_is_treat_as_withdraw`, also cited the wrong
+  clause (§7.3, which is actually NEXT_HOP) — renamed and rewritten to
+  assert `AttributeDiscard`, plus two new tests
+  (`test_duplicate_mp_reach_nlri_requires_session_reset`,
+  `test_session_reset_takes_priority_over_treat_as_withdraw_in_same_update`)
+  and a transport-level test
+  (`test_rfc7606_session_reset_sends_notification_and_terminates`) proving
+  the NOTIFICATION is actually sent and the session actually terminates.
+  Real-teeth verified at both layers: reverting the codec branch to the
+  old unconditional `TreatAsWithdraw` failed all three codec-level tests
+  with the expected diagnostics; separately disabling just the
+  `session_reset` branch in `handle_malformed_update` failed the
+  transport-level test with "timed out waiting for the Malformed
+  Attribute List NOTIFICATION". Both reverts were restored and
+  re-verified passing before commit.
 - **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
   non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
   than being flagged malformed. Low impact (no semantic value either
