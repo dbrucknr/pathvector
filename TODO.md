@@ -585,7 +585,29 @@ below, which deserved prompt attention):
   the specific `OperatorStop` reason rather than any `Terminated(_)`;
   real-teeth verified by reverting to the old manual-send/`TcpFailed`
   code and confirming the test fails with `Terminated(Unclean)` exactly
-  as the bug predicts.
+  as the bug predicts. **A follow-up Codex review then found the
+  `NotificationToSend` fix above was itself incomplete**: that input's
+  existing FSM handling (used elsewhere for RFC 9003 administrative
+  shutdown / intentional peer removal, and for RFC 4486 max-prefix-exceeded,
+  which re-arms on its own idle-hold schedule) deliberately does **not**
+  start a `ConnectRetryTimer` — reusing it for a protocol error left a
+  still-configured, merely-misbehaving peer stuck in `Idle` forever, with
+  nothing to ever reconnect it. Per RFC 4271 §8.2.2 Event 28 (`UpdateMsgErr`),
+  a locally detected UPDATE error must send the NOTIFICATION, drop the
+  TCP connection, *and* re-arm the connect-retry timer. Fixed by adding a
+  new, distinct `FsmInput::ProtocolErrorNotificationToSend` (deliberately
+  not changing `NotificationToSend` itself, which must keep its no-retry
+  behavior for its other two call sites) whose `on_established` handling
+  is identical to `NotificationToSend`'s plus `StartConnectRetryTimer`;
+  `handle_malformed_update`'s `session_reset` branch now returns this new
+  input instead. Added `test_established_protocol_error_notification_schedules_reconnect`
+  (FSM-level, mirroring the existing `test_established_tcp_failed_schedules_reconnect`
+  pattern) asserting the NOTIFICATION, `CloseTcpConnection`,
+  `SessionTerminated`, and `StartConnectRetryTimer` outputs all fire;
+  real-teeth verified by removing just the `StartConnectRetryTimer` output
+  and confirming this exact test — and only this one — fails. Full
+  `pathvector-session` suite (316/316) and `pathvector-e2e` fault-injection
+  suite (9/9, real Docker rebuild) both green; clippy and fmt clean.
 - **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
   non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
   than being flagged malformed. Low impact (no semantic value either
