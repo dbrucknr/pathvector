@@ -546,7 +546,23 @@ below, which deserved prompt attention):
   `session_reset` branch in `handle_malformed_update` failed the
   transport-level test with "timed out waiting for the Malformed
   Attribute List NOTIFICATION". Both reverts were restored and
-  re-verified passing before commit.
+  re-verified passing before commit. Also proven over a real wire-level
+  session, not just unit tests: `pathvector-e2e`'s `mock_bgp_fault_peer`
+  gained a `duplicate-mp-reach` scenario sending a genuinely duplicated
+  MP_REACH_NLRI (IPv4-unicast content — deliberately not IPv6, since this
+  fault peer never negotiates the IPv6 MultiProtocol capability, and an
+  IPv6 attribute would additionally exercise unrelated capability-mismatch
+  handling) through pathvectord's real listener/decode path, holding the
+  connection open with its own periodic KEEPALIVEs afterward so the
+  session can only leave Established via the §3(g) code path under test,
+  not an unrelated hold-timer expiry. First attempt at this e2e test was
+  itself flawed — it didn't send keepalives after the fault UPDATE, so
+  pathvectord's 9s hold timer tore the session down on its own regardless
+  of the fix, and a first (accidental) real-teeth run surfaced this as a
+  flaky pass/fail rather than a clean signal; fixed by adding the
+  keepalive loop, after which reverting the fix produced 3/3 consistent
+  failures (~20s, hitting the assertion's 15s deadline) and restoring it
+  produced 3/3 consistent fast passes (~5s).
 - **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
   non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
   than being flagged malformed. Low impact (no semantic value either
