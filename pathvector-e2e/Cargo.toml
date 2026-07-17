@@ -43,6 +43,10 @@ test = false
 name = "mock_bgp_fault_peer"
 test = false
 
+[[bin]]
+name = "mock_bgp_collision_peer"
+test = false
+
 [lints.rust]
 unsafe_code = "forbid"
 

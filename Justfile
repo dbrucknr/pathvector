@@ -245,8 +245,20 @@ _build-mock-bgp-fault-peer-image:
         -t pathvector-mock-bgp-fault-peer-test:latest \
         .
 
+# Build the mock BGP collision-peer test image — shares Dockerfile.pathvectord's
+# builder stage (see _build-mock-rtr-image).
+_build-mock-bgp-collision-peer-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-mock-bgp-collision-peer-test:latest..."
+    docker build \
+        --target mock-bgp-collision-peer \
+        -f pathvector-e2e/Dockerfile.pathvectord \
+        -t pathvector-mock-bgp-collision-peer-test:latest \
+        .
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image _build-mock-bgp-dialer-image _build-mock-bgp-fault-peer-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image _build-mock-bgp-dialer-image _build-mock-bgp-fault-peer-image _build-mock-bgp-collision-peer-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge

@@ -221,6 +221,17 @@ jobs:
           cache-from: type=gha,scope=e2e-rust
           cache-to: type=gha,mode=max,scope=e2e-rust
 
+      - name: Build mock BGP collision peer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: pathvector-e2e/Dockerfile.pathvectord
+          target: mock-bgp-collision-peer
+          load: true
+          tags: pathvector-mock-bgp-collision-peer-test:latest
+          cache-from: type=gha,scope=e2e-rust
+          cache-to: type=gha,mode=max,scope=e2e-rust
+
       - name: Lint pathvector-e2e
         run: cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
 

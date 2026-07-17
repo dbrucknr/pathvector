@@ -78,6 +78,12 @@ pub const MOCK_BGP_DIALER_IMAGE: &str = "pathvector-mock-bgp-dialer-test";
 /// scenario to run is selected at container-start time via `.with_cmd(...)`.
 pub const MOCK_BGP_FAULT_PEER_IMAGE: &str = "pathvector-mock-bgp-fault-peer-test";
 
+/// Mock BGP peer image that both listens *and* dials, built by `just e2e`
+/// from `e2e/Dockerfile.mock-bgp-collision-peer`, used by
+/// [`CollisionHarness`]. See `src/bin/mock_bgp_collision_peer.rs` for the
+/// full scenario list.
+pub const MOCK_BGP_COLLISION_PEER_IMAGE: &str = "pathvector-mock-bgp-collision-peer-test";
+
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
@@ -637,6 +643,48 @@ fn write_daemon_config(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
 local_as  = 65002
 bgp_id    = "10.0.0.2"
 hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+"#
+    )
+    .expect("write pathvectord config header");
+
+    for (ip, remote_as) in peers {
+        write!(
+            f,
+            r#"
+[[peers]]
+address        = "{ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {remote_as}
+import_default = "accept"
+export_default = "accept"
+"#
+        )
+        .expect("write pathvectord peer config");
+    }
+    f
+}
+
+/// Writes a pathvectord config with `hold_time = 0`, fully disabling
+/// pathvectord's own hold/keepalive timers (`negotiated_hold_time` is
+/// `min(local, peer)`, and 0 on either side disables it — see
+/// `pathvector-session/src/fsm/mod.rs`). Used by [`CollisionHarness`]'s
+/// `gr-established-override` scenario: the mock peer deliberately abandons a
+/// connection without ever closing it, so pathvectord's own hold timer is
+/// the *only* other way it could ever notice something's wrong — disabling
+/// it outright makes the RFC 4724 §4.2 incoming-connection-collision code
+/// path the only possible way pathvectord ever leaves `Established` here,
+/// rather than merely making a timer race unlikely. Otherwise identical to
+/// [`write_daemon_config`].
+fn write_daemon_config_no_hold_time(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 0
 grpc_port = {PATHVECTORD_GRPC_PORT}
 "#
     )
@@ -2338,6 +2386,101 @@ impl FaultInjectionHarness {
             client,
             control_peer: control_peer_ip,
             fault_peer: fault_peer_ip,
+            _network: network,
+        }
+    }
+}
+
+/// Harness for [`MOCK_BGP_COLLISION_PEER_IMAGE`] scenarios — proves RFC 4271
+/// §6.8 (connection collision resolution) and RFC 4724 §4.2 (Established-
+/// state Graceful-Restart override) against a real, deliberately-sequenced
+/// second TCP connection, not just an in-process mock transport.
+///
+/// The mock both listens (for pathvectord's outbound dial, connection #1)
+/// and dials back into pathvectord's own listener (connection #2) — so
+/// unlike every other harness in this file, the mock container must start
+/// *before* pathvectord (its listener needs to already be up when
+/// pathvectord dials it), and must be told pathvectord's container name (not
+/// IP — Docker's embedded DNS on this bridge network resolves it, and by the
+/// time the mock dials back pathvectord is already up and network-attached,
+/// so no pre-assigned static IP is needed).
+pub struct CollisionHarness {
+    _mock_peer: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    pub mock_peer: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl CollisionHarness {
+    /// Starts the collision mock peer (running `scenario` — see
+    /// `mock_bgp_collision_peer.rs`'s module doc for the full scenario list)
+    /// and pathvectord, then waits for pathvectord's session to reach
+    /// `Established`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or the session doesn't reach
+    /// `Established` within 30s.
+    pub async fn new(scenario: &str) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+
+        let network_name = format!("pathvector-collision-test-{test_id}");
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        // Both names are needed before either container starts: the mock's
+        // argv names pathvectord (to dial back into), and pathvectord's
+        // config names the mock's IP (read back after the mock starts).
+        let mock_name = format!("mock-bgp-collision-{test_id}");
+        let pathvectord_name = format!("pathvectord-collision-{test_id}");
+
+        let mock_peer = GenericImage::new(MOCK_BGP_COLLISION_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd([
+                format!("{pathvectord_name}:{GOBGPD_BGP_PORT}"),
+                scenario.to_string(),
+            ])
+            .with_network(&network_name)
+            .with_container_name(mock_name.clone())
+            .start()
+            .await
+            .expect("start mock BGP collision peer container");
+        let mock_peer_id = mock_peer.id().to_owned();
+        let mock_peer_ip = container_network_ip(&mock_peer_id, &network_name);
+
+        let pathvectord_config = write_daemon_config_no_hold_time(&[(mock_peer_ip, 65099)]);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(pathvectord_name)
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                pathvectord_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for CollisionHarness");
+
+        wait_for_established(&mut client, mock_peer_ip, Duration::from_secs(30))
+            .await
+            .expect("session did not reach Established within 30 s");
+
+        Self {
+            _mock_peer: mock_peer,
+            _pathvectord: pathvectord,
+            _pathvectord_config: pathvectord_config,
+            client,
+            mock_peer: mock_peer_ip,
             _network: network,
         }
     }
