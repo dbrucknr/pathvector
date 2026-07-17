@@ -73,10 +73,48 @@ fn rfc7606_policy(type_code: u8) -> AttributeErrorPolicy {
         ATTR_ORIGIN | ATTR_AS_PATH | ATTR_NEXT_HOP | ATTR_LOCAL_PREF => {
             AttributeErrorPolicy::TreatAsWithdraw
         }
-        // MP_REACH_NLRI → treat as withdraw for the affected AFI/SAFI
-        ATTR_MP_REACH_NLRI => AttributeErrorPolicy::TreatAsWithdraw,
+        // MP_REACH_NLRI → treat as withdraw for the affected AFI/SAFI.
+        //
+        // ONLY_TO_CUSTOMER (RFC 9234 §5): "The OTC Attribute is considered
+        // malformed if the length value is not 4. An UPDATE message with a
+        // malformed OTC Attribute SHALL be handled using the approach of
+        // 'treat-as-withdraw' [RFC7606]." Security-relevant: OTC is the
+        // entire mechanism RFC 9234 uses to detect route leaks — falling
+        // through to the generic AttributeDiscard arm would let a route
+        // with a deliberately malformed OTC pass through untagged instead
+        // of being withdrawn.
+        ATTR_MP_REACH_NLRI | ATTR_ONLY_TO_CUSTOMER => AttributeErrorPolicy::TreatAsWithdraw,
         // Everything else (optional): attribute discard
         _ => AttributeErrorPolicy::AttributeDiscard,
+    }
+}
+
+/// RFC 4271 §4.3/§5's per-attribute-type expected (Optional, Transitive)
+/// flag bits, for every attribute type this decoder recognizes. Returns
+/// `(optional, transitive)` where each is the bit's required value — `true`
+/// for Optional means "well-known" is wrong (Optional MUST be 0 for
+/// well-known attributes); `true` for Transitive means the Transitive bit
+/// MUST be set. `None` for unrecognized type codes.
+fn expected_optional_transitive(type_code: u8) -> Option<(bool, bool)> {
+    match type_code {
+        // Well-known (mandatory or discretionary): Optional=0, Transitive=1
+        // (RFC 4271 §4.3: "For well-known attributes, the Transitive bit
+        // MUST be set to 1.").
+        ATTR_ORIGIN | ATTR_AS_PATH | ATTR_NEXT_HOP | ATTR_LOCAL_PREF | ATTR_ATOMIC_AGGREGATE => {
+            Some((false, true))
+        }
+        // Optional non-transitive: Optional=1, Transitive=0.
+        ATTR_MED | ATTR_ORIGINATOR_ID | ATTR_CLUSTER_LIST | ATTR_MP_REACH_NLRI
+        | ATTR_MP_UNREACH_NLRI => Some((true, false)),
+        // Optional transitive: Optional=1, Transitive=1.
+        ATTR_AGGREGATOR
+        | ATTR_COMMUNITY
+        | ATTR_EXTENDED_COMMUNITIES
+        | ATTR_AS4_PATH
+        | ATTR_AS4_AGGREGATOR
+        | ATTR_LARGE_COMMUNITY
+        | ATTR_ONLY_TO_CUSTOMER => Some((true, true)),
+        _ => None,
     }
 }
 
@@ -345,6 +383,31 @@ fn decode_path_attributes(
         }
         seen[type_code as usize] = true;
 
+        // Attribute Flags Error (RFC 7606 §3(c), revising RFC 4271 §4.3):
+        // "If the value of either the Optional or Transitive bits in the
+        // Attribute Flags is in conflict with their specified values, then
+        // the attribute MUST be treated as malformed and the
+        // 'treat-as-withdraw' approach used." Deliberately checks only
+        // Optional/Transitive, not Partial — RFC 7606's revised text does
+        // not mention the Partial bit at all, unlike the RFC 4271 text it
+        // replaces. `None` for unrecognized type codes: there's no
+        // "specified value" to conflict with, so any flags combination is
+        // accepted (the flags themselves — not a validated expectation —
+        // continue to govern propagation of unrecognized attributes).
+        if let Some((expect_optional, expect_transitive)) = expected_optional_transitive(type_code)
+        {
+            let actual_optional = flags & FLAG_OPTIONAL != 0;
+            let actual_transitive = flags & FLAG_TRANSITIVE != 0;
+            if actual_optional != expect_optional || actual_transitive != expect_transitive {
+                errors.push(AttributeDecodeError {
+                    type_code,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "attribute flags conflict (Optional or Transitive bit)",
+                });
+                continue;
+            }
+        }
+
         match decode_attr_value(flags, type_code, &mut val) {
             Ok(attr) => attrs.push(attr),
             Err(e) => errors.push(AttributeDecodeError {
@@ -366,10 +429,10 @@ fn decode_attr_value(
 ) -> Result<PathAttribute, CodecError> {
     match type_code {
         ATTR_ORIGIN => {
-            if cur.remaining() < 1 {
+            if cur.remaining() != 1 {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
-                    detail: "ORIGIN must be 1 byte",
+                    detail: "ORIGIN must be exactly 1 byte",
                 });
             }
             let v = cur.read_u8()?;
@@ -383,46 +446,58 @@ fn decode_attr_value(
         }
 
         ATTR_NEXT_HOP => {
-            if cur.remaining() < 4 {
+            if cur.remaining() != 4 {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
-                    detail: "NEXT_HOP must be 4 bytes",
+                    detail: "NEXT_HOP must be exactly 4 bytes",
                 });
             }
             Ok(PathAttribute::NextHop(cur.read_ipv4addr()?))
         }
 
         ATTR_MED => {
-            if cur.remaining() < 4 {
+            if cur.remaining() != 4 {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
-                    detail: "MED must be 4 bytes",
+                    detail: "MED must be exactly 4 bytes",
                 });
             }
             Ok(PathAttribute::Med(cur.read_u32()?))
         }
 
         ATTR_LOCAL_PREF => {
-            if cur.remaining() < 4 {
+            if cur.remaining() != 4 {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
-                    detail: "LOCAL_PREF must be 4 bytes",
+                    detail: "LOCAL_PREF must be exactly 4 bytes",
                 });
             }
             Ok(PathAttribute::LocalPref(cur.read_u32()?))
         }
 
         ATTR_ONLY_TO_CUSTOMER => {
-            if cur.remaining() < 4 {
+            // RFC 9234 §5: "The OTC Attribute is considered malformed if the
+            // length value is not 4."
+            if cur.remaining() != 4 {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
-                    detail: "ONLY_TO_CUSTOMER must be 4 bytes",
+                    detail: "ONLY_TO_CUSTOMER must be exactly 4 bytes",
                 });
             }
             Ok(PathAttribute::OnlyToCustomer(Asn::new(cur.read_u32()?)))
         }
 
-        ATTR_ATOMIC_AGGREGATE => Ok(PathAttribute::AtomicAggregate),
+        ATTR_ATOMIC_AGGREGATE => {
+            // RFC 7606 §7.6: "The attribute SHALL be considered malformed
+            // if its length is not 0."
+            if cur.remaining() != 0 {
+                return Err(CodecError::InvalidAttribute {
+                    type_code,
+                    detail: "ATOMIC_AGGREGATE must be exactly 0 bytes",
+                });
+            }
+            Ok(PathAttribute::AtomicAggregate)
+        }
 
         ATTR_AGGREGATOR => {
             if cur.remaining() < 8 {
@@ -533,10 +608,14 @@ fn decode_attr_value(
         }
 
         ATTR_AS4_AGGREGATOR => {
-            if cur.remaining() < 8 {
+            // RFC 6793: "The AS4_AGGREGATOR attribute in an UPDATE message
+            // SHALL be considered malformed if the attribute length is not
+            // 8." (fixed regardless of negotiated capabilities, unlike
+            // plain AGGREGATOR — see TODO.md for that separate gap.)
+            if cur.remaining() != 8 {
                 return Err(CodecError::InvalidAttribute {
                     type_code,
-                    detail: "AS4_AGGREGATOR must be 8 bytes",
+                    detail: "AS4_AGGREGATOR must be exactly 8 bytes",
                 });
             }
             let asn = cur.read_u32()?;
@@ -1474,7 +1553,7 @@ mod tests {
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_ORIGIN,
                     policy: AttributeErrorPolicy::TreatAsWithdraw,
-                    detail: "ORIGIN must be 1 byte",
+                    detail: "ORIGIN must be exactly 1 byte",
                 }],
                 treat_as_withdraw: true,
                 session_reset: false,
@@ -1496,7 +1575,7 @@ mod tests {
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_NEXT_HOP,
                     policy: AttributeErrorPolicy::TreatAsWithdraw,
-                    detail: "NEXT_HOP must be 4 bytes",
+                    detail: "NEXT_HOP must be exactly 4 bytes",
                 }],
                 treat_as_withdraw: true,
                 session_reset: false,
@@ -1518,7 +1597,7 @@ mod tests {
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_LOCAL_PREF,
                     policy: AttributeErrorPolicy::TreatAsWithdraw,
-                    detail: "LOCAL_PREF must be 4 bytes",
+                    detail: "LOCAL_PREF must be exactly 4 bytes",
                 }],
                 treat_as_withdraw: true,
                 session_reset: false,
@@ -1584,7 +1663,7 @@ mod tests {
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_MED,
                     policy: AttributeErrorPolicy::AttributeDiscard,
-                    detail: "MED must be 4 bytes",
+                    detail: "MED must be exactly 4 bytes",
                 }],
                 treat_as_withdraw: false,
                 session_reset: false,
@@ -1694,7 +1773,7 @@ mod tests {
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_AS4_AGGREGATOR,
                     policy: AttributeErrorPolicy::AttributeDiscard,
-                    detail: "AS4_AGGREGATOR must be 8 bytes",
+                    detail: "AS4_AGGREGATOR must be exactly 8 bytes",
                 }],
                 treat_as_withdraw: false,
                 session_reset: false,
@@ -1891,7 +1970,7 @@ mod tests {
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_MED,
                     policy: AttributeErrorPolicy::AttributeDiscard,
-                    detail: "MED must be 4 bytes",
+                    detail: "MED must be exactly 4 bytes",
                 }],
                 treat_as_withdraw: false,
                 session_reset: false,
@@ -2199,6 +2278,240 @@ mod tests {
             "CLUSTER_LIST with a length not a multiple of 4 must be an error or partial decode"
         );
     }
+
+    // ── RFC 7606 §3(c) — Attribute Flags Error ────────────────────────────────
+
+    #[test]
+    fn test_well_known_attribute_marked_optional_is_treat_as_withdraw() {
+        // ORIGIN (well-known: Optional MUST be 0) sent with Optional=1 set —
+        // an Attribute Flags conflict, not a value-level error (the value
+        // byte itself, 0 = Igp, is perfectly valid).
+        let body = update_with_attr(FLAG_OPTIONAL | FLAG_TRANSITIVE, ATTR_ORIGIN, &[0]);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_ORIGIN,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "attribute flags conflict (Optional or Transitive bit)",
+                }],
+                treat_as_withdraw: true,
+                session_reset: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_well_known_attribute_missing_transitive_bit_is_treat_as_withdraw() {
+        // RFC 4271 §4.3: "For well-known attributes, the Transitive bit
+        // MUST be set to 1." ORIGIN sent with flags=0 (neither bit set).
+        let body = update_with_attr(0, ATTR_ORIGIN, &[0]);
+        let outcome = decode_raw(&body).unwrap();
+        let UpdateDecodeOutcome::Partial {
+            errors,
+            treat_as_withdraw,
+            ..
+        } = outcome
+        else {
+            panic!("expected Partial outcome, got {outcome:?}");
+        };
+        assert!(treat_as_withdraw);
+        assert_eq!(
+            errors,
+            vec![AttributeDecodeError {
+                type_code: ATTR_ORIGIN,
+                policy: AttributeErrorPolicy::TreatAsWithdraw,
+                detail: "attribute flags conflict (Optional or Transitive bit)",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_optional_transitive_attribute_marked_non_transitive_is_treat_as_withdraw() {
+        // AGGREGATOR is optional transitive (Optional=1, Transitive=1).
+        // Sent as optional non-transitive (Transitive=0) instead — flags
+        // conflict, even though the 8-byte value itself is well-formed.
+        let body = update_with_attr(FLAG_OPTIONAL, ATTR_AGGREGATOR, &[0; 8]);
+        let outcome = decode_raw(&body).unwrap();
+        let UpdateDecodeOutcome::Partial {
+            errors,
+            treat_as_withdraw,
+            ..
+        } = outcome
+        else {
+            panic!("expected Partial outcome, got {outcome:?}");
+        };
+        assert!(treat_as_withdraw);
+        assert_eq!(
+            errors,
+            vec![AttributeDecodeError {
+                type_code: ATTR_AGGREGATOR,
+                policy: AttributeErrorPolicy::TreatAsWithdraw,
+                detail: "attribute flags conflict (Optional or Transitive bit)",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_correct_flags_do_not_trigger_flags_conflict() {
+        // Sanity check: every recognized type code's own correct flags must
+        // NOT trip the new check — otherwise every roundtrip test in this
+        // file would already have caught it, but a dedicated assertion
+        // here pins the invariant directly against `expected_optional_transitive`.
+        for type_code in 0u8..=255 {
+            if let Some((optional, transitive)) = expected_optional_transitive(type_code) {
+                let flags = (if optional { FLAG_OPTIONAL } else { 0 })
+                    | (if transitive { FLAG_TRANSITIVE } else { 0 });
+                let actual_optional = flags & FLAG_OPTIONAL != 0;
+                let actual_transitive = flags & FLAG_TRANSITIVE != 0;
+                assert_eq!(actual_optional, optional, "type_code={type_code}");
+                assert_eq!(actual_transitive, transitive, "type_code={type_code}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unrecognized_attribute_any_flags_no_conflict() {
+        // Type code 200 is unrecognized by this decoder — RFC 7606 §3(c)'s
+        // "specified value" language doesn't apply, since there's no
+        // specified value for a type we don't know. Any flags combination
+        // must decode cleanly (as PathAttribute::Unknown), not be flagged
+        // as a conflict.
+        let body = update_with_attr(FLAG_OPTIONAL, 200, &[1, 2, 3]);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Clean(UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::Unknown {
+                    flags: FLAG_OPTIONAL,
+                    type_code: 200,
+                    value: vec![1, 2, 3],
+                }],
+                announced: vec![],
+            })
+        );
+    }
+
+    // ── RFC 9234 §5 / RFC 7606 §7.6 — OTC and ATOMIC_AGGREGATE length ─────────
+
+    #[test]
+    fn test_only_to_customer_wrong_length_is_treat_as_withdraw() {
+        // RFC 9234 §5: malformed (length != 4) OTC is treat-as-withdraw, not
+        // the generic attribute-discard the old catch-all policy produced.
+        let body = update_with_attr(FLAGS_OT, ATTR_ONLY_TO_CUSTOMER, &[0; 3]);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_ONLY_TO_CUSTOMER,
+                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    detail: "ONLY_TO_CUSTOMER must be exactly 4 bytes",
+                }],
+                treat_as_withdraw: true,
+                session_reset: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_only_to_customer_too_long_is_error_not_silently_truncated() {
+        // Before this fix, a >4-byte OTC would silently decode the first 4
+        // bytes and discard the rest with no error at all.
+        let body = update_with_attr(FLAGS_OT, ATTR_ONLY_TO_CUSTOMER, &[0; 6]);
+        let outcome = decode_raw(&body).unwrap();
+        assert!(
+            matches!(outcome, UpdateDecodeOutcome::Partial { .. }),
+            "a 6-byte OTC must be flagged as malformed, not silently accepted: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_atomic_aggregate_nonzero_length_is_error() {
+        // RFC 7606 §7.6: "The attribute SHALL be considered malformed if
+        // its length is not 0." Before this fix, any length was silently
+        // accepted (the arm never read from the cursor at all).
+        let body = update_with_attr(FLAGS_WKM, ATTR_ATOMIC_AGGREGATE, &[0; 4]);
+        assert_eq!(
+            decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_ATOMIC_AGGREGATE,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "ATOMIC_AGGREGATE must be exactly 0 bytes",
+                }],
+                treat_as_withdraw: false,
+                session_reset: false,
+            }
+        );
+    }
+
+    // ── Too-long silently truncated (fixed alongside the OTC/ATOMIC_AGGREGATE
+    // length checks — same root cause: `< N` only catches too-short) ─────────
+
+    #[test]
+    fn test_origin_too_long_is_error_not_silently_truncated() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_ORIGIN, &[0, 0]); // 2 bytes, needs 1
+        let outcome = decode_raw(&body).unwrap();
+        assert!(
+            matches!(outcome, UpdateDecodeOutcome::Partial { .. }),
+            "a 2-byte ORIGIN must be flagged as malformed, not silently truncated: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_next_hop_too_long_is_error_not_silently_truncated() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_NEXT_HOP, &[0; 5]); // 5 bytes, needs 4
+        let outcome = decode_raw(&body).unwrap();
+        assert!(
+            matches!(outcome, UpdateDecodeOutcome::Partial { .. }),
+            "a 5-byte NEXT_HOP must be flagged as malformed, not silently truncated: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_med_too_long_is_error_not_silently_truncated() {
+        let body = update_with_attr(FLAGS_ONT, ATTR_MED, &[0; 5]); // 5 bytes, needs 4
+        let outcome = decode_raw(&body).unwrap();
+        assert!(
+            matches!(outcome, UpdateDecodeOutcome::Partial { .. }),
+            "a 5-byte MED must be flagged as malformed, not silently truncated: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_local_pref_too_long_is_error_not_silently_truncated() {
+        let body = update_with_attr(FLAGS_WKM, ATTR_LOCAL_PREF, &[0; 5]); // 5 bytes, needs 4
+        let outcome = decode_raw(&body).unwrap();
+        assert!(
+            matches!(outcome, UpdateDecodeOutcome::Partial { .. }),
+            "a 5-byte LOCAL_PREF must be flagged as malformed, not silently truncated: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_as4_aggregator_too_long_is_error_not_silently_truncated() {
+        let body = update_with_attr(FLAGS_OT, ATTR_AS4_AGGREGATOR, &[0; 9]); // 9 bytes, needs 8
+        let outcome = decode_raw(&body).unwrap();
+        assert!(
+            matches!(outcome, UpdateDecodeOutcome::Partial { .. }),
+            "a 9-byte AS4_AGGREGATOR must be flagged as malformed, not silently truncated: {outcome:?}"
+        );
+    }
 }
 
 // ── RFC 7606 property tests ───────────────────────────────────────────────────
@@ -2352,12 +2665,15 @@ mod prop_tests {
     //   NEXT_HOP  — 3 bytes, needs 4
     //   LOCAL_PREF — 3 bytes, needs 4
     //   MP_REACH_NLRI — 2 bytes, needs ≥ 4
+    //   ONLY_TO_CUSTOMER — 3 bytes, needs exactly 4 (RFC 9234 §5: malformed
+    //   OTC is treat-as-withdraw, not the generic attribute-discard default)
     const TREAT_AS_WITHDRAW_CASES: &[(u8, &[u8])] = &[
         (ATTR_ORIGIN, &[99]),
         (ATTR_AS_PATH, &[9, 0]),
         (ATTR_NEXT_HOP, &[10, 0, 0]),
         (ATTR_LOCAL_PREF, &[0; 3]),
         (ATTR_MP_REACH_NLRI, &[0; 2]),
+        (ATTR_ONLY_TO_CUSTOMER, &[0; 3]),
     ];
 
     // (type_code, canonical malformed value) for AttributeDiscard attributes.
@@ -2373,11 +2689,23 @@ mod prop_tests {
         (ATTR_AS4_PATH, &[9, 0]),             // unknown segment type
         (ATTR_AS4_AGGREGATOR, &[0; 7]),       // 7 bytes, needs 8
         (ATTR_LARGE_COMMUNITY, &[0; 11]),     // 11 bytes, not multiple of 12
-        (ATTR_ONLY_TO_CUSTOMER, &[0; 3]),     // 3 bytes, needs 4
     ];
 
-    /// Build a minimal UPDATE body with one attribute whose value is `value`.
-    fn one_attr_update(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
+    /// The correct (Optional, Transitive) flags for `type_code`, per
+    /// `expected_optional_transitive`. Used to build test cases that
+    /// exercise a *value*-level decode error without accidentally tripping
+    /// the (independent) Attribute Flags Error check first.
+    fn correct_flags_for(type_code: u8) -> u8 {
+        let (optional, transitive) = expected_optional_transitive(type_code)
+            .expect("test case type code must be one this decoder recognizes");
+        (if optional { FLAG_OPTIONAL } else { 0 }) | (if transitive { FLAG_TRANSITIVE } else { 0 })
+    }
+
+    /// Build a minimal UPDATE body with one attribute whose value is `value`,
+    /// using the type-appropriate flags (see `correct_flags_for`) so the
+    /// value-level error under test isn't masked by a flags conflict.
+    fn one_attr_update(type_code: u8, value: &[u8]) -> Vec<u8> {
+        let flags = correct_flags_for(type_code);
         let attr_total = 3 + value.len(); // flags + type + 1-byte len + value
         let mut body = vec![0u8, 0]; // withdrawn_len = 0
         body.extend_from_slice(&u16::try_from(attr_total).unwrap().to_be_bytes());
@@ -2401,7 +2729,7 @@ mod prop_tests {
             case in proptest::sample::select(TREAT_AS_WITHDRAW_CASES),
         ) {
             let (type_code, value) = case;
-            let body = one_attr_update(FLAG_TRANSITIVE, type_code, value);
+            let body = one_attr_update(type_code, value);
             match decode_outcome(&body) {
                 UpdateDecodeOutcome::Partial { errors, treat_as_withdraw, .. } => {
                     prop_assert!(treat_as_withdraw,
@@ -2425,7 +2753,7 @@ mod prop_tests {
             case in proptest::sample::select(ATTRIBUTE_DISCARD_CASES),
         ) {
             let (type_code, value) = case;
-            let body = one_attr_update(FLAG_OPTIONAL, type_code, value);
+            let body = one_attr_update(type_code, value);
             match decode_outcome(&body) {
                 UpdateDecodeOutcome::Partial { errors, treat_as_withdraw, .. } => {
                     prop_assert!(!treat_as_withdraw,
@@ -2464,7 +2792,7 @@ mod prop_tests {
             // Build an UPDATE with one canonical malformed attribute per case.
             let mut attrs = Vec::new();
             for &(tc, value) in &cases {
-                attrs.push(FLAG_OPTIONAL);
+                attrs.push(correct_flags_for(tc));
                 attrs.push(tc);
                 attrs.push(u8::try_from(value.len()).unwrap());
                 attrs.extend_from_slice(value);
