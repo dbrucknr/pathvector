@@ -48,7 +48,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{
-    BgpMessage, MpReachNlri, OpenMessage, PathAttribute, Prefix, UpdateMessage,
+    BgpMessage, Capability, MpReachNlri, OpenMessage, PathAttribute, Prefix, UpdateMessage,
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -403,12 +403,21 @@ async fn duplicate_mp_reach_update(stream: TcpStream) {
     };
     println!("received OPEN from peer AS {}", peer_open.my_as);
 
+    // Unlike the other scenarios in this file, this one negotiates the
+    // MultiProtocol(IPv4 unicast) capability — the MP_REACH_NLRI attribute
+    // sent below carries IPv4 unicast content, and properly negotiating it
+    // removes capability-mismatch handling as a confound: if the duplicate
+    // detection were ever disabled/broken, the single (post-dedup)
+    // MpReachNlri would fall through to pathvectord's already-supported,
+    // deterministic mp_v4 route-install path instead of an unnegotiated-
+    // AFI/SAFI code path whose behavior isn't what this scenario means to
+    // exercise.
     let our_open = OpenMessage {
         version: 4,
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::MultiProtocol(AfiSafi::IPV4_UNICAST)],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -427,6 +436,15 @@ async fn duplicate_mp_reach_update(stream: TcpStream) {
         }
     }
     println!("session established");
+
+    // Give the e2e test a real window to observe the fault peer's session
+    // as Established (via gRPC) before the fault below resets it — without
+    // this, "session reached Established" and "session got reset" could
+    // both happen faster than the test's own polling could ever observe
+    // the intermediate Established state, letting a broken fix produce a
+    // false pass (never confirmed Established, so "not Established" is
+    // trivially and vacuously true from the very first poll).
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // IPv4 unicast content (not IPv6) deliberately: this scenario's fault
     // peer never negotiates the IPv6 MultiProtocol capability (its OPEN
@@ -461,16 +479,22 @@ async fn duplicate_mp_reach_update(stream: TcpStream) {
     // eventually being torn down by an unrelated 9s HoldTimerExpired that
     // would make this test pass for the wrong reason. A real regression here
     // must show up as "no NOTIFICATION arrives, session stays Established
-    // indefinitely," not as a hold-timer timeout race.
+    // indefinitely," not as a hold-timer timeout race. A 1s interval
+    // (rather than the RFC-typical hold_time/3 = 3s) is deliberate: under
+    // real-teeth testing, a 3s interval left too little margin against
+    // ordinary Docker/host scheduling jitter, and a delayed keepalive was
+    // directly observed causing a spurious `HoldTimerExpired` NOTIFICATION
+    // instead of the fix's own `MalformedAttributeList` — a false signal
+    // unrelated to the code under test.
     let mut ticks = 0;
     loop {
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(3)) => {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
                 if framed.send(BgpMessage::Keepalive).await.is_err() {
                     return;
                 }
                 ticks += 1;
-                if ticks > 10 {
+                if ticks > 60 {
                     // Long past any reasonable test timeout — give up rather
                     // than looping forever if something is very wrong.
                     return;

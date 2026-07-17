@@ -214,6 +214,19 @@ async fn duplicate_mp_reach_nlri_resets_session() {
     assert_control_peer_established(&mut h).await;
 
     let fault_peer = h.fault_peer;
+
+    // Anchor on the fault peer actually reaching Established first.
+    // `SessionState` only has two variants (`Idle` covers every
+    // pre-Established FSM state, `Established` the rest) and
+    // `FaultInjectionHarness::new` only waits for the *control* peer — so
+    // without this, the poll loop below could observe `Idle` because the
+    // fault peer simply hasn't finished its handshake yet, and treat that
+    // as "correctly reset" without the RFC 7606 §3(g) behavior ever having
+    // been exercised at all.
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let state = h
