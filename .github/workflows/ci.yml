@@ -233,7 +233,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=e2e-rust
 
       - name: Lint pathvector-e2e
-        run: cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
+        run: cargo clippy -p pathvector-e2e --all-targets -- -D warnings
 
       - name: Run e2e tests
         run: cargo nextest run -p pathvector-e2e --test-threads 4

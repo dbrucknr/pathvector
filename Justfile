@@ -273,7 +273,7 @@ e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _buil
 # limits make runs flaky. Requires cargo-nextest — see CONTRIBUTING.md.
 # Run end-to-end tests against Docker containers (requires Docker + cargo-nextest)
 e2e: e2e-images
-    cargo clippy -p pathvector-e2e --all-targets -- -D warnings -A clippy::similar_names
+    cargo clippy -p pathvector-e2e --all-targets -- -D warnings
     cargo nextest run -p pathvector-e2e --test-threads 8
 
 # Start the compose dev environment (manual inspection / debugging).

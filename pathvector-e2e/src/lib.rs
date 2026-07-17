@@ -814,7 +814,7 @@ role           = "provider"
 /// (`remote_as` must match its `FAULT_PEER_AS` constant).
 fn write_daemon_config_fault_injection(
     control_ip: Ipv4Addr,
-    fault_peer_ip: Ipv4Addr,
+    fault_peer_addr: Ipv4Addr,
 ) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp pathvectord config");
     write!(
@@ -834,7 +834,7 @@ import_default = "accept"
 export_default = "accept"
 
 [[peers]]
-address        = "{fault_peer_ip}"
+address        = "{fault_peer_addr}"
 port           = {GOBGPD_BGP_PORT}
 remote_as      = 65098
 import_default = "accept"
@@ -2147,7 +2147,7 @@ impl RpkiHarness {
             .await
             .expect("start gobgpd container");
         let gobgpd_id = gobgpd.id().to_owned();
-        let gobgpd_ip = container_network_ip(&gobgpd_id, &network_name);
+        let gobgpd_addr = container_network_ip(&gobgpd_id, &network_name);
 
         let mock_rtr = GenericImage::new(MOCK_RTR_IMAGE, "latest")
             .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
@@ -2157,9 +2157,9 @@ impl RpkiHarness {
             .await
             .expect("start mock RTR server container");
         let mock_rtr_id = mock_rtr.id().to_owned();
-        let mock_rtr_ip = container_network_ip(&mock_rtr_id, &network_name);
+        let mock_rtr_addr = container_network_ip(&mock_rtr_id, &network_name);
 
-        let pathvectord_config = write_daemon_config_rpki(&[(gobgpd_ip, 65001)], mock_rtr_ip);
+        let pathvectord_config = write_daemon_config_rpki(&[(gobgpd_addr, 65001)], mock_rtr_addr);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
@@ -2179,7 +2179,7 @@ impl RpkiHarness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient for RpkiHarness");
 
-        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30))
+        wait_for_established(&mut client, gobgpd_addr, Duration::from_secs(30))
             .await
             .expect("BGP session did not reach Established within 30 s");
         wait_for_rpki_synced(&mut client, Duration::from_secs(15))
@@ -2194,7 +2194,7 @@ impl RpkiHarness {
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,
-            peer: gobgpd_ip,
+            peer: gobgpd_addr,
             _network: network,
         }
     }
@@ -2252,9 +2252,9 @@ impl RoleHarness {
             .await
             .expect("start mock BGP peer container");
         let mock_peer_id = mock_peer.id().to_owned();
-        let mock_peer_ip = container_network_ip(&mock_peer_id, &network_name);
+        let mock_peer_addr = container_network_ip(&mock_peer_id, &network_name);
 
-        let pathvectord_config = write_daemon_config_role(mock_peer_ip, MOCK_PEER_AS);
+        let pathvectord_config = write_daemon_config_role(mock_peer_addr, MOCK_PEER_AS);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
@@ -2274,7 +2274,7 @@ impl RoleHarness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient for RoleHarness");
 
-        wait_for_established(&mut client, mock_peer_ip, Duration::from_secs(30))
+        wait_for_established(&mut client, mock_peer_addr, Duration::from_secs(30))
             .await
             .expect("BGP session did not reach Established within 30 s");
 
@@ -2283,7 +2283,7 @@ impl RoleHarness {
             _pathvectord: pathvectord,
             _pathvectord_config: pathvectord_config,
             client,
-            peer: mock_peer_ip,
+            peer: mock_peer_addr,
             _network: network,
         }
     }
@@ -2339,7 +2339,7 @@ impl FaultInjectionHarness {
             .await
             .expect("start GoBGP control peer container");
         let control_peer_id = control_peer.id().to_owned();
-        let control_peer_ip = container_network_ip(&control_peer_id, &network_name);
+        let control_peer_addr = container_network_ip(&control_peer_id, &network_name);
 
         let fault_peer = GenericImage::new(MOCK_BGP_FAULT_PEER_IMAGE, "latest")
             .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
@@ -2350,10 +2350,10 @@ impl FaultInjectionHarness {
             .await
             .expect("start mock BGP fault peer container");
         let fault_peer_id = fault_peer.id().to_owned();
-        let fault_peer_ip = container_network_ip(&fault_peer_id, &network_name);
+        let fault_peer_addr = container_network_ip(&fault_peer_id, &network_name);
 
         let pathvectord_config =
-            write_daemon_config_fault_injection(control_peer_ip, fault_peer_ip);
+            write_daemon_config_fault_injection(control_peer_addr, fault_peer_addr);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
@@ -2373,7 +2373,7 @@ impl FaultInjectionHarness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient for FaultInjectionHarness");
 
-        wait_for_established(&mut client, control_peer_ip, Duration::from_secs(30))
+        wait_for_established(&mut client, control_peer_addr, Duration::from_secs(30))
             .await
             .expect("control peer session did not reach Established within 30 s");
 
@@ -2384,8 +2384,8 @@ impl FaultInjectionHarness {
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,
-            control_peer: control_peer_ip,
-            fault_peer: fault_peer_ip,
+            control_peer: control_peer_addr,
+            fault_peer: fault_peer_addr,
             _network: network,
         }
     }
@@ -2449,9 +2449,9 @@ impl CollisionHarness {
             .await
             .expect("start mock BGP collision peer container");
         let mock_peer_id = mock_peer.id().to_owned();
-        let mock_peer_ip = container_network_ip(&mock_peer_id, &network_name);
+        let mock_peer_addr = container_network_ip(&mock_peer_id, &network_name);
 
-        let pathvectord_config = write_daemon_config_no_hold_time(&[(mock_peer_ip, 65099)]);
+        let pathvectord_config = write_daemon_config_no_hold_time(&[(mock_peer_addr, 65099)]);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
@@ -2471,7 +2471,7 @@ impl CollisionHarness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient for CollisionHarness");
 
-        wait_for_established(&mut client, mock_peer_ip, Duration::from_secs(30))
+        wait_for_established(&mut client, mock_peer_addr, Duration::from_secs(30))
             .await
             .expect("session did not reach Established within 30 s");
 
@@ -2480,7 +2480,7 @@ impl CollisionHarness {
             _pathvectord: pathvectord,
             _pathvectord_config: pathvectord_config,
             client,
-            mock_peer: mock_peer_ip,
+            mock_peer: mock_peer_addr,
             _network: network,
         }
     }
@@ -3186,10 +3186,10 @@ impl Harness {
 
         // Discover gobgpd's IP on the shared network.  pathvectord's
         // PeerConfig.address is Ipv4Addr, so we need the real IP.
-        let gobgpd_ip = container_network_ip(&gobgpd_container_id, &network_name);
+        let gobgpd_addr = container_network_ip(&gobgpd_container_id, &network_name);
 
         // Write pathvectord config referencing gobgpd's container IP.
-        let pathvectord_config = make_cfg(&[(gobgpd_ip, 65001)]);
+        let pathvectord_config = make_cfg(&[(gobgpd_addr, 65001)]);
         let pathvectord_config_path = pathvectord_config
             .path()
             .to_str()
@@ -3221,7 +3221,7 @@ impl Harness {
         // Wait for the BGP session.  gobgpd is passive (never initiates), so
         // pathvectord dials it.  Both containers are on the same bridge network
         // so the TCP connection goes container-to-container — no proxy involved.
-        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30))
+        wait_for_established(&mut client, gobgpd_addr, Duration::from_secs(30))
             .await
             .expect("BGP session did not reach Established within 30 s");
 
@@ -3239,7 +3239,7 @@ impl Harness {
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,
-            peer: gobgpd_ip,
+            peer: gobgpd_addr,
             pathvectord_ip,
             network_name,
             _network: network,
@@ -3278,9 +3278,9 @@ impl Harness {
             .expect("start gobgpd container");
 
         let gobgpd_container_id = gobgpd.id().to_owned();
-        let gobgpd_ip = container_network_ip(&gobgpd_container_id, &network_name);
+        let gobgpd_addr = container_network_ip(&gobgpd_container_id, &network_name);
 
-        let pathvectord_config = make_cfg(&[(gobgpd_ip, 65001)]);
+        let pathvectord_config = make_cfg(&[(gobgpd_addr, 65001)]);
         let pathvectord_config_path = pathvectord_config
             .path()
             .to_str()
@@ -3304,7 +3304,7 @@ impl Harness {
         let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
             .expect("connect PathvectorClient");
 
-        wait_for_established(&mut client, gobgpd_ip, Duration::from_secs(30))
+        wait_for_established(&mut client, gobgpd_addr, Duration::from_secs(30))
             .await
             .expect("BGP session did not reach Established within 30 s");
 
@@ -3319,7 +3319,7 @@ impl Harness {
             _gobgpd_config: gobgpd_config,
             _pathvectord_config: pathvectord_config,
             client,
-            peer: gobgpd_ip,
+            peer: gobgpd_addr,
             pathvectord_ip,
             network_name,
             _network: network,
