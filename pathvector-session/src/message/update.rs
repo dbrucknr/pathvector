@@ -14,8 +14,10 @@ use super::{Cursor, Writer};
 /// RFC 7606 §2 error handling policy for a malformed path attribute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributeErrorPolicy {
-    /// The session must be reset (NOTIFICATION + teardown).
-    /// Reserved for structural errors; attribute-level errors never produce this.
+    /// The session must be reset (NOTIFICATION + teardown). Produced for a
+    /// duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI` (RFC 7606 §3(g)) — the
+    /// one per-attribute error this specification still escalates to a full
+    /// session reset rather than a route-scoped action.
     SessionReset,
     /// The NLRIs in this UPDATE are treated as withdrawn; the session stays up.
     TreatAsWithdraw,
@@ -53,6 +55,14 @@ pub(super) enum UpdateDecodeOutcome {
         /// `true` if any error has `TreatAsWithdraw` policy — the caller must
         /// treat all announced NLRIs in this UPDATE as withdrawn.
         treat_as_withdraw: bool,
+        /// `true` if any error has `SessionReset` policy — RFC 7606 §3(h):
+        /// this is the strongest of the four error-handling approaches and
+        /// takes priority over `treat_as_withdraw` when both are set (e.g. a
+        /// missing ORIGIN alongside a duplicated `MP_REACH_NLRI` in the same
+        /// UPDATE). The caller must send a Malformed Attribute List
+        /// NOTIFICATION and terminate the session rather than act on
+        /// `treat_as_withdraw`.
+        session_reset: bool,
     },
 }
 
@@ -170,10 +180,14 @@ impl UpdateMessage {
             let treat_as_withdraw = attr_errors
                 .iter()
                 .any(|e| e.policy == AttributeErrorPolicy::TreatAsWithdraw);
+            let session_reset = attr_errors
+                .iter()
+                .any(|e| e.policy == AttributeErrorPolicy::SessionReset);
             Ok(UpdateDecodeOutcome::Partial {
                 update,
                 errors: attr_errors,
                 treat_as_withdraw,
+                session_reset,
             })
         }
     }
@@ -281,8 +295,10 @@ fn encode_nlri_list_v4(nlris: &[Nlri<Ipv4Addr>]) -> Vec<u8> {
 /// errors are recorded in the returned `Vec<AttributeDecodeError>` per
 /// RFC 7606 §5 — the bad attribute is skipped and parsing continues.
 ///
-/// Duplicate type codes are also detected: RFC 7606 §7.3 requires that a
-/// duplicate well-known mandatory attribute be treated as a withdraw.
+/// Duplicate type codes are also detected, per RFC 7606 §3(g): a duplicated
+/// `MP_REACH_NLRI` or `MP_UNREACH_NLRI` requires a full session reset; any
+/// other duplicated attribute (recognized or not) is silently discarded — the
+/// first occurrence is kept, later ones are dropped with no error at all.
 fn decode_path_attributes(
     cur: &mut Cursor<'_>,
 ) -> Result<(Vec<PathAttribute>, Vec<AttributeDecodeError>), CodecError> {
@@ -304,11 +320,25 @@ fn decode_path_attributes(
         // unconditionally, so inner decode errors don't corrupt the stream.
         let mut val = cur.fork(len)?;
 
-        // Duplicate attribute detection (RFC 7606 §7.3).
+        // Duplicate attribute detection (RFC 7606 §3(g)).
         if seen[type_code as usize] {
+            let policy = if type_code == ATTR_MP_REACH_NLRI || type_code == ATTR_MP_UNREACH_NLRI {
+                // "If the MP_REACH_NLRI attribute or the MP_UNREACH_NLRI
+                // attribute appears more than once in the UPDATE message,
+                // then a NOTIFICATION message MUST be sent with the Error
+                // Subcode 'Malformed Attribute List'."
+                AttributeErrorPolicy::SessionReset
+            } else {
+                // "If any other attribute (whether recognized or
+                // unrecognized) appears more than once in an UPDATE message,
+                // then all the occurrences of the attribute other than the
+                // first one SHALL be discarded and the UPDATE message will
+                // continue to be processed."
+                AttributeErrorPolicy::AttributeDiscard
+            };
             errors.push(AttributeDecodeError {
                 type_code,
-                policy: AttributeErrorPolicy::TreatAsWithdraw,
+                policy,
                 detail: "duplicate attribute type code",
             });
             continue;
@@ -1226,6 +1256,7 @@ mod tests {
                     detail: "invalid ORIGIN value",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1403,6 +1434,7 @@ mod tests {
                     detail: "malformed attribute",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1445,6 +1477,7 @@ mod tests {
                     detail: "ORIGIN must be 1 byte",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1466,6 +1499,7 @@ mod tests {
                     detail: "NEXT_HOP must be 4 bytes",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1487,6 +1521,7 @@ mod tests {
                     detail: "LOCAL_PREF must be 4 bytes",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1508,6 +1543,7 @@ mod tests {
                     detail: "MP_REACH_NLRI too short",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1529,6 +1565,7 @@ mod tests {
                     detail: "unknown AS_PATH segment type",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1550,6 +1587,7 @@ mod tests {
                     detail: "MED must be 4 bytes",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1571,6 +1609,7 @@ mod tests {
                     detail: "AGGREGATOR must be 8 bytes (4-byte ASN mode)",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1592,6 +1631,7 @@ mod tests {
                     detail: "COMMUNITY length must be a multiple of 4",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1613,6 +1653,7 @@ mod tests {
                     detail: "MP_UNREACH_NLRI too short",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1634,6 +1675,7 @@ mod tests {
                     detail: "EXTENDED_COMMUNITIES length must be a multiple of 8",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1655,6 +1697,7 @@ mod tests {
                     detail: "AS4_AGGREGATOR must be 8 bytes",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1676,14 +1719,31 @@ mod tests {
                     detail: "LARGE_COMMUNITY length must be a multiple of 12",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
 
-    // ── RFC 7606 §7.3 — duplicate attribute → treat as withdraw ──────────────
+    // ── RFC 7606 §3(g) — duplicate attribute handling ─────────────────────────
+    //
+    // This section previously cited §7.3 (which is actually NEXT_HOP) and
+    // asserted `TreatAsWithdraw`/`treat_as_withdraw: true` for an ordinary
+    // duplicated attribute — exactly backwards. The RFC's actual text:
+    //
+    // > If the MP_REACH_NLRI attribute or the MP_UNREACH_NLRI attribute
+    // > appears more than once in the UPDATE message, then a NOTIFICATION
+    // > message MUST be sent with the Error Subcode "Malformed Attribute
+    // > List". If any other attribute (whether recognized or unrecognized)
+    // > appears more than once in an UPDATE message, then all the
+    // > occurrences of the attribute other than the first one SHALL be
+    // > discarded and the UPDATE message will continue to be processed.
+    //
+    // i.e. an ordinary duplicate (anything but MP_REACH/MP_UNREACH_NLRI) is
+    // `AttributeDiscard`, not `TreatAsWithdraw` — the first occurrence is
+    // kept and the message proceeds completely normally.
 
     #[test]
-    fn test_duplicate_attribute_is_treat_as_withdraw() {
+    fn test_duplicate_ordinary_attribute_is_discarded_not_treat_as_withdraw() {
         // Two ORIGIN attributes in the same UPDATE.
         let mut body = vec![0x00, 0x00]; // no withdrawn
         let attr = |v: u8| [FLAGS_WKM, ATTR_ORIGIN, 0x01, v];
@@ -1695,16 +1755,113 @@ mod tests {
             UpdateDecodeOutcome::Partial {
                 update: UpdateMessage {
                     withdrawn: vec![],
+                    // First occurrence (Igp, v=0) is kept; the duplicate
+                    // (v=1) is discarded, not merely "the loser of a
+                    // withdraw" — the message otherwise proceeds normally.
                     attributes: vec![PathAttribute::Origin(Origin::Igp)],
                     announced: vec![],
                 },
                 errors: vec![AttributeDecodeError {
                     type_code: ATTR_ORIGIN,
-                    policy: AttributeErrorPolicy::TreatAsWithdraw,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
                     detail: "duplicate attribute type code",
                 }],
-                treat_as_withdraw: true,
+                treat_as_withdraw: false,
+                session_reset: false,
             }
+        );
+    }
+
+    /// Build a decode-ready UPDATE body (no header) with no withdrawn routes
+    /// and the given path attributes, reusing the already-tested
+    /// `encode_path_attributes` rather than hand-rolled bytes. Encoding two
+    /// attributes of the same type produces genuinely duplicate TLVs on the
+    /// wire, exactly as a real (malformed) peer message would.
+    fn body_with_attrs(attrs: &[PathAttribute]) -> Vec<u8> {
+        let attrs_bytes = encode_path_attributes(attrs);
+        let mut body = vec![0x00, 0x00]; // no withdrawn
+        body.extend_from_slice(&u16::try_from(attrs_bytes.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&attrs_bytes);
+        body
+    }
+
+    fn sample_mp_reach() -> PathAttribute {
+        PathAttribute::MpReachNlri(MpReachNlri {
+            afi_safi: AfiSafi::IPV6_UNICAST,
+            next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+            prefixes: vec![Prefix::V6(nlri6("2001:db8::/32"))],
+        })
+    }
+
+    #[test]
+    fn test_duplicate_mp_reach_nlri_requires_session_reset() {
+        // Two MP_REACH_NLRI attributes (AFI/SAFI/content doesn't matter —
+        // §3(g) escalates on the mere presence of a second occurrence).
+        let body = body_with_attrs(&[sample_mp_reach(), sample_mp_reach()]);
+        let outcome = decode_raw(&body).unwrap();
+        let UpdateDecodeOutcome::Partial {
+            errors,
+            treat_as_withdraw,
+            session_reset,
+            ..
+        } = outcome
+        else {
+            panic!("expected Partial outcome, got {outcome:?}");
+        };
+        assert!(
+            session_reset,
+            "duplicate MP_REACH_NLRI must set session_reset"
+        );
+        assert!(
+            !treat_as_withdraw,
+            "duplicate MP_REACH_NLRI is SessionReset, not TreatAsWithdraw"
+        );
+        assert_eq!(
+            errors,
+            vec![AttributeDecodeError {
+                type_code: ATTR_MP_REACH_NLRI,
+                policy: AttributeErrorPolicy::SessionReset,
+                detail: "duplicate attribute type code",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_session_reset_takes_priority_over_treat_as_withdraw_in_same_update() {
+        // RFC 7606 §3(h): "When multiple attribute errors exist in an UPDATE
+        // message... the approach with the strongest action MUST be used."
+        // Session reset > treat-as-withdraw. Construct one UPDATE with both:
+        // a malformed (present-but-invalid) ORIGIN (TreatAsWithdraw alone)
+        // and a duplicated MP_REACH_NLRI (SessionReset) — the derived flags
+        // must show both conditions independently true, letting the caller
+        // apply priority (verified at the transport layer, which must
+        // reset rather than treat-as-withdraw when both are set).
+        let mut body = body_with_attrs(&[sample_mp_reach(), sample_mp_reach()]);
+        // Splice a malformed ORIGIN (invalid value byte 99) onto the front
+        // of the already-encoded attribute block, adjusting the attrs-length
+        // field accordingly.
+        let origin_attr = [FLAGS_WKM, ATTR_ORIGIN, 0x01, 99];
+        let old_attrs_len = u16::from_be_bytes([body[2], body[3]]);
+        let new_attrs_len = old_attrs_len + u16::try_from(origin_attr.len()).unwrap();
+        body[2..4].copy_from_slice(&new_attrs_len.to_be_bytes());
+        body.splice(4..4, origin_attr);
+
+        let outcome = decode_raw(&body).unwrap();
+        let UpdateDecodeOutcome::Partial {
+            treat_as_withdraw,
+            session_reset,
+            ..
+        } = outcome
+        else {
+            panic!("expected Partial outcome, got {outcome:?}");
+        };
+        assert!(
+            session_reset,
+            "duplicate MP_REACH_NLRI must set session_reset"
+        );
+        assert!(
+            treat_as_withdraw,
+            "malformed ORIGIN must independently set treat_as_withdraw"
         );
     }
 
@@ -1737,6 +1894,7 @@ mod tests {
                     detail: "MED must be 4 bytes",
                 }],
                 treat_as_withdraw: false,
+                session_reset: false,
             }
         );
     }
@@ -1761,6 +1919,7 @@ mod tests {
                     detail: "unknown AS_PATH segment type",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1783,6 +1942,7 @@ mod tests {
                     detail: "truncated ASN in AS_PATH segment",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1814,6 +1974,7 @@ mod tests {
                     detail: "unexpected next-hop length for AFI",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
@@ -1860,6 +2021,7 @@ mod tests {
                     detail: "attribute value truncated",
                 }],
                 treat_as_withdraw: true,
+                session_reset: false,
             }
         );
     }
