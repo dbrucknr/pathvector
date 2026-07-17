@@ -221,6 +221,19 @@ decision to keep fixes in their own scoped PRs):
   what a fix/test would look like. Check the separate RFC 7606 audit pass
   first — it may change how this should be handled (session reset vs.
   treat-as-withdraw) rather than just "add the RFC 4271 behavior verbatim."
+  **Fixed 2026-07-17** (`fix/rfc7606-attribute-flags-cluster`): per RFC
+  7606 §3(c) (which revises this exact clause — see item #19 below), added
+  `expected_optional_transitive()` giving the required (Optional,
+  Transitive) bits for every recognized attribute type, checked in
+  `decode_path_attributes` before value decode; a mismatch produces
+  `AttributeErrorPolicy::TreatAsWithdraw`, not a session reset, and not the
+  Partial bit (deliberately — RFC 7606's revised text covers only
+  Optional/Transitive, unlike the RFC 4271 text it replaces). Unrecognized
+  type codes are exempt (no "specified value" to conflict with, per RFC
+  7606 §3(c)'s own wording). 5 new tests added, including one iterating all
+  256 type codes to confirm the correct flags never spuriously trip the
+  check. Real-teeth verified: disabling the check made 2 of the new tests
+  fail with a clear diagnostic; restored and re-verified passing.
 - **OPEN and ROUTE_REFRESH don't reject trailing padding within the
   declared header Length.** §4.1 requires the Length field have "the
   smallest value required... padding of extra data after the message is
@@ -453,7 +466,17 @@ narrower:
   OTC attribute is deliberately malformed, rather than the whole route
   being withdrawn as the RFC requires. See `RFC_AUDIT.md`'s RFC 9234 §5
   section. Fix: add `ATTR_ONLY_TO_CUSTOMER` to `rfc7606_policy()`'s
-  `TreatAsWithdraw` arm.
+  `TreatAsWithdraw` arm. **Fixed 2026-07-17**
+  (`fix/rfc7606-attribute-flags-cluster`): `ATTR_ONLY_TO_CUSTOMER` moved
+  into the `TreatAsWithdraw` arm alongside `MP_REACH_NLRI`. Also closed the
+  companion gap this same clause implies: OTC's own length check was
+  `cur.remaining() < 4` (catches too-short only) rather than `!= 4`,
+  meaning a too-*long* OTC attribute would have its first 4 bytes silently
+  read and the rest discarded with no error at all — fixed to `!= 4`, part
+  of the same too-long-truncation pattern documented under item #19 below.
+  Real-teeth verified: reverting the policy change back to
+  `AttributeDiscard` failed the new test with a clear left/right policy
+  mismatch; restored and re-verified passing.
 - **Peer-side duplicate/conflicting Role Capabilities aren't detected.**
   §4.2 requires rejecting the connection (Role Mismatch) if a peer sends
   2+ Role Capabilities with *differing* values (identical duplicates are
@@ -611,7 +634,38 @@ below, which deserved prompt attention):
 - **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
   non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
   than being flagged malformed. Low impact (no semantic value either
-  way). See `RFC_AUDIT.md`'s RFC 7606 §7.6.
+  way). See `RFC_AUDIT.md`'s RFC 7606 §7.6. **Fixed 2026-07-17**
+  (`fix/rfc7606-attribute-flags-cluster`): added a `cur.remaining() != 0`
+  check per RFC 7606 §7.6 ("SHALL be considered malformed if its length
+  is not 0"), producing `AttributeDiscard` (this attribute was never in
+  the `TreatAsWithdraw` arm and stays that way — see the `rfc7606_policy`
+  fallthrough). Previously had no length check at all. Real-teeth
+  verified: removing the check made the new test fail (a 4-byte
+  ATOMIC_AGGREGATE silently decoded as `Clean` instead of `Partial`);
+  restored and re-verified passing.
+- **Systemic: several fixed-length attributes silently truncate instead
+  of erroring on a too-long value.** Found live while fixing the
+  ATOMIC_AGGREGATE gap above (not part of the original systematic audit
+  pass) — `decode_attr_value`'s length checks for ORIGIN, NEXT_HOP, MED,
+  LOCAL_PREF, and AS4_AGGREGATOR (RFC 6793) all used
+  `cur.remaining() < N` (catches too-*short* only), so an attribute
+  declared longer than its fixed size would have its first N bytes read
+  and the excess silently discarded — no error, no indication anything
+  was wrong. `ORIGINATOR_ID` was the sole pre-existing correct example
+  (already used `!= 4`). `AGGREGATOR` was deliberately **not** included in
+  this fix — its correct length depends on whether the 4-octet ASN
+  capability (RFC 6793) was negotiated with this peer, which
+  `decode_attr_value` has no access to; fixing it correctly needs
+  capability-threading through the decoder, deferred as its own follow-up
+  (TODO's PR roadmap, "PR 4b"). **Fixed 2026-07-17**
+  (`fix/rfc7606-attribute-flags-cluster`): all 5 arms changed `<` to `!=`.
+  6 new tests added (one per attribute, including OTC under item #18
+  above), each constructing a value one byte longer than the correct
+  fixed length and asserting an explicit error rather than silent
+  truncation. Real-teeth verified individually: reverting each check
+  back to `<` in turn made its corresponding new test fail with a clear
+  "silently truncated" diagnostic; each was restored and re-verified
+  passing before moving to the next.
 - **(Minor, completeness not correctness) AGGREGATOR decode always
   expects 8 bytes**, not accounting for whether the peer negotiated the
   4-octet ASN capability (RFC 6793) — a legitimate 6-byte AGGREGATOR
@@ -619,7 +673,11 @@ below, which deserved prompt attention):
   The *outcome* (discard) happens to match what RFC 7606 wants for a
   genuinely malformed AGGREGATOR, so this doesn't misbehave, but it
   means AGGREGATOR data from 2-byte peers can never actually be
-  retained. See `RFC_AUDIT.md`'s RFC 7606 §7.7.
+  retained. See `RFC_AUDIT.md`'s RFC 7606 §7.7. **Deferred to "PR 4b"**
+  in the PR roadmap — fixing this correctly requires threading the
+  negotiated FourByteAsn capability into the decoder, an architecture
+  change bundled separately from the rest of this attribute-flags/OTC/
+  too-long-truncation cluster (PR 4).
 
 **20. RFC 5492 (Capabilities Advertisement) gap found by systematic clause
 audit** — found 2026-07-16 (diagnostic only, not fixed here). Low severity,
@@ -722,6 +780,27 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
+
+**23. Test-only: `OpenMsgError` proptest generator could produce an
+impossible value** — found 2026-07-17, coincidentally, via a proptest
+regression-file replay during PR 4 work (unrelated to that PR's own
+changes; confirmed by reproducing on a clean `main` checkout). Not a
+production bug: `notification.rs`'s `OpenMsgError::from_u8`/`as_u8` mapping
+for subcode 11 (RoleMismatch, RFC 9234 §5.1) is correct and symmetric.
+The bug was in `pathvector-session/src/framing/prop_tests.rs`'s
+`Arbitrary`-style generator: it was never updated when `RoleMismatch` was
+added to the enum, so it could still construct `OpenMsgError::Unknown(11)`
+— a value that can never actually arise from decoding real wire bytes,
+since decoding subcode 11 always produces `RoleMismatch`, not `Unknown`.
+Sibling generators (`MsgHeaderError`, `UpdateMsgError`, `CeaseError`)
+already correctly excluded their own named-subcode values from their
+"Unknown" ranges; this was an isolated oversight for `OpenMsgError`
+specifically. **Fixed 2026-07-17**: added `Just(OpenMsgError::RoleMismatch)`
+to the generator's named-variant list and split its "Unknown" range to
+explicitly exclude value 11. Re-ran the previously-flagged
+`prop_back_to_back_messages_decode_in_order` test (5x) to confirm it now
+passes consistently; removed the now-stale pinned regression-file line
+whose comment described a value the fixed generator can no longer produce.
 
 ---
 
