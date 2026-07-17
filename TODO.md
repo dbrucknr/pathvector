@@ -562,7 +562,30 @@ below, which deserved prompt attention):
   flaky pass/fail rather than a clean signal; fixed by adding the
   keepalive loop, after which reverting the fix produced 3/3 consistent
   failures (~20s, hitting the assertion's 15s deadline) and restoring it
-  produced 3/3 consistent fast passes (~5s).
+  produced 3/3 consistent fast passes (~5s). A subsequent independent
+  review of the e2e test itself found two further false-pass gaps (no
+  confirmation the fault peer ever reached `Established` before polling
+  for it to leave; the keepalive interval still wasn't reliably beating
+  the hold timer under real scheduling jitter) — both closed, re-verified
+  5/5 consistent each way. **A second external review (Codex) then found
+  a real correctness bug in the fix itself**: `handle_malformed_update`'s
+  `session_reset` branch manually sent the NOTIFICATION and returned
+  `FsmInput::TcpFailed`, which `run()` records as `TerminationReason::Unclean`
+  — the same reason used for ambiguous/involuntary disconnects, which
+  `on_terminated` treats as grounds to enter RFC 4724 GR helper mode and
+  retain the peer's routes as stale. Wrong here: this is a locally
+  initiated, deliberate protocol-error teardown, not an ambiguous one.
+  Fixed by returning `FsmInput::NotificationToSend(notif)` instead — the
+  FSM already has this exact input for "we detected an error and want to
+  notify-then-close," and `run()` already maps it to
+  `TerminationReason::OperatorStop` (immediate flush, matching
+  `on_terminated`'s own documented "OperatorStop: never eligible — we
+  initiated the teardown"). Strengthened
+  `test_rfc7606_session_reset_sends_notification_and_terminates` to assert
+  the specific `OperatorStop` reason rather than any `Terminated(_)`;
+  real-teeth verified by reverting to the old manual-send/`TcpFailed`
+  code and confirming the test fails with `Terminated(Unclean)` exactly
+  as the bug predicts.
 - **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
   non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
   than being flagged malformed. Low impact (no semantic value either
