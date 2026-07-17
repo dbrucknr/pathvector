@@ -141,7 +141,14 @@ fn arb_notification_error() -> impl Strategy<Value = NotificationError> {
             Just(OpenMsgError::UnsupportedOptionalParameter),
             Just(OpenMsgError::UnacceptableHoldTime),
             Just(OpenMsgError::UnsupportedCapability),
-            prop_oneof![Just(0u8), Just(5u8), 8u8..=u8::MAX].prop_map(OpenMsgError::Unknown),
+            Just(OpenMsgError::RoleMismatch),
+            // Subcode 11 (RoleMismatch, RFC 9234 §5.1) MUST be excluded here —
+            // `OpenMsgError::Unknown(11)` can never actually round-trip,
+            // since decoding subcode 11 always produces `RoleMismatch`, not
+            // `Unknown(11)`. Generating it as a raw `Unknown` value produces
+            // a test input that no real wire byte could ever decode to.
+            prop_oneof![Just(0u8), Just(5u8), 8u8..=10u8, 12u8..=u8::MAX]
+                .prop_map(OpenMsgError::Unknown),
         ]
         .prop_map(NotificationError::OpenMessage),
         prop_oneof![
