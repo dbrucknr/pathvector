@@ -159,6 +159,48 @@ async fn malformed_update_origin_treated_as_withdraw_session_stays_up() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 7606 §3(d): "If any of the well-known mandatory attributes are not
+/// present in an UPDATE message, then 'treat-as-withdraw' MUST be used." —
+/// distinct from the invalid-value case above: here ORIGIN is missing
+/// entirely, not present-but-malformed. Over a real BGP session with the
+/// real wire codec on both ends, proving both the withdrawal (RFC 7606 §2:
+/// "removed from the Adj-RIB-In") and — the one thing the invalid-value test
+/// above only proves indirectly via the control peer — that the fault
+/// peer's *own* session stays Established rather than being torn down with
+/// a NOTIFICATION (the pre-fix, RFC-4271-§6.3-only behavior).
+#[tokio::test]
+async fn missing_mandatory_origin_treated_as_withdraw_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("missing-origin").await;
+    assert_control_peer_established(&mut h).await;
+
+    // The first, clean UPDATE must land.
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    // The second UPDATE (missing ORIGIN) must be treated as a withdraw per
+    // RFC 7606 §3(d)/§2 — the route disappears, but the session and the
+    // rest of the daemon stay healthy.
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 was not withdrawn within 15 s after the UPDATE missing ORIGIN");
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 7606 §3(d): the fault peer's own session must stay Established, \
+         not be reset with a NOTIFICATION"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
 /// A mid-session TCP reset (simulated via a hard Docker-network disconnect,
 /// already exercised by the GR test suite) must be followed by a clean
 /// re-establishment once connectivity returns — reuses the existing

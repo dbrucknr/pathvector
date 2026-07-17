@@ -18,6 +18,10 @@
 //! - `malformed-update-origin` — a real OPEN/KEEPALIVE handshake to
 //!   Established, one clean UPDATE, then a second UPDATE for the same prefix
 //!   carrying an invalid ORIGIN value (RFC 7606 treat-as-withdraw).
+//! - `missing-origin` — same shape as `malformed-update-origin`, but the
+//!   second UPDATE omits the ORIGIN attribute entirely rather than carrying
+//!   an invalid value (RFC 7606 §3(d): missing well-known mandatory
+//!   attribute, still treat-as-withdraw).
 //!
 //! For the three header-error and two truncation scenarios, no valid frame
 //! exists to reuse from `pathvector_session`'s encoder by construction, so
@@ -29,7 +33,9 @@
 //! the one deliberately-invalid ORIGIN attribute can't be constructed through
 //! the type system (`Origin::from_u8` has no invalid discriminant to pick),
 //! so that one frame is hand-rolled after reclaiming the raw stream via
-//! `Framed::into_inner`.
+//! `Framed::into_inner`. `missing-origin` doesn't need any hand-rolling at
+//! all — simply omitting an attribute from `UpdateMessage.attributes` is
+//! fully expressible through the normal encoder.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -76,6 +82,7 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "truncated-header" => truncated_header(stream).await,
         "truncated-open" => truncated_open(stream).await,
         "malformed-update-origin" => malformed_update_origin(stream).await,
+        "missing-origin" => missing_origin_update(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -261,4 +268,111 @@ fn keepalive_frame() -> Vec<u8> {
     frame.extend_from_slice(&HEADER_LEN.to_be_bytes());
     frame.push(MSG_TYPE_KEEPALIVE);
     frame
+}
+
+/// RFC 7606 §3(d): "If any of the well-known mandatory attributes are not
+/// present in an UPDATE message, then 'treat-as-withdraw' MUST be used."
+///
+/// Same shape as `malformed_update_origin`, but the second UPDATE simply
+/// omits `PathAttribute::Origin` from `attributes` (keeping `AsPath`/
+/// `NextHop`) instead of carrying an invalid value — no raw-byte hand-rolling
+/// needed, since a missing attribute is expressible through the normal
+/// `UpdateMessage`/encoder path.
+async fn missing_origin_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    // Drain until pathvectord's own KEEPALIVE arrives, confirming it reached
+    // Established on its side before we send anything UPDATE-shaped.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    let clean = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(clean)).await.is_err() {
+        return;
+    }
+    println!("sent clean UPDATE for {TEST_PREFIX}");
+
+    // Give the test a real window to observe the clean route present in
+    // Loc-RIB before it gets withdrawn below — without this, both UPDATEs
+    // could be processed between two of the test's polling ticks, and the
+    // route would never be observably present at all.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // RFC 7606 §3(d): same prefix, ORIGIN omitted entirely (AS_PATH and
+    // NEXT_HOP still present, so this is unambiguously "missing mandatory
+    // attribute," not "missing everything").
+    let missing_origin = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed
+        .send(BgpMessage::Update(missing_origin))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    println!("sent UPDATE missing ORIGIN for {TEST_PREFIX}");
+
+    // Hold the session open so the test can observe the withdrawal without
+    // racing a session teardown — and to prove the session itself survives
+    // (RFC 7606 §3(d) treat-as-withdraw, not a NOTIFICATION/session reset).
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
 }
