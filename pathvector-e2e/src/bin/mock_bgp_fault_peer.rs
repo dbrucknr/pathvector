@@ -27,6 +27,17 @@
 //!   §3(g): unlike every other malformed-attribute case in this file, this
 //!   one is NOT treat-as-withdraw — it MUST reset the session with a
 //!   Malformed Attribute List NOTIFICATION).
+//! - `attribute-flags-conflict` — same shape as `malformed-update-origin`,
+//!   but the second UPDATE's ORIGIN attribute carries a *valid* value (IGP)
+//!   with a *wrong* flags byte (Optional bit set, which RFC 4271 §4.3
+//!   forbids for a well-known attribute) — isolating RFC 7606 §3(c)'s
+//!   Attribute Flags Error check from the pre-existing invalid-value check
+//!   `malformed-update-origin` already proves.
+//! - `malformed-otc` — same shape again, but the second UPDATE carries an
+//!   ONLY_TO_CUSTOMER (RFC 9234 §5) attribute with length 3 instead of the
+//!   required 4 — proving the security-relevant fix that a malformed OTC is
+//!   treated as withdraw rather than silently discarded (which would let a
+//!   route bypass OTC-based leak detection entirely).
 //!
 //! For the three header-error and two truncation scenarios, no valid frame
 //! exists to reuse from `pathvector_session`'s encoder by construction, so
@@ -91,6 +102,8 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "malformed-update-origin" => malformed_update_origin(stream).await,
         "missing-origin" => missing_origin_update(stream).await,
         "duplicate-mp-reach" => duplicate_mp_reach_update(stream).await,
+        "attribute-flags-conflict" => attribute_flags_conflict_update(stream).await,
+        "malformed-otc" => malformed_otc_update(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -275,6 +288,257 @@ fn keepalive_frame() -> Vec<u8> {
     let mut frame = MARKER_VALID.to_vec();
     frame.extend_from_slice(&HEADER_LEN.to_be_bytes());
     frame.push(MSG_TYPE_KEEPALIVE);
+    frame
+}
+
+/// RFC 7606 §3(c) (revising RFC 4271 §4.3): "If the value of either the
+/// Optional or Transitive bits in the Attribute Flags is in conflict with
+/// their specified values, then the attribute MUST be treated as malformed
+/// and the 'treat-as-withdraw' approach used."
+///
+/// Same shape as `malformed_update_origin`, but the fault is in the flags
+/// byte, not the value — a normal `PathAttribute::Origin` encode always
+/// emits the correct flags, so this can't be built through the type-safe
+/// encoder either, and gets the same raw-byte hand-roll treatment.
+async fn attribute_flags_conflict_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    // Drain until pathvectord's own KEEPALIVE arrives, confirming it reached
+    // Established on its side before we send anything UPDATE-shaped.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    let clean = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(clean)).await.is_err() {
+        return;
+    }
+    println!("sent clean UPDATE for {TEST_PREFIX}");
+
+    // Give the test a real window to observe the clean route present in
+    // Loc-RIB before it gets withdrawn below.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A normal encode of `PathAttribute::Origin` always emits the correct
+    // flags byte, so this frame can't be built via `UpdateMessage`/`.encode()`
+    // — reclaim the raw stream and hand-roll it directly.
+    let mut stream = framed.into_inner();
+    if stream
+        .write_all(&attribute_flags_conflict_frame())
+        .await
+        .is_err()
+    {
+        return;
+    }
+    println!("sent UPDATE with ORIGIN carrying a valid value but conflicting flags");
+
+    // Hold the session open so the test can observe the withdrawal without
+    // racing a session teardown.
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Hand-rolled malformed UPDATE: no withdrawn routes, one ORIGIN attribute
+/// with a *valid* value (0 = IGP) but flags `0xC0` (Optional=1, Transitive=1)
+/// instead of the required well-known-mandatory `0x40` (Optional=0,
+/// Transitive=1) — isolates the flags check from the value check.
+fn attribute_flags_conflict_frame() -> Vec<u8> {
+    let mut attrs = Vec::new();
+    // ORIGIN: flags = 0xC0 (wrong: Optional bit set on a well-known
+    // attribute), type = 1, len = 1, value = 0 (IGP — a valid value). This
+    // is the one attribute under test.
+    attrs.extend_from_slice(&[0xC0, 1, 1, 0]);
+    // AS_PATH and NEXT_HOP: present with *correct* flags and valid content,
+    // deliberately included so this scenario isolates the Attribute Flags
+    // Error check from the separate (already fixed, already tested)
+    // missing-well-known-mandatory-attribute check — without these, a
+    // broken/disabled flags check would still make this UPDATE end up
+    // treat-as-withdrawn for the wrong reason (missing AS_PATH/NEXT_HOP),
+    // masking a real regression in the flags check itself.
+    attrs.extend_from_slice(&[0x40, 2, 0]); // AS_PATH: empty sequence
+    attrs.extend_from_slice(&[0x40, 3, 4, 10, 0, 0, 98]); // NEXT_HOP
+
+    let mut body = vec![0u8, 0]; // withdrawn_len = 0
+    body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&attrs);
+
+    body.push(24); // prefix length for 10.99.0.0/24
+    body.extend_from_slice(&[10, 99, 0]);
+
+    let mut frame = MARKER_VALID.to_vec();
+    let total_len = HEADER_LEN + u16::try_from(body.len()).expect("body always fits in u16");
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.push(MSG_TYPE_UPDATE);
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// RFC 9234 §5: "The OTC Attribute is considered malformed if the length
+/// value is not 4. An UPDATE message with a malformed OTC Attribute SHALL be
+/// handled using the approach of 'treat-as-withdraw' [RFC7606]." Security-
+/// relevant: OTC is RFC 9234's entire route-leak-detection mechanism, so a
+/// malformed OTC being silently discarded (rather than withdrawing the
+/// route) would let a route bypass leak detection instead of being dropped.
+///
+/// Same shape as `attribute_flags_conflict_update` — a 3-byte OTC value
+/// can't be built via the type-safe encoder (`PathAttribute::OnlyToCustomer`
+/// always encodes exactly 4 bytes), so this is hand-rolled too.
+async fn malformed_otc_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    // Drain until pathvectord's own KEEPALIVE arrives, confirming it reached
+    // Established on its side before we send anything UPDATE-shaped.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    let clean = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(clean)).await.is_err() {
+        return;
+    }
+    println!("sent clean UPDATE for {TEST_PREFIX}");
+
+    // Give the test a real window to observe the clean route present in
+    // Loc-RIB before it gets withdrawn below.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut stream = framed.into_inner();
+    if stream.write_all(&malformed_otc_frame()).await.is_err() {
+        return;
+    }
+    println!("sent UPDATE with 3-byte (malformed) OTC attribute");
+
+    // Hold the session open so the test can observe the withdrawal without
+    // racing a session teardown.
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Hand-rolled malformed UPDATE: no withdrawn routes, well-formed ORIGIN/
+/// AS_PATH/NEXT_HOP, plus an ONLY_TO_CUSTOMER (type 35) attribute with a
+/// 3-byte value instead of the required 4.
+fn malformed_otc_frame() -> Vec<u8> {
+    let mut attrs = Vec::new();
+    // ORIGIN: well-known mandatory, transitive, len 1, IGP.
+    attrs.extend_from_slice(&[0x40, 1, 1, 0]);
+    // AS_PATH: well-known mandatory, transitive, len 0 (empty sequence — a
+    // single-hop path from this fault peer's own perspective doesn't matter
+    // for this test, only that the attribute is syntactically present).
+    attrs.extend_from_slice(&[0x40, 2, 0]);
+    // NEXT_HOP: well-known mandatory, transitive, len 4, 10.0.0.98.
+    attrs.extend_from_slice(&[0x40, 3, 4, 10, 0, 0, 98]);
+    // ONLY_TO_CUSTOMER: optional transitive (0xC0), type 35, len 3 (wrong —
+    // RFC 9234 §5 requires exactly 4), 3 arbitrary value bytes.
+    attrs.extend_from_slice(&[0xC0, 35, 3, 0, 0, 1]);
+
+    let mut body = vec![0u8, 0]; // withdrawn_len = 0
+    body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&attrs);
+
+    body.push(24); // prefix length for 10.99.0.0/24
+    body.extend_from_slice(&[10, 99, 0]);
+
+    let mut frame = MARKER_VALID.to_vec();
+    let total_len = HEADER_LEN + u16::try_from(body.len()).expect("body always fits in u16");
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.push(MSG_TYPE_UPDATE);
+    frame.extend_from_slice(&body);
     frame
 }
 
