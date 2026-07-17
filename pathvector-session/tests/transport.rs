@@ -605,14 +605,20 @@ async fn peer_handshake_on_stream(
     (reader, writer)
 }
 
-/// Collision where `local_bgp_id > peer_bgp_id`: the session must close its
-/// outbound connection, adopt the incoming one, and still reach Established.
+/// RFC 4271 §6.8, collision resolution rule 2: "If the value of the local
+/// BGP Identifier is less than the remote one, the local system closes the
+/// BGP connection that already exists... and accepts the BGP connection
+/// initiated by the remote system."
+///
+/// `local_bgp_id` (10.0.0.1) < `peer_bgp_id` (10.0.0.2): the session must close
+/// its outbound connection and reach Established over the newly-adopted
+/// incoming connection instead.
 #[tokio::test]
-async fn test_collision_local_wins_adopts_incoming() {
-    // Session config: local BGP ID 10.0.0.2 (higher than peer 10.0.0.1).
+async fn test_collision_local_id_lower_closes_outbound_adopts_incoming() {
+    // Session config: local BGP ID 10.0.0.1 (lower than peer 10.0.0.2).
     let (outbound_listener, outbound_addr) = loopback_listener().await;
     let config = SessionConfig {
-        local_bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
         peer_as: Some(65002),
         ..local_config(outbound_addr)
     };
@@ -621,7 +627,7 @@ async fn test_collision_local_wins_adopts_incoming() {
 
     // Simulate the outbound connection being accepted by the peer — drive it
     // far enough that the session reaches OpenConfirm (peer OPEN received).
-    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 1); // lower than local
+    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2); // higher than local
     let outbound_peer = tokio::spawn(async move {
         let (stream, _) = outbound_listener.accept().await.unwrap();
         let (r, w) = stream.into_split();
@@ -654,7 +660,7 @@ async fn test_collision_local_wins_adopts_incoming() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Now simulate the daemon delivering an inbound TCP connection from the peer.
-    // This triggers collision detection: local (10.0.0.2) > peer (10.0.0.1),
+    // This triggers collision detection: local (10.0.0.1) < peer (10.0.0.2),
     // so the session should close the outbound and adopt this incoming stream.
     let (incoming_listener, incoming_addr) = loopback_listener().await;
     let incoming_tx = handle.incoming_sender();
@@ -687,15 +693,20 @@ async fn test_collision_local_wins_adopts_incoming() {
     incoming_peer.abort();
 }
 
-/// Collision where `local_bgp_id < peer_bgp_id`: the session must keep its
-/// outbound connection and discard the incoming one, then reach Established
+/// RFC 4271 §6.8, collision resolution rule 3: "Otherwise, the local system
+/// closes the newly created BGP connection (the one associated with the
+/// newly received OPEN message), and continues to use the existing one (the
+/// one that is already in the `OpenConfirm` state)."
+///
+/// `local_bgp_id` (10.0.0.3) > `peer_bgp_id` (10.0.0.2): the session must keep
+/// its outbound connection, discard the incoming one, and reach Established
 /// normally over the outbound.
 #[tokio::test]
-async fn test_collision_peer_wins_keeps_outbound() {
-    // Session config: local BGP ID 10.0.0.1 (lower than peer 10.0.0.2).
+async fn test_collision_local_id_higher_keeps_outbound_rejects_incoming() {
+    // Session config: local BGP ID 10.0.0.3 (higher than peer 10.0.0.2).
     let (outbound_listener, outbound_addr) = loopback_listener().await;
     let config = SessionConfig {
-        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 3),
         peer_as: Some(65002),
         ..local_config(outbound_addr)
     };
@@ -715,7 +726,7 @@ async fn test_collision_peer_wins_keeps_outbound() {
         let msg = reader.next().await.unwrap().unwrap();
         assert!(matches!(msg, BgpMessage::Open(_)));
 
-        // Send our OPEN (higher BGP ID — session should keep this connection).
+        // Send our OPEN (lower BGP ID than local — session should keep this connection).
         writer
             .send(BgpMessage::Open(OpenMessage {
                 version: 4,

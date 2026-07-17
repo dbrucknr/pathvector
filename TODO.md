@@ -287,9 +287,20 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   toggle. See `RFC_AUDIT.md` §6.3.
 
 **15. HIGH PRIORITY — RFC 4271 §6.8 connection collision resolution is
-inverted** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13/#14
-(diagnostic only, not fixed here, but this one deserves prompt attention
-given its severity):
+inverted** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13/#14.
+**Fixed 2026-07-16** (`fix/rfc4271-collision-resolution`): inverted
+comparison corrected, missing Cease/ConnectionCollisionResolution
+NOTIFICATION added to both FSM arms, and — see #17 below — the
+Established-state GR override implemented in the same branch. Proven both
+at unit level and against a real, separately-built Docker image via
+`pathvector-e2e`'s new `mock_bgp_collision_peer` (two real TCP connections
+forcing each direction of the comparison, plus a route-retention check
+across the GR-override switchover), each real-teeth verified by reverting
+the specific fix, rebuilding the image, and confirming the corresponding
+test fails before restoring. One residual gap found while building that
+proof and deliberately deferred rather than fixed, documented below.
+
+Original finding (kept for history):
 
 - **`handle_incoming_connection`'s BGP-ID comparison
   (`pathvector-session/src/transport/mod.rs:634-637`,
@@ -328,7 +339,27 @@ given its severity):
   add the missing NOTIFICATION output to both FSM arms, and — given the
   severity — consider a real e2e test that forces a genuine simultaneous-
   connect race against GoBGP/BIRD/FRR to prove real-world interop, not
-  just a unit-level fix.
+  just a unit-level fix. **Done — see the "Fixed 2026-07-16" note above.**
+
+- **Residual gap found while building the fix's e2e proof, deliberately
+  deferred (not a regression — this behavior predates the fix and is
+  unchanged by it):** `handle_incoming_connection`'s collision-resolution
+  arm only reasons about *two* connections — "the existing one" and "the
+  newly arrived one." Nothing bounds how many additional inbound
+  connections from the same (or a spoofed) peer address can arrive and be
+  processed while one is already being evaluated; each one is handled
+  independently as it's accepted; a peer opening many connections in quick
+  succession (misbehaving client, or deliberate resource-exhaustion
+  attempt) has never been tested and its precise behavior isn't verified —
+  plausibly each extra connection just repeats the same two-way collision
+  decision against whatever is "current" at that moment, but this hasn't
+  been confirmed, and there's no explicit rate-limit or cap on
+  simultaneous half-open connections per configured peer. Lower priority
+  than the two bugs above (RFC 4271 §6.8 doesn't itself address >2-way
+  collisions, and this is more a hardening/DoS-resilience question than a
+  spec-compliance one), but worth a real e2e stress test — and possibly a
+  connection-rate cap per peer — before relying on this code path against
+  untrusted or adversarial peers.
 
 **16. RFC 4271 §9 gaps found by systematic clause audit** — found
 2026-07-16, same `RFC_AUDIT.md` pass as #12-#15 (diagnostic only, not fixed
@@ -377,7 +408,15 @@ areas the existing test suite never covered:
   notice anything's wrong — defeating much of the point of graceful
   restart. Directly reinforces the severity of TODO #15 (the RFC 4271
   §6.8 collision-resolution bug) — same code area, same audit pass. See
-  `RFC_AUDIT.md`'s RFC 4724 §5 section.
+  `RFC_AUDIT.md`'s RFC 4724 §5 section. **Fixed 2026-07-16** (same
+  `fix/rfc4271-collision-resolution` branch as #15): added
+  `Fsm::peer_has_graceful_restart()` and a guarded branch in
+  `handle_incoming_connection`'s `Established` arm implementing the exact
+  §4.2 FSM-text replacement (no NOTIFICATION, state → `Connect`). The e2e
+  proof (`mock_bgp_collision_peer`'s `gr-established-override` scenario)
+  additionally announces a route before the switchover and confirms it's
+  still present afterward — proving retention actually held through this
+  specific trigger path, not just that the connection swap itself worked.
 - **MAJOR FEATURE GAP — no Restarting-Speaker route-selection deferral.**
   RFC 4724 §4.1 requires deferring our *own* best-path decisions after
   *our own* restart until either EOR is received from all GR-capable
