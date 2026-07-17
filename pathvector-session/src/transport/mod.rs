@@ -469,7 +469,14 @@ impl<T: BgpTransport> Session<T> {
                         TerminationReason::Notification(n.clone())
                     }
                     // We initiated the teardown; always flush immediately.
-                    FsmInput::ManualStop | FsmInput::NotificationToSend(_) => {
+                    // (ProtocolErrorNotificationToSend also gets a clean
+                    // reason — it's a locally *detected* error, not an
+                    // ambiguous peer-side failure — but unlike ManualStop/
+                    // NotificationToSend it additionally schedules a
+                    // reconnect, since the peer is still configured.)
+                    FsmInput::ManualStop
+                    | FsmInput::NotificationToSend(_)
+                    | FsmInput::ProtocolErrorNotificationToSend(_) => {
                         TerminationReason::OperatorStop
                     }
                     _ => TerminationReason::Unclean,
@@ -810,12 +817,14 @@ impl<T: BgpTransport> Session<T> {
     ///   error-handling approaches and takes priority over `treat_as_withdraw`
     ///   when both are set in the same UPDATE. Returns `Some(FsmInput)` for
     ///   the caller to return from the event loop in this case — specifically
-    ///   `NotificationToSend`, not a manually-sent NOTIFICATION plus
-    ///   `TcpFailed`: this is a locally-initiated protocol-error teardown, so
-    ///   it must record `TerminationReason::OperatorStop` (immediate route
-    ///   flush) rather than `Unclean` (which `on_terminated` treats as
-    ///   grounds to enter GR helper mode and retain the peer's routes as
-    ///   stale — wrong here, since we know exactly why the session ended).
+    ///   `ProtocolErrorNotificationToSend` (RFC 4271 §8.2.2 Event 28), not a
+    ///   manually-sent NOTIFICATION plus `TcpFailed` and not the plain
+    ///   `NotificationToSend`: this is a locally *detected* protocol error on
+    ///   an ongoing, still-configured peer, so it must (a) record
+    ///   `TerminationReason::OperatorStop` (immediate route flush, not
+    ///   `Unclean`'s GR-retention path — we know exactly why the session
+    ///   ended) and (b) still schedule an automatic reconnect, unlike a
+    ///   genuine administrative/operator-initiated teardown.
     /// - `TreatAsWithdraw`: synthesise a withdrawal UPDATE for all NLRIs that
     ///   were announced in this message, then forward it as a `RouteUpdate`.
     ///   Session stays up; returns `None`.
@@ -838,7 +847,7 @@ impl<T: BgpTransport> Session<T> {
                 error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
                 data: vec![],
             };
-            return Some(FsmInput::NotificationToSend(notif));
+            return Some(FsmInput::ProtocolErrorNotificationToSend(notif));
         }
 
         let update = if m.treat_as_withdraw {

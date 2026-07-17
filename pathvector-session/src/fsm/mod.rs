@@ -73,12 +73,28 @@ pub enum FsmInput {
     CollisionDetected,
     /// A complete BGP message was received from the peer.
     MessageReceived(BgpMessage),
-    /// The daemon requests that a specific NOTIFICATION be sent before tearing
-    /// down the session (RFC 4271 §6.3 mandatory attribute errors).
+    /// The daemon requests a locally initiated, administrative teardown:
+    /// send the given NOTIFICATION, then close with no automatic
+    /// reconnect (no `ConnectRetryTimer`). Used for intentional peer
+    /// removal/shutdown (RFC 9003 shutdown messages) and daemon-detected
+    /// conditions the daemon itself will re-arm on its own schedule (e.g.
+    /// RFC 4486 §4 max-prefix-exceeded, which uses its own idle-hold
+    /// timer). Do **not** reuse this for a protocol error on an ongoing,
+    /// still-configured peer relationship — see
+    /// [`FsmInput::ProtocolErrorNotificationToSend`] for that case.
+    NotificationToSend(crate::message::NotificationMessage),
+    /// The daemon locally detected a protocol error while Established
+    /// (e.g. RFC 7606 §3(g)'s duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI`,
+    /// which requires a session reset) and requests the given NOTIFICATION
+    /// be sent before tearing down. Unlike [`FsmInput::NotificationToSend`],
+    /// this **does** schedule an automatic reconnect (RFC 4271 §8.2.2 Event
+    /// 28: `UpdateMsgErr` — NOTIFICATION, `ConnectRetryTimer`, drop TCP,
+    /// Idle) — the peer is still configured and the error was ours to
+    /// detect, not evidence the peer should be given up on.
     ///
     /// The full [`NotificationMessage`] is carried so the RFC-mandated data
-    /// field (e.g. the missing attribute type code) is preserved verbatim.
-    NotificationToSend(crate::message::NotificationMessage),
+    /// field is preserved verbatim.
+    ProtocolErrorNotificationToSend(crate::message::NotificationMessage),
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -625,8 +641,9 @@ impl Fsm {
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
-            // RFC 4271 §6.3: daemon detected a mandatory attribute error and
-            // requested we send a specific NOTIFICATION before tearing down.
+            // Locally initiated administrative teardown (peer removal/RFC 9003
+            // shutdown, or a daemon-detected condition with its own separate
+            // re-arm schedule) — no automatic reconnect.
             FsmInput::NotificationToSend(msg) => {
                 self.state = State::Idle;
                 vec![
@@ -635,6 +652,22 @@ impl Fsm {
                     FsmOutput::SendMessage(BgpMessage::Notification(msg)),
                     FsmOutput::CloseTcpConnection,
                     FsmOutput::SessionTerminated,
+                ]
+            }
+            // RFC 4271 §8.2.2 Event 28 (UpdateMsgErr): a locally detected
+            // protocol error on an ongoing, still-configured peer — send the
+            // NOTIFICATION, drop the TCP connection, and (unlike
+            // `NotificationToSend`) schedule an automatic reconnect rather
+            // than leaving the peer stuck in Idle indefinitely.
+            FsmInput::ProtocolErrorNotificationToSend(msg) => {
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
+                    FsmOutput::SendMessage(BgpMessage::Notification(msg)),
+                    FsmOutput::CloseTcpConnection,
+                    FsmOutput::SessionTerminated,
+                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
             _ => vec![],
@@ -2490,6 +2523,48 @@ mod tests {
             out.iter()
                 .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
             "must schedule ConnectRetryTimer for automatic reconnect"
+        );
+    }
+
+    /// RFC 4271 §8.2.2 Event 28 (`UpdateMsgErr`): a locally detected protocol
+    /// error (e.g. RFC 7606 §3(g)'s duplicated `MP_REACH_NLRI`) must send the
+    /// NOTIFICATION, tear down, AND schedule an automatic reconnect — unlike
+    /// `NotificationToSend` (administrative/operator-initiated shutdown,
+    /// which must NOT auto-reconnect). A prior version of this fix routed
+    /// protocol errors through `NotificationToSend` and silently lost the
+    /// reconnect, leaving a misbehaving-but-still-configured peer stuck in
+    /// Idle forever.
+    #[test]
+    fn test_established_protocol_error_notification_schedules_reconnect() {
+        use crate::message::UpdateMsgError;
+
+        let mut fsm = Fsm::new(default_config());
+        reach_established(&mut fsm);
+
+        let notif = NotificationMessage {
+            error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+            data: vec![],
+        };
+        let out = fsm.process(FsmInput::ProtocolErrorNotificationToSend(notif.clone()));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(
+            out.contains(&FsmOutput::SendMessage(BgpMessage::Notification(notif))),
+            "must send the given NOTIFICATION"
+        );
+        assert!(
+            out.contains(&FsmOutput::CloseTcpConnection),
+            "must close the TCP connection"
+        );
+        assert!(
+            out.contains(&FsmOutput::SessionTerminated),
+            "must emit SessionTerminated"
+        );
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+            "must schedule ConnectRetryTimer for automatic reconnect — unlike \
+             NotificationToSend, a protocol error on a still-configured peer \
+             must not leave it stuck in Idle indefinitely"
         );
     }
 
