@@ -805,11 +805,17 @@ impl<T: BgpTransport> Session<T> {
     /// Apply RFC 7606 error policy for a malformed UPDATE.
     ///
     /// - `SessionReset` (RFC 7606 §3(g): a duplicated `MP_REACH_NLRI` or
-    ///   `MP_UNREACH_NLRI`): send a Malformed Attribute List NOTIFICATION and
-    ///   tear down the session. Per §3(h) this is the strongest of the four
+    ///   `MP_UNREACH_NLRI`): tear down the session with a Malformed Attribute
+    ///   List NOTIFICATION. Per §3(h) this is the strongest of the four
     ///   error-handling approaches and takes priority over `treat_as_withdraw`
     ///   when both are set in the same UPDATE. Returns `Some(FsmInput)` for
-    ///   the caller to return from the event loop in this case.
+    ///   the caller to return from the event loop in this case — specifically
+    ///   `NotificationToSend`, not a manually-sent NOTIFICATION plus
+    ///   `TcpFailed`: this is a locally-initiated protocol-error teardown, so
+    ///   it must record `TerminationReason::OperatorStop` (immediate route
+    ///   flush) rather than `Unclean` (which `on_terminated` treats as
+    ///   grounds to enter GR helper mode and retain the peer's routes as
+    ///   stale — wrong here, since we know exactly why the session ended).
     /// - `TreatAsWithdraw`: synthesise a withdrawal UPDATE for all NLRIs that
     ///   were announced in this message, then forward it as a `RouteUpdate`.
     ///   Session stays up; returns `None`.
@@ -832,11 +838,7 @@ impl<T: BgpTransport> Session<T> {
                 error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
                 data: vec![],
             };
-            if let Some(t) = &mut self.transport {
-                let _ = t.send(BgpMessage::Notification(notif)).await;
-            }
-            self.drop_connection();
-            return Some(FsmInput::TcpFailed);
+            return Some(FsmInput::NotificationToSend(notif));
         }
 
         let update = if m.treat_as_withdraw {
@@ -1300,6 +1302,14 @@ mod tests {
     /// error that must actually reset the session — a Malformed Attribute
     /// List NOTIFICATION MUST be sent and the connection torn down, unlike
     /// every other RFC 7606 outcome which keeps the session up.
+    ///
+    /// Also asserts the specific `TerminationReason`, not just that some
+    /// `Terminated` event fires: this is a locally-initiated protocol-error
+    /// teardown, so it must be `OperatorStop` (immediate route flush), not
+    /// `Unclean` — the daemon's `on_terminated` treats `Unclean` as grounds
+    /// to enter RFC 4724 GR helper mode and retain the peer's routes as
+    /// stale, which is wrong when we ourselves decided to close the session
+    /// over a clear protocol violation.
     #[tokio::test]
     async fn test_rfc7606_session_reset_sends_notification_and_terminates() {
         let (mock, mut peer) = MockTransport::pair();
@@ -1343,8 +1353,13 @@ mod tests {
             .expect("timed out waiting for Terminated")
             .expect("session exited without emitting an event");
         assert!(
-            matches!(event, SessionEvent::Terminated(_)),
-            "expected Terminated after a session-reset malformed UPDATE, got {event:?}"
+            matches!(
+                event,
+                SessionEvent::Terminated(TerminationReason::OperatorStop)
+            ),
+            "expected Terminated(OperatorStop) — a locally-initiated protocol-error \
+             teardown must not be recorded as Unclean, which would make the daemon \
+             wrongly enter RFC 4724 GR helper mode for this peer — got {event:?}"
         );
     }
 
