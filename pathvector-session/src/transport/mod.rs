@@ -24,7 +24,7 @@ use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
 use crate::message::{
     BgpMessage, Capability, CodecError, MalformedUpdate, MpUnreachNlri, MsgHeaderError,
-    NotificationError, NotificationMessage, PathAttribute, UpdateMessage,
+    NotificationError, NotificationMessage, PathAttribute, UpdateMessage, UpdateMsgError,
 };
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -469,7 +469,14 @@ impl<T: BgpTransport> Session<T> {
                         TerminationReason::Notification(n.clone())
                     }
                     // We initiated the teardown; always flush immediately.
-                    FsmInput::ManualStop | FsmInput::NotificationToSend(_) => {
+                    // (ProtocolErrorNotificationToSend also gets a clean
+                    // reason — it's a locally *detected* error, not an
+                    // ambiguous peer-side failure — but unlike ManualStop/
+                    // NotificationToSend it additionally schedules a
+                    // reconnect, since the peer is still configured.)
+                    FsmInput::ManualStop
+                    | FsmInput::NotificationToSend(_)
+                    | FsmInput::ProtocolErrorNotificationToSend(_) => {
                         TerminationReason::OperatorStop
                     }
                     _ => TerminationReason::Unclean,
@@ -556,7 +563,9 @@ impl<T: BgpTransport> Session<T> {
                 msg = recv_message(&mut self.transport) => {
                     match msg {
                         Some(Ok(BgpMessage::MalformedUpdate(m))) => {
-                            self.handle_malformed_update(m).await;
+                            if let Some(input) = self.handle_malformed_update(m).await {
+                                return input;
+                            }
                             // Session stays up — continue the select! loop.
                         }
                         Some(Ok(m)) => return FsmInput::MessageReceived(m),
@@ -802,13 +811,27 @@ impl<T: BgpTransport> Session<T> {
 
     /// Apply RFC 7606 error policy for a malformed UPDATE.
     ///
+    /// - `SessionReset` (RFC 7606 §3(g): a duplicated `MP_REACH_NLRI` or
+    ///   `MP_UNREACH_NLRI`): tear down the session with a Malformed Attribute
+    ///   List NOTIFICATION. Per §3(h) this is the strongest of the four
+    ///   error-handling approaches and takes priority over `treat_as_withdraw`
+    ///   when both are set in the same UPDATE. Returns `Some(FsmInput)` for
+    ///   the caller to return from the event loop in this case — specifically
+    ///   `ProtocolErrorNotificationToSend` (RFC 4271 §8.2.2 Event 28), not a
+    ///   manually-sent NOTIFICATION plus `TcpFailed` and not the plain
+    ///   `NotificationToSend`: this is a locally *detected* protocol error on
+    ///   an ongoing, still-configured peer, so it must (a) record
+    ///   `TerminationReason::OperatorStop` (immediate route flush, not
+    ///   `Unclean`'s GR-retention path — we know exactly why the session
+    ///   ended) and (b) still schedule an automatic reconnect, unlike a
+    ///   genuine administrative/operator-initiated teardown.
     /// - `TreatAsWithdraw`: synthesise a withdrawal UPDATE for all NLRIs that
     ///   were announced in this message, then forward it as a `RouteUpdate`.
-    /// - `AttributeDiscard` (all errors): forward the cleaned UPDATE (bad
-    ///   attributes already removed by the decoder).
-    ///
-    /// The session is not reset in either case.
-    async fn handle_malformed_update(&mut self, m: MalformedUpdate) {
+    ///   Session stays up; returns `None`.
+    /// - `AttributeDiscard` (all remaining errors): forward the cleaned
+    ///   UPDATE (bad attributes already removed by the decoder). Session
+    ///   stays up; returns `None`.
+    async fn handle_malformed_update(&mut self, m: MalformedUpdate) -> Option<FsmInput> {
         for e in &m.errors {
             tracing::warn!(
                 peer = %self.config.peer_addr,
@@ -819,6 +842,14 @@ impl<T: BgpTransport> Session<T> {
             );
         }
 
+        if m.session_reset {
+            let notif = NotificationMessage {
+                error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+                data: vec![],
+            };
+            return Some(FsmInput::ProtocolErrorNotificationToSend(notif));
+        }
+
         let update = if m.treat_as_withdraw {
             make_treat_as_withdraw(m.update)
         } else {
@@ -826,6 +857,7 @@ impl<T: BgpTransport> Session<T> {
         };
 
         let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
+        None
     }
 
     fn drop_connection(&mut self) {
@@ -985,7 +1017,7 @@ mod tests {
     use crate::message::{
         AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CeaseError, CodecError,
         MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
-        PathAttribute, UpdateMessage,
+        PathAttribute, UpdateMessage, UpdateMsgError,
     };
 
     // ── MockTransport ─────────────────────────────────────────────────────────
@@ -1237,6 +1269,7 @@ mod tests {
                 detail: "invalid origin value",
             }],
             treat_as_withdraw: true,
+            session_reset: false,
         });
         peer.recv_tx.send(Ok(malformed)).unwrap();
 
@@ -1270,6 +1303,72 @@ mod tests {
         assert!(
             result.is_err() || !matches!(result.unwrap(), Some(SessionEvent::Terminated(_))),
             "session must not terminate after a treat-as-withdraw malformed UPDATE"
+        );
+    }
+
+    /// RFC 7606 §3(g)/(h): a [`MalformedUpdate`] with `session_reset=true`
+    /// (a duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI`) is the one per-attribute
+    /// error that must actually reset the session — a Malformed Attribute
+    /// List NOTIFICATION MUST be sent and the connection torn down, unlike
+    /// every other RFC 7606 outcome which keeps the session up.
+    ///
+    /// Also asserts the specific `TerminationReason`, not just that some
+    /// `Terminated` event fires: this is a locally-initiated protocol-error
+    /// teardown, so it must be `OperatorStop` (immediate route flush), not
+    /// `Unclean` — the daemon's `on_terminated` treats `Unclean` as grounds
+    /// to enter RFC 4724 GR helper mode and retain the peer's routes as
+    /// stale, which is wrong when we ourselves decided to close the session
+    /// over a clear protocol violation.
+    #[tokio::test]
+    async fn test_rfc7606_session_reset_sends_notification_and_terminates() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
+            update: UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![],
+                announced: vec![],
+            },
+            errors: vec![AttributeDecodeError {
+                type_code: 14, // MP_REACH_NLRI
+                policy: AttributeErrorPolicy::SessionReset,
+                detail: "duplicate attribute type code",
+            }],
+            treat_as_withdraw: false,
+            session_reset: true,
+        });
+        peer.recv_tx.send(Ok(malformed)).unwrap();
+
+        let notification = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for the Malformed Attribute List NOTIFICATION")
+            .expect("channel closed before the NOTIFICATION was sent");
+        assert!(
+            matches!(
+                notification,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+                    ..
+                })
+            ),
+            "expected UpdateMessage/MalformedAttributeList NOTIFICATION (RFC 7606 §3(g)), got {notification:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Terminated")
+            .expect("session exited without emitting an event");
+        assert!(
+            matches!(
+                event,
+                SessionEvent::Terminated(TerminationReason::OperatorStop)
+            ),
+            "expected Terminated(OperatorStop) — a locally-initiated protocol-error \
+             teardown must not be recorded as Unclean, which would make the daemon \
+             wrongly enter RFC 4724 GR helper mode for this peer — got {event:?}"
         );
     }
 
@@ -1422,6 +1521,7 @@ mod tests {
                 detail: "wrong length for MED",
             }],
             treat_as_withdraw: false,
+            session_reset: false,
         });
         peer.recv_tx.send(Ok(malformed)).unwrap();
 
@@ -1569,6 +1669,7 @@ mod tests {
                 detail: "malformed mp_reach",
             }],
             treat_as_withdraw: true,
+            session_reset: false,
         });
         peer.recv_tx.send(Ok(malformed)).unwrap();
 

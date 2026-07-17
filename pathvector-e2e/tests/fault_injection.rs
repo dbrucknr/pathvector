@@ -201,6 +201,55 @@ async fn missing_mandatory_origin_treated_as_withdraw_session_stays_up() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 7606 §3(g)/(h): unlike every other malformed-UPDATE scenario in this
+/// file, a duplicated MP_REACH_NLRI must NOT be treated as a withdraw — it
+/// is the one per-attribute error RFC 7606 escalates back to a full session
+/// reset (a Malformed Attribute List NOTIFICATION). Over a real BGP session
+/// with the real wire codec on both ends, proving the fault peer's own
+/// session actually leaves Established, while the control peer's session
+/// stays completely unaffected.
+#[tokio::test]
+async fn duplicate_mp_reach_nlri_resets_session() {
+    let mut h = FaultInjectionHarness::new("duplicate-mp-reach").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+
+    // Anchor on the fault peer actually reaching Established first.
+    // `SessionState` only has two variants (`Idle` covers every
+    // pre-Established FSM state, `Established` the rest) and
+    // `FaultInjectionHarness::new` only waits for the *control* peer — so
+    // without this, the poll loop below could observe `Idle` because the
+    // fault peer simply hasn't finished its handshake yet, and treat that
+    // as "correctly reset" without the RFC 7606 §3(g) behavior ever having
+    // been exercised at all.
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = h
+            .client
+            .get_peer(IpAddr::from(fault_peer))
+            .await
+            .expect("get_peer(fault_peer) gRPC call succeeded");
+        if state.session_state != SessionState::Established {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "RFC 7606 §3(g): session with a duplicated MP_REACH_NLRI must leave \
+             Established within 15 s, not stay up like every other RFC 7606 case"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Throughline: the fault must not have wedged the daemon or affected
+    // unrelated sessions.
+    assert_control_peer_established(&mut h).await;
+}
+
 /// A mid-session TCP reset (simulated via a hard Docker-network disconnect,
 /// already exercised by the GR test suite) must be followed by a clean
 /// re-establishment once connectivity returns — reuses the existing

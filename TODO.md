@@ -517,7 +517,97 @@ below, which deserved prompt attention):
   (keep the first, drop the rest, **no error at all**) — much weaker
   than what happens now (currently withdraws the whole route for a
   completely ordinary duplicate like two COMMUNITY attributes). See
-  `RFC_AUDIT.md`'s RFC 7606 §3 section.
+  `RFC_AUDIT.md`'s RFC 7606 §3 section. **Fixed 2026-07-17**
+  (`fix/rfc7606-duplicate-attribute-handling`): `decode_path_attributes`
+  now branches on type code for a duplicate — `MP_REACH_NLRI`/
+  `MP_UNREACH_NLRI` gets the new `AttributeErrorPolicy::SessionReset`
+  (previously unused; the doc comment claiming "attribute-level errors
+  never produce this" was itself wrong and has been corrected), anything
+  else gets `AttributeDiscard`. `UpdateDecodeOutcome::Partial`/
+  `MalformedUpdate` gained a `session_reset: bool` field alongside the
+  existing `treat_as_withdraw`, computed independently so both can be
+  true for the same UPDATE (e.g. a malformed ORIGIN plus a duplicated
+  MP_REACH_NLRI) — §3(h)'s "strongest action wins" rule is then applied
+  by `handle_malformed_update`, which checks `session_reset` first and
+  sends a real `UpdateMessage(MalformedAttributeList)` NOTIFICATION
+  before tearing down the session, ahead of the treat-as-withdraw/discard
+  branch. The pre-existing test asserting the old behavior,
+  `test_duplicate_attribute_is_treat_as_withdraw`, also cited the wrong
+  clause (§7.3, which is actually NEXT_HOP) — renamed and rewritten to
+  assert `AttributeDiscard`, plus two new tests
+  (`test_duplicate_mp_reach_nlri_requires_session_reset`,
+  `test_session_reset_takes_priority_over_treat_as_withdraw_in_same_update`)
+  and a transport-level test
+  (`test_rfc7606_session_reset_sends_notification_and_terminates`) proving
+  the NOTIFICATION is actually sent and the session actually terminates.
+  Real-teeth verified at both layers: reverting the codec branch to the
+  old unconditional `TreatAsWithdraw` failed all three codec-level tests
+  with the expected diagnostics; separately disabling just the
+  `session_reset` branch in `handle_malformed_update` failed the
+  transport-level test with "timed out waiting for the Malformed
+  Attribute List NOTIFICATION". Both reverts were restored and
+  re-verified passing before commit. Also proven over a real wire-level
+  session, not just unit tests: `pathvector-e2e`'s `mock_bgp_fault_peer`
+  gained a `duplicate-mp-reach` scenario sending a genuinely duplicated
+  MP_REACH_NLRI (IPv4-unicast content — deliberately not IPv6, since this
+  fault peer never negotiates the IPv6 MultiProtocol capability, and an
+  IPv6 attribute would additionally exercise unrelated capability-mismatch
+  handling) through pathvectord's real listener/decode path, holding the
+  connection open with its own periodic KEEPALIVEs afterward so the
+  session can only leave Established via the §3(g) code path under test,
+  not an unrelated hold-timer expiry. First attempt at this e2e test was
+  itself flawed — it didn't send keepalives after the fault UPDATE, so
+  pathvectord's 9s hold timer tore the session down on its own regardless
+  of the fix, and a first (accidental) real-teeth run surfaced this as a
+  flaky pass/fail rather than a clean signal; fixed by adding the
+  keepalive loop, after which reverting the fix produced 3/3 consistent
+  failures (~20s, hitting the assertion's 15s deadline) and restoring it
+  produced 3/3 consistent fast passes (~5s). A subsequent independent
+  review of the e2e test itself found two further false-pass gaps (no
+  confirmation the fault peer ever reached `Established` before polling
+  for it to leave; the keepalive interval still wasn't reliably beating
+  the hold timer under real scheduling jitter) — both closed, re-verified
+  5/5 consistent each way. **A second external review (Codex) then found
+  a real correctness bug in the fix itself**: `handle_malformed_update`'s
+  `session_reset` branch manually sent the NOTIFICATION and returned
+  `FsmInput::TcpFailed`, which `run()` records as `TerminationReason::Unclean`
+  — the same reason used for ambiguous/involuntary disconnects, which
+  `on_terminated` treats as grounds to enter RFC 4724 GR helper mode and
+  retain the peer's routes as stale. Wrong here: this is a locally
+  initiated, deliberate protocol-error teardown, not an ambiguous one.
+  Fixed by returning `FsmInput::NotificationToSend(notif)` instead — the
+  FSM already has this exact input for "we detected an error and want to
+  notify-then-close," and `run()` already maps it to
+  `TerminationReason::OperatorStop` (immediate flush, matching
+  `on_terminated`'s own documented "OperatorStop: never eligible — we
+  initiated the teardown"). Strengthened
+  `test_rfc7606_session_reset_sends_notification_and_terminates` to assert
+  the specific `OperatorStop` reason rather than any `Terminated(_)`;
+  real-teeth verified by reverting to the old manual-send/`TcpFailed`
+  code and confirming the test fails with `Terminated(Unclean)` exactly
+  as the bug predicts. **A follow-up Codex review then found the
+  `NotificationToSend` fix above was itself incomplete**: that input's
+  existing FSM handling (used elsewhere for RFC 9003 administrative
+  shutdown / intentional peer removal, and for RFC 4486 max-prefix-exceeded,
+  which re-arms on its own idle-hold schedule) deliberately does **not**
+  start a `ConnectRetryTimer` — reusing it for a protocol error left a
+  still-configured, merely-misbehaving peer stuck in `Idle` forever, with
+  nothing to ever reconnect it. Per RFC 4271 §8.2.2 Event 28 (`UpdateMsgErr`),
+  a locally detected UPDATE error must send the NOTIFICATION, drop the
+  TCP connection, *and* re-arm the connect-retry timer. Fixed by adding a
+  new, distinct `FsmInput::ProtocolErrorNotificationToSend` (deliberately
+  not changing `NotificationToSend` itself, which must keep its no-retry
+  behavior for its other two call sites) whose `on_established` handling
+  is identical to `NotificationToSend`'s plus `StartConnectRetryTimer`;
+  `handle_malformed_update`'s `session_reset` branch now returns this new
+  input instead. Added `test_established_protocol_error_notification_schedules_reconnect`
+  (FSM-level, mirroring the existing `test_established_tcp_failed_schedules_reconnect`
+  pattern) asserting the NOTIFICATION, `CloseTcpConnection`,
+  `SessionTerminated`, and `StartConnectRetryTimer` outputs all fire;
+  real-teeth verified by removing just the `StartConnectRetryTimer` output
+  and confirming this exact test — and only this one — fails. Full
+  `pathvector-session` suite (316/316) and `pathvector-e2e` fault-injection
+  suite (9/9, real Docker rebuild) both green; clippy and fmt clean.
 - **(Minor) ATOMIC_AGGREGATE doesn't validate its length is 0** — a
   non-zero-length ATOMIC_AGGREGATE is silently accepted as valid rather
   than being flagged malformed. Low impact (no semantic value either

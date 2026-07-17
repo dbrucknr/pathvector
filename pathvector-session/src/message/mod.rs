@@ -167,6 +167,10 @@ pub struct MalformedUpdate {
     pub errors: Vec<AttributeDecodeError>,
     /// `true` if any error has `TreatAsWithdraw` policy.
     pub treat_as_withdraw: bool,
+    /// `true` if any error has `SessionReset` policy (RFC 7606 §3(g): a
+    /// duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI`). Takes priority over
+    /// `treat_as_withdraw` per §3(h)'s "strongest action" rule.
+    pub session_reset: bool,
 }
 
 /// A decoded BGP message.
@@ -230,10 +234,12 @@ impl BgpMessage {
                     update,
                     errors,
                     treat_as_withdraw,
+                    session_reset,
                 } => Ok(Self::MalformedUpdate(MalformedUpdate {
                     update,
                     errors,
                     treat_as_withdraw,
+                    session_reset,
                 })),
             },
             MsgType::Notification => Ok(Self::Notification(NotificationMessage::decode(&mut cur)?)),
@@ -575,6 +581,7 @@ mod tests {
             },
             errors: vec![],
             treat_as_withdraw: false,
+            session_reset: false,
         });
         let _ = msg.encode();
     }

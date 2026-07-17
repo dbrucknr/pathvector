@@ -22,6 +22,11 @@
 //!   second UPDATE omits the ORIGIN attribute entirely rather than carrying
 //!   an invalid value (RFC 7606 §3(d): missing well-known mandatory
 //!   attribute, still treat-as-withdraw).
+//! - `duplicate-mp-reach` — a real OPEN/KEEPALIVE handshake to Established,
+//!   then a single UPDATE carrying two `MP_REACH_NLRI` attributes (RFC 7606
+//!   §3(g): unlike every other malformed-attribute case in this file, this
+//!   one is NOT treat-as-withdraw — it MUST reset the session with a
+//!   Malformed Attribute List NOTIFICATION).
 //!
 //! For the three header-error and two truncation scenarios, no valid frame
 //! exists to reuse from `pathvector_session`'s encoder by construction, so
@@ -42,8 +47,10 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
-use pathvector_session::message::{BgpMessage, OpenMessage, PathAttribute, UpdateMessage};
-use pathvector_types::{AsPath, Asn, Origin};
+use pathvector_session::message::{
+    BgpMessage, Capability, MpReachNlri, OpenMessage, PathAttribute, Prefix, UpdateMessage,
+};
+use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -83,6 +90,7 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "truncated-open" => truncated_open(stream).await,
         "malformed-update-origin" => malformed_update_origin(stream).await,
         "missing-origin" => missing_origin_update(stream).await,
+        "duplicate-mp-reach" => duplicate_mp_reach_update(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -371,6 +379,135 @@ async fn missing_origin_update(stream: TcpStream) {
             n = stream.read(&mut buf) => {
                 if matches!(n, Ok(0) | Err(_)) {
                     return;
+                }
+            }
+        }
+    }
+}
+
+/// RFC 7606 §3(g): "If the MP_REACH_NLRI attribute or the MP_UNREACH_NLRI
+/// attribute appears more than once in the UPDATE message, then a
+/// NOTIFICATION message MUST be sent with the Error Subcode 'Malformed
+/// Attribute List'." Unlike every other scenario in this file, this one
+/// expects pathvectord to actually reset the session — no `into_inner`
+/// hand-rolling needed, since encoding two attributes of the same type is
+/// just normal `Vec` iteration in the encoder (see the equivalent unit-level
+/// trick in `pathvector-session/src/message/update.rs`'s
+/// `test_duplicate_mp_reach_nlri_requires_session_reset`).
+async fn duplicate_mp_reach_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    // Unlike the other scenarios in this file, this one negotiates the
+    // MultiProtocol(IPv4 unicast) capability — the MP_REACH_NLRI attribute
+    // sent below carries IPv4 unicast content, and properly negotiating it
+    // removes capability-mismatch handling as a confound: if the duplicate
+    // detection were ever disabled/broken, the single (post-dedup)
+    // MpReachNlri would fall through to pathvectord's already-supported,
+    // deterministic mp_v4 route-install path instead of an unnegotiated-
+    // AFI/SAFI code path whose behavior isn't what this scenario means to
+    // exercise.
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![Capability::MultiProtocol(AfiSafi::IPV4_UNICAST)],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    // Drain until pathvectord's own KEEPALIVE arrives, confirming it reached
+    // Established on its side before we send anything UPDATE-shaped.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Give the e2e test a real window to observe the fault peer's session
+    // as Established (via gRPC) before the fault below resets it — without
+    // this, "session reached Established" and "session got reset" could
+    // both happen faster than the test's own polling could ever observe
+    // the intermediate Established state, letting a broken fix produce a
+    // false pass (never confirmed Established, so "not Established" is
+    // trivially and vacuously true from the very first poll).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // IPv4 unicast content (not IPv6) deliberately: this scenario's fault
+    // peer never negotiates the IPv6 MultiProtocol capability (its OPEN
+    // carries none), so an IPv6 MP_REACH_NLRI would additionally exercise
+    // capability-mismatch handling — a second, unrelated variable this
+    // scenario isn't meant to test. IPv4-via-MP_REACH_NLRI is always
+    // meaningful regardless of capability negotiation (pathvectord already
+    // supports it independently, per the RFC 7606 §3(d) fix's mp_v4
+    // handling), keeping this scenario isolated to §3(g) alone.
+    let mp_reach = || {
+        PathAttribute::MpReachNlri(MpReachNlri {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            next_hop: NextHop::V4(FAULT_PEER_BGP_ID),
+            prefixes: vec![Prefix::V4(
+                TEST_PREFIX.parse().expect("valid prefix literal"),
+            )],
+        })
+    };
+    let duplicate = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![mp_reach(), mp_reach()],
+        announced: vec![],
+    };
+    if framed.send(BgpMessage::Update(duplicate)).await.is_err() {
+        return;
+    }
+    println!("sent UPDATE with duplicate MP_REACH_NLRI attributes");
+
+    // Keep sending our own KEEPALIVEs after this — critically, this means if
+    // pathvectord's fix were disabled/broken, the session would stay fully
+    // alive (bidirectional keepalives, no hold-timer expiry) rather than
+    // eventually being torn down by an unrelated 9s HoldTimerExpired that
+    // would make this test pass for the wrong reason. A real regression here
+    // must show up as "no NOTIFICATION arrives, session stays Established
+    // indefinitely," not as a hold-timer timeout race. A 1s interval
+    // (rather than the RFC-typical hold_time/3 = 3s) is deliberate: under
+    // real-teeth testing, a 3s interval left too little margin against
+    // ordinary Docker/host scheduling jitter, and a delayed keepalive was
+    // directly observed causing a spurious `HoldTimerExpired` NOTIFICATION
+    // instead of the fix's own `MalformedAttributeList` — a false signal
+    // unrelated to the code under test.
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if framed.send(BgpMessage::Keepalive).await.is_err() {
+                    return;
+                }
+                ticks += 1;
+                if ticks > 60 {
+                    // Long past any reasonable test timeout — give up rather
+                    // than looping forever if something is very wrong.
+                    return;
+                }
+            }
+            msg = framed.next() => {
+                match msg {
+                    Some(Ok(BgpMessage::Notification(n))) => {
+                        println!("received NOTIFICATION as expected: {n:?}");
+                        return;
+                    }
+                    Some(Ok(_)) => {} // ignore KEEPALIVE/other, keep looping
+                    _ => return, // EOF or codec error — connection closed
                 }
             }
         }
