@@ -233,7 +233,18 @@ decision to keep fixes in their own scoped PRs):
   7606 §3(c)'s own wording). 5 new tests added, including one iterating all
   256 type codes to confirm the correct flags never spuriously trip the
   check. Real-teeth verified: disabling the check made 2 of the new tests
-  fail with a clear diagnostic; restored and re-verified passing.
+  fail with a clear diagnostic; restored and re-verified passing. Also
+  proven over a real wire-level session: `pathvector-e2e`'s
+  `mock_bgp_fault_peer` gained an `attribute-flags-conflict` scenario
+  sending ORIGIN with a *valid* value but a wrong flags byte, through
+  pathvectord's real listener/decode path — deliberately including
+  well-formed AS_PATH/NEXT_HOP alongside it, since an initial version
+  without them let a disabled flags check pass undetected (the separate,
+  already-fixed missing-mandatory-attribute check produced the same
+  treat-as-withdraw outcome for an unrelated reason, masking the bug).
+  Real-teeth verified at this layer too: reverting the check, rebuilding
+  the Docker image, and confirming the e2e test fails with a clear
+  timeout/assertion diagnostic; restored and reconfirmed passing.
 - **OPEN and ROUTE_REFRESH don't reject trailing padding within the
   declared header Length.** §4.1 requires the Length field have "the
   smallest value required... padding of extra data after the message is
@@ -476,7 +487,15 @@ narrower:
   of the same too-long-truncation pattern documented under item #19 below.
   Real-teeth verified: reverting the policy change back to
   `AttributeDiscard` failed the new test with a clear left/right policy
-  mismatch; restored and re-verified passing.
+  mismatch; restored and re-verified passing. Also proven over a real
+  wire-level session: `pathvector-e2e`'s `mock_bgp_fault_peer` gained a
+  `malformed-otc` scenario sending a genuinely 3-byte OTC attribute
+  (alongside well-formed ORIGIN/AS_PATH/NEXT_HOP) through pathvectord's
+  real listener/decode path, asserting both the route withdrawal and that
+  the fault peer's own session stays Established. Real-teeth verified at
+  this layer too: reverting the policy, rebuilding the Docker image, and
+  confirming the e2e test fails with a clear timeout/assertion
+  diagnostic; restored and reconfirmed passing.
 - **Peer-side duplicate/conflicting Role Capabilities aren't detected.**
   §4.2 requires rejecting the connection (Role Mismatch) if a peer sends
   2+ Role Capabilities with *differing* values (identical duplicates are
