@@ -523,7 +523,32 @@ areas the existing test suite never covered:
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world
   likelihood). `peer.rs:383-402`'s `find_map` takes the first non-zero
-  instance instead. See `RFC_AUDIT.md`'s RFC 4724 §3 section.
+  instance instead. See `RFC_AUDIT.md`'s RFC 4724 §3 section. **Fixed
+  2026-07-18** (`fix/rfc4724-rfc9234-capability-duplicates`): the bug was
+  actually subtler than a simple first/last swap — the old code searched
+  for "the first instance with `restart_time > 0`", not "the first
+  instance", so a peer sending `[restart_time=120, restart_time=0]` (real
+  value, then the authoritative-per-RFC last instance saying EOR-only)
+  would incorrectly keep using the earlier 120, never even reaching the
+  true last instance. Extracted a new `extract_gr_capability()` function
+  (`pathvectord/src/daemon/peer.rs`) that finds the actual **last**
+  `GracefulRestart` instance in the list first, then interprets *that*
+  instance's `restart_time`/flags — matching the RFC exactly regardless
+  of which position(s) happen to carry a non-zero value. The existing
+  test helper `extract_gr_time` (`daemon/mod.rs`) previously duplicated
+  ("mirrored") this logic instead of calling the real function, which is
+  almost certainly why this drifted un-noticed — it now delegates to
+  `extract_gr_capability` directly, eliminating the duplication. Two
+  pre-existing tests, `duplicate_gr_capabilities_do_not_panic_and_first_wins`
+  and `zero_gr_then_nonzero_gr_uses_first_nonzero`, explicitly named and
+  asserted the old (non-compliant) behavior — corrected to assert
+  "last wins" and renamed accordingly; a third, new test
+  (`nonzero_gr_then_zero_gr_uses_last_instance_even_though_it_is_zero`)
+  covers the specific subtlety above. Real-teeth verified: all three
+  tests were written first, confirmed to fail against the unfixed code
+  with clear diagnostics, then the fix was implemented and confirmed to
+  make them pass; reverting the fix afterward reproduced the same
+  failures.
 
 **18. RFC 9234 (Route Leak Prevention/Roles) gaps found by systematic
 clause audit** — found 2026-07-16 (diagnostic only, not fixed here). The
@@ -571,7 +596,28 @@ narrower:
   4724 GR "first instance wins" bug (TODO #17) found in the prior audit
   pass. Worth a dedicated look at whether other capability types (RFC
   5492 in general) have the same recurring pattern. See `RFC_AUDIT.md`'s
-  RFC 9234 §4.2 section.
+  RFC 9234 §4.2 section. **Fixed 2026-07-18**
+  (`fix/rfc4724-rfc9234-capability-duplicates`): `validate_open` now
+  collects every `Capability::Role` value the peer sent; if they're not
+  all identical, the connection is rejected with Role Mismatch
+  immediately — before the existing Provider/Customer-style
+  compatibility check ever runs, since a differing pair is itself
+  grounds for rejection regardless of whether our own local role happens
+  to be compatible with the peer's *first* advertised value. New tests:
+  `test_role_identical_duplicates_are_not_a_mismatch` (collapses to one,
+  proceeds — this one already passed under the old code, since
+  first-wins is trivially correct when all values are equal) and
+  `test_role_differing_duplicates_are_a_mismatch_even_if_first_is_compatible`
+  (the actual bug: peer sends `[Customer, Peer]` against our `Provider`
+  — `Customer` alone is compatible, so a first-wins implementation
+  proceeds to `OpenConfirm` without ever noticing the conflicting second
+  value). Also checked `resolve_as()`'s `Capability::FourByteAsn`
+  extraction for the same shape per the note above — confirmed **not** a
+  gap; see the RFC 5492 section of `RFC_AUDIT.md`. Real-teeth verified:
+  both new tests written first and confirmed to fail against the unfixed
+  code (the differing-duplicates test failed with a clear
+  `OpenConfirm`-instead-of-`Idle` diagnostic); fix implemented, tests
+  pass; reverting the fix afterward reproduced the same failure.
 
 **19. HIGHEST PRIORITY — RFC 7606 gaps found by systematic clause audit,
 including the most operationally severe finding of the entire audit** —

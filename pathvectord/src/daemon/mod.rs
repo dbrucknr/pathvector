@@ -15459,20 +15459,13 @@ mod test_gr_peer_capability {
         }
     }
 
-    /// Extract the peer's GR restart_time from a capability list, exactly as
-    /// on_established does. Returns None if absent or restart_time == 0.
+    /// Extract the peer's GR restart_time from a capability list, delegating
+    /// to the real production function `on_established` calls — not a
+    /// separate mirrored implementation — so this test module can never
+    /// silently drift from what actually runs. Returns None if absent or
+    /// restart_time == 0.
     fn extract_gr_time(caps: &[Capability]) -> Option<u16> {
-        caps.iter().find_map(|c| {
-            if let Capability::GracefulRestart { restart_time, .. } = c {
-                if *restart_time > 0 {
-                    Some(*restart_time)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+        super::peer::extract_gr_capability(caps).0
     }
 
     /// A peer advertising GracefulRestart with restart_time > 0 must be recorded
@@ -15512,31 +15505,50 @@ mod test_gr_peer_capability {
         );
     }
 
-    /// RFC 4724 §3: a peer MUST NOT send more than one GracefulRestart capability,
-    /// but if it does we must not panic and must use the first one (find_map semantics).
+    /// RFC 4724 §3: "A BGP speaker MUST NOT include more than one instance of
+    /// the Graceful Restart Capability in the capability advertisement... If
+    /// more than one instance... is carried..., the receiver of the
+    /// advertisement MUST ignore all but the last instance of the Graceful
+    /// Restart Capability." A peer sending duplicates is itself a sender-side
+    /// RFC violation, but if it happens, the *last* instance must win, not
+    /// the first.
     #[test]
-    fn duplicate_gr_capabilities_do_not_panic_and_first_wins() {
+    fn duplicate_gr_capabilities_do_not_panic_and_last_wins() {
         let caps = vec![gr_cap(90), gr_cap(300)];
         let t = extract_gr_time(&caps);
         assert_eq!(
             t,
-            Some(90),
-            "first GracefulRestart capability must win when duplicates are present"
+            Some(300),
+            "last GracefulRestart capability must win when duplicates are present"
         );
     }
 
-    /// find_map skips GR capabilities with restart_time=0 (they don't indicate GR
-    /// capability — RFC 4724 §3: restart_time=0 means EOR-only). If a peer sends
-    /// restart_time=0 followed by restart_time=120 (malformed but defensive), the
-    /// first non-zero value wins.
+    /// The RFC's "ignore all but the last instance" rule applies to the whole
+    /// capability, not just a first-non-zero-restart_time search — so a last
+    /// instance with restart_time=0 must win even over an earlier non-zero
+    /// instance, correctly yielding "not GR-capable for retention purposes"
+    /// (EOR-only) rather than falling back to the earlier value.
     #[test]
-    fn zero_gr_then_nonzero_gr_uses_first_nonzero() {
+    fn nonzero_gr_then_zero_gr_uses_last_instance_even_though_it_is_zero() {
+        let caps = vec![gr_cap(120), gr_cap(0)];
+        let t = extract_gr_time(&caps);
+        assert_eq!(
+            t, None,
+            "the last instance (restart_time=0) must be authoritative, \
+             not the earlier non-zero instance"
+        );
+    }
+
+    /// Symmetric case: restart_time=0 followed by a real non-zero last
+    /// instance — the last instance must win here too.
+    #[test]
+    fn zero_gr_then_nonzero_gr_uses_last_instance() {
         let caps = vec![gr_cap(0), gr_cap(120)];
         let t = extract_gr_time(&caps);
         assert_eq!(
             t,
             Some(120),
-            "first non-zero restart_time must be used; restart_time=0 is EOR-only and skipped"
+            "the last instance (restart_time=120) must be authoritative"
         );
     }
 

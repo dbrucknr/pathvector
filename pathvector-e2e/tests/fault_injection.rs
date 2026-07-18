@@ -17,7 +17,8 @@ use std::time::Duration;
 use pathvector_client::DaemonClient;
 use pathvector_client::types::SessionState;
 use pathvector_e2e::{
-    FaultInjectionHarness, Harness, wait_for_established, wait_for_route, wait_for_route_withdrawn,
+    FaultInjectionHarness, Harness, wait_for_docker_log, wait_for_established, wait_for_route,
+    wait_for_route_withdrawn,
 };
 
 /// Confirms the control peer is Established — the common precondition and
@@ -89,6 +90,83 @@ async fn bad_type_daemon_stays_healthy() {
         state.session_state,
         SessionState::Established,
         "a connection that only ever sent an unrecognized message type must never reach Established"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 4724 §3: "the receiver of the advertisement MUST ignore all but the
+/// last instance of the Graceful Restart Capability." Over a real BGP
+/// session with the real wire codec on both ends: the fault peer's OPEN
+/// carries two GracefulRestart capabilities (restart_time=90, then 300);
+/// pathvectord must end up recording the *last* one (300), not the first.
+#[tokio::test]
+async fn gr_duplicate_capabilities_last_instance_wins() {
+    let mut h = FaultInjectionHarness::new("gr-duplicate-capabilities").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established within 15 s");
+
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.peer_gr_restart_time, 300,
+        "RFC 4724 §3: the last GracefulRestart instance (restart_time=300) \
+         must be authoritative, not the first (restart_time=90)"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 9234 §4.2: "If multiple BGP Role Capabilities are received and not
+/// all of them have the same value, then the BGP speaker MUST reject the
+/// connection using the Role Mismatch Notification." Over a real BGP
+/// session: the fault peer's OPEN carries two *differing* Role capabilities
+/// (Customer, then Peer) — pathvectord must reject the connection outright,
+/// never reaching Established, regardless of whatever Role (if any) it has
+/// configured locally for this peer.
+#[tokio::test]
+async fn role_differing_duplicates_are_rejected() {
+    let mut h = FaultInjectionHarness::new("role-differing-duplicates").await;
+    assert_control_peer_established(&mut h).await;
+
+    // Assert on what the mock actually observed over the wire, not just on
+    // pathvectord's session state: a session that never reaches Established
+    // is also consistent with the mock's own connection handling breaking
+    // for a reason unrelated to Role Mismatch (the false-pass shape this
+    // scenario was written to catch — see mock_bgp_fault_peer.rs's
+    // `role_differing_duplicates_open` doc comment). Requiring this exact
+    // line in the mock's logs proves pathvectord actually sent a Role
+    // Mismatch NOTIFICATION (code 2, subcode 11), not merely that some
+    // connection failure occurred.
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: role_mismatch_notification_received",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect(
+        "RFC 9234 §4.2: pathvectord must send a Role Mismatch NOTIFICATION to a peer \
+         advertising two differing Role capabilities",
+    );
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_ne!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 9234 §4.2: an OPEN carrying two differing Role capabilities \
+         must be rejected (Role Mismatch), never reaching Established"
     );
 
     assert_control_peer_established(&mut h).await;
