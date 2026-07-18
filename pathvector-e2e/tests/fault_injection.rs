@@ -201,6 +201,91 @@ async fn missing_mandatory_origin_treated_as_withdraw_session_stays_up() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 7606 §3(c) (revising RFC 4271 §4.3): "If the value of either the
+/// Optional or Transitive bits in the Attribute Flags is in conflict with
+/// their specified values, then the attribute MUST be treated as malformed
+/// and the 'treat-as-withdraw' approach used." Distinct from the
+/// invalid-*value* case above: here ORIGIN's value is valid (IGP) but its
+/// flags byte wrongly marks it Optional — a check that didn't exist at all
+/// before this fix, so this proves the mechanism itself, not just a
+/// particular value it happens to reject. Also proves the fault peer's own
+/// session stays Established (treat-as-withdraw, not a NOTIFICATION/reset),
+/// same rigor as the missing-ORIGIN test above.
+#[tokio::test]
+async fn attribute_flags_conflict_treated_as_withdraw_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("attribute-flags-conflict").await;
+    assert_control_peer_established(&mut h).await;
+
+    // The first, clean UPDATE must land.
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    // The second UPDATE (ORIGIN with conflicting flags) must be treated as a
+    // withdraw per RFC 7606 §3(c) — the route disappears, but the session
+    // and the rest of the daemon stay healthy.
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect(
+            "10.99.0.0/24 was not withdrawn within 15 s after the UPDATE with conflicting flags",
+        );
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 7606 §3(c): the fault peer's own session must stay Established, \
+         not be reset with a NOTIFICATION"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 9234 §5: "The OTC Attribute is considered malformed if the length
+/// value is not 4. An UPDATE message with a malformed OTC Attribute SHALL be
+/// handled using the approach of 'treat-as-withdraw' \[RFC7606\]." Security-
+/// relevant: proves a malformed OTC causes the *route* to be withdrawn
+/// rather than the attribute being silently discarded and the route
+/// accepted as if OTC had never been present — which would let a route
+/// bypass OTC-based leak detection entirely.
+#[tokio::test]
+async fn malformed_otc_treated_as_withdraw_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("malformed-otc").await;
+    assert_control_peer_established(&mut h).await;
+
+    // The first, clean UPDATE must land.
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    // The second UPDATE (3-byte OTC instead of 4) must be treated as a
+    // withdraw per RFC 9234 §5 — the route disappears, but the session and
+    // the rest of the daemon stay healthy.
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 was not withdrawn within 15 s after the malformed-length OTC UPDATE");
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 9234 §5: the fault peer's own session must stay Established, \
+         not be reset with a NOTIFICATION"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
 /// RFC 7606 §3(g)/(h): unlike every other malformed-UPDATE scenario in this
 /// file, a duplicated MP_REACH_NLRI must NOT be treated as a withdraw — it
 /// is the one per-attribute error RFC 7606 escalates back to a full session
