@@ -316,7 +316,18 @@ not fixed here):
   looked exactly like the bug this test exists to catch. Real-teeth
   verified: reverting the `peer_type` guard failed all three new tests
   with clear diagnostics; restored and reconfirmed passing. Full
-  `pathvectord` suite (677/677), fmt, and clippy clean.
+  `pathvectord` suite (677/677), fmt, and clippy clean. Also proven over
+  a real wire-level session: `pathvector-e2e`'s `mock_bgp_fault_peer`
+  gained an `ebgp-local-pref` scenario — unlike every other scenario in
+  that file, the UPDATE here is entirely well-formed (tests
+  policy-violating-but-valid input per this project's own testing
+  discipline, not corrupted wire format), sending a real eBGP peer's
+  `u32::MAX` LOCAL_PREF through pathvectord's real listener/decode path
+  and asserting the installed route's `local_pref` is `None`. Real-teeth
+  verified at this layer too: disabling the guard, rebuilding the Docker
+  image, and confirming the e2e test failed with a clear diagnostic
+  (`Some(4294967295)` instead of `None`); restored and reconfirmed
+  passing, full `fault_injection` suite 12/12.
 - **Unrecognized transitive optional attributes cannot survive a relay
   through this router.** §5 requires unrecognized *transitive* optional
   attributes to be passed along to other peers (with Partial bit set to 1);
