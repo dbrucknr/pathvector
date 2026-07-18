@@ -327,7 +327,19 @@ not fixed here):
   verified at this layer too: disabling the guard, rebuilding the Docker
   image, and confirming the e2e test failed with a clear diagnostic
   (`Some(4294967295)` instead of `None`); restored and reconfirmed
-  passing, full `fault_injection` suite 12/12.
+  passing, full `fault_injection` suite 12/12. One open question was
+  flagged in the PR description rather than the fix itself: whether RFC
+  4724 Graceful Restart's stale-route retention could reintroduce a
+  peer-supplied LOCAL_PREF through a path other than `handle_update`.
+  Codex review (and independent verification of the same code) closed
+  this out — `AdjRibIn<A>` (`pathvector-rib/src/adj_rib_in.rs`) stores
+  already-built `Route<A>` objects, not raw `PathAttribute`s to re-parse,
+  and nothing in its stale-marking/GR-flush logic touches `local_pref` at
+  all (stale marking is a boolean flag mutation, not attribute
+  reconstruction); any UPDATE arriving after a GR-triggered reconnect is,
+  by construction, just another call to the same guarded `handle_update`.
+  No separate code path exists for GR retention to bypass this fix
+  through.
 - **Unrecognized transitive optional attributes cannot survive a relay
   through this router.** §5 requires unrecognized *transitive* optional
   attributes to be passed along to other peers (with Partial bit set to 1);
