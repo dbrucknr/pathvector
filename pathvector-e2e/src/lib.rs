@@ -2303,6 +2303,7 @@ pub struct FaultInjectionHarness {
     pub client: PathvectorClient,
     pub control_peer: Ipv4Addr,
     pub fault_peer: Ipv4Addr,
+    pub fault_peer_container_id: String,
     _network: DockerNetwork,
 }
 
@@ -2386,6 +2387,7 @@ impl FaultInjectionHarness {
             client,
             control_peer: control_peer_addr,
             fault_peer: fault_peer_addr,
+            fault_peer_container_id: fault_peer_id,
             _network: network,
         }
     }
@@ -2564,6 +2566,52 @@ pub async fn wait_for_metric(port: u16, needle: &str, timeout: Duration) {
             "timed out after {timeout:?} waiting for metric containing {needle:?}\n\
              full /metrics response:\n{body}"
         );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Polls `docker logs <container_id>` until a line containing `needle`
+/// appears.
+///
+/// Used to observe an outcome recorded by a mock peer running in its own
+/// container/process, which a test in this crate cannot otherwise observe
+/// directly — e.g. confirming the mock actually received a specific
+/// NOTIFICATION, not just that pathvectord's session state changed. A test
+/// that only checks session state and not what the mock actually saw over
+/// the wire can pass even when the mock's own connection handling breaks
+/// for a reason unrelated to the behavior under test.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before `needle` appears in the
+/// container's logs; the error includes the full log tail for diagnosis.
+pub async fn wait_for_docker_log(
+    container_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let logs = Command::new("docker")
+            .args(["logs", container_id])
+            .output()
+            .map_or_else(
+                |e| format!("<docker logs failed: {e}>"),
+                |o| {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    format!("{stdout}{stderr}")
+                },
+            );
+        if logs.contains(needle) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for {needle:?} in container \
+                 {container_id}'s logs\n--- docker logs {container_id} ---\n{logs}"
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

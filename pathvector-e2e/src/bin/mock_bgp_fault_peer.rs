@@ -991,21 +991,30 @@ async fn role_differing_duplicates_open(stream: TcpStream) {
     // silently stalling the handshake and producing "never reached
     // Established" for the wrong reason regardless of whether the fix
     // actually works.
+    //
+    // The outcome is reported via a distinct, greppable stdout line rather
+    // than an in-process `assert_eq!`: this function runs inside a spawned
+    // connection task in a container the test process doesn't share memory
+    // with, so a panic here would only kill that task silently — the test
+    // would still observe "not Established" and pass for the wrong reason
+    // (the same false-pass shape this scenario exists to catch). The test
+    // asserts on this exact line via `docker logs`, not just on session
+    // state, so it fails loudly if the NOTIFICATION is missing or wrong.
     loop {
         match framed.next().await {
             Some(Ok(BgpMessage::Notification(n))) => {
-                println!("received NOTIFICATION as expected: {n:?}");
-                assert_eq!(
-                    n.error,
-                    NotificationError::OpenMessage(OpenMsgError::RoleMismatch),
-                    "expected RoleMismatch, got a different NOTIFICATION"
-                );
+                if n.error == NotificationError::OpenMessage(OpenMsgError::RoleMismatch) {
+                    println!("SCENARIO_OUTCOME: role_mismatch_notification_received");
+                } else {
+                    println!("SCENARIO_OUTCOME: wrong_notification_received: {n:?}");
+                }
                 return;
             }
             Some(Ok(BgpMessage::Keepalive)) => {
                 println!(
-                    "received KEEPALIVE instead of NOTIFICATION — completing the \
-                     handshake so a broken fix genuinely reaches Established"
+                    "SCENARIO_OUTCOME: handshake_completed_without_notification (received \
+                     KEEPALIVE instead) — completing the handshake so a broken fix genuinely \
+                     reaches Established"
                 );
                 if framed.send(BgpMessage::Keepalive).await.is_err() {
                     return;
@@ -1015,7 +1024,9 @@ async fn role_differing_duplicates_open(stream: TcpStream) {
                 println!("WARNING: unexpected message while waiting: {other:?}");
             }
             _ => {
-                println!("connection closed (EOF/codec error) without a NOTIFICATION");
+                println!(
+                    "SCENARIO_OUTCOME: connection_closed_without_notification (EOF/codec error)"
+                );
                 return;
             }
         }
