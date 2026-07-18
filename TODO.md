@@ -274,6 +274,72 @@ not fixed here):
   Fix: gate the `PathAttribute::LocalPref` capture (or its application to
   the route builder) on `peer_type == PeerType::Internal`, plus a test
   proving an eBGP-attached LOCAL_PREF is dropped, not honored.
+  **Fixed 2026-07-18** (`fix/rfc4271-local-pref-ebgp-ignore`):
+  `handle_update`'s `PathAttribute::LocalPref` match arm in
+  `pathvectord/src/daemon/route.rs` now only captures the value when
+  `peer_type == PeerType::Internal`; from any other peer type the
+  attribute is silently ignored (route falls back to `LocalPref::DEFAULT`
+  in `best_path.rs`), matching RFC 4271 §5.1.5's "MUST be ignored"
+  wording exactly (not a value-substitution, an outright drop). RFC
+  4271 §5.1.5's own text carries a confederation exception ("except in
+  the case of BGP Confederations [RFC3065]", reconfirmed still active by
+  RFC 5065 §5.2/§5.3) — deliberately **not** handled here, since this
+  daemon has no confederation-aware peer classification at all yet (see
+  item #22's 2026-07-18 scoping note, filed as its own separate,
+  significantly larger initiative rather than folded into this fix).
+  Two pre-existing tests asserted the old (vulnerable) behavior as
+  correct — `test_handle_update_inserts_route_with_all_attributes` and
+  `test_handle_update_mp_reach_announces_ipv4_route` both asserted an
+  eBGP-attached LOCAL_PREF was honored, incidental to what each test was
+  actually about (generic attribute capture and MP_REACH_NLRI route
+  installation respectively) — both switched to `PeerType::Internal` so
+  they keep proving what they're actually named for. Three new tests
+  added: `test_local_pref_ignored_from_ebgp_peer` /
+  `test_local_pref_honored_from_ibgp_peer` (the gate itself, both
+  directions) and `test_ebgp_local_pref_cannot_win_best_path_over_shorter_as_path`
+  (the actual security property — two eBGP peers announce the same
+  prefix, one with a bogus `u32::MAX` LOCAL_PREF and a longer AS_PATH,
+  the other with no LOCAL_PREF and a shorter AS_PATH; asserts the
+  shorter-AS_PATH peer wins once the bogus LOCAL_PREF can no longer
+  short-circuit the comparison at the first tie-break step). Writing
+  that last test surfaced two of its own bugs before it proved anything:
+  first, its two candidate routes were sharing one `AdjRibIn` instance
+  constructed for a third, unrelated peer ID (`AdjRibIn` is
+  per-peer-connection state; this didn't affect the assertion since
+  `LocRib` — the only thing `best_path` reads — is keyed independently
+  by peer, but was corrected for accuracy); second, and the one that
+  actually mattered, the "legitimate" peer's `AS_PATH` originally used AS
+  65002 — an accidental AS-PATH loop against the test harness's own
+  fixed `local_as` (`handle_update_v4`'s test helper hardcodes `65002`),
+  which RFC 4271 §6.3 loop detection (unrelated, pre-existing, working
+  code) correctly and silently dropped, producing a false failure that
+  looked exactly like the bug this test exists to catch. Real-teeth
+  verified: reverting the `peer_type` guard failed all three new tests
+  with clear diagnostics; restored and reconfirmed passing. Full
+  `pathvectord` suite (677/677), fmt, and clippy clean. Also proven over
+  a real wire-level session: `pathvector-e2e`'s `mock_bgp_fault_peer`
+  gained an `ebgp-local-pref` scenario — unlike every other scenario in
+  that file, the UPDATE here is entirely well-formed (tests
+  policy-violating-but-valid input per this project's own testing
+  discipline, not corrupted wire format), sending a real eBGP peer's
+  `u32::MAX` LOCAL_PREF through pathvectord's real listener/decode path
+  and asserting the installed route's `local_pref` is `None`. Real-teeth
+  verified at this layer too: disabling the guard, rebuilding the Docker
+  image, and confirming the e2e test failed with a clear diagnostic
+  (`Some(4294967295)` instead of `None`); restored and reconfirmed
+  passing, full `fault_injection` suite 12/12. One open question was
+  flagged in the PR description rather than the fix itself: whether RFC
+  4724 Graceful Restart's stale-route retention could reintroduce a
+  peer-supplied LOCAL_PREF through a path other than `handle_update`.
+  Codex review (and independent verification of the same code) closed
+  this out — `AdjRibIn<A>` (`pathvector-rib/src/adj_rib_in.rs`) stores
+  already-built `Route<A>` objects, not raw `PathAttribute`s to re-parse,
+  and nothing in its stale-marking/GR-flush logic touches `local_pref` at
+  all (stale marking is a boolean flag mutation, not attribute
+  reconstruction); any UPDATE arriving after a GR-triggered reconnect is,
+  by construction, just another call to the same guarded `handle_update`.
+  No separate code path exists for GR retention to bypass this fix
+  through.
 - **Unrecognized transitive optional attributes cannot survive a relay
   through this router.** §5 requires unrecognized *transitive* optional
   attributes to be passed along to other peers (with Partial bit set to 1);
@@ -795,7 +861,30 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   bug, since it may be intentionally out of scope. `RFC_REQUIREMENTS.md`
   corrected from ✅ to ⚠️ either way, since the current wording implied
   more than what's actually there. See `RFC_AUDIT.md`'s audit-the-audit
-  section for the full writeup.
+  section for the full writeup. **Scoping note added 2026-07-18** (while
+  scoping PR 5, the LOCAL_PREF-from-eBGP fix): confirmed via direct
+  investigation that this gap is even more foundational than the original
+  writeup suggested — there is currently *no confederation config schema
+  at all* (no `confederation_id`, no `member_as` list; `PeerType` is
+  derived purely from `remote_as == local_as` in one function,
+  `config_peer_type`). RFC 4271 §5.1.5's LOCAL_PREF-ignore rule itself
+  carries a confederation exception ("except in the case of BGP
+  Confederations [RFC3065]"), confirmed still active by RFC 5065 §5.2
+  ("the restriction against sending the LOCAL_PREF attribute to peers in
+  a neighboring autonomous system within the same confederation is
+  removed") and §5.3 ("Path selection criteria for information received
+  from members inside a confederation MUST follow the same rules used
+  for information received from members inside the same autonomous
+  system") — so a fully RFC-correct fix would need a 4th `PeerType`
+  variant threaded through best-path ordering, outbound LOCAL_PREF/
+  NEXT_HOP/MED rules, and `adj_rib_out.rs`'s AS_CONFED-segment-stripping
+  gate, on top of the AS_CONFED_SEQUENCE origination/relay logic already
+  named above. Deliberately **not** bundled into PR 5 — sized as its own
+  initiative, on the order of the earlier RFC 9234 Role feature, not a
+  quick addition. PR 5 ships the ordinary-eBGP LOCAL_PREF fix now (100%
+  of today's deployments, since no confederation config exists yet to
+  even trigger the exception) and explicitly maintains this exact
+  asymmetry rather than worsening or silently fixing it.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
