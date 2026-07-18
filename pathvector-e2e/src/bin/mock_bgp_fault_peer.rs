@@ -38,6 +38,12 @@
 //!   required 4 — proving the security-relevant fix that a malformed OTC is
 //!   treated as withdraw rather than silently discarded (which would let a
 //!   route bypass OTC-based leak detection entirely).
+//! - `ebgp-local-pref` — unlike every other scenario above, this UPDATE is
+//!   not malformed at all: a real OPEN/KEEPALIVE handshake to Established,
+//!   then one well-formed UPDATE carrying an explicit LOCAL_PREF attribute
+//!   (RFC 4271 §5.1.5: LOCAL_PREF received from an external peer MUST be
+//!   ignored by the receiving speaker). Tests policy-violating-but-
+//!   well-formed input, not corrupted wire format.
 //!
 //! For the three header-error and two truncation scenarios, no valid frame
 //! exists to reuse from `pathvector_session`'s encoder by construction, so
@@ -104,6 +110,7 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "duplicate-mp-reach" => duplicate_mp_reach_update(stream).await,
         "attribute-flags-conflict" => attribute_flags_conflict_update(stream).await,
         "malformed-otc" => malformed_otc_update(stream).await,
+        "ebgp-local-pref" => ebgp_local_pref_update(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -772,6 +779,91 @@ async fn duplicate_mp_reach_update(stream: TcpStream) {
                     }
                     Some(Ok(_)) => {} // ignore KEEPALIVE/other, keep looping
                     _ => return, // EOF or codec error — connection closed
+                }
+            }
+        }
+    }
+}
+
+/// RFC 4271 §5.1.5: "If it is contained in an UPDATE message that is
+/// received from an external peer, then this attribute MUST be ignored by
+/// the receiving speaker." Unlike every other scenario in this file, the
+/// UPDATE here is entirely well-formed — this tests policy-violating input
+/// (an eBGP peer attaching LOCAL_PREF, which it's never entitled to
+/// influence), not corrupted wire format. Fully expressible through the
+/// normal type-safe encoder, so no raw-byte hand-rolling needed.
+async fn ebgp_local_pref_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    // Drain until pathvectord's own KEEPALIVE arrives, confirming it reached
+    // Established on its side before we send anything UPDATE-shaped.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // A bogus, deliberately extreme LOCAL_PREF — if it were honored, it
+    // would trivially win any best-path comparison against a route with the
+    // conventional default (100).
+    let update = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+            PathAttribute::LocalPref(u32::MAX),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(update)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE for {TEST_PREFIX} carrying LOCAL_PREF={}",
+        u32::MAX
+    );
+
+    // Hold the session open with periodic keepalives — this UPDATE is
+    // entirely well-formed, so the session must stay Established
+    // indefinitely regardless of how LOCAL_PREF ends up handled.
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
                 }
             }
         }

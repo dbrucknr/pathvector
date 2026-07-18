@@ -286,6 +286,46 @@ async fn malformed_otc_treated_as_withdraw_session_stays_up() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 4271 §5.1.5: "If it is contained in an UPDATE message that is
+/// received from an external peer, then this attribute MUST be ignored by
+/// the receiving speaker." Unlike every other scenario in this file, the
+/// UPDATE here is entirely well-formed — proves policy-violating-but-valid
+/// input is handled correctly, not just malformed bytes. Over a real BGP
+/// session with the real wire codec, not just hand-built `Route` structs in
+/// unit tests: an eBGP peer's bogus `u32::MAX` LOCAL_PREF must never surface
+/// in the installed route, and the session must stay Established throughout
+/// since nothing here is actually malformed.
+#[tokio::test]
+async fn ebgp_local_pref_is_ignored_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("ebgp-local-pref").await;
+    assert_control_peer_established(&mut h).await;
+
+    let route = wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+    assert_eq!(
+        route.local_pref, None,
+        "RFC 4271 §5.1.5: LOCAL_PREF received from an external peer MUST be \
+         ignored — the fault peer's u32::MAX LOCAL_PREF must not surface in \
+         the installed route"
+    );
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "nothing in this UPDATE is malformed — the fault peer's own session \
+         must stay Established"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
 /// RFC 7606 §3(g)/(h): unlike every other malformed-UPDATE scenario in this
 /// file, a duplicated MP_REACH_NLRI must NOT be treated as a withdraw — it
 /// is the one per-attribute error RFC 7606 escalates back to a full session
