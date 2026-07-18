@@ -952,7 +952,16 @@ pub(super) fn handle_update(
                 has_as_path = true;
             }
             PathAttribute::NextHop(ip) => next_hop = Some(NextHop::V4(*ip)),
-            PathAttribute::LocalPref(lp) => local_pref = Some(LocalPref::new(*lp)),
+            // RFC 4271 §5.1.5: "If it is contained in an UPDATE message
+            // that is received from an external peer, then this attribute
+            // MUST be ignored by the receiving speaker, except in the case
+            // of BGP Confederations [RFC3065]." The confederation exception
+            // isn't handled here — this daemon has no confederation-aware
+            // peer classification yet (see TODO.md item #22); every eBGP
+            // peer, confederation member or not, is treated uniformly.
+            PathAttribute::LocalPref(lp) if peer_type == PeerType::Internal => {
+                local_pref = Some(LocalPref::new(*lp));
+            }
             PathAttribute::Med(m) => med = Some(Med::new(*m)),
             PathAttribute::Communities(cs) => communities.clone_from(cs),
             PathAttribute::LargeCommunities(lcs) => large_communities.clone_from(lcs),
