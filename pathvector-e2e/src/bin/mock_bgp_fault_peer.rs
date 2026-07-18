@@ -58,6 +58,17 @@
 //! `Framed::into_inner`. `missing-origin` doesn't need any hand-rolling at
 //! all — simply omitting an attribute from `UpdateMessage.attributes` is
 //! fully expressible through the normal encoder.
+//!
+//! - `gr-duplicate-capabilities` — our own OPEN advertises two
+//!   `GracefulRestart` capabilities with different `restart_time` values
+//!   (RFC 4724 §3: the receiver MUST ignore all but the *last* instance).
+//!   Fully expressible via the normal encoder — no hand-rolling needed, a
+//!   `Vec<Capability>` naturally allows pushing the same variant twice.
+//! - `role-differing-duplicates` — our own OPEN advertises two *differing*
+//!   `Role` capabilities (RFC 9234 §4.2: MUST reject the connection with
+//!   Role Mismatch). This rejection is unconditional on our own Role
+//!   capabilities' consistency, independent of whatever Role (if any)
+//!   pathvectord is locally configured with for this peer.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -65,9 +76,10 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{
-    BgpMessage, Capability, MpReachNlri, OpenMessage, PathAttribute, Prefix, UpdateMessage,
+    BgpMessage, Capability, GracefulRestartFamily, MpReachNlri, NotificationError, OpenMessage,
+    OpenMsgError, PathAttribute, Prefix, UpdateMessage,
 };
-use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin};
+use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Origin, Role};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -111,6 +123,8 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "attribute-flags-conflict" => attribute_flags_conflict_update(stream).await,
         "malformed-otc" => malformed_otc_update(stream).await,
         "ebgp-local-pref" => ebgp_local_pref_update(stream).await,
+        "gr-duplicate-capabilities" => gr_duplicate_capabilities_open(stream).await,
+        "role-differing-duplicates" => role_differing_duplicates_open(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -865,6 +879,144 @@ async fn ebgp_local_pref_update(stream: TcpStream) {
                 if matches!(n, Ok(0) | Err(_)) {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// RFC 4724 §3: "A BGP speaker MUST NOT include more than one instance of
+/// the Graceful Restart Capability in the capability advertisement... If
+/// more than one instance... is carried..., the receiver of the
+/// advertisement MUST ignore all but the last instance of the Graceful
+/// Restart Capability." Fully expressible via the normal encoder — a
+/// `Vec<Capability>` naturally allows pushing the same variant twice, no
+/// hand-rolling needed.
+async fn gr_duplicate_capabilities_open(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let gr_cap = |restart_time: u16| Capability::GracefulRestart {
+        restart_flags: 0,
+        restart_time,
+        families: vec![GracefulRestartFamily {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            forwarding_preserved: true,
+        }],
+    };
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![gr_cap(90), gr_cap(300)],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+    println!("sent OPEN with two GracefulRestart capabilities (restart_time=90, then 300)");
+
+    // Drain until pathvectord's own KEEPALIVE arrives, confirming it reached
+    // Established despite the duplicate capability.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Hold the session open so the test can poll gRPC state
+    // (peer_gr_restart_time) without racing a session teardown.
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// RFC 9234 §4.2: "If multiple BGP Role Capabilities are received and not
+/// all of them have the same value, then the BGP speaker MUST reject the
+/// connection using the Role Mismatch Notification." Unlike every GR/UPDATE
+/// scenario in this file, the fault here is in the OPEN we send, and the
+/// expected outcome is that pathvectord rejects it before the session ever
+/// reaches Established — no preceding handshake to complete.
+async fn role_differing_duplicates_open(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![
+            Capability::Role(Role::Customer),
+            Capability::Role(Role::Peer),
+        ],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    println!("sent OPEN with two differing Role capabilities (Customer, Peer)");
+
+    // If pathvectord's fix is working, it rejects here with a NOTIFICATION
+    // before ever completing the handshake. If the fix is broken, it
+    // proceeds normally (its own KEEPALIVE arrives) — reply in kind so a
+    // broken fix genuinely reaches Established, rather than this mock
+    // silently stalling the handshake and producing "never reached
+    // Established" for the wrong reason regardless of whether the fix
+    // actually works.
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Notification(n))) => {
+                println!("received NOTIFICATION as expected: {n:?}");
+                assert_eq!(
+                    n.error,
+                    NotificationError::OpenMessage(OpenMsgError::RoleMismatch),
+                    "expected RoleMismatch, got a different NOTIFICATION"
+                );
+                return;
+            }
+            Some(Ok(BgpMessage::Keepalive)) => {
+                println!(
+                    "received KEEPALIVE instead of NOTIFICATION — completing the \
+                     handshake so a broken fix genuinely reaches Established"
+                );
+                if framed.send(BgpMessage::Keepalive).await.is_err() {
+                    return;
+                }
+            }
+            Some(Ok(other)) => {
+                println!("WARNING: unexpected message while waiting: {other:?}");
+            }
+            _ => {
+                println!("connection closed (EOF/codec error) without a NOTIFICATION");
+                return;
             }
         }
     }
