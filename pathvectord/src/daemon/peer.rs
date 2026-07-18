@@ -2,6 +2,51 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Extracts the peer's effective GracefulRestart capability from its
+/// advertised capability list.
+///
+/// RFC 4724 §3: "A BGP speaker MUST NOT include more than one instance of
+/// the Graceful Restart Capability in the capability advertisement... If
+/// more than one instance... is carried..., the receiver of the
+/// advertisement MUST ignore all but the last instance of the Graceful
+/// Restart Capability." This finds the *last* `GracefulRestart` instance in
+/// the list — regardless of its own `restart_time` value — before
+/// interpreting it, so a last instance with `restart_time == 0` correctly
+/// overrides an earlier non-zero one (not just "the first non-zero value in
+/// the list", which would silently defer to an out-of-date earlier instance
+/// in that case).
+///
+/// `restart_time == 0` means the peer supports Receiving Speaker procedures
+/// (EOR timing) but not forwarding-state preservation — returns `None` for
+/// the time/families/N-bit in that case, matching the existing
+/// EOR-only-not-GR-capable interpretation.
+///
+/// RFC 8538 §2's N-bit (0x04 in `restart_flags`) is extracted from the same
+/// authoritative instance.
+pub(super) fn extract_gr_capability(
+    caps: &[Capability],
+) -> (Option<u16>, Vec<GracefulRestartFamily>, bool) {
+    let last = caps.iter().rev().find_map(|c| {
+        if let Capability::GracefulRestart {
+            restart_flags,
+            restart_time,
+            families,
+        } = c
+        {
+            Some((*restart_flags, *restart_time, families))
+        } else {
+            None
+        }
+    });
+    match last {
+        Some((restart_flags, restart_time, families)) if restart_time > 0 => {
+            let n_bit = restart_flags & 0x04 != 0;
+            (Some(restart_time), families.clone(), n_bit)
+        }
+        _ => (None, vec![], false),
+    }
+}
+
 impl DaemonState {
     pub(crate) fn add_peer(
         &mut self,
@@ -370,36 +415,14 @@ impl DaemonState {
             self.route_refresh_peers.remove(&peer_ip);
         }
 
-        // RFC 4724: record whether the peer advertised GracefulRestart with a
-        // non-zero restart_time. A zero restart_time means the peer does not
-        // participate in the GR restart window (capability present for EOR only).
-        // RFC 8538 §2: also extract the N-bit (0x04 in restart_flags) — when
-        // set, the peer supports notification mode (non-HardReset NOTIFICATIONs
-        // preserve the GR window rather than triggering an immediate flush).
-        let (peer_gr_time, peer_gr_families, peer_has_n_bit): (
-            Option<u16>,
-            Vec<GracefulRestartFamily>,
-            bool,
-        ) = peer_capabilities
-            .iter()
-            .find_map(|c| {
-                if let Capability::GracefulRestart {
-                    restart_flags,
-                    restart_time,
-                    families,
-                } = c
-                {
-                    if *restart_time > 0 {
-                        let n_bit = restart_flags & 0x04 != 0;
-                        Some((*restart_time, families.clone(), n_bit))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .map_or((None, vec![], false), |(t, f, n)| (Some(t), f, n));
+        // RFC 4724 §3: record whether the peer advertised GracefulRestart with
+        // a non-zero restart_time (see `extract_gr_capability`'s doc comment
+        // for the "last instance wins" rule this applies). A zero restart_time
+        // means the peer does not participate in the GR restart window
+        // (capability present for EOR only). RFC 8538 §2's N-bit (0x04 in
+        // restart_flags) is extracted from the same authoritative instance.
+        let (peer_gr_time, peer_gr_families, peer_has_n_bit) =
+            extract_gr_capability(peer_capabilities);
         let mut stalled = !flush_updates(
             peer_ip,
             decisions,

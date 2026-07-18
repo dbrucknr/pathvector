@@ -802,10 +802,30 @@ impl Fsm {
             Capability::Role(r) => Some(*r),
             _ => None,
         });
-        let peer_role = peer.capabilities.iter().find_map(|c| match c {
+        // RFC 9234 §4.2: "If an eBGP speaker receives multiple but identical
+        // BGP Role Capabilities with the same value in each, then the
+        // speaker considers them to be a single BGP Role Capability and
+        // proceeds [RFC5492]. If multiple BGP Role Capabilities are received
+        // and not all of them have the same value, then the BGP speaker MUST
+        // reject the connection using the Role Mismatch Notification." This
+        // check is independent of local_role's compatibility with any one of
+        // the peer's values — a differing pair is itself grounds for
+        // rejection, before the Provider/Customer-style compatibility check
+        // below ever runs.
+        let mut peer_roles = peer.capabilities.iter().filter_map(|c| match c {
             Capability::Role(r) => Some(*r),
             _ => None,
         });
+        let peer_role = match peer_roles.next() {
+            None => None,
+            Some(first) if peer_roles.all(|r| r == first) => Some(first),
+            Some(_) => {
+                return Err((
+                    NotificationError::OpenMessage(OpenMsgError::RoleMismatch),
+                    vec![],
+                ));
+            }
+        };
         if let (Some(local), Some(peer_role)) = (local_role, peer_role)
             && !local.is_compatible_with(peer_role)
         {
@@ -2284,6 +2304,78 @@ mod tests {
         });
         fsm.process(FsmInput::MessageReceived(peer_open));
         assert_eq!(fsm.state(), State::OpenConfirm);
+    }
+
+    /// Like `negotiate_role`, but the peer advertises multiple `Capability::Role`
+    /// instances (in the given order) instead of at most one.
+    fn negotiate_role_multi(
+        local_role: pathvector_types::Role,
+        peer_roles: &[pathvector_types::Role],
+    ) -> (State, Vec<FsmOutput>) {
+        let mut capabilities = vec![Capability::FourByteAsn(65001)];
+        capabilities.push(Capability::Role(local_role));
+        let config = FsmConfig {
+            capabilities,
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        let mut peer_capabilities = vec![Capability::FourByteAsn(65002)];
+        for &role in peer_roles {
+            peer_capabilities.push(Capability::Role(role));
+        }
+        let peer_open = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: peer_capabilities,
+        });
+        let out = fsm.process(FsmInput::MessageReceived(peer_open));
+        (fsm.state(), out)
+    }
+
+    /// RFC 9234 §4.2: "If an eBGP speaker receives multiple but identical BGP
+    /// Role Capabilities with the same value in each, then the speaker
+    /// considers them to be a single BGP Role Capability and proceeds."
+    #[test]
+    fn test_role_identical_duplicates_are_not_a_mismatch() {
+        use pathvector_types::Role::{Customer, Provider};
+
+        let (state, _) = negotiate_role_multi(Provider, &[Customer, Customer]);
+        assert_eq!(
+            state,
+            State::OpenConfirm,
+            "identical duplicate Role capabilities must collapse to one and proceed"
+        );
+    }
+
+    /// RFC 9234 §4.2: "If multiple BGP Role Capabilities are received and not
+    /// all of them have the same value, then the BGP speaker MUST reject the
+    /// connection using the Role Mismatch Notification." This must hold even
+    /// when the *first* advertised value alone would have been compatible —
+    /// a first-instance-wins implementation would proceed to `OpenConfirm`
+    /// here, never noticing the peer also sent a conflicting second value.
+    #[test]
+    fn test_role_differing_duplicates_are_a_mismatch_even_if_first_is_compatible() {
+        use pathvector_types::Role::{Customer, Peer, Provider};
+
+        // Customer is compatible with our Provider; Peer is not. A
+        // first-wins bug would see only Customer and proceed.
+        let (state, out) = negotiate_role_multi(Provider, &[Customer, Peer]);
+        assert_eq!(
+            state,
+            State::Idle,
+            "differing Role capability values must be rejected regardless of \
+             whether the first one alone would have been compatible"
+        );
+        let n = find_notification(&out).expect("expected RoleMismatch NOTIFICATION");
+        assert_eq!(
+            n.error,
+            NotificationError::OpenMessage(OpenMsgError::RoleMismatch)
+        );
     }
 
     // ── RFC 4271 §6.8 collision detection ─────────────────────────────────────
