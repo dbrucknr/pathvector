@@ -248,7 +248,7 @@ async fn attribute_flags_conflict_treated_as_withdraw_session_stays_up() {
 
 /// RFC 9234 §5: "The OTC Attribute is considered malformed if the length
 /// value is not 4. An UPDATE message with a malformed OTC Attribute SHALL be
-/// handled using the approach of 'treat-as-withdraw' [RFC7606]." Security-
+/// handled using the approach of 'treat-as-withdraw' \[RFC7606\]." Security-
 /// relevant: proves a malformed OTC causes the *route* to be withdrawn
 /// rather than the attribute being silently discarded and the route
 /// accepted as if OTC had never been present — which would let a route

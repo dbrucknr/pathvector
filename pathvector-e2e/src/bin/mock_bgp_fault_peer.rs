@@ -423,7 +423,7 @@ fn attribute_flags_conflict_frame() -> Vec<u8> {
 
 /// RFC 9234 §5: "The OTC Attribute is considered malformed if the length
 /// value is not 4. An UPDATE message with a malformed OTC Attribute SHALL be
-/// handled using the approach of 'treat-as-withdraw' [RFC7606]." Security-
+/// handled using the approach of 'treat-as-withdraw' \[RFC7606\]." Security-
 /// relevant: OTC is RFC 9234's entire route-leak-detection mechanism, so a
 /// malformed OTC being silently discarded (rather than withdrawing the
 /// route) would let a route bypass leak detection instead of being dropped.
