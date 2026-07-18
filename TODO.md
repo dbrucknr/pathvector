@@ -1641,3 +1641,24 @@ applies here. A `bench/` crate (or a standalone binary) could:
   detection and recovery under sustained route churn, not just a single crafted
   test case. Candidate scenario: ExaBGP replaying a partial MRT dump at high
   rate while a second peer's UPDATE channel is artificially constrained.
+- **Audit `pathvector-e2e`'s mock binaries for unobserved-assertion false
+  passes** — during PR 6 (`fix/rfc4724-rfc9234-capability-duplicates`,
+  merged 2026-07-18), `role_differing_duplicates_are_rejected` was found
+  (first by self-review, then a second, deeper instance by a Codex PR
+  review) to have a false-pass shape: an assertion checking the *specific*
+  outcome (which NOTIFICATION a mock peer actually received) lived inside a
+  spawned per-connection task in a separate Docker container, invisible to
+  the test process. A panic, EOF, or wrong message there left the test
+  asserting only a weaker proxy condition (session not Established) that's
+  true for unrelated reasons too — so a broken production fix and a broken
+  mock could both produce the same "passing" result. Fixed there via a new
+  `wait_for_docker_log()` harness helper plus explicit greppable stdout
+  markers the test polls for directly (see `pathvector-e2e/src/lib.rs` and
+  `mock_bgp_fault_peer.rs`'s `role_differing_duplicates_open`). That one
+  instance is fixed and real-teeth verified, but the rest of the suite
+  hasn't been systematically checked for the same pattern — `mock_bgp_peer.rs`,
+  `mock_bgp_collision_peer.rs`, `mock_rtr_server.rs`, and the rest of
+  `mock_bgp_fault_peer.rs`'s other scenarios all deserve a pass asking: does
+  every test-critical assertion actually happen somewhere the test process
+  observes, or could the mock silently swallow the one signal the test
+  depends on?
