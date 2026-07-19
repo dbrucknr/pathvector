@@ -31,6 +31,13 @@ use crate::{
 /// for falling back from v1 to v0.
 const ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION: u16 = 4;
 
+/// RFC 8210 §12 error code for "No Data Available" — the *only* error code
+/// explicitly not marked "(fatal)". The cache is healthy but has nothing to
+/// answer with yet (commonly: still pulling its initial data set after a
+/// reboot). Unlike every other error code, this MUST NOT cause the session
+/// to be dropped — see `sync_once`'s dedicated match arm.
+const ERROR_CODE_NO_DATA_AVAILABLE: u16 = 2;
+
 /// Upper bound on a single PDU's declared length. The largest legitimate
 /// PDU in practice is an `ErrorReport` carrying a copy of the offending PDU
 /// plus UTF-8 text, or a `RouterKey` carrying an SPKI — neither approaches
@@ -50,6 +57,10 @@ pub struct RtrConfig {
     /// v1 session is established.
     pub refresh_interval: Duration,
     /// How long to wait after a connection failure before reconnecting.
+    /// Also reused as the pause before retrying a query on the *same*
+    /// connection after an RFC 8210 §12 Error Code 2 ("No Data Available")
+    /// response — the one non-fatal error code, where a fresh connection
+    /// isn't warranted.
     pub retry_interval: Duration,
     /// How long cached data may go unrefreshed before it's considered stale.
     /// Not enforced automatically in this phase — see [`RtrStatus::is_stale`].
@@ -343,7 +354,14 @@ async fn run_one_connection(
     let mut refresh = config.refresh_interval;
 
     loop {
-        let new_session_id = sync_once(stream, shared, negotiated_version, *session_id).await?;
+        let new_session_id = sync_once(
+            stream,
+            shared,
+            negotiated_version,
+            *session_id,
+            config.retry_interval,
+        )
+        .await?;
         *session_id = Some(new_session_id);
 
         match apply_diff_stream(stream, shared, new_session_id).await? {
@@ -398,6 +416,7 @@ async fn sync_once(
     shared: &Arc<Shared>,
     negotiated_version: &mut RtrVersion,
     known_session_id: Option<u16>,
+    retry_interval: Duration,
 ) -> Result<u16, RtrError> {
     let mut attempted_fallback = false;
     loop {
@@ -449,6 +468,21 @@ async fn sync_once(
                 // interchangeable — force a full resync under the new version.
                 shared.table.clear();
                 attempted_fallback = true;
+            }
+            // RFC 8210 §12: Error Code 2 ("No Data Available") is the only
+            // error code not marked "(fatal)" — the cache is healthy but has
+            // nothing to answer with yet (typically: still pulling its
+            // initial data set after a reboot). Unlike every other error
+            // code, this MUST NOT tear down the session; retry the same
+            // query after a pause, on this connection.
+            Pdu::ErrorReport {
+                error_code, text, ..
+            } if error_code == ERROR_CODE_NO_DATA_AVAILABLE => {
+                warn!(
+                    text = %text,
+                    "RTR cache reports no data available yet; retrying on same connection"
+                );
+                tokio::time::sleep(retry_interval).await;
             }
             Pdu::ErrorReport {
                 error_code, text, ..
@@ -1021,6 +1055,82 @@ mod tests {
 
         assert_eq!(handle.status().version, Some(RtrVersion::V0));
         assert_eq!(handle.status().serial, Some(9));
+    }
+
+    /// RFC 8210 §12: Error Code 2 ("No Data Available") is explicitly the
+    /// *only* non-fatal error code — all 8 others are marked "(fatal)" and
+    /// MUST cause the session to be dropped, but code 2 means "the cache is
+    /// healthy but has no data yet" (e.g. still pulling its initial data set
+    /// after a reboot) and should be retried, not treated as a session-ending
+    /// failure. Proves this by having the mock server send two Reset Queries'
+    /// worth of round trips *on the same TCP connection* — if the client
+    /// disconnected on the `ErrorReport` (the pre-fix behavior), the second
+    /// `read_one` below would never observe a second query on this stream at
+    /// all (the client would instead open a *new* TCP connection, which this
+    /// mock server, listening once via `TcpListener::accept` inside
+    /// `spawn_mock_server`, never accepts).
+    #[tokio::test]
+    async fn error_code_2_no_data_available_retries_on_same_connection() {
+        let (mut config, _server) = spawn_mock_server(|mut stream| async move {
+            let first = read_one(&mut stream).await;
+            assert_eq!(first, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::ErrorReport {
+                    error_code: ERROR_CODE_NO_DATA_AVAILABLE,
+                    pdu_copy: vec![],
+                    text: "cache still loading initial data set".to_string(),
+                },
+            )
+            .await;
+
+            // Same connection, retried Reset Query — no reconnect in between.
+            let second = read_one(&mut stream).await;
+            assert_eq!(second, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 7 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 7,
+                    serial: 5,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+        // Keep the test fast — the fix reuses `retry_interval` as the pause
+        // before resending the query.
+        config.retry_interval = Duration::from_millis(20);
+
+        let (handle, _join) = RtrClient::spawn(config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "client did not recover and complete sync within 5s — did it \
+             disconnect on the non-fatal ErrorReport instead of retrying?",
+        );
+
+        assert_eq!(handle.status().serial, Some(5));
     }
 
     /// RFC 8210 §5 documents a v0-only cache as potentially replying
