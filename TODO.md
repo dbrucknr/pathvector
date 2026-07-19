@@ -899,15 +899,17 @@ audit:
   low severity, but doesn't honor the RFC's specific intent. See
   `RFC_AUDIT.md`'s RFC 8210 section.
 
-  **Fixed 2026-07-19** (`fix/rfc8210-error-code-2-no-data-available`).
-  Added a dedicated match arm for `error_code == 2` in `sync_once`,
-  reusing the same in-loop retry shape already used for the v1→v0
-  fallback case: log a warning, sleep `config.retry_interval` (threaded
-  into `sync_once` as a new parameter — reused, not new config surface),
-  then loop back and resend the same query (Reset or Serial, whichever
-  the loop head computes) on the *same* connection. Every other error
-  code still returns `Err` and tears down the session, per the RFC's
-  explicit "(fatal)" marking on those 8 codes.
+  **Fixed 2026-07-19** (`fix/rfc8210-error-code-2-no-data-available`;
+  see the "Corrected 2026-07-19" entry below for the final, accurate
+  behavior — the query-recomputation bug described in this paragraph's
+  original wording was caught by Codex review before merge). Added a
+  dedicated match arm for `error_code == 2` in `sync_once`, reusing the
+  same in-loop retry shape already used for the v1→v0 fallback case:
+  log a warning, sleep `config.retry_interval` (threaded into
+  `sync_once` as a new parameter — reused, not new config surface),
+  then retry on the *same* connection. Every other error code still
+  returns `Err` and tears down the session, per the RFC's explicit
+  "(fatal)" marking on those 8 codes.
 
   Test-first: wrote
   `error_code_2_no_data_available_retries_on_same_connection`, mirroring
@@ -940,15 +942,12 @@ audit:
   catch this: with no saved state, its query was already a
   `ResetQuery`, so the bug was invisible.
 
-  Fixed by clearing `shared.table` in the code-2 arm (mirrors the
-  existing v1→v0 fallback arm exactly), which forces the next loop
-  iteration's query to be a genuine `ResetQuery` regardless of prior
-  session state — and, per Codex's note, this is also *required* for
-  correctness of the eventual full reload: `apply_diff_stream` has no
-  way to know which records the *previous* sync contributed, so nothing
-  else in this codebase reconciles a stale entry that's absent from the
-  new full data set; clearing before the reset request is the same
-  precondition the v1→v0 fallback already relies on.
+  Fixed by setting a local `force_reset` flag in the code-2 arm, which
+  forces the next loop iteration's query to be a genuine `ResetQuery`
+  regardless of prior session state — the table clear itself is
+  *deferred* until the `CacheResponse` for that forced query arrives
+  (see the second "Corrected" entry immediately below for why an
+  earlier version of this fix cleared eagerly, and why that was wrong).
 
   Also addressed Codex's two other points: (1) **Status** — the code-2
   arm now sets `RtrStatus::last_error` (was previously silent, logging
@@ -983,6 +982,42 @@ audit:
   small to keep the test fast — using the previous default of 600
   caused the test to time out against the corrected code, which was the
   first signal the retry-cadence fix was actually wired in).
+
+  **Corrected again 2026-07-19 (second Codex review pass on PR #38):**
+  the "clear `shared.table` in the code-2 arm" fix above was itself
+  wrong, for a reason this project's own design already warns about —
+  `RtrStatus::is_stale`'s doc comment states "stale-but-recent ROA data
+  is preferable to no data." Clearing the table the instant Error Code
+  2 arrives discards the last successfully validated data for the
+  *entire* retry window, which §12 itself frames as potentially long
+  ("until it gets a new usable load") — an unforced, self-inflicted
+  no-data outage for a condition the RFC explicitly designed *not* to
+  require tearing anything down.
+  
+  Fixed by replacing the eager `shared.table.clear()` with a `force_reset:
+  bool` local that only changes which query is sent; the actual clear
+  moved to the `CacheResponse` arm, gated on `force_reset`, so it fires
+  only once the cache has accepted the forced Reset Query and the
+  replacement full load is genuinely about to arrive — the same
+  proximity-to-the-data `clear()` already keeps for the v1→v0 fallback
+  arm's own single-round-trip case, just applied to a retry window that
+  can legitimately last much longer.
+  
+  Extended `error_code_2_after_serial_query_forces_reset_query` to
+  prove both properties: the initial `ResetQuery` response now carries
+  one ROA that the replacement load deliberately omits; the test polls
+  `validate_v4` for that ROA to be `Valid` *between* the Error Code 2
+  response and the forced Reset Query's `CacheResponse` (proving it
+  wasn't cleared early), then asserts it's `NotFound` once the
+  replacement load — which never mentions it — completes (proving it
+  doesn't leak forward either). Real-teeth verified twice: reverted to
+  eager-clear-on-error-receipt and confirmed the "still valid" poll
+  timed out with a clear diagnostic; separately reverted `force_reset =
+  true` alone (deferred clear left in place) and confirmed the
+  Reset-vs-Serial-Query assertion failed again with the same
+  `left: SerialQuery, right: ResetQuery` signature as the first
+  correction — each property fails independently when its own piece of
+  the fix is missing, then both pass together once fully restored.
 - **Route Origin ASN derivation doesn't apply RFC 6811's substitution
   rule for AS_PATHs ending in a confederation segment (new finding, not
   previously suspected).** RFC 6811 §2 defines a specific three-way rule
