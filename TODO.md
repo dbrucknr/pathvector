@@ -465,6 +465,53 @@ here):
   real, demonstrable divergence from RFC 4271's literal algorithm when a
   route's BGP-Identifier ordering and peer-IP ordering disagree. See
   `RFC_AUDIT.md` §9.1.2 for the full worked example.
+
+  **Fixed 2026-07-18** (`fix/rfc4271-bestpath-tiebreak-f-g`). Added
+  `Route::peer_bgp_id: Option<Ipv4Addr>` (set via
+  `RouteBuilder::peer_bgp_id`), populated at ingest time in
+  `pathvectord/src/daemon/route.rs`'s `handle_update` from the daemon's
+  existing `rib.peer_bgp_ids` map (already maintained per-peer at
+  `on_established`/termination for ORIGINATOR_ID fallback — this fix reuses
+  that data rather than introducing new state). `best_path.rs`'s comparator
+  now has a real step (f) — comparing `peer_bgp_id` when both sides have a
+  known value — inserted before the renamed step (g) (peer IP,
+  unconditional final tie-breaker). When either side's `peer_bgp_id` is
+  `None` (e.g. locally originated routes), step (f) is skipped and (g)
+  decides, preserving the pre-fix behavior for that case. Along the way,
+  found and corrected a **mislabeled row** in `pathvector-rib/RFC.md`: its
+  "Step 10" row claimed "Prefer route from peer with lowest router-id (BGP
+  Identifier)" was ✅ implemented and tested, citing
+  `test_select_best_tiebreak_lower_peer_ip` — but that test and the code it
+  covers were proving the peer-*IP* comparison, not BGP Identifier at all.
+  Split into two accurate rows (Step 10 for (f), Step 11 for (g)).
+
+  Real-teeth verified at two levels: (1) `best_path.rs` — wrote
+  `test_select_best_bgp_identifier_overrides_peer_ip_tiebreak` and
+  `prop_select_best_lower_bgp_identifier_wins_on_full_tie` first, confirmed
+  both failed against the pre-fix comparator (picked the peer-IP winner,
+  not the BGP-Identifier winner), then implemented step (f) and confirmed
+  both pass; also added `test_select_best_falls_back_to_peer_ip_when_*`
+  (unknown on both/one side) to prove the skip-to-(g) fallback wasn't
+  broken. (2) `pathvectord` — added
+  `test_route_carries_peer_bgp_id_from_established_session`, which failed
+  with `left: None, right: Some(9.9.9.9)` when the new
+  `.peer_bgp_id(id)` builder call was temporarily removed from
+  `handle_update`, then passed once restored — proving the daemon-level
+  wiring (not just the isolated comparator, which could pass on
+  `RouteBuilder`-constructed test fixtures even if this wiring were
+  missing entirely) is real.
+
+  **Scope decision, not yet closed:** no Docker/e2e proof was added for
+  this PR. Constructing one requires two real BGP speakers tied through
+  every prior decision step (LOCAL_PREF, AS_PATH length, ORIGIN, MED, IGP
+  metric, route age) with *deliberately disagreeing* BGP-Identifier vs.
+  session-IP ordering — a narrow, deep edge case with no import/export
+  policy interaction. Judged disproportionate given the daemon-level
+  integration test above already proves the OPEN-derived BGP Identifier
+  reaches a real `Route` through genuine daemon state (the main class of
+  risk e2e proofs exist to catch), leaving the comparator's own internal
+  logic — already unit+proptest covered in isolation — as the only
+  remaining surface. Revisit if a future confidence review disagrees.
 - **(Documentation correction, not necessarily a code bug)** `pathvectord/RFC.md`
   claimed withdrawals bypass MRAI per an "RFC 4271 §9.2.1.1 explicit
   exemption" — there is no such exemption in the actual RFC text, which
