@@ -1005,19 +1005,40 @@ audit:
   
   Extended `error_code_2_after_serial_query_forces_reset_query` to
   prove both properties: the initial `ResetQuery` response now carries
-  one ROA that the replacement load deliberately omits; the test polls
-  `validate_v4` for that ROA to be `Valid` *between* the Error Code 2
-  response and the forced Reset Query's `CacheResponse` (proving it
-  wasn't cleared early), then asserts it's `NotFound` once the
-  replacement load — which never mentions it — completes (proving it
-  doesn't leak forward either). Real-teeth verified twice: reverted to
-  eager-clear-on-error-receipt and confirmed the "still valid" poll
-  timed out with a clear diagnostic; separately reverted `force_reset =
-  true` alone (deferred clear left in place) and confirmed the
-  Reset-vs-Serial-Query assertion failed again with the same
-  `left: SerialQuery, right: ResetQuery` signature as the first
-  correction — each property fails independently when its own piece of
-  the fix is missing, then both pass together once fully restored.
+  one ROA that the replacement load deliberately omits, and the test
+  asserts it's `NotFound` once the replacement load — which never
+  mentions it — completes (proving it doesn't leak forward). Real-teeth
+  verified twice: reverted to eager-clear-on-error-receipt and
+  confirmed a failure; separately reverted `force_reset = true` alone
+  (deferred clear left in place) and confirmed the Reset-vs-Serial-Query
+  assertion failed again with the same `left: SerialQuery, right:
+  ResetQuery` signature as the first correction — each property fails
+  independently when its own piece of the fix is missing, then both
+  pass together once fully restored. (The "still valid during the
+  retry window" half of this test was itself buggy at this point — see
+  the next correction below.)
+
+  **Corrected a third time 2026-07-19 (fourth Codex review pass on PR
+  #38):** the "old ROA is still `Valid`" check above used a bare
+  poll-until-true loop starting from test spawn — it could (and did)
+  pass trivially off the *initial* sync's own data, before Error Code 2
+  was even sent, proving nothing about the retry window specifically.
+  There was no synchronization point tying the assertion to a moment
+  that's actually inside the retry window.
+
+  Fixed with a `oneshot` handshake between the test and the mock: the
+  mock signals immediately after observing the forced `ResetQuery` (the
+  earliest point that's unambiguously *after* the Error Code 2 exchange)
+  and then blocks on a second `oneshot` before sending the replacement
+  `CacheResponse`. The test awaits the first signal, asserts the old
+  ROA is still `Valid` at that exact instant, then releases the mock to
+  proceed. Real-teeth verified: temporarily moved `shared.table.clear()`
+  back to fire eagerly (right where `force_reset = true` is set) and
+  confirmed this properly-synchronized version now fails with
+  `left: NotFound, right: Valid` — the version of the test that shipped
+  in the previous correction would *not* have caught this, since its
+  poll could still succeed from the initial sync's data regardless of
+  when the eager clear ran.
 - **Route Origin ASN derivation doesn't apply RFC 6811's substitution
   rule for AS_PATHs ending in a confederation segment (new finding, not
   previously suspected).** RFC 6811 §2 defines a specific three-way rule
