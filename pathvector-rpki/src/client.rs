@@ -31,6 +31,13 @@ use crate::{
 /// for falling back from v1 to v0.
 const ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION: u16 = 4;
 
+/// RFC 8210 §12 error code for "No Data Available" — the *only* error code
+/// explicitly not marked "(fatal)". The cache is healthy but has nothing to
+/// answer with yet (commonly: still pulling its initial data set after a
+/// reboot). Unlike every other error code, this MUST NOT cause the session
+/// to be dropped — see `sync_once`'s dedicated match arm.
+const ERROR_CODE_NO_DATA_AVAILABLE: u16 = 2;
+
 /// Upper bound on a single PDU's declared length. The largest legitimate
 /// PDU in practice is an `ErrorReport` carrying a copy of the offending PDU
 /// plus UTF-8 text, or a `RouterKey` carrying an SPKI — neither approaches
@@ -50,6 +57,10 @@ pub struct RtrConfig {
     /// v1 session is established.
     pub refresh_interval: Duration,
     /// How long to wait after a connection failure before reconnecting.
+    /// Also reused as the pause before retrying a query on the *same*
+    /// connection after an RFC 8210 §12 Error Code 2 ("No Data Available")
+    /// response — the one non-fatal error code, where a fresh connection
+    /// isn't warranted.
     pub retry_interval: Duration,
     /// How long cached data may go unrefreshed before it's considered stale.
     /// Not enforced automatically in this phase — see [`RtrStatus::is_stale`].
@@ -341,9 +352,17 @@ async fn run_one_connection(
     session_id: &mut Option<u16>,
 ) -> Result<(), RtrError> {
     let mut refresh = config.refresh_interval;
+    // RFC 8210 §6: "The router SHOULD NOT retry sooner than [the cache's
+    // advertised Retry Interval]." Starts at `config.retry_interval` (used
+    // for the very first sync, before any cache has told us otherwise) and
+    // is updated below once a v1 session actually supplies one. `expire` is
+    // read directly from `RtrConfig`/`RtrStatus::is_stale` by callers that
+    // need it; nothing here needs to hold onto it beyond this point.
+    let mut retry = config.retry_interval;
 
     loop {
-        let new_session_id = sync_once(stream, shared, negotiated_version, *session_id).await?;
+        let new_session_id =
+            sync_once(stream, shared, negotiated_version, *session_id, retry).await?;
         *session_id = Some(new_session_id);
 
         match apply_diff_stream(stream, shared, new_session_id).await? {
@@ -351,9 +370,7 @@ async fn run_one_connection(
             DiffOutcome::Complete(intervals) => {
                 if let Some(iv) = intervals {
                     refresh = Duration::from_secs(u64::from(iv.refresh));
-                    // `retry`/`expire` are read directly from RtrStatus by
-                    // callers that need them (e.g. is_stale); nothing here
-                    // needs to hold onto them beyond this point.
+                    retry = Duration::from_secs(u64::from(iv.retry));
                 }
 
                 {
@@ -398,15 +415,26 @@ async fn sync_once(
     shared: &Arc<Shared>,
     negotiated_version: &mut RtrVersion,
     known_session_id: Option<u16>,
+    retry_interval: Duration,
 ) -> Result<u16, RtrError> {
     let mut attempted_fallback = false;
+    // RFC 8210 §8.4: set by the Error Code 2 arm below to force the *next*
+    // query to be a `ResetQuery` regardless of remembered serial/session
+    // state. Deliberately does not clear `shared.table` itself — see that
+    // arm's comment for why the clear is deferred to the `CacheResponse` arm
+    // instead of happening here.
+    let mut force_reset = false;
     loop {
-        let query = match (shared.table.serial(), known_session_id) {
-            (Some(serial), Some(sid)) => Pdu::SerialQuery {
-                session_id: sid,
-                serial,
-            },
-            _ => Pdu::ResetQuery,
+        let query = if force_reset {
+            Pdu::ResetQuery
+        } else {
+            match (shared.table.serial(), known_session_id) {
+                (Some(serial), Some(sid)) => Pdu::SerialQuery {
+                    session_id: sid,
+                    serial,
+                },
+                _ => Pdu::ResetQuery,
+            }
         };
         write_pdu(stream, *negotiated_version, &query).await?;
 
@@ -431,6 +459,20 @@ async fn sync_once(
                     );
                     *negotiated_version = observed_version;
                 }
+                if force_reset {
+                    // The cache just accepted our forced Reset Query and is
+                    // about to send the replacement full load — safe to drop
+                    // the stale table now, right before `apply_diff_stream`
+                    // applies the new one. Clearing any earlier (e.g. as
+                    // soon as Error Code 2 arrived) would discard the last
+                    // successfully validated data for the entire, possibly
+                    // long, retry window — exactly the condition RFC 8210
+                    // §12 describes as transient, and exactly what this
+                    // crate's own stale-but-recent-is-better-than-no-data
+                    // design (see `RtrStatus::is_stale`'s doc comment)
+                    // exists to avoid.
+                    shared.table.clear();
+                }
                 return Ok(session_id);
             }
             // The explicit-rejection path. Deliberately not gated on the
@@ -449,6 +491,37 @@ async fn sync_once(
                 // interchangeable — force a full resync under the new version.
                 shared.table.clear();
                 attempted_fallback = true;
+            }
+            // RFC 8210 §12/§8.4: Error Code 2 ("No Data Available") is the
+            // only error code not marked "(fatal)" — the cache is healthy
+            // but has nothing to answer with yet (typically: still pulling
+            // its initial data set after a reboot). This MUST NOT tear down
+            // the session, but §8.4 is explicit about *what* to retry with:
+            // "If no other caches are available, the router MUST issue
+            // periodic Reset Queries until it gets a new usable load" — not
+            // a repeat of whatever query just failed. If this arrived in
+            // response to a Serial Query, blindly looping would resend
+            // another Serial Query, not a Reset Query. Setting `force_reset`
+            // makes the next loop iteration's query a `ResetQuery` (mirrors
+            // the v1→v0 fallback arm above), without discarding the current
+            // table — see the `CacheResponse` arm for where that clear
+            // actually happens, and why it's deferred this far.
+            Pdu::ErrorReport {
+                error_code, text, ..
+            } if error_code == ERROR_CODE_NO_DATA_AVAILABLE => {
+                warn!(
+                    text = %text,
+                    "RTR cache reports no data available yet; forcing a Reset \
+                     Query retry on the same connection"
+                );
+                {
+                    // Transport is still live — only the last sync attempt
+                    // failed — so `connected` is deliberately left as-is.
+                    let mut status = shared.status.write().unwrap();
+                    status.last_error = Some(text);
+                }
+                force_reset = true;
+                tokio::time::sleep(retry_interval).await;
             }
             Pdu::ErrorReport {
                 error_code, text, ..
@@ -1021,6 +1094,295 @@ mod tests {
 
         assert_eq!(handle.status().version, Some(RtrVersion::V0));
         assert_eq!(handle.status().serial, Some(9));
+    }
+
+    /// RFC 8210 §12: Error Code 2 ("No Data Available") is explicitly the
+    /// *only* non-fatal error code — all 8 others are marked "(fatal)" and
+    /// MUST cause the session to be dropped, but code 2 means "the cache is
+    /// healthy but has no data yet" (e.g. still pulling its initial data set
+    /// after a reboot) and should be retried, not treated as a session-ending
+    /// failure. Proves this by having the mock server send two Reset Queries'
+    /// worth of round trips *on the same TCP connection* — if the client
+    /// disconnected on the `ErrorReport` (the pre-fix behavior), the second
+    /// `read_one` below would never observe a second query on this stream at
+    /// all (the client would instead open a *new* TCP connection, which this
+    /// mock server, listening once via `TcpListener::accept` inside
+    /// `spawn_mock_server`, never accepts).
+    #[tokio::test]
+    async fn error_code_2_no_data_available_retries_on_same_connection() {
+        let (mut config, _server) = spawn_mock_server(|mut stream| async move {
+            let first = read_one(&mut stream).await;
+            assert_eq!(first, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::ErrorReport {
+                    error_code: ERROR_CODE_NO_DATA_AVAILABLE,
+                    pdu_copy: vec![],
+                    text: "cache still loading initial data set".to_string(),
+                },
+            )
+            .await;
+
+            // Same connection, retried Reset Query — no reconnect in between.
+            let second = read_one(&mut stream).await;
+            assert_eq!(second, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 7 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 7,
+                    serial: 5,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+        // Keep the test fast — the fix reuses `retry_interval` as the pause
+        // before resending the query.
+        config.retry_interval = Duration::from_millis(20);
+
+        let (handle, _join) = RtrClient::spawn(config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "client did not recover and complete sync within 5s — did it \
+             disconnect on the non-fatal ErrorReport instead of retrying?",
+        );
+
+        assert_eq!(handle.status().serial, Some(5));
+    }
+
+    /// RFC 8210 §8.4: "If no other caches are available, the router MUST
+    /// issue periodic Reset Queries until it gets a new usable load" — not a
+    /// repeat of whatever query just failed. `sync_once` recomputes its next
+    /// query from the remembered serial/session ID, so once a session is
+    /// established, a code-2 response to a *Serial* Query would otherwise
+    /// resend another Serial Query, never satisfying this requirement.
+    ///
+    /// Also proves the pre-reset table's data survives *until* the
+    /// replacement full load actually starts arriving (not discarded the
+    /// instant Error Code 2 is received — this crate's own design treats
+    /// stale-but-recent ROA data as preferable to no data at all, and RFC
+    /// 8210 §12 frames this error as a transient condition, potentially for
+    /// a long retry window), and that the old ROA is correctly gone once the
+    /// replacement load — which doesn't include it — completes.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn error_code_2_after_serial_query_forces_reset_query() {
+        let old_roa_prefix: Ipv4Addr = "198.51.100.0".parse().unwrap();
+        // Synchronization for the "old ROA survives the retry window"
+        // assertion: a plain poll-until-`Valid` loop starting at test start
+        // would trivially succeed during the *initial* sync, long before
+        // Error Code 2 is even sent — proving nothing about the retry
+        // window specifically. `mock_saw_reset` fires once the mock has
+        // observed the forced Reset Query (i.e. the test is now definitely
+        // inside the retry window, past the Error Code 2 response); the
+        // mock then blocks on `release` before sending the replacement
+        // load, so the assertion below is guaranteed to run at the one
+        // point in time that actually matters.
+        let (mock_saw_reset_tx, mock_saw_reset_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (mut config, _server) = spawn_mock_server(move |mut stream| async move {
+            // Establish an initial session/serial via a normal Reset Query,
+            // carrying one ROA that the replacement load below will not
+            // include.
+            let first = read_one(&mut stream).await;
+            assert_eq!(first, Pdu::ResetQuery);
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 4 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::Ipv4Prefix {
+                    flags: PrefixFlags { announce: true },
+                    prefix_len: 24,
+                    max_len: 24,
+                    prefix: old_roa_prefix,
+                    asn: 65099,
+                },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 4,
+                    serial: 10,
+                    // `retry: 1` (RFC 8210 §6's minimum allowed value) keeps
+                    // the test fast — this is the value the fix under test
+                    // must honor as the pause before the forced Reset Query
+                    // below, per the second half of Codex's review comment
+                    // on PR #38 (retain and honor the cache-advertised Retry
+                    // Interval once a v1 session has supplied one).
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 1,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+
+            // Unsolicited Serial Notify triggers an immediate resync via
+            // Serial Query (not waiting on the 3600s refresh timer) — same
+            // trigger used by `unsolicited_serial_notify_triggers_immediate_resync_not_timer_wait`.
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::SerialNotify {
+                    session_id: 4,
+                    serial: 11,
+                },
+            )
+            .await;
+            let second = read_one(&mut stream).await;
+            assert_eq!(
+                second,
+                Pdu::SerialQuery {
+                    session_id: 4,
+                    serial: 10
+                }
+            );
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::ErrorReport {
+                    error_code: ERROR_CODE_NO_DATA_AVAILABLE,
+                    pdu_copy: vec![],
+                    text: "cache lost state, needs full reload".to_string(),
+                },
+            )
+            .await;
+
+            // The client must now send a Reset Query, not another Serial
+            // Query — even though it still remembers session_id=4/serial=10.
+            let third = read_one(&mut stream).await;
+            assert_eq!(
+                third,
+                Pdu::ResetQuery,
+                "RFC 8210 §8.4: Error Code 2 MUST be followed by a Reset \
+                 Query, not a repeat of the Serial Query that failed"
+            );
+            // Tell the test it's now safe to check the pre-reset ROA is
+            // still present — we've observed the forced Reset Query but
+            // haven't sent anything back yet — then wait for the test to
+            // finish that check before sending the replacement load, so the
+            // two can't race.
+            let _ = mock_saw_reset_tx.send(());
+            let _ = release_rx.await;
+            // Replacement full load — deliberately omits `old_roa_prefix`.
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::CacheResponse { session_id: 9 },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::Ipv4Prefix {
+                    flags: PrefixFlags { announce: true },
+                    prefix_len: 24,
+                    max_len: 24,
+                    prefix: "203.0.113.0".parse().unwrap(),
+                    asn: 65001,
+                },
+            )
+            .await;
+            write_one(
+                &mut stream,
+                RtrVersion::V1,
+                &Pdu::EndOfData {
+                    session_id: 9,
+                    serial: 3,
+                    intervals: Some(EndOfDataIntervals {
+                        refresh: 3600,
+                        retry: 600,
+                        expire: 7200,
+                    }),
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+        config.retry_interval = Duration::from_millis(20);
+
+        let (handle, _join) = RtrClient::spawn(config);
+
+        // Wait until the mock has observed the forced Reset Query — this is
+        // the one point in time that actually proves the retry window
+        // survived without an eager clear (checking any earlier could pass
+        // trivially off the initial sync's own data, before Error Code 2 is
+        // even sent).
+        tokio::time::timeout(Duration::from_secs(5), mock_saw_reset_rx)
+            .await
+            .expect("mock never observed the forced Reset Query within 5s")
+            .expect("mock's sender was dropped without signaling");
+
+        assert_eq!(
+            handle.validate_v4(old_roa_prefix, 24, 65099),
+            RoaValidity::Valid,
+            "the pre-reset ROA must still be present at this exact point — \
+             after the forced Reset Query was sent, but before the \
+             replacement load has arrived — otherwise the fix is clearing \
+             the table too early, on Error Code 2 receipt rather than once \
+             the replacement load actually arrives"
+        );
+        release_tx
+            .send(())
+            .expect("mock's release receiver was dropped");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status().serial == Some(3) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "client did not complete the forced Reset Query resync within \
+             5s — did it repeat the failed Serial Query instead?",
+        );
+
+        assert_eq!(handle.status().version, Some(RtrVersion::V1));
+        assert_eq!(
+            handle.validate_v4(old_roa_prefix, 24, 65099),
+            RoaValidity::NotFound,
+            "the pre-reset ROA must not survive the replacement full load, \
+             which doesn't include it"
+        );
+        assert_eq!(
+            handle.validate_v4("203.0.113.1".parse().unwrap(), 24, 65001),
+            RoaValidity::Valid,
+            "the replacement load's own ROA must be present"
+        );
     }
 
     /// RFC 8210 §5 documents a v0-only cache as potentially replying
