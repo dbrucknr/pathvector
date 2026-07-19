@@ -898,6 +898,34 @@ audit:
   resyncs via the existing generic reconnect-with-backoff mechanism, so
   low severity, but doesn't honor the RFC's specific intent. See
   `RFC_AUDIT.md`'s RFC 8210 section.
+
+  **Fixed 2026-07-19** (`fix/rfc8210-error-code-2-no-data-available`).
+  Added a dedicated match arm for `error_code == 2` in `sync_once`,
+  reusing the same in-loop retry shape already used for the v1→v0
+  fallback case: log a warning, sleep `config.retry_interval` (threaded
+  into `sync_once` as a new parameter — reused, not new config surface),
+  then loop back and resend the same query (Reset or Serial, whichever
+  the loop head computes) on the *same* connection. Every other error
+  code still returns `Err` and tears down the session, per the RFC's
+  explicit "(fatal)" marking on those 8 codes.
+
+  Test-first: wrote
+  `error_code_2_no_data_available_retries_on_same_connection`, mirroring
+  `v1_rejected_falls_back_to_v0_and_completes_sync`'s mock-server
+  structure — the mock reads a *second* Reset Query on the same TCP
+  stream after sending the ErrorReport, which only succeeds if the
+  client didn't disconnect in between. Confirmed it failed against the
+  pre-fix code (mock server's second read errored `Closed` — the client
+  had already dropped the connection), then implemented the fix and
+  confirmed it passes. Re-verified real-teeth by temporarily removing
+  just the new match arm (test left in place) and confirming the
+  identical `Closed` failure reappeared, then restoring it.
+
+  No separate Docker e2e proof added: the client.rs test already
+  exercises a real TCP round-trip against the actual client state
+  machine (not a synthetic unit test double), the same level of proof
+  already relied on for the adjacent v1/v0 protocol-fallback behavior in
+  this same file.
 - **Route Origin ASN derivation doesn't apply RFC 6811's substitution
   rule for AS_PATHs ending in a confederation segment (new finding, not
   previously suspected).** RFC 6811 §2 defines a specific three-way rule
