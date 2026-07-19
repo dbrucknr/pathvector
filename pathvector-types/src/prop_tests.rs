@@ -139,22 +139,33 @@ proptest! {
         prop_assert!(path.contains(asn));
     }
 
-    /// Prepending an ASN never changes the origin AS of a non-empty path.
+    /// Prepending an ASN never changes the RFC 6811 origin AS of a
+    /// non-empty path.
     ///
-    /// The origin AS is the rightmost ASN in the path — the AS that first
-    /// introduced the route into BGP. Re-advertising (prepending) by a
-    /// downstream AS must not alter who originated the route.
+    /// `prepend` only ever touches the *first* segment (see its own doc
+    /// comment); `origin_as` is derived solely from the *last* segment
+    /// (RFC 6811 §2). For a non-empty path those are different segments
+    /// (or the same single segment growing in place, which doesn't change
+    /// its *last* element either), so prepending can't affect the result.
     #[test]
     fn prop_aspath_prepend_preserves_origin_as(
         mut path in arb_as_path(),
         asn in arb_asn(),
+        local_as in arb_asn(),
     ) {
-        let origin_before = path.origin_as();
+        // `arb_as_path()` only ever generates an empty path or a single
+        // Sequence segment (see its own doc comment), so `path_length() ==
+        // 0` is an exact proxy for "empty" here — it wouldn't be for an
+        // arbitrary AsPath (a confederation-only path also has length 0).
+        let was_empty = path.path_length() == 0;
+        let origin_before = path.origin_as(local_as);
         path.prepend(asn);
-        // origin_as only changes if the path was empty before (it goes from
-        // None to Some(asn)). For non-empty paths it must be unchanged.
-        if origin_before.is_some() {
-            prop_assert_eq!(path.origin_as(), origin_before);
+        // origin_as only changes if the path was empty before: RFC 6811 §2
+        // substitutes `local_as` for an empty AS_PATH, so it goes from
+        // Some(local_as) to Some(asn) once `asn` is prepended. For
+        // non-empty paths it must be unchanged.
+        if !was_empty {
+            prop_assert_eq!(path.origin_as(local_as), origin_before);
         }
     }
 }

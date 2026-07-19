@@ -469,7 +469,10 @@ mod tests {
         route.as_path = AsPath::from_sequence(vec![Asn::new(65001)]);
         PrependAsPath::once(Asn::new(65002)).apply(&mut route);
         assert_eq!(route.as_path.path_length(), 2);
-        assert_eq!(route.as_path.origin_as(), Some(Asn::new(65001)));
+        assert_eq!(
+            route.as_path.origin_as(Asn::new(65000)),
+            Some(Asn::new(65001))
+        );
     }
 
     #[test]

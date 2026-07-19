@@ -120,9 +120,16 @@ impl<A: IpAddress> FamilyTable<A> {
             };
             if let Some(entries) = self.0.get(ancestor) {
                 saw_covering = true;
+                // RFC 6811 §2: "no valid Route can have an Origin ASN of
+                // zero [AS0] ... no Route can be Matched by a VRP whose ASN
+                // is zero" — excluded explicitly here (not just relied upon
+                // as "no real VRP has ASN 0") because `origin_asn == 0` is
+                // also this crate's sentinel for the "NONE" Route Origin ASN
+                // (a terminal `AS_SET` — see `RoaValidityCondition`), which
+                // per the same section "cannot be Matched by any VRP".
                 if entries
                     .iter()
-                    .any(|e| e.asn == origin_asn && prefix_len <= e.max_len)
+                    .any(|e| e.asn != 0 && e.asn == origin_asn && prefix_len <= e.max_len)
                 {
                     return RoaValidity::Valid;
                 }

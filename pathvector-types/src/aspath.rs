@@ -154,7 +154,7 @@ impl std::fmt::Display for AsPathSegment {
 /// // A route originating from AS 65001, passing through AS 65002
 /// let path = AsPath::from_sequence(vec![Asn::new(65002), Asn::new(65001)]);
 /// assert_eq!(path.path_length(), 2);
-/// assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+/// assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65001)));
 ///
 /// // Loop detection: AS 65002 would reject this route
 /// assert!(path.contains(Asn::new(65002)));
@@ -231,7 +231,7 @@ impl AsPath {
     /// path.prepend(Asn::new(65002));
     ///
     /// assert_eq!(path.path_length(), 2);
-    /// assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+    /// assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65001)));
     /// ```
     pub fn prepend(&mut self, asn: crate::Asn) {
         match self.segments.first_mut() {
@@ -286,12 +286,18 @@ impl AsPath {
         self.segments.iter().map(AsPathSegment::path_length).sum()
     }
 
-    /// Returns the originating AS — the AS that first introduced this route
-    /// into BGP.
+    /// Returns the RFC 6811 §2 "Route Origin ASN" — the AS number used for
+    /// Route Origin Validation lookups against the VRP database.
     ///
-    /// Because routers prepend their ASN at the front, the originator is the
-    /// last ASN in the last `Sequence` segment. Returns `None` if the path is
-    /// empty or contains only non-sequence segments.
+    /// Derived from the `AS_PATH`'s *final* segment only — never searches
+    /// past it — per RFC 6811 §2's exact three-way rule:
+    ///
+    /// - `AS_SEQUENCE`-final: the rightmost ASN in that segment.
+    /// - `AS_CONFED_SEQUENCE`/`AS_CONFED_SET`-final, or an empty `AS_PATH`:
+    ///   `local_as` — the BGP speaker's own AS number, passed in here since
+    ///   `AsPath` has no notion of "local" on its own.
+    /// - Any other final segment type (`AS_SET`): `None`, RFC 6811's
+    ///   distinguished "NONE" value — no VRP can ever match it.
     ///
     /// # Examples
     ///
@@ -299,16 +305,19 @@ impl AsPath {
     /// use pathvector_types::{Asn, AsPath};
     ///
     /// let path = AsPath::from_sequence(vec![Asn::new(65003), Asn::new(65002), Asn::new(65001)]);
-    /// assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+    /// assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65001)));
     ///
-    /// assert_eq!(AsPath::new().origin_as(), None);
+    /// assert_eq!(AsPath::new().origin_as(Asn::new(65000)), Some(Asn::new(65000)));
     /// ```
     #[must_use]
-    pub fn origin_as(&self) -> Option<crate::Asn> {
-        self.segments.iter().rev().find_map(|seg| match seg {
-            AsPathSegment::Sequence(asns) => asns.last().copied(),
-            _ => None,
-        })
+    pub fn origin_as(&self, local_as: crate::Asn) -> Option<crate::Asn> {
+        match self.segments.last() {
+            Some(AsPathSegment::Sequence(asns)) => asns.last().copied(),
+            Some(AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)) | None => {
+                Some(local_as)
+            }
+            Some(AsPathSegment::Set(_)) => None,
+        }
     }
 
     /// Returns the directly neighboring AS — the first ASN in the first
@@ -522,7 +531,9 @@ mod tests {
         let path = AsPath::new();
         assert!(path.is_empty());
         assert_eq!(path.path_length(), 0);
-        assert_eq!(path.origin_as(), None);
+        // RFC 6811 §2: an empty AS_PATH substitutes the local speaker's own
+        // AS number as the Route Origin ASN, not "no origin."
+        assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65000)));
     }
 
     #[test]
@@ -542,7 +553,7 @@ mod tests {
     #[test]
     fn test_aspath_origin_as() {
         let path = AsPath::from_sequence(vec![Asn::new(65003), Asn::new(65002), Asn::new(65001)]);
-        assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+        assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65001)));
     }
 
     #[test]
@@ -550,7 +561,7 @@ mod tests {
         let mut path = AsPath::new();
         path.prepend(Asn::new(65001));
         assert_eq!(path.path_length(), 1);
-        assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+        assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65001)));
     }
 
     #[test]
@@ -560,7 +571,7 @@ mod tests {
         // Should grow the existing sequence, not add a new segment
         assert_eq!(path.segments().len(), 1);
         assert_eq!(path.path_length(), 2);
-        assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+        assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65001)));
     }
 
     #[test]
@@ -673,24 +684,45 @@ mod tests {
         assert_eq!(path.to_string(), "65002 {65000, 65001}");
     }
 
+    // ── origin_as (RFC 6811 §2 Route Origin ASN) ─────────────────────────────
+    //
+    // RFC 6811 §2 derives the Route Origin ASN from the AS_PATH's *final*
+    // segment only — never searches past it. Each test below pins down one
+    // of the three branches; see `RFC_AUDIT.md`'s RFC 6811 section for the
+    // exact clause and the confirmed gap this once was.
+
     #[test]
-    fn test_aspath_origin_as_skips_non_sequence_segments() {
-        // When iterating in reverse, a ConfedSequence appearing after the last
-        // Sequence hits the `_ => None` arm of find_map before the Sequence is found.
+    fn test_aspath_origin_as_confed_sequence_final_substitutes_local_as() {
+        // RFC 6811 §2: "the BGP speaker's own AS number if that segment is
+        // of type AS_CONFED_SEQUENCE" — regardless of what an earlier
+        // Sequence segment contains. The old backward-search implementation
+        // would have skipped past the trailing ConfedSequence and returned
+        // 65002 (the last Sequence's final ASN) instead.
         let path = AsPath::from_segments(vec![
             AsPathSegment::Sequence(vec![Asn::new(65003), Asn::new(65002)]),
             AsPathSegment::ConfedSequence(vec![Asn::new(65001)]),
         ]);
-        // Reversed: ConfedSequence (→ None, continue), then Sequence (→ Some(65002))
-        assert_eq!(path.origin_as(), Some(Asn::new(65002)));
+        assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65000)));
     }
 
     #[test]
-    fn test_aspath_origin_as_none_without_sequence() {
-        // A path with only non-Sequence segments has no determinable origin AS.
-        let path =
-            AsPath::from_segments(vec![AsPathSegment::ConfedSequence(vec![Asn::new(65001)])]);
-        assert_eq!(path.origin_as(), None);
+    fn test_aspath_origin_as_confed_set_final_substitutes_local_as() {
+        // Same rule, AS_CONFED_SET variant.
+        let path = AsPath::from_segments(vec![AsPathSegment::ConfedSet(vec![Asn::new(65001)])]);
+        assert_eq!(path.origin_as(Asn::new(65000)), Some(Asn::new(65000)));
+    }
+
+    #[test]
+    fn test_aspath_origin_as_set_final_is_none() {
+        // RFC 6811 §2: "the distinguished value 'NONE' if the final segment
+        // ... is of any other type" — i.e. AS_SET. `None` is this crate's
+        // representation of "NONE": RFC 6811 notes no VRP can ever have
+        // "NONE" as its ASN, so a route with this origin can never Match.
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::Sequence(vec![Asn::new(65002)]),
+            AsPathSegment::Set(vec![Asn::new(65001), Asn::new(64512)]),
+        ]);
+        assert_eq!(path.origin_as(Asn::new(65000)), None);
     }
 
     // ── strip_confed_segments (RFC 5065 §5.1) ────────────────────────────────
