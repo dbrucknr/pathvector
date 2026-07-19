@@ -75,14 +75,21 @@ where
 {
     fn matches(&self, route: &R) -> bool {
         // RFC 6811 §2: an AS_PATH ending in an AS_SET yields the
-        // distinguished "NONE" origin — no VRP can ever match it, so this
-        // condition never matches such a route rather than guessing at an
-        // ASN.
-        let Some(asn) = route.as_path().origin_as(self.local_as) else {
-            return false;
-        };
+        // distinguished "NONE" origin. The RFC's own pseudo-code represents
+        // this with ASN 0 ("no valid Route can have an Origin ASN of zero
+        // [AS0] ... no Route can be Matched by a VRP whose ASN is zero") —
+        // a value `RoaTable::validate` explicitly excludes from ever
+        // Matching (see `table.rs`). Looking it up (rather than
+        // short-circuiting to `false`) preserves the Invalid-vs-NotFound
+        // distinction: a NONE-origin route covered by a VRP is Invalid, one
+        // with no covering VRP is NotFound — neither is silently exempt
+        // from ROV.
+        let asn = route
+            .as_path()
+            .origin_as(self.local_as)
+            .map_or(0, Asn::as_u32);
         let prefix = route.nlri().prefix();
-        A::lookup(&self.rtr, prefix.ip(), prefix.mask(), asn.as_u32()) == self.target
+        A::lookup(&self.rtr, prefix.ip(), prefix.mask(), asn) == self.target
     }
 }
 
@@ -147,6 +154,55 @@ mod tests {
             Asn::new(65000),
         );
         assert!(!cond.matches(&route));
+        let cond =
+            RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::NotFound, Asn::new(65000));
+        assert!(cond.matches(&route));
+    }
+
+    #[test]
+    fn terminal_as_set_origin_none_is_invalid_when_covered_by_a_roa() {
+        // RFC 6811 §2: a Route whose Origin ASN is "NONE" (terminal AS_SET)
+        // "cannot be Matched by any VRP" — but a VRP still *Covers* the
+        // prefix here, so per the Invalid definition ("At least one VRP
+        // Covers the Route Prefix, but no VRP Matches it") this must be
+        // Invalid, not silently exempted from ROV.
+        let rtr = for_testing(
+            [(Ipv4Addr::new(192, 0, 2, 0), 24, 24, 65001)],
+            std::iter::empty(),
+        );
+        let mut route = TestRoute::new("192.0.2.0/24");
+        route.as_path =
+            AsPath::from_segments(vec![pathvector_types::AsPathSegment::Set(vec![Asn::new(
+                65001,
+            )])]);
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(
+            rtr.clone(),
+            RoaValidity::Invalid,
+            Asn::new(65000),
+        );
+        assert!(
+            cond.matches(&route),
+            "a terminal AS_SET origin is NONE, which can never Match a VRP; \
+             since a VRP covers this prefix, the route must be Invalid"
+        );
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Valid, Asn::new(65000));
+        assert!(!cond.matches(&route));
+    }
+
+    #[test]
+    fn terminal_as_set_origin_none_is_not_found_when_uncovered() {
+        // Same "NONE" origin, but no VRP covers the prefix at all — must be
+        // NotFound, not Invalid, preserving the coverage-vs-match distinction.
+        let rtr = for_testing(std::iter::empty(), std::iter::empty());
+        let mut route = TestRoute::new("203.0.113.0/24");
+        route.as_path =
+            AsPath::from_segments(vec![pathvector_types::AsPathSegment::Set(vec![Asn::new(
+                65001,
+            )])]);
+        for target in [RoaValidity::Valid, RoaValidity::Invalid] {
+            let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr.clone(), target, Asn::new(65000));
+            assert!(!cond.matches(&route));
+        }
         let cond =
             RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::NotFound, Asn::new(65000));
         assert!(cond.matches(&route));

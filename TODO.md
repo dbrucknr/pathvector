@@ -1107,6 +1107,51 @@ audit:
   the top-level summary table was never updated to match — both
   flipped from ⚠️ to ✅.
 
+  **Second gap found by Codex's PR review, same PR** — the initial fix
+  above got the "NONE" origin (terminal `AS_SET`) sentinel wrong.
+  `RoaValidityCondition::matches` (`pathvector-policy/src/rpki.rs`) used
+  to short-circuit to `false` whenever `origin_as()` returned `None`,
+  treating "NONE" as "exempt from ROV" — but RFC 6811 §2 is explicit
+  that "NONE" only means "cannot be Matched by any VRP", not "skip
+  validation": if a VRP still *Covers* the prefix, the correct verdict
+  is `Invalid` (per the RFC's own Invalid definition: "at least one VRP
+  Covers the Route Prefix, but no VRP Matches it"), not a blanket
+  non-match that would let a covered-but-unmatchable route sail through
+  a `reject Invalid` policy unfiltered — a real ROV bypass for any route
+  whose AS_PATH ends in a plain `AS_SET`.
+
+  Fixed by following RFC 6811 §2's own pseudo-code, which represents
+  "NONE" using ASN 0 ("no valid Route can have an Origin ASN of zero
+  [AS0] ... no Route can be Matched by a VRP whose ASN is zero"):
+  `matches` now looks up `origin_as(local_as).map_or(0, Asn::as_u32)`
+  instead of short-circuiting, so the existing `RoaTable::validate`
+  covering-walk naturally produces `Invalid` (covered) or `NotFound`
+  (uncovered) instead of a silent non-match. `RoaTable::validate`
+  (`pathvector-rpki/src/table.rs`) gained an explicit `e.asn != 0` guard
+  on the match condition — defense-in-depth mirroring the RFC
+  pseudo-code's own `entry->origin_as != 0` check, so this isn't just
+  relying on "no real VRP has ASN 0" as an unstated assumption.
+
+  Two new tests in `pathvector-policy/src/rpki.rs`:
+  `terminal_as_set_origin_none_is_invalid_when_covered_by_a_roa` and
+  `terminal_as_set_origin_none_is_not_found_when_uncovered`. Real-teeth
+  verified: both failed against the pre-fix short-circuit-to-`false`
+  code (the covered case failed the `assert!(cond.matches(...))`; the
+  uncovered case failed identically since `false` was also the
+  pre-fix behavior there — the test itself is what proves the
+  *coverage-vs-match distinction* is honored, not just "some non-Valid
+  result").
+
+  Separately, CI caught a real gap in the first fix's own "full
+  workspace call-site sweep" claim: `pathvector-types/README.md` embeds
+  a doctest (`assert_eq!(path.origin_as(), Some(...))`) that Cargo's
+  doctest runner compiles and runs alongside `.rs`-file doctests, but an
+  earlier `grep --include="*.rs"` sweep for call sites structurally
+  could not see it. Both the MSRV and Test CI jobs failed on this
+  identical root cause. Fixed by updating the README example to pass a
+  `local_as` argument, and confirmed via `grep -rn origin_as
+  --include="*.md" .` that no other crate's README has the same gap.
+
 BMP (RFC 7854) was also checked this round: confirmed `pathvector-bmp` is
 honestly and completely unimplemented (every row ❌, explicit "Deferred:
 Everything" note) — no code exists to audit, so no findings possible.
