@@ -81,7 +81,7 @@ use pathvector_types::{Asn, AsPath, AsPathSegment};
 // A route from AS 65001, re-advertised by AS 65002
 let mut path = AsPath::from_sequence(vec![Asn::new(65002), Asn::new(65001)]);
 assert_eq!(path.path_length(), 2);
-assert_eq!(path.origin_as(), Some(Asn::new(65001)));
+assert_eq!(path.origin_as(Asn::new(65002)), Some(Asn::new(65001)));
 
 // AS 65003 receives this and would reject it if it's already in the path
 assert!(!path.contains(Asn::new(65003)));
