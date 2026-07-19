@@ -9,6 +9,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use ipnetx::interfaces::IpAddress;
 use pathvector_rpki::{RoaValidity, RtrHandle};
+use pathvector_types::Asn;
 
 use crate::{condition::Condition, route::BgpRoute};
 
@@ -20,6 +21,10 @@ use crate::{condition::Condition, route::BgpRoute};
 pub struct RoaValidityCondition<A: IpAddress> {
     rtr: RtrHandle,
     target: RoaValidity,
+    /// The BGP speaker's own AS number — needed for RFC 6811 §2's Route
+    /// Origin ASN derivation when a route's `AS_PATH` ends in a
+    /// confederation segment. See [`pathvector_types::AsPath::origin_as`].
+    local_as: Asn,
     _family: std::marker::PhantomData<A>,
 }
 
@@ -29,10 +34,11 @@ impl<A: IpAddress> RoaValidityCondition<A> {
     /// RoaValidity::Invalid` for the common "reject hijacked/misoriginated
     /// routes" policy.
     #[must_use]
-    pub fn new(rtr: RtrHandle, target: RoaValidity) -> Self {
+    pub fn new(rtr: RtrHandle, target: RoaValidity, local_as: Asn) -> Self {
         Self {
             rtr,
             target,
+            local_as,
             _family: std::marker::PhantomData,
         }
     }
@@ -68,9 +74,11 @@ where
     R: BgpRoute<Addr = A>,
 {
     fn matches(&self, route: &R) -> bool {
-        // No origin AS (empty AS_PATH) — nothing to validate against; never
-        // treat this as a match rather than guessing at an ASN.
-        let Some(asn) = route.as_path().origin_as() else {
+        // RFC 6811 §2: an AS_PATH ending in an AS_SET yields the
+        // distinguished "NONE" origin — no VRP can ever match it, so this
+        // condition never matches such a route rather than guessing at an
+        // ASN.
+        let Some(asn) = route.as_path().origin_as(self.local_as) else {
             return false;
         };
         let prefix = route.nlri().prefix();
@@ -105,9 +113,13 @@ mod tests {
         let route = route_with_origin("192.0.2.0/24", 65001);
         // ROA authorizes AS65001 for this exact prefix — validity is Valid,
         // not Invalid, so an "Invalid" condition should not match.
-        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr.clone(), RoaValidity::Invalid);
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(
+            rtr.clone(),
+            RoaValidity::Invalid,
+            Asn::new(65000),
+        );
         assert!(!cond.matches(&route));
-        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Valid);
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Valid, Asn::new(65000));
         assert!(cond.matches(&route));
     }
 
@@ -120,7 +132,8 @@ mod tests {
         // Same prefix, wrong origin AS — a covering ROA exists but doesn't
         // authorize this AS, so validity is Invalid.
         let route = route_with_origin("192.0.2.0/24", 99999);
-        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid);
+        let cond =
+            RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid, Asn::new(65000));
         assert!(cond.matches(&route));
     }
 
@@ -128,27 +141,54 @@ mod tests {
     fn uncovered_prefix_is_not_found_not_invalid() {
         let rtr = for_testing(std::iter::empty(), std::iter::empty());
         let route = route_with_origin("203.0.113.0/24", 65001);
-        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr.clone(), RoaValidity::Invalid);
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(
+            rtr.clone(),
+            RoaValidity::Invalid,
+            Asn::new(65000),
+        );
         assert!(!cond.matches(&route));
-        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::NotFound);
+        let cond =
+            RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::NotFound, Asn::new(65000));
         assert!(cond.matches(&route));
     }
 
     #[test]
-    fn empty_as_path_never_matches_and_never_panics() {
+    fn empty_as_path_validates_against_local_as_not_never_matching() {
+        // RFC 6811 §2: an empty AS_PATH substitutes the BGP speaker's own
+        // AS number as the Route Origin ASN — a locally originated route
+        // IS validated, against `local_as`, not silently exempted. This
+        // deliberately does *not* assert "never matches": that was the
+        // pre-fix behavior, and RFC 6811 doesn't actually call for it.
+        let local_as = Asn::new(65000);
         let rtr = for_testing(
-            [(Ipv4Addr::new(192, 0, 2, 0), 24, 24, 65001)],
+            [(Ipv4Addr::new(192, 0, 2, 0), 24, 24, local_as.as_u32())],
             std::iter::empty(),
         );
         let route = TestRoute::new("192.0.2.0/24"); // default: empty AS_PATH
-        for target in [
-            RoaValidity::Valid,
-            RoaValidity::Invalid,
-            RoaValidity::NotFound,
-        ] {
-            let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr.clone(), target);
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr.clone(), RoaValidity::Valid, local_as);
+        assert!(
+            cond.matches(&route),
+            "a VRP authorizing local_as for this prefix must make an \
+             empty-AS_PATH route Valid, not exempt from validation"
+        );
+        let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid, local_as);
+        assert!(!cond.matches(&route));
+    }
+
+    #[test]
+    fn empty_as_path_uncovered_prefix_is_not_found_and_never_panics() {
+        // No VRP at all — an empty AS_PATH must not panic or spuriously
+        // match Valid/Invalid; it resolves to NotFound like any other
+        // uncovered prefix.
+        let rtr = for_testing(std::iter::empty(), std::iter::empty());
+        let route = TestRoute::new("192.0.2.0/24");
+        for target in [RoaValidity::Valid, RoaValidity::Invalid] {
+            let cond = RoaValidityCondition::<Ipv4Addr>::new(rtr.clone(), target, Asn::new(65000));
             assert!(!cond.matches(&route));
         }
+        let cond =
+            RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::NotFound, Asn::new(65000));
+        assert!(cond.matches(&route));
     }
 
     /// Minimal IPv6 `BgpRoute` used only in this module's tests — the shared
@@ -213,7 +253,8 @@ mod tests {
             nlri: "2001:db8::/32".parse().unwrap(),
             as_path: AsPath::from_sequence(vec![Asn::new(99999)]),
         };
-        let cond = RoaValidityCondition::<Ipv6Addr>::new(rtr, RoaValidity::Invalid);
+        let cond =
+            RoaValidityCondition::<Ipv6Addr>::new(rtr, RoaValidity::Invalid, Asn::new(65000));
         assert!(cond.matches(&route));
     }
 
@@ -227,7 +268,8 @@ mod tests {
             nlri: "2001:db8::/32".parse().unwrap(),
             as_path: AsPath::from_sequence(vec![Asn::new(65001)]),
         };
-        let cond = RoaValidityCondition::<Ipv6Addr>::new(rtr, RoaValidity::Invalid);
+        let cond =
+            RoaValidityCondition::<Ipv6Addr>::new(rtr, RoaValidity::Invalid, Asn::new(65000));
         assert!(!cond.matches(&route));
     }
 
@@ -239,7 +281,7 @@ mod tests {
         );
         let policy = PolicyBuilder::<TestRoute>::new(DefaultAction::Accept)
             .term(
-                RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid),
+                RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid, Asn::new(65000)),
                 Reject,
             )
             .build();
@@ -321,7 +363,7 @@ mod tests {
             std::iter::empty(),
         );
         let term = Term::new(
-            RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid),
+            RoaValidityCondition::<Ipv4Addr>::new(rtr, RoaValidity::Invalid, Asn::new(65000)),
             Reject,
         );
         let mut route = route_with_origin("192.0.2.0/24", 99999);

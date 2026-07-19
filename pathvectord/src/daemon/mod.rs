@@ -597,11 +597,13 @@ impl DaemonState {
     /// are unaffected — they simply don't match this term and fall through to
     /// each peer's existing default action, exactly as before this call.
     pub(crate) fn install_rpki_import_terms(&mut self, rtr: &pathvector_rpki::RtrHandle) {
+        let local_as = Asn::new(self.rib.local_as);
         for policy in self.import_policies.values_mut() {
             policy.add_term(pathvector_policy::Term::new(
                 pathvector_policy::RoaValidityCondition::<Ipv4Addr>::new(
                     rtr.clone(),
                     pathvector_rpki::RoaValidity::Invalid,
+                    local_as,
                 ),
                 pathvector_policy::Reject,
             ));
@@ -611,6 +613,7 @@ impl DaemonState {
                 pathvector_policy::RoaValidityCondition::<Ipv6Addr>::new(
                     rtr.clone(),
                     pathvector_rpki::RoaValidity::Invalid,
+                    local_as,
                 ),
                 pathvector_policy::Reject,
             ));

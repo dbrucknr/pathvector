@@ -253,7 +253,7 @@ mod tests {
         // Still only one route — same prefix, second overwrites first
         assert_eq!(rib.len(), 1);
         assert_eq!(
-            rib.get(&n).unwrap().as_path.origin_as(),
+            rib.get(&n).unwrap().as_path.origin_as(Asn::new(65000)),
             Some(Asn::new(65002))
         );
     }
