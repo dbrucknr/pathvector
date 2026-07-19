@@ -926,6 +926,63 @@ audit:
   machine (not a synthetic unit test double), the same level of proof
   already relied on for the adjacent v1/v0 protocol-fallback behavior in
   this same file.
+
+  **Corrected 2026-07-19 (Codex review on PR #38):** the fix above had
+  a real bug — "loop back and resend the same query the loop head
+  computes" is wrong per RFC 8210 §8.4: "If no other caches are
+  available, the router MUST issue periodic **Reset Queries** until it
+  gets a new usable load" — not a repeat of whatever query just failed.
+  Since `sync_once` recomputes its query from the remembered
+  serial/session ID, a code-2 response to a *Serial* Query (i.e., after
+  a session was already established and a routine refresh/re-sync hit
+  the error) resent another `SerialQuery`, never satisfying this
+  requirement. The original test's first-ever-sync scenario couldn't
+  catch this: with no saved state, its query was already a
+  `ResetQuery`, so the bug was invisible.
+
+  Fixed by clearing `shared.table` in the code-2 arm (mirrors the
+  existing v1→v0 fallback arm exactly), which forces the next loop
+  iteration's query to be a genuine `ResetQuery` regardless of prior
+  session state — and, per Codex's note, this is also *required* for
+  correctness of the eventual full reload: `apply_diff_stream` has no
+  way to know which records the *previous* sync contributed, so nothing
+  else in this codebase reconciles a stale entry that's absent from the
+  new full data set; clearing before the reset request is the same
+  precondition the v1→v0 fallback already relies on.
+
+  Also addressed Codex's two other points: (1) **Status** — the code-2
+  arm now sets `RtrStatus::last_error` (was previously silent, logging
+  only via `tracing::warn!`) while deliberately leaving `connected`
+  untouched, since the transport is still live and only the last sync
+  attempt failed. (2) **Retry cadence** — `run_one_connection` now
+  tracks a `retry` variable analogous to the existing `refresh`
+  variable, updated from the cache's advertised `EndOfDataIntervals.retry`
+  on each successful v1 sync and threaded into `sync_once` in place of
+  the flat `config.retry_interval`, per RFC 8210 §6: "The router SHOULD
+  NOT retry sooner than [the Retry Interval]." `config.retry_interval`
+  remains the value used before any v1 session has ever supplied one
+  (the very first sync attempt), which Codex confirmed is a reasonable
+  default; indefinite fixed-interval retries with no cap were confirmed
+  correct per §8.4's "until it gets a new usable load" and left
+  unchanged.
+
+  New test: `error_code_2_after_serial_query_forces_reset_query` —
+  establishes a real session via an initial `ResetQuery`/`EndOfData`
+  exchange, triggers a `SerialQuery` via unsolicited `SerialNotify`
+  (mirroring `unsolicited_serial_notify_triggers_immediate_resync_not_timer_wait`),
+  responds to that `SerialQuery` with Error Code 2, then asserts the
+  *next* PDU on the same connection is a `ResetQuery`, not another
+  `SerialQuery`. Real-teeth verified: failed against the pre-correction
+  code with `left: SerialQuery { session_id: 4, serial: 10 }, right:
+  ResetQuery`, then passed once `shared.table.clear()` was added;
+  re-verified by temporarily removing just that one line (test left in
+  place) and confirming the identical failure reappeared before
+  restoring it. The 1.0s wall-clock runtime of this test is itself
+  incidental proof the server-advertised retry interval is genuinely
+  honored (the mock's `EndOfDataIntervals.retry: 1` was deliberately
+  small to keep the test fast — using the previous default of 600
+  caused the test to time out against the corrected code, which was the
+  first signal the retry-cadence fix was actually wired in).
 - **Route Origin ASN derivation doesn't apply RFC 6811's substitution
   rule for AS_PATHs ending in a confederation segment (new finding, not
   previously suspected).** RFC 6811 §2 defines a specific three-way rule
