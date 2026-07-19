@@ -103,6 +103,21 @@ pub struct Route<A: IpAddress> {
     /// prefer the one received first (smaller value). Set automatically by
     /// [`RouteBuilder::build`]. Wraps in year 2106.
     pub received_at: u32,
+    /// The BGP Identifier (router-id) of the peer this route was learned
+    /// from, as advertised in that peer's OPEN message — `None` for locally
+    /// originated routes or if the identifier isn't known for some other
+    /// reason.
+    ///
+    /// Distinct from the peer's session/transport IP address (`PeerId`,
+    /// tracked separately by the caller): a router's BGP Identifier is
+    /// commonly a loopback address unrelated to the physical interface used
+    /// for a given peering. Used in best-path step (f) (RFC 4271 §9.1.2.2):
+    /// when routes are tied through every prior criterion, the route from
+    /// the peer with the lowest BGP Identifier wins, evaluated *before* the
+    /// final peer-IP-address tiebreak (step (g)). Set by
+    /// [`RouteBuilder::peer_bgp_id`]; `None` skips step (f) and falls
+    /// through directly to step (g).
+    pub peer_bgp_id: Option<Ipv4Addr>,
     /// Infrequently-set attributes: communities, cluster list, aggregator, etc.
     ///
     /// `None` when all rare attributes are at their default values, saving
@@ -274,6 +289,7 @@ pub struct RouteBuilder<A: IpAddress> {
     med: Option<Med>,
     peer_type: PeerType,
     received_at: u32,
+    peer_bgp_id: Option<Ipv4Addr>,
     rare: Option<Box<RareAttrs>>,
 }
 
@@ -299,6 +315,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             med: None,
             peer_type: PeerType::External,
             received_at: now_unix_secs(),
+            peer_bgp_id: None,
             rare: None,
         }
     }
@@ -318,6 +335,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             med: None,
             peer_type: PeerType::External,
             received_at: now_unix_secs(),
+            peer_bgp_id: None,
             rare: None,
         }
     }
@@ -404,6 +422,18 @@ impl<A: IpAddress> RouteBuilder<A> {
         self
     }
 
+    /// Sets the BGP Identifier (router-id) of the peer this route was
+    /// learned from, as advertised in that peer's OPEN message.
+    ///
+    /// Used in best-path step (f) (RFC 4271 §9.1.2.2) — see
+    /// [`Route::peer_bgp_id`]. Leave unset (`None`) for locally originated
+    /// routes.
+    #[must_use]
+    pub fn peer_bgp_id(mut self, id: Ipv4Addr) -> Self {
+        self.peer_bgp_id = Some(id);
+        self
+    }
+
     /// Consumes the builder and returns a [`Route<A>`].
     #[must_use]
     pub fn build(self) -> Route<A> {
@@ -416,6 +446,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             med: self.med,
             peer_type: self.peer_type,
             received_at: self.received_at,
+            peer_bgp_id: self.peer_bgp_id,
             rare: self.rare,
             stale: false,
         }
