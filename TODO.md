@@ -1056,6 +1056,57 @@ audit:
   so a fix needs to thread the local ASN into its signature — a real API
   change, not a one-line patch. See `RFC_AUDIT.md`'s RFC 6811 section.
 
+  **Fixed 2026-07-19** (`fix/rfc6811-origin-as-confederation-segments`).
+  `AsPath::origin_as` now takes `local_as: Asn` and matches directly on
+  `self.segments.last()`'s variant — `Sequence` → its rightmost ASN;
+  `ConfedSequence`/`ConfedSet`/empty path → `Some(local_as)`; `Set` →
+  `None` (RFC 6811's "NONE" sentinel) — instead of searching backward
+  past confederation/Set segments for an earlier plain `Sequence`.
+  `RoaValidityCondition` (the one production caller, in
+  `pathvector-policy/src/rpki.rs`) gained a `local_as: Asn` field;
+  `pathvectord`'s `install_rpki_import_terms` threads
+  `Asn::new(self.rib.local_as)` through at construction.
+
+  Two tests in `pathvector-types/src/aspath.rs` had actively codified
+  the bug as if it were correct behavior —
+  `test_aspath_origin_as_skips_non_sequence_segments` and
+  `test_aspath_origin_as_none_without_sequence` — both rewritten with
+  RFC-derived expectations (renamed to
+  `test_aspath_origin_as_confed_sequence_final_substitutes_local_as`
+  and folded into new dedicated tests for each of the three branches).
+  Test-first: all four updated/new tests (plus `test_aspath_new_is_empty`,
+  whose empty-path expectation also changes under the new rule) were
+  confirmed to fail against the still-buggy backward-search
+  implementation — including one, `test_aspath_origin_as_set_final_is_none`,
+  where the failure disproved my own initial guess that it would
+  "pass by coincidence": the old code actually searched past the
+  trailing `Set` segment to an earlier `Sequence` and returned a wrong
+  non-`None` value, not `None`. Real-teeth verified: reverted the fix
+  (kept the signature, restored the old `.iter().rev().find_map(...)`
+  body) and confirmed the identical four failures reappeared with the
+  identical diagnostics, then restored the fix and confirmed all pass.
+
+  **Real, intentional behavior change worth flagging explicitly**: an
+  empty AS_PATH (a locally originated route) now validates against
+  `local_as` instead of being silently exempted from ROV. The old
+  `empty_as_path_never_matches_and_never_panics` test in
+  `pathvector-policy/src/rpki.rs` had encoded "never matches" as
+  correct — per RFC 6811 §2 that's simply wrong (empty AS_PATH
+  substitutes the local speaker's own AS number, the same as a
+  confederation-final path), so it was rewritten as
+  `empty_as_path_validates_against_local_as_not_never_matching` (does
+  match when a VRP authorizes `local_as`) plus a separate
+  `empty_as_path_uncovered_prefix_is_not_found_and_never_panics` (the
+  "never panics" half, still true, kept as its own test since it no
+  longer shares a premise with the matching behavior).
+
+  Also corrected two stale caveats in `RFC_REQUIREMENTS.md` discovered
+  while updating this row: the RFC 6810 and RFC 8210 rows still cited
+  the Error Code 2 gap that PR 8 (`fix/rfc8210-error-code-2-no-data-available`)
+  had already fixed at the crate-level `pathvector-rpki/RFC.md`, but
+  the top-level summary table was never updated to match — both
+  flipped from ⚠️ to ✅.
+
 BMP (RFC 7854) was also checked this round: confirmed `pathvector-bmp` is
 honestly and completely unimplemented (every row ❌, explicit "Deferred:
 Everything" note) — no code exists to audit, so no findings possible.
