@@ -1190,6 +1190,18 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn error_code_2_after_serial_query_forces_reset_query() {
         let old_roa_prefix: Ipv4Addr = "198.51.100.0".parse().unwrap();
+        // Synchronization for the "old ROA survives the retry window"
+        // assertion: a plain poll-until-`Valid` loop starting at test start
+        // would trivially succeed during the *initial* sync, long before
+        // Error Code 2 is even sent — proving nothing about the retry
+        // window specifically. `mock_saw_reset` fires once the mock has
+        // observed the forced Reset Query (i.e. the test is now definitely
+        // inside the retry window, past the Error Code 2 response); the
+        // mock then blocks on `release` before sending the replacement
+        // load, so the assertion below is guaranteed to run at the one
+        // point in time that actually matters.
+        let (mock_saw_reset_tx, mock_saw_reset_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let (mut config, _server) = spawn_mock_server(move |mut stream| async move {
             // Establish an initial session/serial via a normal Reset Query,
             // carrying one ROA that the replacement load below will not
@@ -1268,12 +1280,6 @@ mod tests {
 
             // The client must now send a Reset Query, not another Serial
             // Query — even though it still remembers session_id=4/serial=10.
-            // The pre-reset ROA must still be visible right up until this
-            // point: it's checked from the *test's* async context, racing
-            // against this mock server task, immediately after the mock
-            // observes the Reset Query — i.e. as late as possible before the
-            // replacement load starts arriving, without depending on
-            // exact scheduling order between the two tasks.
             let third = read_one(&mut stream).await;
             assert_eq!(
                 third,
@@ -1281,6 +1287,13 @@ mod tests {
                 "RFC 8210 §8.4: Error Code 2 MUST be followed by a Reset \
                  Query, not a repeat of the Serial Query that failed"
             );
+            // Tell the test it's now safe to check the pre-reset ROA is
+            // still present — we've observed the forced Reset Query but
+            // haven't sent anything back yet — then wait for the test to
+            // finish that check before sending the replacement load, so the
+            // two can't race.
+            let _ = mock_saw_reset_tx.send(());
+            let _ = release_rx.await;
             // Replacement full load — deliberately omits `old_roa_prefix`.
             write_one(
                 &mut stream,
@@ -1321,23 +1334,28 @@ mod tests {
 
         let (handle, _join) = RtrClient::spawn(config);
 
-        // Poll until the pre-reset ROA is visible — proves it survived the
-        // Error Code 2 response and the wait before the forced Reset Query,
-        // rather than being cleared the instant the error arrived.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if handle.validate_v4(old_roa_prefix, 24, 65099) == RoaValidity::Valid {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect(
-            "pre-reset ROA was never observed as valid — did the fix clear \
+        // Wait until the mock has observed the forced Reset Query — this is
+        // the one point in time that actually proves the retry window
+        // survived without an eager clear (checking any earlier could pass
+        // trivially off the initial sync's own data, before Error Code 2 is
+        // even sent).
+        tokio::time::timeout(Duration::from_secs(5), mock_saw_reset_rx)
+            .await
+            .expect("mock never observed the forced Reset Query within 5s")
+            .expect("mock's sender was dropped without signaling");
+
+        assert_eq!(
+            handle.validate_v4(old_roa_prefix, 24, 65099),
+            RoaValidity::Valid,
+            "the pre-reset ROA must still be present at this exact point — \
+             after the forced Reset Query was sent, but before the \
+             replacement load has arrived — otherwise the fix is clearing \
              the table too early, on Error Code 2 receipt rather than once \
-             the replacement load actually arrives?",
+             the replacement load actually arrives"
         );
+        release_tx
+            .send(())
+            .expect("mock's release receiver was dropped");
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
