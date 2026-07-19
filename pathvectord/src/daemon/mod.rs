@@ -4084,6 +4084,7 @@ mod tests {
             policy,
             &policy_v6,
             pt,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -5243,6 +5244,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -5285,6 +5287,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -5328,6 +5331,7 @@ mod tests {
             &accept_all(),
             &reject_policy_v6,
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -5487,6 +5491,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -5513,6 +5518,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -5557,6 +5563,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -6247,6 +6254,7 @@ mod tests {
             &accept_all(),
             &reject_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -6295,6 +6303,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -6569,6 +6578,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -6858,6 +6868,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -6898,6 +6909,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -6963,6 +6975,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -7008,6 +7021,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -7052,6 +7066,7 @@ mod tests {
             &accept_all(),
             &accept_all_v6(),
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -7204,6 +7219,7 @@ mod tests {
             &accept_all(),
             &policy_v6,
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -7243,6 +7259,7 @@ mod tests {
             &accept_all(),
             &policy_v6,
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -8852,6 +8869,7 @@ mod tests {
             &policy,
             &policy_v6,
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
@@ -8947,6 +8965,7 @@ mod tests {
             &policy,
             &policy_v6,
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65001,
@@ -8976,6 +8995,7 @@ mod tests {
             &policy,
             &policy_v6,
             PeerType::External,
+            None,
             &AlwaysReachable,
             &AlwaysReachable,
             65001,
@@ -9520,6 +9540,44 @@ mod tests {
             Some(local_bgp_id),
             "with no recorded peer BGP ID, ORIGINATOR_ID must fall back to our own \
              local_bgp_id, not the client's transport address"
+        );
+    }
+
+    /// Regression test for the RFC 4271 §9.1.2.2 (f) best-path fix: proves
+    /// the peer's BGP Identifier (learned at `Established`, tracked in
+    /// `rib.peer_bgp_ids`) is actually threaded onto the `Route` built by a
+    /// real `on_route_update` call. `best_path::prefer()`'s own unit tests
+    /// construct `Route`s directly via `RouteBuilder::peer_bgp_id(...)` and
+    /// would keep passing even if this daemon-level wiring were missing
+    /// entirely — this test is what actually proves the two are connected.
+    #[test]
+    fn test_route_carries_peer_bgp_id_from_established_session() {
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let peer_bgp_id = Ipv4Addr::new(9, 9, 9, 9);
+        let (mut state, _receivers) = make_state(65001, &[(peer_ip, 65002)]);
+
+        state.on_established(
+            peer_ip,
+            peer_bgp_id,
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
+
+        state.on_route_update(peer_ip, update_announce("192.0.2.0/24"));
+
+        let route = state
+            .rib
+            .loc_rib
+            .best(&nlri("192.0.2.0/24"))
+            .expect("route must be installed");
+        assert_eq!(
+            route.peer_bgp_id,
+            Some(peer_bgp_id),
+            "Route::peer_bgp_id must be populated from rib.peer_bgp_ids at \
+             ingest time, so RFC 4271 §9.1.2.2 step (f) has real data to compare"
         );
     }
 

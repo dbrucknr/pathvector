@@ -27,7 +27,8 @@ that filters routes before they enter Adj-RIB-In lives in `pathvector-policy`.
 | Step 7: Prefer eBGP over iBGP (combined with step 3 via PeerType::Ord) | `src/best_path.rs` | ✅ | `test_select_best_prefers_ebgp_over_ibgp` |
 | Step 8: Prefer route with lowest IGP metric to next-hop | `src/best_path.rs` | ✅ | `test_oracle_lower_igp_metric_preferred`, `test_oracle_igp_metric_skipped_when_none`; daemon integration: `test_on_fib_change_reannounces_when_next_hop_recovers` |
 | Step 9: Prefer oldest eBGP route (received_at: Instant, only when both are eBGP) | `src/best_path.rs` | ✅ | `test_select_best_prefers_older_ebgp_route`, `test_step9_only_applies_to_ebgp` |
-| Step 10: Prefer route from peer with lowest router-id (BGP Identifier) | `src/best_path.rs` | ✅ | `test_select_best_tiebreak_lower_peer_ip`, proptest: `prop_select_best_lower_peer_ip_wins_on_full_tie` |
+| Step 10: (f) Prefer route from peer with lowest BGP Identifier (router-id); skipped if unknown on either side | `src/best_path.rs` | ✅ | `test_select_best_bgp_identifier_overrides_peer_ip_tiebreak`, `test_select_best_falls_back_to_peer_ip_when_bgp_identifier_unknown`, `test_select_best_falls_back_to_peer_ip_when_bgp_identifier_known_on_only_one_side`, proptest: `prop_select_best_lower_bgp_identifier_wins_on_full_tie` |
+| Step 11: (g) Prefer route from peer with lowest peer address (final tie-breaker) | `src/best_path.rs` | ✅ | `test_select_best_tiebreak_lower_peer_ip`, proptest: `prop_select_best_lower_peer_ip_wins_on_full_tie` |
 
 **Platform note:** Steps 1 and 8 are active on Linux via `DaemonOracle` wrapping
 `KernelFib`. On macOS (development builds) `AlwaysReachable` is used — step 1 never

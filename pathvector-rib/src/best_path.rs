@@ -24,7 +24,8 @@ use crate::{
 /// | 5 | `ORIGIN` | lower (`IGP=0` best) |
 /// | 6 | `MED` (same neighboring AS only) | lower (missing → `0`) |
 /// | 9 | Route age (eBGP only) | older |
-/// | 10 | Peer IP address | lower |
+/// | 10 | BGP Identifier (RFC 4271 §9.1.2.2 (f); skipped if either side unknown) | lower |
+/// | 11 | Peer IP address (RFC 4271 §9.1.2.2 (g), final tie-breaker) | lower |
 ///
 /// Steps 1 and 8 require IGP reachability information not available at the
 /// RIB layer. See `TODO.md`.
@@ -229,7 +230,19 @@ fn prefer<A: IpAddress>(
         }
     }
 
-    // Step 10: Lowest peer IP address (final tie-breaker).
+    // Step 10 (RFC 4271 §9.1.2.2 (f)): lowest BGP Identifier.
+    // Only compared when both routes have a known peer_bgp_id — if either
+    // is None (e.g. the identifier isn't tracked for that route), this step
+    // is skipped and step 11 decides instead, mirroring how step 8's
+    // IGP-metric comparison is skipped when either side's metric is None.
+    if let (Some(id_a), Some(id_b)) = (a.peer_bgp_id, b.peer_bgp_id) {
+        let bgp_id = id_b.cmp(&id_a);
+        if bgp_id != Ordering::Equal {
+            return bgp_id; // reverse: lower BGP Identifier → Greater → preferred
+        }
+    }
+
+    // Step 11 (RFC 4271 §9.1.2.2 (g)): lowest peer address (final tie-breaker).
     peer_b.cmp(peer_a) // reverse: lower peer IP → Greater → preferred
 }
 
@@ -545,6 +558,38 @@ mod prop_tests {
         }
     }
 
+    // ── Step (f): lowest BGP Identifier, before (g) peer IP (RFC 4271 §9.1.2.2) ──
+
+    // Every candidate's peer IP is deliberately given the *opposite* order
+    // from its BGP Identifier — id_a (1..=127) is always < id_b (128..=254),
+    // but peer_a's session IP is always > peer_b's. If (f) were skipped
+    // (the pre-fix bug), (g) would pick peer_b; (f) must pick peer_a instead.
+    proptest! {
+        #[test]
+        fn prop_select_best_lower_bgp_identifier_wins_on_full_tie(
+            id_a in 1u8..=127u8,
+            id_b in 128u8..=254u8,
+        ) {
+            let route_a = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(100))
+                .peer_bgp_id(Ipv4Addr::new(id_a, id_a, id_a, id_a))
+                .build();
+            let route_b = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(100))
+                .peer_bgp_id(Ipv4Addr::new(id_b, id_b, id_b, id_b))
+                .build();
+
+            let mut candidates = HashMap::new();
+            candidates.insert(peer(200), route_a); // higher peer IP, lower BGP Identifier
+            candidates.insert(peer(50), route_b);  // lower peer IP, higher BGP Identifier
+
+            let (winner, _) = select_best(&candidates).unwrap();
+            prop_assert_eq!(winner, peer(200),
+                "BGP Identifier {}...{} should beat {}...{} regardless of peer IP order",
+                id_a, id_a, id_b, id_b);
+        }
+    }
+
     // ── Step 3: locally originated beats peer-learned (RFC 4271 §9.1) ────────
 
     proptest! {
@@ -768,6 +813,74 @@ mod tests {
         candidates.insert(peer(2), basic(Origin::Igp, 2, Some(100), None));
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(1)); // lower peer IP wins
+    }
+
+    // ── Step (f)/(g): BGP Identifier before peer IP (RFC 4271 §9.1.2.2) ─────
+
+    #[test]
+    fn test_select_best_bgp_identifier_overrides_peer_ip_tiebreak() {
+        // RFC 4271 §9.1.2.2 (f): the route from the peer with the *lowest
+        // BGP Identifier* wins, evaluated before (g)'s peer-IP tiebreak.
+        // peer(1) has the lower session IP but the higher BGP Identifier;
+        // peer(2) has the higher session IP but the lower BGP Identifier.
+        // (f) must decide this in favor of peer(2) — a peer-IP-only
+        // comparator (the pre-fix behavior) would incorrectly pick peer(1).
+        let route_a = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .peer_bgp_id(Ipv4Addr::new(9, 9, 9, 9))
+            .build();
+        let route_b = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .peer_bgp_id(Ipv4Addr::new(1, 1, 1, 1))
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), route_a); // lower peer IP, higher BGP Identifier
+        candidates.insert(peer(2), route_b); // higher peer IP, lower BGP Identifier
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // lower BGP Identifier wins despite higher peer IP
+    }
+
+    #[test]
+    fn test_select_best_falls_back_to_peer_ip_when_bgp_identifier_unknown() {
+        // When neither candidate has a known peer_bgp_id, step (f) has
+        // nothing to compare and (g) peer-IP decides — the pre-fix
+        // behavior, preserved for routes where the BGP Identifier isn't
+        // tracked (e.g. built without going through the daemon's ingest
+        // path that populates it).
+        let route = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), route.clone());
+        candidates.insert(peer(2), route);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(1)); // step (g): lower peer IP
+    }
+
+    #[test]
+    fn test_select_best_falls_back_to_peer_ip_when_bgp_identifier_known_on_only_one_side() {
+        // (f) requires a known BGP Identifier on *both* candidates to
+        // compare; if only one side has it, the comparison is skipped
+        // (mirrors the IGP-metric step's None-on-either-side skip) and (g)
+        // peer-IP decides instead.
+        let with_id = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .peer_bgp_id(Ipv4Addr::new(1, 1, 1, 1))
+            .build();
+        let without_id = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::External)
+            .build();
+        // Give the peer *without* a known BGP Identifier the lower peer IP,
+        // so if (f) were incorrectly applied one-sided it would still have
+        // to fall through to (g) and agree — construct the disagreeing case
+        // instead: the known-ID peer gets the higher peer IP, so a
+        // one-sided (f) bug (e.g. treating missing-as-lowest) would pick a
+        // different winner than the correct skip-to-(g) behavior.
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), without_id); // lower peer IP, no known BGP Identifier
+        candidates.insert(peer(2), with_id); // higher peer IP, known BGP Identifier
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(1)); // (f) skipped entirely; (g): lower peer IP wins
     }
 
     #[test]

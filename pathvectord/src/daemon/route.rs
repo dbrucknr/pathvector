@@ -70,6 +70,12 @@ impl DaemonState {
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
+        // RFC 4271 §9.1.2.2 (f): best-path step (f) needs the peer's BGP
+        // Identifier, distinct from `peer_ip` (the session's transport
+        // address) — see `Route::peer_bgp_id`'s doc comment. `None` if
+        // somehow unknown (shouldn't happen for an established session,
+        // since the peer's OPEN is required before any UPDATE arrives).
+        let peer_bgp_id = self.rib.peer_bgp_ids.get(&peer_ip).copied();
 
         // Route reflection inbound processing (RFC 4456 §8).
         //
@@ -269,6 +275,7 @@ impl DaemonState {
             policy,
             policy_v6,
             peer_type,
+            peer_bgp_id,
             &*oracle_v4,
             &*oracle_v6,
             local_as,
@@ -886,6 +893,7 @@ pub(super) fn handle_update(
     policy: &Policy<Route<Ipv4Addr>>,
     policy_v6: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
+    peer_bgp_id: Option<Ipv4Addr>,
     oracle_v4: &dyn NextHopOracle,
     oracle_v6: &dyn NextHopOracle,
     local_as: u32,
@@ -1179,6 +1187,9 @@ pub(super) fn handle_update(
         let mut builder =
             RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
                 .peer_type(peer_type);
+        if let Some(id) = peer_bgp_id {
+            builder = builder.peer_bgp_id(id);
+        }
         if let Some(nh) = nh {
             builder = builder.next_hop(nh);
         }
@@ -1301,6 +1312,9 @@ pub(super) fn handle_update(
         let mut builder =
             RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
                 .peer_type(peer_type);
+        if let Some(id) = peer_bgp_id {
+            builder = builder.peer_bgp_id(id);
+        }
         builder = builder.next_hop(nh);
         if let Some(lp) = local_pref {
             builder = builder.local_pref(lp);
