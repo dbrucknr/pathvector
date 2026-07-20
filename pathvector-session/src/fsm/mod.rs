@@ -729,7 +729,10 @@ impl Fsm {
     /// Validate a received OPEN, returning the negotiated hold time on success.
     /// Validates the peer's OPEN message. Returns the negotiated hold time on
     /// success, or `(error, data)` where `data` is the NOTIFICATION payload.
-    fn validate_open(&self, peer: &OpenMessage) -> Result<u16, (NotificationError, Vec<u8>)> {
+    pub(crate) fn validate_open(
+        &self,
+        peer: &OpenMessage,
+    ) -> Result<u16, (NotificationError, Vec<u8>)> {
         if peer.version != 4 {
             return Err((
                 NotificationError::OpenMessage(OpenMsgError::UnsupportedVersionNumber),

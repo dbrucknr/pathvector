@@ -24,8 +24,129 @@ use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
 use crate::message::{
     BgpMessage, Capability, CodecError, MalformedUpdate, MpUnreachNlri, MsgHeaderError,
-    NotificationError, NotificationMessage, PathAttribute, UpdateMessage, UpdateMsgError,
+    NotificationError, NotificationMessage, OpenMessage, PathAttribute, UpdateMessage,
+    UpdateMsgError,
 };
+
+/// How long to wait for a staged, not-yet-validated second (collision
+/// candidate) connection to send its OPEN before giving up on it and
+/// leaving the existing connection undisturbed.
+///
+/// RFC 4271 §6.8 doesn't specify a value for this — it's a project-level
+/// resource-exhaustion guard, not a protocol requirement. Mirrors the FSM's
+/// own `OPEN_HOLD_TIMER` (240s) for symmetry: this is the same "how long do
+/// we wait for a peer's OPEN" question, just applied to a second,
+/// unconfirmed connection instead of the primary one.
+const COLLISION_CANDIDATE_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Which side initiated a TCP connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionOrigin {
+    Outbound,
+    Inbound,
+}
+
+/// The local/peer IP addresses and initiator of one TCP connection, used to
+/// test RFC 4271 §6.8's actual collision definition.
+///
+/// RFC 4271 §6.8 (quoted verbatim): "If the source IP address used by one
+/// of these connections is the same as the destination IP address used by
+/// the other, and the destination IP address used by the first connection
+/// is the same as the source IP address used by the other, connection
+/// collision has occurred." Deliberately IP-address-only, no ports: BGP's
+/// own asymmetry (one side always dials the peer's listening port 179; the
+/// other's local port is an OS-assigned ephemeral one) means a port-inclusive
+/// comparison would essentially never match a genuine collision.
+///
+/// Translating "source"/"destination" to what `TcpStream::local_addr()` /
+/// `peer_addr()` actually report takes care: those two calls always report
+/// "my end" / "their end" symmetrically, regardless of which side dialed —
+/// they are *not* source/destination in the RFC's packet-direction sense.
+/// For an outbound connection, local = source and peer = destination. For
+/// an inbound (accepted) one, local = destination and peer = source (the
+/// direction is reversed, precisely because the socket API doesn't care who
+/// initiated). Substituting that mapping into the RFC's own check — one
+/// outbound connection and one inbound connection — reduces to: **the same**
+/// local IP, **the same** peer IP, and opposite `origin`. All three are
+/// necessary:
+/// - Same local/peer alone (ignoring origin) also matches two *inbound*
+///   connections from the same peer, which is not a collision under the
+///   RFC's definition (no connection we dialed is involved at all).
+/// - Opposite origin alone (ignoring endpoints) also matches a multihomed
+///   local speaker's outbound dial from address A colliding with an
+///   unrelated inbound connection that happens to land on a *different*
+///   local address C — same peer, but not a reversed pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionIdentity {
+    local: IpAddr,
+    peer: IpAddr,
+    origin: ConnectionOrigin,
+}
+
+impl ConnectionIdentity {
+    fn is_reversed_pair_with(self, other: ConnectionIdentity) -> bool {
+        self.local == other.local && self.peer == other.peer && self.origin != other.origin
+    }
+}
+
+/// Captures a `TcpStream`'s local/peer IP addresses and pairs them with
+/// `origin`. `None` if either address lookup fails (should not happen for a
+/// connected socket, but this is used purely for the RFC 4271 §6.8 collision
+/// check, not correctness-load-bearing elsewhere — treat a lookup failure
+/// the same as "identity unknown," which conservatively fails the
+/// reversed-pair check).
+fn connection_identity(stream: &TcpStream, origin: ConnectionOrigin) -> Option<ConnectionIdentity> {
+    Some(ConnectionIdentity {
+        local: stream.local_addr().ok()?.ip(),
+        peer: stream.peer_addr().ok()?.ip(),
+        origin,
+    })
+}
+
+/// Which rule a staged candidate is being evaluated under — fixed at the
+/// moment it's staged (see `stage_collision_candidate`), not re-derived from
+/// the primary's state whenever the candidate happens to be resolved.
+///
+/// The primary can move through several states between a candidate being
+/// staged and that candidate finishing its own OPEN handshake (e.g. an
+/// `OpenConfirm`-staged candidate might not validate until the primary has
+/// already reached `Established`). Re-deriving "why was this staged" from
+/// whatever the primary's state happens to be *later* silently reinterprets
+/// the candidate: an RFC 4271 §6.8 collision candidate staged while the
+/// primary was mid-handshake must never be treated as an RFC 4724 §4.2 GR
+/// reconnect just because the primary went on to reach `Established`+GR in
+/// the meantime — GR renegotiating after staging doesn't retroactively make
+/// the candidate a GR reconnect, and adopting it that way would displace a
+/// healthy, just-established primary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionPurpose {
+    /// Staged while the primary was `OpenSent`/`OpenConfirm` — RFC 4271
+    /// §6.8. Requires a genuine reversed TCP pair.
+    Collision,
+    /// Staged while the primary was `Established` with GR negotiated — RFC
+    /// 4724 §4.2. Not gated on the reversed-pair check.
+    GracefulRestart,
+}
+
+/// A second incoming connection staged while resolving a potential RFC
+/// 4271 §6.8 collision or RFC 4724 §4.2 GR override.
+///
+/// `open` is `None` until the candidate has sent (and had validated) its
+/// own OPEN message. Once `Some`, the candidate is no longer read from —
+/// it's held pending a decision, which for an `OpenSent` existing
+/// connection may not be possible yet (see `try_resolve_pending_candidate`):
+/// RFC 4271 §6.8's tiebreak only applies once the existing connection's own
+/// peer BGP Identifier is known, and examining an `OpenSent` connection at
+/// all is only sanctioned "if [the implementation] knows the BGP Identifier
+/// of the peer by means outside of the protocol" — which this
+/// implementation doesn't have, so it must wait for the primary's own OPEN
+/// (or for the primary to fail) rather than guess.
+struct CollisionCandidate<T> {
+    transport: T,
+    identity: ConnectionIdentity,
+    open: Option<OpenMessage>,
+    purpose: CollisionPurpose,
+}
 
 // ── Transport trait ───────────────────────────────────────────────────────────
 
@@ -351,6 +472,65 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         connect_task: None,
         connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
         local_addr: None,
+        transport_identity: None,
+        pending_collision_candidate: None,
+        pending_collision_deadline: None,
+        collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
+        update_rx,
+        termination_reason: TerminationReason::Unclean,
+    };
+
+    tokio::spawn(session.run());
+    SpawnedSessionHandle {
+        cmd_tx,
+        event_rx,
+        update_tx,
+    }
+}
+
+/// Test-only variant of [`spawn`] that overrides
+/// `collision_candidate_open_timeout`, so collision-candidate-deadline tests
+/// can use a short, real (unpaused) wall-clock wait instead of
+/// `tokio::time::pause`, which races its own auto-advance-when-idle
+/// behavior against this module's real-TCP collision tests badly enough to
+/// deadlock outright (not just flake) rather than actually simulate elapsed
+/// time correctly alongside real socket I/O.
+#[cfg(test)]
+fn spawn_with_collision_timeout(
+    config: SessionConfig,
+    collision_candidate_open_timeout: std::time::Duration,
+) -> SpawnedSessionHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(64);
+    let (update_tx, update_rx) = mpsc::channel(256);
+
+    let fsm_config = FsmConfig {
+        local_as: config.local_as,
+        local_bgp_id: config.local_bgp_id,
+        hold_time: config.hold_time,
+        capabilities: config.capabilities.clone(),
+        required_capabilities: config.required_capabilities.clone(),
+        peer_as: config.peer_as,
+    };
+
+    let session: Session<FramedBgpTransport> = Session {
+        config,
+        fsm: Fsm::new(fsm_config),
+        cmd_rx,
+        event_tx,
+        hold_deadline: None,
+        keepalive_deadline: None,
+        retry_deadline: None,
+        transport: None,
+        pending_transport: None,
+        pending_input: None,
+        connect_task: None,
+        connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
+        local_addr: None,
+        transport_identity: None,
+        pending_collision_candidate: None,
+        pending_collision_deadline: None,
+        collision_candidate_open_timeout,
         update_rx,
         termination_reason: TerminationReason::Unclean,
     };
@@ -402,6 +582,10 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         connect_task: None,
         connect_factory: None,
         local_addr: None,
+        transport_identity: None,
+        pending_collision_candidate: None,
+        pending_collision_deadline: None,
+        collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
         update_rx,
         termination_reason: TerminationReason::Unclean,
     };
@@ -447,6 +631,29 @@ struct Session<T: BgpTransport> {
     // local address isn't silently discarded -- the daemon decides how to use
     // it per address family.
     local_addr: Option<IpAddr>,
+    // The local/peer IP addresses and initiator of `self.transport`'s TCP
+    // connection. `None` when `self.transport` is `None`. See
+    // `ConnectionIdentity`.
+    transport_identity: Option<ConnectionIdentity>,
+    // A second incoming connection staged while resolving a potential RFC
+    // 4271 §6.8 collision or RFC 4724 §4.2 GR override. `None` unless a
+    // genuine second connection is currently being staged or held pending
+    // the primary's own identity; see `CollisionCandidate`,
+    // `handle_collision_candidate_message`, and
+    // `try_resolve_pending_candidate`.
+    pending_collision_candidate: Option<CollisionCandidate<T>>,
+    // Deadline for `pending_collision_candidate` to send its OPEN. `None`
+    // once its OPEN has been read and validated (`CollisionCandidate::open`
+    // is `Some`) or whenever `pending_collision_candidate` is `None`.
+    pending_collision_deadline: Option<Instant>,
+    // How long to wait for a staged candidate's OPEN. Always
+    // `COLLISION_CANDIDATE_OPEN_TIMEOUT` in production; overridable in tests
+    // (`spawn_with_collision_timeout`) so the deadline can be exercised with
+    // real, unpaused wall-clock time instead of `tokio::time::pause()` —
+    // pausing time races its own auto-advance-when-idle behavior against
+    // this module's real-TCP collision tests, which can deadlock outright
+    // (confirmed while writing this fix's tests) rather than just flake.
+    collision_candidate_open_timeout: std::time::Duration,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
     // Reason for the most recent (or current) session termination.  Set just
@@ -482,6 +689,35 @@ impl<T: BgpTransport> Session<T> {
                     _ => TerminationReason::Unclean,
                 };
             }
+            // A deliberate, no-automatic-reconnect teardown — `ManualStop`
+            // (operator stop) or `NotificationToSend` (locally initiated
+            // administrative teardown: peer removal, RFC 9003 shutdown, or
+            // a daemon-detected condition with its own separate re-arm
+            // schedule; see its handler in `on_established`) — must close
+            // any staged/pending collision candidate outright, regardless
+            // of what FSM state it ends up in. Idle alone can't tell either
+            // of these apart from "the primary connection failed" (both
+            // land in Idle exactly like `TcpFailed`/`HoldTimerExpired`) —
+            // so `try_resolve_pending_candidate`'s Idle/Connect/Active
+            // adopt-directly path can't safely make that distinction on its
+            // own. `ProtocolErrorNotificationToSend` is deliberately *not*
+            // included here: unlike `NotificationToSend`, it schedules an
+            // automatic reconnect (`StartConnectRetryTimer`) just like a
+            // genuine failure, so a pending candidate is still fair game to
+            // adopt there. Evicting here, before the FSM even processes the
+            // input, closes the gap unconditionally: a candidate that was
+            // mid-validation is dropped without a NOTIFICATION (consistent
+            // with every other silent-rejection path in
+            // `handle_collision_candidate_message`), and one that had
+            // already validated never gets a chance to be adopted.
+            if matches!(
+                input,
+                FsmInput::ManualStop | FsmInput::NotificationToSend(_)
+            ) && let Some(candidate) = self.pending_collision_candidate.take()
+            {
+                drop(candidate);
+                self.pending_collision_deadline = None;
+            }
             let outputs = self.fsm.process(input);
             if !self.execute(outputs).await {
                 // A TCP send failed; feed TcpFailed back into the FSM.
@@ -489,6 +725,13 @@ impl<T: BgpTransport> Session<T> {
                 let recovery = self.fsm.process(FsmInput::TcpFailed);
                 self.execute(recovery).await;
             }
+            // Cheap no-op unless a collision candidate is both staged and
+            // already holding a validated OPEN (see `CollisionCandidate`).
+            // Whatever `input` just did to `self.fsm`'s state — reaching
+            // OpenConfirm from OpenSent (learning the primary's own peer
+            // BGP Identifier for the first time) or dying entirely — may be
+            // exactly what a deferred candidate decision was waiting on.
+            self.try_resolve_pending_candidate().await;
         }
     }
 
@@ -510,6 +753,7 @@ impl<T: BgpTransport> Session<T> {
             let hold = deadline_fut(self.hold_deadline);
             let keepalive = deadline_fut(self.keepalive_deadline);
             let retry = deadline_fut(self.retry_deadline);
+            let collision_deadline = deadline_fut(self.pending_collision_deadline);
 
             tokio::select! {
                 biased;
@@ -522,7 +766,7 @@ impl<T: BgpTransport> Session<T> {
                         return FsmInput::NotificationToSend(msg);
                     }
                     Some(SessionCommand::IncomingConnection(stream)) => {
-                        if let Some(input) = self.handle_incoming_connection(stream).await {
+                        if let Some(input) = self.handle_incoming_connection(stream) {
                             return input;
                         }
                         // Won the collision: incoming rejected, outbound continues.
@@ -552,6 +796,8 @@ impl<T: BgpTransport> Session<T> {
                     return match result {
                         Ok(stream) => {
                             self.local_addr = stream.local_addr().ok().map(|a| a.ip());
+                            self.transport_identity =
+                                connection_identity(&stream, ConnectionOrigin::Outbound);
                             // connect_task is only spawned when connect_factory is Some.
                             self.transport = Some(self.connect_factory.as_ref().unwrap()(stream));
                             FsmInput::TcpConnected
@@ -561,29 +807,30 @@ impl<T: BgpTransport> Session<T> {
                 }
 
                 msg = recv_message(&mut self.transport) => {
-                    match msg {
-                        Some(Ok(BgpMessage::MalformedUpdate(m))) => {
-                            if let Some(input) = self.handle_malformed_update(m).await {
-                                return input;
-                            }
-                            // Session stays up — continue the select! loop.
-                        }
-                        Some(Ok(m)) => return FsmInput::MessageReceived(m),
-                        Some(Err(e)) => {
-                            tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
-                            if let Some(notif) = header_error_notification(&e)
-                                && let Some(t) = &mut self.transport
-                            {
-                                let _ = t.send(BgpMessage::Notification(notif)).await;
-                            }
-                            self.drop_connection();
-                            return FsmInput::TcpFailed;
-                        }
-                        None => {
-                            self.drop_connection();
-                            return FsmInput::TcpFailed;
-                        }
+                    if let Some(input) = self.handle_primary_message(msg).await {
+                        return input;
                     }
+                }
+
+                // A staged collision candidate (see `handle_incoming_connection`)
+                // sent its first message. Doesn't itself return an `FsmInput`
+                // to this select loop — any resulting FSM transitions are
+                // driven synchronously inside `handle_collision_candidate_message`
+                // / `try_resolve_pending_candidate`, since adopting a candidate
+                // can mean feeding the FSM two follow-up inputs in sequence
+                // (TcpConnected, then the candidate's own OPEN), which the
+                // single-slot `pending_input` bypass can't queue.
+                msg = recv_candidate_message(&mut self.pending_collision_candidate) => {
+                    self.handle_collision_candidate_message(msg).await;
+                }
+
+                () = collision_deadline => {
+                    tracing::debug!(
+                        peer = %self.config.peer_addr,
+                        "collision candidate timed out waiting for its OPEN; dropping it"
+                    );
+                    self.pending_collision_candidate = None;
+                    self.pending_collision_deadline = None;
                 }
 
                 () = hold => {
@@ -616,85 +863,380 @@ impl<T: BgpTransport> Session<T> {
         }
     }
 
-    /// RFC 4271 §6.8 connection collision detection.
+    /// RFC 4271 §6.8 connection collision detection / RFC 4724 §4.2 GR
+    /// override — entry point.
     ///
-    /// Called when the daemon's listener accepts an inbound TCP connection from
-    /// this peer.  Returns `Some(FsmInput)` when the session should adopt the
-    /// incoming connection (the FSM will process the input normally), or `None`
-    /// when the incoming connection was rejected and the outbound connection
-    /// should continue undisturbed.
-    async fn handle_incoming_connection(&mut self, stream: TcpStream) -> Option<FsmInput> {
+    /// Called when the daemon's listener accepts an inbound TCP connection
+    /// from this peer. When there's no existing connection to protect
+    /// (`Idle`/`Connect`/`Active`), adopts it immediately. When there IS one
+    /// (`OpenSent`/`OpenConfirm`, or `Established` with Graceful Restart
+    /// negotiated), the incoming connection is *staged*, not decided on the
+    /// spot: RFC 4271 §6.8's own procedure operates on "the BGP Identifier
+    /// of the remote system as specified in the [new] OPEN message," which
+    /// isn't known yet at TCP-accept time. See `resolve_collision_candidate`
+    /// for the actual decision, made once that OPEN is read.
+    ///
+    /// Returns `Some(FsmInput)` only for the immediate-adopt case; the
+    /// staged case always returns `None` here (the eventual decision surfaces
+    /// asynchronously through `wait_for_input`'s `pending_collision_candidate`
+    /// arm).
+    fn handle_incoming_connection(&mut self, stream: TcpStream) -> Option<FsmInput> {
         use crate::fsm::State;
+
+        // Only one staged candidate at a time. A further incoming connection
+        // arriving while one is already being validated is rejected outright
+        // rather than juggling multiple unconfirmed candidates.
+        if self.pending_collision_candidate.is_some() {
+            tracing::debug!(
+                peer = %self.config.peer_addr,
+                "rejecting incoming connection: a collision candidate is already staged"
+            );
+            drop(stream);
+            return None;
+        }
+
         match self.fsm.state() {
             // No active outbound attempt — accept the incoming connection directly.
             State::Idle | State::Connect | State::Active => {
                 self.local_addr = stream.local_addr().ok().map(|a| a.ip());
+                self.transport_identity = connection_identity(&stream, ConnectionOrigin::Inbound);
                 if let Some(factory) = &self.connect_factory {
                     self.transport = Some(factory(stream));
                 }
                 Some(FsmInput::TcpConnected)
             }
 
-            // Collision: compare BGP identifiers (RFC 4271 §6.8).
-            //
-            // RFC 4271 §6.8: "the local system compares the BGP Identifier
-            // of the local system to the BGP Identifier of the remote
-            // system... If the value of the local BGP Identifier is less
-            // than the remote one, the local system closes the BGP
-            // connection that already exists (the one that is already in
-            // the OpenConfirm state), and accepts the BGP connection
-            // initiated by the remote system. Otherwise, the local system
-            // closes the newly created BGP connection... and continues to
-            // use the existing one."
-            //
-            // "The existing one" is always our locally-initiated (outbound)
-            // connection in this codebase's model (this function is only
-            // called for a *new incoming* connection colliding with our own
-            // outbound attempt) — so:
-            // local < peer  →  close outbound, adopt incoming (CollisionDetected)
-            // local > peer  →  keep outbound, discard incoming (return None)
-            // unknown peer  →  conservative: adopt incoming
+            // A connection already exists that this candidate might collide
+            // with (OpenSent/OpenConfirm) or might be a GR reconnect for
+            // (Established). Stage it — wrap it via the same connect_factory
+            // used for a direct accept, but hold it separately from
+            // `self.transport` until its OPEN is read and validated.
             State::OpenSent | State::OpenConfirm => {
-                let should_close_outbound = self
-                    .fsm
-                    .peer_bgp_id()
-                    .is_none_or(|peer_id| self.config.local_bgp_id < peer_id);
+                self.stage_collision_candidate(stream, CollisionPurpose::Collision);
+                None
+            }
+            State::Established if self.fsm.peer_has_graceful_restart() => {
+                self.stage_collision_candidate(stream, CollisionPurpose::GracefulRestart);
+                None
+            }
 
-                if should_close_outbound {
-                    tracing::info!(
-                        peer = %self.config.peer_addr,
-                        local_bgp_id = %self.config.local_bgp_id,
-                        "BGP collision: local BGP ID lower, closing outbound and adopting incoming"
-                    );
-                    let outputs = self.fsm.process(FsmInput::CollisionDetected);
-                    self.execute(outputs).await;
-                    self.local_addr = stream.local_addr().ok().map(|a| a.ip());
-                    if let Some(factory) = &self.connect_factory {
-                        self.transport = Some(factory(stream));
+            // Already established, no Graceful Restart — reject the incoming
+            // connection outright. RFC 4271 §6.8: "a connection collision
+            // with an existing BGP connection that is in the Established
+            // state causes closing of the newly created connection" — no
+            // BGP-Identifier comparison applies here at all, so there's
+            // nothing to stage or read.
+            State::Established => {
+                tracing::warn!(
+                    peer = %self.config.peer_addr,
+                    "BGP collision: already established, rejecting duplicate incoming connection"
+                );
+                drop(stream);
+                None
+            }
+        }
+    }
+
+    /// Wraps `stream` via `connect_factory` and stores it as
+    /// `pending_collision_candidate`, starting the OPEN-wait deadline. A
+    /// no-op (drops `stream`) if no `connect_factory` is configured
+    /// (injected-transport/test mode without one set up), or if the
+    /// identity can't be determined (conservatively refuse to stage
+    /// something we can't ever prove is a genuine reversed pair). Always
+    /// `Inbound` — every candidate arrives via `SessionCommand::IncomingConnection`.
+    ///
+    /// `purpose` is fixed here, at staging time, from the primary's state at
+    /// this exact moment — see `CollisionPurpose` for why it must not be
+    /// re-derived later from whatever the primary's state has become by the
+    /// time the candidate is actually resolved.
+    fn stage_collision_candidate(&mut self, stream: TcpStream, purpose: CollisionPurpose) {
+        let Some(identity) = connection_identity(&stream, ConnectionOrigin::Inbound) else {
+            return;
+        };
+        let Some(factory) = &self.connect_factory else {
+            return;
+        };
+        self.pending_collision_candidate = Some(CollisionCandidate {
+            transport: factory(stream),
+            identity,
+            open: None,
+            purpose,
+        });
+        self.pending_collision_deadline =
+            Some(Instant::now() + self.collision_candidate_open_timeout);
+    }
+
+    /// Handles the first message read from a staged collision candidate
+    /// (called from `wait_for_input`'s select loop once
+    /// `pending_collision_candidate` produces one — only fires while
+    /// `open` is still `None`, i.e. before the candidate has proven itself;
+    /// see `recv_candidate_message`).
+    ///
+    /// Validates the OPEN (RFC 4271 §6.2 — version, BGP Identifier, peer
+    /// AS, hold time; RFC 5492 §3 required capabilities; RFC 9234 §5.1 Role
+    /// compatibility) and the reversed-pair endpoint check (RFC 4271 §6.8)
+    /// immediately — both are already fully knowable and don't depend on
+    /// anything the primary connection might still be waiting on. Anything
+    /// other than a valid OPEN from a genuine reversed pair means the
+    /// candidate is dropped here and now; the existing connection (if any)
+    /// is never touched.
+    ///
+    /// A candidate that clears both checks isn't necessarily *decided* yet
+    /// — seeing `try_resolve_pending_candidate`.
+    async fn handle_collision_candidate_message(
+        &mut self,
+        msg: Option<Result<BgpMessage, FramingError>>,
+    ) {
+        let Some(mut candidate) = self.pending_collision_candidate.take() else {
+            return;
+        };
+        self.pending_collision_deadline = None;
+
+        let open = match msg {
+            Some(Ok(BgpMessage::Open(open))) => open,
+            Some(Ok(other)) => {
+                tracing::debug!(
+                    peer = %self.config.peer_addr,
+                    message = ?other,
+                    "collision candidate's first message was not an OPEN; dropping it"
+                );
+                drop(candidate);
+                return;
+            }
+            Some(Err(e)) => {
+                tracing::debug!(
+                    peer = %self.config.peer_addr,
+                    error = %e,
+                    "codec error reading collision candidate's OPEN; dropping it"
+                );
+                drop(candidate);
+                return;
+            }
+            None => {
+                tracing::debug!(
+                    peer = %self.config.peer_addr,
+                    "collision candidate closed before sending an OPEN; dropping it"
+                );
+                drop(candidate);
+                return;
+            }
+        };
+
+        if let Err((error, data)) = self.fsm.validate_open(&open) {
+            tracing::warn!(
+                peer = %self.config.peer_addr,
+                candidate_bgp_id = %open.bgp_id,
+                error = ?error,
+                "rejecting collision candidate: OPEN failed validation; \
+                 existing connection (if any) left undisturbed"
+            );
+            let _ = candidate
+                .transport
+                .send(BgpMessage::Notification(NotificationMessage {
+                    error,
+                    data,
+                }))
+                .await;
+            drop(candidate);
+            return;
+        }
+
+        // RFC 4271 §6.8's own collision definition only applies to a
+        // genuine reversed pair. This check doesn't depend on any
+        // FSM-state-specific logic — it's already fully known — so it's
+        // resolved here immediately rather than deferred, unlike the
+        // BGP-Identifier tiebreak below (which needs `try_resolve_pending_candidate`
+        // for the `OpenSent` case). Skipped entirely for a GR-purpose
+        // candidate (not a simultaneous-dial scenario at all — see
+        // `try_resolve_pending_candidate`'s doc comment).
+        //
+        // Gated on `candidate.purpose` (fixed at staging time), not on
+        // `self.fsm.state()` right now — the primary may have already moved
+        // on from OpenSent/OpenConfirm to Established by the time this
+        // candidate's OPEN arrives, and re-deriving "is this a collision
+        // candidate" from the *current* state would wrongly skip the check
+        // for what was, in fact, staged as a genuine §6.8 collision
+        // candidate. See `CollisionPurpose`.
+        let needs_reversed_pair = candidate.purpose == CollisionPurpose::Collision;
+        if needs_reversed_pair
+            && !self
+                .transport_identity
+                .is_some_and(|e| e.is_reversed_pair_with(candidate.identity))
+        {
+            tracing::warn!(
+                peer = %self.config.peer_addr,
+                candidate_bgp_id = %open.bgp_id,
+                candidate_identity = ?candidate.identity,
+                existing_identity = ?self.transport_identity,
+                "rejecting collision candidate: not a reversed-direction TCP \
+                 pair per RFC 4271 §6.8"
+            );
+            drop(candidate);
+            return;
+        }
+
+        candidate.open = Some(open);
+        self.pending_collision_candidate = Some(candidate);
+        self.try_resolve_pending_candidate().await;
+    }
+
+    /// Attempts to resolve a staged, already-validated collision candidate
+    /// (`pending_collision_candidate.open.is_some()`) against the *current*
+    /// primary-connection state. Called right after a candidate clears
+    /// validation, and unconditionally after every `FsmInput` `run()`
+    /// processes — covering both events that might newly permit a decision
+    /// that couldn't be made when the candidate first validated: the
+    /// primary reaching `OpenConfirm` from `OpenSent` (learning its peer's
+    /// real BGP Identifier for the first time) or dying entirely. A cheap
+    /// no-op whenever there's no candidate, or it hasn't validated an OPEN
+    /// yet, or the primary's own state still doesn't permit a decision.
+    ///
+    /// RFC 4271 §6.8's collision-resolution procedure only triggers when an
+    /// existing connection's peer BGP Identifier equals the *new*
+    /// connection's, as carried in its own OPEN message. The pre-fix
+    /// version of this code ignored that in `OpenSent` — it just always
+    /// adopted, since the existing connection's ID isn't known yet — but
+    /// RFC 4271 §6.8 doesn't sanction examining an `OpenSent` connection at
+    /// all except "if [the implementation] knows the BGP Identifier of the
+    /// peer by means outside of the protocol," which this implementation
+    /// has no way to do. So rather than guessing, an `OpenSent` primary
+    /// defers the decision until its own OPEN arrives (or it dies).
+    ///
+    /// Also applies the identical identity gap fix to the RFC 4724 §4.2 GR
+    /// override, which previously had no identity check at all — any second
+    /// incoming connection while Established-with-GR unconditionally
+    /// displaced the live session.
+    ///
+    /// Every branch below is additionally gated on `candidate.purpose`
+    /// (fixed at staging time — see `CollisionPurpose`), never solely on
+    /// `self.fsm.state()` as it stands *now*. A candidate staged as an RFC
+    /// 4271 §6.8 collision candidate (while the primary was still
+    /// `OpenSent`/`OpenConfirm`) must never be adopted via the RFC 4724
+    /// §4.2 GR path just because the primary went on to negotiate GR and
+    /// reach `Established` while the candidate was still pending — that
+    /// would displace a healthy, just-established primary based on stale
+    /// context from before it ever finished its own handshake.
+    async fn try_resolve_pending_candidate(&mut self) {
+        use crate::fsm::State;
+
+        let Some(candidate) = &self.pending_collision_candidate else {
+            return;
+        };
+        let Some(open) = candidate.open.clone() else {
+            return;
+        };
+        let purpose = candidate.purpose;
+
+        let adopt = match self.fsm.state() {
+            // Primary's own identity still unknown — wait for its own OPEN
+            // (or for it to die, landing in Idle/Connect/Active below) to
+            // resolve this later. The reversed-pair check already ran (see
+            // `handle_collision_candidate_message`); only identity remains
+            // pending. A GR-purpose candidate has no business seeing
+            // OpenSent (GR candidates are only ever staged while
+            // Established) — stale context from a primary that has since
+            // cycled all the way back through a fresh reconnect; drop it.
+            State::OpenSent if purpose == CollisionPurpose::Collision => return,
+
+            // The existing connection's peer ID IS known — RFC 4271 §6.8
+            // only applies when it equals the candidate's. If it doesn't,
+            // this isn't a genuine collision with the existing connection;
+            // reject the candidate rather than letting an unexpected
+            // identity influence it. Not reachable for a GR-purpose
+            // candidate (staged only while Established) except via the same
+            // stale-context path as the OpenSent arm above.
+            State::OpenConfirm if purpose == CollisionPurpose::Collision => {
+                match self.fsm.peer_bgp_id() {
+                    Some(existing_id) if existing_id == open.bgp_id => {
+                        self.config.local_bgp_id < open.bgp_id
                     }
-                    Some(FsmInput::TcpConnected)
-                } else {
-                    let peer_bgp_id = self.fsm.peer_bgp_id().unwrap();
-                    tracing::info!(
-                        peer = %self.config.peer_addr,
-                        local_bgp_id = %self.config.local_bgp_id,
-                        peer_bgp_id = %peer_bgp_id,
-                        "BGP collision: local BGP ID higher, keeping outbound and rejecting incoming"
-                    );
-                    drop(stream);
-                    None
+                    Some(_) => false,
+                    None => return, // Shouldn't happen in OpenConfirm; wait rather than guess.
                 }
             }
 
-            // RFC 4724 §4.2: if the peer advertised Graceful Restart, a new
-            // incoming connection while we still think we're Established is
-            // proof the old TCP session died without our noticing — adopt it
-            // (no NOTIFICATION, unlike RFC 4271 §6.8's default). Otherwise
-            // keep the plain §6.8 behavior: reject the duplicate outright.
-            State::Established if self.fsm.peer_has_graceful_restart() => {
+            // RFC 4724 §4.2 override: only a reconnection *by the same peer*
+            // may silently displace the live session. Not gated on the
+            // reversed-pair check — GR reconnection ("old TCP died, same
+            // peer dialed in again") isn't RFC 4271 §6.8's simultaneous-dial
+            // scenario and has no such requirement. Requires the candidate
+            // to have actually been staged as a GR reconnect — a
+            // Collision-purpose candidate reaching this arm means the
+            // primary completed its handshake while the candidate was still
+            // pending; that candidate keeps its original §6.8 meaning and
+            // must not be reinterpreted as a GR reconnect just because GR
+            // happened to be negotiated on the primary's new session.
+            State::Established
+                if purpose == CollisionPurpose::GracefulRestart
+                    && self.fsm.peer_has_graceful_restart() =>
+            {
+                self.fsm.peer_bgp_id() == Some(open.bgp_id)
+            }
+
+            // The connection this candidate was staged against (or was
+            // waiting on, if deferred from OpenSent) is already gone —
+            // nothing left to protect. Adopt it directly, same as a fresh
+            // accepted connection. (An operator-issued ManualStop is
+            // handled earlier, in `run()`, by evicting the candidate
+            // outright before this function ever sees it — so reaching this
+            // arm always means a genuine primary failure, not a deliberate
+            // stop.)
+            State::Idle | State::Connect | State::Active => true,
+
+            // Every other combination is stale context: a GR-purpose
+            // candidate seeing OpenSent/OpenConfirm (the primary cycled all
+            // the way back through a fresh reconnect since staging), a
+            // Collision-purpose candidate seeing OpenConfirm with a
+            // mismatched peer ID, or Established with either a
+            // Collision-purpose candidate (the primary completed its
+            // handshake while this candidate was still pending — it keeps
+            // its original §6.8 meaning, not a GR reconnect) or a
+            // GR-purpose candidate whose GR negotiation no longer holds.
+            // Drop it rather than risk disrupting an unrelated, healthy
+            // connection.
+            State::OpenSent | State::OpenConfirm | State::Established => false,
+        };
+
+        let candidate = self
+            .pending_collision_candidate
+            .take()
+            .expect("checked Some above; state() calls above don't touch this field");
+
+        if !adopt {
+            tracing::warn!(
+                peer = %self.config.peer_addr,
+                candidate_bgp_id = %open.bgp_id,
+                fsm_state = ?self.fsm.state(),
+                "rejecting collision candidate: BGP Identifier does not match \
+                 the existing connection's peer (or the existing connection \
+                 has moved on)"
+            );
+            drop(candidate);
+            return;
+        }
+
+        match self.fsm.state() {
+            // `adopt` is only ever `true` for `OpenSent` when `purpose` is
+            // `Collision`, and that arm `return`s early to defer — so
+            // reaching here with `adopt == true` while still `OpenSent` is
+            // impossible.
+            State::OpenSent => unreachable!(
+                "try_resolve_pending_candidate: adopt=true is unreachable while OpenSent"
+            ),
+            State::OpenConfirm => {
                 tracing::info!(
                     peer = %self.config.peer_addr,
-                    "BGP collision: peer has Graceful Restart, adopting incoming \
+                    local_bgp_id = %self.config.local_bgp_id,
+                    candidate_bgp_id = %open.bgp_id,
+                    "BGP collision: adopting validated incoming connection, closing existing"
+                );
+                let outputs = self.fsm.process(FsmInput::CollisionDetected);
+                self.execute(outputs).await;
+            }
+            State::Established => {
+                tracing::info!(
+                    peer = %self.config.peer_addr,
+                    "BGP collision: peer has Graceful Restart, adopting validated incoming \
                      connection over presumed-dead Established session"
                 );
                 // execute() reads self.termination_reason when it forwards
@@ -707,23 +1249,27 @@ impl<T: BgpTransport> Session<T> {
                 self.termination_reason = TerminationReason::Unclean;
                 let outputs = self.fsm.process(FsmInput::CollisionDetected);
                 self.execute(outputs).await;
-                self.local_addr = stream.local_addr().ok().map(|a| a.ip());
-                if let Some(factory) = &self.connect_factory {
-                    self.transport = Some(factory(stream));
-                }
-                Some(FsmInput::TcpConnected)
             }
-
-            // Already established, no Graceful Restart — reject the incoming connection.
-            State::Established => {
-                tracing::warn!(
-                    peer = %self.config.peer_addr,
-                    "BGP collision: already established, rejecting duplicate incoming connection"
-                );
-                drop(stream);
-                None
+            State::Idle | State::Connect | State::Active => {
+                // Nothing to tear down.
             }
         }
+
+        self.transport = Some(candidate.transport);
+        self.transport_identity = Some(candidate.identity);
+        self.local_addr = Some(candidate.identity.local);
+        // Drive both follow-up transitions synchronously here rather than
+        // via the wait_for_input()/pending_input bypass (which only holds
+        // one queued input): TcpConnected (Active/whatever-state -> OpenSent,
+        // sends our OPEN), then the candidate's already-validated OPEN
+        // (OpenSent -> OpenConfirm, sends our KEEPALIVE) — it was already
+        // consumed reading it off the wire, so it can't be read again.
+        let outputs = self.fsm.process(FsmInput::TcpConnected);
+        self.execute(outputs).await;
+        let outputs = self
+            .fsm
+            .process(FsmInput::MessageReceived(BgpMessage::Open(open)));
+        self.execute(outputs).await;
     }
 
     /// Execute a batch of FSM outputs. Returns `false` if a TCP send failed;
@@ -736,6 +1282,9 @@ impl<T: BgpTransport> Session<T> {
                     if let Some(t) = self.pending_transport.take() {
                         // Injected-transport path: activate immediately and queue
                         // TcpConnected so the FSM advances on the next loop tick.
+                        // No real TcpStream here, so no endpoints to capture —
+                        // harmless, since this test/mock-only path never stages
+                        // a real collision candidate to compare against.
                         self.transport = Some(t);
                         self.pending_input = Some(FsmInput::TcpConnected);
                     } else if self.connect_factory.is_some() {
@@ -809,6 +1358,32 @@ impl<T: BgpTransport> Session<T> {
         true
     }
 
+    /// Handles one decoded (or failed-to-decode) message from the primary
+    /// transport, called from `wait_for_input`'s select loop.
+    async fn handle_primary_message(
+        &mut self,
+        msg: Option<Result<BgpMessage, FramingError>>,
+    ) -> Option<FsmInput> {
+        match msg {
+            Some(Ok(BgpMessage::MalformedUpdate(m))) => self.handle_malformed_update(m).await,
+            Some(Ok(m)) => Some(FsmInput::MessageReceived(m)),
+            Some(Err(e)) => {
+                tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
+                if let Some(notif) = header_error_notification(&e)
+                    && let Some(t) = &mut self.transport
+                {
+                    let _ = t.send(BgpMessage::Notification(notif)).await;
+                }
+                self.drop_connection();
+                Some(FsmInput::TcpFailed)
+            }
+            None => {
+                self.drop_connection();
+                Some(FsmInput::TcpFailed)
+            }
+        }
+    }
+
     /// Apply RFC 7606 error policy for a malformed UPDATE.
     ///
     /// - `SessionReset` (RFC 7606 §3(g): a duplicated `MP_REACH_NLRI` or
@@ -862,6 +1437,7 @@ impl<T: BgpTransport> Session<T> {
 
     fn drop_connection(&mut self) {
         self.transport = None;
+        self.transport_identity = None;
         if let Some(t) = self.connect_task.take() {
             t.abort();
         }
@@ -992,24 +1568,40 @@ async fn recv_message<T: BgpTransport>(
     }
 }
 
+/// Resolves with the next decoded message from a staged collision
+/// candidate, or never if none is currently staged.
+async fn recv_candidate_message<T: BgpTransport>(
+    candidate: &mut Option<CollisionCandidate<T>>,
+) -> Option<Result<BgpMessage, FramingError>> {
+    match candidate {
+        // Only poll a candidate that hasn't validated an OPEN yet — one
+        // that has is held pending a decision (see
+        // `try_resolve_pending_candidate`), not read from further.
+        Some(c) if c.open.is_none() => c.transport.recv().await,
+        _ => std::future::pending::<Option<Result<BgpMessage, FramingError>>>().await,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
 
     use std::net::Ipv4Addr as StdIpv4Addr;
 
     use super::{
-        BgpTransport, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand,
-        SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason,
-        spawn_with,
+        BgpTransport, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity, ConnectionOrigin,
+        DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand, SessionConfig,
+        SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason, spawn, spawn_with,
+        spawn_with_collision_timeout,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
@@ -1017,7 +1609,7 @@ mod tests {
     use crate::message::{
         AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CeaseError, CodecError,
         MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
-        PathAttribute, UpdateMessage, UpdateMsgError,
+        OpenMsgError, PathAttribute, UpdateMessage, UpdateMsgError,
     };
 
     // ── MockTransport ─────────────────────────────────────────────────────────
@@ -1134,6 +1726,132 @@ mod tests {
             matches!(event, SessionEvent::Established(_)),
             "expected Established, got {event:?}"
         );
+    }
+
+    // ── Collision-candidate test helpers ────────────────────────────────────
+    //
+    // Unlike the rest of this module, the collision tests below use the
+    // production `spawn()` entry point (`Session<FramedBgpTransport>`) with
+    // real TCP loopback sockets on *both* the existing and candidate sides,
+    // rather than `MockTransport`. This is required, not just preferred:
+    // `spawn_with`'s `MockTransport` harness never sets `connect_factory`
+    // (see `spawn_with`), so `stage_collision_candidate` — which needs a
+    // `connect_factory` to wrap an incoming `TcpStream` into `T` — is
+    // structurally unable to stage anything under it. A real socket pair is
+    // the only way to exercise the staged-candidate code path at all.
+
+    /// Spawns a real (`spawn()`-based) session whose outbound dial lands on
+    /// a test-controlled `TcpListener`, drives it to `OpenConfirm` with the
+    /// peer's OPEN carrying `peer_bgp_id`, and returns the handle plus a
+    /// `FramedBgpTransport` for driving that "existing" peer side further.
+    /// The peer's own KEEPALIVE is deliberately withheld so the session
+    /// stays in `OpenConfirm`.
+    async fn spawn_to_open_confirm(
+        peer_bgp_id: Ipv4Addr,
+    ) -> (SpawnedSessionHandle, FramedBgpTransport) {
+        spawn_to_open_confirm_with_timeout(peer_bgp_id, COLLISION_CANDIDATE_OPEN_TIMEOUT).await
+    }
+
+    /// Same as `spawn_to_open_confirm`, but overrides the candidate
+    /// OPEN-wait deadline — see `spawn_with_collision_timeout`.
+    async fn spawn_to_open_confirm_with_timeout(
+        peer_bgp_id: Ipv4Addr,
+        collision_candidate_open_timeout: Duration,
+    ) -> (SpawnedSessionHandle, FramedBgpTransport) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+
+        let handle = spawn_with_collision_timeout(config, collision_candidate_open_timeout);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut peer = FramedBgpTransport::from_stream(stream);
+
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error on session's OPEN");
+        assert!(
+            matches!(sent_open, BgpMessage::Open(_)),
+            "expected OPEN from session, got {sent_open:?}"
+        );
+
+        let mut open = peer_open();
+        if let BgpMessage::Open(ref mut o) = open {
+            o.bgp_id = peer_bgp_id;
+        }
+        peer.send(open).await.unwrap();
+
+        let ka = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error on session's KEEPALIVE");
+        assert!(
+            matches!(ka, BgpMessage::Keepalive),
+            "expected KEEPALIVE (OpenConfirm entry) from session, got {ka:?}"
+        );
+
+        (handle, peer)
+    }
+
+    /// Real TCP loopback pair for injecting a "candidate" incoming
+    /// connection: the first element is handed to
+    /// `SessionCommand::IncomingConnection`; the second is a
+    /// `FramedBgpTransport` the test uses to act as the candidate's remote
+    /// peer (send its OPEN, read what the session sends back, etc).
+    async fn candidate_pair() -> (TcpStream, FramedBgpTransport) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (incoming, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (accepted_stream, _) = accepted.unwrap();
+        (
+            incoming.unwrap(),
+            FramedBgpTransport::from_stream(accepted_stream),
+        )
+    }
+
+    /// Drives a real-TCP `existing_peer` connection through a full OPEN/
+    /// KEEPALIVE handshake advertising Graceful Restart, and asserts the
+    /// session reaches `Established` with GR negotiated. Shared by tests
+    /// that need a genuinely Established+GR primary to stage a
+    /// `CollisionPurpose::GracefulRestart` candidate against.
+    async fn establish_with_gr(
+        peer_bgp_id: Ipv4Addr,
+        existing_peer: &mut FramedBgpTransport,
+        handle: &mut SpawnedSessionHandle,
+    ) {
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+
+        let mut gr_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = gr_open {
+            open.bgp_id = peer_bgp_id;
+            open.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        existing_peer.send(gr_open).await.unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for initial Established")
+            .expect("session channel closed before Established");
+        assert!(matches!(event, SessionEvent::Established(_)));
     }
 
     /// Extract the inner `UpdateMessage` from a `RouteUpdate` event.
@@ -1722,83 +2440,52 @@ mod tests {
     }
 
     /// RFC 4271 §6.8, collision resolution rule 2 (quoted verbatim from
-    /// rfc-editor.org/rfc/rfc4271, re-fetched fresh for this fix rather than
-    /// trusting `RFC_AUDIT.md`'s paraphrase):
+    /// rfc-editor.org/rfc/rfc4271):
     ///
     /// > If the value of the local BGP Identifier is less than the remote
     /// > one, the local system closes the BGP connection that already
     /// > exists (the one that is already in the OpenConfirm state), and
     /// > accepts the BGP connection initiated by the remote system.
     ///
-    /// `local_bgp_id` = 10.0.0.1 (`test_config()`), peer's BGP ID (from its
-    /// OPEN) = 10.0.0.2 — local < peer, so the *existing* (outbound,
-    /// mock-backed) connection MUST be closed and the incoming one adopted.
-    /// This is the corrected version of a test that used to assert the
-    /// opposite (`test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming`,
-    /// pre-fix) — that test's own scenario (peer ID higher) was previously
-    /// asserted to keep the outbound connection, which is exactly backwards
-    /// per the rule quoted above.
+    /// `local_bgp_id` = 10.0.0.1 (`test_config()`), candidate's BGP ID
+    /// (from its OPEN) = 10.0.0.2, matching the existing connection's
+    /// already-known peer ID — a genuine same-peer collision. local < peer,
+    /// so the existing connection must be closed and the candidate adopted.
     ///
-    /// This test verifies the *decision* (existing connection torn down)
-    /// rather than completing a second handshake over the newly-adopted
-    /// incoming socket: `MockTransport` in this harness is purely
-    /// channel-based (see `MockTransport::pair` below) with no
-    /// `connect_factory` to bridge a raw `TcpStream` into it, so it can't
-    /// meaningfully simulate a fresh handshake completing over an adopted
-    /// connection. That end-to-end proof — that a session actually
-    /// re-establishes over the winning connection against a real,
-    /// independently-implemented peer — belongs in a real e2e/interop test
-    /// (see `pathvector-e2e`), not a unit test built on mocks that would
-    /// just re-encode our own assumptions about both sides of the wire.
+    /// Unlike the pre-fix version of this test, this one completes a real
+    /// second handshake over the adopted connection and confirms
+    /// `Established` — possible now because `spawn()` gives the candidate a
+    /// real `connect_factory`-wrapped transport, not a mock with nowhere to
+    /// bridge a raw `TcpStream` into.
     #[tokio::test]
-    async fn test_collision_in_open_confirm_local_id_lower_closes_outbound_adopts_incoming() {
-        use tokio::net::TcpListener;
+    async fn test_collision_candidate_matching_id_lower_local_adopts_incoming_end_to_end() {
+        let candidate_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut handle, mut existing_peer) = spawn_to_open_confirm(candidate_bgp_id).await;
 
-        // local_bgp_id = 10.0.0.1, peer_open uses bgp_id = 10.0.0.2 (higher).
-        let (mock, mut peer) = MockTransport::pair();
-        let handle = spawn_with(test_config(), mock);
-        handle.start().await;
-
-        // Receive the OPEN the session sent.
-        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
-            .await
-            .expect("timed out waiting for OPEN")
-            .expect("channel closed before OPEN");
-
-        // Inject peer OPEN with higher BGP ID (10.0.0.2 > 10.0.0.1 local).
-        peer.recv_tx.send(Ok(peer_open())).unwrap();
-
-        // Wait for the session's KEEPALIVE — confirms it is now in OpenConfirm
-        // and has recorded the peer's BGP ID.
-        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
-            .await
-            .expect("timed out waiting for KEEPALIVE")
-            .expect("channel closed before KEEPALIVE");
-
-        // Create a real TcpStream to inject as an incoming connection.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (incoming, _) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
-        let incoming = incoming.unwrap();
-
+        let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
 
-        // local (10.0.0.1) < peer (10.0.0.2): the existing (mock-backed)
-        // outbound connection must be closed. The FSM's CollisionDetected
-        // arm sends a Cease/ConnectionCollisionResolution NOTIFICATION
-        // (RFC 4271 §8.2.2) before `CloseTcpConnection` drops `self.transport`
-        // (see `drop_connection`), which drops the mock's `send_tx` half — so
-        // `peer.send_rx` must observe the NOTIFICATION and then the channel
-        // closing (`None`), proving the old connection was actually torn
-        // down rather than kept alive.
-        let notification = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        // Candidate's OPEN carries the SAME BGP ID as the existing
+        // connection's already-known peer — this is what makes it a
+        // genuine RFC 4271 §6.8 collision rather than an unrelated
+        // connection that happens to share the peer's address.
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = candidate_bgp_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // The existing connection must see the Cease/ConnectionCollisionResolution
+        // NOTIFICATION (RFC 4271 §8.2.2), then close.
+        let notification = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
             .await
             .expect("timed out waiting for the collision NOTIFICATION")
-            .expect("channel closed before the collision NOTIFICATION was sent");
+            .expect("existing connection closed before the NOTIFICATION")
+            .expect("decode error on the collision NOTIFICATION");
         assert!(
             matches!(
                 notification,
@@ -1809,14 +2496,38 @@ mod tests {
             ),
             "expected Cease/ConnectionCollisionResolution NOTIFICATION (RFC 4271 §8.2.2), got {notification:?}"
         );
-
-        let closed = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        let closed = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
             .await
-            .expect("timed out waiting for the old outbound connection to close");
+            .expect("timed out waiting for the old connection to close");
         assert!(
             closed.is_none(),
-            "existing outbound connection must be closed when adopting a \
-             higher-ID incoming connection (RFC 4271 §6.8 rule 2), got {closed:?}"
+            "existing connection must be closed when adopting a validated \
+             higher-ID candidate (RFC 4271 §6.8 rule 2), got {closed:?}"
+        );
+
+        // Complete the handshake over the newly-adopted candidate connection
+        // and confirm the session actually re-establishes over it.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN on the adopted connection")
+            .expect("adopted connection closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+        let ka = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE on the adopted connection")
+            .expect("adopted connection closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        candidate_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "expected Established over the adopted connection, got {event:?}"
         );
     }
 
@@ -1827,51 +2538,337 @@ mod tests {
     /// > message), and continues to use the existing one (the one that is
     /// > already in the OpenConfirm state).
     ///
-    /// `local_bgp_id` = 10.0.0.1, peer's BGP ID = 10.0.0.0 (lower than local)
-    /// — local > peer, so the *existing* (outbound) connection must be
-    /// kept and the session must reach `Established` over it, exactly as
-    /// it did before any incoming connection arrived.
+    /// `local_bgp_id` = 10.0.0.1, candidate's BGP ID = 10.0.0.0 (lower than
+    /// local), matching the existing connection's already-known peer ID —
+    /// local > peer, so the existing connection must be kept (reaching
+    /// `Established` over it) and the candidate's socket must actually
+    /// close, not linger.
     #[tokio::test]
-    async fn test_collision_in_open_confirm_local_id_higher_keeps_outbound_rejects_incoming() {
-        use tokio::net::TcpListener;
+    async fn test_collision_candidate_matching_id_higher_local_keeps_existing_rejects_candidate() {
+        let candidate_bgp_id = Ipv4Addr::new(10, 0, 0, 0);
+        let (mut handle, mut existing_peer) = spawn_to_open_confirm(candidate_bgp_id).await;
 
-        let (mock, mut peer) = MockTransport::pair();
-        let mut handle = spawn_with(test_config(), mock);
-        handle.start().await;
-
-        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
-            .await
-            .expect("timed out waiting for OPEN")
-            .expect("channel closed before OPEN");
-
-        // Peer OPEN with a BGP ID lower than local (10.0.0.0 < 10.0.0.1).
-        let mut lower_id_open = peer_open();
-        if let BgpMessage::Open(ref mut open) = lower_id_open {
-            open.bgp_id = "10.0.0.0".parse().unwrap();
-        }
-        peer.recv_tx.send(Ok(lower_id_open)).unwrap();
-
-        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
-            .await
-            .expect("timed out waiting for KEEPALIVE")
-            .expect("channel closed before KEEPALIVE");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (incoming, _) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
-        let incoming = incoming.unwrap();
-
+        let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
 
-        // local (10.0.0.1) > peer (10.0.0.0): the existing outbound
-        // connection must be kept — completing the handshake over it must
-        // still reach Established, exactly as if the incoming connection
-        // never arrived.
-        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = candidate_bgp_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // Existing connection must be entirely undisturbed: completing its
+        // handshake still reaches Established.
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "expected Established over the kept existing connection \
+             (RFC 4271 §6.8 rule 3), got {event:?}"
+        );
+
+        // The rejected candidate's socket must actually close.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the rejected candidate to close");
+        assert!(
+            closed.is_none(),
+            "rejected candidate connection must be closed, not held open, got {closed:?}"
+        );
+    }
+
+    /// The actual regression test for the gap Codex's review of this PR
+    /// found: RFC 4271 §6.8's collision-resolution procedure only applies
+    /// "when...there is a connection to a remote BGP speaker whose BGP
+    /// Identifier equals the one in the [new] OPEN message." The pre-fix
+    /// code skipped that precondition — it compared the local BGP ID
+    /// against whatever the *existing* connection's peer ID already was,
+    /// without ever confirming the candidate actually belonged to that same
+    /// peer, so a second connection from the peer's configured address
+    /// carrying a *different* BGP Identifier could still run the tiebreak
+    /// and tear down a healthy connection.
+    ///
+    /// Existing connection's known peer ID is 10.0.0.2 (> local 10.0.0.1).
+    /// The candidate sends an OPEN with a *different* ID, 10.0.0.9 — also >
+    /// local, so the naive (pre-fix) tiebreak math would have said "adopt."
+    /// The fix must reject the candidate anyway, since its identity doesn't
+    /// match the connection it's supposedly colliding with, and leave the
+    /// existing connection to reach `Established` untouched.
+    #[tokio::test]
+    async fn test_collision_candidate_mismatched_bgp_id_rejected_existing_survives() {
+        let existing_peer_id = Ipv4Addr::new(10, 0, 0, 2);
+        let mismatched_candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let (mut handle, mut existing_peer) = spawn_to_open_confirm(existing_peer_id).await;
+
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = mismatched_candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // The existing connection must survive completely undisturbed.
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "a candidate with a mismatched BGP Identifier must never influence \
+             the existing connection, got {event:?}"
+        );
+
+        // The mismatched-identity candidate must be rejected (socket closes).
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the mismatched candidate to close");
+        assert!(
+            closed.is_none(),
+            "candidate with a BGP Identifier that doesn't match the existing \
+             connection's peer must be rejected, got {closed:?}"
+        );
+    }
+
+    /// Codex's review of this PR's first version found a second gap: RFC
+    /// 4271 §6.8 defines a collision only for a *reversed-direction* pair
+    /// (our own outbound dial versus an inbound candidate). Two connections
+    /// accepted in the *same* direction — here, a second inbound connection
+    /// arriving while an earlier *inbound* connection is still
+    /// mid-handshake — must not be treated as a collision, even when their
+    /// BGP Identifiers match and would otherwise trigger the tiebreak in
+    /// the candidate's favor.
+    #[tokio::test]
+    async fn test_collision_candidate_rejected_when_existing_connection_is_also_inbound() {
+        // Point the session at a port nothing is listening on so the
+        // outbound dial is refused and the FSM lands in Active (mirrors the
+        // technique `pathvector-session/tests/transport.rs`'s
+        // `test_incoming_connection_in_active_accepted` uses).
+        let refused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = refused_listener.local_addr().unwrap();
+        drop(refused_listener);
+
+        let mut config = test_config();
+        config.peer_addr = refused_addr;
+        let mut handle = spawn(config);
+        handle.start().await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // First inbound connection: accepted directly (Active state — no
+        // existing connection to protect). This is genuinely inbound.
+        let existing_peer_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (first_incoming, mut existing_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(first_incoming))
+            .await
+            .unwrap();
+
+        // Immediate-accept path is unchanged: the session sends its OPEN first.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+
+        let mut open = peer_open();
+        if let BgpMessage::Open(ref mut o) = open {
+            o.bgp_id = existing_peer_id;
+        }
+        existing_peer.send(open).await.unwrap();
+
+        let ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        // Withhold our own KEEPALIVE — session stays in OpenConfirm.
+
+        // Second inbound connection: a genuine same-direction extra
+        // connection, with a MATCHING BGP ID chosen so the naive tiebreak
+        // (ignoring direction) would say "adopt" (local 10.0.0.1 < 10.0.0.2).
+        let (second_incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(second_incoming))
+            .await
+            .unwrap();
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = existing_peer_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // The first (existing, inbound) connection must survive completely
+        // undisturbed.
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "a second inbound connection must never collide with an existing \
+             inbound connection (not a reversed pair per RFC 4271 §6.8), got {event:?}"
+        );
+
+        // The second (same-direction) connection must be rejected.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the same-direction candidate to close");
+        assert!(
+            closed.is_none(),
+            "a same-direction second connection must be rejected, got {closed:?}"
+        );
+    }
+
+    /// Pure, socket-free unit test of `ConnectionIdentity::is_reversed_pair_with`
+    /// covering all three cases Codex's second review flagged: a genuine
+    /// collision (matching endpoints, opposite direction) must pass; two
+    /// connections in the *same* direction (a second inbound arriving while
+    /// an existing inbound connection is still mid-handshake) must fail
+    /// even though their endpoints match; and Codex's specific multihomed
+    /// counter-example — outbound dialed from local address A, an unrelated
+    /// inbound connection landing on a *different* local address C — must
+    /// fail even though direction is opposite, since the endpoints
+    /// themselves don't actually reverse.
+    #[test]
+    fn test_connection_identity_reversed_pair() {
+        let addr_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let addr_c: IpAddr = "10.0.0.3".parse().unwrap();
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+
+        // Genuine collision: existing dialed out from A to peer; candidate
+        // is peer dialing in, landing on that same local address A.
+        let existing = ConnectionIdentity {
+            local: addr_a,
+            peer,
+            origin: ConnectionOrigin::Outbound,
+        };
+        let candidate = ConnectionIdentity {
+            local: addr_a,
+            peer,
+            origin: ConnectionOrigin::Inbound,
+        };
+        assert!(
+            existing.is_reversed_pair_with(candidate),
+            "matching endpoints with opposite direction must be a genuine \
+             reversed pair"
+        );
+
+        // Same direction, matching endpoints: not a collision under RFC
+        // 4271 §6.8's definition — no connection we dialed is involved.
+        let existing_inbound = ConnectionIdentity {
+            origin: ConnectionOrigin::Inbound,
+            ..existing
+        };
+        assert!(
+            !existing_inbound.is_reversed_pair_with(candidate),
+            "two inbound connections from the same peer must not be treated \
+             as a reversed pair, even with identical endpoints"
+        );
+
+        // Multihomed: outbound dialed from A, but the "candidate" landed on
+        // a different local address C — opposite direction, but not
+        // actually a reversed pair.
+        let candidate_wrong_local = ConnectionIdentity {
+            local: addr_c,
+            ..candidate
+        };
+        assert!(
+            !existing.is_reversed_pair_with(candidate_wrong_local),
+            "opposite direction alone is not sufficient — endpoints must \
+             also actually reverse (Codex's multihomed counter-example)"
+        );
+    }
+
+    /// Codex's review of this PR's second version: RFC 4271 §6.8 doesn't
+    /// sanction resolving a collision against an `OpenSent` connection
+    /// unless the peer's BGP Identifier is already known "by means outside
+    /// of the protocol" — which this implementation doesn't have. A
+    /// candidate arriving while the primary is `OpenSent` must not be
+    /// decided on the spot; it must wait until the primary's own OPEN
+    /// supplies a real identity to compare against. Here, the candidate's
+    /// BGP ID (10.0.0.9) does *not* match what the primary's own peer turns
+    /// out to be (10.0.0.2, lower than local — would lose the tiebreak
+    /// anyway, but that's not even reachable since identity doesn't match):
+    /// the candidate must be rejected once the primary resolves, and the
+    /// primary itself must never have been disturbed in the meantime.
+    #[tokio::test]
+    async fn test_collision_candidate_deferred_in_open_sent_rejected_once_primary_id_known() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        // Confirm the session is in OpenSent: it has sent its own OPEN, but
+        // we haven't replied yet.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+
+        // Candidate arrives and validates while the primary is still
+        // OpenSent — its identity (10.0.0.9) is unrelated to what the
+        // primary will end up reporting.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+        let mismatched_candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = mismatched_candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // Give the deferred-resolution path a chance to (incorrectly, if
+        // the fix regressed) act before the primary's own OPEN arrives.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now complete the primary's own handshake with its real identity
+        // (10.0.0.2) — unrelated to the candidate's remembered 10.0.0.9.
+        let primary_peer_id = Ipv4Addr::new(10, 0, 0, 2);
+        let mut primary_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = primary_open {
+            o.bgp_id = primary_peer_id;
+        }
+        existing_peer.send(primary_open).await.unwrap();
+
+        let ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
 
         let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
             .await
@@ -1879,76 +2876,431 @@ mod tests {
             .expect("session channel closed");
         assert!(
             matches!(event, SessionEvent::Established(_)),
-            "expected Established over the kept outbound connection \
-             (RFC 4271 §6.8 rule 3), got {event:?}"
+            "the primary connection must reach Established undisturbed — a \
+             deferred OpenSent candidate must never preempt it before the \
+             primary's own identity is known, got {event:?}"
+        );
+
+        // The candidate, now resolved against the primary's real (mismatched)
+        // identity, must be rejected.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the deferred candidate to close");
+        assert!(
+            closed.is_none(),
+            "candidate with an identity that doesn't match the primary's \
+             now-known peer must be rejected once deferral resolves, got {closed:?}"
         );
     }
 
-    /// RFC 4271 §6.8 rule 3 says the rejected connection is closed but
-    /// doesn't specify how — worth pinning down precisely, since a
-    /// rejected-but-unverified socket could in principle be left hanging
-    /// open, or (wrongly) sent a NOTIFICATION despite never having
-    /// completed a BGP handshake. This complements
-    /// `test_collision_in_open_confirm_local_id_higher_keeps_outbound_rejects_incoming`,
-    /// which only proves the *existing* connection survives to Established;
-    /// this test observes the *rejected* connection's own socket directly
-    /// and proves it's dropped outright — zero bytes written, then EOF —
-    /// rather than held open or handshaken.
+    /// Companion to the test above: if the primary dies (here: the peer
+    /// simply closes the TCP connection) while a validated candidate is
+    /// still deferred in `OpenSent`, the candidate must be adopted directly
+    /// once `run()`'s post-input `try_resolve_pending_candidate` hook sees
+    /// the primary has moved to `Active` — same as a fresh accepted
+    /// connection.
     #[tokio::test]
-    async fn test_collision_in_open_confirm_rejected_incoming_socket_closed_silently() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
-
-        let (mock, mut peer) = MockTransport::pair();
-        let handle = spawn_with(test_config(), mock);
+    async fn test_collision_candidate_deferred_in_open_sent_adopted_when_primary_dies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
         handle.start().await;
 
-        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
             .await
             .expect("timed out waiting for OPEN")
-            .expect("channel closed before OPEN");
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
 
-        // Peer OPEN with a BGP ID lower than local (10.0.0.0 < 10.0.0.1) —
-        // local wins, so the incoming connection below must be rejected.
-        let mut lower_id_open = peer_open();
-        if let BgpMessage::Open(ref mut open) = lower_id_open {
-            open.bgp_id = "10.0.0.0".parse().unwrap();
-        }
-        peer.recv_tx.send(Ok(lower_id_open)).unwrap();
-
-        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
             .await
-            .expect("timed out waiting for KEEPALIVE")
-            .expect("channel closed before KEEPALIVE");
+            .unwrap();
+        let candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
 
-        // Unlike the other collision tests, keep the peer's own end of the
-        // pair (rather than discarding it) so this test can observe what,
-        // if anything, arrives on the rejected socket.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Kill the primary connection outright — the session should observe
+        // EOF, feed TcpFailed to the FSM, and land in Active.
+        drop(existing_peer);
+
+        // The deferred candidate must now be adopted directly: it completes
+        // a fresh handshake and the session reaches Established over it.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN on the adopted candidate")
+            .expect("candidate closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+        let ka = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE on the adopted candidate")
+            .expect("candidate closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        candidate_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "a deferred candidate must be adopted once the primary it was \
+             waiting on dies, got {event:?}"
+        );
+    }
+
+    /// [Codex round 3] Counterpart to the "adopted when primary dies" test
+    /// above: a candidate validated and deferred while the primary is still
+    /// `OpenSent` must NOT be adopted if the primary's connection goes away
+    /// because the *operator* issued `ManualStop`, as opposed to a genuine
+    /// `TcpFailed`/`HoldTimerExpired` failure. RFC 4271 §6.8's collision
+    /// resolution exists to pick a winner between two live connection
+    /// attempts for the *same configured peer* — it has nothing to say
+    /// about a session the operator deliberately stopped, and `State::Idle`
+    /// alone can't distinguish the two causes (both `OpenConfirm`'s
+    /// `TcpFailed` and its `ManualStop` arms land there; see
+    /// `on_open_confirm`). `run()` evicts any pending candidate outright
+    /// the moment it processes `ManualStop`, closing that gap — pre-fix,
+    /// this deferred candidate would have been silently adopted once the
+    /// primary reached `Idle`, reopening a session the operator explicitly
+    /// asked to close.
+    #[tokio::test]
+    async fn test_collision_candidate_deferred_in_open_sent_closed_on_manual_stop() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (incoming, accepted) =
-            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
-        let incoming = incoming.unwrap();
-        let (mut peer_side, _) = accepted.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
 
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+
+        // Candidate arrives and validates while the primary is still
+        // OpenSent — its identity is irrelevant here since the operator is
+        // about to stop the session before the primary's own identity is
+        // ever learned.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+        let candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // The operator stops the session while the candidate is still
+        // deferred (validated, but held pending the primary's own identity).
+        handle.stop().await;
+
+        // The primary receives the normal administrative-shutdown NOTIFICATION.
+        let notif = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for the Cease NOTIFICATION")
+            .expect("closed before NOTIFICATION")
+            .expect("decode error");
+        assert!(
+            matches!(
+                notif,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+                    ..
+                })
+            ),
+            "expected Cease/AdministrativeShutdown on ManualStop, got {notif:?}"
+        );
+
+        // The deferred candidate must be closed outright — not adopted.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the deferred candidate to close");
+        assert!(
+            closed.is_none(),
+            "a deferred collision candidate must be closed, not adopted, \
+             when the operator stops the session, got {closed:?}"
+        );
+
+        // No session was created over the candidate: nothing further should
+        // ever come through the session's event channel.
+        let no_event = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            no_event.is_err(),
+            "no further session event should fire once the operator has \
+             stopped the session and the deferred candidate was discarded, \
+             got {no_event:?}"
+        );
+    }
+
+    /// [Codex round 4] Companion to the `ManualStop` eviction test above:
+    /// `NotificationToSend` (locally initiated administrative teardown —
+    /// peer removal, RFC 9003 shutdown, or a daemon-detected condition with
+    /// its own separate re-arm schedule) is the *other* deliberate,
+    /// no-automatic-reconnect FSM input that lands in `Idle` — see its
+    /// handler in `on_established`, which (unlike
+    /// `ProtocolErrorNotificationToSend`) omits `StartConnectRetryTimer`.
+    /// A GR-purpose candidate staged while Established, still pending when
+    /// `NotificationToSend` fires, must be evicted exactly like the
+    /// `ManualStop` case: `State::Idle` alone can't distinguish "the daemon
+    /// deliberately tore this session down" from "the primary connection
+    /// failed," and adopting the candidate here would recreate the session
+    /// the daemon just removed. Pre-fix, this candidate would have survived
+    /// (only `ManualStop` was covered) and been adopted once its OPEN
+    /// arrived, since `Idle` alone said "nothing left to protect."
+    #[tokio::test]
+    async fn test_collision_candidate_pending_closed_on_notification_to_send() {
+        let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+        establish_with_gr(peer_bgp_id, &mut existing_peer, &mut handle).await;
+
+        // A GR-purpose candidate is staged, but held back before it ever
+        // sends its OPEN.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
 
-        // Expect exactly zero bytes (no OPEN, no NOTIFICATION — nothing)
-        // before EOF: proof the session dropped the incoming stream
-        // outright rather than attempting any part of a handshake on it.
-        let mut buf = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(1), peer_side.read(&mut buf))
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // The daemon issues a locally initiated administrative teardown
+        // (e.g. RFC 9003 peer removal) while the candidate is still
+        // pending.
+        handle
+            .incoming_sender()
+            .send(SessionCommand::Notification(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::PeerDeconfigured),
+                data: vec![],
+            }))
             .await
-            .expect("timed out waiting for the rejected socket to close");
-        assert_eq!(
-            read.expect("read on rejected socket errored instead of a clean EOF"),
-            0,
-            "rejected incoming connection must be closed with zero bytes sent, \
-             not held open or handshaken"
+            .unwrap();
+
+        // The primary receives the requested NOTIFICATION.
+        let notif = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for the Cease NOTIFICATION")
+            .expect("closed before NOTIFICATION")
+            .expect("decode error");
+        assert!(
+            matches!(
+                notif,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::PeerDeconfigured),
+                    ..
+                })
+            ),
+            "expected Cease/PeerDeconfigured on NotificationToSend, got {notif:?}"
+        );
+
+        // The primary itself was genuinely Established, so this teardown
+        // legitimately emits Terminated(OperatorStop) — expected, not a
+        // symptom of the bug. Drain it before checking for anything further.
+        let terminated_event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Terminated event")
+            .expect("session channel closed");
+        assert!(
+            matches!(
+                terminated_event,
+                SessionEvent::Terminated(TerminationReason::OperatorStop)
+            ),
+            "expected Terminated(OperatorStop) for the deliberate teardown, \
+             got {terminated_event:?}"
+        );
+
+        // Only now does the candidate send its OPEN — same BGP Identifier
+        // and GR, exactly what a genuine GR reconnect would look like. If
+        // the bug were still present, this would be adopted and recreate
+        // the session the daemon just deliberately tore down.
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = peer_bgp_id;
+            o.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // The candidate must be closed outright — not adopted.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the pending candidate to close");
+        assert!(
+            closed.is_none(),
+            "a pending collision candidate must be closed, not adopted, \
+             when the daemon issues a locally initiated NotificationToSend \
+             teardown, got {closed:?}"
+        );
+
+        // No new session was created: nothing further should ever come
+        // through the session's event channel.
+        let no_event = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            no_event.is_err(),
+            "no further session event should fire once NotificationToSend \
+             tore the session down and the pending candidate was \
+             discarded, got {no_event:?}"
+        );
+    }
+
+    /// Codex's review of this PR's first version found a third gap: the
+    /// candidate's OPEN must pass the same validation any OPEN would (RFC
+    /// 4271 §6.2 — version, BGP Identifier, peer AS, hold time; RFC 5492
+    /// §3 required capabilities; RFC 9234 §5.1 Role compatibility) *before*
+    /// the existing connection is torn down — not just the BGP-Identifier
+    /// match/tiebreak. A same-identity candidate with an invalid field
+    /// (here: a peer AS that doesn't match the configured `peer_as`) must
+    /// be rejected without ever disturbing the existing connection.
+    #[tokio::test]
+    async fn test_collision_candidate_with_invalid_open_rejected_existing_survives() {
+        let existing_peer_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut handle, mut existing_peer) = spawn_to_open_confirm(existing_peer_id).await;
+
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        // Same BGP ID as the existing connection's known peer (so identity
+        // matching and the tiebreak alone would say "adopt"), but a peer AS
+        // that doesn't match test_config()'s configured peer_as (65002) —
+        // this must fail Fsm::validate_open's RFC 4271 §6.2 check.
+        let mut invalid_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = invalid_open {
+            o.bgp_id = existing_peer_id;
+            o.my_as = 23456; // AS_TRANS placeholder; real ASN carried below.
+            o.capabilities = vec![Capability::FourByteAsn(99999)];
+        }
+        candidate_peer.send(invalid_open).await.unwrap();
+
+        // The candidate must receive a NOTIFICATION citing the actual
+        // validation failure, then close — not silently dropped, and
+        // critically, sent on the *candidate's* connection, never the
+        // existing one.
+        let notification = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the validation-failure NOTIFICATION")
+            .expect("candidate closed before the NOTIFICATION")
+            .expect("decode error");
+        assert!(
+            matches!(
+                notification,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::OpenMessage(OpenMsgError::BadPeerAs),
+                    ..
+                })
+            ),
+            "expected OPEN Message Error/Bad Peer AS NOTIFICATION, got {notification:?}"
+        );
+
+        // The existing connection must be completely undisturbed — proof
+        // that the identity/tiebreak match alone did *not* trigger teardown.
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "a same-identity candidate with an invalid OPEN must never tear \
+             down the existing connection, got {event:?}"
+        );
+    }
+
+    /// The candidate-staging deadline mechanism actually fires and drops a
+    /// candidate that never sends anything, without disturbing the existing
+    /// connection. Uses `spawn_with_collision_timeout` to shorten the
+    /// deadline for a fast, real (unpaused) wall-clock wait rather than
+    /// `tokio::time::pause` + `advance` — that combination, used elsewhere
+    /// in this module for purely mock/channel-based tests (e.g.
+    /// `test_no_pending_transport_on_retry_sets_tcp_failed_input`), races
+    /// tokio's paused-clock auto-advance-when-idle against this module's
+    /// real-TCP collision tests badly enough to deadlock outright, not just
+    /// flake — confirmed while developing this test.
+    #[tokio::test]
+    async fn test_collision_candidate_times_out_if_it_never_sends_open() {
+        // Uses a short, real (unpaused) deadline via
+        // `spawn_with_collision_timeout` rather than `tokio::time::pause` +
+        // `advance`: combining paused time with this module's real-TCP
+        // collision tests raced tokio's auto-advance-when-idle behavior
+        // against genuine socket I/O badly enough to deadlock outright (not
+        // just flake) while developing this test. A short real timeout
+        // sidesteps the interaction entirely.
+        let short_timeout = Duration::from_millis(200);
+        let existing_peer_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut handle, mut existing_peer) =
+            spawn_to_open_confirm_with_timeout(existing_peer_id, short_timeout).await;
+
+        // Keep the candidate peer side alive but never write anything to it.
+        let (incoming, mut silent_candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        // The dropped candidate's socket must actually close once the
+        // (real) deadline elapses.
+        let closed = tokio::time::timeout(short_timeout * 10, silent_candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the candidate to be dropped on deadline");
+        assert!(
+            closed.is_none(),
+            "candidate must be dropped once its OPEN-wait deadline elapses, got {closed:?}"
+        );
+
+        // The existing connection must be unaffected by the timed-out candidate.
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "a timed-out candidate must not disturb the existing connection, got {event:?}"
         );
     }
 
@@ -1957,44 +3309,50 @@ mod tests {
     /// terminated, no NOTIFICATION message should be sent -- the previous
     /// TCP session is simply closed."
     ///
-    /// Establishes a session where the peer advertised Graceful Restart, then
-    /// injects a second incoming connection while the FSM still thinks it's
-    /// Established (simulating an undetected TCP failure). Verifies the
-    /// *decision*: the old mock connection closes with no NOTIFICATION, and
-    /// a `Terminated(Unclean)` event fires (the trigger the daemon's GR
-    /// helper-mode entry keys on). Like the OpenConfirm-collision tests
-    /// above, `MockTransport` has no `connect_factory` to bridge a raw
-    /// `TcpStream`, so completing a second real handshake over the adopted
-    /// incoming connection is out of scope for this unit test — that belongs
-    /// in a real e2e/interop test.
+    /// Establishes a session where the peer advertised Graceful Restart,
+    /// then injects a second incoming connection — with the SAME BGP
+    /// Identifier as the Established peer — while the FSM still thinks it's
+    /// Established (simulating an undetected TCP failure). The old
+    /// connection must close with no NOTIFICATION, a `Terminated(Unclean)`
+    /// event must fire, and — unlike the pre-fix mock-based version of this
+    /// test — the candidate must actually complete a fresh handshake and
+    /// reach `Established` again, proven end to end over real sockets.
     #[tokio::test]
-    async fn test_incoming_connection_while_established_with_gr_closes_old_no_notification() {
-        use tokio::net::TcpListener;
-
-        let (mock, mut peer) = MockTransport::pair();
-        let mut handle = spawn_with(test_config(), mock);
+    async fn test_incoming_connection_while_established_with_gr_matching_id_closes_old_no_notification()
+     {
+        let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
         handle.start().await;
 
-        let _sent_open = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
             .await
             .expect("timed out waiting for OPEN")
-            .expect("channel closed before OPEN");
+            .expect("closed before OPEN")
+            .expect("decode error");
 
         let mut gr_open = peer_open();
         if let BgpMessage::Open(ref mut open) = gr_open {
+            open.bgp_id = peer_bgp_id;
             open.capabilities.push(Capability::GracefulRestart {
                 restart_flags: 0,
                 restart_time: 120,
                 families: vec![],
             });
         }
-        peer.recv_tx.send(Ok(gr_open)).unwrap();
+        existing_peer.send(gr_open).await.unwrap();
 
-        let _ka = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        let _ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
             .await
             .expect("timed out waiting for KEEPALIVE")
-            .expect("channel closed before KEEPALIVE");
-        peer.recv_tx.send(Ok(BgpMessage::Keepalive)).unwrap();
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
 
         let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
             .await
@@ -2003,22 +3361,29 @@ mod tests {
         assert!(matches!(event, SessionEvent::Established(_)));
 
         // Simulate the peer's old TCP connection dying without us noticing:
-        // inject a brand-new incoming connection while still Established.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (incoming, _) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
-        let incoming = incoming.unwrap();
-
+        // inject a brand-new incoming connection, with the same BGP
+        // Identifier, while still Established.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = peer_bgp_id;
+            o.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
 
-        // The old mock connection must be torn down with NO NOTIFICATION —
-        // just the channel closing (RFC 4724 §4.2, distinct from RFC 4271
-        // §6.8's default Cease-NOTIFICATION collision behavior).
-        let closed = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+        // The old connection must be torn down with NO NOTIFICATION — just
+        // the socket closing (RFC 4724 §4.2, distinct from RFC 4271 §6.8's
+        // default Cease-NOTIFICATION collision behavior).
+        let closed = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
             .await
             .expect("timed out waiting for the old connection to close");
         assert!(
@@ -2027,8 +3392,6 @@ mod tests {
              no NOTIFICATION, got {closed:?}"
         );
 
-        // The adopted incoming connection must complete a fresh handshake
-        // and reach Established again.
         let terminated_event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
             .await
             .expect("timed out waiting for Terminated event")
@@ -2040,6 +3403,239 @@ mod tests {
             ),
             "expected Terminated(Unclean) for the presumed-dead old connection, \
              got {terminated_event:?}"
+        );
+
+        // The candidate must complete a fresh handshake and reach
+        // Established again, proving real end-to-end adoption.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN on the adopted connection")
+            .expect("adopted connection closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+        let ka = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE on the adopted connection")
+            .expect("adopted connection closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        candidate_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for re-Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "expected Established over the adopted GR-reconnect connection, got {event:?}"
+        );
+    }
+
+    /// [Codex round 3] A candidate staged while the primary is `OpenConfirm`
+    /// is an RFC 4271 §6.8 collision candidate. If the primary goes on to
+    /// negotiate Graceful Restart and reach `Established` *before* the
+    /// candidate's own OPEN arrives, the candidate must keep its original
+    /// §6.8 meaning: it must NOT be reinterpreted as an RFC 4724 §4.2 GR
+    /// reconnect and allowed to displace the now-healthy, just-established
+    /// primary just because GR happened to be negotiated in the meantime.
+    /// See `CollisionPurpose`. Pre-fix, `try_resolve_pending_candidate`
+    /// re-derived "is this a GR candidate" from `self.fsm.state()` /
+    /// `peer_has_graceful_restart()` at resolution time rather than from
+    /// what the candidate was actually staged as, so this exact sequence
+    /// would have torn down the primary and adopted the candidate instead.
+    #[tokio::test]
+    async fn test_collision_candidate_staged_before_established_gr_does_not_displace_primary() {
+        let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+
+        // Peer's OPEN advertises GracefulRestart and moves the primary from
+        // OpenSent to OpenConfirm — withhold KEEPALIVE so it doesn't reach
+        // Established yet.
+        let mut gr_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = gr_open {
+            open.bgp_id = peer_bgp_id;
+            open.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        existing_peer.send(gr_open).await.unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+
+        // The candidate is staged NOW, while the primary is still
+        // OpenConfirm — this must be recorded as a Collision-purpose
+        // candidate (see `CollisionPurpose`), not re-derived later.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now the primary completes its own handshake — Established, with
+        // GR negotiated. The candidate is still pending (hasn't sent its
+        // OPEN yet).
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(matches!(event, SessionEvent::Established(_)));
+
+        // Only now does the candidate send its OPEN — same BGP Identifier
+        // as the primary's peer, and advertising GR too: exactly what a
+        // genuine GR reconnect would look like. If the bug were still
+        // present, this would be misread as a GR reconnect and displace
+        // the primary.
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = peer_bgp_id;
+            o.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // The candidate must be rejected: stale §6.8 context against an
+        // already-Established primary.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the stale candidate to close");
+        assert!(
+            closed.is_none(),
+            "a Collision-purpose candidate staged before GR was negotiated \
+             must be dropped once the primary reaches Established, not \
+             adopted as a GR reconnect, got {closed:?}"
+        );
+
+        // And the primary must be completely undisturbed — no further
+        // event of any kind (in particular, no second Established/
+        // Terminated pair from a spurious teardown-and-reconnect).
+        let no_event = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            no_event.is_err(),
+            "the primary must survive undisturbed once Established; a \
+             Collision-purpose candidate staged before GR was negotiated \
+             must never be treated as a GR reconnect, got {no_event:?}"
+        );
+    }
+
+    /// The same identity-validation gap as
+    /// `test_collision_candidate_mismatched_bgp_id_rejected_existing_survives`,
+    /// but for the RFC 4724 §4.2 Established/GR override — which, pre-fix,
+    /// had NO identity check at all (it unconditionally adopted any second
+    /// incoming connection while Established with GR negotiated). A
+    /// candidate with a BGP Identifier that doesn't match the live,
+    /// Established peer's must not be allowed to displace it.
+    #[tokio::test]
+    async fn test_incoming_connection_while_established_with_gr_mismatched_id_rejected() {
+        let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let mismatched_candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+
+        let mut gr_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = gr_open {
+            open.bgp_id = peer_bgp_id;
+            open.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        existing_peer.send(gr_open).await.unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for initial Established")
+            .expect("session channel closed before Established");
+        assert!(matches!(event, SessionEvent::Established(_)));
+
+        // A second incoming connection arrives with a DIFFERENT BGP
+        // Identifier than the live Established peer's.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = mismatched_candidate_id;
+            o.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // The mismatched candidate must be rejected outright (socket closes).
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the mismatched candidate to close");
+        assert!(
+            closed.is_none(),
+            "a candidate with a BGP Identifier that doesn't match the live \
+             Established peer must be rejected, got {closed:?}"
+        );
+
+        // The live Established session must remain completely undisturbed:
+        // no Terminated event, and it still responds to a normal KEEPALIVE.
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            result.is_err(),
+            "a mismatched-identity candidate must not produce any session \
+             event on the live Established peer, got {result:?}"
         );
     }
 
