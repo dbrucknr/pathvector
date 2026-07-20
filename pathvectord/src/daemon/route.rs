@@ -1039,6 +1039,21 @@ pub(super) fn handle_update(
     // un-inserted), and the session stays up with no NOTIFICATION sent.
     let has_v4_announces = !msg.announced.is_empty() || !mp_v4_announced.is_empty();
     let has_any_announces = has_v4_announces || !mp_v6_announced.is_empty();
+    // Whether the *wire message* encodes reachable NLRI at all, independent
+    // of whether this daemon supports/installs that particular AFI/SAFI
+    // locally. `has_any_announces` above is filtered to only the AFI/SAFIs
+    // this daemon recognizes (IPv4/IPv6 unicast, via mp_v4_announced/
+    // mp_v6_announced) — an MP_REACH_NLRI for an unsupported AFI/SAFI (e.g.
+    // IPv4 multicast) is silently skipped in the attribute-processing loop
+    // above and never added to those, which would make `has_any_announces`
+    // wrongly `false` even though the message plainly does encode reachable
+    // NLRI. This check is the RFC 7606 §5.2 gate below's condition — it
+    // must not be conflated with "did this daemon install anything."
+    let has_reachable_nlri_on_wire = !msg.announced.is_empty()
+        || msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()));
     if has_any_announces {
         let missing_attr = if !has_origin {
             Some(1u8) // ORIGIN type code
@@ -1088,6 +1103,17 @@ pub(super) fn handle_update(
                 fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
             }
         }
+    } else if has_reachable_nlri_on_wire {
+        // This UPDATE does encode reachable NLRI on the wire (e.g. an
+        // MP_REACH_NLRI for an AFI/SAFI this daemon doesn't support/install
+        // locally) — `has_any_announces` was false only because nothing
+        // from it was recognized, not because the message has no reachable
+        // NLRI. RFC 7606 §3(d) treat-as-withdraw still applies to any
+        // missing mandatory attribute here, but since nothing was
+        // installed for this AFI/SAFI in the first place, there's nothing
+        // to actively withdraw either — a silent no-op. Critically, §5.2's
+        // session-reset exception below does NOT apply: it's conditioned
+        // on no reachable NLRI at all, which isn't the case here.
     } else {
         // ── RFC 7606 §5.2: missing NLRI ────────────────────────────────────
         // "if an UPDATE message is encountered that does contain path
@@ -1099,9 +1125,11 @@ pub(super) fn handle_update(
         // approach other than 'attribute discard', then the 'session
         // reset' approach MUST be used."
         //
-        // `has_any_announces` is false here, so this UPDATE carries no
-        // traditional NLRI and no MP_REACH_NLRI. The only messages that are
-        // *legitimately* attribute-bearing with no reachable NLRI are a
+        // Neither `has_any_announces` nor `has_reachable_nlri_on_wire` hold
+        // here, so this UPDATE carries no traditional NLRI and no
+        // MP_REACH_NLRI at all (reachable or otherwise). The only messages
+        // that are *legitimately* attribute-bearing with no reachable NLRI
+        // are a
         // fully empty legacy End-of-RIB (no attributes at all) and an
         // MP_UNREACH_NLRI-only End-of-RIB/withdrawal (RFC 4724 §2) — both
         // have no attribute other than MP_UNREACH_NLRI, so `has_non_unreach_attr`

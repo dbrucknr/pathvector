@@ -9204,6 +9204,43 @@ mod tests {
         );
     }
 
+    /// [Codex] `has_any_announces` is filtered to only the AFI/SAFIs this
+    /// daemon recognizes (IPv4/IPv6 unicast) — an `MP_REACH_NLRI` for an
+    /// unsupported AFI/SAFI (e.g. IPv4 multicast) is silently skipped in
+    /// the attribute-processing loop and never counted there. A missing
+    /// mandatory attribute on such an UPDATE must NOT be escalated to a
+    /// session reset: the wire message plainly does encode reachable NLRI
+    /// (RFC 7606 §5.2's session-reset exception only applies when there's
+    /// no reachable NLRI at all), even though this daemon doesn't
+    /// support/install that particular AFI/SAFI locally.
+    #[test]
+    fn missing_origin_with_unsupported_afi_safi_mp_reach_no_notification() {
+        use pathvector_session::message::{MpReachNlri, Prefix};
+        use pathvector_types::{AfiSafi, NextHop};
+
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            // ORIGIN is missing; AS_PATH is present. MP_REACH_NLRI carries
+            // a real prefix, but for IPv4 Multicast — an AFI/SAFI this
+            // daemon doesn't install routes for.
+            attributes: vec![
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV4_MULTICAST,
+                    next_hop: NextHop::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                    prefixes: vec![Prefix::V4(nlri("192.0.2.0/24"))],
+                }),
+            ],
+            announced: vec![],
+        });
+        assert!(
+            n.is_none(),
+            "a missing mandatory attribute on an UPDATE whose only \
+             reachable NLRI is for an unsupported AFI/SAFI must not reset \
+             the session, got {n:?}"
+        );
+    }
+
     // ── Route Reflection (RFC 4456) ───────────────────────────────────────────
 
     /// Builds a DaemonState acting as an RR for the given clients.
