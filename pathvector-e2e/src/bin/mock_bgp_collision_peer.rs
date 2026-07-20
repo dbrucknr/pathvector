@@ -176,6 +176,19 @@ async fn collision_scenario(
         // NOTIFICATION first), then treats connection #2 like a fresh dial —
         // sending its own OPEN there first, exactly as if it had just
         // connected out.
+        //
+        // pathvectord stages a candidate on OpenConfirm collision and waits
+        // to read *its* OPEN before deciding anything — including sending
+        // its own OPEN — so this mock must send its OPEN first, unprompted,
+        // rather than waiting to hear from pathvectord. A real,
+        // RFC-compliant peer would do exactly this (RFC 4271 §8.2.2's own
+        // Connect-state action: send OPEN as soon as TCP connects,
+        // regardless of what the other side has done).
+        if framed2.send(open_message(bgp_id, vec![])).await.is_err() {
+            return;
+        }
+        println!("connection #2: sent our OPEN (bgp_id={bgp_id}), unprompted");
+
         let Some(Ok(BgpMessage::Open(reopened))) = framed2.next().await else {
             eprintln!("expected a fresh OPEN from pathvectord on the adopted connection #2");
             return;
@@ -184,9 +197,6 @@ async fn collision_scenario(
             "connection #2: received pathvectord's fresh OPEN from AS {}",
             reopened.my_as
         );
-        if framed2.send(open_message(bgp_id, vec![])).await.is_err() {
-            return;
-        }
         if framed2.send(BgpMessage::Keepalive).await.is_err() {
             return;
         }
@@ -315,9 +325,22 @@ async fn gr_established_override(
         .expect("connect to pathvectord for connection #2");
     let mut framed2 = Framed::new(stream2, BgpCodec::new());
 
+    // pathvectord stages this candidate (Established + Graceful Restart
+    // override) and waits to read its OPEN before deciding anything, so —
+    // same as collision_scenario's mock_wins branch — this mock must send
+    // its OPEN first, unprompted.
+    if framed2
+        .send(open_message(BGP_ID_GR, gr_capability))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    println!("connection #2: sent our OPEN, unprompted");
+
     // Per RFC 4724 §4.2, pathvectord treats this exactly like a fresh dial:
-    // it sends its own OPEN on the adopted connection first, with no
-    // NOTIFICATION ever appearing on connection #1.
+    // it sends its own OPEN on the adopted connection, with no NOTIFICATION
+    // ever appearing on connection #1.
     let Some(Ok(BgpMessage::Open(reopened))) = framed2.next().await else {
         eprintln!("expected a fresh OPEN from pathvectord on the adopted connection #2");
         return;
@@ -326,13 +349,6 @@ async fn gr_established_override(
         "connection #2: received pathvectord's fresh OPEN from AS {}",
         reopened.my_as
     );
-    if framed2
-        .send(open_message(BGP_ID_GR, gr_capability))
-        .await
-        .is_err()
-    {
-        return;
-    }
     if framed2.send(BgpMessage::Keepalive).await.is_err() {
         return;
     }

@@ -566,7 +566,17 @@ async fn test_open_with_wrong_peer_as_does_not_establish() {
 
 /// Helper: complete the BGP open/keepalive handshake *from the peer side* over
 /// an already-connected `TcpStream` (as opposed to `accept_and_handshake` which
-/// waits for a listener accept first).
+/// waits for a listener accept first), with the **session under test sending
+/// its OPEN first**.
+///
+/// Valid only when the session adopts the connection immediately on accept
+/// (`Idle`/`Connect`/`Active` — no existing connection to protect, so nothing
+/// is staged and the session sends its OPEN unprompted right away, per RFC
+/// 4271 §8.2.2's Connect-state `TcpConnectionConfirmed` action). For a
+/// connection that collides with an existing `OpenSent`/`OpenConfirm`
+/// connection, the session stages it and waits to read *its* OPEN first
+/// before sending anything — use
+/// [`peer_handshake_on_stream_peer_speaks_first`] for those cases.
 async fn peer_handshake_on_stream(
     stream: tokio::net::TcpStream,
     peer_as: u32,
@@ -594,6 +604,56 @@ async fn peer_handshake_on_stream(
         }))
         .await
         .unwrap();
+
+    // Receive KEEPALIVE sent by the session.
+    let msg = reader.next().await.unwrap().unwrap();
+    assert!(matches!(msg, BgpMessage::Keepalive), "expected KEEPALIVE");
+
+    // Send our KEEPALIVE to complete Established.
+    writer.send(BgpMessage::Keepalive).await.unwrap();
+
+    (reader, writer)
+}
+
+/// Same as [`peer_handshake_on_stream`], but with the **peer sending its OPEN
+/// first, unprompted** — required for a connection that collides with an
+/// existing `OpenSent`/`OpenConfirm` connection. The session under test
+/// stages such a connection and, per RFC 4271 §6.8's own precondition
+/// (comparing "the BGP Identifier of the remote system as specified in the
+/// OPEN message"), waits to read that OPEN before deciding anything —
+/// including sending its own OPEN on this connection. A real, RFC-compliant
+/// peer would send its OPEN immediately upon TCP connecting regardless of
+/// whether it has heard from us (RFC 4271 §8.2.2's own Connect-state
+/// behavior), so this matches realistic peer behavior, not just this
+/// codebase's internals.
+async fn peer_handshake_on_stream_peer_speaks_first(
+    stream: tokio::net::TcpStream,
+    peer_as: u32,
+    peer_bgp_id: Ipv4Addr,
+) -> (
+    FramedRead<tokio::net::tcp::OwnedReadHalf, BgpCodec>,
+    FramedWrite<tokio::net::tcp::OwnedWriteHalf, BgpCodec>,
+) {
+    let (r, w) = stream.into_split();
+    let mut reader = FramedRead::new(r, BgpCodec::new());
+    let mut writer = FramedWrite::new(w, BgpCodec::new());
+
+    // Send our OPEN first, unprompted.
+    writer
+        .send(BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: u16::try_from(peer_as).unwrap_or(23456),
+            hold_time: 90,
+            bgp_id: peer_bgp_id,
+            capabilities: vec![Capability::FourByteAsn(peer_as)],
+        }))
+        .await
+        .unwrap();
+
+    // Now receive the session's OPEN, sent once it has validated ours and
+    // decided to adopt this connection.
+    let msg = reader.next().await.unwrap().unwrap();
+    assert!(matches!(msg, BgpMessage::Open(_)), "expected OPEN");
 
     // Receive KEEPALIVE sent by the session.
     let msg = reader.next().await.unwrap().unwrap();
@@ -665,11 +725,13 @@ async fn test_collision_local_id_lower_closes_outbound_adopts_incoming() {
     let (incoming_listener, incoming_addr) = loopback_listener().await;
     let incoming_tx = handle.incoming_sender();
 
-    // Simulate the peer dialling US: connect to a listener we control.
+    // Simulate the peer dialling US: connect to a listener we control. This
+    // candidate collides with the existing OpenConfirm connection, so the
+    // session stages it and waits for its OPEN before sending anything.
     let incoming_peer = tokio::spawn(async move {
         let stream = tokio::net::TcpStream::connect(incoming_addr).await.unwrap();
         // Complete the handshake on this new connection.
-        peer_handshake_on_stream(stream, 65002, peer_bgp_id).await
+        peer_handshake_on_stream_peer_speaks_first(stream, 65002, peer_bgp_id).await
     });
 
     // Accept the "incoming from peer" stream and deliver it to the session.
@@ -921,10 +983,12 @@ async fn test_incoming_connection_unknown_peer_id_adopts_conservatively() {
     let (incoming_listener, incoming_addr) = loopback_listener().await;
     let incoming_tx = handle.incoming_sender();
 
+    // This candidate collides with the existing OpenSent connection, so the
+    // session stages it and waits for its OPEN before sending anything.
     let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
     let incoming_peer = tokio::spawn(async move {
         let stream = tokio::net::TcpStream::connect(incoming_addr).await.unwrap();
-        peer_handshake_on_stream(stream, 65002, peer_bgp_id).await
+        peer_handshake_on_stream_peer_speaks_first(stream, 65002, peer_bgp_id).await
     });
 
     let (stream, _) = incoming_listener.accept().await.unwrap();
