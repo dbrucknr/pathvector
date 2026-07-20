@@ -22,7 +22,7 @@ use pathvector_session::{
     message::{
         Capability, CeaseError, GracefulRestartFamily, MAX_LEN, MAX_LEN_EXTENDED, MpReachNlri,
         MpUnreachNlri, NotificationError, NotificationMessage, PathAttribute, Prefix,
-        UpdateMessage, encode_shutdown_message,
+        UpdateMessage, UpdateMsgError, encode_shutdown_message,
     },
     transport::{
         self, DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent,
@@ -1224,10 +1224,14 @@ pub(crate) async fn run_event_loop(
                         // handle_update returns Some(NotificationMessage) only for
                         // conditions RFC 7606 still classifies as session-reset-worthy
                         // (e.g. duplicate MP_REACH/MP_UNREACH_NLRI — Malformed Attribute
-                        // List). A missing well-known mandatory attribute is no longer
-                        // one of them: RFC 7606 §3(d) requires treat-as-withdraw instead,
-                        // so handle_update now returns None for that case and this arm
-                        // simply never fires for it.
+                        // List). A missing well-known mandatory attribute is normally
+                        // NOT one of them: RFC 7606 §3(d) requires treat-as-withdraw
+                        // instead, and handle_update returns None for that case. The
+                        // exception is RFC 7606 §5.2 "Missing NLRI": an UPDATE with path
+                        // attributes other than MP_UNREACH_NLRI but no reachable NLRI at
+                        // all can't be confidently treated-as-withdraw (there's nothing
+                        // reliable to withdraw), so a missing-mandatory-attribute error
+                        // in that specific shape still resets the session here.
                         if let Some(err) = notify_err {
                             // Flush pending decisions for other peers before
                             // tearing this one down so they don't starve.
@@ -9124,6 +9128,79 @@ mod tests {
         assert!(
             n.is_none(),
             "well-formed UPDATE must not trigger NOTIFICATION"
+        );
+    }
+
+    /// RFC 7606 §5.2 "Missing NLRI": an UPDATE with path attributes other
+    /// than MP_UNREACH_NLRI but no reachable NLRI at all (no traditional
+    /// NLRI, no MP_REACH_NLRI) cannot be confidently treated-as-withdraw —
+    /// there is no reliable NLRI to withdraw. If such a message also
+    /// carries a missing-mandatory-attribute error (which §3(d) would
+    /// otherwise resolve via treat-as-withdraw), §5.2 requires the
+    /// "session reset" approach instead. Pre-fix, `has_any_announces` being
+    /// false skipped the mandatory-attribute check entirely, silently
+    /// accepting this malformed UPDATE as a no-op.
+    #[test]
+    fn missing_nlri_update_with_attributes_resets_session() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            // AS_PATH present, ORIGIN missing, no NLRI/MP_REACH_NLRI/
+            // MP_UNREACH_NLRI at all.
+            attributes: vec![PathAttribute::AsPath(AsPath::from_sequence(vec![
+                Asn::new(65002),
+            ]))],
+            announced: vec![],
+        });
+        assert!(
+            matches!(
+                n,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(
+                        UpdateMsgError::MissingWellKnownAttribute
+                    ),
+                    ..
+                })
+            ),
+            "an UPDATE with attributes but no reachable NLRI and a missing \
+             mandatory attribute must reset the session (RFC 7606 §5.2), \
+             got {n:?}"
+        );
+    }
+
+    /// Companion to the test above: a fully empty UPDATE (the "legacy"
+    /// End-of-RIB encoding, RFC 4724 §2) has no attributes other than
+    /// MP_UNREACH_NLRI (it has none at all) and must remain valid.
+    #[test]
+    fn legacy_empty_update_no_notification() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        });
+        assert!(
+            n.is_none(),
+            "a fully empty legacy End-of-RIB UPDATE must not trigger a \
+             NOTIFICATION, got {n:?}"
+        );
+    }
+
+    /// Companion to the two tests above: an End-of-RIB encoded as an
+    /// MP_UNREACH_NLRI attribute carrying no NLRI (RFC 4724 §2) has no
+    /// attribute other than MP_UNREACH_NLRI and must remain valid.
+    #[test]
+    fn mp_unreach_only_eor_no_notification() {
+        let n = handle_update_get_notification(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: pathvector_types::AfiSafi::IPV4_UNICAST,
+                prefixes: vec![],
+            })],
+            announced: vec![],
+        });
+        assert!(
+            n.is_none(),
+            "an MP_UNREACH_NLRI-only End-of-RIB UPDATE must not trigger a \
+             NOTIFICATION, got {n:?}"
         );
     }
 

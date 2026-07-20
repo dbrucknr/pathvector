@@ -906,6 +906,7 @@ pub(super) fn handle_update(
     let mut blackhole_announced_v6: Vec<Nlri<Ipv6Addr>> = Vec::new();
     let mut blackhole_withdrawn_v4: Vec<Nlri<Ipv4Addr>> = Vec::new();
     let mut blackhole_withdrawn_v6: Vec<Nlri<Ipv6Addr>> = Vec::new();
+    let mut notification: Option<NotificationMessage> = None;
     let withdrawn_count = msg.withdrawn.len();
 
     // ── Traditional IPv4 withdrawals (RFC 4271 §4.3) ──────────────────────
@@ -1085,6 +1086,56 @@ pub(super) fn handle_update(
                 }
                 adj_rib_in_v6.withdraw(&nlri);
                 fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+            }
+        }
+    } else {
+        // ── RFC 7606 §5.2: missing NLRI ────────────────────────────────────
+        // "if an UPDATE message is encountered that does contain path
+        // attributes other than MP_UNREACH_NLRI and doesn't encode any
+        // reachable NLRI, we cannot be confident that the NLRI have been
+        // successfully parsed as Section 3(j) requires. For this reason, if
+        // any path attribute errors are encountered in such an UPDATE
+        // message and if any encountered error specifies an error-handling
+        // approach other than 'attribute discard', then the 'session
+        // reset' approach MUST be used."
+        //
+        // `has_any_announces` is false here, so this UPDATE carries no
+        // traditional NLRI and no MP_REACH_NLRI. The only messages that are
+        // *legitimately* attribute-bearing with no reachable NLRI are a
+        // fully empty legacy End-of-RIB (no attributes at all) and an
+        // MP_UNREACH_NLRI-only End-of-RIB/withdrawal (RFC 4724 §2) — both
+        // have no attribute other than MP_UNREACH_NLRI, so `has_non_unreach_attr`
+        // is false for them and this block is a no-op. Any other
+        // attribute-bearing, NLRI-less UPDATE is exactly the case Section
+        // 5.2 describes: there's no reachable NLRI to treat-as-withdraw, so
+        // a missing-mandatory-attribute error here (which Section 3(d)
+        // would otherwise resolve via treat-as-withdraw) MUST instead reset
+        // the session.
+        let has_non_unreach_attr = msg
+            .attributes
+            .iter()
+            .any(|a| !matches!(a, PathAttribute::MpUnreachNlri(_)));
+        if has_non_unreach_attr {
+            let missing_attr = if !has_origin {
+                Some(1u8) // ORIGIN type code
+            } else if !has_as_path {
+                Some(2u8) // AS_PATH type code
+            } else {
+                None
+            };
+            if let Some(attr_type) = missing_attr {
+                tracing::warn!(
+                    peer = %peer,
+                    attr_type,
+                    "mandatory well-known attribute missing on an UPDATE with \
+                     no reachable NLRI (RFC 7606 §5.2) — session reset"
+                );
+                notification = Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(
+                        UpdateMsgError::MissingWellKnownAttribute,
+                    ),
+                    data: vec![attr_type],
+                });
             }
         }
     }
@@ -1390,7 +1441,7 @@ pub(super) fn handle_update(
     UpdateResult {
         fib_changes,
         fib_changes_v6,
-        notification: None,
+        notification,
         blackhole_announced_v4,
         blackhole_announced_v6,
         blackhole_withdrawn_v4,
