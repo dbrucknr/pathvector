@@ -39,20 +39,87 @@ use crate::message::{
 /// unconfirmed connection instead of the primary one.
 const COLLISION_CANDIDATE_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
-/// Which side initiated `self.transport`'s underlying TCP connection.
-///
-/// RFC 4271 §6.8 collision detection requires a genuine *reversed-direction*
-/// pair: one connection we dialed out (`Outbound`) and one the peer dialed
-/// in to us (`Inbound`). Two connections accepted in the same direction
-/// (e.g. two inbound connections, the second arriving while the first is
-/// still mid-handshake) are not a collision under the RFC's definition —
-/// tracking this lets `resolve_collision_candidate` tell the difference
-/// instead of assuming the existing connection is always our own outbound
-/// dial.
+/// Which side initiated a TCP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionOrigin {
     Outbound,
     Inbound,
+}
+
+/// The local/peer IP addresses and initiator of one TCP connection, used to
+/// test RFC 4271 §6.8's actual collision definition.
+///
+/// RFC 4271 §6.8 (quoted verbatim): "If the source IP address used by one
+/// of these connections is the same as the destination IP address used by
+/// the other, and the destination IP address used by the first connection
+/// is the same as the source IP address used by the other, connection
+/// collision has occurred." Deliberately IP-address-only, no ports: BGP's
+/// own asymmetry (one side always dials the peer's listening port 179; the
+/// other's local port is an OS-assigned ephemeral one) means a port-inclusive
+/// comparison would essentially never match a genuine collision.
+///
+/// Translating "source"/"destination" to what `TcpStream::local_addr()` /
+/// `peer_addr()` actually report takes care: those two calls always report
+/// "my end" / "their end" symmetrically, regardless of which side dialed —
+/// they are *not* source/destination in the RFC's packet-direction sense.
+/// For an outbound connection, local = source and peer = destination. For
+/// an inbound (accepted) one, local = destination and peer = source (the
+/// direction is reversed, precisely because the socket API doesn't care who
+/// initiated). Substituting that mapping into the RFC's own check — one
+/// outbound connection and one inbound connection — reduces to: **the same**
+/// local IP, **the same** peer IP, and opposite `origin`. All three are
+/// necessary:
+/// - Same local/peer alone (ignoring origin) also matches two *inbound*
+///   connections from the same peer, which is not a collision under the
+///   RFC's definition (no connection we dialed is involved at all).
+/// - Opposite origin alone (ignoring endpoints) also matches a multihomed
+///   local speaker's outbound dial from address A colliding with an
+///   unrelated inbound connection that happens to land on a *different*
+///   local address C — same peer, but not a reversed pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionIdentity {
+    local: IpAddr,
+    peer: IpAddr,
+    origin: ConnectionOrigin,
+}
+
+impl ConnectionIdentity {
+    fn is_reversed_pair_with(self, other: ConnectionIdentity) -> bool {
+        self.local == other.local && self.peer == other.peer && self.origin != other.origin
+    }
+}
+
+/// Captures a `TcpStream`'s local/peer IP addresses and pairs them with
+/// `origin`. `None` if either address lookup fails (should not happen for a
+/// connected socket, but this is used purely for the RFC 4271 §6.8 collision
+/// check, not correctness-load-bearing elsewhere — treat a lookup failure
+/// the same as "identity unknown," which conservatively fails the
+/// reversed-pair check).
+fn connection_identity(stream: &TcpStream, origin: ConnectionOrigin) -> Option<ConnectionIdentity> {
+    Some(ConnectionIdentity {
+        local: stream.local_addr().ok()?.ip(),
+        peer: stream.peer_addr().ok()?.ip(),
+        origin,
+    })
+}
+
+/// A second incoming connection staged while resolving a potential RFC
+/// 4271 §6.8 collision or RFC 4724 §4.2 GR override.
+///
+/// `open` is `None` until the candidate has sent (and had validated) its
+/// own OPEN message. Once `Some`, the candidate is no longer read from —
+/// it's held pending a decision, which for an `OpenSent` existing
+/// connection may not be possible yet (see `try_resolve_pending_candidate`):
+/// RFC 4271 §6.8's tiebreak only applies once the existing connection's own
+/// peer BGP Identifier is known, and examining an `OpenSent` connection at
+/// all is only sanctioned "if [the implementation] knows the BGP Identifier
+/// of the peer by means outside of the protocol" — which this
+/// implementation doesn't have, so it must wait for the primary's own OPEN
+/// (or for the primary to fail) rather than guess.
+struct CollisionCandidate<T> {
+    transport: T,
+    identity: ConnectionIdentity,
+    open: Option<OpenMessage>,
 }
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -379,7 +446,7 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         connect_task: None,
         connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
         local_addr: None,
-        transport_origin: None,
+        transport_identity: None,
         pending_collision_candidate: None,
         pending_collision_deadline: None,
         collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
@@ -434,7 +501,7 @@ fn spawn_with_collision_timeout(
         connect_task: None,
         connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
         local_addr: None,
-        transport_origin: None,
+        transport_identity: None,
         pending_collision_candidate: None,
         pending_collision_deadline: None,
         collision_candidate_open_timeout,
@@ -489,7 +556,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         connect_task: None,
         connect_factory: None,
         local_addr: None,
-        transport_origin: None,
+        transport_identity: None,
         pending_collision_candidate: None,
         pending_collision_deadline: None,
         collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
@@ -538,18 +605,20 @@ struct Session<T: BgpTransport> {
     // local address isn't silently discarded -- the daemon decides how to use
     // it per address family.
     local_addr: Option<IpAddr>,
-    // Which side initiated `self.transport`'s TCP connection. `None` when
-    // `self.transport` is `None`. See `ConnectionOrigin`.
-    transport_origin: Option<ConnectionOrigin>,
-    // A second, not-yet-validated incoming connection staged while resolving
-    // a potential RFC 4271 §6.8 collision or RFC 4724 §4.2 GR override. Its
-    // own local address is captured alongside it (mirroring `local_addr`)
-    // since it can't be read back out of `T` once wrapped. `None` unless a
-    // genuine second connection is currently being staged; see
-    // `resolve_collision_candidate`.
-    pending_collision_candidate: Option<(T, Option<IpAddr>)>,
+    // The local/peer IP addresses and initiator of `self.transport`'s TCP
+    // connection. `None` when `self.transport` is `None`. See
+    // `ConnectionIdentity`.
+    transport_identity: Option<ConnectionIdentity>,
+    // A second incoming connection staged while resolving a potential RFC
+    // 4271 §6.8 collision or RFC 4724 §4.2 GR override. `None` unless a
+    // genuine second connection is currently being staged or held pending
+    // the primary's own identity; see `CollisionCandidate`,
+    // `handle_collision_candidate_message`, and
+    // `try_resolve_pending_candidate`.
+    pending_collision_candidate: Option<CollisionCandidate<T>>,
     // Deadline for `pending_collision_candidate` to send its OPEN. `None`
-    // whenever `pending_collision_candidate` is `None`.
+    // once its OPEN has been read and validated (`CollisionCandidate::open`
+    // is `Some`) or whenever `pending_collision_candidate` is `None`.
     pending_collision_deadline: Option<Instant>,
     // How long to wait for a staged candidate's OPEN. Always
     // `COLLISION_CANDIDATE_OPEN_TIMEOUT` in production; overridable in tests
@@ -601,6 +670,13 @@ impl<T: BgpTransport> Session<T> {
                 let recovery = self.fsm.process(FsmInput::TcpFailed);
                 self.execute(recovery).await;
             }
+            // Cheap no-op unless a collision candidate is both staged and
+            // already holding a validated OPEN (see `CollisionCandidate`).
+            // Whatever `input` just did to `self.fsm`'s state — reaching
+            // OpenConfirm from OpenSent (learning the primary's own peer
+            // BGP Identifier for the first time) or dying entirely — may be
+            // exactly what a deferred candidate decision was waiting on.
+            self.try_resolve_pending_candidate().await;
         }
     }
 
@@ -665,9 +741,10 @@ impl<T: BgpTransport> Session<T> {
                     return match result {
                         Ok(stream) => {
                             self.local_addr = stream.local_addr().ok().map(|a| a.ip());
+                            self.transport_identity =
+                                connection_identity(&stream, ConnectionOrigin::Outbound);
                             // connect_task is only spawned when connect_factory is Some.
                             self.transport = Some(self.connect_factory.as_ref().unwrap()(stream));
-                            self.transport_origin = Some(ConnectionOrigin::Outbound);
                             FsmInput::TcpConnected
                         }
                         Err(_) => FsmInput::TcpFailed,
@@ -680,15 +757,16 @@ impl<T: BgpTransport> Session<T> {
                     }
                 }
 
-                // A staged collision candidate (see `handle_incoming_connection`
-                // and `resolve_collision_candidate`) sent its first message.
-                // Only a well-formed OPEN can ever resolve into an FsmInput —
-                // anything else means the candidate is dropped and the
-                // existing connection (if any) is left undisturbed.
+                // A staged collision candidate (see `handle_incoming_connection`)
+                // sent its first message. Doesn't itself return an `FsmInput`
+                // to this select loop — any resulting FSM transitions are
+                // driven synchronously inside `handle_collision_candidate_message`
+                // / `try_resolve_pending_candidate`, since adopting a candidate
+                // can mean feeding the FSM two follow-up inputs in sequence
+                // (TcpConnected, then the candidate's own OPEN), which the
+                // single-slot `pending_input` bypass can't queue.
                 msg = recv_candidate_message(&mut self.pending_collision_candidate) => {
-                    if let Some(input) = self.handle_collision_candidate_message(msg).await {
-                        return input;
-                    }
+                    self.handle_collision_candidate_message(msg).await;
                 }
 
                 () = collision_deadline => {
@@ -766,9 +844,9 @@ impl<T: BgpTransport> Session<T> {
             // No active outbound attempt — accept the incoming connection directly.
             State::Idle | State::Connect | State::Active => {
                 self.local_addr = stream.local_addr().ok().map(|a| a.ip());
+                self.transport_identity = connection_identity(&stream, ConnectionOrigin::Inbound);
                 if let Some(factory) = &self.connect_factory {
                     self.transport = Some(factory(stream));
-                    self.transport_origin = Some(ConnectionOrigin::Inbound);
                 }
                 Some(FsmInput::TcpConnected)
             }
@@ -807,45 +885,64 @@ impl<T: BgpTransport> Session<T> {
     /// Wraps `stream` via `connect_factory` and stores it as
     /// `pending_collision_candidate`, starting the OPEN-wait deadline. A
     /// no-op (drops `stream`) if no `connect_factory` is configured
-    /// (injected-transport/test mode without one set up).
+    /// (injected-transport/test mode without one set up), or if the
+    /// identity can't be determined (conservatively refuse to stage
+    /// something we can't ever prove is a genuine reversed pair). Always
+    /// `Inbound` — every candidate arrives via `SessionCommand::IncomingConnection`.
     fn stage_collision_candidate(&mut self, stream: TcpStream) {
-        let local_addr = stream.local_addr().ok().map(|a| a.ip());
+        let Some(identity) = connection_identity(&stream, ConnectionOrigin::Inbound) else {
+            return;
+        };
         let Some(factory) = &self.connect_factory else {
             return;
         };
-        self.pending_collision_candidate = Some((factory(stream), local_addr));
+        self.pending_collision_candidate = Some(CollisionCandidate {
+            transport: factory(stream),
+            identity,
+            open: None,
+        });
         self.pending_collision_deadline =
             Some(Instant::now() + self.collision_candidate_open_timeout);
     }
 
     /// Handles the first message read from a staged collision candidate
     /// (called from `wait_for_input`'s select loop once
-    /// `pending_collision_candidate` produces one). Only a well-formed OPEN
-    /// can ever resolve into an `FsmInput` via `resolve_collision_candidate`
-    /// — anything else means the candidate is dropped and the existing
-    /// connection (if any) is left undisturbed.
+    /// `pending_collision_candidate` produces one — only fires while
+    /// `open` is still `None`, i.e. before the candidate has proven itself;
+    /// see `recv_candidate_message`).
+    ///
+    /// Validates the OPEN (RFC 4271 §6.2 — version, BGP Identifier, peer
+    /// AS, hold time; RFC 5492 §3 required capabilities; RFC 9234 §5.1 Role
+    /// compatibility) and the reversed-pair endpoint check (RFC 4271 §6.8)
+    /// immediately — both are already fully knowable and don't depend on
+    /// anything the primary connection might still be waiting on. Anything
+    /// other than a valid OPEN from a genuine reversed pair means the
+    /// candidate is dropped here and now; the existing connection (if any)
+    /// is never touched.
+    ///
+    /// A candidate that clears both checks isn't necessarily *decided* yet
+    /// — seeing `try_resolve_pending_candidate`.
     async fn handle_collision_candidate_message(
         &mut self,
         msg: Option<Result<BgpMessage, FramingError>>,
-    ) -> Option<FsmInput> {
-        let (transport, local_addr) = self
-            .pending_collision_candidate
-            .take()
-            .expect("collision candidate future only resolves when Some");
+    ) {
+        use crate::fsm::State;
+
+        let Some(mut candidate) = self.pending_collision_candidate.take() else {
+            return;
+        };
         self.pending_collision_deadline = None;
-        match msg {
-            Some(Ok(BgpMessage::Open(open))) => {
-                self.resolve_collision_candidate(transport, local_addr, open)
-                    .await
-            }
+
+        let open = match msg {
+            Some(Ok(BgpMessage::Open(open))) => open,
             Some(Ok(other)) => {
                 tracing::debug!(
                     peer = %self.config.peer_addr,
                     message = ?other,
                     "collision candidate's first message was not an OPEN; dropping it"
                 );
-                drop(transport);
-                None
+                drop(candidate);
+                return;
             }
             Some(Err(e)) => {
                 tracing::debug!(
@@ -853,85 +950,113 @@ impl<T: BgpTransport> Session<T> {
                     error = %e,
                     "codec error reading collision candidate's OPEN; dropping it"
                 );
-                drop(transport);
-                None
+                drop(candidate);
+                return;
             }
             None => {
                 tracing::debug!(
                     peer = %self.config.peer_addr,
                     "collision candidate closed before sending an OPEN; dropping it"
                 );
-                drop(transport);
-                None
+                drop(candidate);
+                return;
             }
+        };
+
+        if let Err((error, data)) = self.fsm.validate_open(&open) {
+            tracing::warn!(
+                peer = %self.config.peer_addr,
+                candidate_bgp_id = %open.bgp_id,
+                error = ?error,
+                "rejecting collision candidate: OPEN failed validation; \
+                 existing connection (if any) left undisturbed"
+            );
+            let _ = candidate
+                .transport
+                .send(BgpMessage::Notification(NotificationMessage {
+                    error,
+                    data,
+                }))
+                .await;
+            drop(candidate);
+            return;
         }
+
+        // RFC 4271 §6.8's own collision definition only applies to a
+        // genuine reversed pair. This check doesn't depend on any
+        // FSM-state-specific logic — it's already fully known — so it's
+        // resolved here immediately rather than deferred, unlike the
+        // BGP-Identifier tiebreak below (which needs `try_resolve_pending_candidate`
+        // for the `OpenSent` case). Skipped entirely for `Idle`/`Connect`/
+        // `Active` (existing already gone, nothing to reverse-pair against)
+        // and `Established`+GR (not a simultaneous-dial scenario at all —
+        // see `try_resolve_pending_candidate`'s doc comment).
+        let needs_reversed_pair = matches!(self.fsm.state(), State::OpenSent | State::OpenConfirm);
+        if needs_reversed_pair
+            && !self
+                .transport_identity
+                .is_some_and(|e| e.is_reversed_pair_with(candidate.identity))
+        {
+            tracing::warn!(
+                peer = %self.config.peer_addr,
+                candidate_bgp_id = %open.bgp_id,
+                candidate_identity = ?candidate.identity,
+                existing_identity = ?self.transport_identity,
+                "rejecting collision candidate: not a reversed-direction TCP \
+                 pair per RFC 4271 §6.8"
+            );
+            drop(candidate);
+            return;
+        }
+
+        candidate.open = Some(open);
+        self.pending_collision_candidate = Some(candidate);
+        self.try_resolve_pending_candidate().await;
     }
 
-    /// Resolves a staged collision candidate once its OPEN has been read.
+    /// Attempts to resolve a staged, already-validated collision candidate
+    /// (`pending_collision_candidate.open.is_some()`) against the *current*
+    /// primary-connection state. Called right after a candidate clears
+    /// validation, and unconditionally after every `FsmInput` `run()`
+    /// processes — covering both events that might newly permit a decision
+    /// that couldn't be made when the candidate first validated: the
+    /// primary reaching `OpenConfirm` from `OpenSent` (learning its peer's
+    /// real BGP Identifier for the first time) or dying entirely. A cheap
+    /// no-op whenever there's no candidate, or it hasn't validated an OPEN
+    /// yet, or the primary's own state still doesn't permit a decision.
     ///
-    /// This is where RFC 4271 §6.8's actual precondition is applied: the
-    /// collision-resolution procedure only triggers when the existing
-    /// connection's peer BGP Identifier equals the *new* connection's, as
-    /// carried in its own OPEN message, AND the two connections form a
-    /// genuine reversed-direction pair (our own outbound dial versus this
-    /// inbound candidate — see `ConnectionOrigin`). The pre-fix version of
-    /// this code skipped both checks: it compared the local BGP ID against
-    /// whatever the *existing* connection's peer ID already was (or
-    /// nothing, in `OpenSent`) without confirming the new connection
-    /// belonged to the same peer, and it never considered which side
-    /// initiated the existing connection at all — so two connections
-    /// accepted in the same direction (e.g. a second inbound arriving while
-    /// an earlier accepted one is still mid-handshake) could be wrongly
-    /// treated as a collision. A second connection from the peer's
-    /// configured address carrying a different BGP Identifier (peer restart
-    /// with a new router-id, NAT/anycast/VRRP address reuse, or plain
-    /// misconfiguration) would still run the tiebreak and could tear down a
-    /// healthy in-progress or Established session.
+    /// RFC 4271 §6.8's collision-resolution procedure only triggers when an
+    /// existing connection's peer BGP Identifier equals the *new*
+    /// connection's, as carried in its own OPEN message. The pre-fix
+    /// version of this code ignored that in `OpenSent` — it just always
+    /// adopted, since the existing connection's ID isn't known yet — but
+    /// RFC 4271 §6.8 doesn't sanction examining an `OpenSent` connection at
+    /// all except "if [the implementation] knows the BGP Identifier of the
+    /// peer by means outside of the protocol," which this implementation
+    /// has no way to do. So rather than guessing, an `OpenSent` primary
+    /// defers the decision until its own OPEN arrives (or it dies).
     ///
-    /// Also closes the identical identity gap in the RFC 4724 §4.2 GR
+    /// Also applies the identical identity gap fix to the RFC 4724 §4.2 GR
     /// override, which previously had no identity check at all — any second
     /// incoming connection while Established-with-GR unconditionally
-    /// displaced the live session. The reversed-direction requirement does
-    /// *not* apply to the GR override: unlike §6.8's simultaneous-dial
-    /// scenario, GR reconnection is specifically "the old TCP died, the same
-    /// peer dialed in again" — equally valid whether the original session
-    /// was itself outbound or inbound.
-    async fn resolve_collision_candidate(
-        &mut self,
-        candidate: T,
-        candidate_local_addr: Option<IpAddr>,
-        open: OpenMessage,
-    ) -> Option<FsmInput> {
+    /// displaced the live session.
+    async fn try_resolve_pending_candidate(&mut self) {
         use crate::fsm::State;
 
-        let adopt = match self.fsm.state() {
-            // RFC 4271 §6.8 only defines a collision between a reversed
-            // pair: one connection we dialed out, one the peer dialed in.
-            // If the existing connection is itself inbound, this candidate
-            // — also inbound, by construction (it only ever arrives via
-            // `SessionCommand::IncomingConnection`) — cannot form that pair.
-            // Reject it outright; the identity/tiebreak logic below never
-            // even runs.
-            State::OpenSent | State::OpenConfirm
-                if self.transport_origin != Some(ConnectionOrigin::Outbound) =>
-            {
-                false
-            }
+        let Some(candidate) = &self.pending_collision_candidate else {
+            return;
+        };
+        let Some(open) = candidate.open.clone() else {
+            return;
+        };
 
-            // OpenSent (direction check above already passed): the existing
-            // connection's peer ID isn't known yet (peer_open is only set
-            // once the peer's OPEN has been validated) — nothing to check
-            // the candidate's identity against. Preserve the existing
-            // conservative default (adopt), now gated on the candidate
-            // having actually sent a well-formed OPEN rather than at raw
-            // TCP-accept time.
-            //
-            // Idle/Connect/Active: the connection this candidate was staged
-            // against is already gone (TcpFailed / hold-timer expiry moved
-            // the FSM back here while the candidate was still waiting to
-            // prove itself) — nothing left to protect. Adopt it directly,
-            // same as a fresh accepted connection.
-            State::OpenSent | State::Idle | State::Connect | State::Active => true,
+        let adopt = match self.fsm.state() {
+            // Primary's own identity still unknown — wait for its own OPEN
+            // (or for it to die, landing in Idle/Connect/Active below) to
+            // resolve this later. The reversed-pair check already ran (see
+            // `handle_collision_candidate_message`); only identity remains
+            // pending.
+            State::OpenSent => return,
 
             // The existing connection's peer ID IS known — RFC 4271 §6.8
             // only applies when it equals the candidate's. If it doesn't,
@@ -943,14 +1068,23 @@ impl<T: BgpTransport> Session<T> {
                     self.config.local_bgp_id < open.bgp_id
                 }
                 Some(_) => false,
-                None => true, // Shouldn't happen in OpenConfirm; conservative default.
+                None => return, // Shouldn't happen in OpenConfirm; wait rather than guess.
             },
 
             // RFC 4724 §4.2 override: only a reconnection *by the same peer*
-            // may silently displace the live session.
+            // may silently displace the live session. Not gated on the
+            // reversed-pair check — GR reconnection ("old TCP died, same
+            // peer dialed in again") isn't RFC 4271 §6.8's simultaneous-dial
+            // scenario and has no such requirement.
             State::Established if self.fsm.peer_has_graceful_restart() => {
                 self.fsm.peer_bgp_id() == Some(open.bgp_id)
             }
+
+            // The connection this candidate was staged against (or was
+            // waiting on, if deferred from OpenSent) is already gone —
+            // nothing left to protect. Adopt it directly, same as a fresh
+            // accepted connection.
+            State::Idle | State::Connect | State::Active => true,
 
             // A fresh session cycle started (and possibly re-established,
             // this time without GR) since this candidate was staged. It's
@@ -959,48 +1093,22 @@ impl<T: BgpTransport> Session<T> {
             State::Established => false,
         };
 
+        let candidate = self
+            .pending_collision_candidate
+            .take()
+            .expect("checked Some above; state() calls above don't touch this field");
+
         if !adopt {
             tracing::warn!(
                 peer = %self.config.peer_addr,
                 candidate_bgp_id = %open.bgp_id,
                 fsm_state = ?self.fsm.state(),
-                transport_origin = ?self.transport_origin,
-                "rejecting collision candidate: not a genuine RFC 4271 §6.8 \
-                 collision (identity mismatch, wrong connection direction, \
-                 or the existing connection has moved on)"
+                "rejecting collision candidate: BGP Identifier does not match \
+                 the existing connection's peer (or the existing connection \
+                 has moved on)"
             );
             drop(candidate);
-            return None;
-        }
-
-        // RFC 4271 §6.2: the candidate's OPEN must pass the same validation
-        // any OPEN would (version, BGP Identifier, peer AS, hold time,
-        // required capabilities, RFC 9234 Role compatibility) *before* the
-        // existing connection is torn down. Deciding to adopt on the
-        // BGP-ID/tiebreak check alone and closing the existing connection
-        // first — validating the rest of the OPEN only afterward, once it's
-        // already been fed to the FSM as `MessageReceived` in its new
-        // `OpenSent` state — would let a same-identity candidate with an
-        // invalid field (wrong peer AS, unacceptable hold time, an
-        // unsupported required capability, ...) destroy a healthy session
-        // and then fail anyway.
-        if let Err((error, data)) = self.fsm.validate_open(&open) {
-            tracing::warn!(
-                peer = %self.config.peer_addr,
-                candidate_bgp_id = %open.bgp_id,
-                error = ?error,
-                "rejecting collision candidate: OPEN failed validation; \
-                 existing connection (if any) left undisturbed"
-            );
-            let mut candidate = candidate;
-            let _ = candidate
-                .send(BgpMessage::Notification(NotificationMessage {
-                    error,
-                    data,
-                }))
-                .await;
-            drop(candidate);
-            return None;
+            return;
         }
 
         match self.fsm.state() {
@@ -1036,18 +1144,21 @@ impl<T: BgpTransport> Session<T> {
             }
         }
 
-        self.transport = Some(candidate);
-        // Every candidate arrives via SessionCommand::IncomingConnection —
-        // always inbound by construction.
-        self.transport_origin = Some(ConnectionOrigin::Inbound);
-        self.local_addr = candidate_local_addr;
-        // The candidate's OPEN was already consumed reading it off the wire
-        // — it can't be read again. Queue it so the FSM sees it as its next
-        // input immediately after processing TcpConnected below (same
-        // pending_input bypass `execute()` uses to activate an injected
-        // transport without a real async connect-task round trip).
-        self.pending_input = Some(FsmInput::MessageReceived(BgpMessage::Open(open)));
-        Some(FsmInput::TcpConnected)
+        self.transport = Some(candidate.transport);
+        self.transport_identity = Some(candidate.identity);
+        self.local_addr = Some(candidate.identity.local);
+        // Drive both follow-up transitions synchronously here rather than
+        // via the wait_for_input()/pending_input bypass (which only holds
+        // one queued input): TcpConnected (Active/whatever-state -> OpenSent,
+        // sends our OPEN), then the candidate's already-validated OPEN
+        // (OpenSent -> OpenConfirm, sends our KEEPALIVE) — it was already
+        // consumed reading it off the wire, so it can't be read again.
+        let outputs = self.fsm.process(FsmInput::TcpConnected);
+        self.execute(outputs).await;
+        let outputs = self
+            .fsm
+            .process(FsmInput::MessageReceived(BgpMessage::Open(open)));
+        self.execute(outputs).await;
     }
 
     /// Execute a batch of FSM outputs. Returns `false` if a TCP send failed;
@@ -1060,10 +1171,10 @@ impl<T: BgpTransport> Session<T> {
                     if let Some(t) = self.pending_transport.take() {
                         // Injected-transport path: activate immediately and queue
                         // TcpConnected so the FSM advances on the next loop tick.
-                        // Simulates an outbound connect (this fires in response to
-                        // InitiateTcpConnect, the FSM's own "dial out" action).
+                        // No real TcpStream here, so no endpoints to capture —
+                        // harmless, since this test/mock-only path never stages
+                        // a real collision candidate to compare against.
                         self.transport = Some(t);
-                        self.transport_origin = Some(ConnectionOrigin::Outbound);
                         self.pending_input = Some(FsmInput::TcpConnected);
                     } else if self.connect_factory.is_some() {
                         let addr = self.config.peer_addr;
@@ -1215,7 +1326,7 @@ impl<T: BgpTransport> Session<T> {
 
     fn drop_connection(&mut self) {
         self.transport = None;
-        self.transport_origin = None;
+        self.transport_identity = None;
         if let Some(t) = self.connect_task.take() {
             t.abort();
         }
@@ -1349,11 +1460,14 @@ async fn recv_message<T: BgpTransport>(
 /// Resolves with the next decoded message from a staged collision
 /// candidate, or never if none is currently staged.
 async fn recv_candidate_message<T: BgpTransport>(
-    candidate: &mut Option<(T, Option<IpAddr>)>,
+    candidate: &mut Option<CollisionCandidate<T>>,
 ) -> Option<Result<BgpMessage, FramingError>> {
     match candidate {
-        Some((t, _)) => t.recv().await,
-        None => std::future::pending::<Option<Result<BgpMessage, FramingError>>>().await,
+        // Only poll a candidate that hasn't validated an OPEN yet — one
+        // that has is held pending a decision (see
+        // `try_resolve_pending_candidate`), not read from further.
+        Some(c) if c.open.is_none() => c.transport.recv().await,
+        _ => std::future::pending::<Option<Result<BgpMessage, FramingError>>>().await,
     }
 }
 
@@ -1362,7 +1476,7 @@ async fn recv_candidate_message<T: BgpTransport>(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -1373,9 +1487,10 @@ mod tests {
     use std::net::Ipv4Addr as StdIpv4Addr;
 
     use super::{
-        BgpTransport, COLLISION_CANDIDATE_OPEN_TIMEOUT, DEFAULT_CONNECT_RETRY_TIME,
-        FramedBgpTransport, SessionCommand, SessionConfig, SessionEvent, SessionHandle,
-        SpawnedSessionHandle, TerminationReason, spawn, spawn_with, spawn_with_collision_timeout,
+        BgpTransport, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity, ConnectionOrigin,
+        DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand, SessionConfig,
+        SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason, spawn, spawn_with,
+        spawn_with_collision_timeout,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
@@ -2469,6 +2584,232 @@ mod tests {
         assert!(
             closed.is_none(),
             "a same-direction second connection must be rejected, got {closed:?}"
+        );
+    }
+
+    /// Pure, socket-free unit test of `ConnectionIdentity::is_reversed_pair_with`
+    /// covering all three cases Codex's second review flagged: a genuine
+    /// collision (matching endpoints, opposite direction) must pass; two
+    /// connections in the *same* direction (a second inbound arriving while
+    /// an existing inbound connection is still mid-handshake) must fail
+    /// even though their endpoints match; and Codex's specific multihomed
+    /// counter-example — outbound dialed from local address A, an unrelated
+    /// inbound connection landing on a *different* local address C — must
+    /// fail even though direction is opposite, since the endpoints
+    /// themselves don't actually reverse.
+    #[test]
+    fn test_connection_identity_reversed_pair() {
+        let addr_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let addr_c: IpAddr = "10.0.0.3".parse().unwrap();
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+
+        // Genuine collision: existing dialed out from A to peer; candidate
+        // is peer dialing in, landing on that same local address A.
+        let existing = ConnectionIdentity {
+            local: addr_a,
+            peer,
+            origin: ConnectionOrigin::Outbound,
+        };
+        let candidate = ConnectionIdentity {
+            local: addr_a,
+            peer,
+            origin: ConnectionOrigin::Inbound,
+        };
+        assert!(
+            existing.is_reversed_pair_with(candidate),
+            "matching endpoints with opposite direction must be a genuine \
+             reversed pair"
+        );
+
+        // Same direction, matching endpoints: not a collision under RFC
+        // 4271 §6.8's definition — no connection we dialed is involved.
+        let existing_inbound = ConnectionIdentity {
+            origin: ConnectionOrigin::Inbound,
+            ..existing
+        };
+        assert!(
+            !existing_inbound.is_reversed_pair_with(candidate),
+            "two inbound connections from the same peer must not be treated \
+             as a reversed pair, even with identical endpoints"
+        );
+
+        // Multihomed: outbound dialed from A, but the "candidate" landed on
+        // a different local address C — opposite direction, but not
+        // actually a reversed pair.
+        let candidate_wrong_local = ConnectionIdentity {
+            local: addr_c,
+            ..candidate
+        };
+        assert!(
+            !existing.is_reversed_pair_with(candidate_wrong_local),
+            "opposite direction alone is not sufficient — endpoints must \
+             also actually reverse (Codex's multihomed counter-example)"
+        );
+    }
+
+    /// Codex's review of this PR's second version: RFC 4271 §6.8 doesn't
+    /// sanction resolving a collision against an `OpenSent` connection
+    /// unless the peer's BGP Identifier is already known "by means outside
+    /// of the protocol" — which this implementation doesn't have. A
+    /// candidate arriving while the primary is `OpenSent` must not be
+    /// decided on the spot; it must wait until the primary's own OPEN
+    /// supplies a real identity to compare against. Here, the candidate's
+    /// BGP ID (10.0.0.9) does *not* match what the primary's own peer turns
+    /// out to be (10.0.0.2, lower than local — would lose the tiebreak
+    /// anyway, but that's not even reachable since identity doesn't match):
+    /// the candidate must be rejected once the primary resolves, and the
+    /// primary itself must never have been disturbed in the meantime.
+    #[tokio::test]
+    async fn test_collision_candidate_deferred_in_open_sent_rejected_once_primary_id_known() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        // Confirm the session is in OpenSent: it has sent its own OPEN, but
+        // we haven't replied yet.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+
+        // Candidate arrives and validates while the primary is still
+        // OpenSent — its identity (10.0.0.9) is unrelated to what the
+        // primary will end up reporting.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+        let mismatched_candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = mismatched_candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // Give the deferred-resolution path a chance to (incorrectly, if
+        // the fix regressed) act before the primary's own OPEN arrives.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now complete the primary's own handshake with its real identity
+        // (10.0.0.2) — unrelated to the candidate's remembered 10.0.0.9.
+        let primary_peer_id = Ipv4Addr::new(10, 0, 0, 2);
+        let mut primary_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = primary_open {
+            o.bgp_id = primary_peer_id;
+        }
+        existing_peer.send(primary_open).await.unwrap();
+
+        let ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "the primary connection must reach Established undisturbed — a \
+             deferred OpenSent candidate must never preempt it before the \
+             primary's own identity is known, got {event:?}"
+        );
+
+        // The candidate, now resolved against the primary's real (mismatched)
+        // identity, must be rejected.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the deferred candidate to close");
+        assert!(
+            closed.is_none(),
+            "candidate with an identity that doesn't match the primary's \
+             now-known peer must be rejected once deferral resolves, got {closed:?}"
+        );
+    }
+
+    /// Companion to the test above: if the primary dies (here: the peer
+    /// simply closes the TCP connection) while a validated candidate is
+    /// still deferred in `OpenSent`, the candidate must be adopted directly
+    /// once `run()`'s post-input `try_resolve_pending_candidate` hook sees
+    /// the primary has moved to `Active` — same as a fresh accepted
+    /// connection.
+    #[tokio::test]
+    async fn test_collision_candidate_deferred_in_open_sent_adopted_when_primary_dies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+        let candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Kill the primary connection outright — the session should observe
+        // EOF, feed TcpFailed to the FSM, and land in Active.
+        drop(existing_peer);
+
+        // The deferred candidate must now be adopted directly: it completes
+        // a fresh handshake and the session reaches Established over it.
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN on the adopted candidate")
+            .expect("candidate closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+        let ka = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE on the adopted candidate")
+            .expect("candidate closed before KEEPALIVE")
+            .expect("decode error");
+        assert!(matches!(ka, BgpMessage::Keepalive));
+        candidate_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(
+            matches!(event, SessionEvent::Established(_)),
+            "a deferred candidate must be adopted once the primary it was \
+             waiting on dies, got {event:?}"
         );
     }
 

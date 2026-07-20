@@ -944,13 +944,24 @@ async fn test_incoming_connection_while_established_is_rejected() {
     discard_peer.abort();
 }
 
-/// An inbound connection arriving in `OpenSent` *before* the peer's OPEN has been
-/// received (`peer_bgp_id` is unknown) is accepted conservatively — the outbound
-/// connection is closed and the session restarts over the incoming one.
+/// An inbound connection arriving in `OpenSent` — *before* the primary
+/// connection's own peer BGP Identifier is known — must be **deferred**,
+/// not immediately adopted. RFC 4271 §6.8's collision-resolution procedure
+/// doesn't sanction resolving against an `OpenSent` connection unless the
+/// identifier is already known "by means outside of the protocol," which
+/// this implementation has no way to do. So the candidate validates and
+/// waits; only once the primary's own OPEN later arrives — supplying a
+/// real BGP Identifier to compare — does the tiebreak actually apply. Here
+/// the primary's real identity (10.0.0.2) matches what the already-deferred
+/// candidate declared, so once resolved: local (10.0.0.1) < peer (10.0.0.2)
+/// means the candidate must be adopted.
 #[tokio::test]
-async fn test_incoming_connection_unknown_peer_id_adopts_conservatively() {
+async fn test_incoming_connection_unknown_peer_id_defers_then_resolves_on_match() {
     // Outbound listener: accepts the connect but withholds its OPEN so the
-    // session stays in OpenSent with peer_bgp_id == None.
+    // session stays in OpenSent with peer_bgp_id == None, until told to
+    // proceed — this lets the test control exactly when the primary's own
+    // identity becomes known, ensuring the candidate below has already
+    // validated and deferred by that point.
     let (outbound_listener, outbound_addr) = loopback_listener().await;
 
     let config = SessionConfig {
@@ -961,31 +972,59 @@ async fn test_incoming_connection_unknown_peer_id_adopts_conservatively() {
     let mut handle = spawn(config);
     handle.start().await;
 
-    // Accept the outbound connect and read the OPEN, but send nothing back.
-    // The session is now in OpenSent with peer_bgp_id = None.
+    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2); // higher than local
+
     let outbound_peer = tokio::spawn(async move {
         let (stream, _) = outbound_listener.accept().await.unwrap();
         let (r, w) = stream.into_split();
         let mut reader = FramedRead::new(r, BgpCodec::new());
-        let writer = FramedWrite::new(w, BgpCodec::new());
+        let mut writer = FramedWrite::new(w, BgpCodec::new());
         let msg = reader.next().await.unwrap().unwrap();
         assert!(matches!(msg, BgpMessage::Open(_)));
-        // Hold the connection open without sending our OPEN.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Withhold our own OPEN long enough for the candidate below to
+        // connect, send its OPEN, and be deferred (not decided) first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        writer
+            .send(BgpMessage::Open(OpenMessage {
+                version: 4,
+                my_as: 65002,
+                hold_time: 90,
+                bgp_id: peer_bgp_id,
+                capabilities: vec![Capability::FourByteAsn(65002)],
+            }))
+            .await
+            .unwrap();
+
+        // The deferred candidate's identity matches, so it wins the
+        // tiebreak: this (the primary) connection must now be closed with a
+        // Cease/ConnectionCollisionResolution NOTIFICATION.
+        let msg = reader.next().await.unwrap().unwrap();
+        assert!(
+            matches!(
+                msg,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::ConnectionCollisionResolution),
+                    ..
+                })
+            ),
+            "expected the primary to be closed with a collision NOTIFICATION \
+             once the deferred candidate's matching identity resolved, got {msg:?}"
+        );
         drop((reader, writer));
     });
 
     // Give the session time to send its OPEN and enter OpenSent.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Now deliver an incoming connection — peer_bgp_id is still None, so the
-    // session should conservatively adopt the incoming connection.
+    // This candidate collides with the existing OpenSent connection, so the
+    // session stages it and waits for its OPEN before sending anything —
+    // and since the primary's own identity isn't known yet, the decision
+    // defers rather than resolving immediately.
     let (incoming_listener, incoming_addr) = loopback_listener().await;
     let incoming_tx = handle.incoming_sender();
 
-    // This candidate collides with the existing OpenSent connection, so the
-    // session stages it and waits for its OPEN before sending anything.
-    let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
     let incoming_peer = tokio::spawn(async move {
         let stream = tokio::net::TcpStream::connect(incoming_addr).await.unwrap();
         peer_handshake_on_stream_peer_speaks_first(stream, 65002, peer_bgp_id).await
@@ -997,14 +1036,17 @@ async fn test_incoming_connection_unknown_peer_id_adopts_conservatively() {
         .await
         .unwrap();
 
-    // Session should reach Established over the new incoming connection.
+    // Once the primary's own OPEN resolves the deferral with a matching
+    // identity, the tiebreak adopts the candidate and the session reaches
+    // Established over it.
     let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
         .await
         .expect("timed out waiting for Established")
         .expect("session channel closed");
     assert!(
         matches!(event, SessionEvent::Established(_)),
-        "expected Established after conservative adopt, got {event:?}"
+        "expected Established over the adopted candidate once the deferred \
+         decision resolved, got {event:?}"
     );
 
     outbound_peer.abort();
