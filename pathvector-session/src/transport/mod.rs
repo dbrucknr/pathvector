@@ -689,21 +689,31 @@ impl<T: BgpTransport> Session<T> {
                     _ => TerminationReason::Unclean,
                 };
             }
-            // An operator-issued ManualStop must close any staged/pending
-            // collision candidate outright, regardless of what FSM state it
-            // ends up in. Idle alone can't tell "the operator asked us to
-            // stop" apart from "the primary connection failed" (both
-            // OpenConfirm's TcpFailed and its ManualStop arms land in
-            // Idle) — so `try_resolve_pending_candidate`'s Idle/Connect/
-            // Active adopt-directly path can't safely make that
-            // distinction on its own. Evicting here, before the FSM even
-            // processes the input, closes the gap unconditionally: a
-            // candidate that was mid-validation is dropped without a
-            // NOTIFICATION (consistent with every other silent-rejection
-            // path in `handle_collision_candidate_message`), and one that
-            // had already validated never gets a chance to be adopted.
-            if matches!(input, FsmInput::ManualStop)
-                && let Some(candidate) = self.pending_collision_candidate.take()
+            // A deliberate, no-automatic-reconnect teardown — `ManualStop`
+            // (operator stop) or `NotificationToSend` (locally initiated
+            // administrative teardown: peer removal, RFC 9003 shutdown, or
+            // a daemon-detected condition with its own separate re-arm
+            // schedule; see its handler in `on_established`) — must close
+            // any staged/pending collision candidate outright, regardless
+            // of what FSM state it ends up in. Idle alone can't tell either
+            // of these apart from "the primary connection failed" (both
+            // land in Idle exactly like `TcpFailed`/`HoldTimerExpired`) —
+            // so `try_resolve_pending_candidate`'s Idle/Connect/Active
+            // adopt-directly path can't safely make that distinction on its
+            // own. `ProtocolErrorNotificationToSend` is deliberately *not*
+            // included here: unlike `NotificationToSend`, it schedules an
+            // automatic reconnect (`StartConnectRetryTimer`) just like a
+            // genuine failure, so a pending candidate is still fair game to
+            // adopt there. Evicting here, before the FSM even processes the
+            // input, closes the gap unconditionally: a candidate that was
+            // mid-validation is dropped without a NOTIFICATION (consistent
+            // with every other silent-rejection path in
+            // `handle_collision_candidate_message`), and one that had
+            // already validated never gets a chance to be adopted.
+            if matches!(
+                input,
+                FsmInput::ManualStop | FsmInput::NotificationToSend(_)
+            ) && let Some(candidate) = self.pending_collision_candidate.take()
             {
                 drop(candidate);
                 self.pending_collision_deadline = None;
@@ -1801,6 +1811,47 @@ mod tests {
             incoming.unwrap(),
             FramedBgpTransport::from_stream(accepted_stream),
         )
+    }
+
+    /// Drives a real-TCP `existing_peer` connection through a full OPEN/
+    /// KEEPALIVE handshake advertising Graceful Restart, and asserts the
+    /// session reaches `Established` with GR negotiated. Shared by tests
+    /// that need a genuinely Established+GR primary to stage a
+    /// `CollisionPurpose::GracefulRestart` candidate against.
+    async fn establish_with_gr(
+        peer_bgp_id: Ipv4Addr,
+        existing_peer: &mut FramedBgpTransport,
+        handle: &mut SpawnedSessionHandle,
+    ) {
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+
+        let mut gr_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = gr_open {
+            open.bgp_id = peer_bgp_id;
+            open.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        existing_peer.send(gr_open).await.unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for initial Established")
+            .expect("session channel closed before Established");
+        assert!(matches!(event, SessionEvent::Established(_)));
     }
 
     /// Extract the inner `UpdateMessage` from a `RouteUpdate` event.
@@ -3007,6 +3058,129 @@ mod tests {
             "no further session event should fire once the operator has \
              stopped the session and the deferred candidate was discarded, \
              got {no_event:?}"
+        );
+    }
+
+    /// [Codex round 4] Companion to the `ManualStop` eviction test above:
+    /// `NotificationToSend` (locally initiated administrative teardown —
+    /// peer removal, RFC 9003 shutdown, or a daemon-detected condition with
+    /// its own separate re-arm schedule) is the *other* deliberate,
+    /// no-automatic-reconnect FSM input that lands in `Idle` — see its
+    /// handler in `on_established`, which (unlike
+    /// `ProtocolErrorNotificationToSend`) omits `StartConnectRetryTimer`.
+    /// A GR-purpose candidate staged while Established, still pending when
+    /// `NotificationToSend` fires, must be evicted exactly like the
+    /// `ManualStop` case: `State::Idle` alone can't distinguish "the daemon
+    /// deliberately tore this session down" from "the primary connection
+    /// failed," and adopting the candidate here would recreate the session
+    /// the daemon just removed. Pre-fix, this candidate would have survived
+    /// (only `ManualStop` was covered) and been adopted once its OPEN
+    /// arrived, since `Idle` alone said "nothing left to protect."
+    #[tokio::test]
+    async fn test_collision_candidate_pending_closed_on_notification_to_send() {
+        let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+        establish_with_gr(peer_bgp_id, &mut existing_peer, &mut handle).await;
+
+        // A GR-purpose candidate is staged, but held back before it ever
+        // sends its OPEN.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // The daemon issues a locally initiated administrative teardown
+        // (e.g. RFC 9003 peer removal) while the candidate is still
+        // pending.
+        handle
+            .incoming_sender()
+            .send(SessionCommand::Notification(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::PeerDeconfigured),
+                data: vec![],
+            }))
+            .await
+            .unwrap();
+
+        // The primary receives the requested NOTIFICATION.
+        let notif = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for the Cease NOTIFICATION")
+            .expect("closed before NOTIFICATION")
+            .expect("decode error");
+        assert!(
+            matches!(
+                notif,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::PeerDeconfigured),
+                    ..
+                })
+            ),
+            "expected Cease/PeerDeconfigured on NotificationToSend, got {notif:?}"
+        );
+
+        // The primary itself was genuinely Established, so this teardown
+        // legitimately emits Terminated(OperatorStop) — expected, not a
+        // symptom of the bug. Drain it before checking for anything further.
+        let terminated_event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Terminated event")
+            .expect("session channel closed");
+        assert!(
+            matches!(
+                terminated_event,
+                SessionEvent::Terminated(TerminationReason::OperatorStop)
+            ),
+            "expected Terminated(OperatorStop) for the deliberate teardown, \
+             got {terminated_event:?}"
+        );
+
+        // Only now does the candidate send its OPEN — same BGP Identifier
+        // and GR, exactly what a genuine GR reconnect would look like. If
+        // the bug were still present, this would be adopted and recreate
+        // the session the daemon just deliberately tore down.
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = peer_bgp_id;
+            o.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        // The candidate must be closed outright — not adopted.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the pending candidate to close");
+        assert!(
+            closed.is_none(),
+            "a pending collision candidate must be closed, not adopted, \
+             when the daemon issues a locally initiated NotificationToSend \
+             teardown, got {closed:?}"
+        );
+
+        // No new session was created: nothing further should ever come
+        // through the session's event channel.
+        let no_event = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            no_event.is_err(),
+            "no further session event should fire once NotificationToSend \
+             tore the session down and the pending candidate was \
+             discarded, got {no_event:?}"
         );
     }
 
