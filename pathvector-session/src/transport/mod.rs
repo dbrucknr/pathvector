@@ -103,6 +103,31 @@ fn connection_identity(stream: &TcpStream, origin: ConnectionOrigin) -> Option<C
     })
 }
 
+/// Which rule a staged candidate is being evaluated under — fixed at the
+/// moment it's staged (see `stage_collision_candidate`), not re-derived from
+/// the primary's state whenever the candidate happens to be resolved.
+///
+/// The primary can move through several states between a candidate being
+/// staged and that candidate finishing its own OPEN handshake (e.g. an
+/// `OpenConfirm`-staged candidate might not validate until the primary has
+/// already reached `Established`). Re-deriving "why was this staged" from
+/// whatever the primary's state happens to be *later* silently reinterprets
+/// the candidate: an RFC 4271 §6.8 collision candidate staged while the
+/// primary was mid-handshake must never be treated as an RFC 4724 §4.2 GR
+/// reconnect just because the primary went on to reach `Established`+GR in
+/// the meantime — GR renegotiating after staging doesn't retroactively make
+/// the candidate a GR reconnect, and adopting it that way would displace a
+/// healthy, just-established primary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionPurpose {
+    /// Staged while the primary was `OpenSent`/`OpenConfirm` — RFC 4271
+    /// §6.8. Requires a genuine reversed TCP pair.
+    Collision,
+    /// Staged while the primary was `Established` with GR negotiated — RFC
+    /// 4724 §4.2. Not gated on the reversed-pair check.
+    GracefulRestart,
+}
+
 /// A second incoming connection staged while resolving a potential RFC
 /// 4271 §6.8 collision or RFC 4724 §4.2 GR override.
 ///
@@ -120,6 +145,7 @@ struct CollisionCandidate<T> {
     transport: T,
     identity: ConnectionIdentity,
     open: Option<OpenMessage>,
+    purpose: CollisionPurpose,
 }
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -663,6 +689,25 @@ impl<T: BgpTransport> Session<T> {
                     _ => TerminationReason::Unclean,
                 };
             }
+            // An operator-issued ManualStop must close any staged/pending
+            // collision candidate outright, regardless of what FSM state it
+            // ends up in. Idle alone can't tell "the operator asked us to
+            // stop" apart from "the primary connection failed" (both
+            // OpenConfirm's TcpFailed and its ManualStop arms land in
+            // Idle) — so `try_resolve_pending_candidate`'s Idle/Connect/
+            // Active adopt-directly path can't safely make that
+            // distinction on its own. Evicting here, before the FSM even
+            // processes the input, closes the gap unconditionally: a
+            // candidate that was mid-validation is dropped without a
+            // NOTIFICATION (consistent with every other silent-rejection
+            // path in `handle_collision_candidate_message`), and one that
+            // had already validated never gets a chance to be adopted.
+            if matches!(input, FsmInput::ManualStop)
+                && let Some(candidate) = self.pending_collision_candidate.take()
+            {
+                drop(candidate);
+                self.pending_collision_deadline = None;
+            }
             let outputs = self.fsm.process(input);
             if !self.execute(outputs).await {
                 // A TCP send failed; feed TcpFailed back into the FSM.
@@ -857,11 +902,11 @@ impl<T: BgpTransport> Session<T> {
             // used for a direct accept, but hold it separately from
             // `self.transport` until its OPEN is read and validated.
             State::OpenSent | State::OpenConfirm => {
-                self.stage_collision_candidate(stream);
+                self.stage_collision_candidate(stream, CollisionPurpose::Collision);
                 None
             }
             State::Established if self.fsm.peer_has_graceful_restart() => {
-                self.stage_collision_candidate(stream);
+                self.stage_collision_candidate(stream, CollisionPurpose::GracefulRestart);
                 None
             }
 
@@ -889,7 +934,12 @@ impl<T: BgpTransport> Session<T> {
     /// identity can't be determined (conservatively refuse to stage
     /// something we can't ever prove is a genuine reversed pair). Always
     /// `Inbound` — every candidate arrives via `SessionCommand::IncomingConnection`.
-    fn stage_collision_candidate(&mut self, stream: TcpStream) {
+    ///
+    /// `purpose` is fixed here, at staging time, from the primary's state at
+    /// this exact moment — see `CollisionPurpose` for why it must not be
+    /// re-derived later from whatever the primary's state has become by the
+    /// time the candidate is actually resolved.
+    fn stage_collision_candidate(&mut self, stream: TcpStream, purpose: CollisionPurpose) {
         let Some(identity) = connection_identity(&stream, ConnectionOrigin::Inbound) else {
             return;
         };
@@ -900,6 +950,7 @@ impl<T: BgpTransport> Session<T> {
             transport: factory(stream),
             identity,
             open: None,
+            purpose,
         });
         self.pending_collision_deadline =
             Some(Instant::now() + self.collision_candidate_open_timeout);
@@ -926,8 +977,6 @@ impl<T: BgpTransport> Session<T> {
         &mut self,
         msg: Option<Result<BgpMessage, FramingError>>,
     ) {
-        use crate::fsm::State;
-
         let Some(mut candidate) = self.pending_collision_candidate.take() else {
             return;
         };
@@ -987,11 +1036,18 @@ impl<T: BgpTransport> Session<T> {
         // FSM-state-specific logic — it's already fully known — so it's
         // resolved here immediately rather than deferred, unlike the
         // BGP-Identifier tiebreak below (which needs `try_resolve_pending_candidate`
-        // for the `OpenSent` case). Skipped entirely for `Idle`/`Connect`/
-        // `Active` (existing already gone, nothing to reverse-pair against)
-        // and `Established`+GR (not a simultaneous-dial scenario at all —
-        // see `try_resolve_pending_candidate`'s doc comment).
-        let needs_reversed_pair = matches!(self.fsm.state(), State::OpenSent | State::OpenConfirm);
+        // for the `OpenSent` case). Skipped entirely for a GR-purpose
+        // candidate (not a simultaneous-dial scenario at all — see
+        // `try_resolve_pending_candidate`'s doc comment).
+        //
+        // Gated on `candidate.purpose` (fixed at staging time), not on
+        // `self.fsm.state()` right now — the primary may have already moved
+        // on from OpenSent/OpenConfirm to Established by the time this
+        // candidate's OPEN arrives, and re-deriving "is this a collision
+        // candidate" from the *current* state would wrongly skip the check
+        // for what was, in fact, staged as a genuine §6.8 collision
+        // candidate. See `CollisionPurpose`.
+        let needs_reversed_pair = candidate.purpose == CollisionPurpose::Collision;
         if needs_reversed_pair
             && !self
                 .transport_identity
@@ -1040,6 +1096,16 @@ impl<T: BgpTransport> Session<T> {
     /// override, which previously had no identity check at all — any second
     /// incoming connection while Established-with-GR unconditionally
     /// displaced the live session.
+    ///
+    /// Every branch below is additionally gated on `candidate.purpose`
+    /// (fixed at staging time — see `CollisionPurpose`), never solely on
+    /// `self.fsm.state()` as it stands *now*. A candidate staged as an RFC
+    /// 4271 §6.8 collision candidate (while the primary was still
+    /// `OpenSent`/`OpenConfirm`) must never be adopted via the RFC 4724
+    /// §4.2 GR path just because the primary went on to negotiate GR and
+    /// reach `Established` while the candidate was still pending — that
+    /// would displace a healthy, just-established primary based on stale
+    /// context from before it ever finished its own handshake.
     async fn try_resolve_pending_candidate(&mut self) {
         use crate::fsm::State;
 
@@ -1049,48 +1115,76 @@ impl<T: BgpTransport> Session<T> {
         let Some(open) = candidate.open.clone() else {
             return;
         };
+        let purpose = candidate.purpose;
 
         let adopt = match self.fsm.state() {
             // Primary's own identity still unknown — wait for its own OPEN
             // (or for it to die, landing in Idle/Connect/Active below) to
             // resolve this later. The reversed-pair check already ran (see
             // `handle_collision_candidate_message`); only identity remains
-            // pending.
-            State::OpenSent => return,
+            // pending. A GR-purpose candidate has no business seeing
+            // OpenSent (GR candidates are only ever staged while
+            // Established) — stale context from a primary that has since
+            // cycled all the way back through a fresh reconnect; drop it.
+            State::OpenSent if purpose == CollisionPurpose::Collision => return,
 
             // The existing connection's peer ID IS known — RFC 4271 §6.8
             // only applies when it equals the candidate's. If it doesn't,
             // this isn't a genuine collision with the existing connection;
             // reject the candidate rather than letting an unexpected
-            // identity influence it.
-            State::OpenConfirm => match self.fsm.peer_bgp_id() {
-                Some(existing_id) if existing_id == open.bgp_id => {
-                    self.config.local_bgp_id < open.bgp_id
+            // identity influence it. Not reachable for a GR-purpose
+            // candidate (staged only while Established) except via the same
+            // stale-context path as the OpenSent arm above.
+            State::OpenConfirm if purpose == CollisionPurpose::Collision => {
+                match self.fsm.peer_bgp_id() {
+                    Some(existing_id) if existing_id == open.bgp_id => {
+                        self.config.local_bgp_id < open.bgp_id
+                    }
+                    Some(_) => false,
+                    None => return, // Shouldn't happen in OpenConfirm; wait rather than guess.
                 }
-                Some(_) => false,
-                None => return, // Shouldn't happen in OpenConfirm; wait rather than guess.
-            },
+            }
 
             // RFC 4724 §4.2 override: only a reconnection *by the same peer*
             // may silently displace the live session. Not gated on the
             // reversed-pair check — GR reconnection ("old TCP died, same
             // peer dialed in again") isn't RFC 4271 §6.8's simultaneous-dial
-            // scenario and has no such requirement.
-            State::Established if self.fsm.peer_has_graceful_restart() => {
+            // scenario and has no such requirement. Requires the candidate
+            // to have actually been staged as a GR reconnect — a
+            // Collision-purpose candidate reaching this arm means the
+            // primary completed its handshake while the candidate was still
+            // pending; that candidate keeps its original §6.8 meaning and
+            // must not be reinterpreted as a GR reconnect just because GR
+            // happened to be negotiated on the primary's new session.
+            State::Established
+                if purpose == CollisionPurpose::GracefulRestart
+                    && self.fsm.peer_has_graceful_restart() =>
+            {
                 self.fsm.peer_bgp_id() == Some(open.bgp_id)
             }
 
             // The connection this candidate was staged against (or was
             // waiting on, if deferred from OpenSent) is already gone —
             // nothing left to protect. Adopt it directly, same as a fresh
-            // accepted connection.
+            // accepted connection. (An operator-issued ManualStop is
+            // handled earlier, in `run()`, by evicting the candidate
+            // outright before this function ever sees it — so reaching this
+            // arm always means a genuine primary failure, not a deliberate
+            // stop.)
             State::Idle | State::Connect | State::Active => true,
 
-            // A fresh session cycle started (and possibly re-established,
-            // this time without GR) since this candidate was staged. It's
-            // stale context from a session that no longer exists; drop it
-            // rather than risk disrupting an unrelated, healthy connection.
-            State::Established => false,
+            // Every other combination is stale context: a GR-purpose
+            // candidate seeing OpenSent/OpenConfirm (the primary cycled all
+            // the way back through a fresh reconnect since staging), a
+            // Collision-purpose candidate seeing OpenConfirm with a
+            // mismatched peer ID, or Established with either a
+            // Collision-purpose candidate (the primary completed its
+            // handshake while this candidate was still pending — it keeps
+            // its original §6.8 meaning, not a GR reconnect) or a
+            // GR-purpose candidate whose GR negotiation no longer holds.
+            // Drop it rather than risk disrupting an unrelated, healthy
+            // connection.
+            State::OpenSent | State::OpenConfirm | State::Established => false,
         };
 
         let candidate = self
@@ -1112,7 +1206,14 @@ impl<T: BgpTransport> Session<T> {
         }
 
         match self.fsm.state() {
-            State::OpenSent | State::OpenConfirm => {
+            // `adopt` is only ever `true` for `OpenSent` when `purpose` is
+            // `Collision`, and that arm `return`s early to defer — so
+            // reaching here with `adopt == true` while still `OpenSent` is
+            // impossible.
+            State::OpenSent => unreachable!(
+                "try_resolve_pending_candidate: adopt=true is unreachable while OpenSent"
+            ),
+            State::OpenConfirm => {
                 tracing::info!(
                     peer = %self.config.peer_addr,
                     local_bgp_id = %self.config.local_bgp_id,
@@ -2813,6 +2914,102 @@ mod tests {
         );
     }
 
+    /// [Codex round 3] Counterpart to the "adopted when primary dies" test
+    /// above: a candidate validated and deferred while the primary is still
+    /// `OpenSent` must NOT be adopted if the primary's connection goes away
+    /// because the *operator* issued `ManualStop`, as opposed to a genuine
+    /// `TcpFailed`/`HoldTimerExpired` failure. RFC 4271 §6.8's collision
+    /// resolution exists to pick a winner between two live connection
+    /// attempts for the *same configured peer* — it has nothing to say
+    /// about a session the operator deliberately stopped, and `State::Idle`
+    /// alone can't distinguish the two causes (both `OpenConfirm`'s
+    /// `TcpFailed` and its `ManualStop` arms land there; see
+    /// `on_open_confirm`). `run()` evicts any pending candidate outright
+    /// the moment it processes `ManualStop`, closing that gap — pre-fix,
+    /// this deferred candidate would have been silently adopted once the
+    /// primary reached `Idle`, reopening a session the operator explicitly
+    /// asked to close.
+    #[tokio::test]
+    async fn test_collision_candidate_deferred_in_open_sent_closed_on_manual_stop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+        assert!(matches!(sent_open, BgpMessage::Open(_)));
+
+        // Candidate arrives and validates while the primary is still
+        // OpenSent — its identity is irrelevant here since the operator is
+        // about to stop the session before the primary's own identity is
+        // ever learned.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+        let candidate_id = Ipv4Addr::new(10, 0, 0, 9);
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = candidate_id;
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // The operator stops the session while the candidate is still
+        // deferred (validated, but held pending the primary's own identity).
+        handle.stop().await;
+
+        // The primary receives the normal administrative-shutdown NOTIFICATION.
+        let notif = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for the Cease NOTIFICATION")
+            .expect("closed before NOTIFICATION")
+            .expect("decode error");
+        assert!(
+            matches!(
+                notif,
+                BgpMessage::Notification(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+                    ..
+                })
+            ),
+            "expected Cease/AdministrativeShutdown on ManualStop, got {notif:?}"
+        );
+
+        // The deferred candidate must be closed outright — not adopted.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the deferred candidate to close");
+        assert!(
+            closed.is_none(),
+            "a deferred collision candidate must be closed, not adopted, \
+             when the operator stops the session, got {closed:?}"
+        );
+
+        // No session was created over the candidate: nothing further should
+        // ever come through the session's event channel.
+        let no_event = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            no_event.is_err(),
+            "no further session event should fire once the operator has \
+             stopped the session and the deferred candidate was discarded, \
+             got {no_event:?}"
+        );
+    }
+
     /// Codex's review of this PR's first version found a third gap: the
     /// candidate's OPEN must pass the same validation any OPEN would (RFC
     /// 4271 §6.2 — version, BGP Identifier, peer AS, hold time; RFC 5492
@@ -3057,6 +3254,124 @@ mod tests {
         assert!(
             matches!(event, SessionEvent::Established(_)),
             "expected Established over the adopted GR-reconnect connection, got {event:?}"
+        );
+    }
+
+    /// [Codex round 3] A candidate staged while the primary is `OpenConfirm`
+    /// is an RFC 4271 §6.8 collision candidate. If the primary goes on to
+    /// negotiate Graceful Restart and reach `Established` *before* the
+    /// candidate's own OPEN arrives, the candidate must keep its original
+    /// §6.8 meaning: it must NOT be reinterpreted as an RFC 4724 §4.2 GR
+    /// reconnect and allowed to displace the now-healthy, just-established
+    /// primary just because GR happened to be negotiated in the meantime.
+    /// See `CollisionPurpose`. Pre-fix, `try_resolve_pending_candidate`
+    /// re-derived "is this a GR candidate" from `self.fsm.state()` /
+    /// `peer_has_graceful_restart()` at resolution time rather than from
+    /// what the candidate was actually staged as, so this exact sequence
+    /// would have torn down the primary and adopted the candidate instead.
+    #[tokio::test]
+    async fn test_collision_candidate_staged_before_established_gr_does_not_displace_primary() {
+        let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.peer_addr = listener.local_addr().unwrap();
+        let mut handle = spawn(config);
+        handle.start().await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut existing_peer = FramedBgpTransport::from_stream(stream);
+
+        let _sent_open = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for OPEN")
+            .expect("closed before OPEN")
+            .expect("decode error");
+
+        // Peer's OPEN advertises GracefulRestart and moves the primary from
+        // OpenSent to OpenConfirm — withhold KEEPALIVE so it doesn't reach
+        // Established yet.
+        let mut gr_open = peer_open();
+        if let BgpMessage::Open(ref mut open) = gr_open {
+            open.bgp_id = peer_bgp_id;
+            open.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        existing_peer.send(gr_open).await.unwrap();
+
+        let _ka = tokio::time::timeout(Duration::from_secs(1), existing_peer.recv())
+            .await
+            .expect("timed out waiting for KEEPALIVE")
+            .expect("closed before KEEPALIVE")
+            .expect("decode error");
+
+        // The candidate is staged NOW, while the primary is still
+        // OpenConfirm — this must be recorded as a Collision-purpose
+        // candidate (see `CollisionPurpose`), not re-derived later.
+        let (incoming, mut candidate_peer) = candidate_pair().await;
+        handle
+            .incoming_sender()
+            .send(SessionCommand::IncomingConnection(incoming))
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now the primary completes its own handshake — Established, with
+        // GR negotiated. The candidate is still pending (hasn't sent its
+        // OPEN yet).
+        existing_peer.send(BgpMessage::Keepalive).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for Established")
+            .expect("session channel closed");
+        assert!(matches!(event, SessionEvent::Established(_)));
+
+        // Only now does the candidate send its OPEN — same BGP Identifier
+        // as the primary's peer, and advertising GR too: exactly what a
+        // genuine GR reconnect would look like. If the bug were still
+        // present, this would be misread as a GR reconnect and displace
+        // the primary.
+        let mut candidate_open = peer_open();
+        if let BgpMessage::Open(ref mut o) = candidate_open {
+            o.bgp_id = peer_bgp_id;
+            o.capabilities.push(Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![],
+            });
+        }
+        candidate_peer.send(candidate_open).await.unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // The candidate must be rejected: stale §6.8 context against an
+        // already-Established primary.
+        let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
+            .await
+            .expect("timed out waiting for the stale candidate to close");
+        assert!(
+            closed.is_none(),
+            "a Collision-purpose candidate staged before GR was negotiated \
+             must be dropped once the primary reaches Established, not \
+             adopted as a GR reconnect, got {closed:?}"
+        );
+
+        // And the primary must be completely undisturbed — no further
+        // event of any kind (in particular, no second Established/
+        // Terminated pair from a spurious teardown-and-reconnect).
+        let no_event = tokio::time::timeout(Duration::from_millis(200), handle.next_event()).await;
+        assert!(
+            no_event.is_err(),
+            "the primary must survive undisturbed once Established; a \
+             Collision-purpose candidate staged before GR was negotiated \
+             must never be treated as a GR reconnect, got {no_event:?}"
         );
     }
 
