@@ -451,6 +451,75 @@ Original finding (kept for history):
   connection-rate cap per peer — before relying on this code path against
   untrusted or adversarial peers.
 
+- **Follow-up found by having Codex review the already-merged PR #30
+  independently, opened as new PR #40 (`fix/rfc4271-collision-identity-validation`)
+  — the inverted-comparison fix above was correct but the *identity check*
+  underneath it wasn't rigorous enough, and needed four successive rounds
+  to close properly:**
+
+  1. **Reversed-pair identity.** `ConnectionOrigin` (inbound/outbound) alone
+     isn't sufficient proof of a genuine RFC 4271 §6.8 "reversed pair" — a
+     multihomed speaker's unrelated outbound dial and inbound accept can
+     have opposite origin without being the same two endpoints reversed.
+     Fixed by adding `ConnectionIdentity { local, peer, origin }`, captured
+     from `TcpStream::local_addr()`/`peer_addr()`, requiring same-local,
+     same-peer, *and* opposite-origin — each independently necessary (same
+     endpoints alone also matches two inbound connections from the same
+     peer; opposite origin alone also matches the multihomed
+     counter-example). Caught and corrected a self-introduced bug before it
+     shipped: `local_addr()`/`peer_addr()` report "my end"/"their end"
+     symmetrically regardless of who dialed, not RFC 4271's packet-level
+     source/destination — a first attempt at the comparison had the fields
+     crossed (`self.local == other.peer && self.peer == other.local`)
+     instead of same-local/same-peer, caught via manual derivation of a
+     concrete outbound-vs-inbound scenario before commit. New pure unit
+     test `test_connection_identity_reversed_pair` pins all three cases
+     (genuine collision, same-direction two-inbound, the multihomed
+     counter-example) directly, since loopback testing can't otherwise
+     distinguish direction.
+  2. **OpenSent premature adoption.** A candidate connection validating
+     while the primary session is still `OpenSent` (its own peer BGP
+     Identifier not yet known) was being decided on immediately — RFC 4271
+     §6.8 only sanctions examining an `OpenSent` connection's identity "if
+     [the implementation] knows the BGP Identifier of the peer by means
+     outside of the protocol," which this codebase has no way to do.
+     Fixed by deferring the decision (`CollisionCandidate.open` becomes the
+     "validated, awaiting the primary's own identity" marker) until the
+     primary's own OPEN arrives, or the primary dies — both re-attempted
+     via a new `try_resolve_pending_candidate()` hook called after every
+     `FsmInput` `run()` processes. New tests
+     `test_collision_candidate_deferred_in_open_sent_rejected_once_primary_id_known`
+     and `_adopted_when_primary_dies` cover both outcomes.
+  3. **Staging-context preservation.** The deferred-candidate mechanism
+     re-derived "why was this candidate staged" from the primary's
+     *current* state at resolution time instead of what it actually was at
+     staging time — so a candidate staged as a genuine §6.8 collision
+     candidate (while the primary was `OpenSent`/`OpenConfirm`) could be
+     reinterpreted as an RFC 4724 §4.2 GR reconnect if the primary went on
+     to negotiate GR and reach `Established` while the candidate was still
+     pending, wrongly displacing the now-healthy primary. Separately,
+     `State::Idle` alone can't distinguish a genuine primary failure from a
+     deliberate `ManualStop`/`NotificationToSend` teardown (RFC 9003 peer
+     removal, etc.) — both land in `Idle` from `OpenConfirm` — so a pending
+     candidate could survive an operator-issued teardown and be silently
+     adopted afterward. Fixed by recording the staging purpose
+     (`CollisionPurpose::Collision` vs `GracefulRestart`) at staging time
+     and gating every resolution branch on that recorded purpose rather
+     than re-deriving it, plus evicting any pending candidate outright the
+     moment `run()` processes `ManualStop` or `NotificationToSend`. New
+     tests:
+     `test_collision_candidate_staged_before_established_gr_does_not_displace_primary`,
+     `test_collision_candidate_deferred_in_open_sent_closed_on_manual_stop`,
+     `test_collision_candidate_pending_closed_on_notification_to_send`.
+
+  Every round was real-teeth verified: the specific fix was temporarily
+  reverted, the corresponding new test confirmed to fail with the exact
+  pre-fix symptom (wrong adoption/rejection, or a candidate that never
+  closes), then restored and reconfirmed passing. Full workspace suite
+  (build, clippy `-D warnings`, fmt, unit + integration tests) green at
+  every round; all 7 CI checks (including a real Docker E2E rebuild and
+  fuzz smoke) green on the final commit.
+
 **16. RFC 4271 §9 gaps found by systematic clause audit** — found
 2026-07-16, same `RFC_AUDIT.md` pass as #12-#15 (diagnostic only, not fixed
 here):
@@ -709,6 +778,79 @@ below, which deserved prompt attention):
   (`pathvectord/src/daemon/mod.rs`) to close that gap, real-teeth verified
   by reverting just the v6 drain block (not the already-covered v4 logic)
   and confirming this specific test — and only this one — fails.
+
+  **Follow-up found by having Codex review the already-merged PR #31
+  independently, opened as new PR #41 (`fix/rfc7606-missing-nlri-session-reset`)
+  — the treat-as-withdraw fix above was correct as far as it went, but RFC
+  7606 §5.2 ("Missing NLRI") carves out an exception the original fix never
+  implemented, and it took four rounds across two crates to close properly:**
+
+  1. **Daemon-layer gap.** `handle_update`'s mandatory-attribute check
+     (`pathvectord/src/daemon/route.rs`) only ran when the message had at
+     least one recognized announced NLRI (`has_any_announces`). An UPDATE
+     carrying path attributes (e.g. AS_PATH but no ORIGIN) with no
+     traditional NLRI, no MP_REACH_NLRI, and no MP_UNREACH_NLRI bypassed the
+     check entirely and was silently accepted as a no-op — neither
+     treated-as-withdraw nor session-reset. RFC 7606 §5.2 is explicit that
+     this exact shape can't be confidently treated-as-withdraw (there's no
+     reliable NLRI to withdraw), so an attribute error here must instead
+     reset the session. Fixed by adding an `else` branch: no reachable NLRI
+     but an attribute other than MP_UNREACH_NLRI, plus a missing ORIGIN/
+     AS_PATH, now returns a `MissingWellKnownAttribute` NOTIFICATION and
+     resets the session; the two legitimate NLRI-less encodings (empty
+     legacy End-of-RIB, MP_UNREACH_NLRI-only End-of-RIB) remain unaffected.
+     New tests: `missing_nlri_update_with_attributes_resets_session`,
+     `legacy_empty_update_no_notification`, `mp_unreach_only_eor_no_notification`.
+  2. **Transport-layer gap.** The same §5.2 escalation was missing in
+     `pathvector-session/src/transport/mod.rs`'s `handle_malformed_update`
+     — a *decode-time* attribute error (e.g. a malformed NEXT_HOP, caught by
+     the codec and classified `TreatAsWithdraw`) on an NLRI-less message was
+     forwarded as an ordinary treat-as-withdraw before the daemon ever saw
+     it, since `make_treat_as_withdraw` strips ORIGIN/AS_PATH/NEXT_HOP
+     unconditionally, and the daemon's own check (item 1 above) only ever
+     sees the already-transformed message. Added
+     `is_nlri_less_with_attributes`, applied to the *original* pre-transform
+     UPDATE, gating the same escalation via `ProtocolErrorNotificationToSend`.
+     New test: `test_rfc7606_missing_nlri_with_treat_as_withdraw_error_resets_session`
+     (valid ORIGIN/AS_PATH, malformed NEXT_HOP, no reachable NLRI).
+  3. **Stripped-attribute blindness.** That same predicate only inspected
+     the already-cleaned `m.update.attributes` — the decoder removes a
+     malformed attribute from it *before* `MalformedUpdate` is ever built,
+     so an UPDATE whose only attribute was a malformed NEXT_HOP had an empty
+     attribute list, indistinguishable from a legitimate empty End-of-RIB;
+     the previous round's own test happened to keep ORIGIN/AS_PATH valid
+     and present, which masked this exact gap. Fixed by also consulting the
+     decoder's per-attribute error list (`m.errors`) for attributes that
+     didn't survive — any error whose type code isn't MP_UNREACH_NLRI's (15)
+     now counts as "an attribute other than MP_UNREACH_NLRI is present"
+     regardless of whether it survived decoding. New tests: expanded
+     `test_is_nlri_less_with_attributes` (malformed-NEXT_HOP-only,
+     MP_UNREACH_NLRI-plus-malformed-NEXT_HOP, and malformed-MP_UNREACH_NLRI-
+     only-doesn't-count cases) and
+     `test_rfc7606_missing_nlri_with_only_malformed_attribute_resets_session`
+     (NEXT_HOP as the message's *only*, malformed, attribute).
+  4. **AFI/SAFI conflation (daemon layer again).** `has_any_announces` was
+     filtered to only the AFI/SAFIs this daemon recognizes (IPv4/IPv6
+     unicast) — a valid MP_REACH_NLRI for an unsupported AFI/SAFI (e.g.
+     IPv4 multicast) is silently skipped in the attribute-processing loop
+     and never counted, wrongly leaving `has_any_announces` false even
+     though the message plainly does encode reachable NLRI. Combined with a
+     missing mandatory attribute, this wrongly escalated to a session
+     reset — RFC 7606 §3(d) requires treat-as-withdraw here, and §5.2's
+     reset exception only applies when there's no reachable NLRI at all,
+     which isn't the case for an unsupported-but-present MP_REACH_NLRI.
+     Fixed by adding `has_reachable_nlri_on_wire`, computed directly from
+     the message (any non-empty MP_REACH_NLRI, regardless of AFI/SAFI),
+     independent of local support, gating the §5.2 branch alongside
+     `has_any_announces`. New test:
+     `missing_origin_with_unsupported_afi_safi_mp_reach_no_notification`.
+
+  Every round was real-teeth verified: the specific check was temporarily
+  disabled, the corresponding new test confirmed to fail with the exact
+  bypass symptom described, then restored and reconfirmed passing. Full
+  `pathvectord` suite (683 tests), full workspace suite, clippy
+  `-D warnings`, and fmt clean at every round; all 7 CI checks green on the
+  final commit.
 - **Duplicate-attribute handling is wrong in both directions.**
   `decode_path_attributes`'s duplicate check treats every repeated
   attribute — regardless of type — as `TreatAsWithdraw`. RFC 7606 §3(g)

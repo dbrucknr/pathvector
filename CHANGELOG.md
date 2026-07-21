@@ -4,6 +4,346 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-20 (RFC 7606 §5.2 missing-NLRI session reset — 3-layer fix)
+
+### [pathvectord, pathvector-session] An UPDATE with attributes but no reachable NLRI was silently accepted instead of resetting the session
+
+A Codex review of already-merged PR #31 (the RFC 7606 §3(d) missing-mandatory-
+attribute fix, below) found a gap: `handle_update`'s mandatory-attribute check
+only ran when the message had at least one recognized announced NLRI. An
+UPDATE carrying path attributes (e.g. AS_PATH but no ORIGIN) with no
+traditional NLRI, no MP_REACH_NLRI, and no MP_UNREACH_NLRI bypassed the check
+entirely and was silently accepted as a no-op — neither treated-as-withdraw
+nor session-reset. RFC 7606 §5.2 ("Missing NLRI") is explicit that this
+message shape can't be confidently treated-as-withdraw (there's no reliable
+NLRI to withdraw), so an attribute error here — one that would otherwise
+resolve via treat-as-withdraw per §3(d) — must instead reset the session.
+
+Fixing this correctly took four rounds, each surfacing a deeper layer of the
+same underlying gap (`fix/rfc7606-missing-nlri-session-reset`, PR #41):
+
+1. **Daemon layer** (`pathvectord/src/daemon/route.rs`): added the §5.2
+   escalation — an UPDATE with no reachable NLRI but an attribute other than
+   MP_UNREACH_NLRI, plus a missing ORIGIN/AS_PATH, now returns a
+   `MissingWellKnownAttribute` NOTIFICATION and resets the session. The two
+   legitimate NLRI-less encodings (a fully empty legacy End-of-RIB, an
+   MP_UNREACH_NLRI-only End-of-RIB) remain unaffected.
+2. **Transport layer** (`pathvector-session/src/transport/mod.rs`): the same
+   escalation was missing in `handle_malformed_update`, where a *decode-time*
+   attribute error (e.g. a malformed NEXT_HOP, not merely an absent one) on an
+   NLRI-less message was forwarded as an ordinary treat-as-withdraw before the
+   daemon ever saw it. Added `is_nlri_less_with_attributes`, applied to the
+   *original* pre-transform UPDATE, gating the same escalation.
+3. **Stripped-attribute blindness**: that same predicate only inspected the
+   already-cleaned attribute list — the decoder removes a malformed attribute
+   before `MalformedUpdate` is built, so a message whose *only* attribute was
+   a malformed NEXT_HOP had an empty attribute list, indistinguishable from a
+   legitimate empty End-of-RIB. Fixed by also consulting the decoder's
+   per-attribute error list for attributes that didn't survive.
+4. **AFI/SAFI conflation** (daemon layer again): the "no reachable NLRI" check
+   conflated "did this daemon install anything locally" with "does the wire
+   message have reachable NLRI" — a valid MP_REACH_NLRI for an AFI/SAFI this
+   daemon doesn't support (e.g. IPv4 multicast) was silently skipped and never
+   counted, wrongly triggering a session reset for a message that plainly
+   does encode reachable NLRI. Added a wire-level reachability check
+   independent of local AFI/SAFI support.
+
+Each round shipped with a regression test real-teeth verified against the
+specific bypass it closed (reverted, confirmed the exact pre-fix symptom,
+restored, confirmed passing) before commit. Full workspace suite, clippy
+`-D warnings`, and fmt clean at every step; all 7 CI checks (including E2E
+Docker and fuzz) green on the final commit.
+
+## 2026-07-20 (RFC 4271 §6.8 collision-identity validation — 4-round fix)
+
+### [pathvector-session] Reversed-pair identity, OpenSent deferral, staging-context preservation, and operator-teardown eviction
+
+Codex's review of already-merged PR #30 (the collision-resolution inversion
+fix, below) surfaced that the fix's `ConnectionOrigin`-only tracking wasn't
+sufficient proof of a genuine RFC 4271 §6.8 "reversed pair" — two connections
+where one side dialed the other's listening port and vice versa. Closing this
+took four rounds on `fix/rfc4271-collision-identity-validation` (PR #40):
+
+1. **Reversed-pair identity check.** `TcpStream::local_addr()`/`peer_addr()`
+   report "my end"/"their end" symmetrically regardless of which side dialed
+   — not RFC 4271's packet-direction-based source/destination. Added
+   `ConnectionIdentity { local, peer, origin }`, requiring same-local,
+   same-peer, *and* opposite-origin — all three independently necessary (same
+   endpoints alone also matches two inbound connections from the same peer;
+   opposite origin alone also matches a multihomed speaker's unrelated
+   connections). A first attempt at the endpoint comparison had the fields
+   backwards ("crossed" instead of same-local/same-peer) — caught via manual
+   derivation before it shipped.
+2. **OpenSent premature adoption.** A candidate connection validating while
+   the primary session is still `OpenSent` (its own peer identity not yet
+   known) was being adopted immediately, guessing rather than deferring — RFC
+   4271 §6.8 doesn't sanction examining an `OpenSent` connection without an
+   out-of-band identity source, which this codebase doesn't have. Fixed by
+   deferring the decision until the primary's own OPEN arrives (or it dies).
+3. **Staging-context preservation.** The deferred-candidate mechanism
+   re-derived "why was this candidate staged" from the primary's *current*
+   state at resolution time — so a candidate staged as a §6.8 collision
+   candidate could be reinterpreted as an RFC 4724 §4.2 GR reconnect if the
+   primary reached `Established`+GR while the candidate was still pending,
+   displacing a healthy primary. Fixed by recording the staging purpose
+   (`CollisionPurpose::Collision` vs `GracefulRestart`) at staging time and
+   gating every branch on that recorded purpose instead.
+4. **Operator-teardown eviction.** `State::Idle` alone can't distinguish a
+   genuine primary failure from a deliberate `ManualStop` or `NotificationToSend`
+   teardown (RFC 9003 peer removal, etc.) — both land in `Idle` from
+   `OpenConfirm`. A pending candidate could survive an operator-issued
+   teardown and be silently adopted afterward, reopening a session the
+   operator explicitly closed. Fixed by evicting any pending candidate
+   outright the moment `run()` processes either input.
+
+Every round shipped with real-teeth-verified regression tests (reverted,
+confirmed the exact pre-fix symptom, restored, confirmed passing). Full
+workspace suite, clippy, and fmt clean at every step; all 7 CI checks green
+on the final commit.
+
+## 2026-07-19 (RFC 6811 origin-ASN confederation-segment derivation)
+
+### [pathvector-types, pathvector-policy, pathvectord] `AsPath::origin_as()` now applies RFC 6811 §2's confederation-segment substitution rule, and fixes a ROV bypass for terminal `AS_SET` paths
+
+`fix/rfc6811-origin-as-confederation-segments` (PR #39). RFC 6811 §2 defines a
+specific three-way rule for the ASN used in Route Origin Validation lookups:
+an AS_PATH ending in a plain `Sequence` segment uses its rightmost ASN; one
+ending in `ConfedSequence`/`ConfedSet` (or an empty path) substitutes the
+*local speaker's own AS number*; any other final segment type (a terminal
+`AS_SET`) yields RFC 6811's distinguished "NONE" sentinel. `AsPath::origin_as()`
+instead searched backward past confederation/Set segments for the nearest
+earlier plain `Sequence` — a materially different ASN could end up checked
+against the VRP database in a confederation deployment, flipping a
+Valid/Invalid/NotFound verdict incorrectly. Fixed by matching directly on the
+path's final segment instead of searching backward; `origin_as()` now takes
+`local_as: Asn`, threaded through its one production caller
+(`RoaValidityCondition`) from `pathvectord`'s daemon state. Two tests that had
+actively codified the old (wrong) backward-search behavior as correct were
+rewritten with RFC-derived expectations, real-teeth verified against the
+pre-fix code.
+
+**Codex's review of the same PR found a second, more serious gap**: RFC
+6811's "NONE" sentinel means "cannot be Matched by any VRP" — not "exempt
+from validation." `RoaValidityCondition::matches` had been short-circuiting
+to `false` (no match) whenever `origin_as()` returned `None`, which silently
+let a *covered-but-unmatchable* route (AS_PATH ending in a plain `AS_SET`)
+bypass a `reject Invalid` policy entirely, rather than correctly resolving to
+`Invalid` per the RFC's own definition. Fixed by following RFC 6811 §2's own
+pseudo-code, which represents "NONE" as ASN 0 — `matches` now feeds
+`origin_as(local_as).map_or(0, Asn::as_u32)` into the existing covering-walk
+in `RoaTable::validate`, which naturally produces `Invalid` (covered) or
+`NotFound` (uncovered) instead of a silent non-match; `RoaTable::validate`
+also gained an explicit `asn != 0` guard mirroring the RFC pseudo-code's own
+check. Two new tests prove both the covered (`Invalid`) and uncovered
+(`NotFound`) cases, real-teeth verified against the pre-fix short-circuit.
+
+### [pathvector-rpki] RTR Error Code 2 ("No Data Available") no longer torn down like the 8 genuinely fatal error codes — took four Codex-review rounds to get right
+
+`fix/rfc8210-error-code-2-no-data-available` (PR #38). RFC 8210 §12 marks
+Error Code 2 as the one *non-fatal* RTR error — a transient "cache still
+rebuilding" signal that should keep the session alive and retry, not tear the
+whole RTR connection down like the other 8 codes. The initial fix added a
+dedicated retry-in-place arm, but three successive Codex review passes each
+found a real remaining bug: (1) a code-2 response to a routine *Serial* Query
+should force the *next* query to be a genuine Reset Query per §8.4 ("issue
+periodic Reset Queries until it gets a new usable load"), not a repeat Serial
+Query, since `sync_once` otherwise just recomputes and resends the same query
+type it already had; (2) the fix for that then cleared the ROA table
+*eagerly* on receiving Error Code 2, discarding the last known-good data for
+the entire (potentially long) retry window — RFC 8210's own stale-data
+philosophy explicitly prefers stale data to no data, so the clear was moved
+to fire only once the forced Reset Query's `CacheResponse` actually arrives;
+(3) the regression test proving the "stale data survives the retry window"
+property used an unsynchronized poll loop that could pass trivially against
+data from *before* Error Code 2 was ever sent, proving nothing — fixed with a
+`oneshot` handshake pinning the assertion to a moment provably inside the
+retry window. Also added `RtrStatus::last_error` tracking and threaded the
+cache's own advertised Retry Interval (RFC 8210 §6) into the retry cadence,
+replacing a flat config default. Each of the four rounds shipped with a
+regression test real-teeth verified against the specific bug it closed.
+
+## 2026-07-18 (RFC 4271 best-path tie-break, LOCAL_PREF eBGP filtering, GR/Role capability duplicates)
+
+### [pathvector-rib, pathvectord] Best-path tie-break steps (f) BGP Identifier and (g) peer address were conflated into one peer-IP-only comparison
+
+`fix/rfc4271-bestpath-tiebreak-f-g` (PR #37). RFC 4271 §9.1.2.2's final two
+tie-break criteria are two *distinct* values — a router's BGP Identifier is
+commonly a loopback address unrelated to its session/peer IP — but
+`best_path.rs`'s tie-break skipped Identifier comparison entirely and used
+peer-IP for both steps, silently diverging from the RFC whenever a route's
+BGP-Identifier ordering and peer-IP ordering disagreed. Added
+`Route::peer_bgp_id`, populated at UPDATE-ingest time from the daemon's
+existing per-peer BGP-ID tracking (already maintained for ORIGINATOR_ID
+fallback), and a real step (f) comparing it ahead of the renamed step (g)
+peer-IP fallback (used when either side's Identifier is unknown, e.g. locally
+originated routes). Also corrected a mislabeled `pathvector-rib/RFC.md` row
+that had claimed a peer-IP test was proving BGP-Identifier comparison — split
+into two accurate rows. Real-teeth verified at both the isolated-comparator
+level (unit + proptest) and the daemon-wiring level (a dedicated test proving
+`handle_update` actually threads the established peer's BGP ID onto the
+route, not just that the comparator works on hand-built fixtures).
+
+### [pathvectord] LOCAL_PREF received from an eBGP peer is no longer honored — the audit's highest-severity RFC 4271 finding
+
+`fix/rfc4271-local-pref-ebgp-ignore` (PR #35). RFC 4271 §5.1.5 requires
+LOCAL_PREF from an external peer to be ignored — specifically so an eBGP peer
+can't manipulate this router's best-path selection. `handle_update` captured
+`LocalPref` with no peer-type check, letting a malicious or misconfigured
+eBGP peer send an arbitrary value (e.g. `u32::MAX`) to force its route to win
+the very first best-path tie-break step against routes this router would
+otherwise prefer. Fixed by gating the capture on `peer_type == Internal`; from
+any other peer type the attribute is now silently dropped rather than
+substituted. Three new tests prove the gate itself (both directions) and the
+actual security property end-to-end (a bogus-LOCAL_PREF, longer-AS_PATH eBGP
+route no longer beats a shorter-AS_PATH one once the bogus value can't
+short-circuit the comparison). Also proven over a real wire-level session via
+`pathvector-e2e`'s `mock_bgp_fault_peer`. The RFC's confederation exception to
+this rule is deliberately not handled — this daemon has no confederation-aware
+peer classification yet, tracked as its own larger initiative.
+
+### [pathvector-session] Duplicate GracefulRestart capability instances used first-nonzero, not last; peer-side duplicate/conflicting Role Capabilities went undetected
+
+`fix/rfc4724-rfc9234-capability-duplicates` (PR #36). Two instances of the
+same "first-wins instead of RFC-mandated last-wins" bug shape, found in the
+same audit pass:
+
+- RFC 4724 §3 requires the *last* GracefulRestart capability instance to win
+  if a peer sends 2+. The existing code searched for "the first instance with
+  `restart_time > 0`" — so a peer sending `[restart_time=120, restart_time=0]`
+  incorrectly kept the earlier 120 instead of reaching the true (authoritative,
+  EOR-only) last instance. Fixed with a dedicated `extract_gr_capability()`
+  that finds the actual last instance first, then interprets it.
+- RFC 9234 §4.2 requires rejecting a connection (Role Mismatch) if a peer
+  sends 2+ Role Capabilities with *differing* values — `validate_open` took
+  only the first via `find_map`, so a peer sending `[Customer, Peer]` against
+  a compatible-with-`Customer` local role proceeded to `OpenConfirm` without
+  ever noticing the conflicting second value. Fixed by collecting every Role
+  value the peer sent and rejecting immediately if they're not all identical.
+
+Both fixes shipped with tests written first and confirmed to fail against the
+unfixed code with clear diagnostics before the fix landed.
+
+## 2026-07-17 (RFC 7606 attribute-flags/OTC/truncation cluster)
+
+### [pathvector-session] Attribute Flags conflicts were never checked; a malformed OTC evaded RFC 9234 leak detection; five fixed-length attributes silently truncated instead of erroring
+
+`fix/rfc7606-attribute-flags-cluster` (PR #34), closing out several related
+findings from the same audit pass:
+
+- RFC 4271 §4.3's Attribute Flags requirement (Transitive bit MUST be 1 for
+  well-known attributes; Partial bit MUST be 0 for well-known/optional-
+  non-transitive) was decoded off the wire but never checked against what
+  each known attribute type is supposed to have.
+- OTC (RFC 9234's route-leak detection mechanism) fell into the generic
+  attribute-discard policy for a malformed-length value instead of RFC
+  9234 §5's mandated treat-as-withdraw — a plausible leak-detection evasion
+  path, since a route that should be caught by `OtcLeakCondition` could
+  instead pass through untagged if its OTC attribute were deliberately
+  malformed.
+- ATOMIC_AGGREGATE had no length check at all (should be exactly 0).
+- ORIGIN, NEXT_HOP, MED, LOCAL_PREF, and AS4_AGGREGATOR all used a
+  too-short-only length check (`< N` instead of `!= N`), so a value declared
+  longer than its correct fixed size had its excess bytes silently discarded
+  with no error — found live while fixing the ATOMIC_AGGREGATE gap, not part
+  of the original audit pass.
+
+All fixed by moving OTC into the `TreatAsWithdraw` policy arm and correcting
+the five truncation checks to exact-length. Real-teeth verified individually
+per attribute; also proven over a real wire-level session via
+`pathvector-e2e`'s `mock_bgp_fault_peer` (`malformed-otc` scenario).
+AGGREGATOR's own length-vs-negotiated-4-octet-ASN-capability gap was
+deliberately deferred as its own follow-up ("PR 4b" in the roadmap).
+
+### [pathvector-e2e] Satisfy `clippy::similar_names` in test helpers without an `-A` override
+
+`fix/clippy-similar-names-e2e` (PR #33). Housekeeping: renamed several
+similarly-named IP/ID test-helper bindings in `pathvector-e2e/src/lib.rs` so
+the lint passes on its own merits rather than being suppressed.
+
+### [pathvector-session] Duplicate MP_REACH_NLRI/MP_UNREACH_NLRI now correctly forces a session reset; every other duplicated attribute is silently normalized, not withdrawn
+
+`fix/rfc7606-duplicate-attribute-handling` (PR #32). RFC 7606 §3(g)/(h)
+requires two different, opposite-direction behaviors for a duplicated
+attribute depending on type: a duplicated MP_REACH_NLRI/MP_UNREACH_NLRI needs
+a full session reset (stronger than the codebase's prior treat-as-withdraw for
+everything); any other duplicated attribute should be silently normalized —
+keep the first, drop the rest, no error at all (weaker than the prior
+blanket treat-as-withdraw, which wrongly withdrew the whole route for an
+ordinary duplicate like two COMMUNITY attributes). Fixed by branching on type
+code in the decoder and adding a `session_reset` flag alongside the existing
+`treat_as_withdraw`, with §3(h)'s "strongest action wins" rule applied where
+both can independently be true for the same UPDATE.
+
+**Two rounds of Codex review then found real bugs in the fix itself**: the
+session-reset path was recording the wrong `TerminationReason` (`Unclean`
+instead of `OperatorStop`), which would have wrongly triggered RFC 4724 GR
+helper-mode route retention for what's actually a deliberate, locally
+detected protocol-error teardown — fixed by routing through the FSM's
+existing `NotificationToSend` input, which already maps to `OperatorStop`.
+The fix for *that* then left a still-configured peer stuck in `Idle` forever
+with no reconnect, since `NotificationToSend`'s existing semantics
+deliberately omit the connect-retry timer (correct for its other two
+call sites, RFC 9003 shutdown and max-prefix-exceeded, but wrong for an
+ordinary protocol error a peer might recover from) — fixed by adding a new,
+narrowly-scoped `FsmInput::ProtocolErrorNotificationToSend` per RFC 4271
+§8.2.2 Event 28, identical to `NotificationToSend` plus the retry timer. All
+three rounds real-teeth verified; also proven over a real wire-level session
+via `pathvector-e2e`'s `mock_bgp_fault_peer` (`duplicate-mp-reach` scenario),
+whose own e2e test needed two further fixes (a keepalive loop so the
+session's own hold timer couldn't confound the assertion, and an
+Established-confirmation wait) before it was a reliable real-teeth signal.
+
+## 2026-07-16/17 (RFC 4271 §6.8 collision resolution, RFC 4724 GR override, RFC 7606 missing-mandatory-attribute)
+
+### [pathvector-session] BGP connection-collision resolution had its BGP-ID comparison backwards; RFC 4724 GR restart wasn't recognized during collision; both missing the RFC-required NOTIFICATION
+
+`fix/rfc4271-collision-resolution` (PR #30). `handle_incoming_connection`'s
+collision comparison (`should_close_outbound = local_bgp_id > peer_id`) was
+inverted relative to RFC 4271 §6.8, which retains the connection *initiated
+by* the higher-ID speaker. Self-consistent when two instances of this same
+daemon collide with each other (both invert the same way and still converge),
+but against any standards-compliant peer in a genuine simultaneous-connect
+race, each side would compute a different required survivor and close the
+connection the other side was trying to keep — potentially preventing the
+session from ever establishing in that race window. The existing test asserting
+this behavior had locked in the inverted outcome as correct. Also found in the
+same pass: neither collision-detection FSM arm sent the RFC-required
+Cease/ConnectionCollisionResolution NOTIFICATION before closing.
+
+Same branch also fixed a related RFC 4724 §5 gap: an incoming connection
+arriving while the session is `Established` with GR negotiated is supposed to
+be recognized as evidence the peer restarted (retain its routes, drop the old
+connection) rather than rejected as an ordinary collision — the
+`Established`-state handler didn't check GR status at all.
+
+Proven both at unit level and against a real, separately-built Docker image
+via a new `mock_bgp_collision_peer` e2e test double (two real TCP connections
+forcing each direction of the comparison, plus a route-retention check across
+the GR-override switchover), each real-teeth verified by reverting the
+specific fix, rebuilding the image, and confirming the corresponding test
+fails before restoring. (This area went on to need a further four rounds of
+identity-validation hardening after a later Codex review — see the
+2026-07-20 entry above.)
+
+### [pathvectord] A missing well-known mandatory attribute (ORIGIN/AS_PATH/NEXT_HOP) was tearing down the whole session instead of withdrawing just that route
+
+`fix/rfc7606-missing-mandatory-attribute` (PR #31) — the highest-priority
+finding of the whole audit pass, since it's triggerable by an entirely
+ordinary condition (any peer's UPDATE encoding quirk that happens to omit
+ORIGIN or AS_PATH once) rather than a rare race or a peer willing to send a
+deliberately bogus value. RFC 7606 §3(d) explicitly revises RFC 4271 §6.3:
+"treat-as-withdraw MUST be used," not session reset. `handle_update` sent a
+`MissingWellKnownAttribute` NOTIFICATION and reset the session instead. Fixed
+by withdrawing the affected route (Adj-RIB-In and LocRib, both IPv4 and the
+initially-uncovered IPv6/MP_REACH_NLRI path) instead of returning a
+NOTIFICATION; every sibling test asserting the old session-reset behavior was
+rewritten, not just the misleadingly-named one that first surfaced the gap.
+Proven at the wire level via `pathvector-e2e`'s `mock_bgp_fault_peer`
+(`missing-origin` scenario), real-teeth verified by reverting the fix,
+rebuilding the actual Docker image, and confirming the test fails first.
+(This area went on to need a further four rounds of missing-NLRI hardening
+after a later Codex review — see the 2026-07-20 entry above.)
+
 ## 2026-07-16 (adversarial input / fault-injection testing)
 
 ### [pathvector-session, pathvector-e2e] Close the chaos/adversarial testing gap, fix two real bugs found along the way
