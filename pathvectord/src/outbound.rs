@@ -1777,9 +1777,12 @@ mod route_to_attributes_tests {
 mod propagate_tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use pathvector_policy::{DefaultAction, Policy};
+    use pathvector_policy::{
+        Accept, ActionSequence, AddCommunity, AnyCondition, DefaultAction, Policy, RemoveCommunity,
+        Term,
+    };
     use pathvector_rib::{AdjRibOut, LocRib, PeerId, RouteBuilder};
-    use pathvector_types::{AsPath, NextHop, Nlri, Origin, PeerType};
+    use pathvector_types::{AsPath, Community, NextHop, Nlri, Origin, PeerType};
 
     use super::{PrefixDecision, PrefixDecisionV6, propagate_prefix, propagate_prefix_v6};
 
@@ -2387,6 +2390,100 @@ mod propagate_tests {
         assert!(
             matches!(ibgp_decision, PrefixDecisionV6::Announce(_)),
             "RFC 1997: NO_EXPORT must not suppress v6 advertisement to an iBGP peer"
+        );
+    }
+
+    // ── RFC 1997 / RFC 8642 ordering: suppression reflects post-policy state ───
+    //
+    // RFC 8642 (Policy Behavior for Well-Known BGP Communities) confirms
+    // operators routinely add/remove/replace well-known communities via
+    // export policy ("set"/"add"/"delete community" directives). Since
+    // `is_export_suppressed()` is checked after `export_policy.evaluate()`
+    // mutates the route, it must reflect communities *as policy leaves
+    // them*, not the pre-policy state from Loc-RIB — otherwise an operator
+    // couldn't use policy to either impose or lift a well-known-community
+    // restriction.
+
+    /// A policy that unconditionally adds `NO_ADVERTISE` and accepts must
+    /// suppress the announcement, even though the Loc-RIB route never
+    /// carried the community itself.
+    #[test]
+    fn test_propagate_prefix_export_policy_added_no_advertise_suppresses_announcement() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(src, route_v4(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut policy: Policy<pathvector_rib::Route<Ipv4Addr>> =
+            Policy::new(DefaultAction::Accept);
+        policy.add_term(Term::new(
+            AnyCondition,
+            ActionSequence::new()
+                .then(AddCommunity::new(Community::NO_ADVERTISE))
+                .then(Accept),
+        ));
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &policy,
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(decision, PrefixDecision::NoChange),
+            "RFC 8642: a NO_ADVERTISE community added by export policy must suppress \
+             the announcement, not just one already present on the Loc-RIB route"
+        );
+    }
+
+    /// A policy that removes `NO_EXPORT` before accepting must allow the
+    /// announcement to an eBGP peer, even though the Loc-RIB route carried
+    /// the community — suppression must reflect policy's final say, not the
+    /// pre-policy attribute set.
+    #[test]
+    fn test_propagate_prefix_export_policy_removes_no_export_allows_ebgp_announcement() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v4_with_community(n, Community::NO_EXPORT),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let mut policy: Policy<pathvector_rib::Route<Ipv4Addr>> =
+            Policy::new(DefaultAction::Accept);
+        policy.add_term(Term::new(
+            AnyCondition,
+            ActionSequence::new()
+                .then(RemoveCommunity::new(Community::NO_EXPORT))
+                .then(Accept),
+        ));
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &policy,
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(decision, PrefixDecision::Announce(_)),
+            "RFC 8642: removing NO_EXPORT via export policy must lift the RFC 1997 \
+             suppression, since the check reflects post-policy communities"
         );
     }
 }

@@ -1359,6 +1359,47 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   with the exact same messages again, before restoring the fix. Full
   workspace `cargo test --workspace --exclude pathvector-e2e` and
   `cargo clippy --all-targets -- -D warnings` both clean afterward.
+  **Codex review follow-up on GH PR #42**: flagged that RFC 1997 is itself
+  updated by RFC 8642 (Policy Behavior for Well-Known BGP Communities),
+  and that this PR's docs hadn't discussed it before marking the aggregate
+  status ✅ — specifically, since `is_export_suppressed()` is checked
+  *after* export policy mutates the route, a policy could add or remove a
+  well-known community, and RFC 8642 is the RFC that governs operator
+  expectations for that "set"/"add"/"delete community" behavior. Fetched
+  RFC 8642 directly rather than assuming it was inapplicable: its only
+  normative content is that a vendor's "set" directive's treatment of
+  well-known communities (strip vs. preserve — implementations diverge)
+  MUST be documented and MUST NOT change once a community becomes
+  newly-well-known. `SetCommunities::apply()` (`pathvector-policy/src/action.rs`)
+  replaces the entire community list unconditionally, matching the
+  Junos/Huawei/Brocade model — documented this explicitly in
+  `pathvector-policy/RFC.md`'s RFC 1997 section, which previously said
+  nothing about how `SetCommunities` treats well-known values. Confirmed
+  the suppression check's ordering (post-policy) was already correct —
+  it's the only sensible interpretation, since an operator using policy to
+  strip `NO_EXPORT` before re-advertising to a specific customer is a real
+  and common technique — but it was previously implicit, not
+  regression-guarded. Added two new tests to
+  `pathvectord/src/outbound.rs`'s `propagate_tests`:
+  `test_propagate_prefix_export_policy_added_no_advertise_suppresses_announcement`
+  (a `NO_ADVERTISE` added by an `AddCommunity` policy action must suppress,
+  even though the Loc-RIB route never carried it) and
+  `test_propagate_prefix_export_policy_removes_no_export_allows_ebgp_announcement`
+  (removing `NO_EXPORT` via a `RemoveCommunity` policy action must lift
+  suppression, even though the Loc-RIB route carried it). **Real-teeth
+  verified**: both passed immediately against the already-correct ordering;
+  to prove the tests actually have teeth, temporarily changed the
+  suppression check to read the *pre-policy* `best` route's communities
+  instead of the post-policy `route`'s (simulating the exact regression
+  Codex was worried about), confirmed both new tests failed with the
+  expected assertion messages while the other 14 `propagate_tests` stayed
+  green, then restored the correct post-policy check and confirmed all 16
+  passed again. Also checked RFC 7606 directly for any Community-attribute
+  revision beyond malformed-length handling (§7.8) — confirmed clean, no
+  further gap. Confirmed no similar "policy runs before or after a
+  well-known-value check" ordering question exists for RFC 7999
+  (BLACKHOLE) or RFC 9234 (OTC), since neither of those checks is gated by
+  export policy the way RFC 1997 suppression is.
 - **RFC 5065 (confederations) support is asymmetric — significant,
   architectural, not a quick fix.** Pass-through/interop (stripping
   confederation segments before advertising externally) works and is

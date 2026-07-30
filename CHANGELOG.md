@@ -43,6 +43,25 @@ expected assertion messages, confirmed all pass after the fix, then
 mechanically reverted just the suppression guard and confirmed the same 7
 failures reappeared before restoring.
 
+A Codex review of GH PR #42 flagged that RFC 1997 is itself updated by
+RFC 8642 (Policy Behavior for Well-Known BGP Communities), which governs
+how a "set"/"add"/"delete community" policy directive should treat
+well-known communities — relevant here since `is_export_suppressed()` is
+checked *after* export policy mutates the route. Fetched RFC 8642 directly:
+its only normative content is that a vendor's "set" directive behavior
+toward well-known communities (implementations diverge — some strip them,
+some preserve specific ones) MUST be documented and MUST NOT change once a
+community becomes newly well-known. Documented `SetCommunities::apply()`'s
+existing behavior (replaces the entire list unconditionally, matching the
+Junos/Huawei/Brocade model) in `pathvector-policy/RFC.md`. Added 2 new
+tests proving the suppression check's ordering is intentional, not an
+implicit accident: a `NO_ADVERTISE` added by policy suppresses even when
+absent from Loc-RIB, and a `NO_EXPORT` removed by policy lifts suppression
+even when present in Loc-RIB. Real-teeth verified: both tests passed
+immediately (the ordering was already correct); to confirm they have teeth,
+temporarily switched the check to read pre-policy communities instead,
+confirmed both failed with the expected messages, then restored.
+
 ---
 
 ## 2026-07-20 (RFC 7606 §5.2 missing-NLRI session reset — 3-layer fix)

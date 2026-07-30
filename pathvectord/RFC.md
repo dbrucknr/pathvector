@@ -238,6 +238,23 @@ policy evaluates a route as `Accept` — lives here and in `pathvector-rib`.
 | `NO_ADVERTISE`: "MUST NOT be advertised to other BGP peers" — suppressed for both iBGP and eBGP peers | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_suppresses_ebgp_announcement`, `test_propagate_prefix_no_advertise_suppresses_ibgp_announcement`, `test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement` |
 | `NO_EXPORT`/`NO_EXPORT_SUBCONFED`: "MUST NOT be advertised outside a BGP confederation boundary" / "...to external BGP peers" — suppressed for eBGP peers, not iBGP | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp` |
 | A route already advertised is withdrawn once it starts carrying a suppressing community | `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_withdraws_previously_announced` |
+| Suppression reflects communities *after* export policy runs, not the pre-policy Loc-RIB state — a policy-added well-known community suppresses; a policy-removed one lifts suppression | `src/outbound.rs` | ✅ | `test_propagate_prefix_export_policy_added_no_advertise_suppresses_announcement`, `test_propagate_prefix_export_policy_removes_no_export_allows_ebgp_announcement` |
+
+**RFC 8642 (Policy Behavior for Well-Known BGP Communities) ordering note:**
+raised by a PR #42 review comment — RFC 8642 (which updates RFC 1997)
+confirms operators routinely add/remove/replace well-known communities via
+export policy. `propagate_prefix`/`propagate_prefix_v6` call
+`is_export_suppressed()` *after* `export_policy.evaluate(&mut route)` has
+already mutated `route` in place, so the check inherently sees post-policy
+communities — a `NO_ADVERTISE` added by a policy action suppresses the
+announcement even if the Loc-RIB route never carried it, and a `NO_EXPORT`
+present on the Loc-RIB route but removed by a policy action no longer
+suppresses. This was already the natural consequence of the check's
+placement, not a new code change; the two tests above make the ordering an
+explicit, regression-guarded contract rather than an implicit accident.
+See `pathvector-policy/RFC.md`'s RFC 1997 section for how `SetCommunities`
+(replaces the entire list, well-known or not) relates to RFC 8642's
+documentation requirement for the "set" directive.
 
 **Confederation-boundary scoping note:** RFC 1997 defines `NO_EXPORT`'s
 boundary as the confederation boundary, explicitly noting "a stand-alone
