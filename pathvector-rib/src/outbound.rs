@@ -3,9 +3,31 @@ use std::{
     sync::Arc,
 };
 
-use pathvector_types::{Asn, NextHop, PeerType};
+use pathvector_types::{Asn, Community, NextHop, PeerType};
 
 use crate::Route;
+
+/// Returns `true` if `communities` carries an RFC 1997 well-known community
+/// that forbids advertising the route to a peer of `peer_type`.
+///
+/// - `NO_ADVERTISE`: "MUST NOT be advertised to other BGP peers" — blocks
+///   every peer, internal or external.
+/// - `NO_EXPORT`: "MUST NOT be advertised outside a BGP confederation
+///   boundary (a stand-alone autonomous system that is not part of a
+///   confederation should be considered a confederation itself)". This
+///   project has no confederation-member `PeerType` (see `TODO.md`'s RFC
+///   5065 gap), so a stand-alone AS's confederation boundary is its own AS
+///   boundary — this collapses to blocking eBGP peers only, same as
+///   `NO_EXPORT_SUBCONFED` below, for today's deployment shape.
+/// - `NO_EXPORT_SUBCONFED`: "MUST NOT be advertised to external BGP peers"
+///   — blocks eBGP peers only.
+#[must_use]
+pub fn is_export_suppressed(communities: &[Community], peer_type: PeerType) -> bool {
+    communities.iter().any(|c| {
+        c.is_no_advertise()
+            || ((c.is_no_export() || c.is_no_export_subconfed()) && peer_type == PeerType::External)
+    })
+}
 
 /// Applies eBGP outbound transforms to a route clone before insertion into
 /// `AdjRibOut` or serialisation into an UPDATE message:

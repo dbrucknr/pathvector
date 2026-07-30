@@ -7,7 +7,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 
 | RFC | Title | Owner crate(s) | Status | Detail |
 |---|---|---|---|---|
-| RFC 1997 | BGP Communities Attribute | pathvector-types, pathvector-policy | ⚠️ | [types](pathvector-types/RFC.md#rfc-1997--bgp-communities-attribute) · [policy](pathvector-policy/RFC.md#rfc-1997--bgp-communities-attribute-policy-layer) — well-known values (NO_EXPORT/NO_ADVERTISE/NO_EXPORT_SUBCONFED) are defined and decodable but their mandated propagation behavior is never enforced, found by `RFC_AUDIT.md` 2026-07-16 |
+| RFC 1997 | BGP Communities Attribute | pathvector-types, pathvector-policy, pathvector-rib, pathvectord | ✅ | [types](pathvector-types/RFC.md#rfc-1997--bgp-communities-attribute) · [policy](pathvector-policy/RFC.md#rfc-1997--bgp-communities-attribute-policy-layer) · [daemon](pathvectord/RFC.md#rfc-1997--bgp-communities-attribute-outbound-enforcement) — well-known values (NO_EXPORT/NO_ADVERTISE/NO_EXPORT_SUBCONFED) are defined, decodable, and now enforced in the outbound propagation path; gap found by `RFC_AUDIT.md` 2026-07-16, fixed 2026-07-30 |
 | RFC 1930 | AS Number Guidelines (2-byte private range) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-1930--as-number-guidelines-private-range-2-byte) |
 | RFC 2385 | BGP TCP MD5 Protection | pathvector-sys, pathvector-session, pathvectord | ✅ | — |
 | RFC 2439 | Route Flap Dampening | pathvectord | ❌ | — |

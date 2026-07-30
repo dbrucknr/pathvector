@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use pathvector_policy::{Decision, Policy};
 use pathvector_rib::{
     AdjRibOut, InsertOutcome, LocRib, RibView, Route,
-    outbound::{prepare_outbound, prepare_outbound_v6},
+    outbound::{is_export_suppressed, prepare_outbound, prepare_outbound_v6},
 };
 use pathvector_session::message::{
     MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage, encode_attributes,
@@ -155,18 +155,25 @@ pub(crate) fn propagate_prefix(
                 next_hop_self,
             );
             match export_policy.evaluate(&mut route) {
-                Decision::Accept => match adj_rib_out.insert(route.clone()) {
-                    InsertOutcome::Accepted(prev) => {
-                        if prev.as_ref() == Some(&route) {
-                            PrefixDecision::NoChange
-                        } else {
-                            PrefixDecision::Announce(route)
+                // RFC 1997: a well-known community (NO_ADVERTISE/NO_EXPORT/
+                // NO_EXPORT_SUBCONFED) can forbid advertising to this peer
+                // regardless of what the export policy decided.
+                Decision::Accept
+                    if !is_export_suppressed(&route.rare_or_default().communities, peer_type) =>
+                {
+                    match adj_rib_out.insert(route.clone()) {
+                        InsertOutcome::Accepted(prev) => {
+                            if prev.as_ref() == Some(&route) {
+                                PrefixDecision::NoChange
+                            } else {
+                                PrefixDecision::Announce(route)
+                            }
                         }
+                        InsertOutcome::Filtered(Some(_)) => PrefixDecision::Withdraw(nlri),
+                        InsertOutcome::Filtered(None) => PrefixDecision::NoChange,
                     }
-                    InsertOutcome::Filtered(Some(_)) => PrefixDecision::Withdraw(nlri),
-                    InsertOutcome::Filtered(None) => PrefixDecision::NoChange,
-                },
-                Decision::Reject | Decision::Next => {
+                }
+                Decision::Accept | Decision::Reject | Decision::Next => {
                     if adj_rib_out.withdraw(&nlri).is_some() {
                         PrefixDecision::Withdraw(nlri)
                     } else {
@@ -344,18 +351,25 @@ pub(crate) fn propagate_prefix_v6(
             let mut route =
                 prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6, next_hop_self);
             match export_policy.evaluate(&mut route) {
-                Decision::Accept => match adj_rib_out.insert(route.clone()) {
-                    InsertOutcome::Accepted(prev) => {
-                        if prev.as_ref() == Some(&route) {
-                            PrefixDecisionV6::NoChange
-                        } else {
-                            PrefixDecisionV6::Announce(route)
+                // RFC 1997: a well-known community (NO_ADVERTISE/NO_EXPORT/
+                // NO_EXPORT_SUBCONFED) can forbid advertising to this peer
+                // regardless of what the export policy decided.
+                Decision::Accept
+                    if !is_export_suppressed(&route.rare_or_default().communities, peer_type) =>
+                {
+                    match adj_rib_out.insert(route.clone()) {
+                        InsertOutcome::Accepted(prev) => {
+                            if prev.as_ref() == Some(&route) {
+                                PrefixDecisionV6::NoChange
+                            } else {
+                                PrefixDecisionV6::Announce(route)
+                            }
                         }
+                        InsertOutcome::Filtered(Some(_)) => PrefixDecisionV6::Withdraw(nlri),
+                        InsertOutcome::Filtered(None) => PrefixDecisionV6::NoChange,
                     }
-                    InsertOutcome::Filtered(Some(_)) => PrefixDecisionV6::Withdraw(nlri),
-                    InsertOutcome::Filtered(None) => PrefixDecisionV6::NoChange,
-                },
-                Decision::Reject | Decision::Next => {
+                }
+                Decision::Accept | Decision::Reject | Decision::Next => {
                     if adj_rib_out.withdraw(&nlri).is_some() {
                         PrefixDecisionV6::Withdraw(nlri)
                     } else {
@@ -2064,6 +2078,315 @@ mod propagate_tests {
         assert!(
             matches!(decision, PrefixDecisionV6::NoChange),
             "iBGP split-horizon with no prior entry must produce NoChange"
+        );
+    }
+
+    // ── RFC 1997 well-known community enforcement ───────────────────────────
+    //
+    // NO_ADVERTISE: "MUST NOT be advertised to other BGP peers" — blocks
+    // every peer, internal or external.
+    // NO_EXPORT / NO_EXPORT_SUBCONFED: "MUST NOT be advertised outside a BGP
+    // confederation boundary" / "MUST NOT be advertised to external BGP
+    // peers" — this project has no confederation-member `PeerType` (see
+    // TODO.md item 22's RFC 5065 gap), so a stand-alone AS's confederation
+    // boundary collapses to its own AS boundary: both block eBGP only,
+    // leaving iBGP unaffected.
+
+    fn route_v4_with_community(
+        n: Nlri<Ipv4Addr>,
+        c: pathvector_types::Community,
+    ) -> pathvector_rib::Route<Ipv4Addr> {
+        RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .peer_type(PeerType::External)
+            .community(c)
+            .build()
+    }
+
+    fn route_v6_with_community(
+        n: Nlri<Ipv6Addr>,
+        c: pathvector_types::Community,
+    ) -> pathvector_rib::Route<Ipv6Addr> {
+        RouteBuilder::new(n, Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .peer_type(PeerType::External)
+            .community(c)
+            .build()
+    }
+
+    #[test]
+    fn test_propagate_prefix_no_advertise_suppresses_ebgp_announcement() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v4_with_community(n, pathvector_types::Community::NO_ADVERTISE),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(decision, PrefixDecision::NoChange),
+            "RFC 1997: NO_ADVERTISE must suppress advertisement to an eBGP peer"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_no_advertise_suppresses_ibgp_announcement() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v4_with_community(n, pathvector_types::Community::NO_ADVERTISE),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::Internal);
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::Internal,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(decision, PrefixDecision::NoChange),
+            "RFC 1997: NO_ADVERTISE must suppress advertisement to an iBGP peer too"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v4_with_community(n, pathvector_types::Community::NO_EXPORT),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let ebgp_dest = peer("10.0.0.3");
+        let mut ebgp_adj_out = AdjRibOut::new(ebgp_dest, PeerType::External);
+        let ebgp_decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut ebgp_adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(ebgp_decision, PrefixDecision::NoChange),
+            "RFC 1997: NO_EXPORT must suppress advertisement to an eBGP peer"
+        );
+
+        let ibgp_dest = peer("10.0.0.4");
+        let mut ibgp_adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
+        let ibgp_decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut ibgp_adj_out,
+            &accept_policy(),
+            PeerType::Internal,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(ibgp_decision, PrefixDecision::Announce(_)),
+            "RFC 1997: NO_EXPORT must not suppress advertisement to an iBGP peer"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v4_with_community(n, pathvector_types::Community::NO_EXPORT_SUBCONFED),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let ebgp_dest = peer("10.0.0.3");
+        let mut ebgp_adj_out = AdjRibOut::new(ebgp_dest, PeerType::External);
+        let ebgp_decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut ebgp_adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(ebgp_decision, PrefixDecision::NoChange),
+            "RFC 1997: NO_EXPORT_SUBCONFED must suppress advertisement to an eBGP peer"
+        );
+
+        let ibgp_dest = peer("10.0.0.4");
+        let mut ibgp_adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
+        let ibgp_decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut ibgp_adj_out,
+            &accept_policy(),
+            PeerType::Internal,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(ibgp_decision, PrefixDecision::Announce(_)),
+            "RFC 1997: NO_EXPORT_SUBCONFED must not suppress advertisement to an iBGP peer"
+        );
+    }
+
+    /// A route already advertised must be withdrawn once it starts carrying
+    /// a suppressing community (e.g. an operator or import policy tags it
+    /// NO_ADVERTISE reactively) — suppression must behave like a rejecting
+    /// export policy, not merely block the first announcement.
+    #[test]
+    fn test_propagate_prefix_no_advertise_withdraws_previously_announced() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(src, route_v4(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        let first = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(matches!(first, PrefixDecision::Announce(_)));
+
+        // Best route now carries NO_ADVERTISE.
+        loc_rib.insert(
+            src,
+            route_v4_with_community(n, pathvector_types::Community::NO_ADVERTISE),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+        let second = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+        );
+        assert!(
+            matches!(second, PrefixDecision::Withdraw(_)),
+            "RFC 1997: a previously advertised route must be withdrawn once NO_ADVERTISE applies"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v6_with_community(n, pathvector_types::Community::NO_ADVERTISE),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+        );
+        assert!(
+            matches!(decision, PrefixDecisionV6::NoChange),
+            "RFC 1997: NO_ADVERTISE must suppress v6 advertisement to an eBGP peer"
+        );
+    }
+
+    #[test]
+    fn test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(
+            src,
+            route_v6_with_community(n, pathvector_types::Community::NO_EXPORT),
+            &pathvector_rib::oracle::AlwaysReachable,
+        );
+
+        let ebgp_dest = peer("10.0.0.3");
+        let mut ebgp_adj_out = AdjRibOut::new(ebgp_dest, PeerType::External);
+        let ebgp_decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut ebgp_adj_out,
+            &accept_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+        );
+        assert!(
+            matches!(ebgp_decision, PrefixDecisionV6::NoChange),
+            "RFC 1997: NO_EXPORT must suppress v6 advertisement to an eBGP peer"
+        );
+
+        let ibgp_dest = peer("10.0.0.4");
+        let mut ibgp_adj_out = AdjRibOut::new(ibgp_dest, PeerType::Internal);
+        let ibgp_decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut ibgp_adj_out,
+            &accept_policy_v6(),
+            PeerType::Internal,
+            65001,
+            None,
+            false,
+        );
+        assert!(
+            matches!(ibgp_decision, PrefixDecisionV6::Announce(_)),
+            "RFC 1997: NO_EXPORT must not suppress v6 advertisement to an iBGP peer"
         );
     }
 }

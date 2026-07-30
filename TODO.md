@@ -1318,6 +1318,47 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   `pathvector-rib`). A route tagged with any of these today propagates
   completely normally. `RFC_REQUIREMENTS.md` previously marked this ✅ —
   corrected to ⚠️. See `RFC_AUDIT.md`'s audit-the-audit section.
+  **Fixed 2026-07-30** (`fix/rfc1997-well-known-community-enforcement`).
+  Fetched RFC 1997 directly rather than relying on trained-in memory of
+  "how BGP communities generally work," per this project's standing
+  discipline. New `pathvector_rib::outbound::is_export_suppressed()`
+  (`pathvector-rib/src/outbound.rs`) gates `propagate_prefix`/
+  `propagate_prefix_v6` in `pathvectord/src/outbound.rs`, called right
+  after the export policy evaluates a route as `Accept` — a suppressed
+  route is treated exactly like a rejecting export policy (withdraw if
+  previously advertised, no-op otherwise), reusing the existing `Decision::Reject`
+  branch rather than adding a parallel code path. `NO_ADVERTISE` ("MUST NOT
+  be advertised to other BGP peers") blocks every peer type, internal or
+  external. `NO_EXPORT` and `NO_EXPORT_SUBCONFED` both block eBGP peers
+  only — this project has no confederation-member `PeerType` (see the RFC
+  5065 gap below), so per RFC 1997's own text ("a stand-alone autonomous
+  system that is not part of a confederation should be considered a
+  confederation itself"), `NO_EXPORT`'s confederation boundary collapses to
+  the plain AS boundary for today's deployment shape, identical to
+  `NO_EXPORT_SUBCONFED`. Documented this collapse explicitly in
+  `is_export_suppressed()`'s doc comment and in `pathvectord/RFC.md`'s new
+  RFC 1997 section, rather than silently treating the two constants the
+  same without explanation. Added 7 new regression tests in
+  `pathvectord/src/outbound.rs`'s `propagate_tests` module (v4 + v6):
+  `test_propagate_prefix_no_advertise_suppresses_ebgp_announcement`,
+  `test_propagate_prefix_no_advertise_suppresses_ibgp_announcement`,
+  `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`,
+  `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp`,
+  `test_propagate_prefix_no_advertise_withdraws_previously_announced` (a
+  route already advertised must be withdrawn once it starts carrying
+  `NO_ADVERTISE`, not just have new announcements blocked),
+  `test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement`,
+  `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp`.
+  **Real-teeth verified**: ran the 7 new tests against the pre-fix code
+  first and confirmed all 7 failed with the expected assertion message
+  (e.g. "RFC 1997: NO_EXPORT must suppress advertisement to an eBGP peer")
+  while the 7 pre-existing `propagate_tests` still passed; implemented the
+  fix and confirmed all 14 passed; then mechanically reverted just the
+  suppression guard (forced the `Decision::Accept` arm to always insert,
+  simulating pre-fix behavior) and confirmed the exact same 7 tests failed
+  with the exact same messages again, before restoring the fix. Full
+  workspace `cargo test --workspace --exclude pathvector-e2e` and
+  `cargo clippy --all-targets -- -D warnings` both clean afterward.
 - **RFC 5065 (confederations) support is asymmetric — significant,
   architectural, not a quick fix.** Pass-through/interop (stripping
   confederation segments before advertising externally) works and is

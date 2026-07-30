@@ -96,12 +96,12 @@ is enforced in `pathvector-rib`.
 | Well-known community NO_ADVERTISE (0xFFFFFF02) — value + `is_no_advertise()` predicate | `src/community.rs` | ✅ | `test_community_well_known_no_advertise` |
 | Well-known community NO_EXPORT_SUBCONFED (0xFFFFFF03) — value + predicate | `src/community.rs` | ✅ | `test_community_well_known_no_export_subconfed` |
 | Operator-assigned values do not collide with well-known range | `src/community.rs` | ✅ | `test_community_operator_not_well_known` |
-| **RFC 1997's mandated behavior** for these three values — "MUST NOT be advertised outside a BGP confederation boundary" (NO_EXPORT), "MUST NOT be advertised to other BGP peers" (NO_ADVERTISE), "MUST NOT be advertised to external BGP peers" (NO_EXPORT_SUBCONFED) | — | ❌ | Added 2026-07-16 by `RFC_AUDIT.md`. The predicates above exist and are correctly tested at the type level, but grepping `pathvectord/src/outbound.rs` and `pathvector-rib` for any call to `is_no_export()`/`is_no_advertise()`/`is_well_known()` in the actual propagation path turns up nothing — they're never used to gate whether a route is advertised. A route tagged with any of these three values propagates completely normally today. This is the same "wire format defined, behavior not wired up" pattern as the SAFI-constant RFCs below, but unlike those, this one wasn't previously flagged as such. |
+| **RFC 1997's mandated behavior** for these three values — "MUST NOT be advertised outside a BGP confederation boundary" (NO_EXPORT), "MUST NOT be advertised to other BGP peers" (NO_ADVERTISE), "MUST NOT be advertised to external BGP peers" (NO_EXPORT_SUBCONFED) | `pathvectord/src/outbound.rs`, `pathvector-rib/src/outbound.rs` | ✅ | Fixed 2026-07-30 (`fix/rfc1997-well-known-community-enforcement`). `pathvector_rib::outbound::is_export_suppressed()` gates `propagate_prefix`/`propagate_prefix_v6` in `pathvectord`; see that crate's `RFC.md` for the full writeup. |
 
-**Known gap (found 2026-07-16 by `RFC_AUDIT.md`):** see the row above — this
+**Resolved gap (found 2026-07-16 by `RFC_AUDIT.md`, fixed 2026-07-30):** this
 crate correctly defines and can detect the three well-known community
-values, but nothing downstream currently enforces the RFC-mandated
-propagation restriction they carry.
+values; the propagation restriction they carry is now enforced downstream
+in `pathvectord`'s outbound pipeline (see above).
 
 ---
 

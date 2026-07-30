@@ -221,6 +221,36 @@ your environment.
 
 ---
 
+## RFC 1997 — BGP Communities Attribute (Outbound Enforcement)
+
+**Owns:** Enforcing the propagation restriction each well-known community
+carries. The `Community` type and `is_no_advertise()`/`is_no_export()`/
+`is_no_export_subconfed()` predicates live in `pathvector-types`; the
+enforcement point — `pathvector_rib::outbound::is_export_suppressed()`,
+called from `propagate_prefix`/`propagate_prefix_v6` right after export
+policy evaluates a route as `Accept` — lives here and in `pathvector-rib`.  
+**Boundary:** Community match/mutation policy conditions and actions live in
+`pathvector-policy`. Wire encoding lives in `pathvector-session`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc1997
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `NO_ADVERTISE`: "MUST NOT be advertised to other BGP peers" — suppressed for both iBGP and eBGP peers | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_suppresses_ebgp_announcement`, `test_propagate_prefix_no_advertise_suppresses_ibgp_announcement`, `test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement` |
+| `NO_EXPORT`/`NO_EXPORT_SUBCONFED`: "MUST NOT be advertised outside a BGP confederation boundary" / "...to external BGP peers" — suppressed for eBGP peers, not iBGP | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp` |
+| A route already advertised is withdrawn once it starts carrying a suppressing community | `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_withdraws_previously_announced` |
+
+**Confederation-boundary scoping note:** RFC 1997 defines `NO_EXPORT`'s
+boundary as the confederation boundary, explicitly noting "a stand-alone
+autonomous system that is not part of a confederation should be considered
+a confederation itself." This project has no confederation-member `PeerType`
+(see `TODO.md`'s RFC 5065 gap) — a stand-alone AS's confederation boundary
+is its own AS boundary, so `NO_EXPORT` collapses to blocking eBGP peers only,
+identical to `NO_EXPORT_SUBCONFED`, for today's deployment shape. If
+confederation-member support is ever added, `is_export_suppressed()` will
+need a third case for that peer relationship.
+
+---
+
 ## RFC 8212 — Default External BGP Route Propagation Without Policy
 
 **Owns:** The default import/export policy when no policy is configured: reject all routes

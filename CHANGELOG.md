@@ -4,6 +4,47 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-30 (RFC 1997 well-known community enforcement)
+
+### [pathvector-rib, pathvectord] NO_EXPORT/NO_ADVERTISE/NO_EXPORT_SUBCONFED were defined and decodable but never enforced in outbound propagation
+
+`RFC_AUDIT.md`'s "audit-the-audit" pass (2026-07-16) had flagged this as
+overclaiming: `Community::is_no_export()`/`is_no_advertise()`/
+`is_no_export_subconfed()` existed and were correctly tested at the type
+level, but grepping the entire outbound propagation path
+(`propagate_prefix`/`propagate_prefix_v6` in `pathvectord/src/outbound.rs`,
+`prepare_outbound`/`AdjRibOut::insert` in `pathvector-rib`) turned up no
+call to any of them — a route tagged `NO_EXPORT` or `NO_ADVERTISE`
+propagated exactly like an untagged route. Fixed as PR 10 of the RFC audit
+roadmap (`fix/rfc1997-well-known-community-enforcement`, GH PR #42).
+
+Added `pathvector_rib::outbound::is_export_suppressed()`, gating both
+`propagate_prefix` and `propagate_prefix_v6` immediately after the export
+policy evaluates a route as `Accept` — a suppressed route is withdrawn or
+left alone exactly like a rejecting policy would, reusing the existing
+`Decision::Reject` branch rather than a parallel code path:
+
+- `NO_ADVERTISE` ("MUST NOT be advertised to other BGP peers") blocks every
+  peer, internal or external.
+- `NO_EXPORT` and `NO_EXPORT_SUBCONFED` both block eBGP peers only. RFC
+  1997 defines `NO_EXPORT`'s boundary as the confederation boundary,
+  explicitly noting a stand-alone AS not in a confederation is its own
+  confederation — since this project has no confederation-member
+  `PeerType` (see TODO.md's RFC 5065 gap), that boundary collapses to the
+  plain AS boundary, identical to `NO_EXPORT_SUBCONFED`, for today's
+  deployment shape. Documented explicitly rather than left as an
+  unexplained coincidence.
+
+7 new regression tests (v4 + v6) cover each community's suppression
+behavior for both peer types, plus a route already advertised being
+withdrawn once it starts carrying `NO_ADVERTISE` reactively. Real-teeth
+verified: confirmed all 7 failed against the pre-fix code with the exact
+expected assertion messages, confirmed all pass after the fix, then
+mechanically reverted just the suppression guard and confirmed the same 7
+failures reappeared before restoring.
+
+---
+
 ## 2026-07-20 (RFC 7606 §5.2 missing-NLRI session reset — 3-layer fix)
 
 ### [pathvectord, pathvector-session] An UPDATE with attributes but no reachable NLRI was silently accepted instead of resetting the session
