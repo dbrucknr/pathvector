@@ -41,6 +41,11 @@ from-scratch implementation with no prior "set" behavior to regress,
 trivially satisfies the stability requirement as well. `AddCommunity`/
 `RemoveCommunity` operate on individual values and are unaffected by this
 distinction — they only ever touch the community explicitly named.
+Regression-guarded by `test_set_communities_replaces_well_known_communities`
+(`src/action.rs`), which starts with `NO_EXPORT`/`NO_ADVERTISE` present and
+asserts `SetCommunities` strips both — deliberately distinct from
+`test_set_communities`, which only exercises ordinary values and would stay
+green even if a future change special-cased well-known communities.
 
 ---
 

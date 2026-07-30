@@ -62,6 +62,18 @@ immediately (the ordering was already correct); to confirm they have teeth,
 temporarily switched the check to read pre-policy communities instead,
 confirmed both failed with the expected messages, then restored.
 
+A second Codex round on the same PR noted the ordering fix's coverage
+exercised `AddCommunity`/`RemoveCommunity` but not `SetCommunities` —
+the pre-existing `test_set_communities` only used ordinary values, so a
+future well-known-preserving special case in `SetCommunities::apply()`
+could pass every cited test while violating RFC 8642. Added
+`test_set_communities_replaces_well_known_communities`
+(`pathvector-policy/src/action.rs`), starting with `NO_EXPORT`/
+`NO_ADVERTISE` present and asserting `set` replaces them too. Real-teeth
+verified: temporarily patched `SetCommunities::apply()` to preserve
+well-known communities across `set`, confirmed the new test failed while
+the ordinary one stayed green, then restored.
+
 ---
 
 ## 2026-07-20 (RFC 7606 §5.2 missing-NLRI session reset — 3-layer fix)

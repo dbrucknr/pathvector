@@ -1400,6 +1400,22 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   well-known-value check" ordering question exists for RFC 7999
   (BLACKHOLE) or RFC 9234 (OTC), since neither of those checks is gated by
   export policy the way RFC 1997 suppression is.
+  **Second Codex round on the same PR**: the ordering fix's own regression
+  coverage exercised `AddCommunity`/`RemoveCommunity` but not
+  `SetCommunities` — the pre-existing `test_set_communities`
+  (`pathvector-policy/src/action.rs`) only ever used ordinary `65000:*`
+  values, so a future change special-casing well-known communities inside
+  `SetCommunities::apply()` (e.g. preserving them the way Cisco IOS XR
+  does) could pass every cited test while silently violating RFC 8642's
+  documented, stability-required behavior. Added
+  `test_set_communities_replaces_well_known_communities`, starting the
+  route with `NO_EXPORT`/`NO_ADVERTISE` present and asserting `set`
+  replaces them too, and cited it in `pathvector-policy/RFC.md`.
+  **Real-teeth verified**: temporarily patched `SetCommunities::apply()`
+  to preserve `is_well_known()` communities across `set` (the exact
+  regression shape Codex described), confirmed the new test failed while
+  the ordinary `test_set_communities` stayed green, then restored the
+  correct unconditional-replace behavior and confirmed both pass.
 - **RFC 5065 (confederations) support is asymmetric — significant,
   architectural, not a quick fix.** Pass-through/interop (stripping
   confederation segments before advertising externally) works and is
