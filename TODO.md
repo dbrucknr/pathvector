@@ -1013,6 +1013,34 @@ diagnostic-quality only:
   code, but not *which variant* (e.g. which specific AFI/SAFI) caused
   the rejection — a diagnostics/debuggability gap, not a correctness or
   security issue. See `RFC_AUDIT.md`'s RFC 5492 section.
+  **Fixed 2026-07-30** (`fix/rfc5492-unsupported-capability-notification-data`,
+  GH PR 11). Fetched RFC 5492 §5 directly and checked for amending RFCs —
+  only RFC 8810 updates RFC 5492, and it only revises Capability Code IANA
+  registration ranges (splitting "Private Use" into First-Come-First-Served/
+  Experimental/Reserved), unrelated to error handling or the Data field.
+  Made `encode_capability_value` (`pathvector-session/src/message/open.rs`)
+  `pub(crate)` and re-exported it via `message/mod.rs`, then rewrote
+  `encode_unsupported_capabilities` (`fsm/mod.rs`) to build the real
+  `code(1) + length(1) + value` TLV per capability using that same
+  encoder, instead of a `[code, 0x00]` placeholder — guaranteeing the
+  NOTIFICATION path can't drift from the OPEN-message encoding it's
+  required to match. Added
+  `test_unsupported_capability_notification_encodes_full_capability_tlv`,
+  deliberately using `MultiProtocol(IPv6 unicast)` rather than the
+  existing test's `RouteRefresh`, since `RouteRefresh`'s capability value
+  is empty and can't distinguish the placeholder encoding from the
+  correct one — asserts the exact bytes `[1, 4, 0, 2, 0, 1]` (code,
+  length, AFI high/low, reserved, SAFI). Also strengthened the existing
+  `test_required_capability_missing_sends_unsupported_capability_notification`
+  from a weak `contains(&2)` check to an exact `[2, 0]` assertion.
+  **Real-teeth verified**: confirmed the new test failed against the
+  pre-fix code with `left: [1, 0], right: [1, 4, 0, 2, 0, 1]`; implemented
+  the fix and confirmed both tests passed; then reverted just
+  `encode_unsupported_capabilities` to the placeholder encoding and
+  confirmed the identical failure reappeared, before restoring. Full
+  `cargo test -p pathvector-session` (329 unit + 16 integration + 2
+  doctests) and `cargo clippy -p pathvector-session --all-targets -- -D
+  warnings` both clean afterward.
 
 RFC 6793 and RFC 6396 were also audited this round — no new gaps found;
 both RFCs' existing ⚠️ tracking in `RFC_REQUIREMENTS.md` was independently

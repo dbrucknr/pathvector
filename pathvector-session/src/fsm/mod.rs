@@ -12,7 +12,7 @@ use pathvector_types::PeerType;
 
 use crate::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
-    OpenMsgError, UpdateMessage,
+    OpenMsgError, UpdateMessage, encode_capability_value,
 };
 
 /// Placed in the two-byte `my_as` field when the real ASN exceeds 16 bits
@@ -871,12 +871,18 @@ impl Fsm {
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
 /// Encode a list of capabilities as NOTIFICATION data for Unsupported Capability
-/// (RFC 5492 §3). Each entry is a capability TLV: code(1) + length(1) + value.
+/// (RFC 5492 §5): "Each such capability is encoded in the same way as it
+/// would be encoded in the OPEN message" — a full code(1) + length(1) + value
+/// TLV, not merely the code. Reuses the OPEN message's own value encoder so
+/// the two paths can't drift apart.
 fn encode_unsupported_capabilities(caps: &[&Capability]) -> Vec<u8> {
     let mut data = Vec::new();
     for cap in caps {
+        let value = encode_capability_value(cap);
         data.push(cap.code());
-        data.push(0); // length 0 — we only need the code to identify the capability
+        #[allow(clippy::cast_possible_truncation)]
+        data.push(value.len() as u8);
+        data.extend(value);
     }
     data
 }
@@ -2171,9 +2177,58 @@ mod tests {
             n.error,
             NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability)
         );
-        assert!(
-            n.data.contains(&2),
-            "NOTIFICATION data must contain capability code 2 (RouteRefresh)"
+        assert_eq!(
+            n.data,
+            vec![2, 0],
+            "RouteRefresh has an empty capability value, so its TLV is just code(2) + length(0)"
+        );
+    }
+
+    /// RFC 5492 §5: "Each such capability is encoded in the same way as it
+    /// would be encoded in the OPEN message" — a full <code, length, value>
+    /// TLV, not merely the capability code. `RouteRefresh` (above) has an
+    /// empty value so it can't tell a full TLV apart from a code-only
+    /// placeholder; `MultiProtocol` has a real 4-byte value, which can.
+    #[test]
+    fn test_unsupported_capability_notification_encodes_full_capability_tlv() {
+        let afi_safi = pathvector_types::AfiSafi::IPV6_UNICAST;
+        let config = FsmConfig {
+            required_capabilities: vec![Capability::MultiProtocol(afi_safi)],
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+
+        // Peer OPEN has no MultiProtocol capability at all.
+        let peer_open_no_mp = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![Capability::FourByteAsn(65002)],
+        });
+        let out = fsm.process(FsmInput::MessageReceived(peer_open_no_mp));
+
+        let n = find_notification(&out).expect("expected UnsupportedCapability NOTIFICATION");
+        assert_eq!(
+            n.error,
+            NotificationError::OpenMessage(OpenMsgError::UnsupportedCapability)
+        );
+        let afi = afi_safi.afi.as_u16();
+        #[allow(clippy::cast_possible_truncation)]
+        let expected = vec![
+            1, // MultiProtocol capability code
+            4, // Capability Length: AFI(2) + reserved(1) + SAFI(1)
+            (afi >> 8) as u8,
+            (afi & 0xFF) as u8,
+            0, // reserved
+            afi_safi.safi.as_u8(),
+        ];
+        assert_eq!(
+            n.data, expected,
+            "NOTIFICATION Data field must encode the full capability TLV, \
+             not just its code"
         );
     }
 
