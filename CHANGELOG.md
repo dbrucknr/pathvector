@@ -4,6 +4,78 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-30 (RFC 1997 well-known community enforcement)
+
+### [pathvector-rib, pathvectord] NO_EXPORT/NO_ADVERTISE/NO_EXPORT_SUBCONFED were defined and decodable but never enforced in outbound propagation
+
+`RFC_AUDIT.md`'s "audit-the-audit" pass (2026-07-16) had flagged this as
+overclaiming: `Community::is_no_export()`/`is_no_advertise()`/
+`is_no_export_subconfed()` existed and were correctly tested at the type
+level, but grepping the entire outbound propagation path
+(`propagate_prefix`/`propagate_prefix_v6` in `pathvectord/src/outbound.rs`,
+`prepare_outbound`/`AdjRibOut::insert` in `pathvector-rib`) turned up no
+call to any of them — a route tagged `NO_EXPORT` or `NO_ADVERTISE`
+propagated exactly like an untagged route. Fixed as PR 10 of the RFC audit
+roadmap (`fix/rfc1997-well-known-community-enforcement`, GH PR #42).
+
+Added `pathvector_rib::outbound::is_export_suppressed()`, gating both
+`propagate_prefix` and `propagate_prefix_v6` immediately after the export
+policy evaluates a route as `Accept` — a suppressed route is withdrawn or
+left alone exactly like a rejecting policy would, reusing the existing
+`Decision::Reject` branch rather than a parallel code path:
+
+- `NO_ADVERTISE` ("MUST NOT be advertised to other BGP peers") blocks every
+  peer, internal or external.
+- `NO_EXPORT` and `NO_EXPORT_SUBCONFED` both block eBGP peers only. RFC
+  1997 defines `NO_EXPORT`'s boundary as the confederation boundary,
+  explicitly noting a stand-alone AS not in a confederation is its own
+  confederation — since this project has no confederation-member
+  `PeerType` (see TODO.md's RFC 5065 gap), that boundary collapses to the
+  plain AS boundary, identical to `NO_EXPORT_SUBCONFED`, for today's
+  deployment shape. Documented explicitly rather than left as an
+  unexplained coincidence.
+
+7 new regression tests (v4 + v6) cover each community's suppression
+behavior for both peer types, plus a route already advertised being
+withdrawn once it starts carrying `NO_ADVERTISE` reactively. Real-teeth
+verified: confirmed all 7 failed against the pre-fix code with the exact
+expected assertion messages, confirmed all pass after the fix, then
+mechanically reverted just the suppression guard and confirmed the same 7
+failures reappeared before restoring.
+
+A Codex review of GH PR #42 flagged that RFC 1997 is itself updated by
+RFC 8642 (Policy Behavior for Well-Known BGP Communities), which governs
+how a "set"/"add"/"delete community" policy directive should treat
+well-known communities — relevant here since `is_export_suppressed()` is
+checked *after* export policy mutates the route. Fetched RFC 8642 directly:
+its only normative content is that a vendor's "set" directive behavior
+toward well-known communities (implementations diverge — some strip them,
+some preserve specific ones) MUST be documented and MUST NOT change once a
+community becomes newly well-known. Documented `SetCommunities::apply()`'s
+existing behavior (replaces the entire list unconditionally, matching the
+Junos/Huawei/Brocade model) in `pathvector-policy/RFC.md`. Added 2 new
+tests proving the suppression check's ordering is intentional, not an
+implicit accident: a `NO_ADVERTISE` added by policy suppresses even when
+absent from Loc-RIB, and a `NO_EXPORT` removed by policy lifts suppression
+even when present in Loc-RIB. Real-teeth verified: both tests passed
+immediately (the ordering was already correct); to confirm they have teeth,
+temporarily switched the check to read pre-policy communities instead,
+confirmed both failed with the expected messages, then restored.
+
+A second Codex round on the same PR noted the ordering fix's coverage
+exercised `AddCommunity`/`RemoveCommunity` but not `SetCommunities` —
+the pre-existing `test_set_communities` only used ordinary values, so a
+future well-known-preserving special case in `SetCommunities::apply()`
+could pass every cited test while violating RFC 8642. Added
+`test_set_communities_replaces_well_known_communities`
+(`pathvector-policy/src/action.rs`), starting with `NO_EXPORT`/
+`NO_ADVERTISE` present and asserting `set` replaces them too. Real-teeth
+verified: temporarily patched `SetCommunities::apply()` to preserve
+well-known communities across `set`, confirmed the new test failed while
+the ordinary one stayed green, then restored.
+
+---
+
 ## 2026-07-20 (RFC 7606 §5.2 missing-NLRI session reset — 3-layer fix)
 
 ### [pathvectord, pathvector-session] An UPDATE with attributes but no reachable NLRI was silently accepted instead of resetting the session

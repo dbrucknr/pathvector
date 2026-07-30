@@ -24,6 +24,29 @@ and well-known constants live in `pathvector-types`; wire encoding lives in
 | Action: remove community from route | `src/action.rs` | ✅ | `test_community_remove_action` |
 | Action: set (replace) entire community list | `src/action.rs` | ✅ | `test_community_set_action` |
 
+**RFC 8642 (Policy Behavior for Well-Known BGP Communities) — updates RFC
+1997.** Checked directly (fetched 2026-07-30) in response to a PR #42 review
+comment. RFC 8642 documents that vendor "set community" implementations
+diverge on whether well-known communities survive a `set`/`replace`
+directive (some strip them like any other community — Junos, Huawei,
+Brocade; others preserve specific ones — Cisco IOS XR; OpenBGPD strips
+none) and its only normative requirements are: (1) vendors MUST document
+which behavior their `set` directive has, and (2) that behavior MUST NOT
+change for a community that becomes newly well-known through future
+standardization. `SetCommunities::apply()` (`src/action.rs`) replaces the
+entire community list unconditionally — well-known communities are **not**
+preserved, matching the Junos/Huawei/Brocade model. This satisfies RFC
+8642's documentation requirement (stated here) and, since this is a
+from-scratch implementation with no prior "set" behavior to regress,
+trivially satisfies the stability requirement as well. `AddCommunity`/
+`RemoveCommunity` operate on individual values and are unaffected by this
+distinction — they only ever touch the community explicitly named.
+Regression-guarded by `test_set_communities_replaces_well_known_communities`
+(`src/action.rs`), which starts with `NO_EXPORT`/`NO_ADVERTISE` present and
+asserts `SetCommunities` strips both — deliberately distinct from
+`test_set_communities`, which only exercises ordinary values and would stay
+green even if a future change special-cased well-known communities.
+
 ---
 
 ## RFC 8092 — BGP Large Communities Attribute (Policy Layer)

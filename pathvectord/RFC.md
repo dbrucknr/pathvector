@@ -221,6 +221,53 @@ your environment.
 
 ---
 
+## RFC 1997 — BGP Communities Attribute (Outbound Enforcement)
+
+**Owns:** Enforcing the propagation restriction each well-known community
+carries. The `Community` type and `is_no_advertise()`/`is_no_export()`/
+`is_no_export_subconfed()` predicates live in `pathvector-types`; the
+enforcement point — `pathvector_rib::outbound::is_export_suppressed()`,
+called from `propagate_prefix`/`propagate_prefix_v6` right after export
+policy evaluates a route as `Accept` — lives here and in `pathvector-rib`.  
+**Boundary:** Community match/mutation policy conditions and actions live in
+`pathvector-policy`. Wire encoding lives in `pathvector-session`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc1997
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `NO_ADVERTISE`: "MUST NOT be advertised to other BGP peers" — suppressed for both iBGP and eBGP peers | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_suppresses_ebgp_announcement`, `test_propagate_prefix_no_advertise_suppresses_ibgp_announcement`, `test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement` |
+| `NO_EXPORT`/`NO_EXPORT_SUBCONFED`: "MUST NOT be advertised outside a BGP confederation boundary" / "...to external BGP peers" — suppressed for eBGP peers, not iBGP | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp` |
+| A route already advertised is withdrawn once it starts carrying a suppressing community | `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_withdraws_previously_announced` |
+| Suppression reflects communities *after* export policy runs, not the pre-policy Loc-RIB state — a policy-added well-known community suppresses; a policy-removed one lifts suppression | `src/outbound.rs` | ✅ | `test_propagate_prefix_export_policy_added_no_advertise_suppresses_announcement`, `test_propagate_prefix_export_policy_removes_no_export_allows_ebgp_announcement` |
+
+**RFC 8642 (Policy Behavior for Well-Known BGP Communities) ordering note:**
+raised by a PR #42 review comment — RFC 8642 (which updates RFC 1997)
+confirms operators routinely add/remove/replace well-known communities via
+export policy. `propagate_prefix`/`propagate_prefix_v6` call
+`is_export_suppressed()` *after* `export_policy.evaluate(&mut route)` has
+already mutated `route` in place, so the check inherently sees post-policy
+communities — a `NO_ADVERTISE` added by a policy action suppresses the
+announcement even if the Loc-RIB route never carried it, and a `NO_EXPORT`
+present on the Loc-RIB route but removed by a policy action no longer
+suppresses. This was already the natural consequence of the check's
+placement, not a new code change; the two tests above make the ordering an
+explicit, regression-guarded contract rather than an implicit accident.
+See `pathvector-policy/RFC.md`'s RFC 1997 section for how `SetCommunities`
+(replaces the entire list, well-known or not) relates to RFC 8642's
+documentation requirement for the "set" directive.
+
+**Confederation-boundary scoping note:** RFC 1997 defines `NO_EXPORT`'s
+boundary as the confederation boundary, explicitly noting "a stand-alone
+autonomous system that is not part of a confederation should be considered
+a confederation itself." This project has no confederation-member `PeerType`
+(see `TODO.md`'s RFC 5065 gap) — a stand-alone AS's confederation boundary
+is its own AS boundary, so `NO_EXPORT` collapses to blocking eBGP peers only,
+identical to `NO_EXPORT_SUBCONFED`, for today's deployment shape. If
+confederation-member support is ever added, `is_export_suppressed()` will
+need a third case for that peer relationship.
+
+---
+
 ## RFC 8212 — Default External BGP Route Propagation Without Policy
 
 **Owns:** The default import/export policy when no policy is configured: reject all routes

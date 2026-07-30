@@ -1318,6 +1318,104 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   `pathvector-rib`). A route tagged with any of these today propagates
   completely normally. `RFC_REQUIREMENTS.md` previously marked this ✅ —
   corrected to ⚠️. See `RFC_AUDIT.md`'s audit-the-audit section.
+  **Fixed 2026-07-30** (`fix/rfc1997-well-known-community-enforcement`).
+  Fetched RFC 1997 directly rather than relying on trained-in memory of
+  "how BGP communities generally work," per this project's standing
+  discipline. New `pathvector_rib::outbound::is_export_suppressed()`
+  (`pathvector-rib/src/outbound.rs`) gates `propagate_prefix`/
+  `propagate_prefix_v6` in `pathvectord/src/outbound.rs`, called right
+  after the export policy evaluates a route as `Accept` — a suppressed
+  route is treated exactly like a rejecting export policy (withdraw if
+  previously advertised, no-op otherwise), reusing the existing `Decision::Reject`
+  branch rather than adding a parallel code path. `NO_ADVERTISE` ("MUST NOT
+  be advertised to other BGP peers") blocks every peer type, internal or
+  external. `NO_EXPORT` and `NO_EXPORT_SUBCONFED` both block eBGP peers
+  only — this project has no confederation-member `PeerType` (see the RFC
+  5065 gap below), so per RFC 1997's own text ("a stand-alone autonomous
+  system that is not part of a confederation should be considered a
+  confederation itself"), `NO_EXPORT`'s confederation boundary collapses to
+  the plain AS boundary for today's deployment shape, identical to
+  `NO_EXPORT_SUBCONFED`. Documented this collapse explicitly in
+  `is_export_suppressed()`'s doc comment and in `pathvectord/RFC.md`'s new
+  RFC 1997 section, rather than silently treating the two constants the
+  same without explanation. Added 7 new regression tests in
+  `pathvectord/src/outbound.rs`'s `propagate_tests` module (v4 + v6):
+  `test_propagate_prefix_no_advertise_suppresses_ebgp_announcement`,
+  `test_propagate_prefix_no_advertise_suppresses_ibgp_announcement`,
+  `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`,
+  `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp`,
+  `test_propagate_prefix_no_advertise_withdraws_previously_announced` (a
+  route already advertised must be withdrawn once it starts carrying
+  `NO_ADVERTISE`, not just have new announcements blocked),
+  `test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement`,
+  `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp`.
+  **Real-teeth verified**: ran the 7 new tests against the pre-fix code
+  first and confirmed all 7 failed with the expected assertion message
+  (e.g. "RFC 1997: NO_EXPORT must suppress advertisement to an eBGP peer")
+  while the 7 pre-existing `propagate_tests` still passed; implemented the
+  fix and confirmed all 14 passed; then mechanically reverted just the
+  suppression guard (forced the `Decision::Accept` arm to always insert,
+  simulating pre-fix behavior) and confirmed the exact same 7 tests failed
+  with the exact same messages again, before restoring the fix. Full
+  workspace `cargo test --workspace --exclude pathvector-e2e` and
+  `cargo clippy --all-targets -- -D warnings` both clean afterward.
+  **Codex review follow-up on GH PR #42**: flagged that RFC 1997 is itself
+  updated by RFC 8642 (Policy Behavior for Well-Known BGP Communities),
+  and that this PR's docs hadn't discussed it before marking the aggregate
+  status ✅ — specifically, since `is_export_suppressed()` is checked
+  *after* export policy mutates the route, a policy could add or remove a
+  well-known community, and RFC 8642 is the RFC that governs operator
+  expectations for that "set"/"add"/"delete community" behavior. Fetched
+  RFC 8642 directly rather than assuming it was inapplicable: its only
+  normative content is that a vendor's "set" directive's treatment of
+  well-known communities (strip vs. preserve — implementations diverge)
+  MUST be documented and MUST NOT change once a community becomes
+  newly-well-known. `SetCommunities::apply()` (`pathvector-policy/src/action.rs`)
+  replaces the entire community list unconditionally, matching the
+  Junos/Huawei/Brocade model — documented this explicitly in
+  `pathvector-policy/RFC.md`'s RFC 1997 section, which previously said
+  nothing about how `SetCommunities` treats well-known values. Confirmed
+  the suppression check's ordering (post-policy) was already correct —
+  it's the only sensible interpretation, since an operator using policy to
+  strip `NO_EXPORT` before re-advertising to a specific customer is a real
+  and common technique — but it was previously implicit, not
+  regression-guarded. Added two new tests to
+  `pathvectord/src/outbound.rs`'s `propagate_tests`:
+  `test_propagate_prefix_export_policy_added_no_advertise_suppresses_announcement`
+  (a `NO_ADVERTISE` added by an `AddCommunity` policy action must suppress,
+  even though the Loc-RIB route never carried it) and
+  `test_propagate_prefix_export_policy_removes_no_export_allows_ebgp_announcement`
+  (removing `NO_EXPORT` via a `RemoveCommunity` policy action must lift
+  suppression, even though the Loc-RIB route carried it). **Real-teeth
+  verified**: both passed immediately against the already-correct ordering;
+  to prove the tests actually have teeth, temporarily changed the
+  suppression check to read the *pre-policy* `best` route's communities
+  instead of the post-policy `route`'s (simulating the exact regression
+  Codex was worried about), confirmed both new tests failed with the
+  expected assertion messages while the other 14 `propagate_tests` stayed
+  green, then restored the correct post-policy check and confirmed all 16
+  passed again. Also checked RFC 7606 directly for any Community-attribute
+  revision beyond malformed-length handling (§7.8) — confirmed clean, no
+  further gap. Confirmed no similar "policy runs before or after a
+  well-known-value check" ordering question exists for RFC 7999
+  (BLACKHOLE) or RFC 9234 (OTC), since neither of those checks is gated by
+  export policy the way RFC 1997 suppression is.
+  **Second Codex round on the same PR**: the ordering fix's own regression
+  coverage exercised `AddCommunity`/`RemoveCommunity` but not
+  `SetCommunities` — the pre-existing `test_set_communities`
+  (`pathvector-policy/src/action.rs`) only ever used ordinary `65000:*`
+  values, so a future change special-casing well-known communities inside
+  `SetCommunities::apply()` (e.g. preserving them the way Cisco IOS XR
+  does) could pass every cited test while silently violating RFC 8642's
+  documented, stability-required behavior. Added
+  `test_set_communities_replaces_well_known_communities`, starting the
+  route with `NO_EXPORT`/`NO_ADVERTISE` present and asserting `set`
+  replaces them too, and cited it in `pathvector-policy/RFC.md`.
+  **Real-teeth verified**: temporarily patched `SetCommunities::apply()`
+  to preserve `is_well_known()` communities across `set` (the exact
+  regression shape Codex described), confirmed the new test failed while
+  the ordinary `test_set_communities` stayed green, then restored the
+  correct unconditional-replace behavior and confirmed both pass.
 - **RFC 5065 (confederations) support is asymmetric — significant,
   architectural, not a quick fix.** Pass-through/interop (stripping
   confederation segments before advertising externally) works and is

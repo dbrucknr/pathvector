@@ -521,6 +521,32 @@ mod tests {
         assert_eq!(route.communities, vec![b]);
     }
 
+    /// RFC 8642 requires a vendor's "set" directive treatment of well-known
+    /// communities to be documented and stable. This project's documented
+    /// choice (see `pathvector-policy/RFC.md`'s RFC 1997 section) is that
+    /// `SetCommunities` replaces the entire list unconditionally, matching
+    /// the Junos/Huawei/Brocade model — well-known communities are not
+    /// specially preserved the way Cisco IOS XR preserves some of them.
+    /// This test pins that choice against ordinary `test_set_communities`
+    /// only exercising non-well-known values.
+    #[test]
+    fn test_set_communities_replaces_well_known_communities() {
+        use pathvector_types::Community;
+        let replacement = Community::from_parts(65000, 100);
+        let mut route = TestRoute::new("10.0.0.0/8");
+        route.communities = vec![Community::NO_EXPORT, Community::NO_ADVERTISE];
+
+        SetCommunities::new(vec![replacement]).apply(&mut route);
+
+        assert_eq!(route.communities, vec![replacement]);
+        assert!(
+            !route.communities.contains(&Community::NO_EXPORT),
+            "RFC 8642: this project's documented \"set\" behavior does not \
+             preserve well-known communities"
+        );
+        assert!(!route.communities.contains(&Community::NO_ADVERTISE));
+    }
+
     #[test]
     fn test_add_large_community() {
         use pathvector_types::LargeCommunity;
