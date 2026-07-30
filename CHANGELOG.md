@@ -16,7 +16,7 @@ instead built `[code, 0x00]` placeholder pairs, deliberately omitting the
 value. Diagnostic-quality impact only — a peer could see *that* a
 capability was rejected and its code, but not *which variant* (e.g. which
 AFI/SAFI) caused it. Fixed as PR 11 of the RFC audit roadmap
-(`fix/rfc5492-unsupported-capability-notification-data`, GH PR 11).
+(`fix/rfc5492-unsupported-capability-notification-data`, GH PR #43).
 
 Made `encode_capability_value` (`message/open.rs`) `pub(crate)` and
 re-exported it, then rewrote `encode_unsupported_capabilities` to build the

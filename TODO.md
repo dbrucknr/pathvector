@@ -1014,7 +1014,7 @@ diagnostic-quality only:
   the rejection — a diagnostics/debuggability gap, not a correctness or
   security issue. See `RFC_AUDIT.md`'s RFC 5492 section.
   **Fixed 2026-07-30** (`fix/rfc5492-unsupported-capability-notification-data`,
-  GH PR 11). Fetched RFC 5492 §5 directly and checked for amending RFCs —
+  GH PR #43). Fetched RFC 5492 §5 directly and checked for amending RFCs —
   only RFC 8810 updates RFC 5492, and it only revises Capability Code IANA
   registration ranges (splitting "Private Use" into First-Come-First-Served/
   Experimental/Reserved), unrelated to error handling or the Data field.
