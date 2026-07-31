@@ -4,6 +4,39 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-30 (RFC 5492 Unsupported Capability NOTIFICATION Data field)
+
+### [pathvector-session] NOTIFICATION Data field for a rejected capability encoded only the code, not the full TLV
+
+RFC 5492 §5 requires each capability in an Unsupported Capability
+NOTIFICATION's Data field to be "encoded in the same way as it would be
+encoded in the OPEN message" — the full `code(1) + length(1) + value`
+TLV. `encode_unsupported_capabilities` (`pathvector-session/src/fsm/mod.rs`)
+instead built `[code, 0x00]` placeholder pairs, deliberately omitting the
+value. Diagnostic-quality impact only — a peer could see *that* a
+capability was rejected and its code, but not *which variant* (e.g. which
+AFI/SAFI) caused it. Fixed as PR 11 of the RFC audit roadmap
+(`fix/rfc5492-unsupported-capability-notification-data`, GH PR #43).
+
+Made `encode_capability_value` (`message/open.rs`) `pub(crate)` and
+re-exported it, then rewrote `encode_unsupported_capabilities` to build the
+real TLV using that same encoder the OPEN message path already uses —
+guaranteeing the two can't drift apart. Checked RFC 8810 (the only RFC
+updating RFC 5492) for relevance — it only revises Capability Code IANA
+registration ranges, unrelated to error handling.
+
+Added a new test using `MultiProtocol(IPv6 unicast)` rather than the
+existing test's `RouteRefresh`, since `RouteRefresh`'s capability value is
+empty and can't distinguish the old placeholder encoding from the correct
+one. Real-teeth verified: confirmed the new test failed against the
+pre-fix code (`[1, 0]` vs expected `[1, 4, 0, 2, 0, 1]`), confirmed it
+passed after the fix, then reverted just the encoder function and
+confirmed the identical failure reappeared before restoring. Full
+`cargo test -p pathvector-session` (329 unit + 16 integration + 2
+doctests) and clippy clean.
+
+---
+
 ## 2026-07-30 (RFC 1997 well-known community enforcement)
 
 ### [pathvector-rib, pathvectord] NO_EXPORT/NO_ADVERTISE/NO_EXPORT_SUBCONFED were defined and decodable but never enforced in outbound propagation

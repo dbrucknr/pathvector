@@ -13,6 +13,7 @@ pub use notification::{
     CeaseError, MsgHeaderError, NotificationError, NotificationMessage, OpenMsgError,
     UpdateMsgError, decode_shutdown_message, encode_shutdown_message,
 };
+pub(crate) use open::encode_capability_value;
 pub use open::{Capability, GracefulRestartFamily, OpenMessage};
 pub use route_refresh::{RouteRefreshMessage, RouteRefreshSubtype};
 pub use update::{

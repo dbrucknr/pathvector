@@ -195,7 +195,7 @@ fn encode_capabilities(caps: &[Capability]) -> Vec<u8> {
     out.finish()
 }
 
-fn encode_capability_value(cap: &Capability) -> Vec<u8> {
+pub(crate) fn encode_capability_value(cap: &Capability) -> Vec<u8> {
     let mut v = Writer::new();
     match cap {
         Capability::MultiProtocol(afi_safi) => {
