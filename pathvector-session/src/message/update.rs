@@ -191,7 +191,14 @@ pub struct UpdateMessage {
 }
 
 impl UpdateMessage {
-    pub(super) fn decode(cur: &mut Cursor<'_>) -> Result<UpdateDecodeOutcome, CodecError> {
+    /// `four_byte_asn` reflects whether RFC 6793's 4-octet AS number
+    /// capability was negotiated bilaterally with this peer (advertised to
+    /// *and* received from them) — it governs AGGREGATOR's expected length
+    /// per RFC 7606 §7.7 (see `decode_attr_value`).
+    pub(super) fn decode(
+        cur: &mut Cursor<'_>,
+        four_byte_asn: bool,
+    ) -> Result<UpdateDecodeOutcome, CodecError> {
         // Withdrawn routes — structural error → session reset.
         let withdrawn_len = cur.read_u16()? as usize;
         let mut wd_cur = cur.fork(withdrawn_len)?;
@@ -201,7 +208,7 @@ impl UpdateMessage {
         // per-attribute errors collected for RFC 7606 handling.
         let attrs_len = cur.read_u16()? as usize;
         let mut attrs_cur = cur.fork(attrs_len)?;
-        let (attributes, attr_errors) = decode_path_attributes(&mut attrs_cur)?;
+        let (attributes, attr_errors) = decode_path_attributes(&mut attrs_cur, four_byte_asn)?;
 
         // Announced NLRIs — structural error → session reset.
         let announced = decode_nlri_list_v4(cur)?;
@@ -339,6 +346,7 @@ fn encode_nlri_list_v4(nlris: &[Nlri<Ipv4Addr>]) -> Vec<u8> {
 /// first occurrence is kept, later ones are dropped with no error at all.
 fn decode_path_attributes(
     cur: &mut Cursor<'_>,
+    four_byte_asn: bool,
 ) -> Result<(Vec<PathAttribute>, Vec<AttributeDecodeError>), CodecError> {
     let mut attrs = Vec::new();
     let mut errors: Vec<AttributeDecodeError> = Vec::new();
@@ -408,7 +416,7 @@ fn decode_path_attributes(
             }
         }
 
-        match decode_attr_value(flags, type_code, &mut val) {
+        match decode_attr_value(flags, type_code, &mut val, four_byte_asn) {
             Ok(attr) => attrs.push(attr),
             Err(e) => errors.push(AttributeDecodeError {
                 type_code,
@@ -426,6 +434,7 @@ fn decode_attr_value(
     flags: u8,
     type_code: u8,
     cur: &mut Cursor<'_>,
+    four_byte_asn: bool,
 ) -> Result<PathAttribute, CodecError> {
     match type_code {
         ATTR_ORIGIN => {
@@ -500,15 +509,31 @@ fn decode_attr_value(
         }
 
         ATTR_AGGREGATOR => {
-            if cur.remaining() < 8 {
-                return Err(CodecError::InvalidAttribute {
-                    type_code,
-                    detail: "AGGREGATOR must be 8 bytes (4-byte ASN mode)",
-                });
+            // RFC 7606 §7.7: malformed if length != 6 when the 4-octet AS
+            // number capability is *not* negotiated bilaterally with this
+            // peer, or != 8 when it *is* (both advertised to and received
+            // from the peer — RFC 6793).
+            if four_byte_asn {
+                if cur.remaining() != 8 {
+                    return Err(CodecError::InvalidAttribute {
+                        type_code,
+                        detail: "AGGREGATOR must be 8 bytes (4-byte ASN mode)",
+                    });
+                }
+                let asn = Asn::new(cur.read_u32()?);
+                let ip = cur.read_ipv4addr()?;
+                Ok(PathAttribute::Aggregator(Aggregator::new(asn, ip)))
+            } else {
+                if cur.remaining() != 6 {
+                    return Err(CodecError::InvalidAttribute {
+                        type_code,
+                        detail: "AGGREGATOR must be 6 bytes (2-byte ASN mode)",
+                    });
+                }
+                let asn = Asn::new(u32::from(cur.read_u16()?));
+                let ip = cur.read_ipv4addr()?;
+                Ok(PathAttribute::Aggregator(Aggregator::new(asn, ip)))
             }
-            let asn = Asn::new(cur.read_u32()?);
-            let ip = cur.read_ipv4addr()?;
-            Ok(PathAttribute::Aggregator(Aggregator::new(asn, ip)))
         }
 
         ATTR_COMMUNITY => {
@@ -1068,7 +1093,7 @@ mod tests {
         let encoded = msg.encode();
         let mut cur = Cursor::new(&encoded[19..]);
         assert_eq!(
-            UpdateMessage::decode(&mut cur).unwrap(),
+            UpdateMessage::decode(&mut cur, true).unwrap(),
             UpdateDecodeOutcome::Clean(msg)
         );
     }
@@ -1251,7 +1276,7 @@ mod tests {
         let encoded = msg.encode();
         let mut cur = Cursor::new(&encoded[19..]);
         assert_eq!(
-            UpdateMessage::decode(&mut cur).unwrap(),
+            UpdateMessage::decode(&mut cur, true).unwrap(),
             UpdateDecodeOutcome::Clean(UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![PathAttribute::Unknown {
@@ -1451,8 +1476,18 @@ mod tests {
     // ── Raw-byte decode helpers ───────────────────────────────────────────────
 
     fn decode_raw(body: &[u8]) -> Result<UpdateDecodeOutcome, CodecError> {
+        decode_raw_with_four_byte_asn(body, true)
+    }
+
+    /// Like `decode_raw`, but lets the caller control whether the 4-octet AS
+    /// number capability is treated as negotiated with the peer — needed for
+    /// the AGGREGATOR length tests (RFC 7606 §7.7).
+    fn decode_raw_with_four_byte_asn(
+        body: &[u8],
+        four_byte_asn: bool,
+    ) -> Result<UpdateDecodeOutcome, CodecError> {
         let mut cur = Cursor::new(body);
-        UpdateMessage::decode(&mut cur)
+        UpdateMessage::decode(&mut cur, four_byte_asn)
     }
 
     /// Build an UPDATE body: no withdrawn routes, one path attribute (short len).
@@ -1676,6 +1711,81 @@ mod tests {
         let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &[0u8; 7]); // needs 8
         assert_eq!(
             decode_raw(&body).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AGGREGATOR,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "AGGREGATOR must be 8 bytes (4-byte ASN mode)",
+                }],
+                treat_as_withdraw: false,
+                session_reset: false,
+            }
+        );
+    }
+
+    // ── RFC 7606 §7.7: AGGREGATOR length depends on negotiated 4-octet AS
+    // number capability (RFC 6793), not a fixed 8 bytes ────────────────────────
+
+    #[test]
+    fn test_aggregator_6_bytes_valid_in_two_byte_asn_mode() {
+        // 2-byte ASN (0x1234) + IPv4 router-id (10.0.0.1).
+        let value: [u8; 6] = [0x12, 0x34, 10, 0, 0, 1];
+        let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &value);
+        assert_eq!(
+            decode_raw_with_four_byte_asn(&body, false).unwrap(),
+            UpdateDecodeOutcome::Clean(UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![PathAttribute::Aggregator(Aggregator::new(
+                    Asn::new(0x1234),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                ))],
+                announced: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn test_aggregator_8_bytes_malformed_in_two_byte_asn_mode() {
+        // A full 8-byte (4-byte ASN) AGGREGATOR is malformed when the
+        // 4-octet AS number capability was NOT negotiated bilaterally with
+        // this peer — RFC 7606 §7.7 requires exactly 6 bytes in that case.
+        // Under the old unconditional "expect >= 8 bytes" check this value
+        // would have been silently accepted regardless of capability state.
+        let value: [u8; 8] = [0, 0, 0x12, 0x34, 10, 0, 0, 1];
+        let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &value);
+        assert_eq!(
+            decode_raw_with_four_byte_asn(&body, false).unwrap(),
+            UpdateDecodeOutcome::Partial {
+                update: UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![],
+                    announced: vec![]
+                },
+                errors: vec![AttributeDecodeError {
+                    type_code: ATTR_AGGREGATOR,
+                    policy: AttributeErrorPolicy::AttributeDiscard,
+                    detail: "AGGREGATOR must be 6 bytes (2-byte ASN mode)",
+                }],
+                treat_as_withdraw: false,
+                session_reset: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_aggregator_6_bytes_malformed_in_four_byte_asn_mode() {
+        // A 6-byte (2-byte ASN) AGGREGATOR is malformed when the 4-octet AS
+        // number capability WAS negotiated bilaterally — RFC 7606 §7.7
+        // requires exactly 8 bytes in that case.
+        let value: [u8; 6] = [0x12, 0x34, 10, 0, 0, 1];
+        let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &value);
+        assert_eq!(
+            decode_raw_with_four_byte_asn(&body, true).unwrap(),
             UpdateDecodeOutcome::Partial {
                 update: UpdateMessage {
                     withdrawn: vec![],
@@ -2244,7 +2354,7 @@ mod tests {
         msg.extend_from_slice(attr);
 
         let mut cur = Cursor::new(&msg[19..]);
-        let result = UpdateMessage::decode(&mut cur);
+        let result = UpdateMessage::decode(&mut cur, true);
         assert!(
             result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
             "ORIGINATOR_ID with 3-byte value must be an error or partial decode"
@@ -2272,7 +2382,7 @@ mod tests {
         msg.extend_from_slice(attr);
 
         let mut cur = Cursor::new(&msg[19..]);
-        let result = UpdateMessage::decode(&mut cur);
+        let result = UpdateMessage::decode(&mut cur, true);
         assert!(
             result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
             "CLUSTER_LIST with a length not a multiple of 4 must be an error or partial decode"
@@ -2584,7 +2694,7 @@ mod prop_tests {
         fn prop_withdraw_only_update_roundtrip(msg in arb_withdraw_only_update()) {
             let encoded = msg.encode();
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur)
+            let decoded = UpdateMessage::decode(&mut cur, true)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2594,7 +2704,7 @@ mod prop_tests {
         fn prop_announce_update_roundtrip(msg in arb_announce_update()) {
             let encoded = msg.encode();
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur)
+            let decoded = UpdateMessage::decode(&mut cur, true)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2604,7 +2714,7 @@ mod prop_tests {
         fn prop_encode_is_idempotent(msg in arb_announce_update()) {
             let first = msg.encode();
             let mut cur = Cursor::new(&first[19..]);
-            let roundtripped = match UpdateMessage::decode(&mut cur).unwrap() {
+            let roundtripped = match UpdateMessage::decode(&mut cur, true).unwrap() {
                 UpdateDecodeOutcome::Clean(m) => m,
                 UpdateDecodeOutcome::Partial { .. } => panic!("expected Clean, got Partial"),
             };
@@ -2629,7 +2739,7 @@ mod prop_tests {
             };
             let encoded = msg.encode();
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur)
+            let decoded = UpdateMessage::decode(&mut cur, true)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2651,7 +2761,7 @@ mod prop_tests {
             };
             let encoded = msg.encode();
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur)
+            let decoded = UpdateMessage::decode(&mut cur, true)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2718,7 +2828,7 @@ mod prop_tests {
 
     fn decode_outcome(body: &[u8]) -> UpdateDecodeOutcome {
         let mut cur = Cursor::new(body);
-        UpdateMessage::decode(&mut cur).expect("structural decode error")
+        UpdateMessage::decode(&mut cur, true).expect("structural decode error")
     }
 
     proptest! {

@@ -4,6 +4,64 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-31 (RFC 7606 §7.7 AGGREGATOR capability-dependent length)
+
+### [pathvector-session] AGGREGATOR decode always expected 8 bytes, ignoring whether the 4-octet AS number capability was actually negotiated
+
+RFC 7606 §7.7 requires AGGREGATOR's expected length to depend on whether
+RFC 6793's 4-octet AS number capability was negotiated bilaterally with
+the peer: 6 bytes (2-byte ASN) if not, 8 bytes (4-byte ASN) if so.
+`decode_attr_value`'s `ATTR_AGGREGATOR` arm unconditionally required 8
+bytes, with no capability awareness at all — a legitimate 6-byte
+AGGREGATOR from a 2-byte-ASN-only peer was silently discarded as
+malformed. Low-severity (completeness, not correctness — the *outcome*,
+discard, happened to coincidentally match what RFC 7606 wants for a
+genuinely malformed AGGREGATOR), deliberately deferred out of the earlier
+attribute-flags/OTC cluster (PR 4) as "PR 4b" since it needed
+capability-threading into the decoder, an architecture change. Fixed as
+PR 4b (`fix/rfc7606-aggregator-capability-length`).
+
+Threaded a `four_byte_asn: bool` through the exact chain scoped in the
+original deferral: `decode_attr_value` → `decode_path_attributes` →
+`UpdateMessage::decode` → a new `BgpMessage::decode_with_limit_and_caps`
+(`pub(crate)`), while leaving the widely-used `BgpMessage::decode`/
+`decode_with_limit` entry points unchanged (defaulting to `true`,
+preserving ~18 existing call sites across `pathvector-mrt`, benches, and
+proptests with no session context). `BgpCodec` gained a
+`four_byte_asn_negotiated` field and `set_four_byte_asn()` setter
+mirroring the existing RFC 8654 `set_extended_message()` pattern; the
+transport layer computes the bilateral negotiation
+(`peer_capabilities.contains(FourByteAsn) && local
+config.capabilities.contains(FourByteAsn)`) the same way it already does
+for `ExtendedMessage`, and calls it from `SessionEstablished` alongside
+the existing call.
+
+3 new tests cover both directions of the capability check, plus the
+actual completeness fix (a legitimate 6-byte AGGREGATOR from a 2-byte
+peer now decodes successfully instead of being discarded). Real-teeth
+verified: confirmed the relevant tests failed against the pre-fix
+unconditional-8-byte code, confirmed all passed after the fix, then
+reverted just the `ATTR_AGGREGATOR` decode arm and confirmed the
+identical failures reappeared before restoring. Also fixed a related
+issue the change itself exposed: `BgpCodec::new()`'s default needed to
+be `true`, not `false`, to stay consistent with `encode_path_attributes`'s
+own unconditional 8-byte AGGREGATOR encoding — otherwise generic
+`BgpCodec` round-trip proptests (which don't simulate real capability
+negotiation) failed.
+
+A Codex review of GH PR #44 raised a non-blocking coverage suggestion (no
+code issues found): the decoder-level tests above proved both length
+modes in isolation but not that `SessionEstablished`'s negotiation
+actually reaches `BgpCodec` in production. Added two real-TCP integration
+tests to `tests/transport.rs` driving a genuine loopback session through
+`spawn()` (not `MockTransport`, which bypasses the codec), writing
+hand-crafted raw UPDATE bytes directly to the socket since the encoder
+can't produce a 6-byte AGGREGATOR. Real-teeth verified: temporarily
+removed just the `set_four_byte_asn` call from `SessionEstablished`,
+confirmed the "not negotiated" integration test failed, then restored.
+
+---
+
 ## 2026-07-30 (RFC 5492 Unsupported Capability NOTIFICATION Data field)
 
 ### [pathvector-session] NOTIFICATION Data field for a rejected capability encoded only the code, not the full TLV

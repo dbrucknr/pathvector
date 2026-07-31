@@ -998,6 +998,82 @@ below, which deserved prompt attention):
   negotiated FourByteAsn capability into the decoder, an architecture
   change bundled separately from the rest of this attribute-flags/OTC/
   too-long-truncation cluster (PR 4).
+  **Fixed 2026-07-31** (`fix/rfc7606-aggregator-capability-length`, PR 4b).
+  Fetched RFC 7606 §7.7 directly: AGGREGATOR is malformed if its length
+  is not 6 "when the 4-octet AS number capability is not advertised to
+  or not received from the peer" or not 8 "when... both advertised to
+  and received from the peer" — a bilateral negotiation check, the same
+  shape as the existing `ExtendedMessage`/RFC 8654 negotiation already
+  computed in `transport/mod.rs`'s `SessionEstablished` handler. Threaded
+  a `four_byte_asn: bool` parameter through the exact chain named in this
+  item's own scoping note — `decode_attr_value` → `decode_path_attributes`
+  → `UpdateMessage::decode` → a new `BgpMessage::decode_with_limit_and_caps`
+  (`pub(crate)`) — while leaving the widely-used, context-free
+  `BgpMessage::decode`/`decode_with_limit` entry points unchanged
+  (defaulting to `true`, preserving all ~18 existing call sites across
+  `pathvector-mrt`, benches, and proptests that have no session/capability
+  context). `BgpCodec` (`framing/mod.rs`) gained a `four_byte_asn_negotiated`
+  field and `set_four_byte_asn()` setter mirroring the existing
+  `set_extended_message()` pattern exactly; `BgpCodec::new()` defaults it
+  to `true` to match `encode_path_attributes`'s own unconditional 8-byte
+  AGGREGATOR encoding (encode-side capability-downgrade for AGGREGATOR is
+  a separate, still-unaddressed gap — out of scope here, matching this
+  item's original scoping). `BgpTransport` trait gained a matching
+  `set_four_byte_asn()` (default no-op), implemented for the real
+  `FramedBgpTransport` and called from `SessionEstablished` alongside the
+  existing `set_extended_message()` call, computed as
+  `peer_capabilities.contains(FourByteAsn) && local
+  config.capabilities.contains(FourByteAsn)` (via `.iter().any(|c|
+  matches!(c, Capability::FourByteAsn(_)))`, since the capability carries
+  a value). Added 3 new tests: `test_aggregator_6_bytes_valid_in_two_byte_asn_mode`
+  (a legitimate 6-byte AGGREGATOR from a 2-byte-ASN-only peer now decodes
+  successfully instead of being discarded — the actual completeness gap
+  this item was about), `test_aggregator_8_bytes_malformed_in_two_byte_asn_mode`
+  (an 8-byte AGGREGATOR is correctly rejected when NOT negotiated — under
+  the old unconditional `>= 8 bytes` check this would have been silently
+  accepted regardless of capability state), and
+  `test_aggregator_6_bytes_malformed_in_four_byte_asn_mode` (the reverse
+  direction). **Real-teeth verified**: confirmed both of the first two
+  tests failed against the pre-fix (unconditional-8-byte) code with the
+  expected mismatches, confirmed all 3 passed after the fix, then
+  mechanically reverted just the `ATTR_AGGREGATOR` decode arm and
+  confirmed the identical 2 failures reappeared before restoring. Also
+  caught and fixed a related bug the fix itself exposed: `framing/prop_tests.rs`'s
+  generic `BgpCodec`-based round-trip proptests (which construct
+  arbitrary `BgpMessage` values and don't simulate real capability
+  negotiation) failed once `BgpCodec::new()` defaulted
+  `four_byte_asn_negotiated` to `false`, because `encode_path_attributes`
+  always emits the 8-byte/4-byte-ASN form — fixed by defaulting the new
+  codec field to `true` instead, documented in `BgpCodec::new()`'s doc
+  comment. Full `cargo test -p pathvector-session` (332 unit + 16
+  integration + 2 doctests) and `cargo check --workspace --exclude
+  pathvector-e2e --all-targets` both clean afterward.
+  **Codex review follow-up on GH PR #44** (non-blocking coverage
+  suggestion, no code issues found): the decoder-level tests above prove
+  both RFC 7606 §7.7 length modes in isolation, but nothing proved the
+  actual *production wiring* — that `SessionEstablished`'s bilateral
+  negotiation check really does reach `BgpCodec` through
+  `BgpTransport::set_four_byte_asn` and changes real decode behavior.
+  Added two real-TCP integration tests to `pathvector-session/tests/transport.rs`:
+  `test_aggregator_decoding_when_four_byte_asn_negotiated_bilaterally`
+  (both sides advertise `FourByteAsn`; an 8-byte AGGREGATOR is accepted, a
+  6-byte one discarded) and `test_aggregator_decoding_when_four_byte_asn_not_negotiated`
+  (peer OPEN omits `FourByteAsn`; a 6-byte AGGREGATOR is accepted, an
+  8-byte one discarded). Both drive a genuine loopback TCP session through
+  `spawn()`/real `BgpCodec` (not `MockTransport`, which bypasses the codec
+  entirely) and write hand-crafted raw UPDATE bytes directly to the socket
+  after `into_inner()` — necessary because `BgpMessage::encode()` always
+  emits AGGREGATOR in its 8-byte form unconditionally, so the normal
+  encoder can't produce the 6-byte wire form these tests need to send.
+  **Real-teeth verified**: temporarily removed just the
+  `t.set_four_byte_asn(four_byte_asn)` call from `SessionEstablished`'s
+  handler (simulating "the wiring was never added"), confirmed
+  `test_aggregator_decoding_when_four_byte_asn_not_negotiated` failed with
+  `got []` where an accepted 6-byte AGGREGATOR was expected (the
+  bilaterally-negotiated test stayed green by coincidence, since the
+  codec's default happens to match that scenario) — then restored and
+  confirmed both pass. Full `cargo test -p pathvector-session` (332 unit +
+  18 integration + 2 doctests) and clippy clean afterward.
 
 **20. RFC 5492 (Capabilities Advertisement) gap found by systematic clause
 audit** — found 2026-07-16 (diagnostic only, not fixed here). Low severity,

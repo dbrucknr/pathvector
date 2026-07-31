@@ -14,7 +14,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
-    UpdateMessage,
+    PathAttribute, UpdateMessage,
 };
 use pathvector_session::transport::{
     DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
@@ -1051,4 +1051,226 @@ async fn test_incoming_connection_unknown_peer_id_defers_then_resolves_on_match(
 
     outbound_peer.abort();
     incoming_peer.abort();
+}
+
+// ── RFC 7606 §7.7: AGGREGATOR length vs. real bilateral capability negotiation
+//
+// The decoder-level unit tests in `message/update.rs` prove both length modes
+// in isolation. These integration tests instead prove the full production
+// chain: peer/local OPEN capabilities -> FSM negotiation ->
+// `SessionEstablished` -> `BgpTransport::set_four_byte_asn` ->
+// `BgpCodec`'s actual decode behavior over a real TCP connection — not just
+// that the right boolean is computed somewhere in isolation.
+
+/// Build a complete, framed raw UPDATE message (19-byte header + body) with
+/// no withdrawn routes or NLRI and exactly one path attribute. Written
+/// directly to the raw TCP stream rather than via `BgpMessage::encode`,
+/// because the encoder always emits AGGREGATOR in its 8-byte, 4-byte-ASN
+/// form unconditionally (encode-side capability-downgrade is a separate,
+/// unaddressed gap) — it can't produce the 6-byte wire form these tests need
+/// to send.
+fn raw_update_with_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
+    let attr_total = 3 + value.len(); // flags(1) + type(1) + len(1) + value
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len = 0
+    body.extend_from_slice(&u16::try_from(attr_total).unwrap().to_be_bytes());
+    body.push(flags);
+    body.push(type_code);
+    body.push(u8::try_from(value.len()).unwrap());
+    body.extend_from_slice(value);
+    // No announced NLRI.
+
+    let mut frame = vec![0xFFu8; 16]; // all-ones marker
+    let total_len = 19 + body.len();
+    frame.extend_from_slice(&u16::try_from(total_len).unwrap().to_be_bytes());
+    frame.push(2); // MessageType::Update
+    frame.extend_from_slice(&body);
+    frame
+}
+
+const FLAGS_OPTIONAL_TRANSITIVE: u8 = 0xC0;
+const ATTR_TYPE_AGGREGATOR: u8 = 7;
+
+fn aggregator_value_4byte_asn(asn: u32, ip: [u8; 4]) -> Vec<u8> {
+    let mut v = asn.to_be_bytes().to_vec();
+    v.extend_from_slice(&ip);
+    v
+}
+
+fn aggregator_value_2byte_asn(asn: u16, ip: [u8; 4]) -> Vec<u8> {
+    let mut v = asn.to_be_bytes().to_vec();
+    v.extend_from_slice(&ip);
+    v
+}
+
+fn expect_update_attributes(event: SessionEvent) -> Vec<PathAttribute> {
+    let SessionEvent::RouteUpdate(u) = event else {
+        panic!("expected RouteUpdate, got {event:?}")
+    };
+    u.attributes
+}
+
+#[tokio::test]
+async fn test_aggregator_decoding_when_four_byte_asn_negotiated_bilaterally() {
+    // `local_config`/`peer_open` (this file's defaults) both advertise
+    // FourByteAsn — RFC 7606 §7.7 requires an 8-byte AGGREGATOR to be
+    // accepted and a 6-byte one to be discarded in this mode.
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (reader, writer) = accept_and_handshake(listener).await;
+        let mut raw_writer = writer.into_inner();
+
+        let value8 = aggregator_value_4byte_asn(0x1234_5678, [10, 0, 0, 1]);
+        raw_writer
+            .write_all(&raw_update_with_attr(
+                FLAGS_OPTIONAL_TRANSITIVE,
+                ATTR_TYPE_AGGREGATOR,
+                &value8,
+            ))
+            .await
+            .unwrap();
+
+        let value6 = aggregator_value_2byte_asn(0x1234, [10, 0, 0, 2]);
+        raw_writer
+            .write_all(&raw_update_with_attr(
+                FLAGS_OPTIONAL_TRANSITIVE,
+                ATTR_TYPE_AGGREGATOR,
+                &value6,
+            ))
+            .await
+            .unwrap();
+
+        drop(reader);
+        std::future::pending::<()>().await;
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for RouteUpdate for the 8-byte AGGREGATOR")
+        .expect("session exited");
+    let attrs = expect_update_attributes(event);
+    assert!(
+        attrs
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Aggregator(_))),
+        "an 8-byte AGGREGATOR must be accepted when FourByteAsn is negotiated \
+         bilaterally, got {attrs:?}"
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for RouteUpdate for the 6-byte AGGREGATOR")
+        .expect("session exited");
+    let attrs = expect_update_attributes(event);
+    assert!(
+        !attrs
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Aggregator(_))),
+        "a 6-byte AGGREGATOR must be discarded when FourByteAsn is negotiated \
+         bilaterally, got {attrs:?}"
+    );
+
+    peer.abort();
+}
+
+#[tokio::test]
+async fn test_aggregator_decoding_when_four_byte_asn_not_negotiated() {
+    // Peer OPEN deliberately omits FourByteAsn -> bilateral negotiation
+    // fails, even though the local side advertises it. RFC 7606 §7.7
+    // requires a 6-byte AGGREGATOR to be accepted and an 8-byte one to be
+    // discarded in this mode.
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = FramedRead::new(r, BgpCodec::new());
+        let mut writer = FramedWrite::new(w, BgpCodec::new());
+
+        let _ = reader.next().await.unwrap().unwrap(); // local OPEN
+
+        let peer_open_no_four_byte_asn = BgpMessage::Open(OpenMessage {
+            version: 4,
+            my_as: 65002,
+            hold_time: 90,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+            capabilities: vec![],
+        });
+        writer.send(peer_open_no_four_byte_asn).await.unwrap();
+
+        let _ = reader.next().await.unwrap().unwrap(); // local KEEPALIVE
+        writer.send(BgpMessage::Keepalive).await.unwrap();
+
+        let mut raw_writer = writer.into_inner();
+
+        let value6 = aggregator_value_2byte_asn(0x1234, [10, 0, 0, 1]);
+        raw_writer
+            .write_all(&raw_update_with_attr(
+                FLAGS_OPTIONAL_TRANSITIVE,
+                ATTR_TYPE_AGGREGATOR,
+                &value6,
+            ))
+            .await
+            .unwrap();
+
+        let value8 = aggregator_value_4byte_asn(0x1234_5678, [10, 0, 0, 2]);
+        raw_writer
+            .write_all(&raw_update_with_attr(
+                FLAGS_OPTIONAL_TRANSITIVE,
+                ATTR_TYPE_AGGREGATOR,
+                &value8,
+            ))
+            .await
+            .unwrap();
+
+        drop(reader);
+        std::future::pending::<()>().await;
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for RouteUpdate for the 6-byte AGGREGATOR")
+        .expect("session exited");
+    let attrs = expect_update_attributes(event);
+    assert!(
+        attrs
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Aggregator(_))),
+        "a 6-byte AGGREGATOR must be accepted when FourByteAsn is NOT \
+         negotiated bilaterally, got {attrs:?}"
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for RouteUpdate for the 8-byte AGGREGATOR")
+        .expect("session exited");
+    let attrs = expect_update_attributes(event);
+    assert!(
+        !attrs
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Aggregator(_))),
+        "an 8-byte AGGREGATOR must be discarded when FourByteAsn is NOT \
+         negotiated bilaterally, got {attrs:?}"
+    );
+
+    peer.abort();
 }

@@ -88,14 +88,24 @@ impl From<CodecError> for FramingError {
 /// ```
 pub struct BgpCodec {
     max_msg_len: usize,
+    four_byte_asn_negotiated: bool,
 }
 
 impl BgpCodec {
     /// Create a codec with the default RFC 4271 4096-byte limit.
+    ///
+    /// Defaults to assuming the 4-octet AS number capability (RFC 6793) is
+    /// negotiated, matching this codec's own `encode` behavior — which
+    /// always emits AGGREGATOR in the 8-byte, 4-byte-ASN form regardless of
+    /// peer capabilities (encode-side capability-downgrade is a separate,
+    /// not-yet-implemented gap; see `TODO.md`). Call
+    /// [`Self::set_four_byte_asn`] once real negotiation completes to
+    /// reflect the peer's actual capabilities on the decode side.
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_msg_len: MAX_LEN,
+            four_byte_asn_negotiated: true,
         }
     }
 
@@ -103,6 +113,14 @@ impl BgpCodec {
     /// Call this after Extended Message capability is negotiated by both peers.
     pub fn set_extended_message(&mut self, enabled: bool) {
         self.max_msg_len = if enabled { MAX_LEN_EXTENDED } else { MAX_LEN };
+    }
+
+    /// Record whether RFC 6793's 4-octet AS number capability was negotiated
+    /// bilaterally with the peer (advertised to *and* received from them).
+    /// Governs AGGREGATOR's expected length per RFC 7606 §7.7. Call this
+    /// after capability negotiation completes (i.e. once Established).
+    pub fn set_four_byte_asn(&mut self, negotiated: bool) {
+        self.four_byte_asn_negotiated = negotiated;
     }
 }
 
@@ -138,7 +156,11 @@ impl Decoder for BgpCodec {
         }
 
         let frame = src.split_to(msg_len);
-        Ok(Some(BgpMessage::decode(&frame)?))
+        Ok(Some(BgpMessage::decode_with_limit_and_caps(
+            &frame,
+            self.max_msg_len,
+            self.four_byte_asn_negotiated,
+        )?))
     }
 }
 
