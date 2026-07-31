@@ -171,6 +171,10 @@ pub trait BgpTransport: Send + 'static {
     /// Raise (or lower) the message size limit after Extended Message capability
     /// (RFC 8654) is negotiated. Default implementation is a no-op.
     fn set_extended_message(&mut self, _enabled: bool) {}
+    /// Record whether RFC 6793's 4-octet AS number capability was negotiated
+    /// bilaterally with the peer, governing AGGREGATOR's expected length
+    /// (RFC 7606 §7.7). Default implementation is a no-op.
+    fn set_four_byte_asn(&mut self, _negotiated: bool) {}
 }
 
 // ── Production transport impl ─────────────────────────────────────────────────
@@ -202,6 +206,10 @@ impl BgpTransport for FramedBgpTransport {
 
     fn set_extended_message(&mut self, enabled: bool) {
         self.reader.decoder_mut().set_extended_message(enabled);
+    }
+
+    fn set_four_byte_asn(&mut self, negotiated: bool) {
+        self.reader.decoder_mut().set_four_byte_asn(negotiated);
     }
 }
 
@@ -1338,8 +1346,22 @@ impl<T: BgpTransport> Session<T> {
                             .config
                             .capabilities
                             .contains(&Capability::ExtendedMessage);
+                    // RFC 7606 §7.7 / RFC 6793: AGGREGATOR's expected length
+                    // depends on whether the 4-octet AS number capability was
+                    // negotiated bilaterally — advertised to *and* received
+                    // from the peer, not just one direction.
+                    let four_byte_asn = info
+                        .peer_capabilities
+                        .iter()
+                        .any(|c| matches!(c, Capability::FourByteAsn(_)))
+                        && self
+                            .config
+                            .capabilities
+                            .iter()
+                            .any(|c| matches!(c, Capability::FourByteAsn(_)));
                     if let Some(t) = &mut self.transport {
                         t.set_extended_message(extended);
+                        t.set_four_byte_asn(four_byte_asn);
                     }
                     info.local_addr = self.local_addr;
                     let _ = self.event_tx.send(SessionEvent::Established(info)).await;

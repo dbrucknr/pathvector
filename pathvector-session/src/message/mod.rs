@@ -219,6 +219,29 @@ impl BgpMessage {
     /// range or exceeds `max_len`, the type is unknown, or any field within
     /// the body is malformed.
     pub fn decode_with_limit(buf: &[u8], max_len: usize) -> Result<Self, CodecError> {
+        // Defaults to `true` (assume the 4-octet AS number capability is
+        // negotiated) to preserve this method's existing behavior for
+        // callers with no session/capability context (tests, fuzzing,
+        // `pathvector-mrt`). The framing layer's `BgpCodec`, which decodes
+        // messages for a real, capability-negotiated session, calls
+        // `decode_with_limit_and_caps` directly instead.
+        Self::decode_with_limit_and_caps(buf, max_len, true)
+    }
+
+    /// Like [`Self::decode_with_limit`], but `four_byte_asn` explicitly
+    /// states whether RFC 6793's 4-octet AS number capability was
+    /// negotiated bilaterally with the peer (advertised to *and* received
+    /// from them) — this governs AGGREGATOR's expected length per RFC 7606
+    /// §7.7 (6 bytes vs. 8 bytes).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::decode_with_limit`].
+    pub(crate) fn decode_with_limit_and_caps(
+        buf: &[u8],
+        max_len: usize,
+        four_byte_asn: bool,
+    ) -> Result<Self, CodecError> {
         let mut cur = Cursor::new(buf);
         let (msg_type, total_len) = decode_header(&mut cur, max_len)?;
 
@@ -229,7 +252,7 @@ impl BgpMessage {
         // cur is now positioned at the body (total_len - HEADER_LEN bytes remain).
         match msg_type {
             MsgType::Open => Ok(Self::Open(OpenMessage::decode(&mut cur)?)),
-            MsgType::Update => match UpdateMessage::decode(&mut cur)? {
+            MsgType::Update => match UpdateMessage::decode(&mut cur, four_byte_asn)? {
                 UpdateDecodeOutcome::Clean(u) => Ok(Self::Update(u)),
                 UpdateDecodeOutcome::Partial {
                     update,
