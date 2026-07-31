@@ -7,6 +7,7 @@ use pathvector_types::{
 
 use super::error::CodecError;
 use super::header::{MessageType, encode_header};
+use super::notification::{NotificationError, UpdateMsgError};
 use super::{Cursor, Writer};
 
 // ── RFC 7606 error policy types ──────────────────────────────────────────────
@@ -14,11 +15,17 @@ use super::{Cursor, Writer};
 /// RFC 7606 §2 error handling policy for a malformed path attribute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributeErrorPolicy {
-    /// The session must be reset (NOTIFICATION + teardown). Produced for a
-    /// duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI` (RFC 7606 §3(g)) — the
-    /// one per-attribute error this specification still escalates to a full
-    /// session reset rather than a route-scoped action.
-    SessionReset,
+    /// The session must be reset (NOTIFICATION + teardown), carrying the
+    /// specific `NotificationError` subcode and Data field this clause
+    /// requires. Produced for a duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI`
+    /// (RFC 7606 §3(g)) and for an unrecognized well-known attribute (RFC
+    /// 4271 §6.3, not amended by RFC 7606) — the two per-attribute errors
+    /// still escalated to a full session reset rather than a route-scoped
+    /// action.
+    SessionReset {
+        error: NotificationError,
+        data: Vec<u8>,
+    },
     /// The NLRIs in this UPDATE are treated as withdrawn; the session stays up.
     TreatAsWithdraw,
     /// The malformed attribute is silently dropped; the session and UPDATE are
@@ -227,7 +234,7 @@ impl UpdateMessage {
                 .any(|e| e.policy == AttributeErrorPolicy::TreatAsWithdraw);
             let session_reset = attr_errors
                 .iter()
-                .any(|e| e.policy == AttributeErrorPolicy::SessionReset);
+                .any(|e| matches!(e.policy, AttributeErrorPolicy::SessionReset { .. }));
             Ok(UpdateDecodeOutcome::Partial {
                 update,
                 errors: attr_errors,
@@ -373,7 +380,10 @@ fn decode_path_attributes(
                 // attribute appears more than once in the UPDATE message,
                 // then a NOTIFICATION message MUST be sent with the Error
                 // Subcode 'Malformed Attribute List'."
-                AttributeErrorPolicy::SessionReset
+                AttributeErrorPolicy::SessionReset {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+                    data: vec![],
+                }
             } else {
                 // "If any other attribute (whether recognized or
                 // unrecognized) appears more than once in an UPDATE message,
@@ -414,6 +424,39 @@ fn decode_path_attributes(
                 });
                 continue;
             }
+        } else if flags & FLAG_OPTIONAL == 0 {
+            // RFC 4271 §6.3: "If any of the well-known mandatory attributes
+            // are not recognized, then the Error Subcode MUST be set to
+            // Unrecognized Well-known Attribute. The Data field MUST
+            // contain the unrecognized attribute (type, length, and
+            // value)." Not amended by RFC 7606 — its §3 revisions are an
+            // exhaustive list (a)-(j) and never mention this subcode — so
+            // this remains a full session reset, unlike the
+            // treat-as-withdraw/discard policies RFC 7606 now assigns to
+            // most other attribute-level errors. The sender's Optional bit
+            // (not our own recognition of the type code) is what tells us
+            // whether they intended this as well-known; an unrecognized
+            // *optional* attribute (Optional bit=1) is legitimate and
+            // handled below via the ordinary `Unknown` fallback.
+            let mut data = vec![type_code];
+            if (flags & FLAG_EXT_LEN) != 0 {
+                data.extend_from_slice(&u16::try_from(len).unwrap_or(u16::MAX).to_be_bytes());
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                data.push(len as u8);
+            }
+            data.extend_from_slice(val.read_remaining());
+            errors.push(AttributeDecodeError {
+                type_code,
+                policy: AttributeErrorPolicy::SessionReset {
+                    error: NotificationError::UpdateMessage(
+                        UpdateMsgError::UnrecognizedWellKnownAttribute,
+                    ),
+                    data,
+                },
+                detail: "unrecognized well-known attribute (Optional bit not set)",
+            });
+            continue;
         }
 
         match decode_attr_value(flags, type_code, &mut val, four_byte_asn) {
@@ -2009,7 +2052,10 @@ mod tests {
             errors,
             vec![AttributeDecodeError {
                 type_code: ATTR_MP_REACH_NLRI,
-                policy: AttributeErrorPolicy::SessionReset,
+                policy: AttributeErrorPolicy::SessionReset {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+                    data: vec![],
+                },
                 detail: "duplicate attribute type code",
             }]
         );
@@ -2486,12 +2532,16 @@ mod tests {
     }
 
     #[test]
-    fn test_unrecognized_attribute_any_flags_no_conflict() {
+    fn test_unrecognized_optional_attribute_any_flags_no_conflict() {
         // Type code 200 is unrecognized by this decoder — RFC 7606 §3(c)'s
         // "specified value" language doesn't apply, since there's no
-        // specified value for a type we don't know. Any flags combination
-        // must decode cleanly (as PathAttribute::Unknown), not be flagged
-        // as a conflict.
+        // specified value for a type we don't know. With the Optional bit
+        // set (the sender genuinely claims this is an optional attribute),
+        // any Transitive-bit value must decode cleanly (as
+        // PathAttribute::Unknown), not be flagged as a conflict — see the
+        // companion `test_unrecognized_well_known_attribute_*` tests below
+        // for the opposite case (Optional bit clear), which RFC 4271 §6.3
+        // does require rejecting.
         let body = update_with_attr(FLAG_OPTIONAL, 200, &[1, 2, 3]);
         assert_eq!(
             decode_raw(&body).unwrap(),
@@ -2504,6 +2554,73 @@ mod tests {
                 }],
                 announced: vec![],
             })
+        );
+    }
+
+    // ── RFC 4271 §6.3 — unrecognized well-known attribute ─────────────────────
+
+    #[test]
+    fn test_unrecognized_well_known_attribute_is_session_reset() {
+        // Type code 210 is unrecognized by this decoder. Optional bit clear
+        // (flags=FLAG_TRANSITIVE only, i.e. the sender claims this is
+        // well-known) means RFC 4271 §6.3's "Unrecognized Well-known
+        // Attribute" applies: NOTIFICATION(UPDATE Error, subcode 2), Data =
+        // the unrecognized attribute (type, length, value) — not silent
+        // acceptance as PathAttribute::Unknown the way an unrecognized
+        // *optional* attribute is.
+        let body = update_with_attr(FLAG_TRANSITIVE, 210, &[1, 2, 3]);
+        let outcome = decode_raw(&body).unwrap();
+        let UpdateDecodeOutcome::Partial {
+            errors,
+            session_reset,
+            treat_as_withdraw,
+            ..
+        } = outcome
+        else {
+            panic!("expected Partial outcome, got {outcome:?}");
+        };
+        assert!(
+            session_reset,
+            "unrecognized well-known attribute must set session_reset"
+        );
+        assert!(!treat_as_withdraw);
+        assert_eq!(
+            errors,
+            vec![AttributeDecodeError {
+                type_code: 210,
+                policy: AttributeErrorPolicy::SessionReset {
+                    error: NotificationError::UpdateMessage(
+                        UpdateMsgError::UnrecognizedWellKnownAttribute
+                    ),
+                    data: vec![210, 3, 1, 2, 3], // type, length, value
+                },
+                detail: "unrecognized well-known attribute (Optional bit not set)",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_well_known_attribute_extended_length_data_field() {
+        // Same clause, but via the extended-length (2-byte) encoding — the
+        // Data field's length octet(s) must match how the length was
+        // actually encoded on the wire, not always collapse to 1 byte.
+        let body = update_with_ext_attr(FLAG_TRANSITIVE, 211, &[9, 9, 9, 9]);
+        let outcome = decode_raw(&body).unwrap();
+        let UpdateDecodeOutcome::Partial { errors, .. } = outcome else {
+            panic!("expected Partial outcome, got {outcome:?}");
+        };
+        assert_eq!(
+            errors,
+            vec![AttributeDecodeError {
+                type_code: 211,
+                policy: AttributeErrorPolicy::SessionReset {
+                    error: NotificationError::UpdateMessage(
+                        UpdateMsgError::UnrecognizedWellKnownAttribute
+                    ),
+                    data: vec![211, 0, 4, 9, 9, 9, 9], // type, 2-byte length, value
+                },
+                detail: "unrecognized well-known attribute (Optional bit not set)",
+            }]
         );
     }
 
