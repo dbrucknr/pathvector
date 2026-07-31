@@ -18,6 +18,9 @@ pub enum CodecError {
     InvalidOrigin(u8),
     /// A capability TLV body is too short for the declared code.
     InvalidCapability { code: u8 },
+    /// An OPEN optional parameter's Parameter Type isn't recognized (RFC
+    /// 4271 §6.2: only type 2, Capabilities, is understood).
+    UnsupportedOptionalParameter { param_type: u8 },
     /// A path attribute body does not match the expected format.
     InvalidAttribute { type_code: u8, detail: &'static str },
     /// A prefix length is invalid for its address family
@@ -39,6 +42,9 @@ impl std::fmt::Display for CodecError {
             Self::InvalidOrigin(v) => write!(f, "invalid ORIGIN value: {v} (expected 0–2)"),
             Self::InvalidCapability { code } => {
                 write!(f, "malformed capability TLV for code {code}")
+            }
+            Self::UnsupportedOptionalParameter { param_type } => {
+                write!(f, "unsupported OPEN optional parameter type: {param_type}")
             }
             Self::InvalidAttribute { type_code, detail } => {
                 write!(f, "invalid path attribute {type_code}: {detail}")

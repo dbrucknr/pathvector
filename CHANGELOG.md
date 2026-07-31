@@ -4,6 +4,58 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-07-31 (RFC 4271 §6.2/§6.3 unrecognized-parameter/attribute rejection)
+
+### [pathvector-session] Unrecognized OPEN optional parameter types and unrecognized well-known UPDATE attributes were silently accepted instead of rejected
+
+Two shovel-ready gaps left over from the original systematic clause audit
+(`RFC_AUDIT.md`, item #14 in TODO.md), both about a well-formed message
+from a technically-valid peer that a strict reading of RFC 4271 requires
+rejecting outright:
+
+- **§6.2**: `decode_capabilities` silently skipped any OPEN Optional
+  Parameter whose Parameter Type wasn't 2 (Capabilities) — a comment in
+  the code said as much. §6.2: "If one of the Optional Parameters in the
+  OPEN message is not recognized, then the Error Subcode MUST be set to
+  Unsupported Optional Parameters." Fetched RFC 5492 directly to check
+  whether it revises this (it doesn't — RFC 5492 §3 confirms this is
+  still RFC 4271's own pre-existing mechanism, and only adds a separate,
+  finer-grained subcode for an unsupported capability *inside* an
+  already-recognized Capabilities parameter). Added
+  `CodecError::UnsupportedOptionalParameter`, mapped in
+  `header_error_notification` to NOTIFICATION(OPEN Error,
+  `OpenMsgError::UnsupportedOptionalParameter`).
+- **§6.3**: `decode_attr_value`'s fallback arm treated any unrecognized
+  UPDATE attribute type code identically regardless of the Optional bit
+  — accepted as `PathAttribute::Unknown` whether the sender claimed it
+  optional or well-known. §6.3: "If any of the well-known mandatory
+  attributes are not recognized, then the Error Subcode MUST be set to
+  Unrecognized Well-known Attribute. The Data field MUST contain the
+  unrecognized attribute (type, length, and value)." Fetched RFC 7606
+  directly and confirmed its §3 revisions are an explicit, exhaustive
+  (a)-(j) list that never mentions this subcode — it remains a full
+  session reset, not treat-as-withdraw. `AttributeErrorPolicy::SessionReset`
+  widened from a unit variant to `SessionReset { error: NotificationError,
+  data: Vec<u8> }` so the pre-existing duplicated-MP_REACH_NLRI case and
+  this new case share one code path in `handle_malformed_update` instead
+  of the handler hardcoding one specific NOTIFICATION.
+
+Both existing pre-fix tests told the same story this project's testing
+discipline exists to catch: `test_unknown_opt_param_type_is_skipped`
+asserted the RFC-violating silent-skip as correct behavior by name —
+flipped to `test_unknown_opt_param_type_is_rejected`. 7 new tests added
+across both clauses (codec-level: unrecognized parameter type, the
+deprecated Authentication type-1 parameter, an unrecognized parameter
+after valid capabilities; unrecognized well-known attribute in both
+1-byte and extended-length encodings; session-level: the actual
+NOTIFICATION reaching the wire for both clauses). Real-teeth verified at
+every layer — codec-level checks, the NOTIFICATION-mapping function, and
+`handle_malformed_update`'s notification-selection logic each reverted in
+turn and confirmed to reproduce the exact pre-fix failure before being
+restored.
+
+---
+
 ## 2026-07-31 (RFC 7606 §7.7 AGGREGATOR capability-dependent length)
 
 ### [pathvector-session] AGGREGATOR decode always expected 8 bytes, ignoring whether the 4-octet AS number capability was actually negotiated

@@ -359,6 +359,36 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   `decode_capabilities` (`pathvector-session/src/message/open.rs:91-108`)
   has a comment saying as much: "Unknown parameter types are silently
   skipped." See `RFC_AUDIT.md` §6.2.
+  **Fixed 2026-07-31** (`fix/rfc4271-unrecognized-optional-parameter-and-attribute`).
+  Fetched RFC 4271 §6.2 and RFC 5492 directly rather than assuming RFC
+  5492 changed this: confirmed RFC 5492 §3 explicitly says an unrecognized
+  *outer* Optional Parameter still gets Unsupported Optional Parameter
+  (subcode 4, RFC 4271's original mechanism) — RFC 5492 only adds a
+  separate, finer-grained subcode (Unsupported Capability, 7) for an
+  individual capability *inside* an already-recognized Capabilities
+  parameter, and doesn't touch this clause at all. `decode_capabilities`
+  now returns a new `CodecError::UnsupportedOptionalParameter { param_type }`
+  instead of skipping; `header_error_notification`
+  (`pathvector-session/src/transport/mod.rs`) maps it to
+  NOTIFICATION(OPEN Error, `OpenMsgError::UnsupportedOptionalParameter`)
+  with no Data (§6.2 doesn't require one for this subcode, unlike
+  Unsupported Version Number's fallback-version requirement). The
+  pre-existing `test_unknown_opt_param_type_is_skipped` — whose own name
+  asserted the RFC-violating behavior as correct, the exact failure mode
+  this project's testing discipline exists to catch — was flipped to
+  `test_unknown_opt_param_type_is_rejected`; two more added
+  (`test_authentication_opt_param_type_1_is_rejected`, confirming the
+  deprecated Type 1 Authentication parameter isn't special-cased, and
+  `test_unrecognized_opt_param_after_valid_capabilities_still_rejected`,
+  confirming a valid Capabilities block earlier in the OPEN doesn't mask a
+  later bad parameter), plus a session-level
+  `test_unsupported_optional_parameter_sends_open_message_notification`
+  proving the actual NOTIFICATION reaches the wire. Real-teeth verified at
+  both layers: reverting `decode_capabilities`'s check reproduced the
+  exact pre-fix failures in all 3 codec tests; reverting
+  `header_error_notification`'s new match arm reproduced the exact
+  pre-fix failure in the session-level test; both restored and
+  reconfirmed passing.
 - **An unrecognized well-known attribute (Optional bit = 0) is accepted the
   same as an ordinary unrecognized optional attribute.** §6.3 requires
   NOTIFICATION(UPDATE Error, Unrecognized Well-known Attribute) for this
@@ -367,6 +397,43 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   (`pathvector-session/src/message/update.rs:534-541`) doesn't check the
   Optional bit before treating any unrecognized type code as `Unknown`.
   See `RFC_AUDIT.md` §6.3.
+  **Fixed 2026-07-31** (same branch as the §6.2 fix above). Fetched RFC
+  7606 directly and confirmed it does **not** amend this clause — its §3
+  revisions are an explicit, exhaustive list (a)-(j), none of which
+  mention "Unrecognized Well-known Attribute" — so this remains a full
+  RFC 4271 session reset, unlike the treat-as-withdraw/discard policies
+  RFC 7606 assigns to most other attribute-level errors. `decode_path_attributes`
+  now checks the sender's Optional bit for any type code
+  `expected_optional_transitive` doesn't recognize: Optional bit set is
+  still accepted as `PathAttribute::Unknown` (unchanged — legitimate per
+  §5); Optional bit clear now produces an `AttributeErrorPolicy::SessionReset`
+  error carrying `UpdateMsgError::UnrecognizedWellKnownAttribute` and a
+  Data field of the offending attribute's type, length, and value, per
+  §6.3's explicit text. This required widening
+  `AttributeErrorPolicy::SessionReset` from a unit variant to
+  `SessionReset { error: NotificationError, data: Vec<u8> }`, since the
+  pre-existing sole session-reset case (a duplicated MP_REACH_NLRI/
+  MP_UNREACH_NLRI, RFC 7606 §3(g)) always used a hardcoded Malformed
+  Attribute List NOTIFICATION with no data —
+  `pathvector-session/src/transport/mod.rs`'s `handle_malformed_update`
+  now reads the actual `NotificationError`/data off whichever error
+  triggered the reset instead of hardcoding, so both cases share one code
+  path instead of a special-cased duplicate. 3 new decode-level tests
+  (`test_unrecognized_well_known_attribute_is_session_reset`, an
+  extended-length variant proving the Data field's length encoding
+  matches the wire form, and a renamed
+  `test_unrecognized_optional_attribute_any_flags_no_conflict` clarifying
+  the unaffected companion case) plus a session-level
+  `test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+  proving the real NOTIFICATION (exact subcode and Data bytes) reaches
+  the wire. Real-teeth verified at both layers: removing the new
+  `decode_path_attributes` branch reproduced the exact pre-fix failures
+  in the 2 new decode-level tests; reverting `handle_malformed_update`
+  back to its old hardcoded NOTIFICATION reproduced the exact pre-fix
+  failure in the new session-level test (while the pre-existing
+  MP_REACH_NLRI-duplicate test kept passing, since that case's data
+  happens to coincide with the old hardcoded value) — both restored and
+  reconfirmed passing.
 - **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
   semantic validation for one-hop eBGP peers is looser than §6.3's precise
   criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only
