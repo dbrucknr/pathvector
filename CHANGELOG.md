@@ -49,6 +49,17 @@ own unconditional 8-byte AGGREGATOR encoding — otherwise generic
 `BgpCodec` round-trip proptests (which don't simulate real capability
 negotiation) failed.
 
+A Codex review of GH PR #44 raised a non-blocking coverage suggestion (no
+code issues found): the decoder-level tests above proved both length
+modes in isolation but not that `SessionEstablished`'s negotiation
+actually reaches `BgpCodec` in production. Added two real-TCP integration
+tests to `tests/transport.rs` driving a genuine loopback session through
+`spawn()` (not `MockTransport`, which bypasses the codec), writing
+hand-crafted raw UPDATE bytes directly to the socket since the encoder
+can't produce a 6-byte AGGREGATOR. Real-teeth verified: temporarily
+removed just the `set_four_byte_asn` call from `SessionEstablished`,
+confirmed the "not negotiated" integration test failed, then restored.
+
 ---
 
 ## 2026-07-30 (RFC 5492 Unsupported Capability NOTIFICATION Data field)

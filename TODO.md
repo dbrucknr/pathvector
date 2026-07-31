@@ -1048,6 +1048,32 @@ below, which deserved prompt attention):
   comment. Full `cargo test -p pathvector-session` (332 unit + 16
   integration + 2 doctests) and `cargo check --workspace --exclude
   pathvector-e2e --all-targets` both clean afterward.
+  **Codex review follow-up on GH PR #44** (non-blocking coverage
+  suggestion, no code issues found): the decoder-level tests above prove
+  both RFC 7606 §7.7 length modes in isolation, but nothing proved the
+  actual *production wiring* — that `SessionEstablished`'s bilateral
+  negotiation check really does reach `BgpCodec` through
+  `BgpTransport::set_four_byte_asn` and changes real decode behavior.
+  Added two real-TCP integration tests to `pathvector-session/tests/transport.rs`:
+  `test_aggregator_decoding_when_four_byte_asn_negotiated_bilaterally`
+  (both sides advertise `FourByteAsn`; an 8-byte AGGREGATOR is accepted, a
+  6-byte one discarded) and `test_aggregator_decoding_when_four_byte_asn_not_negotiated`
+  (peer OPEN omits `FourByteAsn`; a 6-byte AGGREGATOR is accepted, an
+  8-byte one discarded). Both drive a genuine loopback TCP session through
+  `spawn()`/real `BgpCodec` (not `MockTransport`, which bypasses the codec
+  entirely) and write hand-crafted raw UPDATE bytes directly to the socket
+  after `into_inner()` — necessary because `BgpMessage::encode()` always
+  emits AGGREGATOR in its 8-byte form unconditionally, so the normal
+  encoder can't produce the 6-byte wire form these tests need to send.
+  **Real-teeth verified**: temporarily removed just the
+  `t.set_four_byte_asn(four_byte_asn)` call from `SessionEstablished`'s
+  handler (simulating "the wiring was never added"), confirmed
+  `test_aggregator_decoding_when_four_byte_asn_not_negotiated` failed with
+  `got []` where an accepted 6-byte AGGREGATOR was expected (the
+  bilaterally-negotiated test stayed green by coincidence, since the
+  codec's default happens to match that scenario) — then restored and
+  confirmed both pass. Full `cargo test -p pathvector-session` (332 unit +
+  18 integration + 2 doctests) and clippy clean afterward.
 
 **20. RFC 5492 (Capabilities Advertisement) gap found by systematic clause
 audit** — found 2026-07-16 (diagnostic only, not fixed here). Low severity,
