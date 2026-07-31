@@ -24,8 +24,8 @@ use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
 use crate::message::{
     AttributeDecodeError, BgpMessage, Capability, CodecError, MalformedUpdate, MpUnreachNlri,
-    MsgHeaderError, NotificationError, NotificationMessage, OpenMessage, PathAttribute,
-    UpdateMessage, UpdateMsgError,
+    MsgHeaderError, NotificationError, NotificationMessage, OpenMessage, OpenMsgError,
+    PathAttribute, UpdateMessage, UpdateMsgError,
 };
 
 /// How long to wait for a staged, not-yet-validated second (collision
@@ -1493,14 +1493,14 @@ impl<T: BgpTransport> Session<T> {
     }
 }
 
-/// Map an RFC 4271 §6.1 message-header framing error to the NOTIFICATION that
-/// must be sent before the connection is torn down.
+/// Map an RFC 4271 message-header or OPEN-body framing error to the
+/// NOTIFICATION that must be sent before the connection is torn down.
 ///
-/// Returns `None` for `CodecError` variants below the header layer (malformed
-/// OPEN/NOTIFICATION message bodies) — those aren't RFC 7606-eligible (that
-/// policy only applies to UPDATE attribute errors) and mapping each to its
-/// RFC-precise `NotificationError`/subcode is a separate follow-up (see
-/// TODO.md).
+/// Returns `None` for `CodecError` variants not mapped below (other
+/// malformed OPEN/NOTIFICATION message bodies) — those aren't RFC
+/// 7606-eligible (that policy only applies to UPDATE attribute errors) and
+/// mapping each to its RFC-precise `NotificationError`/subcode is a separate
+/// follow-up (see TODO.md).
 fn header_error_notification(e: &FramingError) -> Option<NotificationMessage> {
     let FramingError::Codec(codec_err) = e else {
         return None;
@@ -1517,6 +1517,16 @@ fn header_error_notification(e: &FramingError) -> Option<NotificationMessage> {
         CodecError::UnknownMessageType(t) => (
             NotificationError::MessageHeader(MsgHeaderError::BadMessageType),
             vec![*t],
+        ),
+        // RFC 4271 §6.2: an OPEN optional parameter whose Parameter Type
+        // isn't recognized (only type 2, Capabilities, is understood) must
+        // be rejected with Unsupported Optional Parameter. §6.2 doesn't
+        // require a Data field for this subcode (unlike Unsupported
+        // Version Number's fallback-version requirement), so `data` stays
+        // empty.
+        CodecError::UnsupportedOptionalParameter { .. } => (
+            NotificationError::OpenMessage(OpenMsgError::UnsupportedOptionalParameter),
+            vec![],
         ),
         _ => return None,
     };
@@ -2390,6 +2400,37 @@ mod tests {
             }),
             "expected a Message Header Error / Bad Message Type NOTIFICATION carrying the \
              erroneous type byte in data, got {msg:?}"
+        );
+    }
+
+    /// RFC 4271 §6.2: an OPEN optional parameter with an unrecognized
+    /// Parameter Type must produce NOTIFICATION(OPEN Error, Unsupported
+    /// Optional Parameter), not a silent connection drop.
+    #[tokio::test]
+    async fn test_unsupported_optional_parameter_sends_open_message_notification() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx
+            .send(Err(FramingError::Codec(
+                CodecError::UnsupportedOptionalParameter { param_type: 42 },
+            )))
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for NOTIFICATION")
+            .expect("mock channel closed before NOTIFICATION");
+        assert_eq!(
+            msg,
+            BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::OpenMessage(OpenMsgError::UnsupportedOptionalParameter),
+                data: vec![],
+            }),
+            "expected an OPEN Message Error / Unsupported Optional Parameter \
+             NOTIFICATION, got {msg:?}"
         );
     }
 

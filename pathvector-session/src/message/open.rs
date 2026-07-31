@@ -88,21 +88,34 @@ impl OpenMessage {
 
 /// Parse optional parameters from the OPEN body, collecting all capability
 /// TLVs from parameter type 2 into a flat `Vec<Capability>`.
+///
+/// RFC 4271 §6.2: "If one of the Optional Parameters in the OPEN message is
+/// not recognized, then the Error Subcode MUST be set to Unsupported
+/// Optional Parameters." RFC 5492 confirms this is still the correct
+/// behavior for a peer that doesn't send the Capabilities parameter at all
+/// (§3: "A BGP speaker determines that its peer doesn't support
+/// capabilities advertisement if... the speaker receives a NOTIFICATION
+/// message with the Error Subcode set to Unsupported Optional Parameter.
+/// (This is a consequence of the base BGP-4 specification [RFC4271] and
+/// not a new requirement.)") — RFC 5492 only adds a *separate*,
+/// finer-grained subcode (Unsupported Capability, 7) for an individual
+/// capability *inside* a recognized Capabilities parameter; it does not
+/// change how an unrecognized outer Parameter Type is handled.
 fn decode_capabilities(opt_cur: &mut Cursor<'_>) -> Result<Vec<Capability>, CodecError> {
     let mut caps = Vec::new();
     while opt_cur.remaining() > 0 {
         let param_type = opt_cur.read_u8()?;
         let param_len = opt_cur.read_u8()? as usize;
         let mut param_cur = opt_cur.fork(param_len)?;
-        if param_type == OPT_PARAM_CAPABILITIES {
-            while param_cur.remaining() > 0 {
-                let cap_code = param_cur.read_u8()?;
-                let cap_len = param_cur.read_u8()? as usize;
-                let mut cap_cur = param_cur.fork(cap_len)?;
-                caps.push(decode_capability(cap_code, &mut cap_cur)?);
-            }
+        if param_type != OPT_PARAM_CAPABILITIES {
+            return Err(CodecError::UnsupportedOptionalParameter { param_type });
         }
-        // Unknown parameter types are silently skipped.
+        while param_cur.remaining() > 0 {
+            let cap_code = param_cur.read_u8()?;
+            let cap_len = param_cur.read_u8()? as usize;
+            let mut cap_cur = param_cur.fork(cap_len)?;
+            caps.push(decode_capability(cap_code, &mut cap_cur)?);
+        }
     }
     Ok(caps)
 }
@@ -414,12 +427,49 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_opt_param_type_is_skipped() {
-        // param_type=99 (unknown) should be silently skipped, yielding no capabilities.
+    fn test_unknown_opt_param_type_is_rejected() {
+        // RFC 4271 §6.2: an unrecognized Optional Parameter type (99 here;
+        // only type 2, Capabilities, is understood) must be rejected, not
+        // silently skipped.
         let params = [99_u8, 0]; // type=99, len=0
         let body = open_with_raw_opt_params(&params);
-        let open = decode_open_body(&body).unwrap();
-        assert!(open.capabilities.is_empty());
+        assert_eq!(
+            decode_open_body(&body),
+            Err(CodecError::UnsupportedOptionalParameter { param_type: 99 })
+        );
+    }
+
+    #[test]
+    fn test_authentication_opt_param_type_1_is_rejected() {
+        // Parameter Type 1 (Authentication, RFC 4271, long deprecated) is
+        // not implemented by this decoder either — it must be rejected the
+        // same as any other unrecognized type, not special-cased.
+        let params = [1_u8, 2, 0xAA, 0xBB]; // type=1, len=2, arbitrary value
+        let body = open_with_raw_opt_params(&params);
+        assert_eq!(
+            decode_open_body(&body),
+            Err(CodecError::UnsupportedOptionalParameter { param_type: 1 })
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_opt_param_after_valid_capabilities_still_rejected() {
+        // The unrecognized parameter must be caught even when it's not the
+        // first optional parameter — capabilities already parsed from an
+        // earlier block must not cause it to be overlooked.
+        let params = [
+            OPT_PARAM_CAPABILITIES,
+            2,
+            6,
+            0, // ExtendedMessage
+            99,
+            0, // unrecognized type=99, len=0
+        ];
+        let body = open_with_raw_opt_params(&params);
+        assert_eq!(
+            decode_open_body(&body),
+            Err(CodecError::UnsupportedOptionalParameter { param_type: 99 })
+        );
     }
 
     #[test]
