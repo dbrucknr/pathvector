@@ -4,6 +4,47 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-03 (RFC 4271 §6.3 policy revision: session-reset → treat-as-withdraw)
+
+### [pathvector-session] Unrecognized well-known attribute now treat-as-withdraw, matching real-world practice instead of the literal RFC 4271 text
+
+The 2026-07-31 fix for this clause implemented RFC 4271 §6.3 literally:
+an unrecognized attribute with the Optional bit clear triggers
+NOTIFICATION(UPDATE Error, Unrecognized Well-known Attribute) and a full
+session reset, since RFC 7606's §3 revisions are an explicit, exhaustive
+(a)-(j) list that never mentions this subcode. Asked what a real-world
+implementation actually does here rather than relying on the literal
+text alone: checked BIRD's source directly
+(`proto/bgp/attrs.c`'s `bgp_decode_attrs`). For exactly this case, BIRD
+uses its `WITHDRAW` path (`s->err_withdraw = 1`, session stays up), not
+`REJECT` (session reset) — extending RFC 7606's "minimize blast radius"
+philosophy to a clause it doesn't explicitly cover, rather than the
+stricter literal-RFC-4271 reading. This project now follows the same
+practice: an ordinary peer sending one unrecognized attribute (version
+skew, a vendor extension) shouldn't tear down the whole session over it.
+
+Changed the policy from `SessionReset` to `TreatAsWithdraw` in
+`decode_path_attributes`. This let `AttributeErrorPolicy::SessionReset`
+revert to a unit variant (only the pre-existing duplicated
+MP_REACH_NLRI/MP_UNREACH_NLRI case still uses it, RFC 7606 §3(g)),
+`handle_malformed_update` revert to its simpler hardcoded-NOTIFICATION
+form, and removed the now-obsolete Data-reconstruction logic entirely —
+a net simplification on top of the policy change, not just a flip.
+Renamed the decode-level test to
+`test_unrecognized_well_known_attribute_is_treat_as_withdraw` (dropped
+the now-irrelevant extended-length Data-field variant) and removed the
+dedicated session-level NOTIFICATION test — the transport layer no
+longer has any behavior specific to this clause, since it's fully
+absorbed into the pre-existing generic treat-as-withdraw pathway
+(already proven by `test_rfc7606_treat_as_withdraw_keeps_session_up_and_withdraws_nlri`).
+
+Real-teeth verified: flipped the policy back to `SessionReset` and
+confirmed the renamed decode-level test failed with the exact expected
+diagnostic; restored and reconfirmed passing. Full workspace
+build/test, `cargo fmt`, and `cargo clippy` clean.
+
+---
+
 ## 2026-08-03 (RFC 4271 §4.1 trailing-padding rejection)
 
 ### [pathvector-session] OPEN and ROUTE_REFRESH silently accepted trailing padding within the declared header Length

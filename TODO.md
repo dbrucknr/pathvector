@@ -457,6 +457,31 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   MP_REACH_NLRI-duplicate test kept passing, since that case's data
   happens to coincide with the old hardcoded value) — both restored and
   reconfirmed passing.
+  **Policy revised 2026-08-03** (`fix/rfc4271-unrecognized-well-known-attribute-treat-as-withdraw`):
+  the user asked what a real-world implementation does here rather than
+  relying on the literal RFC text alone. Checked BIRD's source directly
+  (`proto/bgp/attrs.c`'s `bgp_decode_attrs`): for this exact case
+  (unrecognized type code, Optional bit not set) BIRD uses its
+  `WITHDRAW` macro (`s->err_withdraw = 1`, session stays up), not
+  `REJECT` (session reset) — i.e. BIRD extends RFC 7606's "minimize
+  blast radius" philosophy to this clause even though RFC 7606 never
+  explicitly amends it. Changed the policy from `SessionReset` to
+  `TreatAsWithdraw` to match. This let `AttributeErrorPolicy::SessionReset`
+  revert to a unit variant (only the MP_REACH_NLRI/MP_UNREACH_NLRI
+  duplicate case still uses it), `handle_malformed_update` revert to its
+  simpler hardcoded-NOTIFICATION form, and removed the now-obsolete
+  Data-reconstruction logic in `decode_path_attributes` entirely — a net
+  simplification, not just a policy flip. Renamed
+  `test_unrecognized_well_known_attribute_is_session_reset` to
+  `test_unrecognized_well_known_attribute_is_treat_as_withdraw` (removed
+  the now-irrelevant extended-length Data-field variant, and removed the
+  session-level NOTIFICATION test since the transport layer no longer
+  has any behavior specific to this clause — it's fully absorbed into
+  the existing generic treat-as-withdraw pathway, already proven by
+  `test_rfc7606_treat_as_withdraw_keeps_session_up_and_withdraws_nlri`).
+  Real-teeth verified: flipped the policy back to `SessionReset` and
+  confirmed the renamed decode-level test failed with the exact expected
+  diagnostic; restored and reconfirmed passing.
 - **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
   semantic validation for one-hop eBGP peers is looser than §6.3's precise
   criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only
