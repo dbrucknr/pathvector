@@ -23,9 +23,9 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
 use crate::message::{
-    AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CodecError,
-    MalformedUpdate, MpUnreachNlri, MsgHeaderError, NotificationError, NotificationMessage,
-    OpenMessage, OpenMsgError, PathAttribute, UpdateMessage, UpdateMsgError,
+    AttributeDecodeError, BgpMessage, Capability, CodecError, MalformedUpdate, MpUnreachNlri,
+    MsgHeaderError, NotificationError, NotificationMessage, OpenMessage, OpenMsgError,
+    PathAttribute, UpdateMessage, UpdateMsgError,
 };
 
 /// How long to wait for a staged, not-yet-validated second (collision
@@ -1409,12 +1409,10 @@ impl<T: BgpTransport> Session<T> {
     /// Apply RFC 7606 error policy for a malformed UPDATE.
     ///
     /// - `SessionReset` (RFC 7606 §3(g): a duplicated `MP_REACH_NLRI` or
-    ///   `MP_UNREACH_NLRI`; or RFC 4271 §6.3, not amended by RFC 7606: an
-    ///   unrecognized well-known attribute): tear down the session with the
-    ///   specific NOTIFICATION the triggering error carries. Per §3(h) this
-    ///   is the strongest of the four error-handling approaches and takes
-    ///   priority over `treat_as_withdraw` when both are set in the same
-    ///   UPDATE. Returns `Some(FsmInput)` for
+    ///   `MP_UNREACH_NLRI`): tear down the session with a Malformed Attribute
+    ///   List NOTIFICATION. Per §3(h) this is the strongest of the four
+    ///   error-handling approaches and takes priority over `treat_as_withdraw`
+    ///   when both are set in the same UPDATE. Returns `Some(FsmInput)` for
     ///   the caller to return from the event loop in this case — specifically
     ///   `ProtocolErrorNotificationToSend` (RFC 4271 §8.2.2 Event 28), not a
     ///   manually-sent NOTIFICATION plus `TcpFailed` and not the plain
@@ -1442,28 +1440,10 @@ impl<T: BgpTransport> Session<T> {
         }
 
         if m.session_reset {
-            // Use the specific NotificationError/data the triggering error
-            // carries (e.g. Unrecognized Well-known Attribute with the
-            // offending attribute in `data`), falling back to Malformed
-            // Attribute List with no data only if none is found — which
-            // shouldn't happen given `session_reset` is itself derived from
-            // the presence of a `SessionReset`-policy error.
-            let notif = m
-                .errors
-                .iter()
-                .find_map(|e| match &e.policy {
-                    AttributeErrorPolicy::SessionReset { error, data } => {
-                        Some(NotificationMessage {
-                            error: error.clone(),
-                            data: data.clone(),
-                        })
-                    }
-                    _ => None,
-                })
-                .unwrap_or(NotificationMessage {
-                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
-                    data: vec![],
-                });
+            let notif = NotificationMessage {
+                error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
+                data: vec![],
+            };
             return Some(FsmInput::ProtocolErrorNotificationToSend(notif));
         }
 
@@ -2168,10 +2148,7 @@ mod tests {
             },
             errors: vec![AttributeDecodeError {
                 type_code: 14, // MP_REACH_NLRI
-                policy: AttributeErrorPolicy::SessionReset {
-                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
-                    data: vec![],
-                },
+                policy: AttributeErrorPolicy::SessionReset,
                 detail: "duplicate attribute type code",
             }],
             treat_as_withdraw: false,
@@ -2206,71 +2183,6 @@ mod tests {
             "expected Terminated(OperatorStop) — a locally-initiated protocol-error \
              teardown must not be recorded as Unclean, which would make the daemon \
              wrongly enter RFC 4724 GR helper mode for this peer — got {event:?}"
-        );
-    }
-
-    /// RFC 4271 §6.3 (not amended by RFC 7606): an unrecognized well-known
-    /// attribute is the *other* per-attribute error that escalates to a
-    /// full session reset. Unlike the duplicate-MP_REACH_NLRI case above,
-    /// this one carries a specific Data field (the offending attribute's
-    /// type, length, and value) — proving `handle_malformed_update` uses
-    /// the error's own carried `NotificationError`/data rather than always
-    /// hardcoding Malformed Attribute List with no data.
-    #[tokio::test]
-    async fn test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates() {
-        let (mock, mut peer) = MockTransport::pair();
-        let mut handle = spawn_with(test_config(), mock);
-
-        drive_to_established(&mut handle, &mut peer).await;
-
-        let malformed = BgpMessage::MalformedUpdate(MalformedUpdate {
-            update: UpdateMessage {
-                withdrawn: vec![],
-                attributes: vec![],
-                announced: vec![],
-            },
-            errors: vec![AttributeDecodeError {
-                type_code: 210,
-                policy: AttributeErrorPolicy::SessionReset {
-                    error: NotificationError::UpdateMessage(
-                        UpdateMsgError::UnrecognizedWellKnownAttribute,
-                    ),
-                    data: vec![210, 3, 1, 2, 3],
-                },
-                detail: "unrecognized well-known attribute (Optional bit not set)",
-            }],
-            treat_as_withdraw: false,
-            session_reset: true,
-        });
-        peer.recv_tx.send(Ok(malformed)).unwrap();
-
-        let notification = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
-            .await
-            .expect("timed out waiting for the Unrecognized Well-known Attribute NOTIFICATION")
-            .expect("channel closed before the NOTIFICATION was sent");
-        assert_eq!(
-            notification,
-            BgpMessage::Notification(NotificationMessage {
-                error: NotificationError::UpdateMessage(
-                    UpdateMsgError::UnrecognizedWellKnownAttribute
-                ),
-                data: vec![210, 3, 1, 2, 3],
-            }),
-            "expected UpdateMessage/UnrecognizedWellKnownAttribute NOTIFICATION carrying \
-             the offending attribute (type, length, value) in Data (RFC 4271 §6.3), \
-             got {notification:?}"
-        );
-
-        let event = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
-            .await
-            .expect("timed out waiting for Terminated")
-            .expect("session exited without emitting an event");
-        assert!(
-            matches!(
-                event,
-                SessionEvent::Terminated(TerminationReason::OperatorStop)
-            ),
-            "expected Terminated(OperatorStop), got {event:?}"
         );
     }
 
