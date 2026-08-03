@@ -251,7 +251,21 @@ impl BgpMessage {
 
         // cur is now positioned at the body (total_len - HEADER_LEN bytes remain).
         match msg_type {
-            MsgType::Open => Ok(Self::Open(OpenMessage::decode(&mut cur)?)),
+            MsgType::Open => {
+                let open = OpenMessage::decode(&mut cur)?;
+                // RFC 4271 §4.1: "'padding' of extra data after the message
+                // is not allowed. Therefore, the Length field MUST have the
+                // smallest value required, given the rest of the message."
+                // OPEN's own fields are all explicitly length-prefixed
+                // (fixed fields + a declared optional-parameters length), so
+                // any bytes left in `cur` once those are consumed are
+                // padding the declared header Length permitted but the
+                // message content didn't need.
+                if cur.remaining() != 0 {
+                    return Err(CodecError::InvalidLength(total_len));
+                }
+                Ok(Self::Open(open))
+            }
             MsgType::Update => match UpdateMessage::decode(&mut cur, four_byte_asn)? {
                 UpdateDecodeOutcome::Clean(u) => Ok(Self::Update(u)),
                 UpdateDecodeOutcome::Partial {
@@ -273,7 +287,17 @@ impl BgpMessage {
                 }
                 Ok(Self::Keepalive)
             }
-            MsgType::RouteRefresh => Ok(Self::RouteRefresh(RouteRefreshMessage::decode(&mut cur)?)),
+            MsgType::RouteRefresh => {
+                let rr = RouteRefreshMessage::decode(&mut cur)?;
+                // RFC 4271 §4.1, same rationale as the OPEN arm above:
+                // ROUTE_REFRESH's body is a fixed 4 bytes (AFI + subtype +
+                // SAFI); anything past that within the declared header
+                // Length is disallowed padding.
+                if cur.remaining() != 0 {
+                    return Err(CodecError::InvalidLength(total_len));
+                }
+                Ok(Self::RouteRefresh(rr))
+            }
         }
     }
 
@@ -571,6 +595,62 @@ mod tests {
         assert!(matches!(
             BgpMessage::decode(&raw),
             Err(CodecError::InvalidLength(20))
+        ));
+    }
+
+    #[test]
+    fn test_open_with_trailing_padding_is_error() {
+        // RFC 4271 §4.1: "'padding' of extra data after the message is not
+        // allowed." A minimal OPEN body (version, my_as, hold_time, bgp_id,
+        // opt_len=0) is 10 bytes; one extra trailing byte inside the
+        // declared header Length must be rejected, not silently discarded.
+        let body: &[u8] = &[
+            4, // version
+            0xFF, 0xE9, // my_as = 65001
+            0x00, 0x5A, // hold_time = 90
+            10, 0, 0, 1,    // bgp_id
+            0,    // opt_len = 0
+            0x00, // trailing padding byte
+        ];
+        let raw = make_raw_message(1, body);
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::InvalidLength(30))
+        ));
+    }
+
+    #[test]
+    fn test_open_with_trailing_padding_after_capabilities_is_error() {
+        // Same clause, but with a non-empty (and otherwise valid) optional
+        // parameters block, to confirm the check isn't accidentally tied to
+        // the opt_len=0 case above.
+        let body: &[u8] = &[
+            4, // version
+            0xFF, 0xE9, // my_as
+            0x00, 0x5A, // hold_time
+            10, 0, 0, 1, // bgp_id
+            4, // opt_len = 4
+            2, 2, 6,
+            0,    // type=2 (Capabilities), len=2, cap_code=6 (ExtendedMessage), cap_len=0
+            0x00, // trailing padding byte, outside the declared opt_len
+        ];
+        let raw = make_raw_message(1, body);
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::InvalidLength(34))
+        ));
+    }
+
+    #[test]
+    fn test_route_refresh_with_trailing_padding_is_error() {
+        // RFC 4271 §4.1, same clause: ROUTE_REFRESH's body is a fixed 4
+        // bytes (AFI + subtype + SAFI); a trailing byte within the declared
+        // header Length must be rejected.
+        let body: &[u8] = &[0x00, 0x01, 0x00, 0x01, 0x00]; // AFI=1, subtype=0, SAFI=1, + padding
+        let raw = make_raw_message(5, body);
+        assert!(matches!(
+            BgpMessage::decode(&raw),
+            Err(CodecError::InvalidLength(24))
         ));
     }
 

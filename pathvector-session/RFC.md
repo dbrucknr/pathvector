@@ -38,16 +38,21 @@ Decision-making on received routes lives in `pathvector-rib`.
 | LARGE_COMMUNITY (type 32) encode/decode — RFC 8092 | `src/message/` | ✅ | `test_attr_large_community_roundtrip` |
 | Unknown optional transitive attributes preserved in Partial flag | `src/message/` | ✅ | `test_unknown_optional_transitive_preserved` |
 
-**Known gap (found by `RFC_AUDIT.md`, 2026-07-16):** §4.1's "Length field MUST
-have the smallest value required... padding of extra data after the message
-is not allowed" is enforced for KEEPALIVE (`decode_with_limit` checks
-`cur.remaining() != 0`) but not for OPEN or ROUTE_REFRESH — their decoders
-stop after reading known/declared-length fields without confirming the
-cursor is empty, so trailing padding within the declared header Length is
-silently discarded rather than rejected. UPDATE and NOTIFICATION are
-unaffected (their trailing fields are defined as "consume the rest of the
-message" by the RFC itself, so full consumption is correct there, not
-incidental). See `RFC_AUDIT.md` §4.1 for detail; not yet fixed.
+**§4.1 padding rejection — fixed 2026-08-03** (`fix/rfc4271-message-padding-rejection`).
+"Length field MUST have the smallest value required... padding of extra
+data after the message is not allowed" was already enforced for KEEPALIVE
+(`decode_with_limit_and_caps` checks `cur.remaining() != 0`) but not for
+OPEN or ROUTE_REFRESH — their decoders stopped after reading known/
+declared-length fields without confirming the cursor was empty, silently
+discarding any trailing padding within the declared header Length. Both
+arms now carry the identical check. UPDATE and NOTIFICATION remain
+unaffected by design (their trailing fields are defined as "consume the
+rest of the message" by the RFC itself). Checked RFC 7606 and RFC 8654
+directly for an amendment to this clause — neither mentions padding.
+`test_open_with_trailing_padding_is_error`,
+`test_open_with_trailing_padding_after_capabilities_is_error`,
+`test_route_refresh_with_trailing_padding_is_error`. See `RFC_AUDIT.md`
+§4.1 for detail.
 
 ---
 

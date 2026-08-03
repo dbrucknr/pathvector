@@ -4,6 +4,42 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-03 (RFC 4271 §4.1 trailing-padding rejection)
+
+### [pathvector-session] OPEN and ROUTE_REFRESH silently accepted trailing padding within the declared header Length
+
+RFC 4271 §4.1: "'padding' of extra data after the message is not allowed.
+Therefore, the Length field MUST have the smallest value required, given
+the rest of the message." `decode_with_limit`'s `Keepalive` arm already
+checked `cur.remaining() != 0` after decode, but the `Open` and
+`RouteRefresh` arms didn't — a message with extra bytes inside the
+declared frame length (beyond what OPEN's capabilities or
+ROUTE_REFRESH's fixed 4-byte body actually need) was silently accepted
+with the padding discarded. Low severity (permissive, not corrupting),
+found by the original systematic clause audit (`RFC_AUDIT.md`), the last
+remaining gap in RFC 4271 §4.
+
+Checked RFC 7606 and RFC 8654 directly for an amendment — neither
+mentions padding, so RFC 4271's original text stands. Added the same
+`cur.remaining() != 0` check to the `Open` and `RouteRefresh` match arms
+in `decode_with_limit_and_caps`, mirroring the pre-existing `Keepalive`
+check exactly. `Update` and `Notification` remain correctly unaffected —
+both are required by the RFC itself to consume the rest of the message.
+
+3 new tests: a minimal (no-capabilities) OPEN with one trailing byte, an
+OPEN with a real capability plus one trailing byte (ruling out the check
+being accidentally tied to the empty-capabilities case), and a
+ROUTE_REFRESH with one trailing byte. Real-teeth verified: reverted each
+of the two new checks in turn, confirmed the corresponding test(s) failed
+with the exact expected diagnostic, then restored and reconfirmed
+passing. Full workspace build/test, `cargo fmt`, and `cargo clippy`
+clean.
+
+This closes out every gap the original 2026-07-16 systematic clause
+audit found in RFC 4271 §4 — the section is now fully ✅.
+
+---
+
 ## 2026-07-31 (RFC 4271 §6.2/§6.3 unrecognized-parameter/attribute rejection)
 
 ### [pathvector-session] Unrecognized OPEN optional parameter types and unrecognized well-known UPDATE attributes were silently accepted instead of rejected
