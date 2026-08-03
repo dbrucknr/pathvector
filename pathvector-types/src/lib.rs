@@ -12,7 +12,7 @@ mod role;
 pub use afi::{Afi, AfiSafi, Safi};
 pub use asn::Asn;
 pub use aspath::{AsPath, AsPathSegment};
-pub use attr::{Aggregator, AtomicAggregate, LocalPref, Med, NextHop, Origin};
+pub use attr::{Aggregator, AtomicAggregate, LocalPref, Med, NextHop, Origin, UnknownAttribute};
 pub use community::{Community, ExtendedCommunity, LargeCommunity};
 pub use nlri::{InvalidPrefixLen, Nlri, ParsePrefixError};
 pub use peer_type::PeerType;

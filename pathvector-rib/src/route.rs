@@ -4,7 +4,7 @@ use ipnetx::interfaces::IpAddress;
 use pathvector_policy::BgpRoute;
 use pathvector_types::{
     Aggregator, AsPath, Asn, Community, ExtendedCommunity, LargeCommunity, LocalPref, Med, NextHop,
-    Nlri, Origin, PeerType,
+    Nlri, Origin, PeerType, UnknownAttribute,
 };
 
 /// A concrete BGP route stored in the RIB.
@@ -70,6 +70,12 @@ pub struct RareAttrs {
     /// per RFC 9234 §5), must be preserved unchanged and must not be
     /// forwarded to a Provider, Peer, or Route Server.
     pub otc: Option<Asn>,
+    /// Unrecognized transitive optional attributes, preserved opaquely so
+    /// they can be forwarded to other peers per RFC 4271 §5. Only
+    /// attributes with both the Optional and Transitive flag bits set are
+    /// ever stored here — unrecognized non-transitive attributes are
+    /// quietly dropped at ingest, per the same RFC clause.
+    pub unknown: Vec<UnknownAttribute>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +161,7 @@ static RARE_DEFAULT: RareAttrs = RareAttrs {
     aggregator: None,
     originator_id: None,
     otc: None,
+    unknown: Vec::new(),
 };
 
 impl<A: IpAddress> BgpRoute for Route<A> {
@@ -409,6 +416,16 @@ impl<A: IpAddress> RouteBuilder<A> {
     #[must_use]
     pub fn otc(mut self, asn: Asn) -> Self {
         self.rare.get_or_insert_with(Box::default).otc = Some(asn);
+        self
+    }
+
+    /// Appends an unrecognized transitive optional attribute (RFC 4271 §5).
+    #[must_use]
+    pub fn unknown_attribute(mut self, attr: UnknownAttribute) -> Self {
+        self.rare
+            .get_or_insert_with(Box::default)
+            .unknown
+            .push(attr);
         self
     }
 
