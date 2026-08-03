@@ -13,7 +13,7 @@ one-line-per-RFC index showing which crate(s) own each RFC and the aggregate sta
 | RFC 2439 | Route Flap Dampening | pathvectord | ❌ | — |
 | RFC 2918 | Route Refresh Capability | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-2918--route-refresh-capability-for-bgp-4) |
 | RFC 3107 | MPLS Label in BGP (SAFI constant) | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-3107-rfc-4364-rfc-4761-rfc-7432-rfc-5575--safi-constants-encoding-deferred) |
-| RFC 4271 §4 | BGP Message Formats | pathvector-session | ⚠️ | [session](pathvector-session/RFC.md#rfc-4271-4--message-formats) — gap found by `RFC_AUDIT.md` 2026-07-16: OPEN/ROUTE_REFRESH don't reject trailing padding |
+| RFC 4271 §4 | BGP Message Formats | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-4--message-formats) — last gap (OPEN/ROUTE_REFRESH trailing padding, found by `RFC_AUDIT.md` 2026-07-16) fixed 2026-08-03 |
 | RFC 4271 §5 | Path Attribute Types | pathvector-types | ✅ | [types](pathvector-types/RFC.md#rfc-4271-5--path-attribute-types) |
 | RFC 4271 §6.1 | Message Header Error Handling | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-61--message-header-error-handling) |
 | RFC 4271 §6.2 | OPEN Message Error Handling (unrecognized Optional Parameter type) | pathvector-session | ✅ | [session](pathvector-session/RFC.md#rfc-4271-4--message-formats) — gap found by `RFC_AUDIT.md` 2026-07-16, fixed 2026-07-31 |

@@ -255,6 +255,29 @@ decision to keep fixes in their own scoped PRs):
   need) is silently accepted with the padding discarded. Low severity
   (permissive, not corrupting), but a clear spec violation. See
   `RFC_AUDIT.md`'s "§4.1 — Message Header Format" for detail.
+  **Fixed 2026-08-03** (`fix/rfc4271-message-padding-rejection`). Checked
+  RFC 7606 and RFC 8654 for an amendment to this clause — neither mentions
+  "padding" at all, so RFC 4271's original text stands unmodified.
+  `decode_with_limit_and_caps`'s `Open` and `RouteRefresh` match arms now
+  each check `cur.remaining() != 0` immediately after their respective
+  decode call, mirroring the pre-existing `Keepalive` check exactly, and
+  return `CodecError::InvalidLength(total_len)` if any bytes remain.
+  UPDATE and NOTIFICATION are unaffected — both are already required to
+  consume the rest of the message by the RFC itself (their trailing
+  fields are `read_remaining()`-style "rest of message" reads), so full
+  consumption there is correct, not incidental; this was already noted in
+  `pathvector-session/RFC.md`'s §4 section and reconfirmed rather than
+  re-derived. 3 new tests: a minimal (no-capabilities) OPEN with one
+  trailing byte, an OPEN with a real capability plus one trailing byte
+  (to rule out the check being accidentally tied to the opt_len=0 case),
+  and a ROUTE_REFRESH with one trailing byte — all via the same
+  `make_raw_message` helper the existing `test_keepalive_with_extra_body_is_error`
+  test uses. Real-teeth verified: reverted each of the two new match-arm
+  checks in turn, confirmed the corresponding new test(s) failed with the
+  exact expected assertion failure, then restored and reconfirmed
+  passing. Full `cargo test -p pathvector-session` (341 unit + 18
+  integration + 2 doctests) and full workspace build/test clean
+  afterward.
 
 **13. RFC 4271 §5 path-attribute gaps found by systematic clause audit** —
 found 2026-07-16, same `RFC_AUDIT.md` pass as #12 above (diagnostic only,
