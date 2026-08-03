@@ -118,3 +118,30 @@ Leak-detection/prevention policy logic (`OtcLeakCondition`, `SetOtc`,
 | `BgpRoute::otc()`/`set_otc()` round-trip on `Route<A>` | `src/route.rs` | ✅ | `test_route_bgproute_otc_getter_and_setter` |
 | Setting OTC to `None` on an unallocated `RareAttrs` does not force allocation | `src/route.rs` | ✅ | `test_route_set_otc_none_on_unallocated_rare_does_not_allocate` |
 | `.otc(asn)` builder method on `RouteBuilder` | `src/route.rs` | ✅ | (exercised by the getter/setter test above) |
+
+---
+
+## RFC 4271 §5 — Unrecognized Transitive Optional Attribute Storage
+
+**Owns:** `UnknownAttribute` storage on `Route<A>` — a `Vec<pathvector_types::UnknownAttribute>`
+field on `RareAttrs`, plus the `.unknown_attribute(attr)` `RouteBuilder` method.  
+**Boundary:** Wire encode/decode of `PathAttribute::Unknown` (including setting
+the Partial bit on re-encode) is in `pathvector-session`. Deciding which
+attributes to store (transitive-only) and forwarding them regardless of peer
+type is `pathvectord`'s concern (`handle_update`/`route_to_attributes`).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-5
+
+Fixed 2026-08-03 (`feature/rfc4271-unrecognized-transitive-attribute-storage`).
+Checked what a real-world implementation does before scoping this: BIRD
+(`proto/bgp/attrs.c`) already stores unknown attributes generically as opaque
+bytes and re-exports transitive ones with the Partial bit set — confirming
+this was a data-model gap, not a deeper architectural problem. Added
+`pathvector_types::UnknownAttribute { type_code, value }` rather than having
+this crate depend on `pathvector-session`'s wire-level `PathAttribute` type
+directly — both crates already depend on `pathvector-types`, so no new
+dependency edge between siblings.
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `unknown: Vec<UnknownAttribute>` on `RareAttrs`, lazily allocated like other rare attributes | `src/route.rs` | ✅ | See `pathvectord`'s `handle_update`/`route_to_attributes` tests for the full ingest/egress round-trip |
+| `.unknown_attribute(attr)` builder method on `RouteBuilder` (appends, unlike single-value setters) | `src/route.rs` | ✅ | (exercised by `pathvectord`'s tests) |

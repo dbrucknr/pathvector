@@ -371,6 +371,59 @@ not fixed here):
   dropped on RIB ingest, transitive or not. This is a design gap (needs a
   new field threaded through the whole route pipeline), not a one-line fix
   — see `RFC_AUDIT.md` §5 for the full detail and what a fix would require.
+  **Fixed 2026-08-03** (`feature/rfc4271-unrecognized-transitive-attribute-storage`).
+  Checked what a real-world implementation does before scoping this: BIRD
+  (`proto/bgp/attrs.c`) already stores unknown attributes generically as
+  opaque bytes in its extended-attribute system and re-exports transitive
+  ones with the Partial bit set, non-transitive ones dropped — confirming
+  this really is "just" a data-model gap, not a deeper architectural
+  problem. Added `pathvector_types::UnknownAttribute { type_code: u8,
+  value: Vec<u8> }` (in `attr.rs`, alongside `Aggregator`) rather than
+  having `pathvector-rib` depend on `pathvector-session`'s wire-level
+  `PathAttribute` type directly — both crates already depend on
+  `pathvector-types`, so this avoids a new dependency edge between
+  siblings. Only the type code and raw value bytes are stored; the flags
+  byte doesn't need to be, since only the Optional=1,Transitive=1
+  combination is ever stored (RFC 4271 §5's own text — non-transitive
+  unknowns are quietly dropped, and any surviving `PathAttribute::Unknown`
+  from `pathvector-session`'s decoder is already guaranteed Optional=1 as
+  of the RFC 4271 §6.3 fix above, since Optional=0 unrecognized attributes
+  now fail decode as a treat-as-withdraw error instead of surviving as
+  `Unknown`), and re-encoding always emits Optional|Transitive
+  unconditionally (`pathvector-session`'s own encoder then sets the
+  Partial bit for exactly that flag combination, regardless of the
+  incoming Partial bit — correct per the RFC, since forwarding an
+  attribute we didn't originate/verify always requires Partial=1, never a
+  reason to clear it back to 0).
+
+  `RareAttrs` gained `pub unknown: Vec<UnknownAttribute>`, following the
+  exact lazy-allocate-on-first-write pattern already used for
+  communities/cluster_list/etc.; `RouteBuilder` gained
+  `.unknown_attribute(attr)` mirroring `.community(c)`. On ingest,
+  `handle_update`'s attribute-processing loop (`pathvectord/src/daemon/route.rs`)
+  gained a new match arm for `PathAttribute::Unknown` guarded on both flag
+  bits — matching RFC 4271 §5's precise text ("Unrecognized non-transitive
+  optional attributes MUST be quietly ignored and not passed along") —
+  wired into both the IPv4 and IPv6 `RouteBuilder` construction sites. On
+  egress, both `route_to_attributes` and `route_v6_to_attributes`
+  (`pathvectord/src/outbound.rs`) gained a call to a new shared
+  `unknown_attrs_to_path_attributes` helper, forwarding unconditionally
+  regardless of peer type — matching how OTC (RFC 9234 §3, also
+  optional+transitive) is already handled, since RFC 4271 §5 doesn't gate
+  transitive-attribute forwarding on peer type either.
+
+  4 new tests: `test_handle_update_stores_unrecognized_transitive_attribute`
+  and `test_handle_update_quietly_ignores_unrecognized_non_transitive_attribute`
+  (ingest, `pathvectord/src/daemon/mod.rs`),
+  `unrecognized_transitive_attribute_is_forwarded_with_optional_transitive_flags`
+  (egress, `pathvectord/src/outbound.rs`), plus `UnknownAttribute`'s own
+  unit tests in `pathvector-types`. Real-teeth verified: removed the new
+  `handle_update` match arm and confirmed the storage test failed with
+  the exact expected diagnostic (0 stored instead of 1); separately
+  removed the new `unknown_attrs_to_path_attributes` calls from both
+  outbound builders and confirmed the egress test failed with "must be
+  present"; both reverts restored and reconfirmed passing. Full workspace
+  build/test, `cargo fmt`, and `cargo clippy` clean.
 
 **14. RFC 4271 §6.2/§6.3 error-handling gaps found by systematic clause
 audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above

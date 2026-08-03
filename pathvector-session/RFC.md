@@ -36,7 +36,7 @@ Decision-making on received routes lives in `pathvector-rib`.
 | COMMUNITY (type 8) encode/decode — RFC 1997 | `src/message/` | ✅ | `test_attr_community_roundtrip` |
 | EXTENDED_COMMUNITIES (type 16) encode/decode — RFC 4360 | `src/message/` | ✅ | `test_attr_extended_community_roundtrip` |
 | LARGE_COMMUNITY (type 32) encode/decode — RFC 8092 | `src/message/` | ✅ | `test_attr_large_community_roundtrip` |
-| Unknown optional transitive attributes preserved in Partial flag | `src/message/` | ✅ | `test_unknown_optional_transitive_preserved` |
+| Unknown optional transitive attributes preserved in Partial flag | `src/message/` | ✅ | `test_unknown_optional_transitive_preserved` — codec round-trip only (decode a message, re-encode the *same* message object); the separate RIB-pipeline question of whether an unknown attribute survives being *relayed* through this router to a different peer is `pathvector-rib`/`pathvectord`'s concern, tracked in their own `RFC.md`s (fixed 2026-08-03, see `RFC_AUDIT.md` §5) |
 
 **§4.1 padding rejection — fixed 2026-08-03** (`fix/rfc4271-message-padding-rejection`).
 "Length field MUST have the smallest value required... padding of extra
