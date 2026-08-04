@@ -11,11 +11,13 @@ enum SessionState {
   SESSION_STATE_ESTABLISHED = 2;
 }
 
-/// Whether a peer is iBGP (same AS) or eBGP (different AS).
+/// Whether a peer is iBGP (same AS), eBGP (different AS), or a fellow BGP
+/// confederation Member-AS (RFC 5065).
 enum PeerType {
-  PEER_TYPE_UNSPECIFIED = 0;
-  PEER_TYPE_EXTERNAL    = 1;
-  PEER_TYPE_INTERNAL    = 2;
+  PEER_TYPE_UNSPECIFIED     = 0;
+  PEER_TYPE_EXTERNAL        = 1;
+  PEER_TYPE_INTERNAL        = 2;
+  PEER_TYPE_CONFED_MEMBER   = 3;
 }
 
 /// BGP ORIGIN path attribute (RFC 4271 §4.3).
