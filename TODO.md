@@ -510,6 +510,35 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   MP_REACH_NLRI-duplicate test kept passing, since that case's data
   happens to coincide with the old hardcoded value) — both restored and
   reconfirmed passing.
+  **Policy revised 2026-08-03** (`fix/rfc4271-unrecognized-well-known-attribute-treat-as-withdraw`):
+  the user asked what a real-world implementation does here rather than
+  relying on the literal RFC text alone. Checked BIRD's source directly
+  (`proto/bgp/attrs.c`'s `bgp_decode_attrs`): for this exact case
+  (unrecognized type code, Optional bit not set) BIRD uses its
+  `WITHDRAW` macro (`s->err_withdraw = 1`, session stays up), not
+  `REJECT` (session reset) — i.e. BIRD extends RFC 7606's "minimize
+  blast radius" philosophy to this clause even though RFC 7606 never
+  explicitly amends it. Changed the policy from `SessionReset` to
+  `TreatAsWithdraw` to match.
+  **Reverted 2026-08-04** (same branch): a code review (Codex) on that
+  PR flagged it as a compliance regression before merge, and on
+  reflection this was the right call — §6.3 is an unamended RFC 4271
+  MUST, not an area the RFC leaves ambiguous for BIRD's practice to fill
+  in. "A specific other implementation does X" isn't a valid basis for
+  deviating from unambiguous RFC text absent an actual amending RFC;
+  BIRD imitation should be reserved for genuinely underspecified areas
+  (e.g. RFC 4724 §4.1's Restarting-Speaker deferral scope, where the RFC
+  text itself leaves room for interpretation), not used to override a
+  clear requirement just because it's inconvenient. Restored
+  `AttributeErrorPolicy::SessionReset { error, data }` and the exact
+  behavior/tests from the original 2026-07-31 fix (`git checkout` of the
+  pre-revision commit for both `update.rs` and `transport/mod.rs`, not a
+  fresh reimplementation) — `test_unrecognized_well_known_attribute_is_session_reset`,
+  `test_unrecognized_well_known_attribute_extended_length_data_field`,
+  and `test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+  are all back. Real-teeth re-verified: reintroduced the treat-as-withdraw
+  policy, confirmed the two decode-level tests failed for the right
+  reason, restored and reconfirmed passing.
 - **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
   semantic validation for one-hop eBGP peers is looser than §6.3's precise
   criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only
