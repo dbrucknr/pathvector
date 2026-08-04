@@ -76,6 +76,61 @@ build/test, `cargo fmt`, and `cargo clippy` clean.
 
 ---
 
+## 2026-08-03 (RFC 4271 §5 unrecognized-transitive-attribute storage)
+
+### [pathvector-types, pathvector-rib, pathvectord] Unrecognized transitive optional attributes couldn't survive a relay through this router
+
+RFC 4271 §5: "Paths with unrecognized transitive optional attributes
+SHOULD be accepted [and] passed... to other BGP peers with the Partial
+bit... set to 1. Unrecognized non-transitive optional attributes MUST be
+quietly ignored and not passed along." `Route`/`RareAttrs`
+(`pathvector-rib`) had no field of any kind for an opaque/unrecognized
+attribute, so any unrecognized attribute — transitive or not — was
+unconditionally dropped the moment a route was accepted into the RIB.
+This was a real transit-correctness concern: any future/foreign BGP path
+attribute riding through this router as a transit AS would have been
+silently stripped, not just an incomplete-coverage gap.
+
+Checked what a real-world implementation does before scoping this: BIRD
+(`proto/bgp/attrs.c`) already stores unknown attributes generically as
+opaque bytes in its extended-attribute system and re-exports transitive
+ones with the Partial bit set — confirming this really was "just" a
+data-model gap, not a deeper architectural problem.
+
+Added `pathvector_types::UnknownAttribute { type_code: u8, value: Vec<u8> }`
+rather than having `pathvector-rib` depend on `pathvector-session`'s
+wire-level `PathAttribute` type directly — both crates already depend on
+`pathvector-types`, so this avoids a new dependency edge between
+siblings. Only the type code and raw value bytes are stored: only the
+Optional=1,Transitive=1 combination is ever stored (matching RFC 4271
+§5's own text), and re-encoding always emits that flag combination
+unconditionally — `pathvector-session`'s own encoder then sets the
+Partial bit for exactly that combination, correctly ignoring whatever
+the incoming Partial bit was (forwarding an attribute we didn't
+originate/verify always requires Partial=1).
+
+`RareAttrs` gained `pub unknown: Vec<UnknownAttribute>` following the
+existing lazy-allocate-on-first-write pattern used for
+communities/cluster_list/etc.; `RouteBuilder` gained
+`.unknown_attribute(attr)` mirroring `.community(c)`. On ingest,
+`handle_update`'s attribute loop gained a match arm for
+`PathAttribute::Unknown` guarded on both flag bits, wired into both the
+IPv4 and IPv6 `RouteBuilder` construction sites. On egress,
+`route_to_attributes`/`route_v6_to_attributes` forward stored unknown
+attributes unconditionally regardless of peer type — matching how OTC
+(RFC 9234 §3, also optional+transitive) is already handled, since RFC
+4271 §5 doesn't gate transitive-attribute forwarding on peer type
+either.
+
+4 new tests across ingest, egress, and the new type itself. Real-teeth
+verified: removed the new `handle_update` match arm and confirmed the
+storage test failed with the exact expected diagnostic; separately
+removed the new outbound calls and confirmed the egress test failed;
+both reverts restored and reconfirmed passing. Full workspace
+build/test, `cargo fmt`, and `cargo clippy` clean.
+
+---
+
 ## 2026-08-03 (RFC 4271 §4.1 trailing-padding rejection)
 
 ### [pathvector-session] OPEN and ROUTE_REFRESH silently accepted trailing padding within the declared header Length

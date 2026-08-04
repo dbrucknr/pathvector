@@ -32,6 +32,7 @@ of UPDATE messages lives in `pathvector-session`.
 | NLRI batching: announcements with same path attributes packed into fewest UPDATEs within `max_len` | `src/outbound.rs` | ✅ | `test_flush_same_attrs_batched_into_one_message`, `test_flush_splits_when_exceeding_max_len`, `test_flush_withdrawal_split_delivers_all_nlris` |
 | Announcement groups with distinct path attributes go into separate UPDATEs | `src/outbound.rs` | ✅ | `test_flush_different_attrs_two_messages` |
 | Withdrawals sent before announcements; withdrawal list packed within `max_len` | `src/outbound.rs` | ✅ | `test_flush_withdrawals_before_announces`, `test_flush_withdrawal_split_delivers_all_nlris` |
+| Unrecognized transitive optional attributes stored on ingest (Optional+Transitive flags only; non-transitive quietly dropped) and forwarded unconditionally on egress regardless of peer type, with the Partial bit set (RFC 4271 §5) | `src/daemon/route.rs`, `src/outbound.rs` | ✅ | Fixed 2026-08-03 (`feature/rfc4271-unrecognized-transitive-attribute-storage`). See `RFC_AUDIT.md` §5 and `pathvector-rib/RFC.md`'s own section for the storage half. `test_handle_update_stores_unrecognized_transitive_attribute`, `test_handle_update_quietly_ignores_unrecognized_non_transitive_attribute`, `unrecognized_transitive_attribute_is_forwarded_with_optional_transitive_flags` |
 
 ---
 

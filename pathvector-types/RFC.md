@@ -29,6 +29,7 @@ logic that uses these types lives in `pathvector-rib`.
 | LOCAL_PREF (type 5): iBGP only; default 100 when absent | `src/attr.rs` | ✅ | `test_local_pref_ordering`, `test_local_pref_default`, `test_local_pref_too_short_is_error` |
 | ATOMIC_AGGREGATE (type 6): flag-only attribute | `src/attr.rs` | ✅ | `test_atomic_aggregate_display`, `test_atomic_aggregate_and_aggregator_roundtrip` |
 | AGGREGATOR (type 7): optional transitive ASN + IPv4 router-id | `src/attr.rs` | ✅ | `test_aggregator_new`, `test_aggregator_display`, `test_aggregator_too_short_is_error` |
+| `UnknownAttribute { type_code, value }`: opaque storage shape for an unrecognized transitive optional attribute, so `pathvector-rib` can preserve one without depending on `pathvector-session`'s wire-level `PathAttribute` type | `src/attr.rs` | ✅ | Fixed 2026-08-03 (`feature/rfc4271-unrecognized-transitive-attribute-storage`). `test_unknown_attribute_new`, `test_unknown_attribute_equality` |
 
 ---
 
