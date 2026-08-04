@@ -25,7 +25,7 @@ of UPDATE messages lives in `pathvector-session`.
 | AS_PATH prepended with local ASN before advertising to eBGP peers | `src/outbound.rs` | ✅ | `test_prepare_outbound_ebgp_prepends_local_as`, `test_propagate_prefix_ebgp_prepends_local_as_in_wire_message` |
 | NEXT_HOP rewritten to TCP session local interface address for eBGP peers (RFC 4271 §5.1.3) | `src/outbound.rs`, `src/daemon.rs` | ✅ | `test_prepare_outbound_ebgp_rewrites_next_hop`, `test_on_established_ebgp_next_hop_uses_local_addr_not_router_id`, `test_propagate_to_all_peers_ebgp_next_hop_uses_local_addr`, e2e: `pathvectord_ebgp_next_hop_is_session_local_addr_not_router_id` |
 | iBGP peers pass-through: LOCAL_PREF preserved, AS_PATH unchanged, NEXT_HOP unchanged | `src/outbound.rs` | ✅ | `test_prepare_outbound_ibgp_preserves_attributes` |
-| LOCAL_PREF received from an eBGP peer MUST be ignored by the receiving speaker (RFC 4271 §5.1.5) | `src/daemon/route.rs` | ❌ | None — `handle_update`'s attribute loop captures `PathAttribute::LocalPref` unconditionally regardless of `peer_type`, and it flows into `best_path.rs`'s comparator uninspected; an eBGP peer can inject an arbitrary LOCAL_PREF and influence our best-path selection, which this MUST exists specifically to prevent. See `RFC_AUDIT.md` §5. |
+| LOCAL_PREF received from an eBGP peer MUST be ignored by the receiving speaker, except confederation Member-AS peers (RFC 4271 §5.1.5, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_ignored_from_ebgp_peer`, `test_local_pref_honored_from_ibgp_peer`, `test_local_pref_honored_from_confed_member_peer`, `test_ebgp_local_pref_cannot_win_best_path_over_shorter_as_path`. Original eBGP-ignore gap fixed 2026-07-xx (`RFC_AUDIT.md` §5); widened to the RFC 5065 confederation exception 2026-08-04 (`feature/rfc5065-confederation-member-support`). |
 | Withdrawal sent to all peers when a best path is removed | `src/daemon.rs` | ✅ | `test_propagate_prefix_sends_withdraw_when_route_removed`, `test_on_terminated_propagates_withdraw_to_other_established_peers` |
 | eBGP split-horizon: route received from eBGP peer not re-advertised back to that peer | `src/daemon.rs` | ✅ | `test_propagate_prefix_ebgp_source_peer_not_readvertised` |
 | iBGP split-horizon: route received from iBGP peer not re-advertised to other iBGP peers | `src/daemon.rs` | ✅ | `test_propagate_prefix_ibgp_split_horizon_no_send`, `test_propagate_prefix_ibgp_split_horizon_eviction_sends_withdraw` |
@@ -236,7 +236,8 @@ policy evaluates a route as `Accept` — lives here and in `pathvector-rib`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | `NO_ADVERTISE`: "MUST NOT be advertised to other BGP peers" — suppressed for both iBGP and eBGP peers | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_suppresses_ebgp_announcement`, `test_propagate_prefix_no_advertise_suppresses_ibgp_announcement`, `test_propagate_prefix_v6_no_advertise_suppresses_ebgp_announcement` |
-| `NO_EXPORT`/`NO_EXPORT_SUBCONFED`: "MUST NOT be advertised outside a BGP confederation boundary" / "...to external BGP peers" — suppressed for eBGP peers, not iBGP | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp` |
+| `NO_EXPORT`: "MUST NOT be advertised outside a BGP confederation boundary" — suppressed for `External` peers, not `Internal`/`ConfedMember` | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_suppresses_ebgp_but_allows_ibgp`, `test_propagate_prefix_v6_no_export_suppresses_ebgp_but_allows_ibgp` |
+| `NO_EXPORT_SUBCONFED`: "MUST NOT be advertised to external BGP peers (this includes peers in other members autonomous systems inside a BGP confederation)" — suppressed for `External` **and** `ConfedMember` peers, not `Internal` | `pathvector-rib/src/outbound.rs`, `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp` |
 | A route already advertised is withdrawn once it starts carrying a suppressing community | `src/outbound.rs` | ✅ | `test_propagate_prefix_no_advertise_withdraws_previously_announced` |
 | Suppression reflects communities *after* export policy runs, not the pre-policy Loc-RIB state — a policy-added well-known community suppresses; a policy-removed one lifts suppression | `src/outbound.rs` | ✅ | `test_propagate_prefix_export_policy_added_no_advertise_suppresses_announcement`, `test_propagate_prefix_export_policy_removes_no_export_allows_ebgp_announcement` |
 
@@ -256,15 +257,15 @@ See `pathvector-policy/RFC.md`'s RFC 1997 section for how `SetCommunities`
 (replaces the entire list, well-known or not) relates to RFC 8642's
 documentation requirement for the "set" directive.
 
-**Confederation-boundary scoping note:** RFC 1997 defines `NO_EXPORT`'s
-boundary as the confederation boundary, explicitly noting "a stand-alone
-autonomous system that is not part of a confederation should be considered
-a confederation itself." This project has no confederation-member `PeerType`
-(see `TODO.md`'s RFC 5065 gap) — a stand-alone AS's confederation boundary
-is its own AS boundary, so `NO_EXPORT` collapses to blocking eBGP peers only,
-identical to `NO_EXPORT_SUBCONFED`, for today's deployment shape. If
-confederation-member support is ever added, `is_export_suppressed()` will
-need a third case for that peer relationship.
+**Confederation-boundary scoping note (resolved 2026-08-04):** RFC 1997
+defines `NO_EXPORT`'s boundary as the confederation boundary, explicitly
+noting "a stand-alone autonomous system that is not part of a confederation
+should be considered a confederation itself." With RFC 5065 confederation
+Member-AS support now implemented (see the RFC 5065 section below),
+`is_export_suppressed()` correctly distinguishes the two cases:
+`NO_EXPORT` blocks `External` peers only (a `ConfedMember` peer is, by
+definition, still inside the confederation boundary); `NO_EXPORT_SUBCONFED`
+blocks both `External` and `ConfedMember` peers.
 
 ---
 
@@ -475,3 +476,89 @@ by this feature) — all six size/scenario combinations landed within ~1-2% of
 the same "no change"/"within noise" result via Criterion's own before/after
 comparison. Matches the architectural expectation: OTC storage is lazily
 allocated on `RareAttrs` and adds only O(1) checks on the hot path.
+
+---
+
+## RFC 5065 — AS Confederations for BGP (Full Member-AS Support)
+
+**Owns:** Confederation config schema (`DaemonConfig.confederation_id`,
+`PeerConfig.confederation_member`, `effective_confederation_member`);
+threading `confederation_member`/`confederation_id` into every session
+classification and spawn call site; `public_as` resolution
+(`confederation_id.unwrap_or(local_as)`) and threading it through the
+outbound pipeline; the MED/RR-metadata attribute-stripping split for
+`ConfedMember` peers; the RFC 5065 §5 malformed-AS_PATH import checks and
+the extended (confederation-ID-aware) loop detection; gRPC/proto surface.  
+**Boundary:** AS_PATH segment types, `strip_confed_segments()`,
+`prepend_confed()`, and `PeerType::ConfedMember` live in `pathvector-types`.
+Best-path preference (`ConfedMember` ties with `Internal`), split-horizon,
+and `prepare_outbound`/`prepare_outbound_v6`'s per-peer-type AS_PATH/
+NEXT_HOP/LOCAL_PREF transform live in `pathvector-rib`. The **authoritative**
+`PeerType` classification for live Established sessions is in
+`pathvector-session`'s FSM (`FsmConfig.confederation_member` /
+`Fsm::build_session_info`) — see that crate's `RFC.md`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc5065
+
+Prior to this work, RFC 5065 support was pass-through/interop only:
+correctly stripping confederation segments from routes relayed from someone
+else's confederation, but with zero representation for *originating or
+relaying as an actual confederation Member-AS* — `PeerType` had only
+`Internal`/`External`/`Local`, and there was no confederation config schema
+at all. Flagged as "significant, architectural, not a quick fix" by
+`RFC_AUDIT.md`'s 2026-07-16 audit-the-audit finding and filed as its own
+initiative (`TODO.md` task #128) rather than folded into the smaller RFC
+4271/9234/1997 fixes shipped earlier. Full Member-AS support shipped
+2026-08-04 (`feature/rfc5065-confederation-member-support`).
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `DaemonConfig.confederation_id` / `PeerConfig.confederation_member` config schema | `src/config.rs` | ✅ | `sidecar_round_trips_all_fields` |
+| `config_peer_type` classifies `ConfedMember` when `confed_member` is set and AS numbers differ; `local_as == remote_as` still wins first (matches BIRD's `is_internal` precedence) | `src/daemon/mod.rs` | ✅ | `test_config_peer_type_confed_member`, `test_config_peer_type_same_as_wins_over_confed_member`, `prop_config_peer_type_internal_iff_equal` |
+| `effective_confederation_member` degrades gracefully (warns, treats as plain eBGP) when `confederation_member` is set but `confederation_id` isn't — mirrors `effective_role`'s shape | `src/daemon/mod.rs` | ✅ | (exercised via `add_peer`/session-spawn call sites; no separate config-abort path exists in this codebase for per-peer misconfiguration, matching `effective_role`'s precedent) |
+| `confederation_id` threaded through `RibSnapshot`/`DaemonState::new`/`SpawnConfig`/`SessionConfig` to every classification and session-spawn site — the critical fix for the two-place `PeerType` classification gap (FSM for live sessions, `config_peer_type` for pre-Established/post-disconnect) | `src/daemon/mod.rs`, `src/daemon/peer.rs`, `src/daemon/capabilities.rs` | ✅ | Full 726-test suite; see `pathvector-session/RFC.md` for the FSM half |
+| `public_as` (`confederation_id.unwrap_or(local_as)`) resolved once per propagation site and threaded through `propagate_prefix`/`propagate_prefix_v6` to `prepare_outbound`/`prepare_outbound_v6` | `src/outbound.rs`, `src/daemon/route.rs`, `src/daemon/policy.rs`, `src/daemon/deferral.rs`, `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | Full 726-test suite (mechanical threading, same shape as the `deferred`-parameter PR) |
+| MED not stripped for `ConfedMember` (RFC 5065 §5.2); ORIGINATOR_ID/CLUSTER_LIST still stripped for `ConfedMember` (deliberate — RR clusters are scoped to a single AS's internal topology; RFC 5065 is silent on the interaction, and letting RR metadata cross a Member-AS boundary risks cluster-ID collisions without serving RR's loop-prevention purpose) | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` | ✅ | `test_route_v6_to_attributes_ibgp_preserves_med`-style coverage extended to the `strip_med`/`strip_rr_metadata` split |
+| LOCAL_PREF accept guard widened from `Internal`-only to `Internal \| ConfedMember` (RFC 4271 §5.1.5's confederation exception, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_honored_from_confed_member_peer` |
+| Loop detection (RFC 4271 §9.1.2) extended to also check the confederation ID, not just `local_as` (RFC 5065 §4) | `src/daemon/route.rs` | ✅ | `test_as_path_loop_detection_drops_confederation_id_in_path`, `test_as_path_loop_detection_confederation_id_absent_does_not_block` |
+| RFC 5065 §5 condition 1: confed segment from an `External` peer is malformed — session reset | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_resets_session` |
+| RFC 5065 §5 condition 2: non-empty `ConfedMember` AS_PATH not starting with `AS_CONFED_SEQUENCE` is malformed — session reset | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_member_peer_missing_confed_sequence_resets_session`, `test_malformed_as_path_confed_member_peer_with_confed_sequence_first_is_accepted` (negative case) |
+| Both §5 conditions are session-reset, not treat-as-withdraw — a deliberate departure from BIRD | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_conditions_are_session_reset_not_withdraw` |
+| gRPC `proto_peer_type()` includes `ConfedMember` (compiler-forced exhaustive match) | `src/grpc.rs` | ✅ | (compile-time guarantee) |
+
+**Session-reset vs. treat-as-withdraw for RFC 5065 §5 (deliberate, RFC-text-
+grounded departure from BIRD):** BIRD implements both of RFC 5065 §5's new
+malformed-AS_PATH conditions as treat-as-withdraw rather than session-reset.
+This project instead implements literal session-reset, matching RFC 5065
+§5's own unamended citation of RFC 4271 §6.3's original procedure. The
+reasoning: RFC 7606 (which revises several RFC 4271 error-handling
+procedures to treat-as-withdraw) states its own scope explicitly — "This
+document updates error handling for RFCs 1997, 4271, 4360, 4456, 4760,
+5543, 5701, and 6368." RFC 5065 is absent from that list, and RFC 7606
+never mentions RFC 5065 or confederations anywhere in its text (confirmed
+by direct fetch and grep of both RFCs' text, not from memory). This follows
+the same precedent this project already established for RFC 4271 §6.3
+itself — see the CHANGELOG's 2026-08-04 revert entry — "BIRD imitation
+should be reserved for genuinely underspecified areas... not used to
+override a clear requirement just because it's inconvenient."
+
+**Critical finding caught during planning, not implementation (see
+`pathvector-session/RFC.md`'s RFC 5065 section for the fix):** `PeerType`
+is classified in two independent places workspace-wide — this crate's
+`config_peer_type` (authoritative only for the pre-Established/
+post-disconnect windows) and `pathvector-session`'s FSM
+(`Fsm::build_session_info`, authoritative for every live Established
+session). A design that extended only `config_peer_type` would have
+shipped a daemon that classifies correctly while a peer is disconnected
+and silently misclassifies every live confederation-member session as
+plain `External` — caught by a dedicated design-review pass before any
+code was written, independently re-verified by reading `fsm/mod.rs`
+directly.
+
+**Deferred:** RFC 5065 §4.1's "MAY include/prepend more than one
+instance... controlled via local configuration" (SHOULD-level
+repeat-prepend-count knob) — no existing precedent anywhere in this
+codebase for a "prepend N times" config field. Filed as a follow-up
+`TODO.md` item rather than folded into this already-large feature. Also
+deferred: the gRPC `AddPeer` RPC does not yet expose a
+`confederation_member` field, so dynamically-added peers cannot be
+configured as confederation members (static config only, for now).

@@ -4,6 +4,76 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-04 (RFC 5065: full BGP Confederation Member-AS support)
+
+### [pathvector-types, pathvector-rib, pathvector-session, pathvectord, pathvector-client] Originate/relay as a confederation Member-AS, not just pass-through interop
+
+Prior to this work, RFC 5065 support was pass-through/interop only —
+correctly stripping confederation segments from routes relayed from
+someone else's confederation, but with zero representation for
+*originating or relaying as an actual confederation Member-AS*: `PeerType`
+had only `Internal`/`External`/`Local`, and there was no confederation
+config schema at all. Flagged as "significant, architectural, not a quick
+fix" by `RFC_AUDIT.md`'s 2026-07-16 audit-the-audit finding and filed as
+its own initiative (`TODO.md` task #128) rather than folded into the
+smaller RFC 4271/9234/1997 fixes shipped earlier this session.
+
+Grounded in three research passes, not memory: RFC 5065's full text (§4.1
+AS_PATH modification rules, §5 error handling, §5.1-§5.3 NEXT_HOP/MED/
+LOCAL_PREF/best-path exceptions); RFC 1997's exact `NO_EXPORT` vs.
+`NO_EXPORT_SUBCONFED` wording; and RFC 7606's own scope statement ("This
+document updates error handling for RFCs 1997, 4271, 4360, 4456, 4760,
+5543, 5701, and 6368") — RFC 5065 is absent from that list, so its two new
+malformed-AS_PATH conditions (§5) are implemented as session-reset, not
+treat-as-withdraw, a deliberate departure from BIRD's more lenient
+practice matching the precedent this session already established for RFC
+4271 §6.3 (see the entry below).
+
+**New:** `PeerType::ConfedMember`, `AsPath::prepend_confed()`,
+`DaemonConfig.confederation_id`/`PeerConfig.confederation_member` config
+schema, `FsmConfig.confederation_member` (the authoritative classifier for
+live Established sessions), `config_peer_type`/`effective_confederation_member`
+(the pre-Established/post-disconnect classifier), an explicit best-path
+rank function (`ConfedMember` ties with `Internal`, which `PeerType`'s
+derived `Ord` cannot express), the `public_as` outbound parameter
+(`confederation_id.unwrap_or(local_as)`), a strip-then-prepend ordering
+fix in `prepare_outbound`/`prepare_outbound_v6`, the RFC 1997
+`NO_EXPORT`/`NO_EXPORT_SUBCONFED` split, LOCAL_PREF-accept widening,
+confederation-ID-aware loop detection, and two new RFC 5065 §5
+malformed-AS_PATH session-reset checks.
+
+**Critical finding caught during planning:** `PeerType` is classified in
+two independent places workspace-wide — `pathvectord`'s `config_peer_type`
+(authoritative only for the pre-Established/post-disconnect windows) and
+`pathvector-session`'s FSM (`Fsm::build_session_info`, authoritative for
+every live Established session). A design extending only
+`config_peer_type` would have shipped a daemon that silently
+misclassifies every live confederation-member session as plain
+`External` — caught by a dedicated Plan-subagent review pass before any
+code was written, independently re-verified by reading `fsm/mod.rs`
+directly, the same defensive pattern that caught the RFC 4724 §4.1
+EOR-only-peer wait-set bug earlier this session.
+
+**Second finding:** the existing (unmodified) `prepare_outbound`/
+`propagate_prefix` pipeline prepended before stripping confederation
+segments, producing two separate `Sequence` segments instead of one
+canonically-merged one for a route that already carries confed segments —
+fixed by reordering to strip-then-prepend inside `prepare_outbound`'s
+`External` branch.
+
+Real-teeth verified throughout: the FSM classification fix, the
+confederation-ID loop-detection extension, and both RFC 5065 §5
+malformed-AS_PATH checks were each reverted, confirmed to fail for the
+right reason, then restored and reran green against the full test suite
+(pathvector-session: 343 tests; pathvectord: 726 tests).
+
+See `pathvector-types/RFC.md`, `pathvector-rib/RFC.md`,
+`pathvector-session/RFC.md`, and `pathvectord/RFC.md`'s RFC 5065 sections
+for the full requirement-by-requirement writeup, and `TODO.md` item #128
+for the closure note.
+
+---
+
 ## 2026-08-04 (RFC 4724 §4.1 Restarting-Speaker Selection_Deferral_Timer)
 
 ### [pathvectord] No deferral of our own outbound route advertisement after a daemon restart

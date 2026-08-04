@@ -321,6 +321,10 @@ not fixed here):
   daemon has no confederation-aware peer classification at all yet (see
   item #22's 2026-07-18 scoping note, filed as its own separate,
   significantly larger initiative rather than folded into this fix).
+  **Confederation exception closed 2026-08-04** (`feature/rfc5065-
+  confederation-member-support`, item #128): the LOCAL_PREF accept guard
+  now widens to `PeerType::Internal | PeerType::ConfedMember`. See
+  `pathvectord/RFC.md`'s RFC 5065 section for the full writeup.
   Two pre-existing tests asserted the old (vulnerable) behavior as
   correct — `test_handle_update_inserts_route_with_all_attributes` and
   `test_handle_update_mp_reach_announces_ipv4_route` both asserted an
@@ -1777,6 +1781,18 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   of today's deployments, since no confederation config exists yet to
   even trigger the exception) and explicitly maintains this exact
   asymmetry rather than worsening or silently fixing it.
+  **Closed 2026-08-04** (`feature/rfc5065-confederation-member-support`,
+  item #128): `DaemonConfig.confederation_id`/`PeerConfig.confederation_member`
+  config schema added; `PeerType::ConfedMember` (the 4th variant this note
+  called for) threaded through both classification sites (the FSM for live
+  sessions — the authoritative one, per a critical finding caught during
+  planning — and `config_peer_type` for the pre-Established/post-disconnect
+  window), best-path preference, split-horizon, `NO_EXPORT_SUBCONFED`,
+  outbound LOCAL_PREF/NEXT_HOP/MED rules, AS_CONFED-segment stripping (plus
+  a latent strip-then-prepend ordering bug found and fixed along the way),
+  and the two new RFC 5065 §5 malformed-AS_PATH session-reset checks. See
+  `pathvectord/RFC.md`'s RFC 5065 section for the full requirement-by-
+  requirement writeup.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
