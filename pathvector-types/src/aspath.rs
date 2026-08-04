@@ -244,6 +244,41 @@ impl AsPath {
         }
     }
 
+    /// Prepends an ASN into a leading `ConfedSequence` segment, following
+    /// RFC 5065 §4.1(b).
+    ///
+    /// This is what a confederation Member-AS does before re-advertising a
+    /// route to a fellow Member-AS peer: it adds its own Member-AS Number
+    /// to the front of the path's confederation portion, rather than the
+    /// public `AS_SEQUENCE` used for [`prepend`](Self::prepend).
+    ///
+    /// The rules mirror `prepend`'s, but target `ConfedSequence`:
+    /// - If the first segment is a `ConfedSequence` with fewer than 255
+    ///   entries, the ASN is inserted at the front of that segment.
+    /// - Otherwise, a new `ConfedSequence` segment containing just the ASN
+    ///   is prepended.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath};
+    ///
+    /// let mut path = AsPath::new();
+    /// path.prepend_confed(Asn::new(65001));
+    /// assert_eq!(path.path_length(), 0); // confed segments don't count
+    /// ```
+    pub fn prepend_confed(&mut self, asn: crate::Asn) {
+        match self.segments.first_mut() {
+            Some(AsPathSegment::ConfedSequence(asns)) if asns.len() < 255 => {
+                asns.insert(0, asn);
+            }
+            _ => {
+                self.segments
+                    .insert(0, AsPathSegment::ConfedSequence(vec![asn]));
+            }
+        }
+    }
+
     /// Returns `true` if this AS path contains the given ASN in any segment.
     ///
     /// Used for loop detection: a router must reject any route whose AS path
@@ -591,6 +626,60 @@ mod tests {
         path.prepend(Asn::new(256));
         // First segment was full (255 ASNs), so a new segment must be created
         assert_eq!(path.segments().len(), 2);
+    }
+
+    // ── prepend_confed (RFC 5065 §4.1(b)) ────────────────────────────────
+
+    #[test]
+    fn test_prepend_confed_to_empty() {
+        let mut path = AsPath::new();
+        path.prepend_confed(Asn::new(65001));
+        assert_eq!(path.segments().len(), 1);
+        assert!(matches!(
+            path.segments()[0],
+            AsPathSegment::ConfedSequence(_)
+        ));
+        assert_eq!(path.segments()[0].asns(), &[Asn::new(65001)]);
+        // Confed segments contribute 0 to path length.
+        assert_eq!(path.path_length(), 0);
+    }
+
+    #[test]
+    fn test_prepend_confed_extends_existing_leading_confed_sequence() {
+        let mut path =
+            AsPath::from_segments(vec![AsPathSegment::ConfedSequence(vec![Asn::new(65001)])]);
+        path.prepend_confed(Asn::new(65002));
+        // Should grow the existing confed sequence, not add a new segment.
+        assert_eq!(path.segments().len(), 1);
+        assert_eq!(
+            path.segments()[0].asns(),
+            &[Asn::new(65002), Asn::new(65001)]
+        );
+    }
+
+    #[test]
+    fn test_prepend_confed_to_non_confed_sequence_creates_new_segment() {
+        let mut path = AsPath::from_sequence(vec![Asn::new(100)]);
+        path.prepend_confed(Asn::new(65001));
+        // First segment is a plain Sequence: must create a new ConfedSequence in front.
+        assert_eq!(path.segments().len(), 2);
+        assert!(matches!(
+            path.segments()[0],
+            AsPathSegment::ConfedSequence(_)
+        ));
+        assert_eq!(path.segments()[0].asns(), &[Asn::new(65001)]);
+        assert!(matches!(path.segments()[1], AsPathSegment::Sequence(_)));
+    }
+
+    #[test]
+    fn test_prepend_confed_overflow_creates_new_segment() {
+        let asns: Vec<Asn> = (1u32..=255).map(Asn::new).collect();
+        let mut path = AsPath::from_segments(vec![AsPathSegment::ConfedSequence(asns)]);
+        assert_eq!(path.segments().len(), 1);
+        path.prepend_confed(Asn::new(256));
+        // First segment was full (255 ASNs), so a new segment must be created.
+        assert_eq!(path.segments().len(), 2);
+        assert_eq!(path.segments()[0].asns(), &[Asn::new(256)]);
     }
 
     #[test]

@@ -1,8 +1,13 @@
-/// Source of a BGP route: iBGP peer, eBGP peer, or locally originated.
+/// Source of a BGP route: iBGP peer, eBGP peer, confederation-member peer,
+/// or locally originated.
 ///
-/// The discriminant values encode the RFC 4271 §9.1 best-path preference
-/// order. Steps 3 and 7 are combined: locally originated routes (step 3)
-/// beat eBGP (step 7) which beats iBGP.
+/// The discriminant values do **not**, by themselves, encode the RFC 4271
+/// §9.1 best-path preference order — `Internal` and `ConfedMember` must
+/// *tie* in preference (RFC 5065 §5.3: a confederation-member peer's routes
+/// "MUST follow the same rules used for information received from members
+/// inside the same autonomous system"), which a linear discriminant cannot
+/// express. Best-path code must compare via an explicit rank function
+/// (see `pathvector-rib`'s `best_path.rs`), not this enum's derived `Ord`.
 ///
 /// # Examples
 ///
@@ -21,6 +26,10 @@ pub enum PeerType {
     /// Locally originated — injected via the origination API, not learned
     /// from any peer. Wins best-path selection at RFC 4271 §9.1 step 3.
     Local = 2,
+    /// A fellow BGP confederation Member-AS (RFC 5065) — eBGP at the wire
+    /// level, but treated like `Internal` for best-path preference,
+    /// LOCAL_PREF, and split-horizon purposes.
+    ConfedMember = 3,
 }
 
 impl std::fmt::Display for PeerType {
@@ -29,6 +38,7 @@ impl std::fmt::Display for PeerType {
             Self::Internal => write!(f, "ibgp"),
             Self::External => write!(f, "ebgp"),
             Self::Local => write!(f, "local"),
+            Self::ConfedMember => write!(f, "confed-member"),
         }
     }
 }
@@ -49,6 +59,7 @@ mod tests {
         assert_eq!(PeerType::Internal.to_string(), "ibgp");
         assert_eq!(PeerType::External.to_string(), "ebgp");
         assert_eq!(PeerType::Local.to_string(), "local");
+        assert_eq!(PeerType::ConfedMember.to_string(), "confed-member");
     }
 
     #[test]
@@ -56,7 +67,9 @@ mod tests {
         assert_eq!(PeerType::Internal, PeerType::Internal);
         assert_eq!(PeerType::External, PeerType::External);
         assert_eq!(PeerType::Local, PeerType::Local);
+        assert_eq!(PeerType::ConfedMember, PeerType::ConfedMember);
         assert_ne!(PeerType::Internal, PeerType::External);
         assert_ne!(PeerType::External, PeerType::Local);
+        assert_ne!(PeerType::Internal, PeerType::ConfedMember);
     }
 }
