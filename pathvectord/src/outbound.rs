@@ -14,7 +14,7 @@ use pathvector_session::message::{
     MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage, encode_attributes,
     nlri_encoded_len, nlri_v6_encoded_len,
 };
-use pathvector_types::{AfiSafi, NextHop, Nlri, PeerType};
+use pathvector_types::{AfiSafi, NextHop, Nlri, PeerType, UnknownAttribute};
 use tokio::sync::mpsc;
 
 /// BGP UPDATE wire overhead: 19-byte header + 2-byte withdrawn-len + 2-byte
@@ -94,6 +94,14 @@ pub(crate) fn route_to_attributes(
     if let Some(asn) = rare.otc {
         attrs.push(PathAttribute::OnlyToCustomer(asn));
     }
+    // RFC 4271 §5: unrecognized transitive optional attributes are
+    // forwarded unconditionally, regardless of peer type (like OTC above)
+    // — only unrecognized *non-transitive* attributes get peer-type-scoped
+    // treatment, and those are never stored in `rare.unknown` in the first
+    // place (RareAttrs::unknown's own doc comment). pathvector-session's
+    // encoder sets the Partial bit for exactly this Optional|Transitive
+    // flag combination.
+    attrs.extend(unknown_attrs_to_path_attributes(&rare.unknown));
     // RFC 6793 §4: when the peer is 2-byte-only, include AS4_PATH so that
     // 4-byte-capable routers further along the path can reconstruct the full
     // AS path. Only emitted when downgrade actually substituted AS_TRANS above.
@@ -101,6 +109,22 @@ pub(crate) fn route_to_attributes(
         attrs.push(PathAttribute::As4Path(as4));
     }
     attrs
+}
+
+/// RFC 4271 §5: converts stored unrecognized transitive optional attributes
+/// back into wire-level `PathAttribute::Unknown` for re-forwarding. Optional
+/// (0x80) and Transitive (0x40) flags are always set — the only combination
+/// ever stored in `RareAttrs::unknown` — so `pathvector-session`'s encoder
+/// unconditionally sets the Partial bit when re-encoding these.
+fn unknown_attrs_to_path_attributes(
+    unknown: &[UnknownAttribute],
+) -> impl Iterator<Item = PathAttribute> + '_ {
+    const FLAGS_OPTIONAL_TRANSITIVE: u8 = 0x80 | 0x40;
+    unknown.iter().map(|attr| PathAttribute::Unknown {
+        flags: FLAGS_OPTIONAL_TRANSITIVE,
+        type_code: attr.type_code,
+        value: attr.value.clone(),
+    })
 }
 
 /// The outbound decision for a single prefix after AdjRibOut processing.
@@ -636,6 +660,9 @@ pub(crate) fn route_v6_to_attributes(
     if let Some(asn) = rare.otc {
         attrs.push(PathAttribute::OnlyToCustomer(asn));
     }
+    // RFC 4271 §5: unrecognized transitive optional attributes — see the
+    // v4 `route_to_attributes`'s comment on `unknown_attrs_to_path_attributes`.
+    attrs.extend(unknown_attrs_to_path_attributes(&rare.unknown));
     if let Some(as4) = as4_path {
         attrs.push(PathAttribute::As4Path(as4));
     }
@@ -1786,6 +1813,44 @@ mod route_to_attributes_tests {
             as4_asns, asns,
             "AS4_PATH must preserve all original 4-byte ASNs in order"
         );
+    }
+
+    /// RFC 4271 §5: an unrecognized transitive optional attribute stored on
+    /// a route must be re-forwarded with the Optional and Transitive flags
+    /// set — pathvector-session's own encoder then sets the Partial bit
+    /// when it sees this exact flag combination on a `PathAttribute::Unknown`.
+    #[test]
+    fn unrecognized_transitive_attribute_is_forwarded_with_optional_transitive_flags() {
+        use pathvector_types::UnknownAttribute;
+
+        let route = RouteBuilder::new(
+            nlri("10.0.0.0/8"),
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65001)]),
+        )
+        .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .unknown_attribute(UnknownAttribute::new(200, vec![0xDE, 0xAD]))
+        .build();
+
+        let attrs = route_to_attributes(&route, PeerType::External, true);
+        let unknown = attrs
+            .iter()
+            .find_map(|a| match a {
+                PathAttribute::Unknown {
+                    flags,
+                    type_code,
+                    value,
+                } => Some((*flags, *type_code, value.clone())),
+                _ => None,
+            })
+            .expect("PathAttribute::Unknown must be present in outbound attributes");
+        assert_eq!(
+            unknown.0,
+            0x80 | 0x40,
+            "Optional and Transitive bits must both be set"
+        );
+        assert_eq!(unknown.1, 200);
+        assert_eq!(unknown.2, vec![0xDE, 0xAD]);
     }
 }
 

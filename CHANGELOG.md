@@ -83,6 +83,135 @@ same way, just not injected deliberately — the first version of the test
 suite found it on its own. Full workspace build/test (713 passing in
 `pathvectord`), `cargo fmt`, and `cargo clippy -D warnings` clean.
 
+---
+
+## 2026-08-04 (RFC 4271 §6.3: revert treat-as-withdraw back to session-reset)
+
+### [pathvector-session] Restored RFC-4271-literal session-reset for unrecognized well-known attribute
+
+A code review (Codex) on the branch carrying yesterday's treat-as-withdraw
+revision (below) flagged it as a compliance regression before it merged.
+On reflection, correctly so: RFC 4271 §6.3's requirement here is an
+unamended MUST, not an area the RFC leaves ambiguous — confirmed again
+that RFC 7606's §3 revisions are an explicit, exhaustive (a)-(j) list that
+never touches this subcode. "A specific other implementation (BIRD) does
+X" is a fine tie-breaker when the RFC text itself is genuinely silent or
+underspecified (as with RFC 4724 §4.1's Restarting-Speaker deferral
+scope), but it isn't a valid basis for deviating from unambiguous RFC
+text just because the RFC's chosen behavior (full session reset) is
+stricter than what's convenient.
+
+Restored `AttributeErrorPolicy::SessionReset { error, data }` and the
+exact decode/transport-layer behavior from the original 2026-07-31 fix by
+checking out that commit's version of `pathvector-session/src/message/update.rs`
+and `pathvector-session/src/transport/mod.rs`, rather than reimplementing
+from scratch — guarantees an exact match rather than a close
+approximation. All three original tests are back:
+`test_unrecognized_well_known_attribute_is_session_reset`,
+`test_unrecognized_well_known_attribute_extended_length_data_field`, and
+`test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`.
+
+Real-teeth re-verified: reintroduced yesterday's treat-as-withdraw policy,
+confirmed the two decode-level tests failed for the right reason, restored
+and reconfirmed passing. Full `pathvector-session` test suite (341 unit +
+18 integration + 2 doctests) green.
+
+## 2026-08-03 (RFC 4271 §6.3 policy revision: session-reset → treat-as-withdraw)
+
+### [pathvector-session] Unrecognized well-known attribute now treat-as-withdraw, matching real-world practice instead of the literal RFC 4271 text
+
+The 2026-07-31 fix for this clause implemented RFC 4271 §6.3 literally:
+an unrecognized attribute with the Optional bit clear triggers
+NOTIFICATION(UPDATE Error, Unrecognized Well-known Attribute) and a full
+session reset, since RFC 7606's §3 revisions are an explicit, exhaustive
+(a)-(j) list that never mentions this subcode. Asked what a real-world
+implementation actually does here rather than relying on the literal
+text alone: checked BIRD's source directly
+(`proto/bgp/attrs.c`'s `bgp_decode_attrs`). For exactly this case, BIRD
+uses its `WITHDRAW` path (`s->err_withdraw = 1`, session stays up), not
+`REJECT` (session reset) — extending RFC 7606's "minimize blast radius"
+philosophy to a clause it doesn't explicitly cover, rather than the
+stricter literal-RFC-4271 reading. This project now follows the same
+practice: an ordinary peer sending one unrecognized attribute (version
+skew, a vendor extension) shouldn't tear down the whole session over it.
+
+Changed the policy from `SessionReset` to `TreatAsWithdraw` in
+`decode_path_attributes`. This let `AttributeErrorPolicy::SessionReset`
+revert to a unit variant (only the pre-existing duplicated
+MP_REACH_NLRI/MP_UNREACH_NLRI case still uses it, RFC 7606 §3(g)),
+`handle_malformed_update` revert to its simpler hardcoded-NOTIFICATION
+form, and removed the now-obsolete Data-reconstruction logic entirely —
+a net simplification on top of the policy change, not just a flip.
+Renamed the decode-level test to
+`test_unrecognized_well_known_attribute_is_treat_as_withdraw` (dropped
+the now-irrelevant extended-length Data-field variant) and removed the
+dedicated session-level NOTIFICATION test — the transport layer no
+longer has any behavior specific to this clause, since it's fully
+absorbed into the pre-existing generic treat-as-withdraw pathway
+(already proven by `test_rfc7606_treat_as_withdraw_keeps_session_up_and_withdraws_nlri`).
+
+Real-teeth verified: flipped the policy back to `SessionReset` and
+confirmed the renamed decode-level test failed with the exact expected
+diagnostic; restored and reconfirmed passing. Full workspace
+build/test, `cargo fmt`, and `cargo clippy` clean.
+
+---
+
+## 2026-08-03 (RFC 4271 §5 unrecognized-transitive-attribute storage)
+
+### [pathvector-types, pathvector-rib, pathvectord] Unrecognized transitive optional attributes couldn't survive a relay through this router
+
+RFC 4271 §5: "Paths with unrecognized transitive optional attributes
+SHOULD be accepted [and] passed... to other BGP peers with the Partial
+bit... set to 1. Unrecognized non-transitive optional attributes MUST be
+quietly ignored and not passed along." `Route`/`RareAttrs`
+(`pathvector-rib`) had no field of any kind for an opaque/unrecognized
+attribute, so any unrecognized attribute — transitive or not — was
+unconditionally dropped the moment a route was accepted into the RIB.
+This was a real transit-correctness concern: any future/foreign BGP path
+attribute riding through this router as a transit AS would have been
+silently stripped, not just an incomplete-coverage gap.
+
+Checked what a real-world implementation does before scoping this: BIRD
+(`proto/bgp/attrs.c`) already stores unknown attributes generically as
+opaque bytes in its extended-attribute system and re-exports transitive
+ones with the Partial bit set — confirming this really was "just" a
+data-model gap, not a deeper architectural problem.
+
+Added `pathvector_types::UnknownAttribute { type_code: u8, value: Vec<u8> }`
+rather than having `pathvector-rib` depend on `pathvector-session`'s
+wire-level `PathAttribute` type directly — both crates already depend on
+`pathvector-types`, so this avoids a new dependency edge between
+siblings. Only the type code and raw value bytes are stored: only the
+Optional=1,Transitive=1 combination is ever stored (matching RFC 4271
+§5's own text), and re-encoding always emits that flag combination
+unconditionally — `pathvector-session`'s own encoder then sets the
+Partial bit for exactly that combination, correctly ignoring whatever
+the incoming Partial bit was (forwarding an attribute we didn't
+originate/verify always requires Partial=1).
+
+`RareAttrs` gained `pub unknown: Vec<UnknownAttribute>` following the
+existing lazy-allocate-on-first-write pattern used for
+communities/cluster_list/etc.; `RouteBuilder` gained
+`.unknown_attribute(attr)` mirroring `.community(c)`. On ingest,
+`handle_update`'s attribute loop gained a match arm for
+`PathAttribute::Unknown` guarded on both flag bits, wired into both the
+IPv4 and IPv6 `RouteBuilder` construction sites. On egress,
+`route_to_attributes`/`route_v6_to_attributes` forward stored unknown
+attributes unconditionally regardless of peer type — matching how OTC
+(RFC 9234 §3, also optional+transitive) is already handled, since RFC
+4271 §5 doesn't gate transitive-attribute forwarding on peer type
+either.
+
+4 new tests across ingest, egress, and the new type itself. Real-teeth
+verified: removed the new `handle_update` match arm and confirmed the
+storage test failed with the exact expected diagnostic; separately
+removed the new outbound calls and confirmed the egress test failed;
+both reverts restored and reconfirmed passing. Full workspace
+build/test, `cargo fmt`, and `cargo clippy` clean.
+
+---
+
 ## 2026-08-03 (RFC 4271 §4.1 trailing-padding rejection)
 
 ### [pathvector-session] OPEN and ROUTE_REFRESH silently accepted trailing padding within the declared header Length

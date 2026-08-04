@@ -456,6 +456,41 @@ impl std::fmt::Display for Aggregator {
     }
 }
 
+/// An unrecognized transitive optional path attribute (RFC 4271 §5),
+/// preserved as opaque bytes so it can be forwarded unchanged (with the
+/// Partial bit set on the wire) even though this implementation doesn't
+/// understand its semantics.
+///
+/// Only ever constructed for attributes with both the Optional and
+/// Transitive flag bits set on receipt — an unrecognized *non-transitive*
+/// attribute MUST be quietly ignored and never stored or forwarded (RFC
+/// 4271 §5), so no such case is represented here.
+///
+/// # Examples
+///
+/// ```
+/// use pathvector_types::UnknownAttribute;
+///
+/// let attr = UnknownAttribute::new(128, vec![0xDE, 0xAD]);
+/// assert_eq!(attr.type_code, 128);
+/// assert_eq!(attr.value, vec![0xDE, 0xAD]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownAttribute {
+    /// The BGP path attribute type code.
+    pub type_code: u8,
+    /// The raw attribute value bytes, exactly as received.
+    pub value: Vec<u8>,
+}
+
+impl UnknownAttribute {
+    /// Creates a new `UnknownAttribute`.
+    #[must_use]
+    pub fn new(type_code: u8, value: Vec<u8>) -> Self {
+        Self { type_code, value }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,5 +641,25 @@ mod tests {
         let c = Aggregator::new(Asn::new(65001), Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    // --- UnknownAttribute ---
+
+    #[test]
+    fn test_unknown_attribute_new() {
+        let attr = UnknownAttribute::new(128, vec![0xDE, 0xAD]);
+        assert_eq!(attr.type_code, 128);
+        assert_eq!(attr.value, vec![0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn test_unknown_attribute_equality() {
+        let a = UnknownAttribute::new(128, vec![1, 2, 3]);
+        let b = UnknownAttribute::new(128, vec![1, 2, 3]);
+        let c = UnknownAttribute::new(128, vec![1, 2, 4]);
+        let d = UnknownAttribute::new(129, vec![1, 2, 3]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
     }
 }

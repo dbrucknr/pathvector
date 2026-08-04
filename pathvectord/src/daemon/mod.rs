@@ -30,7 +30,7 @@ use pathvector_session::{
     },
 };
 use pathvector_types::{
-    AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType, Role,
+    AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType, Role, UnknownAttribute,
 };
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
@@ -4213,6 +4213,84 @@ mod tests {
         assert_eq!(rare.extended_communities.len(), 1);
         assert!(rare.atomic_aggregate);
         assert!(rare.aggregator.is_some());
+    }
+
+    // ── RFC 4271 §5: unrecognized transitive optional attributes ──────────────
+    // "Paths with unrecognized transitive optional attributes SHOULD be
+    // accepted [and] passed... to other BGP peers with the Partial bit...
+    // set to 1. Unrecognized non-transitive optional attributes MUST be
+    // quietly ignored and not passed along."
+
+    #[test]
+    fn test_handle_update_stores_unrecognized_transitive_attribute() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                PathAttribute::Unknown {
+                    flags: 0xC0, // Optional (0x80) | Transitive (0x40)
+                    type_code: 200,
+                    value: vec![0xDE, 0xAD],
+                },
+            ],
+            announced: vec![nlri("192.168.0.0/16")],
+        };
+        handle_update_v4(
+            peer(),
+            msg,
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        let route = rib.best(&nlri("192.168.0.0/16")).unwrap();
+        let unknown = &route.rare_or_default().unknown;
+        assert_eq!(
+            unknown.len(),
+            1,
+            "unrecognized transitive attribute must be stored"
+        );
+        assert_eq!(unknown[0].type_code, 200);
+        assert_eq!(unknown[0].value, vec![0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn test_handle_update_quietly_ignores_unrecognized_non_transitive_attribute() {
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        let msg = UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65009)])),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                PathAttribute::Unknown {
+                    flags: 0x80, // Optional only — non-transitive
+                    type_code: 201,
+                    value: vec![0xBE, 0xEF],
+                },
+            ],
+            announced: vec![nlri("192.168.0.0/16")],
+        };
+        handle_update_v4(
+            peer(),
+            msg,
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+
+        let route = rib.best(&nlri("192.168.0.0/16")).unwrap();
+        assert!(
+            route.rare_or_default().unknown.is_empty(),
+            "unrecognized non-transitive attribute must be quietly ignored, not stored"
+        );
     }
 
     // ── RFC 4271 §5.1.5: LOCAL_PREF from an external peer MUST be ignored ─────

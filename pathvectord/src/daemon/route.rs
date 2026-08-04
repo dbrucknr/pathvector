@@ -957,6 +957,7 @@ pub(super) fn handle_update(
     let mut originator_id: Option<Ipv4Addr> = None;
     let mut cluster_list: Vec<u32> = Vec::new();
     let mut otc: Option<Asn> = None;
+    let mut unknown: Vec<UnknownAttribute> = Vec::new();
     // (nlri, next_hop) pairs from MP_REACH_NLRI; next_hop is mandatory there.
     let mut mp_v4_announced: Vec<(Nlri<Ipv4Addr>, NextHop)> = Vec::new();
     let mut mp_v4_withdrawn: Vec<Nlri<Ipv4Addr>> = Vec::new();
@@ -993,6 +994,21 @@ pub(super) fn handle_update(
             PathAttribute::OriginatorId(id) => originator_id = Some(*id),
             PathAttribute::ClusterList(list) => cluster_list.clone_from(list),
             PathAttribute::OnlyToCustomer(asn) => otc = Some(*asn),
+            // RFC 4271 §5: "Paths with unrecognized transitive optional
+            // attributes SHOULD be accepted [and] passed... to other BGP
+            // peers with the Partial bit... set to 1. Unrecognized
+            // non-transitive optional attributes MUST be quietly ignored
+            // and not passed along." Optional=bit 0x80, Transitive=bit
+            // 0x40 of the attribute Flags octet; store only when both are
+            // set, matching pathvector-session's own encoder condition for
+            // when it sets the Partial bit on re-forward.
+            PathAttribute::Unknown {
+                flags,
+                type_code,
+                value,
+            } if flags & 0x80 != 0 && flags & 0x40 != 0 => {
+                unknown.push(UnknownAttribute::new(*type_code, value.clone()));
+            }
             PathAttribute::MpReachNlri(mp) => {
                 if mp.afi_safi == AfiSafi::IPV4_UNICAST {
                     for prefix in &mp.prefixes {
@@ -1309,6 +1325,9 @@ pub(super) fn handle_update(
         if let Some(asn) = otc {
             builder = builder.otc(asn);
         }
+        for attr in &unknown {
+            builder = builder.unknown_attribute(attr.clone());
+        }
 
         let mut raw = builder.build();
         if originator_id.is_some() || !cluster_list.is_empty() {
@@ -1431,6 +1450,9 @@ pub(super) fn handle_update(
         }
         if let Some(asn) = otc {
             builder = builder.otc(asn);
+        }
+        for attr in &unknown {
+            builder = builder.unknown_attribute(attr.clone());
         }
 
         let raw = builder.build();
