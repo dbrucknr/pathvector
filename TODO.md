@@ -466,22 +466,26 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   `REJECT` (session reset) — i.e. BIRD extends RFC 7606's "minimize
   blast radius" philosophy to this clause even though RFC 7606 never
   explicitly amends it. Changed the policy from `SessionReset` to
-  `TreatAsWithdraw` to match. This let `AttributeErrorPolicy::SessionReset`
-  revert to a unit variant (only the MP_REACH_NLRI/MP_UNREACH_NLRI
-  duplicate case still uses it), `handle_malformed_update` revert to its
-  simpler hardcoded-NOTIFICATION form, and removed the now-obsolete
-  Data-reconstruction logic in `decode_path_attributes` entirely — a net
-  simplification, not just a policy flip. Renamed
-  `test_unrecognized_well_known_attribute_is_session_reset` to
-  `test_unrecognized_well_known_attribute_is_treat_as_withdraw` (removed
-  the now-irrelevant extended-length Data-field variant, and removed the
-  session-level NOTIFICATION test since the transport layer no longer
-  has any behavior specific to this clause — it's fully absorbed into
-  the existing generic treat-as-withdraw pathway, already proven by
-  `test_rfc7606_treat_as_withdraw_keeps_session_up_and_withdraws_nlri`).
-  Real-teeth verified: flipped the policy back to `SessionReset` and
-  confirmed the renamed decode-level test failed with the exact expected
-  diagnostic; restored and reconfirmed passing.
+  `TreatAsWithdraw` to match.
+  **Reverted 2026-08-04** (same branch): a code review (Codex) on that
+  PR flagged it as a compliance regression before merge, and on
+  reflection this was the right call — §6.3 is an unamended RFC 4271
+  MUST, not an area the RFC leaves ambiguous for BIRD's practice to fill
+  in. "A specific other implementation does X" isn't a valid basis for
+  deviating from unambiguous RFC text absent an actual amending RFC;
+  BIRD imitation should be reserved for genuinely underspecified areas
+  (e.g. RFC 4724 §4.1's Restarting-Speaker deferral scope, where the RFC
+  text itself leaves room for interpretation), not used to override a
+  clear requirement just because it's inconvenient. Restored
+  `AttributeErrorPolicy::SessionReset { error, data }` and the exact
+  behavior/tests from the original 2026-07-31 fix (`git checkout` of the
+  pre-revision commit for both `update.rs` and `transport/mod.rs`, not a
+  fresh reimplementation) — `test_unrecognized_well_known_attribute_is_session_reset`,
+  `test_unrecognized_well_known_attribute_extended_length_data_field`,
+  and `test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+  are all back. Real-teeth re-verified: reintroduced the treat-as-withdraw
+  policy, confirmed the two decode-level tests failed for the right
+  reason, restored and reconfirmed passing.
 - **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
   semantic validation for one-hop eBGP peers is looser than §6.3's precise
   criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only

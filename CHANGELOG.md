@@ -4,6 +4,37 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-04 (RFC 4271 §6.3: revert treat-as-withdraw back to session-reset)
+
+### [pathvector-session] Restored RFC-4271-literal session-reset for unrecognized well-known attribute
+
+A code review (Codex) on the branch carrying yesterday's treat-as-withdraw
+revision (below) flagged it as a compliance regression before it merged.
+On reflection, correctly so: RFC 4271 §6.3's requirement here is an
+unamended MUST, not an area the RFC leaves ambiguous — confirmed again
+that RFC 7606's §3 revisions are an explicit, exhaustive (a)-(j) list that
+never touches this subcode. "A specific other implementation (BIRD) does
+X" is a fine tie-breaker when the RFC text itself is genuinely silent or
+underspecified (as with RFC 4724 §4.1's Restarting-Speaker deferral
+scope), but it isn't a valid basis for deviating from unambiguous RFC
+text just because the RFC's chosen behavior (full session reset) is
+stricter than what's convenient.
+
+Restored `AttributeErrorPolicy::SessionReset { error, data }` and the
+exact decode/transport-layer behavior from the original 2026-07-31 fix by
+checking out that commit's version of `pathvector-session/src/message/update.rs`
+and `pathvector-session/src/transport/mod.rs`, rather than reimplementing
+from scratch — guarantees an exact match rather than a close
+approximation. All three original tests are back:
+`test_unrecognized_well_known_attribute_is_session_reset`,
+`test_unrecognized_well_known_attribute_extended_length_data_field`, and
+`test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`.
+
+Real-teeth re-verified: reintroduced yesterday's treat-as-withdraw policy,
+confirmed the two decode-level tests failed for the right reason, restored
+and reconfirmed passing. Full `pathvector-session` test suite (341 unit +
+18 integration + 2 doctests) green.
+
 ## 2026-08-03 (RFC 4271 §6.3 policy revision: session-reset → treat-as-withdraw)
 
 ### [pathvector-session] Unrecognized well-known attribute now treat-as-withdraw, matching real-world practice instead of the literal RFC 4271 text
