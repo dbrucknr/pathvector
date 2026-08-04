@@ -153,6 +153,10 @@ impl DaemonState {
             .copied()
             .unwrap_or(MAX_LEN);
         let local_as = self.rib.local_as;
+        // RFC 5065: the AS number prepended for genuinely external peers —
+        // the confederation identifier when confederations are configured,
+        // or `local_as` again when they are not.
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
@@ -174,6 +178,7 @@ impl DaemonState {
                         export_policy,
                         peer_type,
                         local_as,
+                        public_as,
                         local_bgp_id,
                         next_hop_self,
                         v4_deferred,
@@ -211,6 +216,7 @@ impl DaemonState {
                             export_policy_v6,
                             peer_type,
                             local_as,
+                            public_as,
                             local_ipv6,
                             next_hop_self,
                             v6_deferred,

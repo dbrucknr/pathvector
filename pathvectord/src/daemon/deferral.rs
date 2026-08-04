@@ -319,6 +319,7 @@ impl DaemonState {
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let local_next_hop = self
             .rib
@@ -361,6 +362,7 @@ impl DaemonState {
                     export_policy,
                     peer_type,
                     local_as,
+                    public_as,
                     local_next_hop,
                     next_hop_self,
                     false, // never deferred inside the dump itself — the
@@ -424,6 +426,7 @@ impl DaemonState {
         };
 
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
         let is_rr = !self.rib.rr_clients.is_empty();
@@ -454,6 +457,7 @@ impl DaemonState {
                     export_policy_v6,
                     peer_type,
                     local_as,
+                    public_as,
                     local_ipv6,
                     next_hop_self,
                     false,
