@@ -44,6 +44,12 @@ pub struct FsmConfig {
     pub required_capabilities: Vec<Capability>,
     /// Expected peer AS. `None` skips AS validation.
     pub peer_as: Option<u32>,
+    /// Whether the peer is a fellow BGP confederation Member-AS (RFC 5065),
+    /// rather than a genuine external peer. Classifies the established
+    /// session's [`PeerType`] as [`PeerType::ConfedMember`] instead of
+    /// [`PeerType::External`] when `peer_as != local_as`. Has no effect when
+    /// `peer_as == local_as` (already classified `Internal`).
+    pub confederation_member: bool,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -187,6 +193,7 @@ pub enum State {
 ///     capabilities: vec![],
 ///     required_capabilities: vec![],
 ///     peer_as: Some(65002),
+///     confederation_member: false,
 /// });
 /// assert_eq!(fsm.state(), State::Idle);
 /// ```
@@ -854,6 +861,8 @@ impl Fsm {
         let peer_as = resolve_as(peer);
         let peer_type = if peer_as == self.config.local_as {
             PeerType::Internal
+        } else if self.config.confederation_member {
+            PeerType::ConfedMember
         } else {
             PeerType::External
         };
@@ -950,6 +959,7 @@ mod tests {
             capabilities: vec![Capability::FourByteAsn(65001)],
             required_capabilities: vec![],
             peer_as: Some(65002),
+            confederation_member: false,
         }
     }
 
@@ -1136,6 +1146,50 @@ mod tests {
         let config = FsmConfig {
             local_as: 65002,
             peer_as: Some(65002),
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        fsm.process(FsmInput::TcpConnected);
+        fsm.process(FsmInput::MessageReceived(peer_open(65002, 90)));
+        let outputs = fsm.process(FsmInput::MessageReceived(BgpMessage::Keepalive));
+        let info = outputs
+            .iter()
+            .find_map(|o| {
+                if let FsmOutput::SessionEstablished(i) = o {
+                    Some(i.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("SessionEstablished");
+        assert_eq!(info.peer_type, pathvector_types::PeerType::Internal);
+    }
+
+    #[test]
+    fn test_session_info_confed_member_peer_type_when_configured() {
+        // RFC 5065: a peer with confederation_member=true and a different
+        // AS must classify as ConfedMember, not External — this is the
+        // authoritative classification for live Established sessions
+        // (distinct from pathvectord's config_peer_type, which only covers
+        // pre-Established/post-disconnect windows).
+        let config = FsmConfig {
+            confederation_member: true,
+            ..default_config()
+        };
+        let (_, info) = establish(config);
+        assert_eq!(info.peer_type, pathvector_types::PeerType::ConfedMember);
+    }
+
+    #[test]
+    fn test_session_info_same_as_wins_over_confed_member() {
+        // local_as == peer_as must classify Internal even when
+        // confederation_member is also set — matches config_peer_type's
+        // precedence in pathvectord.
+        let config = FsmConfig {
+            local_as: 65002,
+            peer_as: Some(65002),
+            confederation_member: true,
             ..default_config()
         };
         let mut fsm = Fsm::new(config);
@@ -1593,6 +1647,7 @@ mod tests {
             capabilities: vec![Capability::FourByteAsn(131_072)],
             required_capabilities: vec![],
             peer_as: Some(131_073),
+            confederation_member: false,
         };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);

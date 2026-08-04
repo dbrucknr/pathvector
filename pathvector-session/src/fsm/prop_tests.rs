@@ -16,6 +16,7 @@ fn default_config() -> FsmConfig {
         capabilities: vec![],
         required_capabilities: vec![],
         peer_as: None,
+        confederation_member: false,
     }
 }
 
