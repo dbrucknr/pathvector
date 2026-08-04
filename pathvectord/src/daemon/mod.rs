@@ -220,13 +220,25 @@ pub(crate) struct RibSnapshot {
     /// either did not advertise the capability or advertised `restart_time = 0`
     /// (EOR-only mode, no stale-route window).
     pub(crate) gr_capable_peers: HashMap<IpAddr, u16>,
+    /// Peers whose most-recent OPEN advertised the GracefulRestart
+    /// capability at all — including `restart_time == 0` (EOR-only mode).
+    ///
+    /// Distinct from `gr_capable_peers`, which only tracks `restart_time >
+    /// 0` peers for stale-route-retention purposes. RFC 4724 §3 explicitly
+    /// recommends advertising the capability with `restart_time == 0` "to
+    /// indicate its intention of generating the End-of-RIB marker," and RFC
+    /// 4724 §4.1's Restarting-Speaker wait-set (`daemon/deferral.rs`)
+    /// excludes only peers that "do not advertise the graceful restart
+    /// capability" at all — an EOR-only peer must still be waited on.
+    /// Populated on `Established`; removed on `Terminated`.
+    pub(crate) gr_advertised_peers: HashSet<IpAddr>,
     /// Peers whose most-recent GracefulRestart capability had the Restart
     /// State (R) bit set, i.e. they advertised that *they themselves* are
     /// currently restarting. RFC 4724 §4.1 excludes such peers from the
     /// Restarting-Speaker's own EOR wait-set, since a peer that is itself
     /// mid-restart cannot be expected to have already re-sent its table.
-    /// Populated alongside `gr_capable_peers` in `on_established`; removed
-    /// on `Terminated`.
+    /// Populated alongside `gr_advertised_peers` in `on_established`;
+    /// removed on `Terminated`.
     pub(crate) gr_peer_restarting: HashSet<IpAddr>,
     /// RFC 9234 BGP Role configured for each peer, if any. Present only for
     /// peers with `role` set in `PeerConfig` — absent means Role capability
@@ -562,6 +574,7 @@ impl DaemonState {
             eor_received: HashSet::new(),
             eor_received_v6: HashSet::new(),
             gr_capable_peers: HashMap::new(),
+            gr_advertised_peers: HashSet::new(),
             gr_peer_restarting: HashSet::new(),
             peer_roles,
             negotiated_roles: HashMap::new(),
@@ -15555,6 +15568,18 @@ mod selection_deferral_tests {
         }]
     }
 
+    /// RFC 4724 §3: a peer MAY advertise GracefulRestart with
+    /// `restart_time == 0` and no `<AFI, SAFI>` families specifically to
+    /// signal "I don't preserve forwarding state, but I will still
+    /// generate End-of-RIB" — not the same as never advertising GR at all.
+    fn eor_only_gr_caps() -> Vec<Capability> {
+        vec![Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 0,
+            families: vec![],
+        }]
+    }
+
     fn establish(
         state: &mut super::DaemonState,
         peer: Ipv4Addr,
@@ -15661,6 +15686,32 @@ mod selection_deferral_tests {
         assert!(
             state.selection_deferral.v4_deferred(),
             "gate must stay closed while a configured peer has never connected"
+        );
+    }
+
+    /// RFC 4724 §4.1 excludes only peers that "do not advertise the
+    /// graceful restart capability" — not peers that advertise it with
+    /// `restart_time == 0` (EOR-only mode). A single such peer must still
+    /// block the gate until it sends EOR, exactly like a full GR peer.
+    #[test]
+    fn eor_only_gr_peer_keeps_gate_closed_until_its_eor() {
+        let (mut state, mut rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_A), AS_A)]);
+        state.selection_deferral = SelectionDeferral::new(Instant::now(), 120);
+
+        establish(&mut state, PEER_A, AS_A, &eor_only_gr_caps());
+        assert!(
+            state.selection_deferral.v4_deferred(),
+            "an EOR-only (restart_time=0) GR peer must still block the gate \
+             until its own EOR, not be treated as non-GR"
+        );
+
+        let rx_a = rxs.get_mut(&IpAddr::V4(PEER_A)).unwrap();
+        assert!(rx_a.try_recv().is_err(), "no dump while deferred");
+
+        state.on_route_update(IpAddr::V4(PEER_A), ipv4_eor());
+        assert!(
+            !state.selection_deferral.v4_deferred(),
+            "gate must open once the sole configured (EOR-only) peer sends EOR"
         );
     }
 
@@ -15981,7 +16032,7 @@ mod test_gr_peer_capability {
     /// silently drift from what actually runs. Returns None if absent or
     /// restart_time == 0.
     fn extract_gr_time(caps: &[Capability]) -> Option<u16> {
-        super::peer::extract_gr_capability(caps).0
+        super::peer::extract_gr_capability(caps).1
     }
 
     /// A peer advertising GracefulRestart with restart_time > 0 must be recorded

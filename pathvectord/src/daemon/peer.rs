@@ -16,19 +16,25 @@ use super::*;
 /// the list", which would silently defer to an out-of-date earlier instance
 /// in that case).
 ///
-/// `restart_time == 0` means the peer supports Receiving Speaker procedures
-/// (EOR timing) but not forwarding-state preservation — returns `None` for
-/// the time/families/N-bit in that case, matching the existing
-/// EOR-only-not-GR-capable interpretation.
-///
-/// RFC 8538 §2's N-bit (0x04 in `restart_flags`) is extracted from the same
-/// authoritative instance, as is RFC 4724 §3's Restart State (R) bit (0x08
-/// — the peer signaling that *it* is currently restarting), consumed by
-/// RFC 4724 §4.1's Restarting-Speaker wait-set (see `deferral.rs`) to
-/// exclude such peers from blocking our own outbound-advertisement gate.
+/// Returns `(advertised, restart_time, families, n_bit, r_bit)`.
+/// `advertised` is `true` whenever a GracefulRestart instance was present
+/// at all — including `restart_time == 0` — since RFC 4724 §3 explicitly
+/// recommends advertising the capability with no forwarding-state
+/// preservation "to indicate its intention of generating the End-of-RIB
+/// marker", and §4.1's Restarting-Speaker wait-set excludes only peers
+/// that "do not advertise the graceful restart capability" at all, not
+/// peers that advertise it with `restart_time == 0`. `restart_time` stays
+/// `None` for the zero case, matching the existing forwarding-state /
+/// stale-route-retention semantics that value is otherwise used for
+/// (`gr_capable_peers`, `on_terminated`'s GR-window entry). `n_bit`/`r_bit`
+/// are extracted from the authoritative last instance whenever `advertised`
+/// is true, regardless of `restart_time` — the Restart State (R) bit in
+/// particular is meaningful even for an EOR-only (`restart_time == 0`)
+/// peer, and RFC 4724 §4.1's wait-set needs it to exclude a peer that is
+/// itself restarting.
 pub(super) fn extract_gr_capability(
     caps: &[Capability],
-) -> (Option<u16>, Vec<GracefulRestartFamily>, bool, bool) {
+) -> (bool, Option<u16>, Vec<GracefulRestartFamily>, bool, bool) {
     let last = caps.iter().rev().find_map(|c| {
         if let Capability::GracefulRestart {
             restart_flags,
@@ -42,12 +48,13 @@ pub(super) fn extract_gr_capability(
         }
     });
     match last {
-        Some((restart_flags, restart_time, families)) if restart_time > 0 => {
+        Some((restart_flags, restart_time, families)) => {
             let n_bit = restart_flags & 0x04 != 0;
             let r_bit = restart_flags & 0x08 != 0;
-            (Some(restart_time), families.clone(), n_bit, r_bit)
+            let effective_restart_time = (restart_time > 0).then_some(restart_time);
+            (true, effective_restart_time, families.clone(), n_bit, r_bit)
         }
-        _ => (None, vec![], false, false),
+        None => (false, None, vec![], false, false),
     }
 }
 
@@ -146,6 +153,7 @@ impl DaemonState {
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
         self.rib_mut().gr_capable_peers.remove(&peer_ip);
+        self.rib_mut().gr_advertised_peers.remove(&peer_ip);
         self.rib_mut().gr_peer_restarting.remove(&peer_ip);
         self.gr.remove_peer(peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
@@ -372,14 +380,17 @@ impl DaemonState {
             self.route_refresh_peers.remove(&peer_ip);
         }
 
-        // RFC 4724 §3: record whether the peer advertised GracefulRestart with
-        // a non-zero restart_time (see `extract_gr_capability`'s doc comment
-        // for the "last instance wins" rule this applies). A zero restart_time
-        // means the peer does not participate in the GR restart window
-        // (capability present for EOR only). RFC 8538 §2's N-bit (0x04 in
-        // restart_flags) and RFC 4724 §3's Restart State (R) bit (0x08) are
-        // extracted from the same authoritative instance.
-        let (peer_gr_time, peer_gr_families, peer_has_n_bit, peer_r_bit) =
+        // RFC 4724 §3: record whether the peer advertised GracefulRestart at
+        // all, and separately whether it did so with a non-zero restart_time
+        // (see `extract_gr_capability`'s doc comment for the "last instance
+        // wins" rule this applies). A zero restart_time means the peer does
+        // not participate in the GR stale-route retention window (capability
+        // present for EOR only) — but it did still advertise the capability,
+        // which matters for RFC 4724 §4.1's Restarting-Speaker wait-set
+        // below. RFC 8538 §2's N-bit (0x04 in restart_flags) and RFC 4724
+        // §3's Restart State (R) bit (0x08) are extracted from the same
+        // authoritative instance.
+        let (peer_gr_advertised, peer_gr_time, peer_gr_families, peer_has_n_bit, peer_r_bit) =
             extract_gr_capability(peer_capabilities);
 
         // Full-table dump for IPv6 — only for peers that negotiated IPv6 unicast
@@ -420,7 +431,12 @@ impl DaemonState {
             } else {
                 rib.gr_capable_peers.remove(&peer_ip);
             }
-            if peer_gr_time.is_some() && peer_r_bit {
+            if peer_gr_advertised {
+                rib.gr_advertised_peers.insert(peer_ip);
+            } else {
+                rib.gr_advertised_peers.remove(&peer_ip);
+            }
+            if peer_gr_advertised && peer_r_bit {
                 rib.gr_peer_restarting.insert(peer_ip);
             } else {
                 rib.gr_peer_restarting.remove(&peer_ip);
@@ -589,6 +605,7 @@ impl DaemonState {
             rib.eor_received.remove(&peer_ip);
             rib.eor_received_v6.remove(&peer_ip);
             rib.negotiated_roles.remove(&peer_ip);
+            rib.gr_advertised_peers.remove(&peer_ip);
             rib.gr_peer_restarting.remove(&peer_ip);
         }
         self.negotiated_max_len.remove(&peer_ip);

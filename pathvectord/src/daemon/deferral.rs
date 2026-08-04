@@ -76,14 +76,18 @@ impl SelectionDeferral {
     /// the deadline, see [`force_release`](Self::force_release)).
     ///
     /// A peer blocks a family's release only while all of the following
-    /// hold: it is established, it advertised GracefulRestart with a
-    /// non-zero `restart_time` (i.e. is present in `gr_capable_peers`), it
-    /// is not itself restarting (`gr_peer_restarting`), and it has not yet
-    /// sent that family's End-of-RIB marker. An established peer that is
-    /// not GR-capable, or that set its own Restart State bit, never blocks —
-    /// excluded per the RFC text. The v6 gate additionally excludes
-    /// established peers that never negotiated the IPv6 unicast
-    /// Multi-Protocol capability (`ipv6_capable_peers`).
+    /// hold: it is established, it advertised the GracefulRestart
+    /// capability at all — including with `restart_time == 0` (EOR-only
+    /// mode; RFC 4724 §3 explicitly recommends this specifically so peers
+    /// can be relied on for EOR timing, and §4.1's exclusion is for peers
+    /// that "do not advertise the graceful restart capability", not for
+    /// this case) — it is not itself restarting (`gr_peer_restarting`,
+    /// its Restart State bit), and it has not yet sent that family's
+    /// End-of-RIB marker. An established peer that never advertised GR at
+    /// all, or that set its own Restart State bit, never blocks — excluded
+    /// per the RFC text. The v6 gate additionally excludes established
+    /// peers that never negotiated the IPv6 unicast Multi-Protocol
+    /// capability (`ipv6_capable_peers`).
     ///
     /// Idempotent and one-way: a family already released is left untouched
     /// and always contributes `false` to the returned tuple, regardless of
@@ -95,7 +99,7 @@ impl SelectionDeferral {
         &mut self,
         configured_peers: impl Iterator<Item = IpAddr>,
         peer_types: &HashMap<IpAddr, PeerType>,
-        gr_capable_peers: &HashMap<IpAddr, u16>,
+        gr_advertised_peers: &HashSet<IpAddr>,
         gr_peer_restarting: &HashSet<IpAddr>,
         ipv6_capable_peers: &HashSet<IpAddr>,
         eor_received: &HashSet<IpAddr>,
@@ -114,7 +118,7 @@ impl SelectionDeferral {
                     peer_ip,
                     false,
                     peer_types,
-                    gr_capable_peers,
+                    gr_advertised_peers,
                     gr_peer_restarting,
                     ipv6_capable_peers,
                     eor_received,
@@ -128,7 +132,7 @@ impl SelectionDeferral {
                     peer_ip,
                     true,
                     peer_types,
-                    gr_capable_peers,
+                    gr_advertised_peers,
                     gr_peer_restarting,
                     ipv6_capable_peers,
                     eor_received,
@@ -183,7 +187,7 @@ fn family_blocks(
     peer_ip: IpAddr,
     is_v6: bool,
     peer_types: &HashMap<IpAddr, PeerType>,
-    gr_capable_peers: &HashMap<IpAddr, u16>,
+    gr_advertised_peers: &HashSet<IpAddr>,
     gr_peer_restarting: &HashSet<IpAddr>,
     ipv6_capable_peers: &HashSet<IpAddr>,
     eor_received: &HashSet<IpAddr>,
@@ -199,8 +203,12 @@ fn family_blocks(
         // v6 wait-set at all.
         return false;
     }
-    if !gr_capable_peers.contains_key(&peer_ip) {
-        // Established but not GR-capable — excluded per RFC 4724 §4.1.
+    if !gr_advertised_peers.contains(&peer_ip) {
+        // Established but never advertised GracefulRestart at all —
+        // excluded per RFC 4724 §4.1. Note this is deliberately NOT
+        // `gr_capable_peers` (restart_time > 0 only): a peer advertising
+        // GR with restart_time == 0 (EOR-only mode) still counts as having
+        // advertised the capability and must still be waited on.
         return false;
     }
     if gr_peer_restarting.contains(&peer_ip) {
@@ -223,7 +231,7 @@ impl DaemonState {
         let (v4_released, v6_released) = self.selection_deferral.recompute(
             configured.into_iter(),
             &self.rib.peer_types,
-            &self.rib.gr_capable_peers,
+            &self.rib.gr_advertised_peers,
             &self.rib.gr_peer_restarting,
             &self.ipv6_capable_peers,
             &self.rib.eor_received,
@@ -484,7 +492,7 @@ mod tests {
     struct Fixture {
         configured: Vec<IpAddr>,
         peer_types: HashMap<IpAddr, PeerType>,
-        gr_capable_peers: HashMap<IpAddr, u16>,
+        gr_advertised_peers: HashSet<IpAddr>,
         gr_peer_restarting: HashSet<IpAddr>,
         ipv6_capable_peers: HashSet<IpAddr>,
         eor_received: HashSet<IpAddr>,
@@ -496,7 +504,7 @@ mod tests {
             Self {
                 configured: Vec::new(),
                 peer_types: HashMap::new(),
-                gr_capable_peers: HashMap::new(),
+                gr_advertised_peers: HashSet::new(),
                 gr_peer_restarting: HashSet::new(),
                 ipv6_capable_peers: HashSet::new(),
                 eor_received: HashSet::new(),
@@ -508,7 +516,7 @@ mod tests {
             sd.recompute(
                 self.configured.iter().copied(),
                 &self.peer_types,
-                &self.gr_capable_peers,
+                &self.gr_advertised_peers,
                 &self.gr_peer_restarting,
                 &self.ipv6_capable_peers,
                 &self.eor_received,
@@ -542,7 +550,7 @@ mod tests {
         let mut fx = Fixture::empty();
         fx.configured.push(peer(1));
         fx.peer_types.insert(peer(1), PeerType::External); // established
-        // Not in gr_capable_peers ⇒ excluded from the wait-set entirely.
+        // Not in gr_advertised_peers ⇒ excluded from the wait-set entirely.
         assert_eq!(fx.recompute(&mut sd), (true, true));
     }
 
@@ -552,7 +560,7 @@ mod tests {
         let mut fx = Fixture::empty();
         fx.configured.push(peer(1));
         fx.peer_types.insert(peer(1), PeerType::External);
-        fx.gr_capable_peers.insert(peer(1), 120);
+        fx.gr_advertised_peers.insert(peer(1));
         fx.gr_peer_restarting.insert(peer(1)); // peer itself is restarting
         assert_eq!(fx.recompute(&mut sd), (true, true));
     }
@@ -563,7 +571,7 @@ mod tests {
         let mut fx = Fixture::empty();
         fx.configured.push(peer(1));
         fx.peer_types.insert(peer(1), PeerType::External);
-        fx.gr_capable_peers.insert(peer(1), 120);
+        fx.gr_advertised_peers.insert(peer(1));
         fx.ipv6_capable_peers.insert(peer(1)); // also part of the v6 wait-set
         // No EOR yet (either family).
         assert_eq!(fx.recompute(&mut sd), (false, false));
@@ -575,7 +583,7 @@ mod tests {
         let mut fx = Fixture::empty();
         fx.configured.push(peer(1));
         fx.peer_types.insert(peer(1), PeerType::External);
-        fx.gr_capable_peers.insert(peer(1), 120);
+        fx.gr_advertised_peers.insert(peer(1));
         fx.ipv6_capable_peers.insert(peer(1)); // also part of the v6 wait-set
         assert_eq!(fx.recompute(&mut sd), (false, false));
 
@@ -591,7 +599,7 @@ mod tests {
         let mut fx = Fixture::empty();
         fx.configured.push(peer(1));
         fx.peer_types.insert(peer(1), PeerType::External);
-        fx.gr_capable_peers.insert(peer(1), 120);
+        fx.gr_advertised_peers.insert(peer(1));
         fx.eor_received.insert(peer(1));
         // No v6 EOR and not ipv6-capable — still releases v6 since this peer
         // isn't part of the v6 wait-set at all.
@@ -604,7 +612,7 @@ mod tests {
         let mut fx = Fixture::empty();
         fx.configured.push(peer(1));
         fx.peer_types.insert(peer(1), PeerType::External);
-        fx.gr_capable_peers.insert(peer(1), 120);
+        fx.gr_advertised_peers.insert(peer(1));
         fx.ipv6_capable_peers.insert(peer(1));
         fx.eor_received.insert(peer(1));
         assert_eq!(fx.recompute(&mut sd), (true, false));

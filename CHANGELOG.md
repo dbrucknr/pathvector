@@ -83,6 +83,46 @@ same way, just not injected deliberately — the first version of the test
 suite found it on its own. Full workspace build/test (713 passing in
 `pathvectord`), `cargo fmt`, and `cargo clippy -D warnings` clean.
 
+### [pathvectord] Follow-up: EOR-only (`restart_time = 0`) GR peers were wrongly excluded from the deferral wait-set
+
+A Codex review on the PR carrying the above feature caught a real
+RFC-compliance bug before merge: RFC 4724 §3 explicitly recommends
+advertising the GracefulRestart capability with `restart_time == 0` and no
+`<AFI, SAFI>` families specifically to signal "I don't preserve forwarding
+state, but I will still generate End-of-RIB" — and §4.1's Restarting-Speaker
+wait-set excludes only peers that "do not advertise the graceful restart
+capability" at all, not peers advertising it with `restart_time == 0`.
+`extract_gr_capability()` collapsed the zero-time case to the same `None`
+result used for "no capability sent at all," so the deferral wait-set (which
+was consulting `gr_capable_peers`, itself correctly `restart_time > 0`-gated
+for its actual purpose — stale-route retention) treated an EOR-only peer as
+non-GR and released the gate before that peer's EOR arrived, defeating the
+feature for the project's own documented default configuration
+(`graceful_restart_time = 0`).
+
+Fetched RFC 4724 §3/§4.1 again directly to confirm the exact wording before
+fixing. Added `RibSnapshot::gr_advertised_peers: HashSet<IpAddr>` as a signal
+distinct from `gr_capable_peers`: populated whenever a GracefulRestart
+capability was present at all, regardless of `restart_time`.
+`extract_gr_capability()` now returns a separate `advertised: bool` alongside
+`restart_time: Option<u16>` (still `None` for the zero case, preserving the
+existing stale-route-retention semantics `gr_capable_peers` needs), and
+extracts the R-bit unconditionally whenever a capability is present — the
+previous version only extracted it inside the `restart_time > 0` branch, so
+an EOR-only peer's own Restart State bit was silently discarded and
+`gr_peer_restarting` was never set for it either. `deferral.rs`'s
+`family_blocks`/`recompute` now consult `gr_advertised_peers` instead of
+`gr_capable_peers`.
+
+New test `eor_only_gr_peer_keeps_gate_closed_until_its_eor`
+(`daemon::selection_deferral_tests`) establishes a peer advertising GR with
+`restart_time = 0` and confirms the gate stays closed until that peer's own
+EOR arrives. Real-teeth verified: reintroduced the `restart_time > 0`
+collapse in `extract_gr_capability()`, confirmed the new test failed with
+exactly the diagnostic the review predicted, then restored and reconfirmed
+passing. Full `pathvectord` test suite (717 passing), `cargo fmt`, and
+`cargo clippy -D warnings` clean.
+
 ---
 
 ## 2026-08-04 (RFC 4271 §6.3: revert treat-as-withdraw back to session-reset)
