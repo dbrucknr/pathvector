@@ -642,10 +642,8 @@ pub(crate) fn route_v6_to_attributes(
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if !strip_med {
-        if let Some(m) = route.med {
-            attrs.push(PathAttribute::Med(m.as_u32()));
-        }
+    if !strip_med && let Some(m) = route.med {
+        attrs.push(PathAttribute::Med(m.as_u32()));
     }
     let rare = route.rare_or_default();
     if !rare.communities.is_empty() {

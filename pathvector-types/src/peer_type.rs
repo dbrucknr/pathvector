@@ -28,7 +28,7 @@ pub enum PeerType {
     Local = 2,
     /// A fellow BGP confederation Member-AS (RFC 5065) — eBGP at the wire
     /// level, but treated like `Internal` for best-path preference,
-    /// LOCAL_PREF, and split-horizon purposes.
+    /// `LOCAL_PREF`, and split-horizon purposes.
     ConfedMember = 3,
 }
 

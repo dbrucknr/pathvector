@@ -419,6 +419,7 @@ pub(crate) struct DaemonState {
 }
 
 impl DaemonState {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         local_as: u32,
         local_bgp_id: Ipv4Addr,
