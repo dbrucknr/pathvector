@@ -806,7 +806,42 @@ areas the existing test suite never covered:
   is a substantial feature (new timer, EOR-tracking-since-our-restart,
   a gate in front of the decision-process pipeline) — needs its own design
   discussion, not a quick patch. See `RFC_AUDIT.md`'s RFC 4724 §4.1
-  section.
+  section. **Fixed** (`feature/rfc4724-restarting-speaker-selection-deferral`):
+  scoped to **outbound-advertisement-only** deferral rather than the RFC's
+  literal "defer route selection" (Loc-RIB/FIB computation stays
+  immediate) — matches BIRD's real implementation, confirmed by reading
+  `nest/proto.c`'s doc comment directly rather than trusting a mental model
+  of "how BIRD generally works." New `selection_deferral_time` config field
+  (applies on every startup when nonzero, independent of the `restarting`
+  flag). New `SelectionDeferral` struct (`daemon/deferral.rs`) implements
+  the wait-set over the **full configured peer set**, not just
+  currently-established peers — a first design draft got this wrong (an
+  established-only wait-set would let one fast peer's EOR falsely satisfy
+  the wait-set before a slow peer even connects) and was caught during
+  planning review before any code was written. `propagate_prefix`/
+  `propagate_prefix_v6` gained a `deferred: bool` gate that returns
+  `NoChange` before touching AdjRibOut at all, so there's nothing to
+  reconcile once a family's gate opens; a gate-open catch-up dump (full
+  table + EOR) runs for every established peer at that point.
+  **Follow-up fix 2026-08-04** (Codex PR review, same branch): the
+  wait-set wrongly excluded peers advertising GracefulRestart with
+  `restart_time == 0` (EOR-only mode) — §3 explicitly recommends this
+  specifically to signal EOR intent, and §4.1 excludes only peers that
+  don't advertise the capability at all, not this case.
+  `extract_gr_capability()`'s zero-time branch collapsed to the same
+  `None` result used for "no capability at all," so `gr_capable_peers`
+  (correctly `restart_time > 0`-gated, used for stale-route retention)
+  was the only signal the deferral wait-set had to work with, and an
+  EOR-only peer fell through it. Added `RibSnapshot::gr_advertised_peers`
+  as a separate "advertised at all" signal for the wait-set to consult
+  instead; `extract_gr_capability()` now returns a distinct `advertised:
+  bool` and extracts the R-bit regardless of `restart_time` (previously
+  lost for the zero-time case — an EOR-only peer's own Restart State bit
+  wasn't being honored either). New test
+  `eor_only_gr_peer_keeps_gate_closed_until_its_eor`
+  (`daemon::selection_deferral_tests`); real-teeth verified by
+  reintroducing the `restart_time > 0` collapse and confirming the new
+  test failed with the exact diagnostic Codex predicted, then restoring.
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world

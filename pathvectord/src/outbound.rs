@@ -142,6 +142,12 @@ pub(crate) enum PrefixDecision {
 /// attribute transforms, and calls `AdjRibOut::insert` to record the change.
 /// Returns what should be sent without transmitting anything — callers batch
 /// decisions and flush via [`flush_updates`].
+///
+/// `deferred` implements RFC 4724 §4.1's Restarting-Speaker
+/// outbound-advertisement deferral: when `true`, returns `NoChange`
+/// immediately without touching `loc_rib`/`adj_rib_out`/`export_policy` at
+/// all — nothing is written until the gate genuinely opens, so there is
+/// nothing to reconcile once it does (see `daemon/deferral.rs`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
@@ -152,7 +158,11 @@ pub(crate) fn propagate_prefix(
     local_as: u32,
     local_next_hop: Ipv4Addr,
     next_hop_self: bool,
+    deferred: bool,
 ) -> PrefixDecision {
+    if deferred {
+        return PrefixDecision::NoChange;
+    }
     // Compute best_peer once; callers that already looked it up for split-horizon
     // checks pass the same call, but the real savings is removing the internal
     // second call that used to exist here.
@@ -346,6 +356,8 @@ pub(crate) enum PrefixDecisionV6 {
 /// For eBGP peers, `local_ipv6` must be `Some` for an announcement to be
 /// generated; if `None`, eBGP routes are silently suppressed (no next-hop to
 /// rewrite) but any previously advertised route is withdrawn.
+///
+/// `deferred` — see [`propagate_prefix`]'s doc comment; same semantics.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn propagate_prefix_v6(
     nlri: Nlri<Ipv6Addr>,
@@ -356,7 +368,11 @@ pub(crate) fn propagate_prefix_v6(
     local_as: u32,
     local_ipv6: Option<Ipv6Addr>,
     next_hop_self: bool,
+    deferred: bool,
 ) -> PrefixDecisionV6 {
+    if deferred {
+        return PrefixDecisionV6::NoChange;
+    }
     // For eBGP with no local IPv6 address configured, we can't rewrite the
     // next-hop, so don't announce — but do withdraw if we previously did.
     let can_announce = peer_type != PeerType::External || local_ipv6.is_some();
@@ -1915,6 +1931,7 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(
             matches!(decision, PrefixDecision::Withdraw(_)),
@@ -1943,6 +1960,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
             false,
         );
         assert!(
@@ -1973,6 +1991,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
             false,
         );
         assert!(
@@ -2005,6 +2024,7 @@ mod propagate_tests {
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
+            false,
         );
         assert!(matches!(first, PrefixDecisionV6::Announce(_)));
 
@@ -2018,6 +2038,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
             false,
         );
         assert!(
@@ -2047,6 +2068,7 @@ mod propagate_tests {
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
+            false,
         );
 
         // Second call with same best route: NoChange.
@@ -2058,6 +2080,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
             false,
         );
         assert!(
@@ -2108,6 +2131,7 @@ mod propagate_tests {
             65001,
             None,
             false,
+            false,
         );
         assert!(
             matches!(decision, PrefixDecisionV6::Withdraw(_)),
@@ -2141,6 +2165,7 @@ mod propagate_tests {
             PeerType::Internal,
             65001,
             None,
+            false,
             false,
         );
         assert!(
@@ -2204,6 +2229,7 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(
             matches!(decision, PrefixDecision::NoChange),
@@ -2232,6 +2258,7 @@ mod propagate_tests {
             PeerType::Internal,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
+            false,
             false,
         );
         assert!(
@@ -2263,6 +2290,7 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(
             matches!(ebgp_decision, PrefixDecision::NoChange),
@@ -2279,6 +2307,7 @@ mod propagate_tests {
             PeerType::Internal,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
+            false,
             false,
         );
         assert!(
@@ -2310,6 +2339,7 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(
             matches!(ebgp_decision, PrefixDecision::NoChange),
@@ -2326,6 +2356,7 @@ mod propagate_tests {
             PeerType::Internal,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
+            false,
             false,
         );
         assert!(
@@ -2357,6 +2388,7 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(matches!(first, PrefixDecision::Announce(_)));
 
@@ -2374,6 +2406,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
+            false,
             false,
         );
         assert!(
@@ -2403,6 +2436,7 @@ mod propagate_tests {
             PeerType::External,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
+            false,
             false,
         );
         assert!(
@@ -2434,6 +2468,7 @@ mod propagate_tests {
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
+            false,
         );
         assert!(
             matches!(ebgp_decision, PrefixDecisionV6::NoChange),
@@ -2450,6 +2485,7 @@ mod propagate_tests {
             PeerType::Internal,
             65001,
             None,
+            false,
             false,
         );
         assert!(
@@ -2500,6 +2536,7 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(
             matches!(decision, PrefixDecision::NoChange),
@@ -2544,11 +2581,144 @@ mod propagate_tests {
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
+            false,
         );
         assert!(
             matches!(decision, PrefixDecision::Announce(_)),
             "RFC 8642: removing NO_EXPORT via export policy must lift the RFC 1997 \
              suppression, since the check reflects post-policy communities"
         );
+    }
+
+    // ── RFC 4724 §4.1 selection-deferral gate ────────────────────────────────
+
+    /// `deferred = true` must suppress what would otherwise be an Announce,
+    /// and must leave `adj_rib_out` completely untouched — nothing is
+    /// written until the gate genuinely opens (see `daemon/deferral.rs`).
+    #[test]
+    fn test_propagate_prefix_deferred_suppresses_announce_and_leaves_adj_rib_out_untouched() {
+        let n = nlri4("10.0.0.0/8");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+        loc_rib.insert(src, route_v4(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        assert_eq!(adj_out.len(), 0, "precondition: nothing advertised yet");
+
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+            true, // deferred
+        );
+        assert!(
+            matches!(decision, PrefixDecision::NoChange),
+            "deferred must return NoChange even though this would otherwise Announce"
+        );
+        assert_eq!(
+            adj_out.len(),
+            0,
+            "deferred must not write anything to adj_rib_out"
+        );
+        assert!(adj_out.get(&n).is_none());
+    }
+
+    /// `deferred = true` must suppress what would otherwise be a Withdraw,
+    /// and must leave the previously-advertised entry in `adj_rib_out`
+    /// exactly as it was.
+    #[test]
+    fn test_propagate_prefix_deferred_suppresses_withdraw_and_leaves_adj_rib_out_untouched() {
+        let n = nlri4("10.0.0.0/8");
+        let dest = peer("10.0.0.3");
+        // Empty Loc-RIB — the route has since been withdrawn upstream, which
+        // would normally produce PrefixDecision::Withdraw.
+        let loc_rib: LocRib<Ipv4Addr> = LocRib::new();
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        adj_out.insert(route_v4(n));
+        assert_eq!(adj_out.len(), 1, "precondition: previously advertised");
+
+        let decision = propagate_prefix(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy(),
+            PeerType::External,
+            65001,
+            Ipv4Addr::new(10, 1, 0, 1),
+            false,
+            true, // deferred
+        );
+        assert!(
+            matches!(decision, PrefixDecision::NoChange),
+            "deferred must return NoChange even though this would otherwise Withdraw"
+        );
+        assert_eq!(
+            adj_out.len(),
+            1,
+            "deferred must not remove the previously-advertised entry"
+        );
+        assert!(adj_out.get(&n).is_some());
+    }
+
+    /// IPv6 counterpart: deferred suppresses Announce, adj_rib_out_v6 untouched.
+    #[test]
+    fn test_propagate_prefix_v6_deferred_suppresses_announce_and_leaves_adj_rib_out_untouched() {
+        let n = nlri6("2001:db8::/32");
+        let src = peer("10.0.0.2");
+        let dest = peer("10.0.0.3");
+        let mut loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+        loc_rib.insert(src, route_v6(n), &pathvector_rib::oracle::AlwaysReachable);
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        assert_eq!(adj_out.len(), 0);
+
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+            true, // deferred
+        );
+        assert!(matches!(decision, PrefixDecisionV6::NoChange));
+        assert_eq!(adj_out.len(), 0);
+        assert!(adj_out.get(&n).is_none());
+    }
+
+    /// IPv6 counterpart: deferred suppresses Withdraw, adj_rib_out_v6 untouched.
+    #[test]
+    fn test_propagate_prefix_v6_deferred_suppresses_withdraw_and_leaves_adj_rib_out_untouched() {
+        let n = nlri6("2001:db8::/32");
+        let dest = peer("10.0.0.3");
+        let loc_rib: LocRib<Ipv6Addr> = LocRib::new();
+
+        let mut adj_out = AdjRibOut::new(dest, PeerType::External);
+        adj_out.insert(route_v6(n));
+        assert_eq!(adj_out.len(), 1);
+
+        let decision = propagate_prefix_v6(
+            n,
+            &loc_rib,
+            &mut adj_out,
+            &accept_policy_v6(),
+            PeerType::External,
+            65001,
+            Some("2001:db8::ff".parse().unwrap()),
+            false,
+            true, // deferred
+        );
+        assert!(matches!(decision, PrefixDecisionV6::NoChange));
+        assert_eq!(adj_out.len(), 1);
+        assert!(adj_out.get(&n).is_some());
     }
 }
