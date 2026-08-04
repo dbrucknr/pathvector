@@ -109,6 +109,26 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub cluster_id: Option<u32>,
+    /// BGP Confederation Identifier (RFC 5065).
+    ///
+    /// When set, `local_as` is reinterpreted as this daemon's private
+    /// Member-AS Number, and `confederation_id` becomes the AS number this
+    /// speaker presents to the outside world: it is prepended into
+    /// `AS_SEQUENCE` toward peers outside the confederation (instead of
+    /// `local_as`), while `local_as` continues to be prepended into
+    /// `AS_CONFED_SEQUENCE` toward peers marked `confederation_member = true`
+    /// (see [`PeerConfig::confederation_member`]). Omit to disable
+    /// confederation support entirely (the default) — existing pass-through
+    /// interop with someone else's confederation is unaffected either way.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as         = 65001   # this router's private Member-AS Number
+    /// bgp_id           = "10.0.0.1"
+    /// confederation_id = 64500    # AS number advertised to the outside world
+    /// ```
+    #[serde(default)]
+    pub confederation_id: Option<u32>,
     /// Linux routing table into which BGP routes are installed (default: 254 = main).
     ///
     /// Set to a non-default value (e.g. 100) to keep BGP routes in a separate
@@ -578,6 +598,26 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub role: Option<PeerRole>,
+    /// Whether this peer is a fellow Member-AS within the same BGP
+    /// confederation (RFC 5065), rather than a genuine external peer.
+    ///
+    /// Requires `daemon.confederation_id` to also be set — a peer with
+    /// `confederation_member = true` under an unconfigured confederation is
+    /// treated as a plain eBGP peer (with a warning), the same
+    /// graceful-degradation pattern used by [`PeerConfig::role`] for
+    /// iBGP-configured Role. When both are set, this session is classified
+    /// as [`pathvector_types::PeerType::ConfedMember`]: AS_PATH is prepended
+    /// into `AS_CONFED_SEQUENCE` (not `AS_SEQUENCE`), LOCAL_PREF and MED are
+    /// passed through unchanged, and best-path preference matches `Internal`.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address              = "10.0.0.2"
+    /// remote_as            = 64501
+    /// confederation_member = true
+    /// ```
+    #[serde(default)]
+    pub confederation_member: bool,
 }
 
 fn default_bgp_port() -> u16 {
@@ -700,6 +740,7 @@ mod sidecar_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }
     }
 
@@ -783,6 +824,7 @@ mod sidecar_tests {
             max_prefixes_v6: Some(100_000),
             max_prefixes_restart: Some(300),
             role: Some(PeerRole::Provider),
+            confederation_member: true,
         };
         store.upsert(full_peer.clone()).await;
 
@@ -812,6 +854,10 @@ mod sidecar_tests {
             "max_prefixes_restart must round-trip"
         );
         assert_eq!(got.role, Some(PeerRole::Provider), "role must round-trip");
+        assert!(
+            got.confederation_member,
+            "confederation_member must round-trip"
+        );
     }
 
     #[tokio::test]
