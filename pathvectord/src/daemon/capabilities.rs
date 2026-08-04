@@ -17,6 +17,10 @@ pub(super) struct SpawnConfig {
     pub(super) configured_restarting: bool,
     /// Instant the daemon process started; used to expire the R-bit window.
     pub(super) startup_instant: std::time::Instant,
+    /// RFC 5065 Confederation Identifier, if this daemon is a confederation
+    /// Member-AS. Threaded into [`SessionConfig::confederation_member`]
+    /// resolution at each session spawn via `effective_confederation_member`.
+    pub(super) confederation_id: Option<u32>,
 }
 
 impl SpawnConfig {

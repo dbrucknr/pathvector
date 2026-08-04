@@ -105,10 +105,19 @@ fn resolve_export_default(opt: Option<config::ExportDefault>, is_ebgp: bool) -> 
     }
 }
 
-/// Derives the peer type (iBGP / eBGP) from the configured AS numbers.
-fn config_peer_type(local_as: u32, remote_as: u32) -> PeerType {
+/// Derives the peer type (iBGP / eBGP / confederation Member-AS) from the
+/// configured AS numbers and confederation membership.
+///
+/// `local_as == remote_as` is checked first regardless of `confed_member`:
+/// a peer with matching AS numbers is definitionally same-AS iBGP even if
+/// `confederation_member` was mistakenly also set (matches BIRD's
+/// `is_internal`, which is likewise computed independently of confederation
+/// state).
+fn config_peer_type(local_as: u32, remote_as: u32, confed_member: bool) -> PeerType {
     if local_as == remote_as {
         PeerType::Internal
+    } else if confed_member {
+        PeerType::ConfedMember
     } else {
         PeerType::External
     }
@@ -203,6 +212,10 @@ pub(crate) struct RibSnapshot {
     /// Defaults to the 32-bit representation of `bgp_id` when not explicitly
     /// configured. Immutable after startup.
     pub(crate) cluster_id: u32,
+    /// RFC 5065 Confederation Identifier, if this daemon is a confederation
+    /// Member-AS. `None` disables confederation support entirely. Immutable
+    /// after startup.
+    pub(crate) confederation_id: Option<u32>,
     /// BGP Identifier of each established peer, received in their OPEN message.
     ///
     /// Used to set `ORIGINATOR_ID` when reflecting routes from a client (RFC 4456
@@ -411,6 +424,7 @@ impl DaemonState {
         local_bgp_id: Ipv4Addr,
         local_ipv6: Option<Ipv6Addr>,
         cluster_id: Option<u32>,
+        confederation_id: Option<u32>,
         peers: &[config::PeerConfig],
         update_senders: HashMap<IpAddr, mpsc::Sender<UpdateMessage>>,
         config_capabilities: Vec<Capability>,
@@ -502,16 +516,29 @@ impl DaemonState {
             .map(|p| (p.address, AdjRibIn::new(PeerId::from(p.address))))
             .collect();
 
+        // A peer's `confederation_member` flag only takes effect when the
+        // daemon itself has a `confederation_id` configured — mirrors
+        // `effective_confederation_member`'s graceful degradation, without
+        // repeating its warning (already logged at session-spawn time,
+        // where the full `PeerConfig`/`DaemonConfig` are both in scope).
+        let confed_member =
+            |p: &config::PeerConfig| p.confederation_member && confederation_id.is_some();
+
         let peer_config_types = peers
             .iter()
-            .map(|p| (p.address, config_peer_type(local_as, p.remote_as)))
+            .map(|p| {
+                (
+                    p.address,
+                    config_peer_type(local_as, p.remote_as, confed_member(p)),
+                )
+            })
             .collect();
 
         let (adj_ribs_out, adj_ribs_out_v6) = {
             let mut v4 = HashMap::new();
             let mut v6 = HashMap::new();
             for p in peers {
-                let pt = config_peer_type(local_as, p.remote_as);
+                let pt = config_peer_type(local_as, p.remote_as, confed_member(p));
                 let (aro_v4, aro_v6) = make_adj_ribs_out_pair(PeerId::from(p.address), pt, is_rr);
                 v4.insert(p.address, aro_v4);
                 v6.insert(p.address, aro_v6);
@@ -570,6 +597,7 @@ impl DaemonState {
             next_hop_self_peers,
             rr_clients,
             cluster_id,
+            confederation_id,
             peer_bgp_ids: HashMap::new(),
             eor_received: HashSet::new(),
             eor_received_v6: HashSet::new(),
@@ -675,6 +703,36 @@ fn effective_role(peer: &config::PeerConfig, local_as: u32) -> Option<Role> {
         return None;
     }
     Some(role.into())
+}
+
+/// Resolves whether `peer` should be classified as a confederation
+/// Member-AS (RFC 5065), or `false` if confederation membership must not
+/// apply to this session.
+///
+/// Requires `confederation_id` to be configured — a peer with
+/// `confederation_member = true` under an unconfigured confederation is
+/// treated as a plain eBGP peer. Warns once (rather than failing startup)
+/// so a config typo doesn't silently disable a peer, matching
+/// [`effective_role`]'s graceful-degradation pattern. Takes the resolved
+/// `confederation_id` scalar (rather than the whole `DaemonConfig`) to
+/// match `effective_role`'s existing `local_as: u32` convention — callers
+/// may only have `SpawnConfig`'s copy of it in scope, not the full config.
+fn effective_confederation_member(
+    peer: &config::PeerConfig,
+    confederation_id: Option<u32>,
+) -> bool {
+    if !peer.confederation_member {
+        return false;
+    }
+    if confederation_id.is_none() {
+        tracing::warn!(
+            peer = %peer.address,
+            "confederation_member is configured but daemon.confederation_id is unset; \
+             ignoring confederation membership for this peer"
+        );
+        return false;
+    }
+    true
 }
 
 /// RFC 9234 §5 ingress terms for a peer configured with `session_role`.
@@ -915,6 +973,7 @@ where
                 hold_time,
                 graceful_restart_time: cfg.daemon.graceful_restart_time,
                 configured_restarting: cfg.daemon.restarting,
+                confederation_id: cfg.daemon.confederation_id,
                 startup_instant: daemon_start, // R-bit expires after graceful_restart_time secs
             },
             peer_store,
@@ -1045,6 +1104,7 @@ where
             capabilities,
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
+            confederation_member: effective_confederation_member(peer, cfg.daemon.confederation_id),
             peer_addr: SocketAddr::new(peer.address, peer.port),
             md5_password: peer.md5_password.clone(),
             connect_retry_time: peer
@@ -1095,6 +1155,7 @@ where
         local_bgp_id,
         cfg.daemon.local_ipv6,
         cfg.daemon.cluster_id,
+        cfg.daemon.confederation_id,
         &cfg.peers,
         update_senders,
         config_capabilities,
@@ -1696,6 +1757,7 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -1704,6 +1766,7 @@ mod tests {
             local_bgp_id,
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -1777,12 +1840,27 @@ mod tests {
 
     #[test]
     fn test_config_peer_type_different_as_is_external() {
-        assert_eq!(config_peer_type(65001, 65002), PeerType::External);
+        assert_eq!(config_peer_type(65001, 65002, false), PeerType::External);
     }
 
     #[test]
     fn test_config_peer_type_same_as_is_internal() {
-        assert_eq!(config_peer_type(65001, 65001), PeerType::Internal);
+        assert_eq!(config_peer_type(65001, 65001, false), PeerType::Internal);
+    }
+
+    #[test]
+    fn test_config_peer_type_confed_member() {
+        // RFC 5065: a fellow confederation Member-AS is neither plain
+        // Internal nor plain External.
+        assert_eq!(config_peer_type(65001, 65002, true), PeerType::ConfedMember);
+    }
+
+    #[test]
+    fn test_config_peer_type_same_as_wins_over_confed_member() {
+        // local_as == remote_as must classify Internal even if
+        // confed_member is mistakenly also set — matches BIRD's
+        // is_internal precedence.
+        assert_eq!(config_peer_type(65001, 65001, true), PeerType::Internal);
     }
 
     // ── RFC 8212 default resolution ───────────────────────────────────────────
@@ -1871,6 +1949,7 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role,
+            confederation_member: false,
         }
     }
 
@@ -1937,12 +2016,14 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }];
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peers,
             {
                 let mut m = HashMap::new();
@@ -2272,6 +2353,7 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }];
         let mut senders = HashMap::new();
         senders.insert(peer_ip, tx);
@@ -2280,6 +2362,7 @@ mod tests {
             local_bgp_id,
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -2353,12 +2436,14 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }];
         let mut state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peers,
             {
                 let mut m = HashMap::new();
@@ -3257,6 +3342,7 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: Some(role),
+                confederation_member: false,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -3265,6 +3351,7 @@ mod tests {
             local_bgp_id,
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -3848,6 +3935,7 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             mpsc::channel(64).0,
         );
@@ -4059,6 +4147,7 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             mpsc::channel(64).0,
         );
@@ -4167,6 +4256,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5405,6 +5495,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5448,6 +5539,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5492,6 +5584,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5536,12 +5629,14 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }];
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peers,
             {
                 let mut m = HashMap::new();
@@ -5585,12 +5680,14 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }];
         let state = DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peers,
             {
                 let mut m = HashMap::new();
@@ -5652,6 +5749,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5679,6 +5777,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5724,6 +5823,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -5762,6 +5862,7 @@ mod tests {
             &accept_all_v6(),
             PeerType::Internal,
             65001,
+            65001,
             None, // no local_ipv6 — OK for iBGP
             false,
             false,
@@ -5790,6 +5891,7 @@ mod tests {
             &mut aro,
             &accept_all_v6(),
             PeerType::External,
+            65001,
             65001,
             Some(local_v6),
             false,
@@ -5825,6 +5927,7 @@ mod tests {
             &accept_all_v6(),
             PeerType::External,
             65001,
+            65001,
             None, // no local_ipv6 — eBGP must NOT announce
             false,
             false,
@@ -5854,6 +5957,7 @@ mod tests {
             &accept_all_v6(),
             PeerType::Internal,
             65001,
+            65001,
             None,
             false,
             false,
@@ -5867,6 +5971,7 @@ mod tests {
             &mut aro,
             &accept_all_v6(),
             PeerType::Internal,
+            65001,
             65001,
             None,
             false,
@@ -6422,6 +6527,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -6471,6 +6577,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -6522,7 +6629,7 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ebgp_prepends_local_as() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
-        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id(), false);
+        let out = prepare_outbound(route, PeerType::External, 65001, 65001, bgp_id(), false);
         assert_eq!(out.as_path.path_length(), 2);
         assert!(out.as_path.contains(Asn::new(65001)));
         assert!(out.as_path.contains(Asn::new(65002)));
@@ -6531,14 +6638,14 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ebgp_rewrites_next_hop() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
-        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id(), false);
+        let out = prepare_outbound(route, PeerType::External, 65001, 65001, bgp_id(), false);
         assert_eq!(out.next_hop, Some(NextHop::V4(bgp_id())));
     }
 
     #[test]
     fn test_prepare_outbound_ebgp_strips_local_pref() {
         let route = ebgp_route_with_lp("10.0.0.0/8");
-        let out = prepare_outbound(route, PeerType::External, 65001, bgp_id(), false);
+        let out = prepare_outbound(route, PeerType::External, 65001, 65001, bgp_id(), false);
         assert!(
             out.local_pref.is_none(),
             "LOCAL_PREF must be stripped for eBGP"
@@ -6548,7 +6655,14 @@ mod tests {
     #[test]
     fn test_prepare_outbound_ibgp_preserves_attributes() {
         let route = ibgp_route("10.0.0.0/8");
-        let out = prepare_outbound(route.clone(), PeerType::Internal, 65001, bgp_id(), false);
+        let out = prepare_outbound(
+            route.clone(),
+            PeerType::Internal,
+            65001,
+            65001,
+            bgp_id(),
+            false,
+        );
         assert_eq!(out.as_path.path_length(), route.as_path.path_length());
         assert_eq!(out.local_pref, route.local_pref);
         assert_eq!(out.next_hop, route.next_hop);
@@ -6746,6 +6860,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -6826,6 +6941,293 @@ mod tests {
         assert!(
             rib.is_empty(),
             "withdrawal must be processed despite looping AS_PATH"
+        );
+    }
+
+    // ── RFC 5065: confederation Member-AS import semantics ───────────────────
+
+    #[test]
+    fn test_local_pref_honored_from_confed_member_peer() {
+        // RFC 4271 §5.1.5's "except in the case of BGP Confederations"
+        // exception, reinforced by RFC 5065 §5.2's explicit removal of the
+        // eBGP-only restriction: a ConfedMember peer's LOCAL_PREF must be
+        // honored, not dropped like a genuine External peer's.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_segments(vec![
+                        pathvector_types::AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                    PathAttribute::LocalPref(200),
+                ],
+                announced: vec![nlri("192.168.0.0/16")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::ConfedMember,
+        );
+        let route = rib.best(&nlri("192.168.0.0/16")).unwrap();
+        assert_eq!(
+            route.local_pref,
+            Some(LocalPref::new(200)),
+            "LOCAL_PREF from a ConfedMember peer must be honored (RFC 5065 §5.2)"
+        );
+    }
+
+    #[test]
+    fn test_as_path_loop_detection_drops_confederation_id_in_path() {
+        // RFC 5065 §4: loop detection extends to the Confederation
+        // Identifier, not just the local Member-AS Number — a route whose
+        // AS_PATH contains our confederation's public AS has looped back
+        // through the confederation, even though it never contains our
+        // private Member-AS Number.
+        let mut ari = fresh_ari();
+        let mut rib = LocRib::new();
+        let mut ari_v6 = fresh_ari_v6();
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy_v6: Policy<Route<Ipv6Addr>> =
+            Policy::new(pathvector_policy::DefaultAction::Accept);
+        handle_update(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65100),
+                        Asn::new(64500), // confederation ID, not local_as
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &accept_all(),
+            &policy_v6,
+            PeerType::External,
+            None,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,        // local_as (does NOT appear in the path above)
+            Some(64_500), // confederation_id
+            None,
+            None,
+        );
+        assert!(
+            rib.is_empty(),
+            "route whose AS_PATH contains the confederation ID must be dropped (RFC 5065 §4)"
+        );
+    }
+
+    #[test]
+    fn test_as_path_loop_detection_confederation_id_absent_does_not_block() {
+        // Sanity check for the test above: without a configured
+        // confederation_id, the same AS_PATH must NOT be treated as a loop.
+        let mut rib = LocRib::new();
+        let mut ari = fresh_ari();
+        handle_update_v4(
+            peer(),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65100),
+                        Asn::new(64500),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &accept_all(),
+            PeerType::External,
+        );
+        assert_eq!(
+            rib.len(),
+            1,
+            "without confederation_id configured, 64500 in AS_PATH is an ordinary transit AS"
+        );
+    }
+
+    fn handle_update_get_notification_for(
+        peer_type: PeerType,
+        confederation_id: Option<u32>,
+        msg: UpdateMessage,
+    ) -> Option<NotificationMessage> {
+        let p = peer();
+        let mut ari = AdjRibIn::new(p);
+        let mut rib = LocRib::new();
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy = accept_all();
+        let policy_v6: Policy<Route<Ipv6Addr>> =
+            Policy::new(pathvector_policy::DefaultAction::Accept);
+        handle_update(
+            p,
+            msg,
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &policy,
+            &policy_v6,
+            peer_type,
+            None,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            confederation_id,
+            None,
+            None,
+        )
+        .notification
+    }
+
+    #[test]
+    fn test_malformed_as_path_confed_segment_from_external_peer_resets_session() {
+        // RFC 5065 §5 condition 1: a confederation segment received from a
+        // peer outside the confederation is malformed — session reset, not
+        // treat-as-withdraw (see the doc comment at the check site for the
+        // RFC-7606-scope reasoning behind this choice).
+        let n = handle_update_get_notification_for(
+            PeerType::External,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_segments(vec![
+                        pathvector_types::AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+                        pathvector_types::AsPathSegment::Sequence(vec![Asn::new(65200)]),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert!(
+            matches!(
+                n,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    ..
+                })
+            ),
+            "expected session-reset MalformedAsPath NOTIFICATION, got {n:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_as_path_confed_member_peer_missing_confed_sequence_resets_session() {
+        // RFC 5065 §5 condition 2: a non-empty AS_PATH from a ConfedMember
+        // peer whose first segment is not AS_CONFED_SEQUENCE is malformed.
+        let n = handle_update_get_notification_for(
+            PeerType::ConfedMember,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65100)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert!(
+            matches!(
+                n,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    ..
+                })
+            ),
+            "expected session-reset MalformedAsPath NOTIFICATION, got {n:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_as_path_confed_member_peer_with_confed_sequence_first_is_accepted() {
+        // Negative case for condition 2: a ConfedMember peer whose AS_PATH
+        // *does* start with AS_CONFED_SEQUENCE is well-formed.
+        let n = handle_update_get_notification_for(
+            PeerType::ConfedMember,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_segments(vec![
+                        pathvector_types::AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert!(
+            n.is_none(),
+            "well-formed ConfedMember AS_PATH must not trigger a NOTIFICATION, got {n:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_as_path_confed_conditions_are_session_reset_not_withdraw() {
+        // Deliberate, RFC-text-grounded departure from BIRD (which treats
+        // both RFC 5065 §5 conditions as withdraw-only): confirm the route
+        // is NOT simply dropped from Loc-RIB while the session stays up —
+        // a NOTIFICATION must be produced instead.
+        let p = peer();
+        let mut ari = AdjRibIn::new(p);
+        let mut rib = LocRib::new();
+        let mut ari_v6: AdjRibIn<Ipv6Addr> = AdjRibIn::new(p);
+        let mut rib_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let policy = accept_all();
+        let policy_v6: Policy<Route<Ipv6Addr>> =
+            Policy::new(pathvector_policy::DefaultAction::Accept);
+        let result = handle_update(
+            p,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_segments(vec![
+                        pathvector_types::AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+                    ])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+            &mut ari,
+            &mut rib,
+            &mut ari_v6,
+            &mut rib_v6,
+            &policy,
+            &policy_v6,
+            PeerType::External,
+            None,
+            &AlwaysReachable,
+            &AlwaysReachable,
+            65002,
+            Some(64_500),
+            None,
+            None,
+        );
+        assert!(
+            result.notification.is_some(),
+            "RFC 5065 §5 malformed AS_PATH must produce a NOTIFICATION (session reset)"
         );
     }
 
@@ -7036,6 +7438,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -7077,6 +7480,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -7143,6 +7547,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -7189,6 +7594,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -7234,6 +7640,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         );
@@ -7387,6 +7794,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None,           // confederation_id
             Some(own_addr), // local interface address matches NEXT_HOP
             None,
         );
@@ -7427,6 +7835,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None,           // confederation_id
             Some(own_addr), // NEXT_HOP differs from own address — valid
             None,
         );
@@ -7698,7 +8107,7 @@ mod tests {
     ) -> bool {
         let peer_ip = aro.peer().ip();
         let decision = propagate_prefix(
-            nlri, rib, aro, policy, peer_type, local_as, bgp_id, false, false,
+            nlri, rib, aro, policy, peer_type, local_as, local_as, bgp_id, false, false,
         );
         flush_updates(peer_ip, vec![decision], MAX_LEN, tx, peer_type, true)
     }
@@ -9039,6 +9448,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65002,
+            None, // confederation_id
             None,
             None,
         )
@@ -9135,6 +9545,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65001,
+            None, // confederation_id
             None,
             None,
         );
@@ -9165,6 +9576,7 @@ mod tests {
             &AlwaysReachable,
             &AlwaysReachable,
             65001,
+            None, // confederation_id
             None,
             None,
         );
@@ -9436,6 +9848,7 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
                 address: IpAddr::V4(address),
@@ -9454,6 +9867,7 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             }))
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -9462,6 +9876,7 @@ mod tests {
             local_bgp_id,
             None,
             Some(cluster_id),
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -10402,6 +10817,7 @@ mod tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
         let (tx, _rx) = mpsc::channel(64);
         state.add_peer(&new_peer, tx);
@@ -10469,6 +10885,7 @@ mod stall_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .collect();
         let state = DaemonState::new(
@@ -10476,6 +10893,7 @@ mod stall_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -10572,6 +10990,7 @@ mod stall_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -10590,6 +11009,7 @@ mod stall_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
         ];
         let mut senders = HashMap::new();
@@ -10600,6 +11020,7 @@ mod stall_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -10746,6 +11167,7 @@ mod stall_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -10764,6 +11186,7 @@ mod stall_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
         ];
         let mut senders = HashMap::new();
@@ -10774,6 +11197,7 @@ mod stall_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -11283,6 +11707,7 @@ mod coalescing_tests {
                     max_prefixes_v6: None,
                     max_prefixes_restart: None,
                     role: None,
+                    confederation_member: false,
                 }
             })
             .collect();
@@ -11291,6 +11716,7 @@ mod coalescing_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -11669,6 +12095,7 @@ mod coalescing_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -11687,6 +12114,7 @@ mod coalescing_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
         ];
         let mut senders = HashMap::new();
@@ -11697,6 +12125,7 @@ mod coalescing_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -11859,6 +12288,7 @@ mod coalescing_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -11877,6 +12307,7 @@ mod coalescing_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -11888,6 +12319,7 @@ mod coalescing_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             update_senders,
             vec![],
@@ -12137,6 +12569,7 @@ mod event_loop_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .collect();
 
@@ -12145,6 +12578,7 @@ mod event_loop_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             update_senders,
             vec![],
@@ -12294,6 +12728,7 @@ mod event_loop_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -12312,6 +12747,7 @@ mod event_loop_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -12322,6 +12758,7 @@ mod event_loop_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             update_senders,
             vec![],
@@ -12540,6 +12977,7 @@ mod event_loop_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }
     }
 
@@ -12776,6 +13214,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 graceful_restart_time: 0,
                 configured_restarting: false,
+                confederation_id: None,
                 startup_instant: std::time::Instant::now(),
             },
             None,
@@ -12941,6 +13380,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 graceful_restart_time: 0,
                 configured_restarting: false,
+                confederation_id: None,
                 startup_instant: std::time::Instant::now(),
             },
             None,
@@ -13023,6 +13463,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 graceful_restart_time: 0,
                 configured_restarting: false,
+                confederation_id: None,
                 startup_instant: std::time::Instant::now(),
             },
             None,
@@ -13096,12 +13537,14 @@ mod event_loop_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[peer_cfg],
             senders,
             vec![],
@@ -13128,6 +13571,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 graceful_restart_time: 0,
                 configured_restarting: false,
+                confederation_id: None,
                 startup_instant: std::time::Instant::now(),
             },
             None,
@@ -13316,6 +13760,7 @@ mod event_loop_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
         assert_eq!(
             peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
@@ -13395,6 +13840,7 @@ mod event_loop_tests {
                 hold_time: global_hold_time,
                 graceful_restart_time: 0,
                 configured_restarting: false,
+                confederation_id: None,
                 startup_instant: std::time::Instant::now(),
             },
             None,
@@ -13417,6 +13863,7 @@ mod event_loop_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
 
         cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
@@ -13654,6 +14101,7 @@ mod event_loop_tests {
                 hold_time: 180,
                 graceful_restart_time: 0,
                 configured_restarting: false,
+                confederation_id: None,
                 startup_instant: std::time::Instant::now(),
             },
             None,
@@ -13822,12 +14270,15 @@ mod prop_tests {
 
     proptest! {
         /// `config_peer_type` returns `Internal` iff the two AS numbers are
-        /// equal, and `External` otherwise.
+        /// equal (regardless of `confed_member`); otherwise `ConfedMember`
+        /// when `confed_member` is set, and `External` otherwise.
         #[test]
-        fn prop_config_peer_type_internal_iff_equal(a: u32, b: u32) {
-            let pt = config_peer_type(a, b);
+        fn prop_config_peer_type_internal_iff_equal(a: u32, b: u32, confed_member: bool) {
+            let pt = config_peer_type(a, b, confed_member);
             if a == b {
                 prop_assert_eq!(pt, PeerType::Internal);
+            } else if confed_member {
+                prop_assert_eq!(pt, PeerType::ConfedMember);
             } else {
                 prop_assert_eq!(pt, PeerType::External);
             }
@@ -13912,7 +14363,7 @@ mod prop_tests {
             let result = prepare_outbound(
                 route.clone(),
                 PeerType::Internal,
-                65001,
+                65001, 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
                 false,
             );
@@ -13930,7 +14381,7 @@ mod prop_tests {
             let route = base_route("10.0.0.0/8");
             let original_path_len = route.as_path.path_length();
 
-            let result = prepare_outbound(route, PeerType::External, local_as, bgp_id, false);
+            let result = prepare_outbound(route, PeerType::External, local_as, local_as, bgp_id, false);
 
             prop_assert_eq!(
                 result.as_path.path_length(),
@@ -13977,6 +14428,7 @@ mod dynamic_peer_prop_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }
     }
 
@@ -13995,6 +14447,7 @@ mod dynamic_peer_prop_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &cfgs,
             senders,
             vec![],
@@ -14164,6 +14617,7 @@ mod rib_consistency_prop_tests {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }
     }
 
@@ -14203,6 +14657,7 @@ mod rib_consistency_prop_tests {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &cfgs,
             senders,
             vec![],
@@ -14388,6 +14843,7 @@ mod mrai_tests {
             Ipv4Addr::new(1, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[],
             HashMap::new(),
             vec![],
@@ -14606,6 +15062,7 @@ mod run_with_tests {
                 metrics_port: None,
                 local_ipv6: None,
                 cluster_id: None,
+                confederation_id: None,
                 fib_table: 254,
                 fib_metric: 20,
                 graceful_restart_time: 0,
@@ -14632,6 +15089,7 @@ mod run_with_tests {
                     max_prefixes_v6: None,
                     max_prefixes_restart: None,
                     role: None,
+                    confederation_member: false,
                 })
                 .collect(),
             sidecar_path: None,
@@ -15289,6 +15747,7 @@ mod run_with_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .await;
 
@@ -15344,6 +15803,7 @@ mod run_with_tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .await;
 
@@ -15940,6 +16400,7 @@ mod test_build_local_capabilities {
             hold_time: 90,
             graceful_restart_time: gr_time,
             configured_restarting,
+            confederation_id: None,
             startup_instant: std::time::Instant::now().checked_sub(age).unwrap(),
         }
     }
@@ -16189,6 +16650,7 @@ mod test_gr_phase2 {
                     max_prefixes_v6: None,
                     max_prefixes_restart: None,
                     role: None,
+                    confederation_member: false,
                 }
             })
             .collect();
@@ -16197,6 +16659,7 @@ mod test_gr_phase2 {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -18041,6 +18504,7 @@ mod test_ipv6_peer_identity {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .collect();
         let state = DaemonState::new(
@@ -18048,6 +18512,7 @@ mod test_ipv6_peer_identity {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -18143,6 +18608,7 @@ mod test_ipv6_peer_identity {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
             config::PeerConfig {
                 address: peer_v6,
@@ -18161,6 +18627,7 @@ mod test_ipv6_peer_identity {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             },
         ];
         let mut senders = HashMap::new();
@@ -18175,6 +18642,7 @@ mod test_ipv6_peer_identity {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -18331,6 +18799,7 @@ mod test_rfc8538 {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
         // Build local capabilities with GR time 120 and N-bit set, matching a
         // realistic pathvectord deployment that participates in RFC 8538.
@@ -18340,6 +18809,7 @@ mod test_rfc8538 {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[peer],
             [(IpAddr::V4(PEER_IP), tx)].into(),
             local_caps,
@@ -18631,6 +19101,7 @@ mod test_rfc8538 {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
         // Local daemon has graceful_restart_time = 0 → no N-bit advertised.
         let mut state = DaemonState::new(
@@ -18638,6 +19109,7 @@ mod test_rfc8538 {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[peer],
             [(IpAddr::V4(PEER_IP), tx)].into(),
             build_local_capabilities(LOCAL_AS, 0, false, None),
@@ -18742,6 +19214,7 @@ mod test_max_prefix {
                 None
             },
             role: None,
+            confederation_member: false,
         }];
         let mut senders = HashMap::new();
         senders.insert(IpAddr::V4(PEER_IP), tx);
@@ -18750,6 +19223,7 @@ mod test_max_prefix {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -18886,6 +19360,7 @@ mod test_max_prefix {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }];
         let mut senders = HashMap::new();
         senders.insert(IpAddr::V4(PEER_IP), tx);
@@ -18894,6 +19369,7 @@ mod test_max_prefix {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &peer_configs,
             senders,
             vec![],
@@ -18930,12 +19406,14 @@ mod test_max_prefix {
             max_prefixes_v6: Some(200),
             max_prefixes_restart: Some(30),
             role: None,
+            confederation_member: false,
         };
         let mut state = DaemonState::new(
             LOCAL_AS,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[],
             HashMap::new(),
             vec![],
@@ -19069,6 +19547,7 @@ mod test_max_prefix {
                 None
             },
             role: None,
+            confederation_member: false,
         };
         let mut senders = HashMap::new();
         senders.insert(peer_ip, update_tx);
@@ -19077,6 +19556,7 @@ mod test_max_prefix {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[peer_cfg],
             senders,
             vec![],
@@ -19486,6 +19966,7 @@ mod test_max_prefix {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         }
     }
 
@@ -19505,6 +19986,7 @@ mod test_max_prefix {
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[
                 peer_cfg(IpAddr::V4(PEER_A), AS_A, None),
                 peer_cfg(IpAddr::V4(PEER_B), AS_B, Some(1)),
@@ -19622,12 +20104,14 @@ mod test_max_prefix {
             max_prefixes_v6: Some(1),
             max_prefixes_restart: None,
             role: None,
+            confederation_member: false,
         };
         let mut state = DaemonState::new(
             LOCAL_AS,
             Ipv4Addr::new(10, 0, 0, 1),
             None,
             None,
+            None, // confederation_id (RFC 5065 — TODO: thread real value)
             &[cfg],
             senders,
             vec![],

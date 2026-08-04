@@ -70,7 +70,8 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let is_ebgp = peer.remote_as != local_as;
-        let pt = config_peer_type(local_as, peer.remote_as);
+        let confed_member = peer.confederation_member && self.rib.confederation_id.is_some();
+        let pt = config_peer_type(local_as, peer.remote_as, confed_member);
         let peer_id = PeerId::from(peer.address);
 
         let is_rr = !self.rib.rr_clients.is_empty();
@@ -731,6 +732,7 @@ impl DaemonState {
             .collect();
 
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         let propagation_start = std::time::Instant::now();
@@ -780,6 +782,7 @@ impl DaemonState {
                         export_policy,
                         other_type,
                         local_as,
+                        public_as,
                         local_next_hop,
                         other_next_hop_self,
                         v4_deferred,
@@ -882,6 +885,10 @@ pub(super) async fn run_command_processor<H, F>(
                     capabilities: cfg.capabilities(effective_role(&peer, cfg.local_as)),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
+                    confederation_member: effective_confederation_member(
+                        &peer,
+                        cfg.confederation_id,
+                    ),
                     peer_addr: SocketAddr::new(peer.address, peer.port),
                     md5_password: peer.md5_password.clone(),
                     connect_retry_time: peer
