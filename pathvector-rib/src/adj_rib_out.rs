@@ -400,4 +400,54 @@ mod tests {
         let stored = rib.get(&nlri("10.0.0.0/8")).unwrap();
         assert_eq!(stored.as_path.path_length(), 2);
     }
+
+    // ── RFC 5065: ConfedMember is neither Internal nor External ──────────────
+
+    fn confed_peer() -> PeerId {
+        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)))
+    }
+
+    #[test]
+    fn test_confed_member_to_confed_member_not_split_horizoned() {
+        // RFC 5065 §2: confederations replace full-mesh iBGP with
+        // inter-Member-AS relaying, so ConfedMember-to-ConfedMember must
+        // NOT be split-horizoned the way Internal-to-Internal is — the
+        // split-horizon guard's `PeerType::Internal` checks must stay
+        // scoped to literal `Internal`, not widen to include ConfedMember.
+        let mut rib: AdjRibOut<Ipv4Addr> = AdjRibOut::new(confed_peer(), PeerType::ConfedMember);
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .peer_type(PeerType::ConfedMember)
+            .build();
+        let outcome = rib.insert(route);
+        assert!(
+            matches!(outcome, InsertOutcome::Accepted(_)),
+            "ConfedMember-to-ConfedMember must not be split-horizon filtered"
+        );
+        assert!(!rib.is_empty());
+    }
+
+    #[test]
+    fn test_confed_segments_preserved_for_confed_member_peer() {
+        // The eBGP-only strip gate (`peer_type == External`) must exclude
+        // ConfedMember — confed segments stay intact when relaying between
+        // fellow Member-ASes.
+        let mut rib: AdjRibOut<Ipv4Addr> = AdjRibOut::new(confed_peer(), PeerType::ConfedMember);
+
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+            AsPathSegment::Sequence(vec![Asn::new(65001)]),
+        ]);
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, path)
+            .peer_type(PeerType::ConfedMember)
+            .build();
+        rib.insert(route);
+
+        let stored = rib.get(&nlri("10.0.0.0/8")).unwrap();
+        let has_confed = stored
+            .as_path
+            .segments()
+            .iter()
+            .any(|s| matches!(s, AsPathSegment::ConfedSequence(_)));
+        assert!(has_confed, "confed segment stripped for ConfedMember peer");
+    }
 }

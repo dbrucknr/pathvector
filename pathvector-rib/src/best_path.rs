@@ -144,6 +144,23 @@ pub fn select_best_with_oracle<'a, A: IpAddress, S: std::hash::BuildHasher>(
         .map(|(peer, route)| (*peer, route))
 }
 
+/// Best-path preference rank for RFC 4271 §9.1 steps 3/7, extended by RFC
+/// 5065 §5.3.
+///
+/// `Local` beats `External`, which beats `Internal`/`ConfedMember` — the
+/// latter two are a deliberate tie (RFC 5065 §5.3 requires confederation
+/// Member-AS routes to be treated exactly like iBGP routes here). Do not
+/// replace this with `PeerType`'s derived `Ord`: that comparison has no
+/// concept of ties and only exists to support unrelated uses (e.g. sorting
+/// for display).
+fn peer_type_rank(pt: PeerType) -> u8 {
+    match pt {
+        PeerType::Internal | PeerType::ConfedMember => 0,
+        PeerType::External => 1,
+        PeerType::Local => 2,
+    }
+}
+
 /// Compares two (peer, route) pairs and returns the ordering from the
 /// perspective of route preference — `Ordering::Greater` means the first
 /// pair is preferred.
@@ -200,10 +217,13 @@ fn prefer<A: IpAddress>(
     }
 
     // Steps 3/7: Prefer locally originated routes, then eBGP over iBGP
-    // (RFC 4271 §9.1 steps 3 and 7).
-    // PeerType discriminants encode the preference order:
-    // Local (2) > External (1) > Internal (0).
-    let session = a.peer_type.cmp(&b.peer_type);
+    // (RFC 4271 §9.1 steps 3 and 7). RFC 5065 §5.3: a confederation
+    // Member-AS peer "MUST follow the same rules used for information
+    // received from members inside the same autonomous system" — it ties
+    // with Internal here, which `PeerType`'s derived `Ord` cannot express
+    // (it has its own, unrelated discriminant). Use an explicit rank
+    // instead of comparing the enum directly.
+    let session = peer_type_rank(a.peer_type).cmp(&peer_type_rank(b.peer_type));
     if session != Ordering::Equal {
         return session;
     }
@@ -954,6 +974,69 @@ mod tests {
         candidates.insert(peer(2), route);
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(winner, peer(1)); // step 10: lower peer IP
+    }
+
+    // ── RFC 5065 §5.3: ConfedMember ties with Internal ───────────────────────
+
+    #[test]
+    fn test_confed_member_ties_with_internal_falls_through_to_tiebreak() {
+        // RFC 5065 §5.3: a confederation Member-AS peer's routes "MUST
+        // follow the same rules used for information received from members
+        // inside the same autonomous system" — ConfedMember must NOT win
+        // outright at step 3/7 the way External does; it ties with
+        // Internal and falls through to a later tiebreak (step 10: BGP ID).
+        let confed = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::ConfedMember)
+            .peer_bgp_id(Ipv4Addr::new(9, 9, 9, 9))
+            .build();
+        let ibgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::Internal)
+            .peer_bgp_id(Ipv4Addr::new(1, 1, 1, 1))
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), confed);
+        candidates.insert(peer(2), ibgp);
+        let (winner, _) = select_best(&candidates).unwrap();
+        // Lower BGP ID wins at step 10, proving step 3/7 was a tie.
+        assert_eq!(winner, peer(2));
+    }
+
+    #[test]
+    fn test_confed_member_beaten_by_external() {
+        // Step 7 preference (eBGP over iBGP) still holds against
+        // ConfedMember specifically — only Internal ties with it.
+        let confed = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::ConfedMember)
+            .build();
+        let ebgp = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::External)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), confed);
+        candidates.insert(peer(2), ebgp);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // eBGP peer wins
+    }
+
+    #[test]
+    fn test_confed_member_beaten_by_local() {
+        let confed = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::ConfedMember)
+            .build();
+        let local = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(100))
+            .peer_type(PeerType::Local)
+            .build();
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), confed);
+        candidates.insert(peer(2), local);
+        let (winner, _) = select_best(&candidates).unwrap();
+        assert_eq!(winner, peer(2)); // locally originated wins
     }
 
     // ── Step 3: locally originated (RFC 4271 §9.1 step 3) ───────────────────
