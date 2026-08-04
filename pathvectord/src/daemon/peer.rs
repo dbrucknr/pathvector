@@ -22,10 +22,13 @@ use super::*;
 /// EOR-only-not-GR-capable interpretation.
 ///
 /// RFC 8538 §2's N-bit (0x04 in `restart_flags`) is extracted from the same
-/// authoritative instance.
+/// authoritative instance, as is RFC 4724 §3's Restart State (R) bit (0x08
+/// — the peer signaling that *it* is currently restarting), consumed by
+/// RFC 4724 §4.1's Restarting-Speaker wait-set (see `deferral.rs`) to
+/// exclude such peers from blocking our own outbound-advertisement gate.
 pub(super) fn extract_gr_capability(
     caps: &[Capability],
-) -> (Option<u16>, Vec<GracefulRestartFamily>, bool) {
+) -> (Option<u16>, Vec<GracefulRestartFamily>, bool, bool) {
     let last = caps.iter().rev().find_map(|c| {
         if let Capability::GracefulRestart {
             restart_flags,
@@ -41,9 +44,10 @@ pub(super) fn extract_gr_capability(
     match last {
         Some((restart_flags, restart_time, families)) if restart_time > 0 => {
             let n_bit = restart_flags & 0x04 != 0;
-            (Some(restart_time), families.clone(), n_bit)
+            let r_bit = restart_flags & 0x08 != 0;
+            (Some(restart_time), families.clone(), n_bit, r_bit)
         }
-        _ => (None, vec![], false),
+        _ => (None, vec![], false, false),
     }
 }
 
@@ -142,6 +146,7 @@ impl DaemonState {
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
         self.rib_mut().gr_capable_peers.remove(&peer_ip);
+        self.rib_mut().gr_peer_restarting.remove(&peer_ip);
         self.gr.remove_peer(peer_ip);
         self.mrai_last_sent.remove(&peer_ip);
         self.mrai_pending.remove(&peer_ip);
@@ -164,6 +169,10 @@ impl DaemonState {
         rib.next_hop_self_peers.remove(&peer_ip);
         rib.peer_roles.remove(&peer_ip);
         rib.negotiated_roles.remove(&peer_ip);
+        // RFC 4724 §4.1: a permanently-removed peer can no longer block
+        // release — unlike ordinary disconnect-with-reconnect-expected
+        // (`on_terminated`), this peer has left the configured set entirely.
+        self.recompute_selection_deferral();
         true
     }
 
@@ -316,73 +325,21 @@ impl DaemonState {
         }
         self.adj_ribs_out_v6.insert(peer_ip, new_aro_v6);
 
-        let all_nlris: Vec<Nlri<Ipv4Addr>> =
-            self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
-        let all_nlris_v6: Vec<Nlri<Ipv6Addr>> =
-            self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
-        let rib_prefixes = all_nlris.len() + all_nlris_v6.len();
+        let rib_prefixes =
+            self.rib.loc_rib.best_routes().count() + self.rib.loc_rib_v6.best_routes().count();
 
-        let Some(export_policy) = self.export_policies.get(&peer_ip) else {
+        if !self.export_policies.contains_key(&peer_ip) {
             tracing::error!(peer = %peer_ip, "export_policies missing peer — skipping Established event");
             return;
-        };
-        let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
+        }
+        if !self.adj_ribs_out.contains_key(&peer_ip) {
             tracing::error!(peer = %peer_ip, "adj_ribs_out missing peer — skipping Established event");
             return;
-        };
-        let Some(update_tx) = self.update_senders.get(&peer_ip) else {
+        }
+        if !self.update_senders.contains_key(&peer_ip) {
             tracing::error!(peer = %peer_ip, "update_senders missing peer — skipping Established event");
             return;
-        };
-
-        let local_as = self.rib.local_as;
-        let local_bgp_id = self.rib.local_bgp_id;
-        let local_next_hop = local_addr
-            .and_then(|a| match a {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            })
-            .unwrap_or(local_bgp_id);
-        let local_ipv6 = self.rib.local_ipv6;
-        let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
-
-        // RFC 4456 §8 split-horizon: when acting as an RR, a non-client iBGP
-        // peer must not receive routes learned from other non-client iBGP peers
-        // in the initial full-table dump. The same check applies in
-        // propagate_to_all_peers for incremental updates.
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let dest_is_client = self.rib.rr_clients.contains(&peer_ip);
-        let rr_clients = &self.rib.rr_clients;
-        let peer_types = &self.rib.peer_types;
-        let loc_rib = &self.rib.loc_rib;
-
-        let decisions: Vec<PrefixDecision> = all_nlris
-            .into_iter()
-            .map(|nlri| {
-                if is_rr
-                    && peer_type == PeerType::Internal
-                    && let Some(src) = loc_rib.best_peer(&nlri)
-                    && let IpAddr::V4(src_ip) = src.ip()
-                {
-                    let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                    let src_is_ibgp =
-                        peer_types.get(&IpAddr::V4(src_ip)).copied() == Some(PeerType::Internal);
-                    if src_is_ibgp && !src_is_client && !dest_is_client {
-                        return PrefixDecision::NoChange;
-                    }
-                }
-                propagate_prefix(
-                    nlri,
-                    loc_rib,
-                    adj_rib_out,
-                    export_policy,
-                    peer_type,
-                    local_as,
-                    local_next_hop,
-                    next_hop_self,
-                )
-            })
-            .collect();
+        }
 
         // RFC 6793: track whether this peer supports 4-byte ASNs.
         let peer_four_byte = peer_capabilities
@@ -420,20 +377,10 @@ impl DaemonState {
         // for the "last instance wins" rule this applies). A zero restart_time
         // means the peer does not participate in the GR restart window
         // (capability present for EOR only). RFC 8538 §2's N-bit (0x04 in
-        // restart_flags) is extracted from the same authoritative instance.
-        let (peer_gr_time, peer_gr_families, peer_has_n_bit) =
+        // restart_flags) and RFC 4724 §3's Restart State (R) bit (0x08) are
+        // extracted from the same authoritative instance.
+        let (peer_gr_time, peer_gr_families, peer_has_n_bit, peer_r_bit) =
             extract_gr_capability(peer_capabilities);
-        let mut stalled = !flush_updates(
-            peer_ip,
-            decisions,
-            max_len,
-            update_tx,
-            peer_type,
-            peer_four_byte,
-        );
-        if stalled {
-            self.stalled_peers.push(peer_ip);
-        }
 
         // Full-table dump for IPv6 — only for peers that negotiated IPv6 unicast
         // (RFC 4760): sending MP_REACH_NLRI to a peer that did not advertise the
@@ -446,68 +393,23 @@ impl DaemonState {
         } else {
             self.ipv6_capable_peers.remove(&peer_ip);
         }
-        if !stalled
-            && peer_supports_ipv6
-            && !all_nlris_v6.is_empty()
-            && let Some(export_policy_v6) = self.export_policies_v6.get(&peer_ip)
-            && let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&peer_ip)
-        {
-            let loc_rib_v6 = &self.rib.loc_rib_v6;
-            let decisions_v6: Vec<PrefixDecisionV6> = all_nlris_v6
-                .into_iter()
-                .map(|nlri| {
-                    // RFC 4456 §8 split-horizon: same rule as IPv4 — block
-                    // non-client iBGP → non-client iBGP in the initial dump.
-                    if is_rr
-                        && peer_type == PeerType::Internal
-                        && let Some(src) = loc_rib_v6.best_peer(&nlri)
-                        && let IpAddr::V4(src_ip) = src.ip()
-                    {
-                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
-                            == Some(PeerType::Internal);
-                        if src_is_ibgp && !src_is_client && !dest_is_client {
-                            return PrefixDecisionV6::NoChange;
-                        }
-                    }
-                    propagate_prefix_v6(
-                        nlri,
-                        loc_rib_v6,
-                        adj_rib_out_v6,
-                        export_policy_v6,
-                        peer_type,
-                        local_as,
-                        local_ipv6,
-                        next_hop_self,
-                    )
-                })
-                .collect();
-            if !flush_updates_v6(
-                peer_ip,
-                decisions_v6,
-                max_len,
-                update_tx,
-                peer_type,
-                peer_four_byte,
-            ) {
-                stalled = true;
-                self.stalled_peers.push(peer_ip);
-            }
-        }
 
-        // RFC 4724 §2: send End-of-RIB marker after the full-table dump so
-        // the peer knows the initial Adj-RIB-Out snapshot is complete.
-        // Skip if the channel stalled — the session will be torn down anyway.
-        if !stalled
-            && (!send_eor_ipv4(update_tx) || (peer_supports_ipv6 && !send_eor_ipv6(update_tx)))
-        {
-            self.stalled_peers.push(peer_ip);
+        // RFC 4724 §4.1: each family's initial dump is independently gated
+        // by the Restarting-Speaker selection-deferral state. A deferred
+        // family is skipped entirely here (AdjRibOut left untouched, no EOR
+        // sent) — `recompute_selection_deferral` performs the equivalent
+        // dump once that family's gate opens, whether that peer is still
+        // connected then or not. The two paths are temporally exclusive: a
+        // peer can only be Established during the deferral window by having
+        // connected during it, so it is dumped by exactly one path.
+        if !self.selection_deferral.v4_deferred() {
+            self.dump_family_v4(peer_ip);
         }
-
-        self.sync_advertised(peer_ip);
+        if !self.selection_deferral.v6_deferred() {
+            self.dump_family_v6(peer_ip);
+        }
 
         // RFC 4724: update gr_capable_peers from the peer's advertised capability.
-        // Done here after update_tx is fully consumed to avoid borrow conflicts.
         let we_advertise_gr: bool = self.config_capabilities.iter().any(
             |c| matches!(c, Capability::GracefulRestart { restart_time, .. } if *restart_time > 0),
         );
@@ -517,6 +419,11 @@ impl DaemonState {
                 rib.gr_capable_peers.insert(peer_ip, t);
             } else {
                 rib.gr_capable_peers.remove(&peer_ip);
+            }
+            if peer_gr_time.is_some() && peer_r_bit {
+                rib.gr_peer_restarting.insert(peer_ip);
+            } else {
+                rib.gr_peer_restarting.remove(&peer_ip);
             }
             if let Some(role) = peer_role {
                 rib.negotiated_roles.insert(peer_ip, role);
@@ -535,6 +442,14 @@ impl DaemonState {
             self.gr.peer_families.remove(&peer_ip);
             self.gr.notification_capable_peers.remove(&peer_ip);
         }
+
+        // RFC 4724 §4.1: this peer's establishment (EOR receipt for either
+        // family is still to come, but its GR/role/restarting-state
+        // bookkeeping above is now final) may satisfy the wait-set, or a
+        // peer that will never send EOR (not GR-capable) should stop
+        // blocking release immediately rather than waiting for the deadline.
+        self.recompute_selection_deferral();
+
         if peer_gr_time.is_none() && we_advertise_gr {
             tracing::warn!(
                 peer = %peer_ip,
@@ -674,6 +589,7 @@ impl DaemonState {
             rib.eor_received.remove(&peer_ip);
             rib.eor_received_v6.remove(&peer_ip);
             rib.negotiated_roles.remove(&peer_ip);
+            rib.gr_peer_restarting.remove(&peer_ip);
         }
         self.negotiated_max_len.remove(&peer_ip);
         self.ipv6_capable_peers.remove(&peer_ip);
@@ -799,6 +715,7 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let v4_deferred = self.selection_deferral.v4_deferred();
         let propagation_start = std::time::Instant::now();
         let prefix_count = prev_prefixes.len();
         for other_ip in other_peers {
@@ -848,6 +765,7 @@ impl DaemonState {
                         local_as,
                         local_next_hop,
                         other_next_hop_self,
+                        v4_deferred,
                     )
                 })
                 .collect();

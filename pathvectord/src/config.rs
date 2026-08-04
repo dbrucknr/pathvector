@@ -180,6 +180,41 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub restarting: bool,
+    /// RFC 4724 §4.1: how long (in seconds) to defer outbound route
+    /// advertisement after this daemon starts, giving peers time to
+    /// re-send their full routing tables before we propagate anything
+    /// based on a possibly-incomplete view.
+    ///
+    /// Applies the "Restarting Speaker" deferral to **outbound
+    /// advertisement only** — Loc-RIB/FIB computation stays immediate, as
+    /// today. This matches how BIRD implements graceful restart recovery
+    /// (deferring export while tables repopulate normally), rather than
+    /// the RFC's literal text of deferring route selection itself.
+    ///
+    /// While deferred, each address family (IPv4 unicast, IPv6 unicast)
+    /// independently releases as soon as either (a) every currently- or
+    /// eventually-established peer that advertises the GracefulRestart
+    /// capability (and isn't itself restarting) has sent its End-of-RIB
+    /// marker for that family, or (b) this timer expires — whichever
+    /// comes first. Once released, a family never re-defers, even if a
+    /// peer later disconnects.
+    ///
+    /// Unlike `restarting`, this applies on **every** startup when
+    /// non-zero — it is not gated behind the `restarting` flag, since it
+    /// protects against advertising based on incomplete peer state
+    /// regardless of whether this restart was planned.
+    ///
+    /// Set to `0` (the default) to disable — outbound advertisement is
+    /// never deferred.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as                = 65001
+    /// bgp_id                  = "10.0.0.1"
+    /// selection_deferral_time = 120
+    /// ```
+    #[serde(default)]
+    pub selection_deferral_time: u16,
     /// RPKI Route Origin Validation via the RTR protocol (RFC 8210 / RFC 6810).
     ///
     /// When present, pathvectord connects to an external RPKI validator

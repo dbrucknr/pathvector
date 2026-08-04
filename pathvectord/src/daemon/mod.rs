@@ -42,6 +42,7 @@ use crate::{config, fib as crate_fib, grpc, proto};
 use crate_fib::ApplyFibChange;
 
 mod capabilities;
+mod deferral;
 mod fib;
 mod gr;
 mod origination;
@@ -52,6 +53,7 @@ mod route;
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use capabilities::{SpawnConfig, build_local_capabilities};
+use deferral::SelectionDeferral;
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
 use peer::{run_bgp_listener, run_command_processor};
@@ -218,6 +220,14 @@ pub(crate) struct RibSnapshot {
     /// either did not advertise the capability or advertised `restart_time = 0`
     /// (EOR-only mode, no stale-route window).
     pub(crate) gr_capable_peers: HashMap<IpAddr, u16>,
+    /// Peers whose most-recent GracefulRestart capability had the Restart
+    /// State (R) bit set, i.e. they advertised that *they themselves* are
+    /// currently restarting. RFC 4724 §4.1 excludes such peers from the
+    /// Restarting-Speaker's own EOR wait-set, since a peer that is itself
+    /// mid-restart cannot be expected to have already re-sent its table.
+    /// Populated alongside `gr_capable_peers` in `on_established`; removed
+    /// on `Terminated`.
+    pub(crate) gr_peer_restarting: HashSet<IpAddr>,
     /// RFC 9234 BGP Role configured for each peer, if any. Present only for
     /// peers with `role` set in `PeerConfig` — absent means Role capability
     /// negotiation and OTC leak prevention are disabled for that peer
@@ -320,6 +330,13 @@ pub(crate) struct DaemonState {
     ///
     /// See [`GracefulRestartState`] for field-level documentation.
     pub(crate) gr: GracefulRestartState,
+    /// RFC 4724 §4.1 Restarting-Speaker outbound-advertisement deferral.
+    ///
+    /// `SelectionDeferral::disabled()` until `run_with` wires the real
+    /// `daemon_start`/`selection_deferral_time` post-construction — mirrors
+    /// `install_rpki_import_terms`'s pattern to avoid touching this
+    /// struct's ~30 existing `DaemonState::new()` test call sites.
+    pub(crate) selection_deferral: SelectionDeferral,
     /// RFC 9003 shutdown reason strings, keyed by peer address.
     ///
     /// Populated when a peer is added (static or dynamic) and has a
@@ -545,6 +562,7 @@ impl DaemonState {
             eor_received: HashSet::new(),
             eor_received_v6: HashSet::new(),
             gr_capable_peers: HashMap::new(),
+            gr_peer_restarting: HashSet::new(),
             peer_roles,
             negotiated_roles: HashMap::new(),
         });
@@ -573,6 +591,7 @@ impl DaemonState {
             pending_decisions_v6: HashMap::new(),
             pending_removal: HashSet::new(),
             gr: GracefulRestartState::new(),
+            selection_deferral: SelectionDeferral::disabled(),
             shutdown_messages,
             peer_max_prefixes_v4,
             peer_max_prefixes_v6,
@@ -764,6 +783,8 @@ where
         if let Some(writer) = fib_writer {
             guard.fib_manager = Some(Arc::new(crate_fib::FibManager::new(writer)));
         }
+        guard.selection_deferral =
+            SelectionDeferral::new(daemon_start, cfg.daemon.selection_deferral_time);
     }
 
     // Channel for gRPC → event-loop command injection (AddPeer / RemovePeer).
@@ -1420,6 +1441,44 @@ pub(crate) async fn run_event_loop(
                         if let Some(tx) = tx {
                             let _ = tx.send(SessionCommand::Stop).await;
                         }
+                    }
+                }
+            }
+
+            // RFC 4724 §4.1 — Selection_Deferral_Timer.  Fires once, at
+            // whichever family still hasn't released by the deadline (path
+            // (b) — the wait-set-satisfied path (a) is driven reactively by
+            // `recompute_selection_deferral` on EOR receipt / establishment /
+            // permanent removal, not by this timer). `pending_deadline()`
+            // returns `None` once both families are released, or when the
+            // feature is disabled, so this branch is dormant in the common
+            // case.
+            () = async {
+                let deadline = state.read().await.selection_deferral.pending_deadline();
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None    => std::future::pending::<()>().await,
+                }
+            } => {
+                let mut s = state.write().await;
+                tracing::warn!(
+                    "RFC 4724 §4.1: selection-deferral timer expired — \
+                     releasing any still-deferred address family unconditionally"
+                );
+                s.force_release_selection_deferral();
+                s.flush_pending();
+                let stalled = s.take_stalled_peers();
+                drop(s);
+
+                for peer in stalled {
+                    tracing::error!(
+                        peer = %peer,
+                        "closing session: outbound UPDATE channel overflowed during \
+                         selection-deferral timer flush"
+                    );
+                    let tx = stop_senders.lock().unwrap().get(&peer).cloned();
+                    if let Some(tx) = tx {
+                        let _ = tx.send(SessionCommand::Stop).await;
                     }
                 }
             }
@@ -5614,6 +5673,7 @@ mod tests {
             65001,
             None, // no local_ipv6 — OK for iBGP
             false,
+            false,
         );
 
         assert!(
@@ -5641,6 +5701,7 @@ mod tests {
             PeerType::External,
             65001,
             Some(local_v6),
+            false,
             false,
         );
 
@@ -5675,6 +5736,7 @@ mod tests {
             65001,
             None, // no local_ipv6 — eBGP must NOT announce
             false,
+            false,
         );
 
         assert!(
@@ -5703,6 +5765,7 @@ mod tests {
             65001,
             None,
             false,
+            false,
         );
 
         // Now withdraw from loc_rib_v6 and propagate again.
@@ -5715,6 +5778,7 @@ mod tests {
             PeerType::Internal,
             65001,
             None,
+            false,
             false,
         );
 
@@ -5755,15 +5819,17 @@ mod tests {
             None,
         );
 
-        // First message should be the MP_REACH_NLRI UPDATE for the v6 prefix.
-        let msg = rxs
-            .get_mut(&peer_ip)
-            .unwrap()
-            .try_recv()
-            .expect("should receive v6 UPDATE on establish");
-        let has_mp_reach = msg.attributes.iter().any(
-            |a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST),
-        );
+        // RFC 4724 §4.1: v4 and v6 dumps are independently gated (each family
+        // sends its own EOR right after its own flush), so the v6
+        // MP_REACH_NLRI is no longer guaranteed to be the very first message
+        // — the (empty here) v4 dump's EOR precedes it. Drain messages until
+        // the MP_REACH_NLRI UPDATE is found.
+        let rx = rxs.get_mut(&peer_ip).unwrap();
+        let has_mp_reach = std::iter::from_fn(|| rx.try_recv().ok()).any(|msg| {
+            msg.attributes.iter().any(
+                |a| matches!(a, PathAttribute::MpReachNlri(mp) if mp.afi_safi == AfiSafi::IPV6_UNICAST),
+            )
+        });
         assert!(
             has_mp_reach,
             "Established full-table dump must include v6 MP_REACH_NLRI"
@@ -7540,7 +7606,9 @@ mod tests {
         tx: &mpsc::Sender<UpdateMessage>,
     ) -> bool {
         let peer_ip = aro.peer().ip();
-        let decision = propagate_prefix(nlri, rib, aro, policy, peer_type, local_as, bgp_id, false);
+        let decision = propagate_prefix(
+            nlri, rib, aro, policy, peer_type, local_as, bgp_id, false, false,
+        );
         flush_updates(peer_ip, vec![decision], MAX_LEN, tx, peer_type, true)
     }
 
@@ -14451,6 +14519,7 @@ mod run_with_tests {
                 fib_metric: 20,
                 graceful_restart_time: 0,
                 restarting: false,
+                selection_deferral_time: 0,
                 rpki: None,
             },
             peers: peer_ips
@@ -15370,6 +15439,200 @@ mod eor_receive_tests {
             !state.rib.eor_received.contains(&IpAddr::V4(PEER_IP)),
             "eor_received must be cleared on session re-establishment"
         );
+    }
+}
+
+// ── RFC 4724 §4.1 — Restarting-Speaker Selection_Deferral_Timer ─────────────
+
+#[cfg(test)]
+mod selection_deferral_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Instant;
+
+    use pathvector_session::message::{PathAttribute, UpdateMessage};
+    use pathvector_types::{AfiSafi, AsPath, Asn, Nlri, Origin, PeerType};
+
+    use super::deferral::SelectionDeferral;
+    use super::tests::make_state;
+    use super::{Capability, GracefulRestartFamily};
+
+    const PEER_A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
+    const AS_A: u32 = 65002;
+    const AS_B: u32 = 65003;
+    const LOCAL_AS: u32 = 65001;
+
+    fn nlri(s: &str) -> Nlri<Ipv4Addr> {
+        s.parse().unwrap()
+    }
+
+    fn gr_caps() -> Vec<Capability> {
+        vec![Capability::GracefulRestart {
+            restart_flags: 0,
+            restart_time: 120,
+            families: vec![GracefulRestartFamily {
+                afi_safi: AfiSafi::IPV4_UNICAST,
+                forwarding_preserved: true,
+            }],
+        }]
+    }
+
+    fn establish(
+        state: &mut super::DaemonState,
+        peer: Ipv4Addr,
+        remote_as: u32,
+        caps: &[Capability],
+    ) {
+        state.on_established(
+            IpAddr::V4(peer),
+            peer,
+            PeerType::External,
+            remote_as,
+            90,
+            caps,
+            None,
+        );
+    }
+
+    fn ipv4_eor() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![],
+        }
+    }
+
+    fn announce(prefix: &str, peer_as: u32) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(peer_as)])),
+                PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+            ],
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    /// Nonzero `selection_deferral_time`, two configured peers, both
+    /// established. Only peer A is GR-capable; peer B is not, so it never
+    /// contributes to the v4 wait-set (RFC 4724 §4.1 excludes non-GR-capable
+    /// peers). Peer A announces a route with no EOR yet — the gate must
+    /// still be closed, so peer B's outbound stays empty despite the route
+    /// existing in Loc-RIB. Once A sends its EOR, the wait-set is fully
+    /// satisfied (B never counted), the gate opens, and B receives a
+    /// catch-up dump ending in its own EOR.
+    #[test]
+    fn deferred_gate_blocks_propagation_until_eor_then_catches_up() {
+        let (mut state, mut rxs) = make_state(
+            LOCAL_AS,
+            &[(IpAddr::V4(PEER_A), AS_A), (IpAddr::V4(PEER_B), AS_B)],
+        );
+        state.selection_deferral = SelectionDeferral::new(Instant::now(), 120);
+
+        establish(&mut state, PEER_A, AS_A, &gr_caps());
+        establish(&mut state, PEER_B, AS_B, &[]); // not GR-capable
+        assert!(state.selection_deferral.v4_deferred(), "gate starts closed");
+
+        // Drain the (empty) dumps from establishment.
+        let rx_b = rxs.get_mut(&IpAddr::V4(PEER_B)).unwrap();
+        assert!(rx_b.try_recv().is_err(), "no dump while deferred");
+
+        // A announces a route — Loc-RIB updates immediately (scope is
+        // outbound-only), but propagation to B must stay suppressed.
+        state.on_route_update(IpAddr::V4(PEER_A), announce("10.0.0.0/24", AS_A));
+        state.flush_pending();
+        assert!(
+            rx_b.try_recv().is_err(),
+            "B must receive nothing while the v4 gate is still closed"
+        );
+
+        // A's EOR satisfies the wait-set (B was never a member) — gate opens.
+        state.on_route_update(IpAddr::V4(PEER_A), ipv4_eor());
+        assert!(
+            !state.selection_deferral.v4_deferred(),
+            "gate must open once the only GR-capable configured peer EORs"
+        );
+
+        // B must now receive a catch-up dump: the announced route, followed
+        // by B's own EOR.
+        let msg = rx_b
+            .try_recv()
+            .expect("B must receive the catch-up dump once the gate opens");
+        assert_eq!(msg.announced, vec![nlri("10.0.0.0/24")]);
+        let eor = rx_b.try_recv().expect("B must also receive its own EOR");
+        assert!(eor.withdrawn.is_empty() && eor.attributes.is_empty() && eor.announced.is_empty());
+    }
+
+    /// A configured peer that never establishes conservatively blocks
+    /// release — even after the only established peer sends its EOR, the
+    /// gate must stay closed until the unestablished peer either connects
+    /// or the deadline fires.
+    #[test]
+    fn unestablished_configured_peer_keeps_gate_closed() {
+        let (mut state, _rxs) = make_state(
+            LOCAL_AS,
+            &[(IpAddr::V4(PEER_A), AS_A), (IpAddr::V4(PEER_B), AS_B)],
+        );
+        state.selection_deferral = SelectionDeferral::new(Instant::now(), 120);
+
+        establish(&mut state, PEER_A, AS_A, &gr_caps());
+        // PEER_B is configured but never established.
+
+        state.on_route_update(IpAddr::V4(PEER_A), ipv4_eor());
+        assert!(
+            state.selection_deferral.v4_deferred(),
+            "gate must stay closed while a configured peer has never connected"
+        );
+    }
+
+    /// The Selection_Deferral_Timer (path (b)) overrides an unsatisfied
+    /// wait-set unconditionally, and still runs the gate-open catch-up for
+    /// whichever peers are currently established.
+    #[test]
+    fn force_release_overrides_unsatisfied_wait_set_and_catches_up() {
+        let (mut state, mut rxs) = make_state(
+            LOCAL_AS,
+            &[(IpAddr::V4(PEER_A), AS_A), (IpAddr::V4(PEER_B), AS_B)],
+        );
+        state.selection_deferral = SelectionDeferral::new(Instant::now(), 120);
+
+        establish(&mut state, PEER_A, AS_A, &gr_caps());
+        // PEER_B never connects — would block release forever without (b).
+        assert!(state.selection_deferral.v4_deferred());
+
+        state.force_release_selection_deferral();
+        assert!(
+            !state.selection_deferral.v4_deferred(),
+            "force_release must open the gate regardless of the wait-set"
+        );
+
+        // A (currently established) must receive its own catch-up EOR.
+        let rx_a = rxs.get_mut(&IpAddr::V4(PEER_A)).unwrap();
+        let eor = rx_a
+            .try_recv()
+            .expect("A must receive a catch-up EOR after forced release");
+        assert!(eor.withdrawn.is_empty() && eor.attributes.is_empty() && eor.announced.is_empty());
+    }
+
+    /// Regression guard: `selection_deferral_time == 0` (the
+    /// `DaemonState::new()` default) must behave exactly as before this
+    /// feature existed — no deferral, immediate full-table dump on establish.
+    #[test]
+    fn disabled_deferral_dumps_immediately_on_establish() {
+        let (mut state, mut rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_A), AS_A)]);
+        assert!(!state.selection_deferral.v4_deferred());
+        assert!(!state.selection_deferral.v6_deferred());
+
+        establish(&mut state, PEER_A, AS_A, &gr_caps());
+
+        // No routes exist yet, so the only message is A's own EOR — but it
+        // must arrive immediately, not be withheld.
+        let rx_a = rxs.get_mut(&IpAddr::V4(PEER_A)).unwrap();
+        let eor = rx_a
+            .try_recv()
+            .expect("disabled deferral must still dump (here: just EOR) immediately");
+        assert!(eor.withdrawn.is_empty() && eor.attributes.is_empty() && eor.announced.is_empty());
     }
 }
 

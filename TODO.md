@@ -724,7 +724,23 @@ areas the existing test suite never covered:
   is a substantial feature (new timer, EOR-tracking-since-our-restart,
   a gate in front of the decision-process pipeline) — needs its own design
   discussion, not a quick patch. See `RFC_AUDIT.md`'s RFC 4724 §4.1
-  section.
+  section. **Fixed** (`feature/rfc4724-restarting-speaker-selection-deferral`):
+  scoped to **outbound-advertisement-only** deferral rather than the RFC's
+  literal "defer route selection" (Loc-RIB/FIB computation stays
+  immediate) — matches BIRD's real implementation, confirmed by reading
+  `nest/proto.c`'s doc comment directly rather than trusting a mental model
+  of "how BIRD generally works." New `selection_deferral_time` config field
+  (applies on every startup when nonzero, independent of the `restarting`
+  flag). New `SelectionDeferral` struct (`daemon/deferral.rs`) implements
+  the wait-set over the **full configured peer set**, not just
+  currently-established peers — a first design draft got this wrong (an
+  established-only wait-set would let one fast peer's EOR falsely satisfy
+  the wait-set before a slow peer even connects) and was caught during
+  planning review before any code was written. `propagate_prefix`/
+  `propagate_prefix_v6` gained a `deferred: bool` gate that returns
+  `NoChange` before touching AdjRibOut at all, so there's nothing to
+  reconcile once a family's gate opens; a gate-open catch-up dump (full
+  table + EOR) runs for every established peer at that point.
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world

@@ -162,6 +162,7 @@ impl DaemonState {
             .collect();
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let v4_deferred = self.selection_deferral.v4_deferred();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -206,6 +207,7 @@ impl DaemonState {
                         local_as,
                         local_next_hop,
                         other_next_hop_self,
+                        v4_deferred,
                     )
                 })
                 .collect();
@@ -237,6 +239,7 @@ impl DaemonState {
             .collect();
         let local_as = self.rib.local_as;
         let local_ipv6 = self.rib.local_ipv6;
+        let v6_deferred = self.selection_deferral.v6_deferred();
         for other_ip in other_peers {
             if !self.ipv6_capable_peers.contains(&other_ip) {
                 continue;
@@ -275,6 +278,7 @@ impl DaemonState {
                         local_as,
                         local_ipv6,
                         other_next_hop_self,
+                        v6_deferred,
                     )
                 })
                 .collect();
@@ -349,6 +353,7 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let v4_deferred = self.selection_deferral.v4_deferred();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -393,6 +398,7 @@ impl DaemonState {
                         local_as,
                         local_next_hop,
                         other_next_hop_self,
+                        v4_deferred,
                     )
                 })
                 .collect();
@@ -462,6 +468,7 @@ impl DaemonState {
 
         let local_as = self.rib.local_as;
         let local_ipv6 = self.rib.local_ipv6;
+        let v6_deferred = self.selection_deferral.v6_deferred();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -500,6 +507,7 @@ impl DaemonState {
                         local_as,
                         local_ipv6,
                         other_next_hop_self,
+                        v6_deferred,
                     )
                 })
                 .collect();
@@ -578,6 +586,7 @@ impl DaemonState {
             .collect();
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
+        let v4_deferred = self.selection_deferral.v4_deferred();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -622,6 +631,7 @@ impl DaemonState {
                         local_as,
                         local_next_hop,
                         other_next_hop_self,
+                        v4_deferred,
                     )
                 })
                 .collect();
@@ -651,6 +661,7 @@ impl DaemonState {
             .filter(|&ip| ip != peer_ip)
             .collect();
         let local_ipv6 = self.rib.local_ipv6;
+        let v6_deferred = self.selection_deferral.v6_deferred();
         for other_ip in other_peers_v6 {
             if !self.ipv6_capable_peers.contains(&other_ip) {
                 continue;
@@ -689,6 +700,7 @@ impl DaemonState {
                         local_as,
                         local_ipv6,
                         other_next_hop_self,
+                        v6_deferred,
                     )
                 })
                 .collect();

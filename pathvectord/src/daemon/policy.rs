@@ -156,6 +156,8 @@ impl DaemonState {
         let local_bgp_id = self.rib.local_bgp_id;
         let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
+        let v4_deferred = self.selection_deferral.v4_deferred();
+        let v6_deferred = self.selection_deferral.v6_deferred();
 
         if let (Some(export_policy), Some(adj_rib_out), Some(update_tx)) = (
             self.export_policies.get(&peer_ip),
@@ -174,6 +176,7 @@ impl DaemonState {
                         local_as,
                         local_bgp_id,
                         next_hop_self,
+                        v4_deferred,
                     )
                 })
                 .collect();
@@ -210,6 +213,7 @@ impl DaemonState {
                             local_as,
                             local_ipv6,
                             next_hop_self,
+                            v6_deferred,
                         )
                     })
                     .collect();

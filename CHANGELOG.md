@@ -4,6 +4,85 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-04 (RFC 4724 §4.1 Restarting-Speaker Selection_Deferral_Timer)
+
+### [pathvectord] No deferral of our own outbound route advertisement after a daemon restart
+
+RFC 4724 §4.1: a Restarting Speaker "MUST defer route selection for an
+address family" until it either receives End-of-RIB from all GR-capable
+peers (excluding restarting ones) or a configurable
+`Selection_Deferral_Timer` expires. No such mechanism existed anywhere in
+the codebase — `handle_update`/propagation ran immediately per-UPDATE with
+no notion that this daemon's own restart might still be settling, so a
+route could be advertised to one peer moments before a slower peer's
+routes arrived and changed the best-path outcome. This project's existing
+GR work covered the *Receiving Speaker* role (holding a peer's stale
+routes during *their* restart) well; the *Restarting Speaker* role
+(deferring *our own* decisions after *our* restart) had no code path.
+
+Researched BIRD's actual source (`nest/proto.c`'s doc comment, not
+trained-in memory of "how BIRD generally works") before scoping: BIRD
+implements this by deferring **export only** — Loc-RIB/route selection
+itself stays immediate; only outbound advertisement to peers is held back
+while tables refill. Adopted the same scope here, over the RFC's more
+literal "defer route selection" text, per explicit direction to match
+BIRD's real-world practice. New `selection_deferral_time` config field
+(`[daemon]`, seconds, `0` disables) applies on **every** startup when
+nonzero — deliberately not gated behind the pre-existing `restarting` flag
+(which only controls the R-bit), since incomplete peer state on startup is
+a risk regardless of whether the restart was planned.
+
+New `SelectionDeferral` struct (`pathvectord/src/daemon/deferral.rs`)
+tracks a one-way per-family (v4/v6) latch. `recompute()` implements the
+wait-set: a family blocks release for every peer in the **full configured
+peer set** that is either not yet established, or established-and-GR-capable-
+and-not-itself-restarting-and-hasn't-sent-EOR. Using the full configured
+set rather than just currently-established peers was a deliberate
+correction — a design-review pass caught that an established-only
+wait-set would let one fast peer's EOR falsely satisfy the wait-set before
+a slower peer even attempted its TCP connection, defeating the feature in
+the ordinary multi-peer-restart case. `force_release()` implements the
+Selection_Deferral_Timer expiry path (b), overriding an unsatisfied
+wait-set unconditionally.
+
+`propagate_prefix`/`propagate_prefix_v6` (`outbound.rs`) gained a
+`deferred: bool` parameter: when `true`, returns `NoChange` immediately
+without touching `loc_rib`/`adj_rib_out`/`export_policy` at all, so
+nothing needs reconciling once the gate genuinely opens — an earlier
+design draft considered filtering announcements out downstream in
+`flush_updates` instead, but that would have left AdjRibOut believing a
+route was sent when it wasn't. `on_established`'s initial full-table dump
+is now independently gated per family (skipped entirely, no EOR sent,
+while deferred); `recompute_selection_deferral` — triggered on EOR
+receipt, peer establishment, and permanent peer removal — runs a gate-open
+catch-up (full dump + EOR) across every currently-established peer once a
+family transitions to released. A new event-loop `tokio::select!` arm
+fires the Selection_Deferral_Timer itself, calling a dedicated
+`force_release_selection_deferral()` that drives the catch-up directly off
+`force_release`'s own return value — calling plain `force_release()`
+followed by `recompute_selection_deferral()` was tried first and found (by
+its own new test going red) to silently skip the catch-up entirely, since
+`force_release` already flips both released flags before `recompute()`
+runs, leaving nothing for it to see as "newly transitioned."
+
+13 new `daemon::deferral::tests` (wait-set membership rules including the
+corrected full-configured-peer-set semantics, one-way latch, force-release
+override), 4 new `outbound::propagate_tests` (deferred suppresses
+Announce/Withdraw for both v4 and v6, AdjRibOut left completely
+untouched), 4 new `daemon::selection_deferral_tests` (gate blocks
+propagation until EOR then catches up; an unestablished configured peer
+keeps the gate closed even after other peers EOR; forced release
+overrides an unsatisfied wait-set and still catches up; `0` is a true
+no-op regression guard). Real-teeth verified: reverted the
+configured-peer-set wait-set fix back to established-only and confirmed
+the corresponding test failed with the expected diagnostic; reverted the
+`propagate_prefix` deferred early-return and confirmed the corresponding
+test failed; both restored and reconfirmed passing. The
+`force_release`/`recompute_selection_deferral` ordering bug was caught the
+same way, just not injected deliberately — the first version of the test
+suite found it on its own. Full workspace build/test (713 passing in
+`pathvectord`), `cargo fmt`, and `cargo clippy -D warnings` clean.
+
 ## 2026-08-03 (RFC 4271 §4.1 trailing-padding rejection)
 
 ### [pathvector-session] OPEN and ROUTE_REFRESH silently accepted trailing padding within the declared header Length

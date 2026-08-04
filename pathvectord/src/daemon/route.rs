@@ -36,6 +36,9 @@ impl DaemonState {
                     self.prune_stale_nlri(peer_ip, &stale);
                 }
             }
+            // RFC 4724 §4.1: this EOR may satisfy the Restarting-Speaker
+            // wait-set for the IPv4 family.
+            self.recompute_selection_deferral();
             return None;
         }
         // IPv6 EOR: UPDATE with only an empty MP_UNREACH_NLRI for IPv6 unicast.
@@ -60,6 +63,9 @@ impl DaemonState {
                     self.prune_stale_nlri_v6(peer_ip, &stale);
                 }
             }
+            // RFC 4724 §4.1: this EOR may satisfy the Restarting-Speaker
+            // wait-set for the IPv6 family.
+            self.recompute_selection_deferral();
             return None;
         }
 
@@ -411,6 +417,10 @@ impl DaemonState {
         let local_as = self.rib.local_as;
         let local_bgp_id = self.rib.local_bgp_id;
         let is_rr = !self.rib.rr_clients.is_empty();
+        // RFC 4724 §4.1: while the IPv4 selection-deferral gate is closed,
+        // incremental propagation is suppressed the same way the initial
+        // dump is — nothing is written to AdjRibOut until the gate opens.
+        let v4_deferred = self.selection_deferral.v4_deferred();
         for peer_ip in established_peers {
             let peer_type = self
                 .rib
@@ -469,6 +479,7 @@ impl DaemonState {
                         local_as,
                         local_next_hop,
                         next_hop_self,
+                        v4_deferred,
                     )
                 })
                 .collect();
@@ -617,6 +628,7 @@ impl DaemonState {
         let is_rr = !self.rib.rr_clients.is_empty();
         let local_as = self.rib.local_as;
         let local_ipv6 = self.rib.local_ipv6;
+        let v6_deferred = self.selection_deferral.v6_deferred();
         for peer_ip in established_peers {
             let peer_type = self
                 .rib
@@ -663,6 +675,7 @@ impl DaemonState {
                         local_as,
                         local_ipv6,
                         next_hop_self,
+                        v6_deferred,
                     )
                 })
                 .collect();
