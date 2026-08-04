@@ -79,6 +79,12 @@ cargo run -p pathvector -- route list
 cargo run -p pathvector -- dashboard        # live ratatui TUI
 ```
 
+> **⚠️ Security:** the gRPC management API above binds to `0.0.0.0` with no
+> authentication by default — anyone who can reach it can add/remove peers
+> and originate/withdraw routes. Firewall it from untrusted networks before
+> running anywhere but a trusted local/lab environment. See
+> [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) before any real deployment.
+
 See [pathvectord/README.md](pathvectord/README.md) for the full configuration reference,
 gRPC API, and GoBGP/BIRD interop guide.
 
@@ -232,6 +238,8 @@ pathvector-sys
 | Benchmark with a real internet table | [pathvector-mrt/README.md](pathvector-mrt/README.md) |
 | Contribute code | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Understand the test strategy | [TESTING.md](TESTING.md) |
+| Assess production deployment readiness | [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) |
+| Review known gaps and planned work | [TODO.md](TODO.md) |
 
 ---
 

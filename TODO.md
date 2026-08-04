@@ -4,12 +4,23 @@ Tracked items that are intentionally deferred — known gaps, planned features,
 and protocol steps that require components not yet built. Each entry notes
 which crate it belongs to and why it was deferred.
 
+Operational release gates are maintained separately in
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md). That document consolidates
+existing production-related items from this backlog and adds cross-cutting gaps
+such as management-plane security, graceful process lifecycle, startup config
+validation, task supervision/readiness, persistence semantics, and release
+hardening. Keep implementation tasks here; use the production-readiness document
+to decide whether a particular deployment is supportable.
+
 ---
 
-## Production readiness gaps (2026-06-24)
+## Production feature gaps (2026-06-24)
 
 Items identified as blocking or materially impairing trustworthy production
-operation of pathvectord as an internet-facing BGP speaker.
+operation of pathvectord as an internet-facing BGP speaker. Protocol- and
+feature-level gaps only — cross-cutting operational gates (management-plane
+security, process lifecycle, config validation, etc.) live in
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md) instead.
 
 ### Tier 1 — Blocks operating safely on the internet
 
