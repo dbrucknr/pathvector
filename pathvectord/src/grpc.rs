@@ -77,6 +77,7 @@ fn proto_peer_type(pt: PeerType) -> i32 {
         PeerType::External => proto::PeerType::External as i32,
         PeerType::Internal => proto::PeerType::Internal as i32,
         PeerType::Local => proto::PeerType::Unspecified as i32,
+        PeerType::ConfedMember => proto::PeerType::ConfedMember as i32,
     }
 }
 
@@ -529,6 +530,11 @@ impl PeerService for PeerServiceImpl {
             max_prefixes_v6: None,
             max_prefixes_restart: None,
             role: None,
+            // TODO(RFC 5065): the AddPeer RPC does not yet expose a
+            // confederation_member field; dynamically-added peers cannot be
+            // configured as confederation members until the proto surface
+            // is extended.
+            confederation_member: false,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -1436,11 +1442,13 @@ mod tests {
                 max_prefixes_v6: None,
                 max_prefixes_restart: None,
                 role: None,
+                confederation_member: false,
             })
             .collect();
         DaemonState::new(
             local_as,
             Ipv4Addr::new(10, 0, 0, 1),
+            None,
             None,
             None,
             &peer_configs,

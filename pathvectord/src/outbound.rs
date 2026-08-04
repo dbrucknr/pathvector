@@ -24,9 +24,16 @@ pub(crate) const UPDATE_FIXED_OVERHEAD: usize = 19 + 2 + 2;
 /// Builds the path-attribute list for an outbound route.
 ///
 /// `peer_type` controls attribute stripping:
-/// - ORIGINATOR_ID and CLUSTER_LIST are route-reflector metadata (RFC 4456 §8)
-///   and MUST be stripped before sending to eBGP peers.
-/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4).
+/// - ORIGINATOR_ID and CLUSTER_LIST are route-reflector metadata (RFC 4456
+///   §8) and MUST be stripped before sending to genuinely external peers —
+///   `ConfedMember` peers are included in this strip too: RR clusters are
+///   scoped to a single AS's internal topology, and RFC 5065 is silent on
+///   the interaction, so letting cluster metadata cross a Member-AS
+///   boundary risks cluster-ID collisions between independently
+///   administered Member-ASes without serving RR's loop-prevention
+///   purpose. This is a deliberate choice, not an oversight.
+/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4) — but RFC 5065
+///   §5.2 removes this restriction for `ConfedMember` peers.
 ///
 /// `peer_four_byte` indicates whether the peer negotiated RFC 6793
 /// `FourByteAsn` capability. When `false`, any 4-byte ASN in AS_PATH is
@@ -37,7 +44,8 @@ pub(crate) fn route_to_attributes(
     peer_type: PeerType,
     peer_four_byte: bool,
 ) -> Vec<PathAttribute> {
-    let is_ebgp = peer_type == PeerType::External;
+    let strip_med = peer_type == PeerType::External;
+    let strip_rr_metadata = matches!(peer_type, PeerType::External | PeerType::ConfedMember);
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
@@ -54,8 +62,9 @@ pub(crate) fn route_to_attributes(
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if !is_ebgp {
-        // RFC 4271 §5.1.4: MED SHOULD NOT be sent to eBGP peers.
+    if !strip_med {
+        // RFC 4271 §5.1.4 / RFC 5065 §5.2: MED SHOULD NOT be sent to eBGP
+        // peers, but this restriction is removed for ConfedMember peers.
         if let Some(m) = route.med {
             attrs.push(PathAttribute::Med(m.as_u32()));
         }
@@ -80,7 +89,7 @@ pub(crate) fn route_to_attributes(
     if let Some(agg) = rare.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
-    if !is_ebgp {
+    if !strip_rr_metadata {
         // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
         if let Some(id) = rare.originator_id {
             attrs.push(PathAttribute::OriginatorId(id));
@@ -156,6 +165,7 @@ pub(crate) fn propagate_prefix(
     export_policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
     local_as: u32,
+    public_as: u32,
     local_next_hop: Ipv4Addr,
     next_hop_self: bool,
     deferred: bool,
@@ -185,6 +195,7 @@ pub(crate) fn propagate_prefix(
                 best.clone(),
                 peer_type,
                 local_as,
+                public_as,
                 local_next_hop,
                 next_hop_self,
             );
@@ -366,6 +377,7 @@ pub(crate) fn propagate_prefix_v6(
     export_policy: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
     local_as: u32,
+    public_as: u32,
     local_ipv6: Option<Ipv6Addr>,
     next_hop_self: bool,
     deferred: bool,
@@ -388,8 +400,14 @@ pub(crate) fn propagate_prefix_v6(
                     PrefixDecisionV6::NoChange
                 };
             }
-            let mut route =
-                prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6, next_hop_self);
+            let mut route = prepare_outbound_v6(
+                best.clone(),
+                peer_type,
+                local_as,
+                public_as,
+                local_ipv6,
+                next_hop_self,
+            );
             match export_policy.evaluate(&mut route) {
                 // RFC 1997: a well-known community (NO_ADVERTISE/NO_EXPORT/
                 // NO_EXPORT_SUBCONFED) can forbid advertising to this peer
@@ -596,8 +614,11 @@ pub(crate) fn send_eor_ipv6(update_tx: &mpsc::Sender<UpdateMessage>) -> bool {
 /// Builds the path-attribute list for an outbound IPv6 route.
 ///
 /// `peer_type` controls attribute stripping — same rules as [`route_to_attributes`]:
-/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4).
-/// - ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP peers (RFC 4456 §8).
+/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4), except
+///   ConfedMember peers (RFC 5065 §5.2).
+/// - ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP peers (RFC
+///   4456 §8) — and, deliberately, for ConfedMember peers too; see
+///   [`route_to_attributes`]'s doc comment for why.
 ///
 /// The NLRI is carried in MP_REACH_NLRI (RFC 4760); the traditional
 /// `NEXT_HOP` attribute is not emitted for IPv6 routes.
@@ -606,7 +627,8 @@ pub(crate) fn route_v6_to_attributes(
     peer_type: PeerType,
     peer_four_byte: bool,
 ) -> (Vec<PathAttribute>, MpReachNlri) {
-    let is_ebgp = peer_type == PeerType::External;
+    let strip_med = peer_type == PeerType::External;
+    let strip_rr_metadata = matches!(peer_type, PeerType::External | PeerType::ConfedMember);
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
@@ -620,8 +642,7 @@ pub(crate) fn route_v6_to_attributes(
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if !is_ebgp {
-        // RFC 4271 §5.1.4: MED SHOULD NOT be sent to eBGP peers.
+    if !strip_med {
         if let Some(m) = route.med {
             attrs.push(PathAttribute::Med(m.as_u32()));
         }
@@ -646,7 +667,7 @@ pub(crate) fn route_v6_to_attributes(
     if let Some(agg) = rare.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
-    if !is_ebgp {
+    if !strip_rr_metadata {
         // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
         if let Some(id) = rare.originator_id {
             attrs.push(PathAttribute::OriginatorId(id));
@@ -1929,6 +1950,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -1958,6 +1980,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -1989,6 +2012,7 @@ mod propagate_tests {
             &mut adj_out,
             &reject_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2022,6 +2046,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             false,
@@ -2036,6 +2061,7 @@ mod propagate_tests {
             &mut adj_out,
             &reject_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2066,6 +2092,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             false,
@@ -2078,6 +2105,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2129,6 +2157,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
+            65001,
             None,
             false,
             false,
@@ -2163,6 +2192,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::Internal,
+            65001,
             65001,
             None,
             false,
@@ -2227,6 +2257,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2256,6 +2287,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy(),
             PeerType::Internal,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2288,6 +2320,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2305,6 +2338,7 @@ mod propagate_tests {
             &mut ibgp_adj_out,
             &accept_policy(),
             PeerType::Internal,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2337,6 +2371,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2354,6 +2389,7 @@ mod propagate_tests {
             &mut ibgp_adj_out,
             &accept_policy(),
             PeerType::Internal,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2386,6 +2422,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2404,6 +2441,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy(),
             PeerType::External,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2434,6 +2472,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2466,6 +2505,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             false,
@@ -2483,6 +2523,7 @@ mod propagate_tests {
             &mut ibgp_adj_out,
             &accept_policy_v6(),
             PeerType::Internal,
+            65001,
             65001,
             None,
             false,
@@ -2534,6 +2575,7 @@ mod propagate_tests {
             &policy,
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2579,6 +2621,7 @@ mod propagate_tests {
             &policy,
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2612,6 +2655,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy(),
             PeerType::External,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2651,6 +2695,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             true, // deferred
@@ -2686,6 +2731,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             true, // deferred
@@ -2712,6 +2758,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
