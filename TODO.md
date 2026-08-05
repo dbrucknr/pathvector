@@ -1793,6 +1793,17 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   and the two new RFC 5065 §5 malformed-AS_PATH session-reset checks. See
   `pathvectord/RFC.md`'s RFC 5065 section for the full requirement-by-
   requirement writeup.
+  **2026-08-05 correction (external review of PR #51):** four blocking
+  issues found and fixed — external OPENs/`FourByteAsn` weren't using the
+  Confederation Identifier (RFC 5065 §4 covers *all* transactions with a
+  peer, not just AS_PATH); the two RFC 5065 §5 checks above were wrongly
+  session-reset rather than treat-as-withdraw (RFC 7606 §3(e) amends the
+  RFC 4271 §6.3 procedure RFC 5065 §5 cites by reference — RFC 5065's
+  absence from RFC 7606's formal "Updates:" list doesn't exempt it); an
+  empty AS_PATH from a `ConfedMember` peer was wrongly exempted from the
+  §5 condition-2 check; AS4_PATH could leak AS_CONFED_SEQUENCE/
+  AS_CONFED_SET segments (RFC 6793 §§3, 4.2.2 forbid this). See
+  `CHANGELOG.md`'s 2026-08-05 entry.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.

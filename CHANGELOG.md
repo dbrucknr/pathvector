@@ -4,6 +4,84 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (RFC 5065: 4 blocking fixes from external code review of PR #51)
+
+### [pathvectord, pathvector-session] External code review found four real gaps in the RFC 5065 Member-AS work below — all four confirmed against directly-fetched RFC text and fixed
+
+An external review of PR #51 (RFC 5065 full Member-AS support, entry
+below) identified four blocking issues. Each was independently re-verified
+against directly-fetched RFC text (not from memory, not taking the review's
+word for it) before fixing:
+
+1. **External OPENs still advertised the private Member-AS Number, not the
+   Confederation Identifier.** RFC 5065 §4: "A member of a BGP
+   confederation MUST use its AS Confederation Identifier in all
+   transactions with peers that are not members of its confederation...
+   this number is used in OPEN messages... MUST use its Member-AS Number
+   in all transactions with peers that are members of the same
+   confederation." The original work applied this only to AS_PATH
+   generation, missing the session's own `my_as` field and `FourByteAsn`
+   capability. Added `FsmConfig.public_as`/`SessionConfig.public_as`
+   (`pathvector-session`) and `effective_session_as` (`pathvectord`),
+   threaded through every session-spawn site (static startup, dynamic
+   `AddPeer`) and the reconnect capability-refresh path.
+
+2. **RFC 5065 §5's two malformed-AS_PATH conditions were session-reset;
+   RFC 7606 §3(e) actually reclassifies them as treat-as-withdraw.** The
+   original reasoning — RFC 5065 is absent from RFC 7606's formal
+   "Updates: 1997, 4271, 4360, 4456, 4760, 5543, 5701, 6368" list, so its
+   citation of RFC 4271 §6.3 stays literal — was wrong. RFC 7606 §3 states
+   "This specification amends Section 6.3 of [RFC4271]," and §3(e): MUST
+   use treat-as-withdraw "for the cases that specify a session reset and
+   involve any of the attributes ORIGIN, AS_PATH, NEXT_HOP,
+   MULTI_EXIT_DISC, or LOCAL_PREF." RFC 5065 §5 delegates to "the
+   procedures of [BGP-4], Section 6.3" by reference rather than hard-coding
+   session-reset itself, and both conditions specify a session reset
+   involving AS_PATH — so RFC 7606's amendment to the referenced procedure
+   text applies regardless of RFC 5065's absence from the formal
+   "Updates:" list, which names documents RFC 7606 edits directly, not
+   every document that cites §6.3. This ends up matching BIRD's actual
+   practice after all — just derived from RFC text rather than trusted
+   from BIRD's behavior or the Updates-list heuristic alone. The one
+   preserved exception is RFC 7606 §3(j)/§5.2 (session reset when NLRI
+   wasn't parseable), handled by gating the RFC 5065 §5 checks on
+   `notification.is_none()` so an already-decided §5.2 reset wins.
+
+3. **An empty AS_PATH from a `ConfedMember` peer was wrongly exempted.**
+   The original condition-2 check required `!as_path.is_empty()` before
+   flagging a missing leading `AS_CONFED_SEQUENCE`. RFC 5065 §5's actual
+   wording has no such exemption ("does not have AS_CONFED_SEQUENCE as the
+   first segment" — an empty path has no first segment at all), and §4.1(b)
+   requires even an originated route sent to a neighboring Member-AS to
+   carry a ConfedSequence. Removed the exemption; folded into the same
+   condition-2 check as a natural consequence of `.first()` returning
+   `None` for an empty path.
+
+4. **AS4_PATH could carry AS_CONFED_SEQUENCE/AS_CONFED_SET segments.**
+   RFC 6793 §§3, 4.2.2: these segment types "are declared invalid for the
+   AS4_PATH attribute and MUST NOT be included." `route_to_attributes`/
+   `route_v6_to_attributes` built AS4_PATH from the full original
+   (pre-downgrade) path, which — once RFC 5065 relaying could legitimately
+   leave confed segments in a route sent to a `ConfedMember` peer — could
+   propagate those segments into AS4_PATH when the same route was later
+   downgraded for a two-byte-only peer. Fixed by applying the existing
+   `AsPath::strip_confed_segments()` to the AS4_PATH value specifically,
+   leaving the (downgraded) wire AS_PATH untouched.
+
+Real-teeth verified: fix #1's `make_open` change (reverted, confirmed
+`test_sent_open_uses_public_as_not_local_as` failed with `left: 65001,
+right: 64512`, restored); fix #4's AS4_PATH strip (reverted, confirmed
+`as4_path_excludes_confed_segments_for_two_byte_peer` failed with the
+confed ASN present in AS4_PATH, restored). Fixes #2/#3 rewrote the
+existing test suite's expectations from session-reset to treat-as-withdraw
+(the tests' own prior assertions were the thing proven wrong, not new
+code) plus one new explicit empty-AS_PATH regression test.
+
+See `pathvector-session/RFC.md` and `pathvectord/RFC.md`'s RFC 5065
+sections for the full corrected requirement tables.
+
+---
+
 ## 2026-08-04 (RFC 5065: full BGP Confederation Member-AS support)
 
 ### [pathvector-types, pathvector-rib, pathvector-session, pathvectord, pathvector-client] Originate/relay as a confederation Member-AS, not just pass-through interop

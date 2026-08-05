@@ -516,30 +516,40 @@ initiative (`TODO.md` task #128) rather than folded into the smaller RFC
 | `config_peer_type` classifies `ConfedMember` when `confed_member` is set and AS numbers differ; `local_as == remote_as` still wins first (matches BIRD's `is_internal` precedence) | `src/daemon/mod.rs` | ✅ | `test_config_peer_type_confed_member`, `test_config_peer_type_same_as_wins_over_confed_member`, `prop_config_peer_type_internal_iff_equal` |
 | `effective_confederation_member` degrades gracefully (warns, treats as plain eBGP) when `confederation_member` is set but `confederation_id` isn't — mirrors `effective_role`'s shape | `src/daemon/mod.rs` | ✅ | (exercised via `add_peer`/session-spawn call sites; no separate config-abort path exists in this codebase for per-peer misconfiguration, matching `effective_role`'s precedent) |
 | `confederation_id` threaded through `RibSnapshot`/`DaemonState::new`/`SpawnConfig`/`SessionConfig` to every classification and session-spawn site — the critical fix for the two-place `PeerType` classification gap (FSM for live sessions, `config_peer_type` for pre-Established/post-disconnect) | `src/daemon/mod.rs`, `src/daemon/peer.rs`, `src/daemon/capabilities.rs` | ✅ | Full 726-test suite; see `pathvector-session/RFC.md` for the FSM half |
-| `public_as` (`confederation_id.unwrap_or(local_as)`) resolved once per propagation site and threaded through `propagate_prefix`/`propagate_prefix_v6` to `prepare_outbound`/`prepare_outbound_v6` | `src/outbound.rs`, `src/daemon/route.rs`, `src/daemon/policy.rs`, `src/daemon/deferral.rs`, `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | Full 726-test suite (mechanical threading, same shape as the `deferred`-parameter PR) |
+| `public_as` (`confederation_id.unwrap_or(local_as)`, but see the correction below — resolved via `effective_session_as`, not a bare `unwrap_or`, once `PeerType` is known) resolved once per propagation site and threaded through `propagate_prefix`/`propagate_prefix_v6` to `prepare_outbound`/`prepare_outbound_v6` | `src/outbound.rs`, `src/daemon/route.rs`, `src/daemon/policy.rs`, `src/daemon/deferral.rs`, `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | Full test suite (mechanical threading, same shape as the `deferred`-parameter PR) |
+| OPEN message `my_as` and the `FourByteAsn` capability also carry `public_as` (Confederation Identifier for `External` peers, Member-AS Number for `Internal`/`ConfedMember`) — RFC 5065 §4 covers *all* transactions with a peer, not just AS_PATH | `src/daemon/mod.rs` (`effective_session_as`, static spawn loop, reconnect capability refresh), `src/daemon/peer.rs` (dynamic `AddPeer`), `src/daemon/capabilities.rs` (`SpawnConfig::capabilities`), `pathvector-session/src/fsm/mod.rs` (`FsmConfig::public_as`, `make_open`) | ✅ | `test_effective_session_as_external_uses_confederation_id`, `test_effective_session_as_internal_uses_member_as`, `test_effective_session_as_confed_member_uses_member_as`, `test_effective_session_as_external_falls_back_to_local_as_when_unconfigured`, `pathvector-session`'s `test_sent_open_uses_public_as_not_local_as` |
 | MED not stripped for `ConfedMember` (RFC 5065 §5.2); ORIGINATOR_ID/CLUSTER_LIST still stripped for `ConfedMember` (deliberate — RR clusters are scoped to a single AS's internal topology; RFC 5065 is silent on the interaction, and letting RR metadata cross a Member-AS boundary risks cluster-ID collisions without serving RR's loop-prevention purpose) | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` | ✅ | `test_route_v6_to_attributes_ibgp_preserves_med`-style coverage extended to the `strip_med`/`strip_rr_metadata` split |
+| AS4_PATH excludes AS_CONFED_SEQUENCE/AS_CONFED_SET (RFC 6793 §§3, 4.2.2) even though the downgraded wire AS_PATH correctly keeps them | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` (`.strip_confed_segments()` on the AS4_PATH value) | ✅ | `as4_path_excludes_confed_segments_for_two_byte_peer`, `test_route_v6_to_attributes_as4path_excludes_confed_segments` |
 | LOCAL_PREF accept guard widened from `Internal`-only to `Internal \| ConfedMember` (RFC 4271 §5.1.5's confederation exception, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_honored_from_confed_member_peer` |
 | Loop detection (RFC 4271 §9.1.2) extended to also check the confederation ID, not just `local_as` (RFC 5065 §4) | `src/daemon/route.rs` | ✅ | `test_as_path_loop_detection_drops_confederation_id_in_path`, `test_as_path_loop_detection_confederation_id_absent_does_not_block` |
-| RFC 5065 §5 condition 1: confed segment from an `External` peer is malformed — session reset | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_resets_session` |
-| RFC 5065 §5 condition 2: non-empty `ConfedMember` AS_PATH not starting with `AS_CONFED_SEQUENCE` is malformed — session reset | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_member_peer_missing_confed_sequence_resets_session`, `test_malformed_as_path_confed_member_peer_with_confed_sequence_first_is_accepted` (negative case) |
-| Both §5 conditions are session-reset, not treat-as-withdraw — a deliberate departure from BIRD | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_conditions_are_session_reset_not_withdraw` |
+| RFC 5065 §5 condition 1: confed segment from an `External` peer is malformed — treat-as-withdraw | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_is_treat_as_withdraw` |
+| RFC 5065 §5 condition 2: an AS_PATH from a `ConfedMember` peer whose first segment is not `AS_CONFED_SEQUENCE` is malformed — treat-as-withdraw. Covers empty AS_PATH too (no exemption: an empty path has no first segment, so it cannot be `AS_CONFED_SEQUENCE`) | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_member_peer_missing_confed_sequence_is_treat_as_withdraw`, `test_malformed_as_path_empty_from_confed_member_peer_is_treat_as_withdraw`, `test_malformed_as_path_confed_member_peer_with_confed_sequence_first_is_accepted` (negative case) |
+| Both §5 conditions are treat-as-withdraw, not session-reset (RFC 7606 §3(e)) | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_conditions_are_treat_as_withdraw_not_session_reset` |
 | gRPC `proto_peer_type()` includes `ConfedMember` (compiler-forced exhaustive match) | `src/grpc.rs` | ✅ | (compile-time guarantee) |
 
-**Session-reset vs. treat-as-withdraw for RFC 5065 §5 (deliberate, RFC-text-
-grounded departure from BIRD):** BIRD implements both of RFC 5065 §5's new
-malformed-AS_PATH conditions as treat-as-withdraw rather than session-reset.
-This project instead implements literal session-reset, matching RFC 5065
-§5's own unamended citation of RFC 4271 §6.3's original procedure. The
-reasoning: RFC 7606 (which revises several RFC 4271 error-handling
-procedures to treat-as-withdraw) states its own scope explicitly — "This
-document updates error handling for RFCs 1997, 4271, 4360, 4456, 4760,
-5543, 5701, and 6368." RFC 5065 is absent from that list, and RFC 7606
-never mentions RFC 5065 or confederations anywhere in its text (confirmed
-by direct fetch and grep of both RFCs' text, not from memory). This follows
-the same precedent this project already established for RFC 4271 §6.3
-itself — see the CHANGELOG's 2026-08-04 revert entry — "BIRD imitation
-should be reserved for genuinely underspecified areas... not used to
-override a clear requirement just because it's inconvenient."
+**Treat-as-withdraw, not session-reset, for RFC 5065 §5 (corrected
+2026-08-05 after external code review; see `CHANGELOG.md`):** this section
+originally implemented literal session-reset, reasoning that RFC 5065 §5's
+citation of RFC 4271 §6.3 was unamended because RFC 5065 is absent from RFC
+7606's formal "Updates: 1997, 4271, 4360, 4456, 4760, 5543, 5701, 6368"
+header. That reasoning was wrong: RFC 7606 §3 states "This specification
+amends Section 6.3 of [RFC4271]" and its §3(e) says "Treat-as-withdraw MUST
+be used for the cases that specify a session reset and involve any of the
+attributes ORIGIN, AS_PATH, NEXT_HOP, MULTI_EXIT_DISC, or LOCAL_PREF." RFC
+5065 §5 doesn't hard-code session-reset itself — it delegates to "the
+procedures of [BGP-4], Section 6.3" by reference, and both of its
+conditions specify a session reset involving AS_PATH. Since RFC 7606 §3
+directly rewrites the referenced procedure's text (not merely the
+originating RFC 4271 document), the amendment applies via the reference,
+regardless of whether RFC 5065 itself appears in the formal "Updates:"
+list — that list names documents whose own text RFC 7606 edits, not every
+document that cites RFC 4271 §6.3. The one exception, RFC 7606 §3(j)/§5.2
+(session reset when NLRI wasn't successfully parsed), is preserved by
+gating the RFC 5065 §5 checks on `notification.is_none()`, so an
+already-decided §5.2 session-reset still wins. BIRD's real source (fetched
+directly) implements both conditions as withdraw-only, which — now
+correctly derived from RFC text rather than from the formal Updates-list
+heuristic alone — matches this project's implementation too.
 
 **Critical finding caught during planning, not implementation (see
 `pathvector-session/RFC.md`'s RFC 5065 section for the fix):** `PeerType`
