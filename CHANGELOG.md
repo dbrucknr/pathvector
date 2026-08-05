@@ -4,6 +4,77 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
+
+### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate
+
+Review of PR #48 found that `test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+uses `MockTransport` and injects a pre-decoded `MalformedUpdate` directly —
+it proves the FSM picks the right NOTIFICATION given that input, but never
+exercises the actual byte-level decoder that classifies a raw attribute as
+"unrecognized well-known" in the first place, nor the NOTIFICATION's own
+wire encoding.
+
+Added `test_raw_unrecognized_well_known_attribute_sends_real_notification_bytes`
+to `pathvector-session/tests/transport.rs`: a hand-rolled raw UPDATE frame
+(Optional bit clear, Transitive bit set, unrecognized type code — RFC 4271
+§4.3) goes in over a real loopback TCP socket, decoded by the real
+`BgpCodec`, and the NOTIFICATION that comes back out is itself decoded by
+the real codec on the peer's side. Mirrors the existing
+`raw_update_with_attr`/`accept_and_handshake` pattern already used by the
+AGGREGATOR decoding tests in that file.
+
+Real-teeth verified: temporarily disabled the RFC 4271 §6.3
+unrecognized-well-known-attribute check, confirmed the new test failed (the
+attribute silently fell through as `Unknown`, no NOTIFICATION sent),
+restored and reran green. Full transport integration suite (19 tests)
+passes.
+
+### [pathvector-e2e] PR #50 — RFC 4724 §4.1 Selection_Deferral_Timer had no real end-to-end coverage
+
+Review of PR #50 found that its four "integration" tests all operate
+directly on `DaemonState`, bypassing TOML config parsing, real OPEN
+capability negotiation, receiving an actual wire-encoded EOR, the
+`tokio::select!` timer branch in `daemon/mod.rs`, and delivery of the
+catch-up dump over a real BGP session. The existing Docker e2e suite passed
+throughout PR #50 but never configured `selection_deferral_time` at all, so
+it supplied regression coverage without ever exercising the new feature.
+
+Added a new mock binary, `mock_bgp_gr_peer.rs` (+ `mock-bgp-gr-peer` Docker
+stage, Justfile target, and CI step, mirroring `mock_bgp_fault_peer`'s
+established pattern), with two scenarios: `withhold-eor` (advertises GR
+with a nonzero `restart_time`, announces a route, then never sends EOR) and
+`restart-time-zero-delayed-eor` (advertises GR with `restart_time == 0` —
+RFC 4724 §3's EOR-only mode — announces the same route, then sends EOR
+after a fixed delay). `SelectionDeferralHarness` (pathvectord + this mock
+as the GR-capable "source" + a plain GoBGP "observer") and
+`pathvector-e2e/tests/selection_deferral.rs`'s two tests validate the full
+path Codex asked for:
+
+- `route_withheld_from_observer_until_deferral_timer_expires`: the route
+  reaches pathvectord's own Loc-RIB immediately (deferral is scoped to
+  outbound advertisement only) but is withheld from the observer until the
+  Selection_Deferral_Timer force-releases and flushes it.
+- `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`: a
+  `restart_time == 0` peer still blocks the wait-set until its own real EOR
+  arrives (not exempted just because it claims no forwarding-state
+  preservation) — release happens well before a deliberately much longer
+  deferral deadline, distinguishing the wait-set-satisfied path from the
+  timer-expiry path. This is exactly PR #50's own P1 fix (EOR-only GR peers
+  must stay in the deferral wait-set), now proven over a real session.
+
+Real-teeth verified both: reverted PR #50's P1 fix
+(`gr_advertised_peers` insertion gated on `peer_gr_time.is_some()` instead
+of unconditionally on `peer_gr_advertised`), confirmed
+`restart_time_zero_peer_blocks_release_until_its_own_eor_arrives` failed
+(route reached the observer within ~1-2s, before the mock's 3s EOR delay);
+separately forced `SelectionDeferral::new` to always construct disabled,
+confirmed `route_withheld_from_observer_until_deferral_timer_expires`
+failed (route reached the observer immediately); restored both and reran
+green.
+
+---
+
 ## 2026-08-05 (RFC 5065: 4 blocking fixes from external code review of PR #51)
 
 ### [pathvectord, pathvector-session] External code review found four real gaps in the RFC 5065 Member-AS work below — all four confirmed against directly-fetched RFC text and fixed

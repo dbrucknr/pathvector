@@ -554,6 +554,20 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   are all back. Real-teeth re-verified: reintroduced the treat-as-withdraw
   policy, confirmed the two decode-level tests failed for the right
   reason, restored and reconfirmed passing.
+  **e2e gap closed 2026-08-05** (Codex review of PR #48, a documentation-only
+  PR): the PR's description claimed `test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+  proved "real NOTIFICATION bytes on the wire," but that test actually uses
+  `MockTransport` with a pre-decoded `MalformedUpdate`, exercising neither
+  the decoder nor the codec's wire encoding. Added
+  `test_raw_unrecognized_well_known_attribute_sends_real_notification_bytes`
+  (`pathvector-session/tests/transport.rs`) which sends a hand-rolled raw
+  UPDATE frame over a real loopback TCP socket and decodes the resulting
+  NOTIFICATION with the real `BgpCodec` on the peer's side — the full
+  raw-bytes-in, raw-bytes-out round trip the PR description had claimed.
+  Real-teeth verified: temporarily short-circuited the Optional-bit check
+  in `update.rs`'s `decode_path_attributes`, confirmed the new test failed
+  (attribute fell through as `Unknown`, no NOTIFICATION), reverted and
+  reconfirmed passing.
 - **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
   semantic validation for one-hop eBGP peers is looser than §6.3's precise
   criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only
@@ -857,6 +871,33 @@ areas the existing test suite never covered:
   (`daemon::selection_deferral_tests`); real-teeth verified by
   reintroducing the `restart_time > 0` collapse and confirming the new
   test failed with the exact diagnostic Codex predicted, then restoring.
+  **e2e gap closed 2026-08-05** (Codex review of PR #50): all four
+  "integration" tests for this feature ran directly against `DaemonState`,
+  bypassing TOML config wiring, real OPEN capability negotiation, a real
+  wire-encoded EOR, the `tokio::select!` timer branch, and catch-up-dump
+  delivery over an actual session — the Docker e2e job passed but no e2e
+  config exercised `selection_deferral_time` at all. Added a new mock peer
+  binary (`pathvector-e2e/src/bin/mock_bgp_gr_peer.rs`) with two scenarios
+  and a `SelectionDeferralHarness` (`pathvector-e2e/src/lib.rs`), exercised
+  by two new tests in `pathvector-e2e/tests/selection_deferral.rs`:
+  `route_withheld_from_observer_until_deferral_timer_expires` (a GR peer
+  that announces a route and never sends EOR — proves the route reaches
+  pathvectord's own Loc-RIB but is withheld from an observer peer until the
+  Selection_Deferral_Timer itself expires, then delivered) and
+  `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives` (a
+  `restart_time == 0` EOR-only peer that delays its EOR — proves the
+  wait-set-satisfied release path, not just the timer-expiry path, still
+  waits on this peer, closing the exact gap the #147 P1 fix addressed, now
+  through a complete real session rather than direct `DaemonState` calls).
+  Both tests assert a negative pre-check (route must NOT yet be at the
+  observer) before the positive wait, so neither could pass merely because
+  the route eventually arrived within a generous timeout. Real-teeth
+  verified: reintroducing the #147 P1 bug (excluding `restart_time == 0`
+  peers from the wait-set) failed the second test as expected; forcing the
+  deferral gate to always treat `deferral_secs == 0` failed the first test
+  as expected; both reverted and reconfirmed passing.
+  IPv4/IPv6 independent release was flagged by Codex as optional follow-up
+  coverage, not a blocker, and remains open.
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world
