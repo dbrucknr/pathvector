@@ -291,6 +291,10 @@ pub struct SessionConfig {
     /// Whether the peer is a fellow BGP confederation Member-AS (RFC 5065).
     /// See [`crate::fsm::FsmConfig::confederation_member`].
     pub confederation_member: bool,
+    /// AS number placed in the OPEN message's `my_as` field and the
+    /// `FourByteAsn` capability sent to this peer. See
+    /// [`crate::fsm::FsmConfig::public_as`].
+    pub public_as: u32,
     /// Address (IP + port) of the remote BGP peer.
     pub peer_addr: SocketAddr,
     /// RFC 2385 TCP MD5 authentication key for this peer. When set, the kernel
@@ -468,6 +472,7 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
         required_capabilities: config.required_capabilities.clone(),
         peer_as: config.peer_as,
         confederation_member: config.confederation_member,
+        public_as: config.public_as,
     };
 
     let session: Session<FramedBgpTransport> = Session {
@@ -524,6 +529,7 @@ fn spawn_with_collision_timeout(
         required_capabilities: config.required_capabilities.clone(),
         peer_as: config.peer_as,
         confederation_member: config.confederation_member,
+        public_as: config.public_as,
     };
 
     let session: Session<FramedBgpTransport> = Session {
@@ -580,6 +586,7 @@ pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> Spawn
         required_capabilities: config.required_capabilities.clone(),
         peer_as: config.peer_as,
         confederation_member: config.confederation_member,
+        public_as: config.public_as,
     };
 
     let session: Session<T> = Session {
@@ -1796,6 +1803,7 @@ mod tests {
             required_capabilities: vec![],
             peer_as: Some(65002),
             confederation_member: false,
+            public_as: 65001,
             // peer_addr is unused when a transport is injected via spawn_with.
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             md5_password: None,
@@ -4227,6 +4235,7 @@ mod tests {
             required_capabilities: vec![],
             peer_as: Some(65002),
             confederation_member: false,
+            public_as: 65001,
         });
 
         assert!(!fsm.is_established(), "FSM must start non-Established");

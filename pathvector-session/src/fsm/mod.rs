@@ -28,8 +28,22 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(120);
 /// Local configuration for a BGP session.
 #[derive(Debug, Clone)]
 pub struct FsmConfig {
-    /// Local AS number.
+    /// Local AS number, used for own-AS classification (`peer_as ==
+    /// local_as` → `Internal`) and, for `ConfedMember`/`Internal` peers, as
+    /// the AS placed in `my_as` and the `FourByteAsn` capability.
     pub local_as: u32,
+    /// AS number placed in the OPEN message's `my_as` field and the
+    /// `FourByteAsn` capability sent to *this* peer.
+    ///
+    /// RFC 5065 §4: "A member of a BGP confederation MUST use its AS
+    /// Confederation Identifier in all transactions with peers that are not
+    /// members of its confederation. This ... is used in OPEN messages ...
+    /// A member ... MUST use its Member-AS Number in all transactions with
+    /// peers that are members of the same confederation." Callers resolve
+    /// this per peer: `local_as` (Member-AS) for `Internal`/`ConfedMember`
+    /// peers, the Confederation Identifier for `External` peers. Equal to
+    /// `local_as` when no confederation is configured.
+    pub public_as: u32,
     /// Local BGP identifier (router-id).
     pub local_bgp_id: Ipv4Addr,
     /// Proposed hold time in seconds. `0` disables the hold timer; any other
@@ -194,6 +208,7 @@ pub enum State {
 ///     required_capabilities: vec![],
 ///     peer_as: Some(65002),
 ///     confederation_member: false,
+///     public_as: 65001,
 /// });
 /// assert_eq!(fsm.state(), State::Idle);
 /// ```
@@ -716,12 +731,15 @@ impl Fsm {
 
     /// Build the OPEN message we send to the peer.
     fn make_open(&self) -> OpenMessage {
-        let my_as = if self.config.local_as > u32::from(u16::MAX) {
+        // RFC 5065 §4: advertise `public_as` (the Confederation Identifier for
+        // `External` peers, the Member-AS Number otherwise), not `local_as`
+        // directly — see `FsmConfig::public_as`.
+        let my_as = if self.config.public_as > u32::from(u16::MAX) {
             AS_TRANS
         } else {
             #[allow(clippy::cast_possible_truncation)] // guarded by the branch above
             {
-                self.config.local_as as u16
+                self.config.public_as as u16
             }
         };
         OpenMessage {
@@ -960,6 +978,7 @@ mod tests {
             required_capabilities: vec![],
             peer_as: Some(65002),
             confederation_member: false,
+            public_as: 65001,
         }
     }
 
@@ -1060,6 +1079,28 @@ mod tests {
         assert_eq!(open.my_as, 65001);
         assert_eq!(open.bgp_id, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(open.hold_time, 90);
+    }
+
+    #[test]
+    fn test_sent_open_uses_public_as_not_local_as() {
+        // RFC 5065 §4: "A member of a BGP confederation MUST use its AS
+        // Confederation Identifier in all transactions with peers that are
+        // not members of its confederation... this number is used in OPEN
+        // messages." `my_as` must follow `public_as` (the Confederation
+        // Identifier resolved by the caller), not the Member-AS `local_as` —
+        // these differ for an External peer under a configured confederation.
+        let config = FsmConfig {
+            local_as: 65001,  // private Member-AS Number
+            public_as: 64512, // AS Confederation Identifier
+            ..default_config()
+        };
+        let mut fsm = Fsm::new(config);
+        fsm.process(FsmInput::ManualStart);
+        let out = fsm.process(FsmInput::TcpConnected);
+        let Some(BgpMessage::Open(open)) = find_send(&out) else {
+            panic!("expected OPEN message")
+        };
+        assert_eq!(open.my_as, 64512);
     }
 
     #[test]
@@ -1648,6 +1689,7 @@ mod tests {
             required_capabilities: vec![],
             peer_as: Some(131_073),
             confederation_member: false,
+            public_as: 131_072,
         };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
