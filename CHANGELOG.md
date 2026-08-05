@@ -137,6 +137,27 @@ its own Member-AS number rather than appending a new segment, so the
 source's own AS is not necessarily the *first* ASN in that segment — only
 still present within it.
 
+### [pathvector-e2e] Confederation-identifier loop detection had no e2e coverage
+
+`daemon/route.rs`'s `has_loop` check — extending RFC 4271 §9.1.2 loop
+detection to also match the confederation identifier, not just `local_as`
+(RFC 5065 §4) — was unit-tested only.
+
+Added a `confederation-id-loop` scenario to `mock_bgp_fault_peer.rs` (a
+plain `External` peer sends a well-formed UPDATE whose AS_PATH contains the
+confederation identifier) and `FaultInjectionHarness::new_with_confederation_id`
+(confederation_id set on the daemon, fault peer stays `External` — the
+check applies to AS_PATH content regardless of peer type). New test
+`confederation_id_in_as_path_is_treated_as_loop_and_dropped` asserts the
+route never reaches pathvectord's own Loc-RIB while the session stays
+Established throughout.
+
+Real-teeth verified: disabled the confederation-ID half of `has_loop`,
+confirmed the test failed with the route present in Loc-RIB (AS_PATH
+visibly containing the confederation identifier), reverted (clean no-op
+diff) and reconfirmed passing. Full `fault_injection` suite (19/19)
+regression-clean.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate

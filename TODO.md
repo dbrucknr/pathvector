@@ -1937,6 +1937,17 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   `prepend_confed()` extends the existing leading `AS_CONFED_SEQUENCE`
   with its own Member-AS number rather than appending a new segment, so
   the source's own AS need not be the *first* ASN in that segment.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review):
+  `daemon/route.rs`'s confederation-identifier loop check (`has_loop`,
+  RFC 5065 §4) was unit-tested only. Added a `confederation-id-loop`
+  scenario to `mock_bgp_fault_peer.rs` (a plain `External` peer sends a
+  well-formed UPDATE whose AS_PATH contains the confederation identifier)
+  and `FaultInjectionHarness::new_with_confederation_id`. New test
+  `confederation_id_in_as_path_is_treated_as_loop_and_dropped` asserts the
+  route never reaches Loc-RIB while the session stays Established.
+  Real-teeth verified: disabled the confederation-ID half of `has_loop`,
+  confirmed the test failed with the route visibly present in Loc-RIB,
+  reverted (clean no-op diff) and reconfirmed passing.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
