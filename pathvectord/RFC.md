@@ -563,6 +563,18 @@ implementation. Two gaps that unit tests structurally cannot close:
   (`pathvector-e2e/tests/fault_injection.rs`) — proving the real wire
   codec on both ends produces the same treat-as-withdraw/session-reset
   split the unit tests assert on hand-built messages.
+- e2e (2026-08-05, round 2, Codex review): condition 1 above only
+  exercised an ordinary `External` peer — condition 2 (a peer pathvectord
+  actually classifies as `ConfedMember`, sending an AS_PATH that doesn't
+  lead with `AS_CONFED_SEQUENCE`) had no e2e coverage at all.
+  `mock_bgp_fault_peer` gained
+  `rfc5065-confed-member-wrong-first-segment-with-nlri` and
+  `rfc5065-confed-member-wrong-first-segment-no-nlri` scenarios, exercised
+  by `FaultInjectionHarness::new_confed_member` (pathvectord configured
+  with `confederation_id`, the fault peer marked `confederation_member =
+  true`) via
+  `rfc5065_confed_member_wrong_first_segment_with_nlri_treated_as_withdraw_session_stays_up`
+  and `rfc5065_confed_member_wrong_first_segment_no_nlri_resets_session`.
 
 Real-teeth verified: the confederation interop test was run with
 `strip_confed_segments()` temporarily disabled in `pathvector-rib`'s

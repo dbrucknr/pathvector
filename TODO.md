@@ -1888,6 +1888,23 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   `mock_bgp_fault_peer` RFC 5065 §5 scenarios — closing the gap between
   unit-tested `handle_update` behavior and a real wire codec talking to
   real BGP implementations. See `CHANGELOG.md`'s 2026-08-05 entries.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review): the
+  scenarios above only covered condition 1 (an ordinary `External` peer
+  sending a confed segment) — condition 2 (a peer pathvectord actually
+  classifies as `ConfedMember`, whose AS_PATH doesn't lead with
+  `AS_CONFED_SEQUENCE`) had no e2e coverage at all. Added
+  `rfc5065-confed-member-wrong-first-segment-with-nlri`/`-no-nlri`
+  scenarios and `FaultInjectionHarness::new_confed_member` (pathvectord
+  configured with `confederation_id`, fault peer marked
+  `confederation_member = true`) plus `write_gobgp_config_confed_control`
+  (the plain control peer's GoBGP config needs `peer-as` set to the
+  confederation identifier, not `65002`, once pathvectord has
+  `confederation_id` configured — RFC 5065 §4.1(c) — otherwise GoBGP
+  rejects pathvectord's OPEN with Bad Peer AS; diagnosed via a temporary
+  `RUST_LOG=debug` container env var). Real-teeth verified: disabled the
+  `malformed_from_confed_member` check in `daemon/route.rs`, confirmed
+  both new tests failed for the right reason, reverted (clean no-op diff)
+  and reconfirmed passing.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.

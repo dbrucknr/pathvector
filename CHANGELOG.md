@@ -64,6 +64,32 @@ unknown attributes — confirmed the test failed with
 `nontransitive_present=true`. Both reverted (clean no-op diffs) and
 reconfirmed passing.
 
+### [pathvector-e2e] RFC 5065 §5 condition 2 (confed-member peer, wrong-first-segment AS_PATH) had no e2e coverage
+
+The RFC 5065 confederation-member support PR added e2e coverage for §5
+condition 1 (an ordinary `External` peer sending a confederation segment),
+but condition 2 — a peer pathvectord is actually configured to treat as a
+fellow confederation Member-AS, whose AS_PATH doesn't lead with
+`AS_CONFED_SEQUENCE` — had none.
+
+Added two `mock_bgp_fault_peer.rs` scenarios
+(`rfc5065-confed-member-wrong-first-segment-with-nlri`/`-no-nlri`, mirroring
+condition 1's pair) and `FaultInjectionHarness::new_confed_member`, which
+configures pathvectord with a `confederation_id` and marks the fault peer
+`confederation_member = true` so it's genuinely classified as
+`PeerType::ConfedMember`. Also added `write_gobgp_config_confed_control`:
+once `confederation_id` is set, pathvectord presents that value — not its
+private Member-AS number — toward peers it classifies as `External` (RFC
+5065 §4.1(c)), so the plain control peer's GoBGP config needs a matching
+`peer-as` or it rejects pathvectord's OPEN with Bad Peer AS. Diagnosed via
+a temporary `RUST_LOG=debug` container env var before finding the real
+cause (not a pathvectord bug — a test-harness config mismatch).
+
+Real-teeth verified: disabled the `malformed_from_confed_member` check in
+`daemon/route.rs`, confirmed both new tests failed for the right reason,
+reverted (clean no-op diff) and reconfirmed passing. Full `fault_injection`
+suite (18/18) regression-clean.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate
