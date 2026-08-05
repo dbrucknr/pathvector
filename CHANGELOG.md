@@ -90,6 +90,25 @@ Real-teeth verified: disabled the `malformed_from_confed_member` check in
 reverted (clean no-op diff) and reconfirmed passing. Full `fault_injection`
 suite (18/18) regression-clean.
 
+### [pathvector-e2e] RFC 5065 §5 no-NLRI session-reset tests only asserted "left Established"
+
+Codex noted `rfc5065_confed_segment_no_nlri_resets_session` and its
+condition-2 sibling (above) only checked that the session left
+`Established`, which would also false-pass on an unrelated disconnect
+(e.g. a hold-timer race) — not proof pathvectord actually sent the
+`MalformedAsPath` NOTIFICATION RFC 7606 §5.2 requires.
+
+Both `mock_bgp_fault_peer.rs` no-NLRI scenarios now log a
+`SCENARIO_OUTCOME:` line naming the exact NOTIFICATION subcode received;
+both tests now require `malformed_as_path_notification_received`
+specifically via `wait_for_docker_log`, matching the precedent set by
+`role_differing_duplicates_are_rejected`.
+
+Real-teeth verified: temporarily swapped the session-reset NOTIFICATION in
+`daemon/route.rs` to a different subcode (`MissingWellKnownAttribute`),
+confirmed both tests failed waiting for the expected log line, reverted
+(clean no-op diff) and reconfirmed passing.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate

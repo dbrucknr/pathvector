@@ -1905,6 +1905,17 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   `malformed_from_confed_member` check in `daemon/route.rs`, confirmed
   both new tests failed for the right reason, reverted (clean no-op diff)
   and reconfirmed passing.
+  **Test-quality tightened 2026-08-05** (Codex follow-up): both no-NLRI
+  tests (condition 1's `rfc5065_confed_segment_no_nlri_resets_session` and
+  condition 2's sibling above) only asserted the session left
+  `Established`, which would also false-pass on an unrelated disconnect.
+  `mock_bgp_fault_peer.rs`'s no-NLRI scenarios now log a
+  `SCENARIO_OUTCOME:` line naming the exact NOTIFICATION subcode
+  received; both tests now require `malformed_as_path_notification_received`
+  specifically, matching `role_differing_duplicates_are_rejected`'s
+  precedent. Real-teeth verified: swapped the session-reset NOTIFICATION
+  to a different subcode, confirmed both tests failed, reverted and
+  reconfirmed passing.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
