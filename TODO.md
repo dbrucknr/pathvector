@@ -439,6 +439,24 @@ not fixed here):
   outbound builders and confirmed the egress test failed with "must be
   present"; both reverts restored and reconfirmed passing. Full workspace
   build/test, `cargo fmt`, and `cargo clippy` clean.
+  **e2e gap closed 2026-08-05** (Codex review of PR #49): the coverage
+  above is decode-level and daemon-storage-level only — nothing proved the
+  complete decode → storage → RIB → outbound-reconstruction → encode
+  pipeline through a real relay, and a GoBGP CLI's rendered RIB text can't
+  assert an exact re-encoded flags octet anyway. Added
+  `pathvector-e2e/src/bin/mock_bgp_attr_peer.rs` (a `source` role that
+  injects an unrecognized Optional+Transitive attribute with Partial
+  clear, plus an unrecognized Optional-only non-transitive negative
+  control; an `observer` role that decodes pathvectord's re-advertised
+  UPDATE with the real wire codec and logs a `SCENARIO_OUTCOME:` line) and
+  `UnknownTransitiveAttrHarness`/`unknown_transitive_attribute_relayed_with_partial_bit_set`
+  (`pathvector-e2e/tests/unknown_transitive_attribute.rs`). Real-teeth
+  verified in two independent places: disabling `pathvector-session`'s
+  Partial-bit-setting logic failed the test with `partial_bit_set=false`;
+  separately widening `pathvectord`'s attribute-storage guard to also
+  store non-transitive attributes failed it with
+  `nontransitive_present=true`; both reverted (clean no-op diffs) and
+  reconfirmed passing.
 
 **14. RFC 4271 §6.2/§6.3 error-handling gaps found by systematic clause
 audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above

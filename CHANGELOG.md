@@ -35,6 +35,35 @@ diagnostic (route present at the observer immediately after the fast EOR,
 well before the timer deadline), reverted (`git diff --stat` confirmed a
 clean no-op diff) and reran green.
 
+### [pathvector-e2e] PR #49 unrecognized-transitive-attribute relay had no full-pipeline e2e coverage
+
+Codex's review of PR #49 found the existing coverage for RFC 4271 §5's
+unrecognized-transitive-attribute handling — accept, store, and re-forward
+with the Partial bit set — was decode-level and daemon-storage-level only.
+Nothing proved the complete decode → daemon storage → RIB →
+outbound-reconstruction → encode pipeline through a real relay, and a GoBGP
+CLI's rendered RIB text can't assert an exact re-encoded flags octet anyway.
+
+Added a new mock binary, `mock_bgp_attr_peer.rs`, playing either a `source`
+role (injects an unrecognized Optional+Transitive attribute with the
+Partial bit deliberately clear, plus an unrecognized Optional-only
+non-transitive attribute as a negative control) or an `observer` role
+(decodes pathvectord's re-advertised UPDATE with the real wire codec and
+logs a `SCENARIO_OUTCOME:` line). New `UnknownTransitiveAttrHarness`
+(`pathvector-e2e/src/lib.rs`) and test
+`unknown_transitive_attribute_relayed_with_partial_bit_set`
+(`pathvector-e2e/tests/unknown_transitive_attribute.rs`) assert the
+transitive attribute survives with its value unchanged and the Partial bit
+now set, while the non-transitive one never reaches the observer.
+
+Real-teeth verified in two independent places: (1) temporarily disabled
+`pathvector-session`'s Partial-bit-setting logic on re-encode — confirmed
+the test failed with `partial_bit_set=false`; (2) temporarily widened
+`pathvectord`'s attribute-storage guard to also store non-transitive
+unknown attributes — confirmed the test failed with
+`nontransitive_present=true`. Both reverted (clean no-op diffs) and
+reconfirmed passing.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate
