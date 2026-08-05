@@ -878,17 +878,18 @@ pub(super) async fn run_command_processor<H, F>(
                     }
                 }
 
+                let confed_member = effective_confederation_member(&peer, cfg.confederation_id);
+                let peer_type = config_peer_type(cfg.local_as, peer.remote_as, confed_member);
+                let public_as = effective_session_as(cfg.local_as, cfg.confederation_id, peer_type);
                 let session_cfg = SessionConfig {
                     local_as: cfg.local_as,
+                    public_as,
                     local_bgp_id: cfg.local_bgp_id,
                     hold_time: peer.hold_time.unwrap_or(cfg.hold_time),
-                    capabilities: cfg.capabilities(effective_role(&peer, cfg.local_as)),
+                    capabilities: cfg.capabilities(effective_role(&peer, cfg.local_as), public_as),
                     required_capabilities: vec![],
                     peer_as: Some(peer.remote_as),
-                    confederation_member: effective_confederation_member(
-                        &peer,
-                        cfg.confederation_id,
-                    ),
+                    confederation_member: confed_member,
                     peer_addr: SocketAddr::new(peer.address, peer.port),
                     md5_password: peer.md5_password.clone(),
                     connect_retry_time: peer

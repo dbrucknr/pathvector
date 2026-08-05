@@ -35,12 +35,17 @@ impl SpawnConfig {
     /// across every session) — pass `peer.role.map(Into::into)` from the
     /// `PeerConfig` being spawned. `None` omits the Role capability entirely,
     /// matching RFC 9234's own non-strict default.
-    pub(super) fn capabilities(&self, role: Option<Role>) -> Vec<Capability> {
+    ///
+    /// `advertised_as` is the AS number to place in the `FourByteAsn`
+    /// capability for this specific peer — see
+    /// [`super::effective_session_as`] (RFC 5065 §4: Confederation
+    /// Identifier for `External` peers, Member-AS Number otherwise).
+    pub(super) fn capabilities(&self, role: Option<Role>, advertised_as: u32) -> Vec<Capability> {
         let in_window = self.configured_restarting
             && self.graceful_restart_time > 0
             && self.startup_instant.elapsed()
                 < std::time::Duration::from_secs(u64::from(self.graceful_restart_time));
-        build_local_capabilities(self.local_as, self.graceful_restart_time, in_window, role)
+        build_local_capabilities(advertised_as, self.graceful_restart_time, in_window, role)
     }
 }
 

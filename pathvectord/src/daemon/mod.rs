@@ -123,6 +123,25 @@ fn config_peer_type(local_as: u32, remote_as: u32, confed_member: bool) -> PeerT
     }
 }
 
+/// Resolves the AS number this daemon presents to a specific peer, in the
+/// OPEN message's `my_as` field and the `FourByteAsn` capability.
+///
+/// RFC 5065 §4: "A member of a BGP confederation MUST use its AS
+/// Confederation Identifier in all transactions with peers that are not
+/// members of its confederation... this number is used in OPEN messages...
+/// A member of a BGP confederation MUST use its Member-AS Number in all
+/// transactions with peers that are members of the same confederation."
+/// `local_as` is the private Member-AS Number; only `External` peers see
+/// `confederation_id` instead. Falls back to `local_as` when no
+/// confederation is configured, so behavior is unchanged for non-confederation
+/// deployments.
+fn effective_session_as(local_as: u32, confederation_id: Option<u32>, peer_type: PeerType) -> u32 {
+    match peer_type {
+        PeerType::External => confederation_id.unwrap_or(local_as),
+        PeerType::Internal | PeerType::ConfedMember | PeerType::Local => local_as,
+    }
+}
+
 /// Creates a matched pair of `AdjRibOut` tables (IPv4 + IPv6) for one peer.
 ///
 /// Both tables are created with identical reflecting/non-reflecting mode so they
@@ -1087,10 +1106,13 @@ where
     let startup_instant = std::time::Instant::now();
 
     for peer in &cfg.peers {
+        let confed_member = effective_confederation_member(peer, cfg.daemon.confederation_id);
+        let peer_type = config_peer_type(local_as, peer.remote_as, confed_member);
+        let public_as = effective_session_as(local_as, cfg.daemon.confederation_id, peer_type);
         // Recompute capabilities for each session so the R-bit correctly reflects
         // elapsed time since startup (RFC 4724 §3: R-bit must be cleared after restart).
         let capabilities = build_local_capabilities(
-            local_as,
+            public_as,
             cfg.daemon.graceful_restart_time,
             cfg.daemon.restarting
                 && cfg.daemon.graceful_restart_time > 0
@@ -1100,12 +1122,13 @@ where
         );
         let session_cfg = SessionConfig {
             local_as,
+            public_as,
             local_bgp_id,
             hold_time: peer.hold_time.unwrap_or(cfg.daemon.hold_time),
             capabilities,
             required_capabilities: vec![],
             peer_as: Some(peer.remote_as),
-            confederation_member: effective_confederation_member(peer, cfg.daemon.confederation_id),
+            confederation_member: confed_member,
             peer_addr: SocketAddr::new(peer.address, peer.port),
             md5_password: peer.md5_password.clone(),
             connect_retry_time: peer
@@ -1272,8 +1295,21 @@ pub(crate) async fn run_event_loop(
                                         None
                                     }
                                 }).unwrap_or(0);
+                                // RFC 5065 §4: the FourByteAsn capability must carry the
+                                // same AS number as `my_as` — the Confederation Identifier
+                                // for `External` peers, the Member-AS Number otherwise.
+                                // `peer_config_types` survives disconnects (only cleared on
+                                // permanent removal), so it reflects this peer's static
+                                // classification here.
+                                let peer_type = s
+                                    .peer_config_types
+                                    .get(&peer_ip)
+                                    .copied()
+                                    .unwrap_or(PeerType::External);
+                                let public_as =
+                                    effective_session_as(s.rib.local_as, s.rib.confederation_id, peer_type);
                                 let fresh_caps = build_local_capabilities(
-                                    s.rib.local_as,
+                                    public_as,
                                     gr_time,
                                     false,
                                     s.rib.peer_roles.get(&peer_ip).copied(),
@@ -1862,6 +1898,43 @@ mod tests {
         // confed_member is mistakenly also set — matches BIRD's
         // is_internal precedence.
         assert_eq!(config_peer_type(65001, 65001, true), PeerType::Internal);
+    }
+
+    // ── effective_session_as ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_effective_session_as_external_uses_confederation_id() {
+        // RFC 5065 §4: "MUST use its AS Confederation Identifier in all
+        // transactions with peers that are not members of its confederation."
+        assert_eq!(
+            effective_session_as(65001, Some(64_500), PeerType::External),
+            64_500
+        );
+    }
+
+    #[test]
+    fn test_effective_session_as_internal_uses_member_as() {
+        assert_eq!(
+            effective_session_as(65001, Some(64_500), PeerType::Internal),
+            65001
+        );
+    }
+
+    #[test]
+    fn test_effective_session_as_confed_member_uses_member_as() {
+        // RFC 5065 §4: "MUST use its Member-AS Number in all transactions
+        // with peers that are members of the same confederation."
+        assert_eq!(
+            effective_session_as(65001, Some(64_500), PeerType::ConfedMember),
+            65001
+        );
+    }
+
+    #[test]
+    fn test_effective_session_as_external_falls_back_to_local_as_when_unconfigured() {
+        // No confederation configured — behavior must be unchanged from
+        // pre-RFC-5065 (always local_as).
+        assert_eq!(effective_session_as(65001, None, PeerType::External), 65001);
     }
 
     // ── RFC 8212 default resolution ───────────────────────────────────────────
@@ -16410,7 +16483,7 @@ mod test_build_local_capabilities {
     #[test]
     fn spawn_config_r_bit_set_within_restart_window() {
         let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(10));
-        let caps = cfg.capabilities(None);
+        let caps = cfg.capabilities(None, 65001);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
         assert_eq!(
             flags & 0x08,
@@ -16424,7 +16497,7 @@ mod test_build_local_capabilities {
     fn spawn_config_r_bit_cleared_after_restart_window() {
         // Simulate 130 s elapsed for a 120 s window.
         let cfg = spawn_cfg(120, true, std::time::Duration::from_secs(130));
-        let caps = cfg.capabilities(None);
+        let caps = cfg.capabilities(None, 65001);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
         assert_eq!(
             flags & 0x08,
@@ -16437,7 +16510,7 @@ mod test_build_local_capabilities {
     #[test]
     fn spawn_config_r_bit_not_set_when_not_configured_restarting() {
         let cfg = spawn_cfg(120, false, std::time::Duration::from_secs(5));
-        let caps = cfg.capabilities(None);
+        let caps = cfg.capabilities(None, 65001);
         let (flags, _, _) = find_gr(&caps).expect("GracefulRestart must be present");
         assert_eq!(
             flags & 0x08,
@@ -16456,7 +16529,7 @@ mod test_build_local_capabilities {
     #[test]
     fn spawn_config_capabilities_includes_role_when_configured() {
         let cfg = spawn_cfg(0, false, std::time::Duration::from_secs(0));
-        let caps = cfg.capabilities(Some(Role::Provider));
+        let caps = cfg.capabilities(Some(Role::Provider), 65001);
         assert!(
             caps.iter()
                 .any(|c| matches!(c, Capability::Role(Role::Provider))),
