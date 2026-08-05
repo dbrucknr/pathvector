@@ -281,8 +281,20 @@ _build-mock-bgp-attr-peer-image:
         -t pathvector-mock-bgp-attr-peer-test:latest \
         .
 
+# Build the mock BGP AS4_PATH-peer test image — shares Dockerfile.pathvectord's
+# builder stage (see _build-mock-rtr-image).
+_build-mock-bgp-as4path-peer-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building pathvector-mock-bgp-as4path-peer-test:latest..."
+    docker build \
+        --target mock-bgp-as4path-peer \
+        -f pathvector-e2e/Dockerfile.pathvectord \
+        -t pathvector-mock-bgp-as4path-peer-test:latest \
+        .
+
 # Build all test images (idempotent — Docker layer cache keeps rebuilds fast).
-e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image _build-mock-bgp-dialer-image _build-mock-bgp-fault-peer-image _build-mock-bgp-collision-peer-image _build-mock-bgp-gr-peer-image _build-mock-bgp-attr-peer-image
+e2e-images: _build-gobgpd-image _build-pathvectord-image _build-bird-image _build-frr-image _build-mock-rtr-image _build-mock-bgp-peer-image _build-mock-bgp-dialer-image _build-mock-bgp-fault-peer-image _build-mock-bgp-collision-peer-image _build-mock-bgp-gr-peer-image _build-mock-bgp-attr-peer-image _build-mock-bgp-as4path-peer-image
 
 # Run end-to-end tests.
 # Both gobgpd and pathvectord run as Docker containers on an isolated bridge
