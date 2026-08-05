@@ -5675,6 +5675,409 @@ impl FrrHarness {
     }
 }
 
+// ── ConfederationHarness (RFC 5065 real interop) ───────────────────────────────
+
+/// Derives the per-test confederation subnet and fixed IPs from `test_id`.
+///
+/// `172.32.{id % 256}.0/24` — a dedicated second octet, distinct from
+/// `md5_test_subnet` (172.29), `fib_test_subnet` (172.30), `bird_test_subnet`
+/// (172.31), and `frr_test_subnet` (172.31, offset +128), so this harness's
+/// three-container topology can run concurrently with any of them.
+#[must_use]
+pub fn confederation_test_subnet(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.32.{third}.0/24")
+}
+
+#[must_use]
+pub fn confederation_frr_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.32.{third}.10")
+}
+
+#[must_use]
+pub fn confederation_pathvectord_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.32.{third}.20")
+}
+
+#[must_use]
+pub fn confederation_external_ip(test_id: u32) -> String {
+    let third = test_id % 256;
+    format!("172.32.{third}.30")
+}
+
+/// AS Confederation Identifier (the "public" AS advertised to genuinely
+/// external peers) used throughout [`ConfederationHarness`].
+pub const CONFEDERATION_ID: u32 = 64512;
+/// pathvectord's private Member-AS Number within the confederation.
+pub const CONFEDERATION_PATHVECTORD_MEMBER_AS: u32 = 65001;
+/// FRR's private Member-AS Number — a fellow confederation Member-AS.
+pub const CONFEDERATION_FRR_MEMBER_AS: u32 = 65002;
+/// The genuinely external GoBGP peer's AS — outside the confederation
+/// entirely, deliberately chosen far from the Member-AS numbers above so a
+/// stray unstripped Member-AS/Member-AS-adjacent number in AS_PATH is easy
+/// to tell apart from a legitimate ASN in this topology.
+pub const CONFEDERATION_EXTERNAL_AS: u32 = 65099;
+/// Prefix FRR originates (via a `network` statement) toward pathvectord.
+pub const CONFEDERATION_FRR_ROUTE: &str = "10.150.0.0/24";
+/// Prefix the external GoBGP peer originates (via `gobgp global rib add`)
+/// toward pathvectord.
+pub const CONFEDERATION_EXTERNAL_ROUTE: &str = "10.160.0.0/24";
+
+/// Writes an FRR bgpd config for a fellow confederation Member-AS.
+///
+/// `bgp confederation identifier` + `bgp confederation peers` make FRR treat
+/// `pathvectord_ip` as a fellow Member-AS peer: FRR wraps its own outbound
+/// AS_PATH in `AS_CONFED_SEQUENCE` toward it and accepts a leading
+/// `AS_CONFED_SEQUENCE` from it, exactly the RFC 5065 §4.1 behavior this
+/// harness exists to prove pathvectord also implements correctly.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_frr_config_confederation(pathvectord_ip: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp frr confederation config");
+    write!(
+        f,
+        "
+frr defaults traditional
+
+router bgp {CONFEDERATION_FRR_MEMBER_AS}
+ bgp router-id 1.0.0.1
+ bgp confederation identifier {CONFEDERATION_ID}
+ bgp confederation peers {CONFEDERATION_PATHVECTORD_MEMBER_AS}
+ no bgp ebgp-requires-policy
+ no bgp network import-check
+ neighbor {pathvectord_ip} remote-as {CONFEDERATION_PATHVECTORD_MEMBER_AS}
+ neighbor {pathvectord_ip} passive
+ !
+ address-family ipv4 unicast
+  neighbor {pathvectord_ip} activate
+  neighbor {pathvectord_ip} next-hop-self
+  network {CONFEDERATION_FRR_ROUTE}
+ exit-address-family
+exit
+"
+    )
+    .expect("write frr confederation config");
+    f
+}
+
+/// Writes a GoBGP config for the genuinely-external peer in
+/// [`ConfederationHarness`].
+///
+/// Unlike every other GoBGP config in this file, `peer-as` here is
+/// [`CONFEDERATION_ID`] — the confederation's public AS — not pathvectord's
+/// own AS number. RFC 5065 §4: "A member of a BGP confederation MUST use its
+/// AS Confederation Identifier in all transactions with peers that are not
+/// members of its confederation... this number is used in OPEN messages."
+/// If pathvectord regressed and advertised its private Member-AS Number to
+/// this peer instead, GoBGP would reject the session outright (Bad Peer AS)
+/// and it would never reach Established — this config is itself part of the
+/// interop proof, not just a passive observer.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_confederation_external() -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp confederation-external config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = {CONFEDERATION_EXTERNAL_AS}
+  router-id = "1.0.0.3"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = {CONFEDERATION_ID}
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp confederation-external config");
+    f
+}
+
+/// Writes a pathvectord config for [`ConfederationHarness`]: Member-AS
+/// [`CONFEDERATION_PATHVECTORD_MEMBER_AS`], confederation identifier
+/// [`CONFEDERATION_ID`], a `confederation_member = true` peer (FRR) and a
+/// plain eBGP peer (the external GoBGP).
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_confederation(frr_ip: Ipv4Addr, external_ip: Ipv4Addr) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord confederation config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as         = {CONFEDERATION_PATHVECTORD_MEMBER_AS}
+bgp_id           = "10.0.0.2"
+hold_time        = 9
+grpc_port        = {PATHVECTORD_GRPC_PORT}
+confederation_id = {CONFEDERATION_ID}
+
+[[peers]]
+address              = "{frr_ip}"
+port                 = {GOBGPD_BGP_PORT}
+remote_as            = {CONFEDERATION_FRR_MEMBER_AS}
+confederation_member = true
+import_default       = "accept"
+export_default       = "accept"
+
+[[peers]]
+address        = "{external_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {CONFEDERATION_EXTERNAL_AS}
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord confederation config");
+    f
+}
+
+/// Runs `gobgp global rib` inside `container_id` and returns the raw stdout,
+/// for AS_PATH assertions that `wait_for_gobgp_rib_entry` (existence-only)
+/// can't express.
+///
+/// # Panics
+///
+/// Panics if `docker exec` itself fails to run (not if the command inside
+/// exits non-zero — an empty/partial RIB is a normal polling state).
+#[must_use]
+pub fn gobgp_rib_text(container_id: &str) -> String {
+    let out = Command::new("docker")
+        .args(["exec", container_id, "gobgp", "global", "rib"])
+        .output()
+        .expect("docker exec gobgp global rib");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Runs `vtysh -c "show bgp ipv4 unicast <prefix>"` inside `container_id` and
+/// returns the raw stdout, for AS_PATH assertions that
+/// `wait_for_frr_rib_entry` (existence-only) can't express.
+///
+/// # Panics
+///
+/// Panics if `docker exec` itself fails to run.
+#[must_use]
+pub fn frr_show_route_text(container_id: &str, prefix: &str) -> String {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            container_id,
+            "vtysh",
+            "-c",
+            &format!("show bgp ipv4 unicast {prefix}"),
+        ])
+        .output()
+        .expect("docker exec vtysh show bgp");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Real interop harness for RFC 5065 (BGP Confederations): pathvectord acts
+/// as an actual confederation Member-AS, not just a pass-through relay.
+///
+/// Three containers: pathvectord (Member-AS
+/// [`CONFEDERATION_PATHVECTORD_MEMBER_AS`], confederation identifier
+/// [`CONFEDERATION_ID`]), FRR (Member-AS [`CONFEDERATION_FRR_MEMBER_AS`],
+/// configured as a fellow confederation member via FRR's own `bgp
+/// confederation identifier`/`bgp confederation peers` directives — FRR is
+/// the confederation-aware peer needed here; a plain eBGP speaker would
+/// originate routes with an ordinary `AS_SEQUENCE` rather than the
+/// `AS_CONFED_SEQUENCE` RFC 5065 §5 requires from a fellow Member-AS peer),
+/// and a genuinely external GoBGP peer (AS [`CONFEDERATION_EXTERNAL_AS`],
+/// configured to expect [`CONFEDERATION_ID`] in pathvectord's OPEN — see
+/// [`write_gobgp_config_confederation_external`]'s doc comment for why that
+/// alone is part of the interop proof).
+pub struct ConfederationHarness {
+    // Containers must drop before the network (declaration order = drop order).
+    _frr: ContainerGuard,
+    _external: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _frr_config: NamedTempFile,
+    _external_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// Container ID of the FRR (fellow Member-AS) container.
+    pub frr_id: String,
+    /// Container ID of the genuinely-external GoBGP container.
+    pub external_id: String,
+    /// Container ID of the pathvectord container.
+    pub pathvectord_id: String,
+    /// IP of the FRR container as seen by pathvectord.
+    pub frr_ip: Ipv4Addr,
+    /// IP of the external GoBGP container as seen by pathvectord.
+    pub external_ip: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl ConfederationHarness {
+    /// Starts all three containers, announces
+    /// [`CONFEDERATION_EXTERNAL_ROUTE`] from the external GoBGP peer, and
+    /// waits for both BGP sessions to reach `Established`.
+    ///
+    /// FRR announces [`CONFEDERATION_FRR_ROUTE`] itself via a `network`
+    /// statement in its own config — no post-startup action needed for that
+    /// side.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or either session doesn't
+    /// reach `Established` within 30s.
+    pub async fn new() -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-confederation-test-{test_id}");
+
+        let subnet = confederation_test_subnet(test_id);
+        let frr_ip_str = confederation_frr_ip(test_id);
+        let pv_ip_str = confederation_pathvectord_ip(test_id);
+        let external_ip_str = confederation_external_ip(test_id);
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        // ── FRR (fellow Member-AS) ────────────────────────────────────────
+        let frr_config = write_frr_config_confederation(&pv_ip_str);
+        let frr_config_path = frr_config.path().to_str().unwrap().to_owned();
+
+        let frr = docker_start_with_caps(
+            &format!("frr-confederation-{test_id}"),
+            FRR_IMAGE,
+            &network_name,
+            Some(&frr_ip_str),
+            true,
+            true,
+            &frr_config_path,
+            "/etc/frr/frr.conf",
+            None,
+            None,
+        );
+        wait_container_healthy(&frr.0, Duration::from_secs(60));
+
+        // ── External GoBGP peer ────────────────────────────────────────────
+        let external_config = write_gobgp_config_confederation_external();
+        let external_config_path = external_config.path().to_str().unwrap().to_owned();
+
+        let external = docker_start(
+            &format!("gobgp-confederation-external-{test_id}"),
+            GOBGPD_IMAGE,
+            &network_name,
+            Some(&external_ip_str),
+            false,
+            &external_config_path,
+            "/etc/gobgp/gobgpd.conf",
+            None,
+            None,
+        );
+        wait_container_healthy(&external.0, Duration::from_secs(30));
+
+        // ── pathvectord ──────────────────────────────────────────────────
+        let frr_ip: Ipv4Addr = frr_ip_str.parse().unwrap();
+        let external_ip: Ipv4Addr = external_ip_str.parse().unwrap();
+        let pathvectord_config = write_daemon_config_confederation(frr_ip, external_ip);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start(
+            &format!("pathvectord-confederation-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pv_ip_str),
+            false,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for ConfederationHarness");
+
+        wait_for_established(&mut client, frr_ip, Duration::from_secs(30))
+            .await
+            .expect("BGP session with FRR (confederation Member-AS) did not reach Established within 30 s");
+        wait_for_established(&mut client, external_ip, Duration::from_secs(30))
+            .await
+            .expect(
+                "BGP session with the external GoBGP peer did not reach Established within 30 s \
+                 (if pathvectord's OPEN sent the private Member-AS instead of the confederation \
+                 ID, GoBGP would reject it as Bad Peer AS and this session would never establish)",
+            );
+
+        let external_container = external.0.clone();
+        // Announce the external peer's route now that its session is up.
+        confederation_gobgp_announce_external(&external_container, external_ip);
+
+        let frr_container = frr.0.clone();
+        let pathvectord_container = pathvectord.0.clone();
+        ConfederationHarness {
+            _frr: frr,
+            _external: external,
+            _pathvectord: pathvectord,
+            _frr_config: frr_config,
+            _external_config: external_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            frr_id: frr_container,
+            external_id: external_container,
+            pathvectord_id: pathvectord_container,
+            frr_ip,
+            external_ip,
+            _network: network,
+        }
+    }
+}
+
+/// Runs `gobgp global rib add <CONFEDERATION_EXTERNAL_ROUTE> nexthop
+/// <nexthop> origin igp` inside `container_id` — split out of
+/// [`ConfederationHarness::new`] to keep that function under clippy's
+/// line-count lint.
+///
+/// # Panics
+///
+/// Panics if `docker exec` fails or the command exits non-zero.
+fn confederation_gobgp_announce_external(container_id: &str, nexthop: Ipv4Addr) {
+    let status = Command::new("docker")
+        .args(["exec", container_id])
+        .args([
+            "gobgp",
+            "global",
+            "rib",
+            "add",
+            CONFEDERATION_EXTERNAL_ROUTE,
+            "nexthop",
+            &nexthop.to_string(),
+            "origin",
+            "igp",
+        ])
+        .status()
+        .expect("docker exec gobgp announce");
+    assert!(
+        status.success(),
+        "gobgp announce {CONFEDERATION_EXTERNAL_ROUTE} failed: {status}"
+    );
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 //
 // These tests cover the pure path-calculation helpers that do not require

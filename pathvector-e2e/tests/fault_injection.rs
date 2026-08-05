@@ -477,9 +477,7 @@ async fn rfc5065_confed_segment_with_nlri_treated_as_withdraw_session_stays_up()
     // disappears, but the session and the rest of the daemon stay healthy.
     wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
         .await
-        .expect(
-            "10.99.0.0/24 was not withdrawn within 15 s after the AS_CONFED_SEQUENCE UPDATE",
-        );
+        .expect("10.99.0.0/24 was not withdrawn within 15 s after the AS_CONFED_SEQUENCE UPDATE");
 
     let fault_peer = h.fault_peer;
     let state = h
