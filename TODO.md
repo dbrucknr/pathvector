@@ -586,6 +586,20 @@ audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
   in `update.rs`'s `decode_path_attributes`, confirmed the new test failed
   (attribute fell through as `Unknown`, no NOTIFICATION), reverted and
   reconfirmed passing.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review — lowest
+  priority of the round-2 follow-ups, since the raw-loopback-TCP test above
+  already proved the real wire codec, but still real coverage this project
+  lacked: a separate-container mock peer plus an unaffected control peer
+  alongside it). Added an `unrecognized-well-known-attribute` scenario to
+  `mock_bgp_fault_peer.rs` and `unrecognized_well_known_attribute_resets_session`
+  (`pathvector-e2e/tests/fault_injection.rs`), asserting the exact
+  `NotificationError` variant and Data field bytes via the fault peer's
+  `SCENARIO_OUTCOME:` log, plus that `FaultInjectionHarness`'s GoBGP control
+  peer stays Established throughout. Real-teeth verified: temporarily
+  disabled the `flags & FLAG_OPTIONAL == 0` check, confirmed the test failed
+  (NOTIFICATION never arrived, timed out), reverted (clean no-op diff) and
+  reconfirmed passing. This closes out all 6 gaps from the round-2 Codex
+  follow-up review.
 - **(Lower priority / needs a judgment call, not obviously a bug)** NEXT_HOP
   semantic validation for one-hop eBGP peers is looser than §6.3's precise
   criterion (sender's IP or shared subnet) — `is_valid_next_hop_v4` only

@@ -6,6 +6,34 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-08-05 (round 2: additional e2e coverage gaps, Codex follow-up review)
 
+### [pathvector-e2e] PR #48's "exact NOTIFICATION" claim had no Docker-level proof, only a single-process real-TCP test
+
+The lowest-priority of the round-2 follow-ups per Codex's own ranking
+("its marginal value is lower than the three gaps above"), but still real
+coverage this project lacked: `pathvector-session`'s own RFC 4271 §6.3
+"Unrecognized Well-known Attribute" coverage
+(`test_raw_unrecognized_well_known_attribute_sends_real_notification_bytes`)
+proves the real wire codec on both ends, but as a raw-loopback-TCP test
+within a single process — it has no separate mock-peer container and no
+unaffected control peer running alongside it.
+
+Added an `unrecognized-well-known-attribute` scenario to
+`mock_bgp_fault_peer.rs` (real OPEN/KEEPALIVE handshake, then an UPDATE
+carrying the mandatory well-known attributes plus one
+`PathAttribute::Unknown` with the Optional bit clear) and
+`unrecognized_well_known_attribute_resets_session`
+(`pathvector-e2e/tests/fault_injection.rs`), which asserts, via the fault
+peer's `SCENARIO_OUTCOME:` log line, both the exact `NotificationError`
+variant and the exact Data field bytes (type, length, value) — plus that
+`FaultInjectionHarness`'s paired GoBGP control peer stays Established
+throughout.
+
+Real-teeth verified: temporarily disabled the `flags & FLAG_OPTIONAL == 0`
+check in `pathvector-session`'s `update.rs` decoder, confirmed the test
+failed (NOTIFICATION never arrived, `wait_for_docker_log` timed out after
+15s), reverted (clean no-op diff) and reconfirmed passing. Full
+`fault_injection` suite (20/20) regression-clean.
+
 ### [pathvector-e2e] Selection Deferral wait-set must cover the full configured peer set, not just one peer's EOR
 
 A follow-up Codex review of the PR #50 gap closure (below) pointed out that
