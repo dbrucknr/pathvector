@@ -1916,6 +1916,27 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   precedent. Real-teeth verified: swapped the session-reset NOTIFICATION
   to a different subcode, confirmed both tests failed, reverted and
   reconfirmed passing.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review): the
+  AS4_PATH-excludes-confed-segments fix above (RFC 6793 §§3, 4.2.2) had
+  unit coverage only — nothing proved the real wire codec on both ends
+  produces the expected split: a confed segment surviving the downgraded
+  wire AS_PATH toward a fellow `ConfedMember` peer (RFC 5065 §5.3) while
+  AS4_PATH excludes it entirely. Added
+  `pathvector-e2e/src/bin/mock_bgp_as4path_peer.rs` (a `confed-source`
+  role advertising `FourByteAsn` that sends AS_PATH =
+  `[AS_CONFED_SEQUENCE, 4-byte ASN]`; a `two-byte-observer` role that
+  omits `FourByteAsn` so pathvectord downgrades that session, then
+  decodes the real wire bytes) and `As4PathConfedHarness` — both mock
+  peers configured as fellow confederation Member-AS peers. New test
+  `as4_path_excludes_confed_segment_while_wire_as_path_keeps_it`
+  (`pathvector-e2e/tests/as4path_confed.rs`). Real-teeth verified:
+  temporarily removed the `strip_confed_segments()` call, confirmed the
+  test failed with `as4_path_excludes_confed_segments=false`, reverted
+  (clean no-op diff) and reconfirmed passing. Also caught and fixed an
+  overly-strict assertion of my own during development: pathvectord's
+  `prepend_confed()` extends the existing leading `AS_CONFED_SEQUENCE`
+  with its own Member-AS number rather than appending a new segment, so
+  the source's own AS need not be the *first* ASN in that segment.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.

@@ -109,6 +109,34 @@ Real-teeth verified: temporarily swapped the session-reset NOTIFICATION in
 confirmed both tests failed waiting for the expected log line, reverted
 (clean no-op diff) and reconfirmed passing.
 
+### [pathvector-e2e] RFC 6793 §4 / RFC 5065 §5.3 AS4_PATH confederation-stripping had no wire-level proof
+
+`pathvectord/src/outbound.rs`'s `as4.strip_confed_segments()` call (RFC 6793
+§§3, 4.2.2: confed segments "MUST NOT be included" in AS4_PATH) had unit
+coverage only. Nothing proved the real wire codec on both ends produces the
+expected shape: a confed segment surviving the downgraded wire AS_PATH
+toward a fellow `ConfedMember` peer (RFC 5065 §5.3 — the opposite of the
+`External` case) while AS4_PATH excludes it entirely.
+
+Added `mock_bgp_as4path_peer.rs` (a `confed-source` role advertising
+`FourByteAsn` that sends an UPDATE with AS_PATH = `[AS_CONFED_SEQUENCE,
+4-byte ASN]`; a `two-byte-observer` role that deliberately omits
+`FourByteAsn` so pathvectord downgrades that specific session, then decodes
+the real wire bytes it receives) and `As4PathConfedHarness` — both mock
+peers configured as fellow confederation Member-AS peers on pathvectord's
+side. New test
+`as4_path_excludes_confed_segment_while_wire_as_path_keeps_it`
+(`pathvector-e2e/tests/as4path_confed.rs`).
+
+Real-teeth verified: temporarily removed the `strip_confed_segments()`
+call, confirmed the test failed with `as4_path_excludes_confed_segments=false`,
+reverted (clean no-op diff) and reconfirmed passing. Also caught and fixed
+an overly-strict assertion of my own during development: pathvectord's
+`prepend_confed()` extends the existing leading `AS_CONFED_SEQUENCE` with
+its own Member-AS number rather than appending a new segment, so the
+source's own AS is not necessarily the *first* ASN in that segment — only
+still present within it.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate
