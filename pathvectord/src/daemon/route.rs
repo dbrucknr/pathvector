@@ -285,6 +285,7 @@ impl DaemonState {
             &*oracle_v4,
             &*oracle_v6,
             local_as,
+            rib.confederation_id,
             local_v4_addr,
             local_v6_addr,
         );
@@ -415,6 +416,7 @@ impl DaemonState {
     pub(super) fn propagate_to_all_peers(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
         let established_peers: Vec<IpAddr> = self.rib.peer_types.keys().copied().collect();
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let is_rr = !self.rib.rr_clients.is_empty();
         // RFC 4724 §4.1: while the IPv4 selection-deferral gate is closed,
@@ -477,6 +479,7 @@ impl DaemonState {
                         export_policy,
                         peer_type,
                         local_as,
+                        public_as,
                         local_next_hop,
                         next_hop_self,
                         v4_deferred,
@@ -627,6 +630,7 @@ impl DaemonState {
             .collect();
         let is_rr = !self.rib.rr_clients.is_empty();
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
         let v6_deferred = self.selection_deferral.v6_deferred();
         for peer_ip in established_peers {
@@ -673,6 +677,7 @@ impl DaemonState {
                         export_policy_v6,
                         peer_type,
                         local_as,
+                        public_as,
                         local_ipv6,
                         next_hop_self,
                         v6_deferred,
@@ -910,6 +915,7 @@ pub(super) fn handle_update(
     oracle_v4: &dyn NextHopOracle,
     oracle_v6: &dyn NextHopOracle,
     local_as: u32,
+    confederation_id: Option<u32>,
     local_v4_addr: Option<Ipv4Addr>,
     local_v6_addr: Option<Ipv6Addr>,
 ) -> UpdateResult {
@@ -978,11 +984,13 @@ pub(super) fn handle_update(
             // RFC 4271 §5.1.5: "If it is contained in an UPDATE message
             // that is received from an external peer, then this attribute
             // MUST be ignored by the receiving speaker, except in the case
-            // of BGP Confederations [RFC3065]." The confederation exception
-            // isn't handled here — this daemon has no confederation-aware
-            // peer classification yet (see TODO.md item #22); every eBGP
-            // peer, confederation member or not, is treated uniformly.
-            PathAttribute::LocalPref(lp) if peer_type == PeerType::Internal => {
+            // of BGP Confederations [RFC5065]." RFC 5065 §5.2 confirms the
+            // exception explicitly: "the restriction... is removed" for
+            // confederation-member peers — so a `ConfedMember` peer's
+            // LOCAL_PREF is accepted alongside `Internal`'s.
+            PathAttribute::LocalPref(lp)
+                if matches!(peer_type, PeerType::Internal | PeerType::ConfedMember) =>
+            {
                 local_pref = Some(LocalPref::new(*lp));
             }
             PathAttribute::Med(m) => med = Some(Med::new(*m)),
@@ -1213,11 +1221,18 @@ pub(super) fn handle_update(
         mp_v6_announced.clear();
     }
 
-    // ── RFC 4271 §9.1.2: AS_PATH loop detection ──────────────────────────
+    // ── RFC 4271 §9.1.2 / RFC 5065 §4: AS_PATH loop detection ────────────
     // If our own AS appears in the received AS_PATH the route has looped back
-    // to us. Silently ignore all announced NLRIs in this UPDATE (withdrawals
-    // are still processed — they are safe and necessary).
-    let has_loop = as_path.contains(pathvector_types::Asn::new(local_as));
+    // to us. RFC 5065 extends this: within a confederation, a route can also
+    // loop back via the Confederation Identifier (e.g. relayed out to a
+    // genuine external peer and back in through a different Member-AS) —
+    // `AsPathSegment::contains` does not discriminate by segment type, so
+    // the `local_as` check already catches "own Member-AS Number inside a
+    // CONFED segment" for free; only the confederation-identifier half is
+    // new here. Silently ignore all announced NLRIs in this UPDATE
+    // (withdrawals are still processed — they are safe and necessary).
+    let has_loop = as_path.contains(pathvector_types::Asn::new(local_as))
+        || confederation_id.is_some_and(|cid| as_path.contains(pathvector_types::Asn::new(cid)));
     if has_loop
         && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
     {
@@ -1225,13 +1240,118 @@ pub(super) fn handle_update(
             peer = %peer,
             local_as,
             %as_path,
-            "dropping UPDATE: AS_PATH contains local AS (RFC 4271 §9.1.2)"
+            "dropping UPDATE: AS_PATH contains local AS or confederation ID (RFC 4271 §9.1.2 / RFC 5065 §4)"
         );
         // Still process withdrawals below; clear the announce lists.
         mp_v4_announced.clear();
         mp_v6_announced.clear();
         // The traditional NLRI list is consumed by the iterator below; return
         // early after processing withdrawals by short-circuiting via a flag.
+    }
+
+    // ── RFC 5065 §5: malformed AS_PATH (confederation-relationship-aware) ──
+    // These two conditions can only be detected here, not at the wire-decode
+    // layer (`pathvector-session`) — they depend on the *relationship* with
+    // the sending peer (External vs. ConfedMember), which the decoder has no
+    // visibility into.
+    //
+    // RFC 5065 §5 delegates handling to "the procedures of [RFC4271],
+    // Section 6.3" — it does not hard-code session reset itself, it cites
+    // RFC 4271 §6.3's general UPDATE-error procedure by reference. RFC 7606
+    // §3 directly amends that same referenced procedure: "amends Section
+    // 6.3 of [RFC4271]... Treat-as-withdraw MUST be used for the cases that
+    // specify a session reset and involve any of the attributes ORIGIN,
+    // AS_PATH, NEXT_HOP, MULTI_EXIT_DISC, or LOCAL_PREF" (§3(e)). Both RFC
+    // 5065 §5 conditions specify a session reset and involve AS_PATH, so
+    // they fall under §3(e) even though RFC 5065 itself is absent from RFC
+    // 7606's formal "Updates:" list — that list names documents whose
+    // *own* text RFC 7606 edits, not every document that merely cites RFC
+    // 4271 §6.3's procedure by reference. The one carve-out is RFC 7606
+    // §3(j)/§5.2: session reset still applies when NLRI wasn't successfully
+    // parsed — handled above by gating this whole block on
+    // `notification.is_none()`, so an already-decided §5.2 session reset
+    // takes precedence and these conditions are only evaluated when NLRI
+    // parsing succeeded.
+    if has_as_path && notification.is_none() {
+        let confed_segment_from_external = peer_type == PeerType::External
+            && as_path.segments().iter().any(|seg| {
+                matches!(
+                    seg,
+                    pathvector_types::AsPathSegment::ConfedSequence(_)
+                        | pathvector_types::AsPathSegment::ConfedSet(_)
+                )
+            });
+        let malformed_from_confed_member = peer_type == PeerType::ConfedMember
+            && !matches!(
+                as_path.segments().first(),
+                Some(pathvector_types::AsPathSegment::ConfedSequence(_))
+            );
+        if confed_segment_from_external || malformed_from_confed_member {
+            if has_reachable_nlri_on_wire {
+                tracing::warn!(
+                    peer = %peer,
+                    %as_path,
+                    confed_segment_from_external,
+                    malformed_from_confed_member,
+                    "malformed AS_PATH (RFC 5065 §5) — treat-as-withdraw (RFC 7606 §3(e))"
+                );
+                let treat_as_withdraw_v4: Vec<Nlri<Ipv4Addr>> = msg
+                    .announced
+                    .drain(..)
+                    .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
+                    .collect();
+                for nlri in treat_as_withdraw_v4 {
+                    if adj_rib_in.get(&nlri).is_some_and(|r| {
+                        r.rare_or_default()
+                            .communities
+                            .iter()
+                            .any(|c| c.is_blackhole())
+                    }) {
+                        blackhole_withdrawn_v4.push(nlri);
+                    }
+                    adj_rib_in.withdraw(&nlri);
+                    fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
+                }
+                let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
+                    mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
+                for nlri in treat_as_withdraw_v6 {
+                    if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
+                        r.rare_or_default()
+                            .communities
+                            .iter()
+                            .any(|c| c.is_blackhole())
+                    }) {
+                        blackhole_withdrawn_v6.push(nlri);
+                    }
+                    adj_rib_in_v6.withdraw(&nlri);
+                    fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+                }
+            } else {
+                // RFC 7606 §5.2: this UPDATE carries path attributes (at
+                // least AS_PATH) but no reachable NLRI at all — draining an
+                // empty announced-NLRI list would be a silent no-op, and
+                // "we cannot be confident that the NLRI have been
+                // successfully parsed as Section 3(j) requires. For this
+                // reason, if any path attribute errors are encountered in
+                // such an UPDATE message and if any encountered error
+                // specifies an error-handling approach other than
+                // 'attribute discard', then the 'session reset' approach
+                // MUST be used." Treat-as-withdraw (§3(e)) is "other than
+                // attribute discard", so session reset applies here instead.
+                tracing::warn!(
+                    peer = %peer,
+                    %as_path,
+                    confed_segment_from_external,
+                    malformed_from_confed_member,
+                    "malformed AS_PATH (RFC 5065 §5) on an UPDATE with no reachable NLRI \
+                     (RFC 7606 §5.2) — session reset"
+                );
+                notification = Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    data: vec![],
+                });
+            }
+        }
     }
 
     // ── MP_UNREACH_NLRI withdrawals (RFC 4760) ────────────────────────────

@@ -16,6 +16,8 @@ fn default_config() -> FsmConfig {
         capabilities: vec![],
         required_capabilities: vec![],
         peer_as: None,
+        confederation_member: false,
+        public_as: 65001,
     }
 }
 
@@ -91,7 +93,7 @@ proptest! {
     /// local_as > 65535 → outbound OPEN carries AS_TRANS in the my_as field.
     #[test]
     fn prop_large_asn_uses_as_trans(local_as in 65536u32..=u32::MAX) {
-        let config = FsmConfig { local_as, ..default_config() };
+        let config = FsmConfig { local_as, public_as: local_as, ..default_config() };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
         let out = fsm.process(FsmInput::TcpConnected);
@@ -104,7 +106,7 @@ proptest! {
     /// local_as ≤ 65535 → outbound OPEN carries local_as directly in my_as.
     #[test]
     fn prop_small_asn_sent_directly(local_as in 0u32..=65535) {
-        let config = FsmConfig { local_as, ..default_config() };
+        let config = FsmConfig { local_as, public_as: local_as, ..default_config() };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
         let out = fsm.process(FsmInput::TcpConnected);

@@ -321,6 +321,10 @@ not fixed here):
   daemon has no confederation-aware peer classification at all yet (see
   item #22's 2026-07-18 scoping note, filed as its own separate,
   significantly larger initiative rather than folded into this fix).
+  **Confederation exception closed 2026-08-04** (`feature/rfc5065-
+  confederation-member-support`, item #128): the LOCAL_PREF accept guard
+  now widens to `PeerType::Internal | PeerType::ConfedMember`. See
+  `pathvectord/RFC.md`'s RFC 5065 section for the full writeup.
   Two pre-existing tests asserted the old (vulnerable) behavior as
   correct — `test_handle_update_inserts_route_with_all_attributes` and
   `test_handle_update_mp_reach_announces_ipv4_route` both asserted an
@@ -1777,6 +1781,33 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   of today's deployments, since no confederation config exists yet to
   even trigger the exception) and explicitly maintains this exact
   asymmetry rather than worsening or silently fixing it.
+  **Closed 2026-08-04** (`feature/rfc5065-confederation-member-support`,
+  item #128): `DaemonConfig.confederation_id`/`PeerConfig.confederation_member`
+  config schema added; `PeerType::ConfedMember` (the 4th variant this note
+  called for) threaded through both classification sites (the FSM for live
+  sessions — the authoritative one, per a critical finding caught during
+  planning — and `config_peer_type` for the pre-Established/post-disconnect
+  window), best-path preference, split-horizon, `NO_EXPORT_SUBCONFED`,
+  outbound LOCAL_PREF/NEXT_HOP/MED rules, AS_CONFED-segment stripping (plus
+  a latent strip-then-prepend ordering bug found and fixed along the way),
+  and the two new RFC 5065 §5 malformed-AS_PATH session-reset checks. See
+  `pathvectord/RFC.md`'s RFC 5065 section for the full requirement-by-
+  requirement writeup.
+  **2026-08-05 correction (external review of PR #51):** four blocking
+  issues found and fixed — external OPENs/`FourByteAsn` weren't using the
+  Confederation Identifier (RFC 5065 §4 covers *all* transactions with a
+  peer, not just AS_PATH); the two RFC 5065 §5 checks above were wrongly
+  session-reset rather than treat-as-withdraw (RFC 7606 §3(e) amends the
+  RFC 4271 §6.3 procedure RFC 5065 §5 cites by reference — RFC 5065's
+  absence from RFC 7606's formal "Updates:" list doesn't exempt it); an
+  empty AS_PATH from a `ConfedMember` peer was wrongly exempted from the
+  §5 condition-2 check; AS4_PATH could leak AS_CONFED_SEQUENCE/
+  AS_CONFED_SET segments (RFC 6793 §§3, 4.2.2 forbid this). A follow-up
+  review pass the same day found the treat-as-withdraw fix silently
+  no-op'd (no NOTIFICATION, nothing to drain) on an UPDATE with a
+  malformed AS_PATH and no reachable NLRI at all — RFC 7606 §5.2 requires
+  session reset in exactly that case; fixed by branching on
+  `has_reachable_nlri_on_wire`. See `CHANGELOG.md`'s 2026-08-05 entries.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.

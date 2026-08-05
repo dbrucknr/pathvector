@@ -75,6 +75,7 @@ fn run_pipeline(route: &Route<Ipv4Addr>, peers: &mut [AdjRibOut<Ipv4Addr>]) {
             route.clone(),
             adj.peer_type(),
             LOCAL_AS,
+            LOCAL_AS,
             LOCAL_BGP_ID,
             false,
         );

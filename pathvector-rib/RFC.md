@@ -66,9 +66,14 @@ and `strip_confed_segments()` helper live in `pathvector-types`.
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | Confederation segments (type 3, 4) count as 0 in AS path length for step 4 | `src/best_path.rs` | ✅ | `test_aspath_length_excludes_confed_segments` |
-| Confederation segments stripped from AS_PATH before advertising to eBGP peers (§4.1(c)(1)) | `src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_strips_confed_segments_for_ebgp` |
-| §4.1(c)(2)-(4): after stripping, prepend the Confederation Identifier into the now-external `AS_SEQUENCE` | — | ❌ | Added 2026-07-16 by `RFC_AUDIT.md` — `strip_confed_segments()` only removes the confed segments; nothing prepends the Confederation Identifier afterward, and `prepare_outbound`'s eBGP prepend uses `local_as` generically with no distinct Confederation-Identifier-vs-Member-AS concept |
-| §4.1(b): originate/relay as an actual confederation member (prepend Member-AS Number into `AS_CONFED_SEQUENCE` toward fellow members) | — | ❌ | Added 2026-07-16 — `PeerType` has no representation for "peer in a different Member-AS of the same confederation" at all; only `Internal`/`External`/`Local` exist. This project's RFC 5065 support is pass-through/interop only (correctly strips confed segments from routes that already have them from an upstream confederation), not full confederation-member participation. See `RFC_AUDIT.md`'s "audit-the-audit" section for the full writeup and the open question of whether this is in scope at all. |
+| Confederation segments stripped from AS_PATH before advertising to eBGP peers (§4.1(c)(1)) | `src/adj_rib_out.rs`, `src/outbound.rs` | ✅ | `test_adj_rib_out_strips_confed_segments_for_ebgp`, `test_external_strips_confed_before_prepending_public_as` |
+| §4.1(c)(2)-(4): after stripping, prepend the Confederation Identifier into the now-external `AS_SEQUENCE` | `src/outbound.rs` | ✅ | `test_external_prepends_public_as_not_local_as`, `test_external_strips_confed_before_prepending_public_as` (also fixes a strip-then-prepend ordering bug found during implementation — see `CHANGELOG.md`) |
+| §4.1(b): originate/relay as an actual confederation member (prepend Member-AS Number into `AS_CONFED_SEQUENCE` toward fellow members) | `src/outbound.rs`, `pathvector-types::AsPath::prepend_confed` | ✅ | `test_confed_member_prepends_into_confed_sequence`, `test_confed_member_v6_prepends_into_confed_sequence` |
+| §5.3: ConfedMember peer ties with Internal for best-path preference (not eBGP's step 7 win) | `src/best_path.rs` | ✅ | `test_confed_member_ties_with_internal_falls_through_to_tiebreak`, `test_confed_member_beaten_by_external`, `test_confed_member_beaten_by_local` |
+| Split-horizon and confed-strip gates correctly exclude ConfedMember (neither Internal-only-suppress nor External-only-strip apply) | `src/adj_rib_out.rs` | ✅ | `test_confed_member_to_confed_member_not_split_horizoned`, `test_confed_segments_preserved_for_confed_member_peer` |
+| RFC 1997 `NO_EXPORT` blocks External only; `NO_EXPORT_SUBCONFED` blocks External and ConfedMember | `src/outbound.rs` | ✅ | `test_propagate_prefix_no_export_subconfed_suppresses_ebgp_but_allows_ibgp` (pathvectord), `is_export_suppressed` doc comment |
+
+Shipped 2026-08-04 (`feature/rfc5065-confederation-member-support`), closing the gap `RFC_AUDIT.md`'s 2026-07-16 "audit-the-audit" finding flagged. See `pathvectord/RFC.md` and `pathvector-session/RFC.md` for the config schema, session-classification, and import-side (§5/§6) halves of this work.
 
 ---
 

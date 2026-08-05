@@ -161,6 +161,7 @@ impl DaemonState {
             .filter(|&ip| ip != peer_ip)
             .collect();
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         for other_ip in other_peers {
@@ -205,6 +206,7 @@ impl DaemonState {
                         export_policy,
                         other_type,
                         local_as,
+                        public_as,
                         local_next_hop,
                         other_next_hop_self,
                         v4_deferred,
@@ -238,6 +240,7 @@ impl DaemonState {
             .filter(|&ip| ip != peer_ip)
             .collect();
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
         let v6_deferred = self.selection_deferral.v6_deferred();
         for other_ip in other_peers {
@@ -276,6 +279,7 @@ impl DaemonState {
                         export_policy_v6,
                         other_type,
                         local_as,
+                        public_as,
                         local_ipv6,
                         other_next_hop_self,
                         v6_deferred,
@@ -352,6 +356,7 @@ impl DaemonState {
             .collect();
 
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         for other_ip in other_peers {
@@ -396,6 +401,7 @@ impl DaemonState {
                         export_policy,
                         other_type,
                         local_as,
+                        public_as,
                         local_next_hop,
                         other_next_hop_self,
                         v4_deferred,
@@ -467,6 +473,7 @@ impl DaemonState {
             .collect();
 
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
         let v6_deferred = self.selection_deferral.v6_deferred();
         for other_ip in other_peers {
@@ -505,6 +512,7 @@ impl DaemonState {
                         export_policy_v6,
                         other_type,
                         local_as,
+                        public_as,
                         local_ipv6,
                         other_next_hop_self,
                         v6_deferred,
@@ -585,6 +593,7 @@ impl DaemonState {
             .filter(|&ip| ip != peer_ip)
             .collect();
         let local_as = self.rib.local_as;
+        let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         for other_ip in other_peers {
@@ -629,6 +638,7 @@ impl DaemonState {
                         export_policy,
                         other_type,
                         local_as,
+                        public_as,
                         local_next_hop,
                         other_next_hop_self,
                         v4_deferred,
@@ -698,6 +708,7 @@ impl DaemonState {
                         export_policy_v6,
                         other_type,
                         local_as,
+                        public_as,
                         local_ipv6,
                         other_next_hop_self,
                         v6_deferred,

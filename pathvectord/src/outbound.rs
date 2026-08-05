@@ -24,9 +24,16 @@ pub(crate) const UPDATE_FIXED_OVERHEAD: usize = 19 + 2 + 2;
 /// Builds the path-attribute list for an outbound route.
 ///
 /// `peer_type` controls attribute stripping:
-/// - ORIGINATOR_ID and CLUSTER_LIST are route-reflector metadata (RFC 4456 §8)
-///   and MUST be stripped before sending to eBGP peers.
-/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4).
+/// - ORIGINATOR_ID and CLUSTER_LIST are route-reflector metadata (RFC 4456
+///   §8) and MUST be stripped before sending to genuinely external peers —
+///   `ConfedMember` peers are included in this strip too: RR clusters are
+///   scoped to a single AS's internal topology, and RFC 5065 is silent on
+///   the interaction, so letting cluster metadata cross a Member-AS
+///   boundary risks cluster-ID collisions between independently
+///   administered Member-ASes without serving RR's loop-prevention
+///   purpose. This is a deliberate choice, not an oversight.
+/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4) — but RFC 5065
+///   §5.2 removes this restriction for `ConfedMember` peers.
 ///
 /// `peer_four_byte` indicates whether the peer negotiated RFC 6793
 /// `FourByteAsn` capability. When `false`, any 4-byte ASN in AS_PATH is
@@ -37,7 +44,8 @@ pub(crate) fn route_to_attributes(
     peer_type: PeerType,
     peer_four_byte: bool,
 ) -> Vec<PathAttribute> {
-    let is_ebgp = peer_type == PeerType::External;
+    let strip_med = peer_type == PeerType::External;
+    let strip_rr_metadata = matches!(peer_type, PeerType::External | PeerType::ConfedMember);
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
@@ -54,8 +62,9 @@ pub(crate) fn route_to_attributes(
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if !is_ebgp {
-        // RFC 4271 §5.1.4: MED SHOULD NOT be sent to eBGP peers.
+    if !strip_med {
+        // RFC 4271 §5.1.4 / RFC 5065 §5.2: MED SHOULD NOT be sent to eBGP
+        // peers, but this restriction is removed for ConfedMember peers.
         if let Some(m) = route.med {
             attrs.push(PathAttribute::Med(m.as_u32()));
         }
@@ -80,7 +89,7 @@ pub(crate) fn route_to_attributes(
     if let Some(agg) = rare.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
-    if !is_ebgp {
+    if !strip_rr_metadata {
         // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
         if let Some(id) = rare.originator_id {
             attrs.push(PathAttribute::OriginatorId(id));
@@ -105,8 +114,15 @@ pub(crate) fn route_to_attributes(
     // RFC 6793 §4: when the peer is 2-byte-only, include AS4_PATH so that
     // 4-byte-capable routers further along the path can reconstruct the full
     // AS path. Only emitted when downgrade actually substituted AS_TRANS above.
+    //
+    // RFC 6793 §§3, 4.2.2: AS_CONFED_SEQUENCE/AS_CONFED_SET "are declared
+    // invalid for the AS4_PATH attribute and MUST NOT be included" — strip
+    // them here. The wire AS_PATH (`wire_as_path` above) keeps its
+    // (downgraded) confed segments; only the AS4_PATH side-channel excludes
+    // them, since RFC 5065 confederation relaying can leave confed segments
+    // in a route sent toward a two-byte-only peer.
     if let Some(as4) = as4_path {
-        attrs.push(PathAttribute::As4Path(as4));
+        attrs.push(PathAttribute::As4Path(as4.strip_confed_segments()));
     }
     attrs
 }
@@ -156,6 +172,7 @@ pub(crate) fn propagate_prefix(
     export_policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
     local_as: u32,
+    public_as: u32,
     local_next_hop: Ipv4Addr,
     next_hop_self: bool,
     deferred: bool,
@@ -185,6 +202,7 @@ pub(crate) fn propagate_prefix(
                 best.clone(),
                 peer_type,
                 local_as,
+                public_as,
                 local_next_hop,
                 next_hop_self,
             );
@@ -366,6 +384,7 @@ pub(crate) fn propagate_prefix_v6(
     export_policy: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
     local_as: u32,
+    public_as: u32,
     local_ipv6: Option<Ipv6Addr>,
     next_hop_self: bool,
     deferred: bool,
@@ -388,8 +407,14 @@ pub(crate) fn propagate_prefix_v6(
                     PrefixDecisionV6::NoChange
                 };
             }
-            let mut route =
-                prepare_outbound_v6(best.clone(), peer_type, local_as, local_ipv6, next_hop_self);
+            let mut route = prepare_outbound_v6(
+                best.clone(),
+                peer_type,
+                local_as,
+                public_as,
+                local_ipv6,
+                next_hop_self,
+            );
             match export_policy.evaluate(&mut route) {
                 // RFC 1997: a well-known community (NO_ADVERTISE/NO_EXPORT/
                 // NO_EXPORT_SUBCONFED) can forbid advertising to this peer
@@ -596,8 +621,11 @@ pub(crate) fn send_eor_ipv6(update_tx: &mpsc::Sender<UpdateMessage>) -> bool {
 /// Builds the path-attribute list for an outbound IPv6 route.
 ///
 /// `peer_type` controls attribute stripping — same rules as [`route_to_attributes`]:
-/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4).
-/// - ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP peers (RFC 4456 §8).
+/// - MED SHOULD NOT be sent to eBGP peers (RFC 4271 §5.1.4), except
+///   ConfedMember peers (RFC 5065 §5.2).
+/// - ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP peers (RFC
+///   4456 §8) — and, deliberately, for ConfedMember peers too; see
+///   [`route_to_attributes`]'s doc comment for why.
 ///
 /// The NLRI is carried in MP_REACH_NLRI (RFC 4760); the traditional
 /// `NEXT_HOP` attribute is not emitted for IPv6 routes.
@@ -606,7 +634,8 @@ pub(crate) fn route_v6_to_attributes(
     peer_type: PeerType,
     peer_four_byte: bool,
 ) -> (Vec<PathAttribute>, MpReachNlri) {
-    let is_ebgp = peer_type == PeerType::External;
+    let strip_med = peer_type == PeerType::External;
+    let strip_rr_metadata = matches!(peer_type, PeerType::External | PeerType::ConfedMember);
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
@@ -620,11 +649,8 @@ pub(crate) fn route_v6_to_attributes(
     if let Some(lp) = route.local_pref {
         attrs.push(PathAttribute::LocalPref(lp.as_u32()));
     }
-    if !is_ebgp {
-        // RFC 4271 §5.1.4: MED SHOULD NOT be sent to eBGP peers.
-        if let Some(m) = route.med {
-            attrs.push(PathAttribute::Med(m.as_u32()));
-        }
+    if !strip_med && let Some(m) = route.med {
+        attrs.push(PathAttribute::Med(m.as_u32()));
     }
     let rare = route.rare_or_default();
     if !rare.communities.is_empty() {
@@ -646,7 +672,7 @@ pub(crate) fn route_v6_to_attributes(
     if let Some(agg) = rare.aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
-    if !is_ebgp {
+    if !strip_rr_metadata {
         // RFC 4456 §8: ORIGINATOR_ID and CLUSTER_LIST MUST be stripped for eBGP.
         if let Some(id) = rare.originator_id {
             attrs.push(PathAttribute::OriginatorId(id));
@@ -663,8 +689,10 @@ pub(crate) fn route_v6_to_attributes(
     // RFC 4271 §5: unrecognized transitive optional attributes — see the
     // v4 `route_to_attributes`'s comment on `unknown_attrs_to_path_attributes`.
     attrs.extend(unknown_attrs_to_path_attributes(&rare.unknown));
+    // RFC 6793 §§3, 4.2.2: strip confed segments from AS4_PATH — see the v4
+    // `route_to_attributes`'s comment above.
     if let Some(as4) = as4_path {
-        attrs.push(PathAttribute::As4Path(as4));
+        attrs.push(PathAttribute::As4Path(as4.strip_confed_segments()));
     }
     let next_hop = route.next_hop.unwrap_or(NextHop::V6(Ipv6Addr::UNSPECIFIED));
     let mp_reach = MpReachNlri {
@@ -1420,6 +1448,48 @@ mod v6_tests {
             "As4Path must be present when 4-byte ASNs are downgraded for a two-byte peer"
         );
     }
+
+    /// RFC 6793 §§3, 4.2.2: AS4_PATH must exclude AS_CONFED_SEQUENCE/
+    /// AS_CONFED_SET segments — see the v4 `as4_path_excludes_confed_segments_for_two_byte_peer`
+    /// test in `route_to_attributes_tests` for the full RFC citation.
+    #[test]
+    fn test_route_v6_to_attributes_as4path_excludes_confed_segments() {
+        use pathvector_rib::RouteBuilder;
+        use pathvector_types::{AsPath, AsPathSegment, Asn};
+        let n = nlri6("2001:db8::/32");
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(64_512)]),
+            AsPathSegment::Sequence(vec![Asn::new(131_072), Asn::new(65001)]),
+        ]);
+        let route = RouteBuilder::new(n, pathvector_types::Origin::Igp, path)
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build();
+        let (attrs, _) = route_v6_to_attributes(&route, PeerType::External, false);
+
+        let as4_asns: Vec<Asn> = attrs
+            .iter()
+            .find_map(|a| {
+                if let PathAttribute::As4Path(p) = a {
+                    Some(
+                        p.segments()
+                            .iter()
+                            .flat_map(|s| s.asns().to_vec())
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .expect("AS4_PATH must be present");
+        assert!(
+            !as4_asns.contains(&Asn::new(64_512)),
+            "AS4_PATH must exclude AS_CONFED_SEQUENCE, got {as4_asns:?}"
+        );
+        assert!(
+            as4_asns.contains(&Asn::new(131_072)) && as4_asns.contains(&Asn::new(65001)),
+            "AS4_PATH must still carry the non-confed segment's original ASNs"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1794,6 +1864,49 @@ mod route_to_attributes_tests {
         );
     }
 
+    /// RFC 6793 §§3, 4.2.2: AS_CONFED_SEQUENCE/AS_CONFED_SET "are declared
+    /// invalid for the AS4_PATH attribute and MUST NOT be included." A route
+    /// relayed toward a `ConfedMember` peer can carry a leading
+    /// ConfedSequence (RFC 5065 §4.1(b)); if that same route is later
+    /// downgraded for a two-byte peer, AS4_PATH must exclude the confed
+    /// segment while the wire AS_PATH keeps it (downgraded to AS_TRANS for
+    /// the four-byte ASN inside it).
+    #[test]
+    fn as4_path_excludes_confed_segments_for_two_byte_peer() {
+        use pathvector_types::AsPathSegment;
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(64_512)]),
+            AsPathSegment::Sequence(vec![Asn::new(131_072), Asn::new(65001)]),
+        ]);
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, path)
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .build();
+        let attrs = route_to_attributes(&route, PeerType::External, false);
+
+        // Wire AS_PATH keeps the confed segment (downgraded: no four-byte
+        // ASNs in it here, so it's untouched) plus AS_TRANS for the 4-byte ASN.
+        let wire_asns = as_path_asns(&attrs);
+        assert!(
+            wire_asns.contains(&Asn::new(64_512)),
+            "wire AS_PATH must keep the confed segment's ASN"
+        );
+        assert!(
+            wire_asns.contains(&Asn::TRANS),
+            "wire AS_PATH must substitute AS_TRANS for the 4-byte ASN"
+        );
+
+        // AS4_PATH must NOT contain the confed segment's ASN at all.
+        let as4_asns = as4_path_asns(&attrs).expect("AS4_PATH must be present");
+        assert!(
+            !as4_asns.contains(&Asn::new(64_512)),
+            "AS4_PATH must exclude AS_CONFED_SEQUENCE (RFC 6793 §§3, 4.2.2), got {as4_asns:?}"
+        );
+        assert!(
+            as4_asns.contains(&Asn::new(131_072)) && as4_asns.contains(&Asn::new(65001)),
+            "AS4_PATH must still carry the non-confed segment's original ASNs"
+        );
+    }
+
     /// All-4-byte path sent to 2-byte peer: every ASN becomes AS_TRANS, all
     /// original ASNs are recoverable from AS4_PATH.
     #[test]
@@ -1929,6 +2042,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -1958,6 +2072,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -1989,6 +2104,7 @@ mod propagate_tests {
             &mut adj_out,
             &reject_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2022,6 +2138,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             false,
@@ -2036,6 +2153,7 @@ mod propagate_tests {
             &mut adj_out,
             &reject_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2066,6 +2184,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             false,
@@ -2078,6 +2197,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2129,6 +2249,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
+            65001,
             None,
             false,
             false,
@@ -2163,6 +2284,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::Internal,
+            65001,
             65001,
             None,
             false,
@@ -2227,6 +2349,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2256,6 +2379,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy(),
             PeerType::Internal,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2288,6 +2412,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2305,6 +2430,7 @@ mod propagate_tests {
             &mut ibgp_adj_out,
             &accept_policy(),
             PeerType::Internal,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2337,6 +2463,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2354,6 +2481,7 @@ mod propagate_tests {
             &mut ibgp_adj_out,
             &accept_policy(),
             PeerType::Internal,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2386,6 +2514,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2404,6 +2533,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy(),
             PeerType::External,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2434,6 +2564,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
@@ -2466,6 +2597,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             false,
@@ -2483,6 +2615,7 @@ mod propagate_tests {
             &mut ibgp_adj_out,
             &accept_policy_v6(),
             PeerType::Internal,
+            65001,
             65001,
             None,
             false,
@@ -2534,6 +2667,7 @@ mod propagate_tests {
             &policy,
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2579,6 +2713,7 @@ mod propagate_tests {
             &policy,
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             false,
@@ -2612,6 +2747,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy(),
             PeerType::External,
+            65001,
             65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
@@ -2651,6 +2787,7 @@ mod propagate_tests {
             &accept_policy(),
             PeerType::External,
             65001,
+            65001,
             Ipv4Addr::new(10, 1, 0, 1),
             false,
             true, // deferred
@@ -2686,6 +2823,7 @@ mod propagate_tests {
             &accept_policy_v6(),
             PeerType::External,
             65001,
+            65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,
             true, // deferred
@@ -2712,6 +2850,7 @@ mod propagate_tests {
             &mut adj_out,
             &accept_policy_v6(),
             PeerType::External,
+            65001,
             65001,
             Some("2001:db8::ff".parse().unwrap()),
             false,

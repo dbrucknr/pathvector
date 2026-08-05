@@ -349,3 +349,51 @@ enforces role-pair compatibility at session-establishment time.
 this optional and non-default; tracked as a non-blocking follow-up in `TODO.md`.
 AS-confederation-aware OTC — the RFC itself says NOT RECOMMENDED, matching this
 project's existing confederation scope boundary.
+
+---
+
+## RFC 5065 — AS Confederations for BGP (Session Layer)
+
+**Owns:** `FsmConfig.confederation_member` / `SessionConfig.confederation_member` —
+the per-session flag that makes `Fsm::build_session_info` classify the peer as
+`PeerType::ConfedMember` instead of `PeerType::External`. This is the
+**authoritative** classification for every live Established session; a
+daemon-side classifier alone would only cover the pre-Established/
+post-disconnect windows. Also owns `FsmConfig.public_as` /
+`SessionConfig.public_as` — the AS number `make_open` places in the OPEN
+message's `my_as` field, resolved by the caller (`pathvectord`) per RFC 5065
+§4 ("MUST use its AS Confederation Identifier in all transactions with peers
+that are not members of its confederation... this number is used in OPEN
+messages... MUST use its Member-AS Number in all transactions with peers
+that are members of the same confederation").  
+**Boundary:** AS_PATH segment types, `strip_confed_segments()`, and
+`prepend_confed()` live in `pathvector-types`. Confederation config schema
+(`confederation_id`, `confederation_member`), best-path/outbound handling, and
+the RFC 5065 §5 malformed-AS_PATH import checks all live in `pathvectord`/
+`pathvector-rib` — this crate's decoder has no visibility into which peer
+sent an UPDATE relative to confederation membership, so those relationship-
+dependent checks cannot live here.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc5065
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| `Fsm::build_session_info` classifies `ConfedMember` when `confederation_member` is set and `peer_as != local_as` | `src/fsm/mod.rs` | ✅ | `test_session_info_confed_member_peer_type_when_configured` |
+| `local_as == peer_as` still classifies `Internal` even if `confederation_member` is also set | `src/fsm/mod.rs` | ✅ | `test_session_info_same_as_wins_over_confed_member` |
+| `make_open`'s `my_as` (and the caller-supplied `FourByteAsn` capability) uses `public_as`, not `local_as` — required so a genuinely `External` session under a configured confederation advertises the Confederation Identifier, not the private Member-AS Number (RFC 5065 §4) | `src/fsm/mod.rs` | ✅ | `test_sent_open_uses_public_as_not_local_as` |
+
+Shipped 2026-08-04 (`feature/rfc5065-confederation-member-support`). Real-teeth
+verified: reverted the fix, confirmed
+`test_session_info_confed_member_peer_type_when_configured` failed with
+`left: External, right: ConfedMember`, then restored and reran the full
+343-test suite green.
+
+**Fixed 2026-08-05** after external code review of PR #51 found that
+external OPENs still advertised the private Member-AS Number, not the
+Confederation Identifier — RFC 5065 §4's OPEN-message requirement had only
+been applied to AS_PATH generation, not to the session's own `my_as`/
+`FourByteAsn` capability. Added `FsmConfig.public_as`/`SessionConfig.public_as`,
+resolved by `pathvectord` (`effective_session_as`) at every session-spawn
+and reconnect-capability-refresh call site. Real-teeth verified: reverted
+`make_open` to use `local_as`, confirmed `test_sent_open_uses_public_as_not_local_as`
+failed (`left: 65001, right: 64512`), then restored and reran the full
+344-test suite green.

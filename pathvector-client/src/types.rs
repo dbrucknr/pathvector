@@ -36,6 +36,10 @@ pub enum PeerType {
     Internal,
     /// Locally originated — injected via the origination API.
     Local,
+    /// A fellow BGP confederation Member-AS (RFC 5065) — eBGP at the wire
+    /// level, but treated like `Internal` for best-path preference,
+    /// LOCAL_PREF, and split-horizon purposes.
+    ConfedMember,
 }
 
 /// BGP ORIGIN path attribute (RFC 4271 §4.3).

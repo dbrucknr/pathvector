@@ -62,6 +62,7 @@ fn peer_type_from_i32(value: i32) -> Option<PeerType> {
     match value {
         1 => Some(PeerType::External),
         2 => Some(PeerType::Internal),
+        3 => Some(PeerType::ConfedMember),
         _ => None,
     }
 }
@@ -74,6 +75,7 @@ impl TryFrom<i32> for PeerType {
             0 => Ok(PeerType::Local), // Unspecified proto value = locally originated route
             1 => Ok(PeerType::External),
             2 => Ok(PeerType::Internal),
+            3 => Ok(PeerType::ConfedMember),
             _ => Err(ConvertError::UnknownEnumValue("PeerType", value)),
         }
     }
@@ -512,6 +514,12 @@ mod tests {
         assert_eq!(PeerType::try_from(2).unwrap(), PeerType::Internal);
     }
 
+    #[test]
+    fn peer_type_confed_member() {
+        // RFC 5065: PEER_TYPE_CONFED_MEMBER (3).
+        assert_eq!(PeerType::try_from(3).unwrap(), PeerType::ConfedMember);
+    }
+
     /// Discriminant 0 is PEER_TYPE_UNSPECIFIED. For routes, this maps to
     /// `PeerType::Local` (locally originated). For `PeerState`, the
     /// `peer_type_from_i32` helper still returns `None` for unspecified.
@@ -522,7 +530,7 @@ mod tests {
 
     #[test]
     fn peer_type_unknown_is_error() {
-        for v in [3, 99, -1, i32::MAX] {
+        for v in [4, 99, -1, i32::MAX] {
             assert!(
                 matches!(
                     PeerType::try_from(v),
@@ -544,11 +552,12 @@ mod tests {
     fn peer_type_from_i32_known_values() {
         assert_eq!(peer_type_from_i32(1), Some(PeerType::External));
         assert_eq!(peer_type_from_i32(2), Some(PeerType::Internal));
+        assert_eq!(peer_type_from_i32(3), Some(PeerType::ConfedMember));
     }
 
     #[test]
     fn peer_type_from_i32_unknown_is_none() {
-        for v in [3, 99, -1, i32::MAX] {
+        for v in [4, 99, -1, i32::MAX] {
             assert_eq!(
                 peer_type_from_i32(v),
                 None,
@@ -1100,25 +1109,28 @@ mod tests {
             }
         }
 
-        /// PeerType try_from must never panic; succeeds only for 1 and 2.
+        /// PeerType try_from must never panic; succeeds for 0, 1, 2, 3.
         #[test]
         fn prop_peer_type_total(v: i32) {
             let result = PeerType::try_from(v);
             match v {
+                0 => prop_assert_eq!(result.unwrap(), PeerType::Local),
                 1 => prop_assert_eq!(result.unwrap(), PeerType::External),
                 2 => prop_assert_eq!(result.unwrap(), PeerType::Internal),
+                3 => prop_assert_eq!(result.unwrap(), PeerType::ConfedMember),
                 _ => prop_assert!(result.is_err()),
             }
         }
 
         /// peer_type_from_i32 must never panic; returns None for anything
-        /// other than 1 and 2.
+        /// other than 1, 2, 3.
         #[test]
         fn prop_peer_type_from_i32_total(v: i32) {
             let result = peer_type_from_i32(v);
             match v {
                 1 => prop_assert_eq!(result, Some(PeerType::External)),
                 2 => prop_assert_eq!(result, Some(PeerType::Internal)),
+                3 => prop_assert_eq!(result, Some(PeerType::ConfedMember)),
                 _ => prop_assert_eq!(result, None),
             }
         }

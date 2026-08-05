@@ -71,16 +71,26 @@ field live in `pathvector-session`.
 
 ## RFC 5065 — AS Confederations for BGP
 
-**Owns:** Confederation segment types and the `strip_confed_segments()` helper.  
-**Boundary:** Confederation segment stripping before eBGP advertisement is applied in
-`pathvector-rib` (`AdjRibOut`). Best-path step 4 (confederation segments count as 0)
-is enforced in `pathvector-rib`.  
+**Owns:** Confederation segment types, the `strip_confed_segments()` helper,
+`AsPath::prepend_confed()` (§4.1(b) Member-AS-to-Member-AS prepend), and
+`PeerType::ConfedMember`.  
+**Boundary:** Confederation segment stripping before eBGP advertisement, the
+strip-then-prepend ordering, and best-path preference are enforced in
+`pathvector-rib`. Config schema, session classification, and import-side §5
+error handling are in `pathvector-session`/`pathvectord`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc5065
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | AS_CONFED_SEQUENCE (segment type 3) and AS_CONFED_SET (segment type 4) defined | `src/aspath.rs` | ✅ | `test_segment_display_confed_sequence`, `test_segment_display_confed_set`, `test_as_path_confed_segments_roundtrip` |
 | `AsPath::strip_confed_segments()` removes all confederation segments | `src/aspath.rs` | ✅ | `test_strip_confed_segments_removes_confed_sequence_and_set`, `test_strip_confed_segments_preserves_sequence_and_set`, `test_strip_confed_segments_all_confed_yields_empty`, `test_strip_confed_segments_empty_path_stays_empty`, `test_strip_confed_segments_does_not_mutate_original`, `test_strip_confed_segments_preserves_segment_order` |
+| §4.1(b): `AsPath::prepend_confed()` prepends into a leading `ConfedSequence`, or creates one | `src/aspath.rs` | ✅ | `test_prepend_confed_to_empty`, `test_prepend_confed_extends_existing_leading_confed_sequence`, `test_prepend_confed_to_non_confed_sequence_creates_new_segment`, `test_prepend_confed_overflow_creates_new_segment` |
+| `PeerType::ConfedMember` — a fellow confederation Member-AS, distinct from `Internal`/`External`/`Local` | `src/peer_type.rs` | ✅ | `test_peer_type_display`, `test_peer_type_equality` |
+
+Shipped 2026-08-04 (`feature/rfc5065-confederation-member-support`). See
+`pathvector-rib/RFC.md`, `pathvector-session/RFC.md`, and `pathvectord/RFC.md`
+for the RIB-layer, session-classification, and daemon-config/import-side
+halves of this work.
 
 ---
 

@@ -4,6 +4,183 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (RFC 5065: 4 blocking fixes from external code review of PR #51)
+
+### [pathvectord, pathvector-session] External code review found four real gaps in the RFC 5065 Member-AS work below — all four confirmed against directly-fetched RFC text and fixed
+
+An external review of PR #51 (RFC 5065 full Member-AS support, entry
+below) identified four blocking issues. Each was independently re-verified
+against directly-fetched RFC text (not from memory, not taking the review's
+word for it) before fixing:
+
+1. **External OPENs still advertised the private Member-AS Number, not the
+   Confederation Identifier.** RFC 5065 §4: "A member of a BGP
+   confederation MUST use its AS Confederation Identifier in all
+   transactions with peers that are not members of its confederation...
+   this number is used in OPEN messages... MUST use its Member-AS Number
+   in all transactions with peers that are members of the same
+   confederation." The original work applied this only to AS_PATH
+   generation, missing the session's own `my_as` field and `FourByteAsn`
+   capability. Added `FsmConfig.public_as`/`SessionConfig.public_as`
+   (`pathvector-session`) and `effective_session_as` (`pathvectord`),
+   threaded through every session-spawn site (static startup, dynamic
+   `AddPeer`) and the reconnect capability-refresh path.
+
+2. **RFC 5065 §5's two malformed-AS_PATH conditions were session-reset;
+   RFC 7606 §3(e) actually reclassifies them as treat-as-withdraw.** The
+   original reasoning — RFC 5065 is absent from RFC 7606's formal
+   "Updates: 1997, 4271, 4360, 4456, 4760, 5543, 5701, 6368" list, so its
+   citation of RFC 4271 §6.3 stays literal — was wrong. RFC 7606 §3 states
+   "This specification amends Section 6.3 of [RFC4271]," and §3(e): MUST
+   use treat-as-withdraw "for the cases that specify a session reset and
+   involve any of the attributes ORIGIN, AS_PATH, NEXT_HOP,
+   MULTI_EXIT_DISC, or LOCAL_PREF." RFC 5065 §5 delegates to "the
+   procedures of [BGP-4], Section 6.3" by reference rather than hard-coding
+   session-reset itself, and both conditions specify a session reset
+   involving AS_PATH — so RFC 7606's amendment to the referenced procedure
+   text applies regardless of RFC 5065's absence from the formal
+   "Updates:" list, which names documents RFC 7606 edits directly, not
+   every document that cites §6.3. This ends up matching BIRD's actual
+   practice after all — just derived from RFC text rather than trusted
+   from BIRD's behavior or the Updates-list heuristic alone. The one
+   preserved exception is RFC 7606 §3(j)/§5.2 (session reset when NLRI
+   wasn't parseable), handled by gating the RFC 5065 §5 checks on
+   `notification.is_none()` so an already-decided §5.2 reset wins.
+
+3. **An empty AS_PATH from a `ConfedMember` peer was wrongly exempted.**
+   The original condition-2 check required `!as_path.is_empty()` before
+   flagging a missing leading `AS_CONFED_SEQUENCE`. RFC 5065 §5's actual
+   wording has no such exemption ("does not have AS_CONFED_SEQUENCE as the
+   first segment" — an empty path has no first segment at all), and §4.1(b)
+   requires even an originated route sent to a neighboring Member-AS to
+   carry a ConfedSequence. Removed the exemption; folded into the same
+   condition-2 check as a natural consequence of `.first()` returning
+   `None` for an empty path.
+
+4. **AS4_PATH could carry AS_CONFED_SEQUENCE/AS_CONFED_SET segments.**
+   RFC 6793 §§3, 4.2.2: these segment types "are declared invalid for the
+   AS4_PATH attribute and MUST NOT be included." `route_to_attributes`/
+   `route_v6_to_attributes` built AS4_PATH from the full original
+   (pre-downgrade) path, which — once RFC 5065 relaying could legitimately
+   leave confed segments in a route sent to a `ConfedMember` peer — could
+   propagate those segments into AS4_PATH when the same route was later
+   downgraded for a two-byte-only peer. Fixed by applying the existing
+   `AsPath::strip_confed_segments()` to the AS4_PATH value specifically,
+   leaving the (downgraded) wire AS_PATH untouched.
+
+Real-teeth verified: fix #1's `make_open` change (reverted, confirmed
+`test_sent_open_uses_public_as_not_local_as` failed with `left: 65001,
+right: 64512`, restored); fix #4's AS4_PATH strip (reverted, confirmed
+`as4_path_excludes_confed_segments_for_two_byte_peer` failed with the
+confed ASN present in AS4_PATH, restored). Fixes #2/#3 rewrote the
+existing test suite's expectations from session-reset to treat-as-withdraw
+(the tests' own prior assertions were the thing proven wrong, not new
+code) plus one new explicit empty-AS_PATH regression test.
+
+See `pathvector-session/RFC.md` and `pathvectord/RFC.md`'s RFC 5065
+sections for the full corrected requirement tables.
+
+### [pathvectord] Follow-up review pass: RFC 5065 §5 treat-as-withdraw was a silent no-op on UPDATEs with no reachable NLRI
+
+A second review pass on the fixes above found one remaining gap in the
+treat-as-withdraw fix (finding #2): when an UPDATE carrying a malformed
+AS_PATH (RFC 5065 §5) has no announced NLRI at all — no traditional NLRI,
+no MP_REACH_NLRI — draining the (empty) announced-NLRI list into
+withdrawals does nothing, and no NOTIFICATION was sent either, so the
+malformed condition was silently ignored. RFC 7606 §5.2: "if an UPDATE
+message is encountered that does contain path attributes other than
+MP_UNREACH_NLRI and doesn't encode any reachable NLRI... if any path
+attribute errors are encountered in such an UPDATE message and if any
+encountered error specifies an error-handling approach other than
+'attribute discard', then the 'session reset' approach MUST be used."
+Treat-as-withdraw is "other than attribute discard," so this exact case
+requires session reset, not a silent no-op.
+
+Fixed by branching the RFC 5065 §5 checks on the already-existing
+`has_reachable_nlri_on_wire` variable: treat-as-withdraw when there's
+reachable NLRI to drain, `MalformedAsPath` NOTIFICATION/session-reset
+otherwise. Real-teeth verified (forced the old `if true` no-op branch,
+confirmed all three new regression tests failed with `got None`, restored
+and reran green). Added regression tests for both RFC 5065 §5 conditions
+with no reachable NLRI, including the empty-`ConfedMember`-path case.
+
+Full workspace re-verified after this fix: `cargo build --workspace`,
+`cargo clippy -p pathvectord --all-targets -- -D warnings`, `cargo fmt
+--all -- --check`, `cargo nextest run --workspace --exclude
+pathvector-e2e` — 1967/1967 passing.
+
+---
+
+## 2026-08-04 (RFC 5065: full BGP Confederation Member-AS support)
+
+### [pathvector-types, pathvector-rib, pathvector-session, pathvectord, pathvector-client] Originate/relay as a confederation Member-AS, not just pass-through interop
+
+Prior to this work, RFC 5065 support was pass-through/interop only —
+correctly stripping confederation segments from routes relayed from
+someone else's confederation, but with zero representation for
+*originating or relaying as an actual confederation Member-AS*: `PeerType`
+had only `Internal`/`External`/`Local`, and there was no confederation
+config schema at all. Flagged as "significant, architectural, not a quick
+fix" by `RFC_AUDIT.md`'s 2026-07-16 audit-the-audit finding and filed as
+its own initiative (`TODO.md` task #128) rather than folded into the
+smaller RFC 4271/9234/1997 fixes shipped earlier this session.
+
+Grounded in three research passes, not memory: RFC 5065's full text (§4.1
+AS_PATH modification rules, §5 error handling, §5.1-§5.3 NEXT_HOP/MED/
+LOCAL_PREF/best-path exceptions); RFC 1997's exact `NO_EXPORT` vs.
+`NO_EXPORT_SUBCONFED` wording; and RFC 7606's own scope statement ("This
+document updates error handling for RFCs 1997, 4271, 4360, 4456, 4760,
+5543, 5701, and 6368") — RFC 5065 is absent from that list, so its two new
+malformed-AS_PATH conditions (§5) are implemented as session-reset, not
+treat-as-withdraw, a deliberate departure from BIRD's more lenient
+practice matching the precedent this session already established for RFC
+4271 §6.3 (see the entry below).
+
+**New:** `PeerType::ConfedMember`, `AsPath::prepend_confed()`,
+`DaemonConfig.confederation_id`/`PeerConfig.confederation_member` config
+schema, `FsmConfig.confederation_member` (the authoritative classifier for
+live Established sessions), `config_peer_type`/`effective_confederation_member`
+(the pre-Established/post-disconnect classifier), an explicit best-path
+rank function (`ConfedMember` ties with `Internal`, which `PeerType`'s
+derived `Ord` cannot express), the `public_as` outbound parameter
+(`confederation_id.unwrap_or(local_as)`), a strip-then-prepend ordering
+fix in `prepare_outbound`/`prepare_outbound_v6`, the RFC 1997
+`NO_EXPORT`/`NO_EXPORT_SUBCONFED` split, LOCAL_PREF-accept widening,
+confederation-ID-aware loop detection, and two new RFC 5065 §5
+malformed-AS_PATH session-reset checks.
+
+**Critical finding caught during planning:** `PeerType` is classified in
+two independent places workspace-wide — `pathvectord`'s `config_peer_type`
+(authoritative only for the pre-Established/post-disconnect windows) and
+`pathvector-session`'s FSM (`Fsm::build_session_info`, authoritative for
+every live Established session). A design extending only
+`config_peer_type` would have shipped a daemon that silently
+misclassifies every live confederation-member session as plain
+`External` — caught by a dedicated Plan-subagent review pass before any
+code was written, independently re-verified by reading `fsm/mod.rs`
+directly, the same defensive pattern that caught the RFC 4724 §4.1
+EOR-only-peer wait-set bug earlier this session.
+
+**Second finding:** the existing (unmodified) `prepare_outbound`/
+`propagate_prefix` pipeline prepended before stripping confederation
+segments, producing two separate `Sequence` segments instead of one
+canonically-merged one for a route that already carries confed segments —
+fixed by reordering to strip-then-prepend inside `prepare_outbound`'s
+`External` branch.
+
+Real-teeth verified throughout: the FSM classification fix, the
+confederation-ID loop-detection extension, and both RFC 5065 §5
+malformed-AS_PATH checks were each reverted, confirmed to fail for the
+right reason, then restored and reran green against the full test suite
+(pathvector-session: 343 tests; pathvectord: 726 tests).
+
+See `pathvector-types/RFC.md`, `pathvector-rib/RFC.md`,
+`pathvector-session/RFC.md`, and `pathvectord/RFC.md`'s RFC 5065 sections
+for the full requirement-by-requirement writeup, and `TODO.md` item #128
+for the closure note.
+
+---
+
 ## 2026-08-04 (RFC 4724 §4.1 Restarting-Speaker Selection_Deferral_Timer)
 
 ### [pathvectord] No deferral of our own outbound route advertisement after a daemon restart
