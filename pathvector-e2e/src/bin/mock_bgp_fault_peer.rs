@@ -96,6 +96,18 @@
 //!   NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op here, so
 //!   this must instead reset the session with a `MalformedAsPath`
 //!   NOTIFICATION.
+//! - `confederation-id-loop` — a real OPEN/KEEPALIVE handshake to
+//!   Established, then a single well-formed UPDATE whose AS_PATH contains
+//!   the confederation identifier (RFC 5065 §4: a route can loop back into
+//!   the confederation via the identifier itself, e.g. relayed out to a
+//!   genuine external peer and back in through a different Member-AS).
+//!   This peer is configured plain `External` on pathvectord's side — the
+//!   check applies to AS_PATH content regardless of peer type. Unlike every
+//!   other scenario above, this UPDATE is not malformed at all: the loop is
+//!   silently dropped (the announced NLRI never reaches Loc-RIB), and the
+//!   session stays Established throughout. Tests policy-violating-but-
+//!   well-formed input, not corrupted wire format — same shape as
+//!   `ebgp-local-pref`.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -160,6 +172,7 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "rfc5065-confed-member-wrong-first-segment-no-nlri" => {
             rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream).await;
         }
+        "confederation-id-loop" => confederation_id_loop_update(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -1473,6 +1486,89 @@ async fn rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream: TcpStr
                     }
                     Some(Ok(_)) => {}
                     _ => return,
+                }
+            }
+        }
+    }
+}
+
+/// RFC 5065 §4: a route can loop back into the confederation via the
+/// confederation identifier itself, not just via a Member-AS Number (e.g.
+/// relayed out to a genuine external peer and back in through a different
+/// Member-AS). This peer is configured plain `External` on pathvectord's
+/// side (see [`FaultInjectionHarness::new_with_confederation_id`]) — the
+/// check applies to AS_PATH content regardless of peer type. A well-formed
+/// UPDATE whose AS_PATH contains the confederation identifier must be
+/// silently dropped (the announced NLRI never reaches Loc-RIB), while the
+/// session itself stays Established throughout.
+async fn confederation_id_loop_update(stream: TcpStream) {
+    /// Kept in sync manually with `CONFEDERATION_ID` in
+    /// `pathvector-e2e/src/lib.rs` — there is no shared crate boundary
+    /// between the mock binary and the harness.
+    const CONFEDERATION_ID: u32 = 64_512;
+
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    let update = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![
+                Asn::new(u32::from(FAULT_PEER_AS)),
+                Asn::new(CONFEDERATION_ID),
+            ])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(update)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE with confederation identifier ({CONFEDERATION_ID}) in AS_PATH for {TEST_PREFIX}"
+    );
+
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
                 }
             }
         }

@@ -690,3 +690,52 @@ async fn mid_session_tcp_reset_recovers_cleanly() {
         .await
         .expect("session did not re-establish within 30 s of reconnecting");
 }
+
+/// RFC 5065 §4: a route can loop back into a confederation via the
+/// confederation identifier itself (not just via a Member-AS Number) — e.g.
+/// relayed out to a genuine external peer and back in through a different
+/// Member-AS. A well-formed UPDATE whose AS_PATH contains the confederation
+/// identifier must be silently dropped: the announced NLRI never reaches
+/// pathvectord's own Loc-RIB, and the session stays Established throughout.
+/// Currently unit-only in `route.rs`'s `has_loop` check — this proves it
+/// over a real BGP session with the real wire codec on both ends.
+#[tokio::test]
+async fn confederation_id_in_as_path_is_treated_as_loop_and_dropped() {
+    let mut h = FaultInjectionHarness::new_with_confederation_id("confederation-id-loop").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established within 15 s");
+
+    // Give pathvectord a real window to have processed the UPDATE (and,
+    // if the loop-detection check were broken, to have installed the
+    // route) before asserting its absence.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let route = h
+        .client
+        .get_best_route("10.99.0.0/24")
+        .await
+        .expect("get_best_route gRPC call succeeded");
+    assert!(
+        route.is_none(),
+        "RFC 5065 §4: a route whose AS_PATH contains the confederation identifier must be \
+         silently dropped as a loop, never reaching Loc-RIB; got: {route:?}"
+    );
+
+    // The session itself must stay healthy — this is a policy-violating
+    // but well-formed UPDATE, not a wire-format fault.
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 5065 §4: a confederation-identifier loop must not affect the session itself"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}

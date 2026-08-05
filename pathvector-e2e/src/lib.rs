@@ -866,6 +866,47 @@ export_default = "accept"
 }
 
 /// Same as [`write_daemon_config_fault_injection`], but pathvectord has a
+/// confederation identifier configured. The fault peer stays plain
+/// `External` (unlike
+/// [`write_daemon_config_fault_injection_confed_member`]) — used by the
+/// confederation-identifier loop-detection scenario, which applies
+/// regardless of peer type and is simplest to exercise from an ordinary
+/// `External` peer with no confed-segment involvement at all.
+fn write_daemon_config_fault_injection_confederation_id(
+    control_ip: Ipv4Addr,
+    fault_peer_addr: Ipv4Addr,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord confederation-id-only config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as         = 65002
+bgp_id           = "10.0.0.2"
+hold_time        = 9
+grpc_port        = {PATHVECTORD_GRPC_PORT}
+confederation_id = {CONFEDERATION_ID}
+
+[[peers]]
+address        = "{control_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address        = "{fault_peer_addr}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65098
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord confederation-id-only config");
+    f
+}
+
+/// Same as [`write_daemon_config_fault_injection`], but pathvectord has a
 /// confederation identifier configured and the fault peer is marked
 /// `confederation_member = true` — used by RFC 5065 §5 condition 2
 /// scenarios, which require pathvectord to actually classify the fault peer
@@ -2456,6 +2497,25 @@ impl FaultInjectionHarness {
         Self::new_inner(
             scenario,
             write_daemon_config_fault_injection_confed_member,
+            write_gobgp_config_confed_control,
+        )
+        .await
+    }
+
+    /// Same as [`Self::new`], but pathvectord is configured with a
+    /// confederation identifier while the fault peer stays plain
+    /// `External`. Used by the confederation-identifier loop-detection
+    /// scenario (`confederation-id-loop`), which applies to AS_PATH content
+    /// regardless of the sending peer's classification.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or the control peer's session
+    /// doesn't reach `Established` within 30s.
+    pub async fn new_with_confederation_id(scenario: &str) -> Self {
+        Self::new_inner(
+            scenario,
+            write_daemon_config_fault_injection_confederation_id,
             write_gobgp_config_confed_control,
         )
         .await
