@@ -89,6 +89,13 @@ pub const MOCK_BGP_COLLISION_PEER_IMAGE: &str = "pathvector-mock-bgp-collision-p
 /// [`SelectionDeferralHarness`].
 pub const MOCK_BGP_GR_PEER_IMAGE: &str = "pathvector-mock-bgp-gr-peer-test";
 
+/// Unrecognized-transitive-attribute relay pair built by `just e2e-images`
+/// from `e2e/Dockerfile.pathvectord`'s `mock-bgp-attr-peer` stage, used by
+/// [`UnknownTransitiveAttrHarness`]. See `src/bin/mock_bgp_attr_peer.rs` for
+/// the `source`/`observer` role selected at container-start time via
+/// `.with_cmd([role])`.
+pub const MOCK_BGP_ATTR_PEER_IMAGE: &str = "pathvector-mock-bgp-attr-peer-test";
+
 // ── Fixed container-internal ports ───────────────────────────────────────────
 
 /// BGP listen port inside the gobgpd container.
@@ -6473,6 +6480,168 @@ impl TwoSourceSelectionDeferralHarness {
             _daemon_config: daemon_config,
             client,
             observer_addr,
+            observer_id,
+            _network: network,
+        }
+    }
+}
+
+// ── UnknownTransitiveAttrHarness (RFC 4271 §5 real relay) ───────────────────────
+
+/// Prefix [`MOCK_BGP_ATTR_PEER_IMAGE`]'s `source` role announces — see
+/// `src/bin/mock_bgp_attr_peer.rs`'s `TEST_PREFIX` constant (kept in sync
+/// manually; there is no shared crate boundary between the mock binary and
+/// this harness).
+pub const UNKNOWN_TRANSITIVE_ATTR_TEST_PREFIX: &str = "10.160.0.0/24";
+
+/// Writes a pathvectord config for [`UnknownTransitiveAttrHarness`]: two
+/// peers — `source` and `observer` (both [`MOCK_BGP_ATTR_PEER_IMAGE`],
+/// running its `source`/`observer` roles respectively) — with
+/// `import_default`/`export_default` both `"accept"` so the route flows
+/// freely from source through to observer.
+fn write_daemon_config_unknown_transitive_attr(
+    source_ip: Ipv4Addr,
+    source_as: u32,
+    observer_ip: Ipv4Addr,
+    observer_as: u32,
+) -> NamedTempFile {
+    let mut f =
+        NamedTempFile::new().expect("create temp pathvectord unknown-transitive-attr config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as   = 65002
+bgp_id     = "10.0.0.2"
+hold_time  = 9
+grpc_port  = {PATHVECTORD_GRPC_PORT}
+
+[[peers]]
+address        = "{source_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {source_as}
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address        = "{observer_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {observer_as}
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord unknown-transitive-attr config");
+    f
+}
+
+/// Real interop harness for RFC 4271 §5's unrecognized-transitive-attribute
+/// relay: pathvectord between a `source` mock (injects an unrecognized
+/// transitive attribute plus an unrecognized non-transitive negative
+/// control) and an `observer` mock (decodes pathvectord's re-advertised
+/// UPDATE with the real wire codec — a GoBGP CLI's rendered RIB text is not
+/// precise enough to assert an exact flags octet).
+///
+/// Closes the gap identified in Codex's review: the existing coverage for
+/// this feature is decode-level and daemon-storage-level only; nothing
+/// proves the full decode → storage → RIB → outbound-reconstruction →
+/// encode pipeline through a real two-hop relay.
+pub struct UnknownTransitiveAttrHarness {
+    // Containers must drop before the network (declaration order = drop order).
+    _source: ContainerAsync<GenericImage>,
+    _observer: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _daemon_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// Container ID of the observer mock — pass to `wait_for_docker_log`.
+    pub observer_id: String,
+    _network: DockerNetwork,
+}
+
+impl UnknownTransitiveAttrHarness {
+    /// Starts all three containers and waits for both BGP sessions to reach
+    /// `Established`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or either session doesn't
+    /// reach `Established` within 30s.
+    pub async fn new() -> Self {
+        // Both mock instances advertise AS 65001 regardless of role —
+        // mock_bgp_attr_peer.rs's MOCK_AS is a fixed const, not
+        // parameterized by the CLI role argument.
+        const SOURCE_AS: u32 = 65001;
+        const OBSERVER_AS: u32 = 65001;
+
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-unknown-transitive-attr-test-{test_id}");
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        // ── source mock (injects the unrecognized attributes) ─────────────
+        let source = GenericImage::new(MOCK_BGP_ATTR_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["source"])
+            .with_network(&network_name)
+            .with_container_name(format!("mock-bgp-attr-peer-source-{test_id}"))
+            .start()
+            .await
+            .expect("start mock BGP attr peer container (source)");
+        let source_id = source.id().to_owned();
+        let source_addr = container_network_ip(&source_id, &network_name);
+
+        // ── observer mock (decodes pathvectord's re-advertised UPDATE) ────
+        let observer = GenericImage::new(MOCK_BGP_ATTR_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["observer"])
+            .with_network(&network_name)
+            .with_container_name(format!("mock-bgp-attr-peer-observer-{test_id}"))
+            .start()
+            .await
+            .expect("start mock BGP attr peer container (observer)");
+        let observer_id = observer.id().to_owned();
+        let observer_addr = container_network_ip(&observer_id, &network_name);
+
+        // ── pathvectord ──────────────────────────────────────────────────
+        let daemon_config = write_daemon_config_unknown_transitive_attr(
+            source_addr,
+            SOURCE_AS,
+            observer_addr,
+            OBSERVER_AS,
+        );
+        let daemon_config_path = daemon_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-unknown-transitive-attr-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                daemon_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for UnknownTransitiveAttrHarness");
+
+        wait_for_established(&mut client, source_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with the source peer did not reach Established within 30 s");
+        wait_for_established(&mut client, observer_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with the observer peer did not reach Established within 30 s");
+
+        Self {
+            _source: source,
+            _observer: observer,
+            _pathvectord: pathvectord,
+            _daemon_config: daemon_config,
+            client,
             observer_id,
             _network: network,
         }

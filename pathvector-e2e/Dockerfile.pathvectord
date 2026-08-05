@@ -68,11 +68,13 @@ COPY proto/               proto/
 RUN if [ "$CARGO_PROFILE" = "release" ]; then \
         cargo build --release -p pathvectord -p pathvector-e2e \
             --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer \
-            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer --bin mock_bgp_gr_peer; \
+            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer --bin mock_bgp_gr_peer \
+            --bin mock_bgp_attr_peer; \
     else \
         cargo build -p pathvectord -p pathvector-e2e \
             --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer \
-            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer --bin mock_bgp_gr_peer; \
+            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer --bin mock_bgp_gr_peer \
+            --bin mock_bgp_attr_peer; \
     fi
 
 # ── mock-rtr runtime ───────────────────────────────────────────────────────────
@@ -207,6 +209,38 @@ HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
     CMD nc -z 127.0.0.1 179 || exit 1
 
 ENTRYPOINT ["mock_bgp_gr_peer"]
+
+# ── mock-bgp-attr-peer runtime ───────────────────────────────────────────────────
+#
+# Unrecognized-transitive-attribute relay pair for the pathvector-e2e RFC
+# 4271 §5 test: proves the complete decode → daemon storage → RIB →
+# outbound-reconstruction → encode pipeline, not just any one layer. Plays
+# either the "source" role (injects an UPDATE carrying an unrecognized
+# transitive attribute and an unrecognized non-transitive negative control)
+# or the "observer" role (decodes pathvectord's re-advertised UPDATE and
+# logs a SCENARIO_OUTCOME line), per the role CLI argument (see
+# src/bin/mock_bgp_attr_peer.rs). The role is passed at container-start time
+# via `.with_cmd([role])`, mirroring mock-bgp-gr-peer.
+
+FROM debian:bookworm-slim AS mock-bgp-attr-peer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_attr_peer /usr/local/bin/mock_bgp_attr_peer
+
+# 179 — BGP, container-to-container only, never mapped to host.
+EXPOSE 179
+
+# The healthcheck only confirms the listener is bound — it passes regardless
+# of which role the container is running, since both roles bind :179
+# immediately at startup before any role-specific logic runs.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 179 || exit 1
+
+ENTRYPOINT ["mock_bgp_attr_peer"]
 
 # ── mock-bgp-collision-peer runtime ─────────────────────────────────────────────
 #
