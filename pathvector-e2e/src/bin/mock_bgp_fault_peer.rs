@@ -108,6 +108,20 @@
 //!   session stays Established throughout. Tests policy-violating-but-
 //!   well-formed input, not corrupted wire format — same shape as
 //!   `ebgp-local-pref`.
+//! - `unrecognized-well-known-attribute` — a real OPEN/KEEPALIVE handshake to
+//!   Established, then a single UPDATE carrying the mandatory well-known
+//!   attributes plus one extra `PathAttribute::Unknown` with the Optional
+//!   bit clear (RFC 4271 §6.3: "Unrecognized Well-known Attribute" — a
+//!   sender claiming an unrecognized attribute type is well-known, not
+//!   optional). Unlike the confederation/LOCAL_PREF scenarios above, this
+//!   is a session-reset case (RFC 4271 §6.3's original, unamended
+//!   procedure — RFC 7606 does not touch this specific error), so this
+//!   scenario doubles as this project's first Docker/testcontainers-level
+//!   proof of it (`pathvector-session`'s own coverage is a real-TCP
+//!   loopback test within a single process, not a separate container).
+//!   Run via [`FaultInjectionHarness::new`], which always pairs the fault
+//!   peer with a well-behaved GoBGP control peer — this scenario's test
+//!   also asserts that control peer's session is unaffected.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -173,6 +187,9 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
             rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream).await;
         }
         "confederation-id-loop" => confederation_id_loop_update(stream).await,
+        "unrecognized-well-known-attribute" => {
+            unrecognized_well_known_attribute_update(stream).await;
+        }
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -1569,6 +1586,135 @@ async fn confederation_id_loop_update(stream: TcpStream) {
             n = stream.read(&mut buf) => {
                 if matches!(n, Ok(0) | Err(_)) {
                     return;
+                }
+            }
+        }
+    }
+}
+
+/// RFC 4271 §6.3 "Unrecognized Well-known Attribute": an unrecognized
+/// attribute type with the Optional bit clear (the sender is claiming it is
+/// well-known) must reset the session with NOTIFICATION(UPDATE Error,
+/// subcode 2), Data = the unrecognized attribute (type, length, value) — not
+/// silently accepted as `PathAttribute::Unknown` the way an unrecognized
+/// *optional* attribute would be.
+#[allow(clippy::too_many_lines)]
+async fn unrecognized_well_known_attribute_update(stream: TcpStream) {
+    /// Optional bit clear, Transitive bit set — "well-known" per RFC 4271
+    /// §4.3's flag semantics. Matches the flags used by
+    /// `pathvector-session`'s own
+    /// `test_unrecognized_well_known_attribute_is_session_reset`.
+    const FLAG_TRANSITIVE_ONLY: u8 = 0x40;
+    const UNRECOGNIZED_TYPE_CODE: u8 = 210;
+    const UNRECOGNIZED_VALUE: [u8; 3] = [1, 2, 3];
+
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Give the e2e test a real window to observe this session as
+    // Established (via gRPC) before the fault below resets it — same
+    // reasoning as `duplicate_mp_reach_update`'s identical sleep.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let update = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+            PathAttribute::Unknown {
+                flags: FLAG_TRANSITIVE_ONLY,
+                type_code: UNRECOGNIZED_TYPE_CODE,
+                value: UNRECOGNIZED_VALUE.to_vec(),
+            },
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(update)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE with unrecognized well-known attribute (type {UNRECOGNIZED_TYPE_CODE}, \
+         Optional bit clear)"
+    );
+
+    // Same 1s-keepalive reasoning as `duplicate_mp_reach_update`: a broken
+    // fix that leaves the session alive must show up as "no NOTIFICATION
+    // arrives," not an unrelated hold-timer expiry.
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if framed.send(BgpMessage::Keepalive).await.is_err() {
+                    return;
+                }
+                ticks += 1;
+                if ticks > 60 {
+                    return;
+                }
+            }
+            msg = framed.next() => {
+                match msg {
+                    Some(Ok(BgpMessage::Notification(n))) => {
+                        println!("received NOTIFICATION: {n:?}");
+                        let correct_error = matches!(
+                            n.error,
+                            NotificationError::UpdateMessage(
+                                UpdateMsgError::UnrecognizedWellKnownAttribute
+                            )
+                        );
+                        let expected_data = {
+                            // `UNRECOGNIZED_VALUE`'s length is fixed at compile time
+                            // ([u8; 3]), so the length byte is a literal, not a cast.
+                            let mut d = vec![UNRECOGNIZED_TYPE_CODE, 3u8];
+                            d.extend_from_slice(&UNRECOGNIZED_VALUE);
+                            d
+                        };
+                        let correct_data = n.data == expected_data;
+                        if correct_error && correct_data {
+                            println!(
+                                "SCENARIO_OUTCOME: unrecognized_well_known_attribute_notification_received"
+                            );
+                        } else {
+                            println!(
+                                "SCENARIO_OUTCOME: unexpected_notification_received \
+                                 (correct_error={correct_error}, correct_data={correct_data})"
+                            );
+                        }
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return,
                 }
             }
         }

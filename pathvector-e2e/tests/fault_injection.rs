@@ -453,6 +453,62 @@ async fn duplicate_mp_reach_nlri_resets_session() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 4271 §6.3 "Unrecognized Well-known Attribute": an unrecognized
+/// attribute type with the Optional bit clear must reset the session with
+/// NOTIFICATION(UPDATE Error, subcode 2), Data = the unrecognized attribute
+/// (type, length, value). `pathvector-session`'s own coverage
+/// (`test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`)
+/// is a real-TCP loopback test within a single process; this is the first
+/// Docker/testcontainers-level proof of the same behavior, over the real
+/// wire codec end to end, alongside a well-behaved control peer that must
+/// stay unaffected (PR #48 gap, Codex follow-up review — lowest priority of
+/// the round-2 follow-ups, but still real coverage this project lacked).
+#[tokio::test]
+async fn unrecognized_well_known_attribute_resets_session() {
+    let mut h = FaultInjectionHarness::new("unrecognized-well-known-attribute").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: unrecognized_well_known_attribute_notification_received",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect(
+        "RFC 4271 §6.3: pathvectord must send a NOTIFICATION(UPDATE Error, \
+         UnrecognizedWellKnownAttribute) whose Data field is exactly the unrecognized \
+         attribute's (type, length, value)",
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = h
+            .client
+            .get_peer(IpAddr::from(fault_peer))
+            .await
+            .expect("get_peer(fault_peer) gRPC call succeeded");
+        if state.session_state != SessionState::Established {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "RFC 4271 §6.3: session with an unrecognized well-known attribute must leave \
+             Established within 15 s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Throughline: the fault must not have wedged the daemon or affected
+    // unrelated sessions — this is the "unaffected control peer" half of
+    // the Codex follow-up review's requested coverage.
+    assert_control_peer_established(&mut h).await;
+}
+
 /// RFC 5065 §5 condition 1: "It is an error for a BGP speaker to receive an
 /// UPDATE message with an AS_PATH attribute that contains AS_CONFED_SEQUENCE
 /// or AS_CONFED_SET segments from a neighbor that is not located in the same
