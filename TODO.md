@@ -898,6 +898,22 @@ areas the existing test suite never covered:
   as expected; both reverted and reconfirmed passing.
   IPv4/IPv6 independent release was flagged by Codex as optional follow-up
   coverage, not a blocker, and remains open.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review of the
+  above gap closure): a single-source harness can't distinguish "the
+  wait-set correctly requires every configured GR peer" from "it
+  incorrectly releases on any one peer's EOR" — both look identical with
+  only one GR peer configured. Added `eor-immediately` scenario to
+  `mock_bgp_gr_peer.rs` and `TwoSourceSelectionDeferralHarness`
+  (`pathvector-e2e/src/lib.rs`); new test
+  `fast_eor_from_one_source_does_not_release_wait_set_for_the_other`
+  (`pathvector-e2e/tests/selection_deferral.rs`) runs two independent GR
+  peers — one sends EOR immediately, the other withholds it forever —
+  and asserts the fast peer's EOR isn't mistaken for satisfying the slow
+  peer's; only the Selection_Deferral_Timer itself eventually releases the
+  route to the observer. Real-teeth verified: patched `recompute` so any
+  single peer's EOR released the whole wait-set, confirmed the new test
+  failed with the exact diagnostic, reverted (clean no-op diff) and
+  reconfirmed passing.
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world

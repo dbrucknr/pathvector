@@ -4,6 +4,37 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (round 2: additional e2e coverage gaps, Codex follow-up review)
+
+### [pathvector-e2e] Selection Deferral wait-set must cover the full configured peer set, not just one peer's EOR
+
+A follow-up Codex review of the PR #50 gap closure (below) pointed out that
+the single-source `SelectionDeferralHarness` cannot distinguish "the
+wait-set correctly waits on every configured GR peer" from "the wait-set
+incorrectly releases as soon as any one peer sends EOR" — both produce
+identical observable behavior with only one GR peer configured. The
+underlying `daemon/deferral.rs::recompute` algorithm already iterates the
+full configured peer set correctly (a first design draft that only checked
+established peers was caught during planning review — see that module's
+doc comment), but nothing had proven this at the real-session level.
+
+Added an `eor-immediately` scenario to `mock_bgp_gr_peer.rs` (sends its EOR
+the instant the handshake completes, no route announced) and a
+`TwoSourceSelectionDeferralHarness` (`pathvector-e2e/src/lib.rs`) running
+two independent GR-capable mock peers plus a plain GoBGP observer. New test
+`fast_eor_from_one_source_does_not_release_wait_set_for_the_other`
+(`pathvector-e2e/tests/selection_deferral.rs`): one source sends its EOR
+immediately, the other (`withhold-eor`) never does; asserts the observer
+does not receive the route right after the fast EOR, and only receives it
+once the Selection_Deferral_Timer itself expires.
+
+Real-teeth verified: temporarily patched `SelectionDeferral::recompute` so
+that any single peer's EOR release the whole wait-set (ignoring the rest of
+the configured peer set), confirmed the new test failed with the exact
+diagnostic (route present at the observer immediately after the fast EOR,
+well before the timer deadline), reverted (`git diff --stat` confirmed a
+clean no-op diff) and reran green.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate
