@@ -80,6 +80,35 @@ code) plus one new explicit empty-AS_PATH regression test.
 See `pathvector-session/RFC.md` and `pathvectord/RFC.md`'s RFC 5065
 sections for the full corrected requirement tables.
 
+### [pathvectord] Follow-up review pass: RFC 5065 §5 treat-as-withdraw was a silent no-op on UPDATEs with no reachable NLRI
+
+A second review pass on the fixes above found one remaining gap in the
+treat-as-withdraw fix (finding #2): when an UPDATE carrying a malformed
+AS_PATH (RFC 5065 §5) has no announced NLRI at all — no traditional NLRI,
+no MP_REACH_NLRI — draining the (empty) announced-NLRI list into
+withdrawals does nothing, and no NOTIFICATION was sent either, so the
+malformed condition was silently ignored. RFC 7606 §5.2: "if an UPDATE
+message is encountered that does contain path attributes other than
+MP_UNREACH_NLRI and doesn't encode any reachable NLRI... if any path
+attribute errors are encountered in such an UPDATE message and if any
+encountered error specifies an error-handling approach other than
+'attribute discard', then the 'session reset' approach MUST be used."
+Treat-as-withdraw is "other than attribute discard," so this exact case
+requires session reset, not a silent no-op.
+
+Fixed by branching the RFC 5065 §5 checks on the already-existing
+`has_reachable_nlri_on_wire` variable: treat-as-withdraw when there's
+reachable NLRI to drain, `MalformedAsPath` NOTIFICATION/session-reset
+otherwise. Real-teeth verified (forced the old `if true` no-op branch,
+confirmed all three new regression tests failed with `got None`, restored
+and reran green). Added regression tests for both RFC 5065 §5 conditions
+with no reachable NLRI, including the empty-`ConfedMember`-path case.
+
+Full workspace re-verified after this fix: `cargo build --workspace`,
+`cargo clippy -p pathvectord --all-targets -- -D warnings`, `cargo fmt
+--all -- --check`, `cargo nextest run --workspace --exclude
+pathvector-e2e` — 1967/1967 passing.
+
 ---
 
 ## 2026-08-04 (RFC 5065: full BGP Confederation Member-AS support)

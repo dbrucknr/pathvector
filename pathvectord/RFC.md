@@ -525,6 +525,7 @@ initiative (`TODO.md` task #128) rather than folded into the smaller RFC
 | RFC 5065 §5 condition 1: confed segment from an `External` peer is malformed — treat-as-withdraw | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_is_treat_as_withdraw` |
 | RFC 5065 §5 condition 2: an AS_PATH from a `ConfedMember` peer whose first segment is not `AS_CONFED_SEQUENCE` is malformed — treat-as-withdraw. Covers empty AS_PATH too (no exemption: an empty path has no first segment, so it cannot be `AS_CONFED_SEQUENCE`) | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_member_peer_missing_confed_sequence_is_treat_as_withdraw`, `test_malformed_as_path_empty_from_confed_member_peer_is_treat_as_withdraw`, `test_malformed_as_path_confed_member_peer_with_confed_sequence_first_is_accepted` (negative case) |
 | Both §5 conditions are treat-as-withdraw, not session-reset (RFC 7606 §3(e)) | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_conditions_are_treat_as_withdraw_not_session_reset` |
+| Exception: when the UPDATE has no reachable NLRI at all, treat-as-withdraw would be a no-op — RFC 7606 §5.2 requires session reset instead in that case | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_no_nlri_resets_session`, `test_malformed_as_path_confed_member_peer_missing_confed_sequence_no_nlri_resets_session`, `test_malformed_as_path_empty_from_confed_member_peer_no_nlri_resets_session` |
 | gRPC `proto_peer_type()` includes `ConfedMember` (compiler-forced exhaustive match) | `src/grpc.rs` | ✅ | (compile-time guarantee) |
 
 **Treat-as-withdraw, not session-reset, for RFC 5065 §5 (corrected
@@ -544,12 +545,24 @@ originating RFC 4271 document), the amendment applies via the reference,
 regardless of whether RFC 5065 itself appears in the formal "Updates:"
 list — that list names documents whose own text RFC 7606 edits, not every
 document that cites RFC 4271 §6.3. The one exception, RFC 7606 §3(j)/§5.2
-(session reset when NLRI wasn't successfully parsed), is preserved by
-gating the RFC 5065 §5 checks on `notification.is_none()`, so an
-already-decided §5.2 session-reset still wins. BIRD's real source (fetched
+(session reset when NLRI wasn't successfully parsed), is preserved two
+ways: gating the RFC 5065 §5 checks on `notification.is_none()` so an
+already-decided §5.2 session-reset (from the earlier missing-mandatory-
+attribute block) wins, **and** — found in a follow-up review pass
+2026-08-05 — branching *within* the RFC 5065 §5 checks themselves on
+`has_reachable_nlri_on_wire`. Treat-as-withdraw only has meaning when
+there is announced NLRI to drain; on an UPDATE with a malformed AS_PATH
+but zero reachable NLRI, draining an empty list is a silent no-op, which
+is exactly the case RFC 7606 §5.2 forbids ("if any path attribute errors
+are encountered in such an UPDATE message and if any encountered error
+specifies an error-handling approach other than 'attribute discard', then
+the 'session reset' approach MUST be used") — so that branch sends a
+`MalformedAsPath` NOTIFICATION instead. BIRD's real source (fetched
 directly) implements both conditions as withdraw-only, which — now
 correctly derived from RFC text rather than from the formal Updates-list
-heuristic alone — matches this project's implementation too.
+heuristic alone — matches this project's implementation too (for the
+has-reachable-NLRI case; BIRD's handling of the no-NLRI edge case was not
+separately verified).
 
 **Critical finding caught during planning, not implementation (see
 `pathvector-session/RFC.md`'s RFC 5065 section for the fix):** `PeerType`

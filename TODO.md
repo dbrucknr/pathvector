@@ -1802,8 +1802,12 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   absence from RFC 7606's formal "Updates:" list doesn't exempt it); an
   empty AS_PATH from a `ConfedMember` peer was wrongly exempted from the
   §5 condition-2 check; AS4_PATH could leak AS_CONFED_SEQUENCE/
-  AS_CONFED_SET segments (RFC 6793 §§3, 4.2.2 forbid this). See
-  `CHANGELOG.md`'s 2026-08-05 entry.
+  AS_CONFED_SET segments (RFC 6793 §§3, 4.2.2 forbid this). A follow-up
+  review pass the same day found the treat-as-withdraw fix silently
+  no-op'd (no NOTIFICATION, nothing to drain) on an UPDATE with a
+  malformed AS_PATH and no reachable NLRI at all — RFC 7606 §5.2 requires
+  session reset in exactly that case; fixed by branching on
+  `has_reachable_nlri_on_wire`. See `CHANGELOG.md`'s 2026-08-05 entries.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
