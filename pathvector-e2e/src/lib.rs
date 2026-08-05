@@ -5381,6 +5381,47 @@ pub async fn wait_for_frr_rib_entry(
     }
 }
 
+/// Polls `vtysh -c "show bgp ipv4 unicast <prefix>"` until `prefix` is
+/// absent (withdrawn) — FRR renders an absent prefix as `% Network not in
+/// table` (or similar "not found" phrasing) rather than an empty success
+/// output, so this checks for that phrasing rather than the raw prefix
+/// string being absent (which could also be true on a transient CLI error).
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `timeout` expires before the prefix is
+/// withdrawn.
+pub async fn wait_for_frr_rib_withdrawn(
+    container_id: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for prefix {prefix} to be withdrawn from FRR RIB"
+            ));
+        }
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "vtysh",
+                "-c",
+                &format!("show bgp ipv4 unicast {prefix}"),
+            ])
+            .output();
+        if let Ok(o) = output {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if !o.status.success() || stdout.contains("not found") || !stdout.contains(prefix) {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Polls `vtysh -c "show bgp neighbors <peer_ip> json"` until
 /// `gracefulRestartInfo.rBit` matches `expected`.
 ///
@@ -6252,6 +6293,32 @@ impl ConfederationHarness {
             external_ip,
             _network: network,
         }
+    }
+
+    /// Withdraws [`CONFEDERATION_EXTERNAL_ROUTE`] from the external GoBGP
+    /// peer — used by the withdrawal-relay test to prove a withdrawal
+    /// crosses the confederation boundary the same way the original
+    /// announcement did, not just that announcements do.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn external_withdraw(&self) {
+        let status = Command::new("docker")
+            .args(["exec", &self.external_id])
+            .args([
+                "gobgp",
+                "global",
+                "rib",
+                "del",
+                CONFEDERATION_EXTERNAL_ROUTE,
+            ])
+            .status()
+            .expect("docker exec gobgp external withdraw");
+        assert!(
+            status.success(),
+            "gobgp external withdraw {CONFEDERATION_EXTERNAL_ROUTE} failed: {status}"
+        );
     }
 }
 

@@ -18,7 +18,7 @@ use pathvector_e2e::{
     CONFEDERATION_EXTERNAL_AS, CONFEDERATION_EXTERNAL_ROUTE, CONFEDERATION_FRR_MEMBER_AS,
     CONFEDERATION_FRR_ROUTE, CONFEDERATION_ID, CONFEDERATION_PATHVECTORD_MEMBER_AS,
     ConfederationHarness, frr_show_route_text, gobgp_rib_text, wait_for_frr_rib_entry,
-    wait_for_gobgp_rib_entry,
+    wait_for_frr_rib_withdrawn, wait_for_gobgp_rib_entry,
 };
 
 /// Both BGP sessions must reach `Established`.
@@ -129,5 +129,39 @@ async fn route_from_external_relayed_to_confed_member_prepends_confed_sequence()
         "FRR (a fellow Member-AS) must see pathvectord's private Member-AS Number, not \
          the public confederation identifier {CONFEDERATION_ID} — that substitution is \
          only for genuinely external peers; got:\n{route}"
+    );
+}
+
+/// RFC 5065 §4.1(b)/(c) cover announcements; this proves a withdrawal
+/// crosses the confederation boundary the same way. The genuinely external
+/// GoBGP peer withdraws [`CONFEDERATION_EXTERNAL_ROUTE`] after it has
+/// already been relayed to FRR — the route must disappear from FRR's own
+/// RIB, not just stop being re-advertised (a route stuck in FRR's RIB after
+/// its source withdrew it would be a stale/leaked route, exactly the
+/// failure mode withdrawal propagation exists to prevent).
+#[tokio::test]
+async fn withdrawal_from_external_peer_propagates_to_confed_member() {
+    let h = ConfederationHarness::new().await;
+
+    wait_for_frr_rib_entry(
+        &h.frr_id,
+        CONFEDERATION_EXTERNAL_ROUTE,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("external peer's originated route did not reach FRR within 20 s");
+
+    h.external_withdraw();
+
+    wait_for_frr_rib_withdrawn(
+        &h.frr_id,
+        CONFEDERATION_EXTERNAL_ROUTE,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect(
+        "RFC 5065 §4.1(b): a withdrawal from the genuinely external peer must propagate \
+         across the confederation boundary and remove the route from FRR's (the fellow \
+         Member-AS) own RIB, not just stop future re-advertisement",
     );
 }
