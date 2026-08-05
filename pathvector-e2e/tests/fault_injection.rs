@@ -453,6 +453,91 @@ async fn duplicate_mp_reach_nlri_resets_session() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 5065 §5 condition 1: "It is an error for a BGP speaker to receive an
+/// UPDATE message with an AS_PATH attribute that contains AS_CONFED_SEQUENCE
+/// or AS_CONFED_SET segments from a neighbor that is not located in the same
+/// confederation." The fault peer is configured as a plain `External` peer
+/// (no `confederation_member`), so its AS_CONFED_SEQUENCE segment is
+/// malformed. Since the UPDATE carries reachable NLRI, RFC 7606 §3(e)
+/// reclassifies this as treat-as-withdraw — over a real BGP session with the
+/// real wire codec on both ends, not just the hand-built `UpdateMessage`
+/// structs `pathvectord`'s own unit tests use.
+#[tokio::test]
+async fn rfc5065_confed_segment_with_nlri_treated_as_withdraw_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("rfc5065-confed-segment-with-nlri").await;
+    assert_control_peer_established(&mut h).await;
+
+    // The first, clean UPDATE must land.
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    // The second UPDATE (AS_CONFED_SEQUENCE from an External peer) must be
+    // treated as a withdraw per RFC 5065 §5 / RFC 7606 §3(e) — the route
+    // disappears, but the session and the rest of the daemon stay healthy.
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect(
+            "10.99.0.0/24 was not withdrawn within 15 s after the AS_CONFED_SEQUENCE UPDATE",
+        );
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 5065 §5 / RFC 7606 §3(e): the fault peer's own session must stay \
+         Established, not be reset with a NOTIFICATION"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 5065 §5 condition 1 again, but sent as the *only* UPDATE with no
+/// reachable NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op
+/// with nothing to withdraw, so this must instead reset the session with a
+/// `MalformedAsPath` NOTIFICATION — the one RFC 5065 §5 case (alongside the
+/// with-NLRI case above) that isn't treat-as-withdraw. Mirrors
+/// `duplicate_mp_reach_nlri_resets_session`'s polling shape.
+#[tokio::test]
+async fn rfc5065_confed_segment_no_nlri_resets_session() {
+    let mut h = FaultInjectionHarness::new("rfc5065-confed-segment-no-nlri").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    // Anchor on the fault peer actually reaching Established first — see
+    // `duplicate_mp_reach_nlri_resets_session`'s comment on why this matters.
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = h
+            .client
+            .get_peer(IpAddr::from(fault_peer))
+            .await
+            .expect("get_peer(fault_peer) gRPC call succeeded");
+        if state.session_state != SessionState::Established {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "RFC 7606 §5.2: session with a malformed AS_PATH and no reachable NLRI \
+             must leave Established within 15 s, not stay up like the with-NLRI case"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Throughline: the fault must not have wedged the daemon or affected
+    // unrelated sessions.
+    assert_control_peer_established(&mut h).await;
+}
+
 /// A mid-session TCP reset (simulated via a hard Docker-network disconnect,
 /// already exercised by the GR test suite) must be followed by a clean
 /// re-establishment once connectivity returns — reuses the existing
