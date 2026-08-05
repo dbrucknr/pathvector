@@ -857,6 +857,94 @@ export_default = "accept"
     f
 }
 
+/// Same as [`write_daemon_config_fault_injection`], but pathvectord has a
+/// confederation identifier configured and the fault peer is marked
+/// `confederation_member = true` — used by RFC 5065 §5 condition 2
+/// scenarios, which require pathvectord to actually classify the fault peer
+/// as `PeerType::ConfedMember`, not plain `External`.
+fn write_daemon_config_fault_injection_confed_member(
+    control_ip: Ipv4Addr,
+    fault_peer_addr: Ipv4Addr,
+) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord confed-member config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as         = 65002
+bgp_id           = "10.0.0.2"
+hold_time        = 9
+grpc_port        = {PATHVECTORD_GRPC_PORT}
+confederation_id = {CONFEDERATION_ID}
+
+[[peers]]
+address        = "{control_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = 65001
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address              = "{fault_peer_addr}"
+port                 = {GOBGPD_BGP_PORT}
+remote_as            = 65098
+confederation_member = true
+import_default       = "accept"
+export_default       = "accept"
+"#
+    )
+    .expect("write pathvectord confed-member config");
+    f
+}
+
+/// Same as [`write_gobgp_config`], but the peer group expects the far-end
+/// speaker to present [`CONFEDERATION_ID`] — the confederation's public AS —
+/// not `65002`, as its own AS. Required for a control peer paired with
+/// [`write_daemon_config_fault_injection_confed_member`]: once pathvectord
+/// has a `confederation_id` configured, it presents that value (not its
+/// private Member-AS number) toward any peer it classifies as `External`,
+/// per RFC 5065 §4.1(c).
+fn write_gobgp_config_confed_control() -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp gobgp confed-control config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "pathvector-peers"
+    peer-as         = {CONFEDERATION_ID}
+  [peer-groups.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+  [peer-groups.transport.config]
+    passive-mode = true
+
+  [peer-groups.graceful-restart.config]
+    enabled      = true
+    restart-time = 120
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+
+  [[peer-groups.afi-safis]]
+    [peer-groups.afi-safis.config]
+      afi-safi-name = "ipv6-unicast"
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix     = "0.0.0.0/0"
+    peer-group = "pathvector-peers"
+"#
+    )
+    .expect("write gobgp confed-control config");
+    f
+}
+
 /// Writes a pathvectord config with `local_ipv6` set for eBGP IPv6 next-hop
 /// rewrite.  All other settings are identical to [`write_daemon_config`].
 fn write_daemon_config_v6(peers: &[(Ipv4Addr, u32)]) -> NamedTempFile {
@@ -2330,6 +2418,46 @@ impl FaultInjectionHarness {
     /// Panics if any container fails to start, or the control peer's session
     /// doesn't reach `Established` within 30s.
     pub async fn new(scenario: &str) -> Self {
+        Self::new_inner(
+            scenario,
+            write_daemon_config_fault_injection,
+            write_gobgp_config,
+        )
+        .await
+    }
+
+    /// Same as [`Self::new`], but pathvectord is configured with a
+    /// confederation identifier and the fault peer is marked
+    /// `confederation_member = true` — i.e. classified as `PeerType::ConfedMember`
+    /// rather than plain `External`. Used by RFC 5065 §5 condition 2
+    /// scenarios (`rfc5065-confed-member-*`), which are only malformed when
+    /// sent by a peer pathvectord actually believes is a fellow Member-AS.
+    ///
+    /// Also swaps in a control-peer GoBGP config that expects pathvectord to
+    /// present the confederation identifier as its own AS (RFC 5065 §4.1(c):
+    /// a genuine external peer sees the confederation identifier, not
+    /// pathvectord's private Member-AS number) — [`write_gobgp_config`]'s
+    /// plain `peer-as = 65002` would otherwise reject pathvectord's OPEN
+    /// with a Bad Peer AS NOTIFICATION.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or the control peer's session
+    /// doesn't reach `Established` within 30s.
+    pub async fn new_confed_member(scenario: &str) -> Self {
+        Self::new_inner(
+            scenario,
+            write_daemon_config_fault_injection_confed_member,
+            write_gobgp_config_confed_control,
+        )
+        .await
+    }
+
+    async fn new_inner(
+        scenario: &str,
+        make_cfg: fn(Ipv4Addr, Ipv4Addr) -> NamedTempFile,
+        make_gobgp_cfg: fn() -> NamedTempFile,
+    ) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
 
@@ -2337,7 +2465,7 @@ impl FaultInjectionHarness {
         let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
         let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
 
-        let gobgpd_config = write_gobgp_config();
+        let gobgpd_config = make_gobgp_cfg();
         let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
 
         let control_peer = GenericImage::new(GOBGPD_IMAGE, "latest")
@@ -2365,8 +2493,7 @@ impl FaultInjectionHarness {
         let fault_peer_id = fault_peer.id().to_owned();
         let fault_peer_addr = container_network_ip(&fault_peer_id, &network_name);
 
-        let pathvectord_config =
-            write_daemon_config_fault_injection(control_peer_addr, fault_peer_addr);
+        let pathvectord_config = make_cfg(control_peer_addr, fault_peer_addr);
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")

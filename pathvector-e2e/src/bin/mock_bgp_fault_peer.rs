@@ -81,6 +81,21 @@
 //!   sent as the *only* UPDATE, with no announced NLRI at all. RFC 7606
 //!   §5.2: treat-as-withdraw would be a no-op here, so this must instead
 //!   reset the session with a `MalformedAsPath` NOTIFICATION.
+//! - `rfc5065-confed-member-wrong-first-segment-with-nlri` — RFC 5065 §5
+//!   condition 2: "a UPDATE... received... with an AS_PATH attribute that
+//!   does not start with an AS_CONFED_SEQUENCE... from a neighbor that is
+//!   located in the same confederation." This fault peer is configured on
+//!   pathvectord's side as `confederation_member = true` (see
+//!   [`FaultInjectionHarness::new_confed_member`]), so a first UPDATE with a
+//!   correct leading `AS_CONFED_SEQUENCE` is accepted normally, then a
+//!   second UPDATE for the same prefix whose AS_PATH's first segment is an
+//!   ordinary `AS_SEQUENCE` instead is malformed — treat-as-withdraw per RFC
+//!   7606 §3(e) since the UPDATE has reachable NLRI.
+//! - `rfc5065-confed-member-wrong-first-segment-no-nlri` — same malformed
+//!   AS_PATH as above, but sent as the *only* UPDATE, with no announced
+//!   NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op here, so
+//!   this must instead reset the session with a `MalformedAsPath`
+//!   NOTIFICATION.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -139,6 +154,12 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "role-differing-duplicates" => role_differing_duplicates_open(stream).await,
         "rfc5065-confed-segment-with-nlri" => rfc5065_confed_segment_with_nlri_update(stream).await,
         "rfc5065-confed-segment-no-nlri" => rfc5065_confed_segment_no_nlri_update(stream).await,
+        "rfc5065-confed-member-wrong-first-segment-with-nlri" => {
+            rfc5065_confed_member_wrong_first_segment_with_nlri_update(stream).await;
+        }
+        "rfc5065-confed-member-wrong-first-segment-no-nlri" => {
+            rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream).await;
+        }
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -1215,6 +1236,202 @@ async fn rfc5065_confed_segment_no_nlri_update(stream: TcpStream) {
         return;
     }
     println!("sent UPDATE with AS_CONFED_SEQUENCE and no reachable NLRI");
+
+    // Keep sending our own KEEPALIVEs (same 1s cadence and reasoning as
+    // `duplicate_mp_reach_update`) so a broken fix that leaves the session
+    // alive shows up as "no NOTIFICATION arrives" rather than an unrelated
+    // hold-timer expiry.
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if framed.send(BgpMessage::Keepalive).await.is_err() {
+                    return;
+                }
+                ticks += 1;
+                if ticks > 60 {
+                    return;
+                }
+            }
+            msg = framed.next() => {
+                match msg {
+                    Some(Ok(BgpMessage::Notification(n))) => {
+                        println!("received NOTIFICATION as expected: {n:?}");
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return,
+                }
+            }
+        }
+    }
+}
+
+/// RFC 5065 §5 condition 2: a peer pathvectord is configured to treat as a
+/// fellow confederation Member-AS (`confederation_member = true`) must lead
+/// its AS_PATH with an `AS_CONFED_SEQUENCE` segment. A first, well-formed
+/// UPDATE establishes this baseline (leading `AS_CONFED_SEQUENCE`, accepted
+/// normally), then a second UPDATE for the same prefix swaps in an ordinary
+/// `AS_SEQUENCE` as the first segment instead — malformed per condition 2.
+/// Since the UPDATE carries reachable NLRI, RFC 7606 §3(e) reclassifies
+/// this as treat-as-withdraw — the session must stay Established.
+async fn rfc5065_confed_member_wrong_first_segment_with_nlri_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Well-formed per condition 2: leading AS_CONFED_SEQUENCE, from a peer
+    // configured as confederation_member = true.
+    let clean = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_segments(vec![AsPathSegment::ConfedSequence(
+                vec![Asn::new(u32::from(FAULT_PEER_AS))],
+            )])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(clean)).await.is_err() {
+        return;
+    }
+    println!("sent clean UPDATE (leading AS_CONFED_SEQUENCE) for {TEST_PREFIX}");
+
+    // Give the test a real window to observe the clean route present in
+    // Loc-RIB before it gets withdrawn below.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // RFC 5065 §5 condition 2: an ordinary AS_SEQUENCE as the first segment
+    // from a confed-member peer is malformed. Well-formed as a wire message
+    // — the fault is purely relational (this peer IS configured as a fellow
+    // Member-AS on pathvectord's side, unlike the condition-1 scenarios).
+    let malformed = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_segments(vec![AsPathSegment::Sequence(vec![
+                Asn::new(u32::from(FAULT_PEER_AS)),
+            ])])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(malformed)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE with AS_SEQUENCE-first AS_PATH from a confed-member peer for {TEST_PREFIX}"
+    );
+
+    // Hold the session open so the test can observe the withdrawal without
+    // racing a session teardown — and to prove the session itself survives
+    // (RFC 7606 §3(e) treat-as-withdraw, not a NOTIFICATION/session reset).
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// RFC 5065 §5 condition 2 again, but sent as the *only* UPDATE with no
+/// announced NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op
+/// with no NLRI to withdraw, so this must instead reset the session with a
+/// `MalformedAsPath` NOTIFICATION.
+async fn rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Give the test a real window to observe Established before the fault
+    // below resets it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let malformed_no_nlri = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_segments(vec![AsPathSegment::Sequence(vec![
+                Asn::new(u32::from(FAULT_PEER_AS)),
+            ])])),
+        ],
+        announced: vec![],
+    };
+    if framed
+        .send(BgpMessage::Update(malformed_no_nlri))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    println!(
+        "sent UPDATE with AS_SEQUENCE-first AS_PATH (confed-member peer) and no reachable NLRI"
+    );
 
     // Keep sending our own KEEPALIVEs (same 1s cadence and reasoning as
     // `duplicate_mp_reach_update`) so a broken fix that leaves the session

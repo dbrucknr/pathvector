@@ -536,6 +536,93 @@ async fn rfc5065_confed_segment_no_nlri_resets_session() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 5065 §5 condition 2: "a UPDATE... received... with an AS_PATH
+/// attribute that does not start with an AS_CONFED_SEQUENCE... from a
+/// neighbor that is located in the same confederation." Unlike condition 1
+/// (above), this fault peer IS configured as `confederation_member = true`
+/// (see [`FaultInjectionHarness::new_confed_member`]) — the fault is an
+/// ordinary AS_SEQUENCE-first AS_PATH from a peer pathvectord believes is a
+/// fellow Member-AS. Since the UPDATE carries reachable NLRI, RFC 7606
+/// §3(e) reclassifies this as treat-as-withdraw.
+#[tokio::test]
+async fn rfc5065_confed_member_wrong_first_segment_with_nlri_treated_as_withdraw_session_stays_up()
+{
+    let mut h = FaultInjectionHarness::new_confed_member(
+        "rfc5065-confed-member-wrong-first-segment-with-nlri",
+    )
+    .await;
+    assert_control_peer_established(&mut h).await;
+
+    // The first, clean UPDATE (leading AS_CONFED_SEQUENCE) must land.
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    // The second UPDATE (AS_SEQUENCE-first AS_PATH from a confed-member
+    // peer) must be treated as a withdraw per RFC 5065 §5 condition 2 / RFC
+    // 7606 §3(e) — the route disappears, but the session and the rest of
+    // the daemon stay healthy.
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 was not withdrawn within 15 s after the AS_SEQUENCE-first UPDATE");
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 5065 §5 condition 2 / RFC 7606 §3(e): the fault peer's own session must \
+         stay Established, not be reset with a NOTIFICATION"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 5065 §5 condition 2 again, but sent as the *only* UPDATE with no
+/// reachable NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op
+/// with nothing to withdraw, so this must instead reset the session with a
+/// `MalformedAsPath` NOTIFICATION.
+#[tokio::test]
+async fn rfc5065_confed_member_wrong_first_segment_no_nlri_resets_session() {
+    let mut h = FaultInjectionHarness::new_confed_member(
+        "rfc5065-confed-member-wrong-first-segment-no-nlri",
+    )
+    .await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = h
+            .client
+            .get_peer(IpAddr::from(fault_peer))
+            .await
+            .expect("get_peer(fault_peer) gRPC call succeeded");
+        if state.session_state != SessionState::Established {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "RFC 7606 §5.2: session with a malformed (AS_SEQUENCE-first, confed-member \
+             peer) AS_PATH and no reachable NLRI must leave Established within 15 s, \
+             not stay up like the with-NLRI case"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Throughline: the fault must not have wedged the daemon or affected
+    // unrelated sessions.
+    assert_control_peer_established(&mut h).await;
+}
+
 /// A mid-session TCP reset (simulated via a hard Docker-network disconnect,
 /// already exercised by the GR test suite) must be followed by a clean
 /// re-establishment once connectivity returns — reuses the existing
