@@ -1287,43 +1287,69 @@ pub(super) fn handle_update(
                 Some(pathvector_types::AsPathSegment::ConfedSequence(_))
             );
         if confed_segment_from_external || malformed_from_confed_member {
-            tracing::warn!(
-                peer = %peer,
-                %as_path,
-                confed_segment_from_external,
-                malformed_from_confed_member,
-                "malformed AS_PATH (RFC 5065 §5) — treat-as-withdraw (RFC 7606 §3(e))"
-            );
-            let treat_as_withdraw_v4: Vec<Nlri<Ipv4Addr>> = msg
-                .announced
-                .drain(..)
-                .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
-                .collect();
-            for nlri in treat_as_withdraw_v4 {
-                if adj_rib_in.get(&nlri).is_some_and(|r| {
-                    r.rare_or_default()
-                        .communities
-                        .iter()
-                        .any(|c| c.is_blackhole())
-                }) {
-                    blackhole_withdrawn_v4.push(nlri);
+            if has_reachable_nlri_on_wire {
+                tracing::warn!(
+                    peer = %peer,
+                    %as_path,
+                    confed_segment_from_external,
+                    malformed_from_confed_member,
+                    "malformed AS_PATH (RFC 5065 §5) — treat-as-withdraw (RFC 7606 §3(e))"
+                );
+                let treat_as_withdraw_v4: Vec<Nlri<Ipv4Addr>> = msg
+                    .announced
+                    .drain(..)
+                    .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
+                    .collect();
+                for nlri in treat_as_withdraw_v4 {
+                    if adj_rib_in.get(&nlri).is_some_and(|r| {
+                        r.rare_or_default()
+                            .communities
+                            .iter()
+                            .any(|c| c.is_blackhole())
+                    }) {
+                        blackhole_withdrawn_v4.push(nlri);
+                    }
+                    adj_rib_in.withdraw(&nlri);
+                    fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
                 }
-                adj_rib_in.withdraw(&nlri);
-                fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
-            }
-            let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
-                mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
-            for nlri in treat_as_withdraw_v6 {
-                if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
-                    r.rare_or_default()
-                        .communities
-                        .iter()
-                        .any(|c| c.is_blackhole())
-                }) {
-                    blackhole_withdrawn_v6.push(nlri);
+                let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
+                    mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
+                for nlri in treat_as_withdraw_v6 {
+                    if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
+                        r.rare_or_default()
+                            .communities
+                            .iter()
+                            .any(|c| c.is_blackhole())
+                    }) {
+                        blackhole_withdrawn_v6.push(nlri);
+                    }
+                    adj_rib_in_v6.withdraw(&nlri);
+                    fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
                 }
-                adj_rib_in_v6.withdraw(&nlri);
-                fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+            } else {
+                // RFC 7606 §5.2: this UPDATE carries path attributes (at
+                // least AS_PATH) but no reachable NLRI at all — draining an
+                // empty announced-NLRI list would be a silent no-op, and
+                // "we cannot be confident that the NLRI have been
+                // successfully parsed as Section 3(j) requires. For this
+                // reason, if any path attribute errors are encountered in
+                // such an UPDATE message and if any encountered error
+                // specifies an error-handling approach other than
+                // 'attribute discard', then the 'session reset' approach
+                // MUST be used." Treat-as-withdraw (§3(e)) is "other than
+                // attribute discard", so session reset applies here instead.
+                tracing::warn!(
+                    peer = %peer,
+                    %as_path,
+                    confed_segment_from_external,
+                    malformed_from_confed_member,
+                    "malformed AS_PATH (RFC 5065 §5) on an UPDATE with no reachable NLRI \
+                     (RFC 7606 §5.2) — session reset"
+                );
+                notification = Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    data: vec![],
+                });
             }
         }
     }

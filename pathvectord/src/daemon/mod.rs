@@ -7277,6 +7277,95 @@ mod tests {
         );
     }
 
+    // ── RFC 7606 §5.2: RFC 5065 §5 conditions on an UPDATE with no reachable NLRI ──
+    //
+    // Treat-as-withdraw is meaningless when there is nothing to withdraw —
+    // RFC 7606 §5.2 requires session reset instead whenever an UPDATE
+    // carries path attributes but no reachable NLRI at all, and the
+    // attribute error found calls for something stronger than "attribute
+    // discard" (treat-as-withdraw qualifies).
+
+    #[test]
+    fn test_malformed_as_path_confed_segment_from_external_peer_no_nlri_resets_session() {
+        let n = handle_update_get_notification_for(
+            PeerType::External,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_segments(vec![
+                        pathvector_types::AsPathSegment::ConfedSequence(vec![Asn::new(65100)]),
+                        pathvector_types::AsPathSegment::Sequence(vec![Asn::new(65200)]),
+                    ])),
+                ],
+                announced: vec![],
+            },
+        );
+        assert!(
+            matches!(
+                n,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    ..
+                })
+            ),
+            "no reachable NLRI (RFC 7606 §5.2) must force session reset, got {n:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_as_path_confed_member_peer_missing_confed_sequence_no_nlri_resets_session() {
+        let n = handle_update_get_notification_for(
+            PeerType::ConfedMember,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65100)])),
+                ],
+                announced: vec![],
+            },
+        );
+        assert!(
+            matches!(
+                n,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    ..
+                })
+            ),
+            "no reachable NLRI (RFC 7606 §5.2) must force session reset, got {n:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_as_path_empty_from_confed_member_peer_no_nlri_resets_session() {
+        let n = handle_update_get_notification_for(
+            PeerType::ConfedMember,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                ],
+                announced: vec![],
+            },
+        );
+        assert!(
+            matches!(
+                n,
+                Some(NotificationMessage {
+                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
+                    ..
+                })
+            ),
+            "no reachable NLRI (RFC 7606 §5.2) must force session reset, got {n:?}"
+        );
+    }
+
     #[test]
     fn test_malformed_as_path_confed_conditions_are_treat_as_withdraw_not_session_reset() {
         // RFC 7606 §3(e) reclassifies RFC 5065 §5's two conditions as
