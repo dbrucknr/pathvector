@@ -6273,6 +6273,212 @@ impl SelectionDeferralHarness {
     }
 }
 
+/// Writes a pathvectord config for [`TwoSourceSelectionDeferralHarness`]:
+/// three peers — `source_first` and `source_second` (both GR-capable mocks,
+/// [`MOCK_BGP_GR_PEER_IMAGE`], under distinct AS numbers) and `observer` (a
+/// plain GoBGP peer, no GR involvement) — and `selection_deferral_time` set
+/// to `deferral_secs`.
+fn write_daemon_config_selection_deferral_two_sources(
+    source_first_ip: Ipv4Addr,
+    source_first_as: u32,
+    source_second_ip: Ipv4Addr,
+    source_second_as: u32,
+    deferral_secs: u16,
+    observer_ip: Ipv4Addr,
+    observer_as: u32,
+) -> NamedTempFile {
+    let mut f =
+        NamedTempFile::new().expect("create temp pathvectord two-source selection-deferral config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as                = 65002
+bgp_id                  = "10.0.0.2"
+hold_time               = 9
+grpc_port               = {PATHVECTORD_GRPC_PORT}
+selection_deferral_time = {deferral_secs}
+
+[[peers]]
+address        = "{source_first_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {source_first_as}
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address        = "{source_second_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {source_second_as}
+import_default = "accept"
+export_default = "accept"
+
+[[peers]]
+address        = "{observer_ip}"
+port           = {GOBGPD_BGP_PORT}
+remote_as      = {observer_as}
+import_default = "accept"
+export_default = "accept"
+"#
+    )
+    .expect("write pathvectord two-source selection-deferral config");
+    f
+}
+
+/// Real interop harness proving RFC 4724 §4.1's Selection_Deferral_Timer
+/// wait-set is evaluated over the **full configured peer set**, not
+/// satisfied by any single peer's End-of-RIB: two independent GR-capable
+/// mock peers (`source_first` — [`MOCK_BGP_GR_PEER_IMAGE`]'s `eor-immediately`
+/// scenario, sends its EOR the instant the handshake completes — and
+/// `source_second`, typically `withhold-eor`, which never sends one) plus a
+/// plain GoBGP observer.
+///
+/// Closes the gap identified in Codex's follow-up review of the PR #50 gap
+/// closure: the single-source [`SelectionDeferralHarness`] cannot
+/// distinguish "the wait-set correctly requires every configured GR peer"
+/// from "the wait-set incorrectly releases as soon as any one peer sends
+/// EOR" — both produce the same observable behavior with only one GR peer
+/// configured. `daemon/deferral.rs`'s own unit tests already prove the
+/// underlying `recompute` algorithm requires all peers (a first design
+/// draft that only checked established peers was caught during planning
+/// review — see that module's doc comment) — this harness is the first
+/// proof of the same property through a real, complete BGP session pair.
+pub struct TwoSourceSelectionDeferralHarness {
+    // Containers must drop before the network (declaration order = drop order).
+    _source_first: ContainerAsync<GenericImage>,
+    _source_second: ContainerAsync<GenericImage>,
+    _observer: ContainerAsync<GenericImage>,
+    _pathvectord: ContainerAsync<GenericImage>,
+    _observer_config: NamedTempFile,
+    _daemon_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// IP of the observer container as seen by pathvectord — use with
+    /// `wait_for_gobgp_rib_entry`/`gobgp_rib_text`.
+    pub observer_addr: Ipv4Addr,
+    pub observer_id: String,
+    _network: DockerNetwork,
+}
+
+impl TwoSourceSelectionDeferralHarness {
+    /// Starts all four containers, waits for all three BGP sessions to
+    /// reach `Established`, and returns once the harness is ready.
+    /// `scenario_first`/`scenario_second` select each source's
+    /// `mock_bgp_gr_peer.rs` behavior; `deferral_secs` is pathvectord's own
+    /// `selection_deferral_time`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any container fails to start, or any session doesn't
+    /// reach `Established` within 30s.
+    pub async fn new(scenario_first: &str, scenario_second: &str, deferral_secs: u16) -> Self {
+        // Both mock instances advertise AS 65001 regardless of scenario —
+        // mock_bgp_gr_peer.rs's MOCK_AS is a fixed const, not parameterized
+        // by the CLI scenario argument.
+        const SOURCE_FIRST_AS: u32 = 65001;
+        const SOURCE_SECOND_AS: u32 = 65001;
+        const OBSERVER_AS: u32 = 65003;
+
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-selection-deferral-2src-test-{test_id}");
+        let subnet = format!("10.{}.{}.0/24", (test_id >> 8) & 0xff, test_id & 0xff);
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        // ── Two GR-capable mock source peers ──────────────────────────────
+        let source_first = GenericImage::new(MOCK_BGP_GR_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd([scenario_first])
+            .with_network(&network_name)
+            .with_container_name(format!("mock-bgp-gr-peer-a-{test_id}"))
+            .start()
+            .await
+            .expect("start mock BGP GR peer container (source_first)");
+        let source_first_id = source_first.id().to_owned();
+        let source_first_addr = container_network_ip(&source_first_id, &network_name);
+
+        let source_second = GenericImage::new(MOCK_BGP_GR_PEER_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd([scenario_second])
+            .with_network(&network_name)
+            .with_container_name(format!("mock-bgp-gr-peer-b-{test_id}"))
+            .start()
+            .await
+            .expect("start mock BGP GR peer container (source_second)");
+        let source_second_id = source_second.id().to_owned();
+        let source_second_addr = container_network_ip(&source_second_id, &network_name);
+
+        // ── Plain GoBGP observer (no GR involvement) ──────────────────────
+        let observer_config = write_gobgp_config_with_as(OBSERVER_AS);
+        let observer_config_path = observer_config.path().to_str().unwrap().to_owned();
+
+        let observer = GenericImage::new(GOBGPD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_network(&network_name)
+            .with_container_name(format!("gobgpd-selection-deferral-2src-observer-{test_id}"))
+            .with_mount(Mount::bind_mount(
+                observer_config_path,
+                "/etc/gobgp/gobgpd.conf",
+            ))
+            .start()
+            .await
+            .expect("start gobgpd observer container");
+        let observer_id = observer.id().to_owned();
+        let observer_addr = container_network_ip(&observer_id, &network_name);
+
+        // ── pathvectord ──────────────────────────────────────────────────
+        let daemon_config = write_daemon_config_selection_deferral_two_sources(
+            source_first_addr,
+            SOURCE_FIRST_AS,
+            source_second_addr,
+            SOURCE_SECOND_AS,
+            deferral_secs,
+            observer_addr,
+            OBSERVER_AS,
+        );
+        let daemon_config_path = daemon_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = GenericImage::new(PATHVECTORD_IMAGE, "latest")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::default()))
+            .with_cmd(["/etc/pathvectord.toml"])
+            .with_network(&network_name)
+            .with_container_name(format!("pathvectord-selection-deferral-2src-{test_id}"))
+            .with_mapped_port(grpc_host_port, ContainerPort::Tcp(PATHVECTORD_GRPC_PORT))
+            .with_mount(Mount::bind_mount(
+                daemon_config_path,
+                "/etc/pathvectord.toml",
+            ))
+            .start()
+            .await
+            .expect("start pathvectord container");
+
+        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("PathvectorClient::connect for TwoSourceSelectionDeferralHarness");
+
+        wait_for_established(&mut client, source_first_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with source_first did not reach Established within 30 s");
+        wait_for_established(&mut client, source_second_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with source_second did not reach Established within 30 s");
+        wait_for_established(&mut client, observer_addr, Duration::from_secs(30))
+            .await
+            .expect("BGP session with the observer peer did not reach Established within 30 s");
+
+        Self {
+            _source_first: source_first,
+            _source_second: source_second,
+            _observer: observer,
+            _pathvectord: pathvectord,
+            _observer_config: observer_config,
+            _daemon_config: daemon_config,
+            client,
+            observer_addr,
+            observer_id,
+            _network: network,
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 //
 // These tests cover the pure path-calculation helpers that do not require

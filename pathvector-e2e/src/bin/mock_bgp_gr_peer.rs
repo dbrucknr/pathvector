@@ -20,6 +20,13 @@
 //!   same as any other GR-capable peer — it must still be waited on until
 //!   its real EOR arrives, not treated as if it never advertised the
 //!   capability at all.
+//! - `eor-immediately` — advertises GracefulRestart with a nonzero
+//!   `restart_time`, sends its End-of-RIB marker as soon as the handshake
+//!   completes (no route announced first), then holds the connection open.
+//!   Used alongside a second, slower mock peer (a `withhold-eor` instance
+//!   under a different AS) to prove the Selection_Deferral_Timer wait-set is
+//!   evaluated over the *full configured peer set*: this peer's fast EOR
+//!   must not be mistaken for satisfying the other peer's outstanding EOR.
 //!
 //! Fully expressible via `pathvector_session`'s own `BgpMessage`/`Capability`
 //! encoder — no raw-byte hand-rolling needed, matching `mock_bgp_peer.rs`'s
@@ -69,6 +76,7 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
     match scenario.as_str() {
         "withhold-eor" => withhold_eor(stream, 60).await,
         "restart-time-zero-delayed-eor" => restart_time_zero_delayed_eor(stream).await,
+        "eor-immediately" => eor_immediately(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -161,6 +169,15 @@ async fn withhold_eor(stream: TcpStream, restart_time: u16) {
         .await
         .unwrap();
     println!("sent route for {TEST_PREFIX}; withholding End-of-RIB indefinitely");
+
+    hold_forever(framed).await;
+}
+
+async fn eor_immediately(stream: TcpStream) {
+    let mut framed = do_handshake(stream, 60).await;
+
+    framed.send(BgpMessage::Update(end_of_rib())).await.unwrap();
+    println!("sent End-of-RIB immediately after the handshake");
 
     hold_forever(framed).await;
 }

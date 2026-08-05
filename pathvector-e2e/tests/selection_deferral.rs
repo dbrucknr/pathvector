@@ -13,8 +13,8 @@
 use std::time::Duration;
 
 use pathvector_e2e::{
-    SELECTION_DEFERRAL_TEST_PREFIX, SelectionDeferralHarness, wait_for_gobgp_rib_entry,
-    wait_for_route,
+    SELECTION_DEFERRAL_TEST_PREFIX, SelectionDeferralHarness, TwoSourceSelectionDeferralHarness,
+    wait_for_gobgp_rib_entry, wait_for_route,
 };
 
 /// RFC 4724 §4.1: a route learned from a GR-capable peer that never sends
@@ -113,5 +113,59 @@ async fn restart_time_zero_peer_blocks_release_until_its_own_eor_arrives() {
         "RFC 4724 §4.1: a restart_time=0 (EOR-only) peer must still release the wait-set \
          once its own EOR arrives, well before the (deliberately much longer) \
          Selection_Deferral_Timer would have expired on its own",
+    );
+}
+
+/// RFC 4724 §4.1: the wait-set is evaluated over the *full configured peer
+/// set*, not satisfied by any single peer's End-of-RIB. `source_a` sends its
+/// EOR the instant its handshake completes; `source_b` never sends one. A
+/// single-source harness cannot distinguish "the wait-set correctly waits
+/// on every configured GR peer" from "the wait-set incorrectly releases as
+/// soon as any one peer sends EOR" — both look identical with only one GR
+/// peer configured. This test proves it's the former: `source_a`'s fast EOR
+/// must not be mistaken for satisfying `source_b`'s still-outstanding one.
+#[tokio::test]
+async fn fast_eor_from_one_source_does_not_release_wait_set_for_the_other() {
+    const DEFERRAL_SECS: u16 = 8;
+    let mut h =
+        TwoSourceSelectionDeferralHarness::new("eor-immediately", "withhold-eor", DEFERRAL_SECS)
+            .await;
+
+    // source_b's route reaching Loc-RIB confirms both sessions are up and
+    // source_b has announced — Loc-RIB is unaffected by deferral either way.
+    wait_for_route(
+        &mut h.client,
+        SELECTION_DEFERRAL_TEST_PREFIX,
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("route did not appear in pathvectord's own Loc-RIB within 15 s");
+
+    // By this point source_a's EOR (sent immediately on handshake) has
+    // certainly already arrived. If pathvectord's wait-set incorrectly
+    // treated any single peer's EOR as satisfying the whole set, release
+    // would have already happened — well before source_b's outstanding EOR
+    // (which source_b, running `withhold-eor`, will never send) or the
+    // Selection_Deferral_Timer (DEFERRAL_SECS) have anything to do with it.
+    let rib_text = pathvector_e2e::gobgp_rib_text(&h.observer_id);
+    assert!(
+        !rib_text.contains(SELECTION_DEFERRAL_TEST_PREFIX),
+        "RFC 4724 §4.1: source_a's immediate EOR must not be mistaken for satisfying \
+         source_b's still-outstanding EOR — the wait-set must cover every configured \
+         GR peer, not just the fastest one; got RIB:\n{rib_text}"
+    );
+
+    // Only the Selection_Deferral_Timer itself (source_b never sends EOR)
+    // eventually releases the gate — confirms this isn't just "never
+    // releases at all".
+    wait_for_gobgp_rib_entry(
+        &h.observer_id,
+        SELECTION_DEFERRAL_TEST_PREFIX,
+        Duration::from_secs(u64::from(DEFERRAL_SECS) + 15),
+    )
+    .await
+    .expect(
+        "RFC 4724 §4.1: the observer must eventually receive the route once the \
+         Selection_Deferral_Timer expires, since source_b never sends its EOR",
     );
 }
