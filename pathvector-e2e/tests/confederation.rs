@@ -14,11 +14,13 @@
 
 use std::time::Duration;
 
+use pathvector_client::DaemonClient;
 use pathvector_e2e::{
-    CONFEDERATION_EXTERNAL_AS, CONFEDERATION_EXTERNAL_ROUTE, CONFEDERATION_FRR_MEMBER_AS,
-    CONFEDERATION_FRR_ROUTE, CONFEDERATION_ID, CONFEDERATION_PATHVECTORD_MEMBER_AS,
-    ConfederationHarness, frr_show_route_text, gobgp_rib_text, wait_for_frr_rib_entry,
-    wait_for_frr_rib_withdrawn, wait_for_gobgp_rib_entry,
+    CONFEDERATION_EXTERNAL_AS, CONFEDERATION_EXTERNAL_MED_ROUTE,
+    CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE, CONFEDERATION_EXTERNAL_ROUTE,
+    CONFEDERATION_FRR_MEMBER_AS, CONFEDERATION_FRR_ROUTE, CONFEDERATION_ID,
+    CONFEDERATION_PATHVECTORD_MEMBER_AS, ConfederationHarness, frr_show_route_text, gobgp_rib_text,
+    wait_for_frr_rib_entry, wait_for_frr_rib_withdrawn, wait_for_gobgp_rib_entry,
 };
 
 /// Both BGP sessions must reach `Established`.
@@ -130,6 +132,16 @@ async fn route_from_external_relayed_to_confed_member_prepends_confed_sequence()
          the public confederation identifier {CONFEDERATION_ID} — that substitution is \
          only for genuinely external peers; got:\n{route}"
     );
+    // RFC 5065 §5.1: NEXT_HOP is unchanged by default toward a ConfedMember
+    // peer (pathvectord has no `next_hop_self` configured for the FRR peer)
+    // — FRR must see the external peer's own address, not pathvectord's.
+    assert!(
+        route.contains(&h.external_ip.to_string()),
+        "FRR must see the external peer's own NEXT_HOP ({}) unchanged — pathvectord has no \
+         next_hop_self configured for this peer, so RFC 5065 §5.1's default (unchanged) \
+         applies; got:\n{route}",
+        h.external_ip
+    );
 }
 
 /// RFC 5065 §4.1(b)/(c) cover announcements; this proves a withdrawal
@@ -163,5 +175,98 @@ async fn withdrawal_from_external_peer_propagates_to_confed_member() {
         "RFC 5065 §4.1(b): a withdrawal from the genuinely external peer must propagate \
          across the confederation boundary and remove the route from FRR's (the fellow \
          Member-AS) own RIB, not just stop future re-advertisement",
+    );
+}
+
+/// RFC 5065 §5.2: "the restriction against sending the LOCAL_PREF attribute
+/// to peers in a neighboring autonomous system within the same
+/// confederation is removed." FRR (the fellow Member-AS) is RFC-compliant
+/// and includes LOCAL_PREF on every UPDATE it sends over this
+/// confederation session — checked against pathvectord's own Loc-RIB (via
+/// its gRPC client) rather than FRR's or GoBGP's CLI text, since LOCAL_PREF
+/// is never re-advertised to any eBGP-style peer regardless (it wouldn't
+/// show up on the wire past pathvectord either way) — the property under
+/// test is specifically whether pathvectord *accepted* it on import, not
+/// whether it re-exports it.
+#[tokio::test]
+async fn local_pref_survives_relay_from_confed_member() {
+    let mut h = ConfederationHarness::new().await;
+
+    wait_for_gobgp_rib_entry(
+        &h.external_id,
+        CONFEDERATION_FRR_ROUTE,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("FRR's originated route did not reach the external GoBGP peer within 20 s");
+
+    let route = h
+        .client
+        .get_best_route(CONFEDERATION_FRR_ROUTE)
+        .await
+        .expect("get_best_route gRPC call succeeded")
+        .expect("FRR's route must be present in pathvectord's own Loc-RIB");
+    assert!(
+        route.local_pref.is_some(),
+        "RFC 5065 §5.2: LOCAL_PREF from a fellow ConfedMember peer must be accepted, not \
+         ignored like the ordinary eBGP case; got: {route:?}"
+    );
+}
+
+/// RFC 5065 §5.2: MED is not stripped when relaying to a fellow
+/// `ConfedMember` peer, unlike the `External` case (RFC 4271 doesn't
+/// mandate stripping MED, but pathvectord's own convention does for
+/// `External` — see `outbound.rs`'s `strip_med` split). The external peer
+/// announces a route carrying an explicit MED; it must reach FRR with that
+/// exact value preserved.
+#[tokio::test]
+async fn med_is_preserved_when_relayed_to_confed_member() {
+    const MED: u32 = 50;
+    let h = ConfederationHarness::new().await;
+
+    h.external_announce_with_med(MED);
+
+    wait_for_frr_rib_entry(
+        &h.frr_id,
+        CONFEDERATION_EXTERNAL_MED_ROUTE,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("MED-carrying route did not reach FRR within 20 s");
+
+    let route = frr_show_route_text(&h.frr_id, CONFEDERATION_EXTERNAL_MED_ROUTE);
+    // A bare `contains(&MED.to_string())` is not sufficient: the external
+    // peer's own AS number (65099) contains "50" as a substring, so a
+    // naive check would false-positive even with MED stripped. FRR renders
+    // the actual MED as "metric <N>" in this text view, so match on that.
+    let expected = format!("metric {MED}");
+    assert!(
+        route.contains(&expected),
+        "RFC 5065 §5.2: MED ({MED}) must survive relay to a fellow ConfedMember peer; \
+         got:\n{route}"
+    );
+}
+
+/// RFC 1997: `NO_EXPORT_SUBCONFED` "MUST NOT be advertised to external BGP
+/// peers (this includes peers in other members autonomous systems inside a
+/// BGP confederation)" — unlike plain `NO_EXPORT`, which only blocks
+/// genuinely external peers. The external peer announces a route carrying
+/// this community; it must never reach FRR (a fellow Member-AS) at all.
+#[tokio::test]
+async fn no_export_subconfed_suppresses_advertisement_to_confed_member() {
+    let h = ConfederationHarness::new().await;
+
+    h.external_announce_no_export_subconfed();
+
+    // Give pathvectord a real window to have processed and (if the
+    // suppression check were broken) advertised the route before asserting
+    // its absence — mirrors the negative-check pattern used for the
+    // confederation-identifier loop test.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let route = frr_show_route_text(&h.frr_id, CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE);
+    assert!(
+        !route.contains(CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE),
+        "RFC 1997: a route carrying NO_EXPORT_SUBCONFED must never reach a fellow \
+         ConfedMember peer; got:\n{route}"
     );
 }

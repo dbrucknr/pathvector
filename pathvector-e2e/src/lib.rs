@@ -5972,6 +5972,15 @@ pub const CONFEDERATION_FRR_ROUTE: &str = "10.150.0.0/24";
 /// Prefix the external GoBGP peer originates (via `gobgp global rib add`)
 /// toward pathvectord.
 pub const CONFEDERATION_EXTERNAL_ROUTE: &str = "10.160.0.0/24";
+/// Prefix the external GoBGP peer originates carrying an explicit MED —
+/// used to prove MED is not stripped when relayed to a fellow `ConfedMember`
+/// peer (RFC 5065 §5.2), unlike the `External` case.
+pub const CONFEDERATION_EXTERNAL_MED_ROUTE: &str = "10.161.0.0/24";
+/// Prefix the external GoBGP peer originates carrying the well-known
+/// `NO_EXPORT_SUBCONFED` community — used to prove it suppresses
+/// advertisement to a fellow `ConfedMember` peer, unlike plain `NO_EXPORT`
+/// (RFC 1997).
+pub const CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE: &str = "10.162.0.0/24";
 
 /// Writes an FRR bgpd config for a fellow confederation Member-AS.
 ///
@@ -6318,6 +6327,71 @@ impl ConfederationHarness {
         assert!(
             status.success(),
             "gobgp external withdraw {CONFEDERATION_EXTERNAL_ROUTE} failed: {status}"
+        );
+    }
+
+    /// Announces [`CONFEDERATION_EXTERNAL_MED_ROUTE`] from the external
+    /// GoBGP peer with an explicit MED value — used to prove pathvectord
+    /// does not strip MED when relaying to a fellow `ConfedMember` peer
+    /// (RFC 5065 §5.2), unlike the `External` case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn external_announce_with_med(&self, med: u32) {
+        let status = Command::new("docker")
+            .args(["exec", &self.external_id])
+            .args([
+                "gobgp",
+                "global",
+                "rib",
+                "add",
+                CONFEDERATION_EXTERNAL_MED_ROUTE,
+                "nexthop",
+                &self.external_ip.to_string(),
+                "origin",
+                "igp",
+                "med",
+                &med.to_string(),
+            ])
+            .status()
+            .expect("docker exec gobgp external announce with MED");
+        assert!(
+            status.success(),
+            "gobgp external announce {CONFEDERATION_EXTERNAL_MED_ROUTE} with med {med} failed: {status}"
+        );
+    }
+
+    /// Announces [`CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE`] from
+    /// the external GoBGP peer carrying the well-known `NO_EXPORT_SUBCONFED`
+    /// community — used to prove it suppresses advertisement to a fellow
+    /// `ConfedMember` peer, unlike plain `NO_EXPORT` (RFC 1997).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn external_announce_no_export_subconfed(&self) {
+        let status = Command::new("docker")
+            .args(["exec", &self.external_id])
+            .args([
+                "gobgp",
+                "global",
+                "rib",
+                "add",
+                CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE,
+                "nexthop",
+                &self.external_ip.to_string(),
+                "origin",
+                "igp",
+                "community",
+                "no-export-subconfed",
+            ])
+            .status()
+            .expect("docker exec gobgp external announce with NO_EXPORT_SUBCONFED");
+        assert!(
+            status.success(),
+            "gobgp external announce {CONFEDERATION_EXTERNAL_NO_EXPORT_SUBCONFED_ROUTE} with \
+             NO_EXPORT_SUBCONFED failed: {status}"
         );
     }
 }
