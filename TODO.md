@@ -1948,6 +1948,19 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   Real-teeth verified: disabled the confederation-ID half of `has_loop`,
   confirmed the test failed with the route visibly present in Loc-RIB,
   reverted (clean no-op diff) and reconfirmed passing.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review): the
+  `ConfederationHarness` tests verified announcements/AS_PATH transforms
+  but never withdrawal propagation. Added
+  `ConfederationHarness::external_withdraw()` and
+  `wait_for_frr_rib_withdrawn` (mirroring `wait_for_frr_rib_entry`'s
+  polling shape). New test
+  `withdrawal_from_external_peer_propagates_to_confed_member`: the
+  external GoBGP peer withdraws its route after it reached FRR via
+  pathvectord; asserts it disappears from FRR's own RIB, not just stops
+  being re-advertised. Real-teeth verified: changed `propagate_prefix`'s
+  `loc_rib.best() == None` branch to swallow the withdrawal into
+  `NoChange`, confirmed the test failed (timed out waiting for FRR to
+  drop the route), reverted (clean no-op diff) and reconfirmed passing.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.

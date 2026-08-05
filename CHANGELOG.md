@@ -158,6 +158,30 @@ visibly containing the confederation identifier), reverted (clean no-op
 diff) and reconfirmed passing. Full `fault_injection` suite (19/19)
 regression-clean.
 
+### [pathvector-e2e] Confederation withdrawal propagation had no e2e coverage
+
+The existing `ConfederationHarness` tests verify announcements and AS_PATH
+transforms crossing both confederation boundaries, but never withdrawal
+propagation — a route stuck in a peer's RIB after its source withdrew it
+would be a stale/leaked route, exactly the failure mode withdrawal
+propagation exists to prevent.
+
+Added `ConfederationHarness::external_withdraw()` and a new
+`wait_for_frr_rib_withdrawn` helper (mirroring `wait_for_frr_rib_entry`'s
+polling shape). New test
+`withdrawal_from_external_peer_propagates_to_confed_member`: the genuinely
+external GoBGP peer withdraws its route after it has already reached FRR
+(the fellow Member-AS) via pathvectord; asserts the route disappears from
+FRR's own RIB.
+
+Real-teeth verified: temporarily changed `propagate_prefix`'s
+`loc_rib.best() == None` branch (the code path that fires when a
+withdrawal empties Loc-RIB for a prefix) to swallow the withdrawal into
+`NoChange` instead of generating a real `Withdraw` decision, confirmed the
+test failed (timed out waiting for FRR to drop the route), reverted (clean
+no-op diff) and reconfirmed passing. Full `confederation` suite (4/4)
+regression-clean.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate

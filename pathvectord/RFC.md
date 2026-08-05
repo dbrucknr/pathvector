@@ -545,17 +545,22 @@ implementation. Two gaps that unit tests structurally cannot close:
   `bgp confederation peers` directives — FRR is confederation-aware,
   unlike a plain eBGP speaker, and its own outbound AS_PATH handling was
   never something this project's tests controlled) and a genuinely
-  external GoBGP peer. `pathvector-e2e/tests/confederation.rs`'s three
-  tests confirm both sessions establish with the correct visible AS (the
+  external GoBGP peer. `pathvector-e2e/tests/confederation.rs`'s tests
+  confirm both sessions establish with the correct visible AS (the
   external GoBGP peer's config expects the confederation identifier in
   pathvectord's OPEN, not the Member-AS — a `public_as` regression would
   make that specific session fail to establish while the FRR session
   still came up fine), a route from FRR crosses to the external peer with
   confed segments fully stripped (checked against real `gobgp global rib`
-  output), and a route from the external peer crosses to FRR with a
+  output), a route from the external peer crosses to FRR with a
   prepended confederation segment (checked against real FRR `vtysh show
   bgp` output, which renders confederation segments in parentheses and
-  marks the route `confed-external`).
+  marks the route `confed-external`), and — added 2026-08-05, round 2,
+  Codex follow-up review, since the above only covered announcements —
+  a withdrawal from the external peer removes the route from FRR's own
+  RIB (`withdrawal_from_external_peer_propagates_to_confed_member`, via
+  `ConfederationHarness::external_withdraw()` and the new
+  `wait_for_frr_rib_withdrawn` helper).
 - RFC 5065 §5's two malformed-AS_PATH conditions over a real BGP session:
   `mock_bgp_fault_peer` gained `rfc5065-confed-segment-with-nlri` and
   `rfc5065-confed-segment-no-nlri` scenarios (`pathvector-e2e/src/bin/
