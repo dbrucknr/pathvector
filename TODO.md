@@ -995,6 +995,19 @@ areas the existing test suite never covered:
   the "not yet released" assertion deterministically correct rather than
   a wall-clock guess, closing the gap the `GetDeferralStatus` idea above
   was meant to address, at least for this one test.
+  **Third round, 2026-08-05** (re-review of the round-2 fix): the round-2
+  doc comment's "fully deterministic" claim was itself too strong —
+  pathvectord's `Selection_Deferral_Timer` is a *second*, independent
+  clock (anchored at daemon process startup) running the whole time the
+  harness spends starting 3 containers and doing 2 sequential
+  `wait_for_established` calls plus `wait_for_route`; at `DEFERRAL_SECS =
+  30`, sufficiently slow startup could still let the daemon's own timer
+  force-release before the negative check ran, independent of the
+  now-fixed mock-EOR race. Since EOR release is test-controlled, the
+  happy path no longer depends on `DEFERRAL_SECS` at all, so raising it
+  costs nothing: bumped to 120s and corrected the doc comment to
+  distinguish "the mock's own EOR is deterministic" from "the daemon's
+  timer has a large but not infinite margin."
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world

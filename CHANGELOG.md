@@ -4,6 +4,30 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
+
+Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s
+fixed mock-EOR sleep with a real control-socket signal, and its doc
+comment claimed this made the test's sequencing "fully deterministic."
+Re-review found that claim too strong: pathvectord's own
+`Selection_Deferral_Timer` is a second, independent clock anchored at
+daemon *process* startup (`daemon/deferral.rs::new`), running the entire
+time the harness spends starting three containers and performing two
+sequential `wait_for_established` calls plus `wait_for_route`. At the
+previous `DEFERRAL_SECS = 30`, sufficiently slow harness startup could
+still let the daemon's own timer force-release before the test's negative
+check ever ran — a real, if narrower, residual gap the round-2 fix's own
+comment didn't account for.
+
+Since the EOR release is now test-controlled, the happy path's runtime no
+longer depends on `DEFERRAL_SECS` at all — raising it costs nothing.
+Raised to 120s (comfortably exceeding any realistic harness-startup time)
+and corrected the doc comment to state precisely what's now deterministic
+(the mock's own EOR release) versus what still has a margin, however
+generous (the daemon's independent timer not auto-firing first). Full
+`selection_deferral` suite (3/3) reconfirmed passing, with the fixed test
+still completing in ~7s regardless of the higher ceiling.
+
 ## 2026-08-05 (PR #52 code review, round 2: a distinct synchronization bug survived the round-1 fix)
 
 Round-1 review response (below) raised `DEFERRAL_SECS` from 8 to 20 in both

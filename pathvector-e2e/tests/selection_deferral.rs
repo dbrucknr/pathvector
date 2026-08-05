@@ -90,16 +90,29 @@ async fn route_withheld_from_observer_until_deferral_timer_expires() {
 /// signal, not a fixed sleep — flagged by code review on PR #52: an
 /// earlier fixed-delay version raced the mock's own wall-clock timer
 /// against unbounded harness-startup/session-establishment overhead). This
-/// makes the sequencing fully deterministic: the negative ("not yet
+/// makes the *mock's own EOR* deterministic: the negative ("not yet
 /// released") check below is guaranteed to run before the mock has any
 /// possibility of having sent its EOR, since the mock cannot send it until
 /// this test calls `release_delayed_eor()` — which happens strictly after
-/// that check. `DEFERRAL_SECS` is still deliberately large so the
-/// Selection_Deferral_Timer itself has no opportunity to preempt this
-/// test's own release signal.
+/// that check.
+///
+/// This does *not* by itself make the whole test deterministic, though —
+/// pathvectord's own `Selection_Deferral_Timer` is a second, independent
+/// clock anchored at daemon *process* startup (`daemon/deferral.rs::new`),
+/// running the entire time this test's harness is starting three
+/// containers and waiting on two `wait_for_established` calls plus
+/// `wait_for_route` below. If that setup ever took longer than
+/// `DEFERRAL_SECS`, the daemon's own timer could force-release before this
+/// test's negative check ever runs — a second review pass on PR #52 flagged
+/// exactly this gap in an earlier version of this comment, which
+/// overclaimed full determinism. Since the EOR release is now
+/// test-controlled, the happy path's runtime doesn't depend on
+/// `DEFERRAL_SECS` at all, so there's no cost to making it comfortably
+/// larger than any realistic harness-startup time instead of just "much
+/// longer than the mock's old fixed delay".
 #[tokio::test]
 async fn restart_time_zero_peer_blocks_release_until_its_own_eor_arrives() {
-    const DEFERRAL_SECS: u16 = 30;
+    const DEFERRAL_SECS: u16 = 120;
     let mut h = SelectionDeferralHarness::new("restart-time-zero-delayed-eor", DEFERRAL_SECS).await;
 
     wait_for_route(
