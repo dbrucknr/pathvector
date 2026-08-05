@@ -1253,55 +1253,78 @@ pub(super) fn handle_update(
     // These two conditions can only be detected here, not at the wire-decode
     // layer (`pathvector-session`) — they depend on the *relationship* with
     // the sending peer (External vs. ConfedMember), which the decoder has no
-    // visibility into. Session-reset per RFC 5065 §5's literal, unamended
-    // citation of RFC 4271 §6.3's original procedure — RFC 7606's own scope
-    // statement lists RFCs 1997, 4271, 4360, 4456, 4760, 5543, 5701, and 6368
-    // as revised; RFC 5065 is absent from that list and RFC 7606 never
-    // mentions confederations. This is a deliberate departure from BIRD
-    // (which treats both conditions as withdraw-only), not an oversight —
-    // see `CHANGELOG.md`'s RFC 4271 §6.3 entry for the precedent this
-    // decision follows.
+    // visibility into.
+    //
+    // RFC 5065 §5 delegates handling to "the procedures of [RFC4271],
+    // Section 6.3" — it does not hard-code session reset itself, it cites
+    // RFC 4271 §6.3's general UPDATE-error procedure by reference. RFC 7606
+    // §3 directly amends that same referenced procedure: "amends Section
+    // 6.3 of [RFC4271]... Treat-as-withdraw MUST be used for the cases that
+    // specify a session reset and involve any of the attributes ORIGIN,
+    // AS_PATH, NEXT_HOP, MULTI_EXIT_DISC, or LOCAL_PREF" (§3(e)). Both RFC
+    // 5065 §5 conditions specify a session reset and involve AS_PATH, so
+    // they fall under §3(e) even though RFC 5065 itself is absent from RFC
+    // 7606's formal "Updates:" list — that list names documents whose
+    // *own* text RFC 7606 edits, not every document that merely cites RFC
+    // 4271 §6.3's procedure by reference. The one carve-out is RFC 7606
+    // §3(j)/§5.2: session reset still applies when NLRI wasn't successfully
+    // parsed — handled above by gating this whole block on
+    // `notification.is_none()`, so an already-decided §5.2 session reset
+    // takes precedence and these conditions are only evaluated when NLRI
+    // parsing succeeded.
     if has_as_path && notification.is_none() {
-        if peer_type == PeerType::External
+        let confed_segment_from_external = peer_type == PeerType::External
             && as_path.segments().iter().any(|seg| {
                 matches!(
                     seg,
                     pathvector_types::AsPathSegment::ConfedSequence(_)
                         | pathvector_types::AsPathSegment::ConfedSet(_)
                 )
-            })
-        {
-            // Condition 1: a confederation segment received from a peer
-            // outside the confederation.
-            tracing::warn!(
-                peer = %peer,
-                %as_path,
-                "malformed AS_PATH: confederation segment from an External peer \
-                 (RFC 5065 §5) — session reset"
-            );
-            notification = Some(NotificationMessage {
-                error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
-                data: vec![],
             });
-        } else if peer_type == PeerType::ConfedMember
-            && !as_path.is_empty()
+        let malformed_from_confed_member = peer_type == PeerType::ConfedMember
             && !matches!(
                 as_path.segments().first(),
                 Some(pathvector_types::AsPathSegment::ConfedSequence(_))
-            )
-        {
-            // Condition 2: a non-empty AS_PATH from a fellow Member-AS whose
-            // first segment is not AS_CONFED_SEQUENCE.
+            );
+        if confed_segment_from_external || malformed_from_confed_member {
             tracing::warn!(
                 peer = %peer,
                 %as_path,
-                "malformed AS_PATH: non-empty path from a ConfedMember peer does not \
-                 start with AS_CONFED_SEQUENCE (RFC 5065 §5) — session reset"
+                confed_segment_from_external,
+                malformed_from_confed_member,
+                "malformed AS_PATH (RFC 5065 §5) — treat-as-withdraw (RFC 7606 §3(e))"
             );
-            notification = Some(NotificationMessage {
-                error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
-                data: vec![],
-            });
+            let treat_as_withdraw_v4: Vec<Nlri<Ipv4Addr>> = msg
+                .announced
+                .drain(..)
+                .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
+                .collect();
+            for nlri in treat_as_withdraw_v4 {
+                if adj_rib_in.get(&nlri).is_some_and(|r| {
+                    r.rare_or_default()
+                        .communities
+                        .iter()
+                        .any(|c| c.is_blackhole())
+                }) {
+                    blackhole_withdrawn_v4.push(nlri);
+                }
+                adj_rib_in.withdraw(&nlri);
+                fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
+            }
+            let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
+                mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
+            for nlri in treat_as_withdraw_v6 {
+                if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
+                    r.rare_or_default()
+                        .communities
+                        .iter()
+                        .any(|c| c.is_blackhole())
+                }) {
+                    blackhole_withdrawn_v6.push(nlri);
+                }
+                adj_rib_in_v6.withdraw(&nlri);
+                fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+            }
         }
     }
 

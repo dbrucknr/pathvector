@@ -7170,11 +7170,12 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_as_path_confed_segment_from_external_peer_resets_session() {
+    fn test_malformed_as_path_confed_segment_from_external_peer_is_treat_as_withdraw() {
         // RFC 5065 §5 condition 1: a confederation segment received from a
-        // peer outside the confederation is malformed — session reset, not
-        // treat-as-withdraw (see the doc comment at the check site for the
-        // RFC-7606-scope reasoning behind this choice).
+        // peer outside the confederation is malformed. RFC 7606 §3(e)
+        // reclassifies this as treat-as-withdraw (not session reset) — see
+        // the doc comment at the check site for the RFC-7606-scope
+        // reasoning.
         let n = handle_update_get_notification_for(
             PeerType::External,
             Some(64_500),
@@ -7192,21 +7193,17 @@ mod tests {
             },
         );
         assert!(
-            matches!(
-                n,
-                Some(NotificationMessage {
-                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
-                    ..
-                })
-            ),
-            "expected session-reset MalformedAsPath NOTIFICATION, got {n:?}"
+            n.is_none(),
+            "RFC 5065 §5 condition 1 must be treat-as-withdraw (RFC 7606 §3(e)), \
+             not a session-reset NOTIFICATION; got {n:?}"
         );
     }
 
     #[test]
-    fn test_malformed_as_path_confed_member_peer_missing_confed_sequence_resets_session() {
+    fn test_malformed_as_path_confed_member_peer_missing_confed_sequence_is_treat_as_withdraw() {
         // RFC 5065 §5 condition 2: a non-empty AS_PATH from a ConfedMember
-        // peer whose first segment is not AS_CONFED_SEQUENCE is malformed.
+        // peer whose first segment is not AS_CONFED_SEQUENCE is malformed —
+        // treat-as-withdraw per RFC 7606 §3(e), not session reset.
         let n = handle_update_get_notification_for(
             PeerType::ConfedMember,
             Some(64_500),
@@ -7221,14 +7218,37 @@ mod tests {
             },
         );
         assert!(
-            matches!(
-                n,
-                Some(NotificationMessage {
-                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath),
-                    ..
-                })
-            ),
-            "expected session-reset MalformedAsPath NOTIFICATION, got {n:?}"
+            n.is_none(),
+            "RFC 5065 §5 condition 2 must be treat-as-withdraw (RFC 7606 §3(e)), \
+             not a session-reset NOTIFICATION; got {n:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_as_path_empty_from_confed_member_peer_is_treat_as_withdraw() {
+        // RFC 5065 §5 condition 2 also covers an *empty* AS_PATH from a
+        // ConfedMember peer: an empty path has no first segment, so it
+        // cannot be AS_CONFED_SEQUENCE — RFC 5065 §4.1(b)(3) requires even
+        // an originated route sent to a neighboring Member-AS to carry a
+        // ConfedSequence. There is no legitimate-empty-AS_PATH exemption
+        // for ConfedMember peers (unlike, e.g., an Internal peer within the
+        // same Member-AS, where an empty AS_PATH is normal).
+        let n = handle_update_get_notification_for(
+            PeerType::ConfedMember,
+            Some(64_500),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::new()),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec![nlri("10.0.0.0/8")],
+            },
+        );
+        assert!(
+            n.is_none(),
+            "empty AS_PATH from a ConfedMember peer is treat-as-withdraw, not session reset; got {n:?}"
         );
     }
 
@@ -7258,11 +7278,11 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_as_path_confed_conditions_are_session_reset_not_withdraw() {
-        // Deliberate, RFC-text-grounded departure from BIRD (which treats
-        // both RFC 5065 §5 conditions as withdraw-only): confirm the route
-        // is NOT simply dropped from Loc-RIB while the session stays up —
-        // a NOTIFICATION must be produced instead.
+    fn test_malformed_as_path_confed_conditions_are_treat_as_withdraw_not_session_reset() {
+        // RFC 7606 §3(e) reclassifies RFC 5065 §5's two conditions as
+        // treat-as-withdraw (see the doc comment at the check site):
+        // no NOTIFICATION, and the announced route is actively withdrawn
+        // (not merely left un-inserted) rather than installed.
         let p = peer();
         let mut ari = AdjRibIn::new(p);
         let mut rib = LocRib::new();
@@ -7271,6 +7291,7 @@ mod tests {
         let policy = accept_all();
         let policy_v6: Policy<Route<Ipv6Addr>> =
             Policy::new(pathvector_policy::DefaultAction::Accept);
+        let target = nlri("10.0.0.0/8");
         let result = handle_update(
             p,
             UpdateMessage {
@@ -7282,7 +7303,7 @@ mod tests {
                     ])),
                     PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
                 ],
-                announced: vec![nlri("10.0.0.0/8")],
+                announced: vec![target],
             },
             &mut ari,
             &mut rib,
@@ -7300,8 +7321,13 @@ mod tests {
             None,
         );
         assert!(
-            result.notification.is_some(),
-            "RFC 5065 §5 malformed AS_PATH must produce a NOTIFICATION (session reset)"
+            result.notification.is_none(),
+            "RFC 5065 §5 malformed AS_PATH must be treat-as-withdraw (RFC 7606 §3(e)), \
+             not a session-reset NOTIFICATION"
+        );
+        assert!(
+            ari.get(&target).is_none(),
+            "the malformed-AS_PATH route must not be installed into AdjRibIn"
         );
     }
 
