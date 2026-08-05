@@ -104,7 +104,7 @@ use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{
     BgpMessage, Capability, GracefulRestartFamily, MpReachNlri, NotificationError, OpenMessage,
-    OpenMsgError, PathAttribute, Prefix, UpdateMessage,
+    OpenMsgError, PathAttribute, Prefix, UpdateMessage, UpdateMsgError,
 };
 use pathvector_types::{AfiSafi, AsPath, AsPathSegment, Asn, NextHop, Origin, Role};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1256,7 +1256,15 @@ async fn rfc5065_confed_segment_no_nlri_update(stream: TcpStream) {
             msg = framed.next() => {
                 match msg {
                     Some(Ok(BgpMessage::Notification(n))) => {
-                        println!("received NOTIFICATION as expected: {n:?}");
+                        println!("received NOTIFICATION: {n:?}");
+                        if matches!(
+                            n.error,
+                            NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath)
+                        ) {
+                            println!("SCENARIO_OUTCOME: malformed_as_path_notification_received");
+                        } else {
+                            println!("SCENARIO_OUTCOME: unexpected_notification_received");
+                        }
                         return;
                     }
                     Some(Ok(_)) => {}
@@ -1452,7 +1460,15 @@ async fn rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream: TcpStr
             msg = framed.next() => {
                 match msg {
                     Some(Ok(BgpMessage::Notification(n))) => {
-                        println!("received NOTIFICATION as expected: {n:?}");
+                        println!("received NOTIFICATION: {n:?}");
+                        if matches!(
+                            n.error,
+                            NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath)
+                        ) {
+                            println!("SCENARIO_OUTCOME: malformed_as_path_notification_received");
+                        } else {
+                            println!("SCENARIO_OUTCOME: unexpected_notification_received");
+                        }
                         return;
                     }
                     Some(Ok(_)) => {}

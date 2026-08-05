@@ -501,6 +501,12 @@ async fn rfc5065_confed_segment_with_nlri_treated_as_withdraw_session_stays_up()
 /// `MalformedAsPath` NOTIFICATION — the one RFC 5065 §5 case (alongside the
 /// with-NLRI case above) that isn't treat-as-withdraw. Mirrors
 /// `duplicate_mp_reach_nlri_resets_session`'s polling shape.
+///
+/// Asserts on the mock's own decoded view of the NOTIFICATION, not just
+/// "left Established" — a session that drops for an unrelated reason (e.g.
+/// a hold-timer expiry racing the test) would also leave Established,
+/// which is exactly the false-pass shape `role_differing_duplicates_are_rejected`
+/// guards against with the same `wait_for_docker_log` pattern.
 #[tokio::test]
 async fn rfc5065_confed_segment_no_nlri_resets_session() {
     let mut h = FaultInjectionHarness::new("rfc5065-confed-segment-no-nlri").await;
@@ -512,6 +518,17 @@ async fn rfc5065_confed_segment_no_nlri_resets_session() {
     wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
         .await
         .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: malformed_as_path_notification_received",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect(
+        "RFC 7606 §5.2: pathvectord must send a MalformedAsPath NOTIFICATION for a \
+         malformed AS_PATH with no reachable NLRI",
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -598,6 +615,17 @@ async fn rfc5065_confed_member_wrong_first_segment_no_nlri_resets_session() {
     wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
         .await
         .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: malformed_as_path_notification_received",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect(
+        "RFC 7606 §5.2: pathvectord must send a MalformedAsPath NOTIFICATION for a \
+         malformed (AS_SEQUENCE-first, confed-member peer) AS_PATH with no reachable NLRI",
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
