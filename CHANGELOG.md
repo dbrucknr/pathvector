@@ -182,6 +182,39 @@ test failed (timed out waiting for FRR to drop the route), reverted (clean
 no-op diff) and reconfirmed passing. Full `confederation` suite (4/4)
 regression-clean.
 
+### [pathvector-e2e] Confederation-specific attribute exceptions (LOCAL_PREF/NEXT_HOP/MED/NO_EXPORT_SUBCONFED) had no e2e coverage
+
+The `ConfederationHarness` suite proved AS_PATH transforms and withdrawal
+propagation but never exercised the four attribute-handling exceptions
+RFC 5065 §5.1/§5.2 and RFC 1997 carve out specifically for a
+`ConfedMember` peer (as opposed to plain `External`): LOCAL_PREF is
+accepted rather than ignored, NEXT_HOP is left unchanged by default,
+MED is not stripped, and `NO_EXPORT_SUBCONFED` (unlike plain `NO_EXPORT`)
+still blocks advertisement.
+
+Extended `route_from_external_relayed_to_confed_member_prepends_confed_sequence`
+with a NEXT_HOP assertion, and added `local_pref_survives_relay_from_confed_member`,
+`med_is_preserved_when_relayed_to_confed_member`, and
+`no_export_subconfed_suppresses_advertisement_to_confed_member`
+(`pathvector-e2e/tests/confederation.rs`), backed by two new
+`ConfederationHarness` methods (`external_announce_with_med`,
+`external_announce_no_export_subconfed`) and two new well-known-prefix
+constants in `pathvector-e2e/src/lib.rs`.
+
+Real-teeth verified independently for all four: LOCAL_PREF by narrowing
+`daemon/route.rs`'s accept guard back to `Internal`-only; NEXT_HOP by
+removing the `next_hop_self` gate on `prepare_outbound`'s `ConfedMember`
+branch; MED by widening `outbound.rs`'s `strip_med` to include
+`ConfedMember`; `NO_EXPORT_SUBCONFED` by narrowing
+`is_export_suppressed`'s check back to `External`-only. Each confirmed to
+fail for the stated reason, then reverted to a clean (`git diff --stat`-
+empty) diff and reconfirmed green. The MED assertion needed a second
+iteration: a first-draft `route.contains("50")` false-positived against
+the broken code because the external peer's own AS number (65099)
+contains "50" as a substring — fixed by matching the literal `"metric 50"`
+FRR renders for the real attribute, then re-verified RED/GREEN against the
+corrected assertion. Full `confederation` suite (7/7) regression-clean.
+
 ## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
 
 ### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate

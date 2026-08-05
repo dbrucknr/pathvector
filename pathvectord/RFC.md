@@ -560,7 +560,21 @@ implementation. Two gaps that unit tests structurally cannot close:
   a withdrawal from the external peer removes the route from FRR's own
   RIB (`withdrawal_from_external_peer_propagates_to_confed_member`, via
   `ConfederationHarness::external_withdraw()` and the new
-  `wait_for_frr_rib_withdrawn` helper).
+  `wait_for_frr_rib_withdrawn` helper) — and, added 2026-08-05, round 2,
+  Codex follow-up review, the confederation-specific attribute exceptions
+  themselves: LOCAL_PREF survives relay from FRR into pathvectord's own
+  Loc-RIB (`local_pref_survives_relay_from_confed_member`, RFC 5065 §5.2),
+  NEXT_HOP toward FRR is left unchanged by default
+  (extended into `route_from_external_relayed_to_confed_member_prepends_confed_sequence`,
+  RFC 5065 §5.1), MED from the external peer survives relay to FRR
+  (`med_is_preserved_when_relayed_to_confed_member`, via new
+  `ConfederationHarness::external_announce_with_med` — RFC 5065 §5.2,
+  unlike pathvectord's own convention of stripping MED for plain
+  `External` peers), and `NO_EXPORT_SUBCONFED` suppresses advertisement to
+  FRR (`no_export_subconfed_suppresses_advertisement_to_confed_member`,
+  via new `ConfederationHarness::external_announce_no_export_subconfed` —
+  RFC 1997, unlike plain `NO_EXPORT` which does not block a fellow
+  Member-AS peer).
 - RFC 5065 §5's two malformed-AS_PATH conditions over a real BGP session:
   `mock_bgp_fault_peer` gained `rfc5065-confed-segment-with-nlri` and
   `rfc5065-confed-segment-no-nlri` scenarios (`pathvector-e2e/src/bin/
@@ -588,7 +602,20 @@ Real-teeth verified: the confederation interop test was run with
 `prepare_outbound` (confirmed it failed — the malformed export never
 even reached the external GoBGP peer, since GoBGP itself won't accept
 it), restored and reran green; the two fault-injection scenarios were
-verified the same way against `daemon/route.rs`'s RFC 5065 §5 check.
+verified the same way against `daemon/route.rs`'s RFC 5065 §5 check. The
+four confederation-attribute assertions (2026-08-05) were each real-teeth
+verified independently: LOCAL_PREF by narrowing `daemon/route.rs`'s accept
+guard back to `Internal`-only; NEXT_HOP by removing the `next_hop_self`
+gate on `prepare_outbound`'s `ConfedMember` branch so it always rewrote;
+MED by widening `outbound.rs`'s `strip_med` to include `ConfedMember`; and
+`NO_EXPORT_SUBCONFED` by narrowing `is_export_suppressed`'s check back to
+`External`-only — each confirmed to fail for the stated reason, then
+reverted to a clean (`git diff --stat`-empty) state and reconfirmed green.
+The MED assertion needed a second iteration: an initial bare
+`route.contains("50")` false-positived against the broken code because
+the external peer's own AS number (65099) contains "50" as a substring;
+fixed by matching the literal `"metric 50"` FRR renders for the actual
+attribute, re-verified RED then GREEN against the corrected assertion.
 
 **Treat-as-withdraw, not session-reset, for RFC 5065 §5 (corrected
 2026-08-05 after external code review; see `CHANGELOG.md`):** this section

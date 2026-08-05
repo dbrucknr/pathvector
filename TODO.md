@@ -1961,6 +1961,27 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   `loc_rib.best() == None` branch to swallow the withdrawal into
   `NoChange`, confirmed the test failed (timed out waiting for FRR to
   drop the route), reverted (clean no-op diff) and reconfirmed passing.
+  **e2e gap closed 2026-08-05, round 2** (Codex follow-up review): the
+  `ConfederationHarness` suite never exercised the four attribute-handling
+  exceptions RFC 5065 §5.1/§5.2 and RFC 1997 carve out specifically for a
+  `ConfedMember` peer. Extended
+  `route_from_external_relayed_to_confed_member_prepends_confed_sequence`
+  with a NEXT_HOP assertion, and added
+  `local_pref_survives_relay_from_confed_member`,
+  `med_is_preserved_when_relayed_to_confed_member`, and
+  `no_export_subconfed_suppresses_advertisement_to_confed_member`
+  (`pathvector-e2e/tests/confederation.rs`), backed by two new
+  `ConfederationHarness` methods and two new well-known-prefix constants.
+  Real-teeth verified all four independently (LOCAL_PREF guard narrowed to
+  `Internal`-only, NEXT_HOP `next_hop_self` gate removed, `strip_med`
+  widened to include `ConfedMember`, `is_export_suppressed`'s
+  `NO_EXPORT_SUBCONFED` check narrowed to `External`-only), each confirmed
+  to fail for the stated reason then reverted (clean no-op diff) and
+  reconfirmed passing. Caught and fixed a false-positive of my own during
+  development: the MED assertion's first draft (`route.contains("50")`)
+  matched even with MED stripped, because the external peer's own AS
+  number (65099) contains "50" as a substring — fixed to match the literal
+  `"metric 50"` FRR renders for the real attribute.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
