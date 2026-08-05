@@ -528,6 +528,46 @@ initiative (`TODO.md` task #128) rather than folded into the smaller RFC
 | Exception: when the UPDATE has no reachable NLRI at all, treat-as-withdraw would be a no-op — RFC 7606 §5.2 requires session reset instead in that case | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_no_nlri_resets_session`, `test_malformed_as_path_confed_member_peer_missing_confed_sequence_no_nlri_resets_session`, `test_malformed_as_path_empty_from_confed_member_peer_no_nlri_resets_session` |
 | gRPC `proto_peer_type()` includes `ConfedMember` (compiler-forced exhaustive match) | `src/grpc.rs` | ✅ | (compile-time guarantee) |
 
+**End-to-end coverage (2026-08-05, `pathvector-e2e`):** the requirement
+table above is entirely `pathvectord`-unit-test-level — hand-built
+`UpdateMessage`/`Route` structs, no real wire codec, no real peer
+implementation. Two gaps that unit tests structurally cannot close:
+
+- Real confederation interop, not just unit-level correctness:
+  `ConfederationHarness` (`pathvector-e2e/src/lib.rs`) stands up
+  pathvectord as a real confederation Member-AS against FRR (configured
+  as a fellow Member-AS via FRR's own `bgp confederation identifier`/
+  `bgp confederation peers` directives — FRR is confederation-aware,
+  unlike a plain eBGP speaker, and its own outbound AS_PATH handling was
+  never something this project's tests controlled) and a genuinely
+  external GoBGP peer. `pathvector-e2e/tests/confederation.rs`'s three
+  tests confirm both sessions establish with the correct visible AS (the
+  external GoBGP peer's config expects the confederation identifier in
+  pathvectord's OPEN, not the Member-AS — a `public_as` regression would
+  make that specific session fail to establish while the FRR session
+  still came up fine), a route from FRR crosses to the external peer with
+  confed segments fully stripped (checked against real `gobgp global rib`
+  output), and a route from the external peer crosses to FRR with a
+  prepended confederation segment (checked against real FRR `vtysh show
+  bgp` output, which renders confederation segments in parentheses and
+  marks the route `confed-external`).
+- RFC 5065 §5's two malformed-AS_PATH conditions over a real BGP session:
+  `mock_bgp_fault_peer` gained `rfc5065-confed-segment-with-nlri` and
+  `rfc5065-confed-segment-no-nlri` scenarios (`pathvector-e2e/src/bin/
+  mock_bgp_fault_peer.rs`), exercised by
+  `rfc5065_confed_segment_with_nlri_treated_as_withdraw_session_stays_up`
+  and `rfc5065_confed_segment_no_nlri_resets_session`
+  (`pathvector-e2e/tests/fault_injection.rs`) — proving the real wire
+  codec on both ends produces the same treat-as-withdraw/session-reset
+  split the unit tests assert on hand-built messages.
+
+Real-teeth verified: the confederation interop test was run with
+`strip_confed_segments()` temporarily disabled in `pathvector-rib`'s
+`prepare_outbound` (confirmed it failed — the malformed export never
+even reached the external GoBGP peer, since GoBGP itself won't accept
+it), restored and reran green; the two fault-injection scenarios were
+verified the same way against `daemon/route.rs`'s RFC 5065 §5 check.
+
 **Treat-as-withdraw, not session-reset, for RFC 5065 §5 (corrected
 2026-08-05 after external code review; see `CHANGELOG.md`):** this section
 originally implemented literal session-reset, reasoning that RFC 5065 §5's

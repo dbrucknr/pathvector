@@ -109,6 +109,57 @@ Full workspace re-verified after this fix: `cargo build --workspace`,
 --all -- --check`, `cargo nextest run --workspace --exclude
 pathvector-e2e` — 1967/1967 passing.
 
+### [pathvector-e2e] Real end-to-end coverage for RFC 5065: a 3-node confederation interop harness and two new fault-injection scenarios
+
+Everything above (both the original RFC 5065 Member-AS work and the
+review-driven fixes) was verified at the unit level only — hand-built
+`UpdateMessage`/`Route` structs and `handle_update` calls, never a real
+wire codec exchanging bytes with a real BGP implementation. Requested
+explicitly after PR #51 merged (user-prioritized: real confederation
+interop first, then the two RFC 5065 §5 error-handling scenarios fitted
+into the existing fault-injection harness).
+
+**`ConfederationHarness`** (`pathvector-e2e/src/lib.rs`) stands up
+pathvectord as a real confederation Member-AS (local_as 65001,
+confederation_id 64512) against two real peers: FRR configured as a
+fellow Member-AS via FRR's own `bgp confederation identifier`/`bgp
+confederation peers` directives (FRR is confederation-aware — a plain
+eBGP speaker would originate routes with an ordinary AS_SEQUENCE, not
+the AS_CONFED_SEQUENCE RFC 5065 §5 requires from a fellow Member-AS
+peer), and a genuinely external GoBGP peer whose config expects the
+confederation identifier in pathvectord's OPEN rather than the private
+Member-AS — itself part of the interop proof, since a `public_as`
+regression would make that specific session fail to establish (Bad Peer
+AS) while the FRR session still came up fine.
+`pathvector-e2e/tests/confederation.rs`'s three tests confirm both
+sessions establish with the correct visible AS, a route originated by
+FRR crosses to the external peer with confederation segments fully
+stripped (checked against real `gobgp global rib` output — AS_PATH
+shows only `64512`, no trace of either private Member-AS number), and a
+route originated by the external peer crosses to FRR with a prepended
+confederation segment (checked against real FRR `vtysh show bgp`
+output: `(65001) 65099`, with FRR's own `confed-external` status
+marker).
+
+**Two new `mock_bgp_fault_peer` scenarios**
+(`rfc5065-confed-segment-with-nlri`, `rfc5065-confed-segment-no-nlri`)
+exercise RFC 5065 §5's two malformed-AS_PATH conditions over a real BGP
+session with the real wire codec on both ends, mirroring the file's
+existing `missing-origin`/`duplicate-mp-reach` scenario shapes — both
+fully expressible via `AsPath`/`AsPathSegment` with no raw-byte
+hand-rolling needed, unlike the invalid-ORIGIN-byte scenarios elsewhere
+in the file.
+
+Real-teeth verified end to end: temporarily disabled
+`strip_confed_segments()` in `pathvector-rib`'s `prepare_outbound`,
+rebuilt the pathvectord Docker image, confirmed the route-crossing test
+failed (the malformed export never even reached the external GoBGP
+peer — GoBGP itself refuses to accept it), restored and reran green;
+the two fault-injection scenarios were verified the same way against
+`daemon/route.rs`'s RFC 5065 §5 check (temporarily forced to its old
+no-op branch). Full `pathvector-e2e` suite (129 tests, all harnesses)
+passes with no regressions from the `lib.rs` additions.
+
 ---
 
 ## 2026-08-04 (RFC 5065: full BGP Confederation Member-AS support)

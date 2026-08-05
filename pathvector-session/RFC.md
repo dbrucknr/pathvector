@@ -397,3 +397,15 @@ and reconnect-capability-refresh call site. Real-teeth verified: reverted
 `make_open` to use `local_as`, confirmed `test_sent_open_uses_public_as_not_local_as`
 failed (`left: 65001, right: 64512`), then restored and reran the full
 344-test suite green.
+
+**End-to-end coverage (2026-08-05, `pathvector-e2e`):** the unit test above
+proves `make_open` picks the right field; it doesn't prove a real
+implementation on the other end of the wire actually accepts it.
+`ConfederationHarness`'s
+`confederation_sessions_establish_with_correct_visible_as` (see
+`pathvectord/RFC.md`'s RFC 5065 section for the full 3-node topology)
+peers pathvectord against a real GoBGP process configured to expect the
+Confederation Identifier — a `public_as` regression would make that
+session fail to establish (Bad Peer AS) while an otherwise-identical
+Member-AS session to FRR still came up fine, so this test would have
+caught the original finding directly.

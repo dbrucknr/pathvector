@@ -1807,7 +1807,12 @@ list. Found 2026-07-16, diagnostic only, not fixed here:
   no-op'd (no NOTIFICATION, nothing to drain) on an UPDATE with a
   malformed AS_PATH and no reachable NLRI at all — RFC 7606 §5.2 requires
   session reset in exactly that case; fixed by branching on
-  `has_reachable_nlri_on_wire`. See `CHANGELOG.md`'s 2026-08-05 entries.
+  `has_reachable_nlri_on_wire`. Real interop coverage added the same day:
+  `pathvector-e2e`'s `ConfederationHarness` (pathvectord + a real FRR
+  fellow Member-AS + a real external GoBGP peer) and two new
+  `mock_bgp_fault_peer` RFC 5065 §5 scenarios — closing the gap between
+  unit-tested `handle_update` behavior and a real wire codec talking to
+  real BGP implementations. See `CHANGELOG.md`'s 2026-08-05 entries.
 - Checked RFC 4360 (Extended Communities) and RFC 8092 (Large Communities)
   for the same "well-known value with mandated enforcement" trap as the
   RFC 1997 finding — both confirmed genuinely clean, no similar issue.
