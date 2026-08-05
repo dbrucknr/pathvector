@@ -4,6 +4,91 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (PR #52 code review: fix Docs CI + 3 test-quality gaps)
+
+External code review of PR #52 (the round-2 e2e coverage gaps below) found
+a broken Docs CI job plus three real coverage/robustness issues in that
+same PR's new tests. All four addressed before merge.
+
+### [pathvector-e2e] Docs CI failure: broken intra-doc links from a `bin` target to the lib crate
+
+`mock_bgp_fault_peer.rs` (a `[[bin]]` target in the `pathvector-e2e`
+package) had three doc comments referencing `[`FaultInjectionHarness::*`]`
+— a type defined in the package's own `lib.rs`. Rustdoc's intra-doc-link
+resolution operates per compilation unit; a bin target doesn't
+automatically have the sibling lib crate's items in scope for link
+resolution unless explicitly `use`d, so `cargo doc --workspace --no-deps`
+(the CI `Docs` job, `-D warnings`) failed with three `unresolved link`
+errors. Fixed by rendering the three references as plain inline code
+(no link brackets) instead of intra-doc links — matches Codex's suggested
+resolution; no other doc comments in the `pathvector-e2e` bin targets had
+the same issue.
+
+### [pathvector-e2e] Unknown-transitive-attribute test's "Partial bit clear on the wire" claim was never actually true
+
+`mock_bgp_attr_peer.rs`'s `source` role built its UPDATE through
+`pathvector_session`'s typed `BgpMessage`/`PathAttribute` encoder, which
+unconditionally ORs the Partial bit into any Optional+Transitive
+`PathAttribute::Unknown` on encode (RFC 4271 §5's forwarding rule, applied
+indiscriminately by that shared encoder regardless of whether the caller
+is originating or relaying). That means `source`'s own wire bytes already
+had Partial=1 before pathvectord ever received them — the test proved
+storage/relay/value-preservation and that the *observer* sees Partial set,
+but never proved pathvectord itself performs the clear-to-set transition,
+since the source could not produce a genuinely Partial-clear instance
+through that encoder in the first place.
+
+Fixed by hand-rolling `source`'s raw UPDATE frame bytes directly (mirroring
+`mock_bgp_fault_peer.rs`'s `attribute_flags_conflict_frame()` pattern —
+reclaim the raw `TcpStream` via `Framed::into_inner()`, write a
+purpose-built byte sequence), so the unknown-transitive attribute's
+Partial bit is genuinely clear on the wire the source sends. The
+observer's decode-side assertions are unchanged.
+
+### [pathvector-e2e] AS4_PATH confederation-stripping test overclaimed genuine two-byte wire interop
+
+The `two-byte-observer` role name and doc comments in
+`mock_bgp_as4path_peer.rs`/`as4path_confed.rs` implied the test proved
+interop with a real two-octet-per-ASN peer. Review found pathvectord's
+AS_PATH encoder (`encode_as_path_segments`) always writes 4 bytes per ASN
+regardless of capability negotiation — encode-side capability downgrade
+is implemented for AGGREGATOR only (a separate, already-tracked open gap;
+see `TODO.md`'s "No e2e test for AS_TRANS wire encoding against a real
+2-byte-only peer" item). The observer's own `BgpCodec` is likewise never
+switched into a genuine 2-byte decode mode, so it parses the (still
+4-byte-wide) wire bytes correctly by construction, not because real 2-byte
+interop was exercised.
+
+Rather than implementing full encode-side AS_PATH downgrade (a
+substantial, separately-scoped production feature), corrected the doc
+comments in both files plus this file's own RFC.md entries to state
+precisely what the test proves: the *logical* AS_TRANS-substitution/
+AS4_PATH-split decision is triggered correctly by capability
+non-negotiation, and the confed-segment inclusion/exclusion split between
+AS_PATH and AS4_PATH is correct. Real two-byte-only wire interop remains
+an explicitly open gap.
+
+### [pathvector-e2e] Selection Deferral e2e tests had a wall-clock race against real harness startup overhead
+
+Both Selection Deferral e2e tests' "route not yet released to the
+observer" snapshot assertion runs after 3-4 containers have started,
+passed healthchecks, and 2-3 BGP sessions have reached Established — but
+the Selection_Deferral_Timer's deadline is `daemon_start + DEFERRAL_SECS`
+(`daemon_start` captured at pathvectord *process* startup, not at session
+Established; see `daemon/deferral.rs::new`). At the original
+`DEFERRAL_SECS = 8`, a slow/loaded CI runner could exhaust that margin
+before the snapshot check runs, turning it into a real (not spurious)
+intermittent failure. The tests passed in PR #52's actual CI run, but the
+synchronization was not deterministic.
+
+Mitigated by raising both tests' `DEFERRAL_SECS` to 20 for more headroom
+against realistic harness-startup overhead — this reduces the probability
+of the race but does not eliminate it structurally; a fully deterministic
+fix would need an explicit synchronization point (e.g. a gRPC-exposed
+deferral-pending status) instead of inferring "still pending" from a
+timed snapshot. Filed as an explicit open item in `TODO.md` rather than
+implemented here, given the scope of adding a new gRPC surface.
+
 ## 2026-08-05 (round 2: additional e2e coverage gaps, Codex follow-up review)
 
 ### [pathvector-e2e] PR #48's "exact NOTIFICATION" claim had no Docker-level proof, only a single-process real-TCP test
@@ -164,6 +249,23 @@ an overly-strict assertion of my own during development: pathvectord's
 its own Member-AS number rather than appending a new segment, so the
 source's own AS is not necessarily the *first* ASN in that segment — only
 still present within it.
+
+**Scope correction (PR #52 code review):** the write-up above and the
+`two-byte-observer` role name overclaimed genuine two-octet-per-ASN wire
+interop. Review found that pathvectord's AS_PATH encoder
+(`encode_as_path_segments`) always writes 4 bytes per ASN regardless of
+capability negotiation — encode-side capability downgrade is implemented
+for AGGREGATOR only, a separate, still-open gap (see `TODO.md`'s "No e2e
+test for AS_TRANS wire encoding against a real 2-byte-only peer" item).
+The observer's own `BgpCodec` is also never switched into a genuine 2-byte
+decode mode, so it parses the (still 4-byte-wide) wire bytes correctly by
+construction. What the test validly proves: pathvectord's *logical*
+decision to substitute AS_TRANS and split AS4_PATH out is triggered
+correctly by the peer not negotiating `FourByteAsn`, and the confed-segment
+inclusion/exclusion split between AS_PATH and AS4_PATH is correct. Real
+two-byte-only wire interop remains open. Doc comments in
+`mock_bgp_as4path_peer.rs`, `as4path_confed.rs`, and this file's `RFC.md`
+table row were corrected to state this scope precisely.
 
 ### [pathvector-e2e] Confederation-identifier loop detection had no e2e coverage
 

@@ -1,11 +1,33 @@
 //! A peer pair for `pathvector-e2e`'s RFC 6793 §4 / RFC 5065 AS4_PATH
 //! confederation-stripping test: proves that when a route carrying a
-//! confederation segment is relayed toward a two-byte-ASN-only fellow
-//! confederation Member-AS peer, the wire AS_PATH keeps the confed segment
-//! (RFC 5065 §5.3 — a `ConfedMember` peer sees the same AS_PATH shape as an
-//! internal one) while AS4_PATH, if emitted, excludes it entirely (RFC 6793
-//! §§3, 4.2.2: "declared invalid for the AS4_PATH attribute and MUST NOT be
-//! included").
+//! confederation segment is relayed toward a fellow confederation Member-AS
+//! peer that hasn't negotiated the `FourByteAsn` capability, the AS_PATH
+//! *value* keeps the confed segment (RFC 5065 §5.3 — a `ConfedMember` peer
+//! sees the same AS_PATH shape as an internal one) with AS_TRANS substituted
+//! for the real ASN (RFC 6793 §4), while AS4_PATH, if emitted, carries the
+//! real ASN and excludes the confed segment entirely (RFC 6793 §§3, 4.2.2:
+//! "declared invalid for the AS4_PATH attribute and MUST NOT be included").
+//!
+//! **Scope note (flagged by code review on PR #52):** the `two-byte-observer`
+//! role name refers to *capability negotiation only* — this peer omits the
+//! `FourByteAsn` capability in its own OPEN, which is what makes pathvectord
+//! classify the session as needing the AS_TRANS/AS4_PATH downgrade. It does
+//! **not** prove genuine two-octet-per-ASN wire encoding: pathvectord's own
+//! AS_PATH encoder (`encode_as_path_segments` in
+//! `pathvector-session/src/message/update.rs`) unconditionally writes each
+//! ASN as 4 bytes regardless of negotiation (encode-side capability
+//! downgrade is implemented for AGGREGATOR only, not AS_PATH — a separate,
+//! still-open gap; see `TODO.md`'s "No e2e test for AS_TRANS wire encoding
+//! against a real 2-byte-only peer" item). This observer's own `BgpCodec`
+//! is never switched into a genuine 2-byte decode mode either, so it happens
+//! to parse the (still 4-byte-wide) wire bytes correctly by construction,
+//! not because real 2-byte interop was exercised. What this test does prove,
+//! validly: pathvectord's *logical* decision to substitute AS_TRANS and
+//! split AS4_PATH out (as opposed to sending the raw 4-byte ASN unmodified)
+//! is triggered correctly by capability non-negotiation, and the confed-
+//! segment inclusion/exclusion split between AS_PATH and AS4_PATH is
+//! correct. Real 2-byte-only wire interop (e.g. against GoBGP's `--as2`
+//! mode) remains an open gap, tracked in `TODO.md`.
 //!
 //! Listens on `:179` and, on the accepted connection, plays one of two roles
 //! selected by its only argument:
@@ -18,14 +40,13 @@
 //!   side) followed by an ordinary `AS_SEQUENCE` segment containing
 //!   [`FOUR_BYTE_ASN`] (a value that doesn't fit in 2 bytes).
 //! - `two-byte-observer` — deliberately does **not** advertise `FourByteAsn`
-//!   (so pathvectord treats *this* session as two-byte-only and applies the
-//!   RFC 6793 §4 AS_TRANS/AS4_PATH downgrade), then decodes the real wire
-//!   bytes of pathvectord's re-advertised UPDATE and logs a
-//!   `SCENARIO_OUTCOME:` line recording: whether the wire AS_PATH still
-//!   contains the leading `AS_CONFED_SEQUENCE` segment (it must — RFC 5065
-//!   §5.3), whether it substitutes AS_TRANS (23456) for the 4-byte ASN
-//!   (RFC 6793 §4), whether AS4_PATH is present and carries the real
-//!   4-byte ASN, and whether AS4_PATH excludes the confed segment.
+//!   (see the scope note above — this affects capability negotiation only),
+//!   then decodes the real wire bytes of pathvectord's re-advertised UPDATE
+//!   and logs a `SCENARIO_OUTCOME:` line recording: whether the AS_PATH
+//!   value still contains the leading `AS_CONFED_SEQUENCE` segment (it
+//!   must — RFC 5065 §5.3), whether it substitutes AS_TRANS (23456) for the
+//!   4-byte ASN (RFC 6793 §4), whether AS4_PATH is present and carries the
+//!   real 4-byte ASN, and whether AS4_PATH excludes the confed segment.
 //!
 //! Fully expressible via `pathvector_session`'s own `BgpMessage`/
 //! `PathAttribute`/`Capability` encoder — no raw-byte hand-rolling needed.

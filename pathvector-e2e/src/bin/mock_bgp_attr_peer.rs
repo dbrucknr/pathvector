@@ -6,10 +6,10 @@
 //! Listens on `:179` and, on the accepted connection, plays one of two
 //! roles selected by its only argument:
 //!
-//! - `source` — completes the handshake, then sends a single UPDATE
-//!   announcing [`TEST_PREFIX`] carrying two unrecognized attributes:
+//! - `source` — completes the handshake, then sends a single hand-rolled
+//!   UPDATE announcing [`TEST_PREFIX`] carrying two unrecognized attributes:
 //!   [`UNKNOWN_TRANSITIVE_TYPE`] (Optional+Transitive, Partial bit
-//!   deliberately clear — RFC 4271 §5's "Paths with unrecognized
+//!   genuinely clear on the wire — RFC 4271 §5's "Paths with unrecognized
 //!   transitive optional attributes SHOULD be accepted" case) and
 //!   [`UNKNOWN_NONTRANSITIVE_TYPE`] (Optional only — the "Unrecognized
 //!   non-transitive optional attributes MUST be quietly ignored and not
@@ -26,11 +26,16 @@
 //!   whether its value round-tripped unchanged; and for
 //!   [`UNKNOWN_NONTRANSITIVE_TYPE`]: whether it is (wrongly) present at all.
 //!
-//! Fully expressible via `pathvector_session`'s own `BgpMessage`/
-//! `PathAttribute` encoder — `PathAttribute::Unknown`'s fields are exactly
-//! what's needed to construct both a Partial-bit-clear transitive
-//! unrecognized attribute and a non-transitive one, with no raw-byte
-//! hand-rolling required.
+//! `source`'s UPDATE is hand-rolled raw bytes, not built through
+//! `pathvector_session`'s typed `BgpMessage`/`PathAttribute` encoder —
+//! that encoder unconditionally ORs the Partial bit into any
+//! Optional+Transitive `PathAttribute::Unknown` on encode (RFC 4271 §5's
+//! forwarding rule, applied indiscriminately), so a `source` built through
+//! it would already send Partial=1 on the wire, making it impossible to
+//! prove pathvectord itself performs the clear-to-set transition. See
+//! `source()`'s doc comment for the full explanation; this was caught by
+//! external code review (PR #52) after the original version of this file
+//! shipped with exactly that false-positive.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -38,7 +43,8 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{BgpMessage, Capability, OpenMessage, PathAttribute};
-use pathvector_types::{AfiSafi, AsPath, Asn, Origin};
+use pathvector_types::AfiSafi;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -123,35 +129,108 @@ async fn hold_forever(mut framed: Framed<TcpStream, BgpCodec>) {
 }
 
 async fn source(stream: TcpStream) {
-    let mut framed = do_handshake(stream).await;
+    let framed = do_handshake(stream).await;
 
-    let update = pathvector_session::message::UpdateMessage {
-        withdrawn: vec![],
-        attributes: vec![
-            PathAttribute::Origin(Origin::Igp),
-            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(MOCK_AS))])),
-            PathAttribute::NextHop(MOCK_BGP_ID),
-            PathAttribute::Unknown {
-                flags: FLAGS_OPTIONAL_TRANSITIVE,
-                type_code: UNKNOWN_TRANSITIVE_TYPE,
-                value: UNKNOWN_TRANSITIVE_VALUE.to_vec(),
-            },
-            PathAttribute::Unknown {
-                flags: FLAGS_OPTIONAL_NONTRANSITIVE,
-                type_code: UNKNOWN_NONTRANSITIVE_TYPE,
-                value: UNKNOWN_NONTRANSITIVE_VALUE.to_vec(),
-            },
-        ],
-        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
-    };
-    framed.send(BgpMessage::Update(update)).await.unwrap();
+    // `pathvector_session::message::update::encode` (the only way to build a
+    // wire frame through the typed `UpdateMessage`/`PathAttribute` API)
+    // unconditionally ORs the Partial bit into any Optional+Transitive
+    // `PathAttribute::Unknown` on encode, per RFC 4271 §5's forwarding rule —
+    // so going through that encoder here would already send Partial=1 on the
+    // wire, making it impossible to prove pathvectord itself performs the
+    // clear-to-set transition (a source that also uses that encoder can't
+    // originate a Partial-clear instance to relay in the first place). Hand-
+    // rolling the raw frame is required, mirroring
+    // `mock_bgp_fault_peer.rs`'s `attribute_flags_conflict_frame()` pattern.
+    let mut stream = framed.into_inner();
+    if stream
+        .write_all(&unknown_transitive_partial_clear_frame())
+        .await
+        .is_err()
+    {
+        return;
+    }
     println!(
         "sent route for {TEST_PREFIX} carrying unknown-transitive (type \
-         {UNKNOWN_TRANSITIVE_TYPE}) and unknown-non-transitive (type \
-         {UNKNOWN_NONTRANSITIVE_TYPE}) attributes"
+         {UNKNOWN_TRANSITIVE_TYPE}, Partial bit genuinely clear on the wire) and \
+         unknown-non-transitive (type {UNKNOWN_NONTRANSITIVE_TYPE}) attributes"
     );
 
-    hold_forever(framed).await;
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Marker + length + type — RFC 4271 §4.1.
+const HEADER_LEN: u16 = 19;
+const MARKER_VALID: [u8; 16] = [0xFF; 16];
+const MSG_TYPE_UPDATE: u8 = 2;
+const MSG_TYPE_KEEPALIVE: u8 = 4;
+
+fn keepalive_frame() -> Vec<u8> {
+    let mut frame = MARKER_VALID.to_vec();
+    frame.extend_from_slice(&HEADER_LEN.to_be_bytes());
+    frame.push(MSG_TYPE_KEEPALIVE);
+    frame
+}
+
+/// Hand-rolled UPDATE for [`TEST_PREFIX`] carrying well-formed mandatory
+/// attributes plus the two unrecognized-attribute test cases, with the
+/// unknown-transitive attribute's Partial bit (0x20) genuinely clear —
+/// see `source()`'s doc comment for why this can't go through the typed
+/// encoder.
+fn unknown_transitive_partial_clear_frame() -> Vec<u8> {
+    let mut attrs = Vec::new();
+    attrs.extend_from_slice(&[0x40, 1, 1, 0]); // ORIGIN = IGP
+    // AS_PATH: one Sequence segment containing MOCK_AS as a 4-byte ASN.
+    let mock_as = u32::from(MOCK_AS).to_be_bytes();
+    attrs.extend_from_slice(&[0x40, 2, 6, 2, 1]);
+    attrs.extend_from_slice(&mock_as);
+    attrs.extend_from_slice(&[0x40, 3, 4]); // NEXT_HOP
+    attrs.extend_from_slice(&MOCK_BGP_ID.octets());
+    // Unknown transitive: Optional(0x80)|Transitive(0x40), Partial(0x20) NOT
+    // set — the exact case this test needs and the typed encoder cannot
+    // produce.
+    attrs.push(FLAGS_OPTIONAL_TRANSITIVE);
+    attrs.push(UNKNOWN_TRANSITIVE_TYPE);
+    attrs.push(u8::try_from(UNKNOWN_TRANSITIVE_VALUE.len()).expect("value fits in one byte"));
+    attrs.extend_from_slice(&UNKNOWN_TRANSITIVE_VALUE);
+    // Unknown non-transitive: Optional(0x80) only — the negative control.
+    attrs.push(FLAGS_OPTIONAL_NONTRANSITIVE);
+    attrs.push(UNKNOWN_NONTRANSITIVE_TYPE);
+    attrs.push(u8::try_from(UNKNOWN_NONTRANSITIVE_VALUE.len()).expect("value fits in one byte"));
+    attrs.extend_from_slice(&UNKNOWN_NONTRANSITIVE_VALUE);
+
+    let mut body = vec![0u8, 0]; // withdrawn_len = 0
+    body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&attrs);
+
+    let prefix: Ipv4Addr = TEST_PREFIX
+        .split('/')
+        .next()
+        .expect("prefix literal has an address part")
+        .parse()
+        .expect("valid prefix address");
+    body.push(24); // /24, matching TEST_PREFIX
+    body.extend_from_slice(&prefix.octets()[..3]);
+
+    let mut frame = MARKER_VALID.to_vec();
+    let total_len = HEADER_LEN + u16::try_from(body.len()).expect("body always fits in u16");
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.push(MSG_TYPE_UPDATE);
+    frame.extend_from_slice(&body);
+    frame
 }
 
 async fn observer(stream: TcpStream) {

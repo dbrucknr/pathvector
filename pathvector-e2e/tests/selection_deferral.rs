@@ -26,7 +26,22 @@ use pathvector_e2e::{
 /// receives it.
 #[tokio::test]
 async fn route_withheld_from_observer_until_deferral_timer_expires() {
-    const DEFERRAL_SECS: u16 = 8;
+    // The Selection_Deferral_Timer deadline is `daemon_start + DEFERRAL_SECS`
+    // (`daemon_start` captured when the pathvectord *process* starts, per
+    // `daemon/deferral.rs`), not relative to session Established — so the
+    // margin that matters here is DEFERRAL_SECS minus (container startup +
+    // healthchecks + both `wait_for_established` calls + `wait_for_route`)
+    // elapsed by the time the snapshot assertion below runs. A tighter
+    // value (previously 8s) left too little headroom on a loaded/slow CI
+    // runner: if that margin is exhausted, the timer can force-release
+    // before the snapshot check, turning this into a real (not
+    // false-positive) intermittent failure rather than a deterministic
+    // proof of the withheld state (flagged in PR #52 review). This remains
+    // a wall-clock mitigation, not a true fix — a fully deterministic
+    // version would need an explicit synchronization point (e.g. a
+    // gRPC-exposed deferral-pending status) instead of inferring "still
+    // pending" from a single timed snapshot; see TODO.md.
+    const DEFERRAL_SECS: u16 = 20;
     let mut h = SelectionDeferralHarness::new("withhold-eor", DEFERRAL_SECS).await;
 
     // Loc-RIB is unaffected by deferral — the route must appear promptly
@@ -126,7 +141,12 @@ async fn restart_time_zero_peer_blocks_release_until_its_own_eor_arrives() {
 /// must not be mistaken for satisfying `source_b`'s still-outstanding one.
 #[tokio::test]
 async fn fast_eor_from_one_source_does_not_release_wait_set_for_the_other() {
-    const DEFERRAL_SECS: u16 = 8;
+    // Same wall-clock-margin reasoning as
+    // `route_withheld_from_observer_until_deferral_timer_expires` above —
+    // and this harness starts a fourth container (two sources instead of
+    // one) before its own snapshot check, so the margin was even tighter
+    // at the previous value of 8s.
+    const DEFERRAL_SECS: u16 = 20;
     let mut h =
         TwoSourceSelectionDeferralHarness::new("eor-immediately", "withhold-eor", DEFERRAL_SECS)
             .await;

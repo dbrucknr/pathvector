@@ -457,6 +457,16 @@ not fixed here):
   store non-transitive attributes failed it with
   `nontransitive_present=true`; both reverted (clean no-op diffs) and
   reconfirmed passing.
+  **Fixed 2026-08-05** (PR #52 code review): the "Partial-bit-setting
+  logic" real-teeth check above was itself confounded — `source`'s UPDATE
+  was built through `pathvector_session`'s typed encoder, which
+  unconditionally ORs Partial into any Optional+Transitive
+  `PathAttribute::Unknown` regardless of caller, so `source` never
+  actually sent Partial=0 on the wire in the first place; the test proved
+  relay/storage/value-preservation but not the clear-to-set transition
+  itself. Fixed by hand-rolling `source`'s raw UPDATE bytes directly
+  (mirroring `mock_bgp_fault_peer.rs`'s `attribute_flags_conflict_frame()`
+  pattern) so Partial is genuinely clear on the wire the source sends.
 
 **14. RFC 4271 §6.2/§6.3 error-handling gaps found by systematic clause
 audit** — found 2026-07-16, same `RFC_AUDIT.md` pass as #12/#13 above
@@ -946,6 +956,25 @@ areas the existing test suite never covered:
   single peer's EOR released the whole wait-set, confirmed the new test
   failed with the exact diagnostic, reverted (clean no-op diff) and
   reconfirmed passing.
+  **Flagged by code review on PR #52** (both Selection Deferral e2e tests):
+  the Selection_Deferral_Timer's deadline is `daemon_start + DEFERRAL_SECS`
+  (`daemon_start` captured at pathvectord *process* startup, not at session
+  Established — see `daemon/deferral.rs::new`), but each test's "route not
+  yet released" snapshot check runs only after 3-4 containers have started,
+  passed healthchecks, and 2-3 BGP sessions have reached Established — all
+  wall-clock time eating into the DEFERRAL_SECS margin before the timer
+  itself force-releases. At `DEFERRAL_SECS = 8` (both tests' original
+  value), a slow/loaded CI runner could exhaust that margin, turning the
+  snapshot assertion into a real (not spurious) intermittent failure — the
+  tests passed in the actual PR #52 CI run, but the synchronization is not
+  deterministic. **Mitigated 2026-08-05**: raised both tests'
+  `DEFERRAL_SECS` to 20 for more headroom, but this only reduces the
+  probability of the race, it does not eliminate it. **Not yet fixed**: a
+  fully deterministic version needs an explicit synchronization point
+  instead of inferring "still pending" from a timed snapshot — e.g. expose
+  `SelectionDeferral`'s pending/released state via gRPC (a new
+  `GetDeferralStatus`-shaped RPC) so the test can poll for "still deferred"
+  directly rather than racing the timer's own wall clock.
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world

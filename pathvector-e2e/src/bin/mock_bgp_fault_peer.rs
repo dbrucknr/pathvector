@@ -86,7 +86,7 @@
 //!   does not start with an AS_CONFED_SEQUENCE... from a neighbor that is
 //!   located in the same confederation." This fault peer is configured on
 //!   pathvectord's side as `confederation_member = true` (see
-//!   [`FaultInjectionHarness::new_confed_member`]), so a first UPDATE with a
+//!   `FaultInjectionHarness::new_confed_member`), so a first UPDATE with a
 //!   correct leading `AS_CONFED_SEQUENCE` is accepted normally, then a
 //!   second UPDATE for the same prefix whose AS_PATH's first segment is an
 //!   ordinary `AS_SEQUENCE` instead is malformed — treat-as-withdraw per RFC
@@ -119,7 +119,7 @@
 //!   scenario doubles as this project's first Docker/testcontainers-level
 //!   proof of it (`pathvector-session`'s own coverage is a real-TCP
 //!   loopback test within a single process, not a separate container).
-//!   Run via [`FaultInjectionHarness::new`], which always pairs the fault
+//!   Run via `FaultInjectionHarness::new`, which always pairs the fault
 //!   peer with a well-behaved GoBGP control peer — this scenario's test
 //!   also asserts that control peer's session is unaffected.
 
@@ -1513,7 +1513,7 @@ async fn rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream: TcpStr
 /// confederation identifier itself, not just via a Member-AS Number (e.g.
 /// relayed out to a genuine external peer and back in through a different
 /// Member-AS). This peer is configured plain `External` on pathvectord's
-/// side (see [`FaultInjectionHarness::new_with_confederation_id`]) — the
+/// side (see `FaultInjectionHarness::new_with_confederation_id`) — the
 /// check applies to AS_PATH content regardless of peer type. A well-formed
 /// UPDATE whose AS_PATH contains the confederation identifier must be
 /// silently dropped (the announced NLRI never reaches Loc-RIB), while the

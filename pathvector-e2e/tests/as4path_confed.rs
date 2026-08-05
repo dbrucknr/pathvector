@@ -7,8 +7,16 @@
 //! "are declared invalid for the AS4_PATH attribute and MUST NOT be
 //! included") had unit coverage only. Nothing previously proved the real
 //! wire codec on both ends produces the expected shape: a confed segment
-//! surviving the wire AS_PATH toward a fellow `ConfedMember` peer (RFC 5065
+//! surviving the AS_PATH value toward a fellow `ConfedMember` peer (RFC 5065
 //! §5.3 — the opposite of the `External` case) while AS4_PATH excludes it.
+//!
+//! **Scope note (flagged by code review on PR #52):** this proves the
+//! *logical* AS_TRANS-substitution/AS4_PATH-split decision and the
+//! confed-segment inclusion/exclusion split, triggered by the observer not
+//! negotiating `FourByteAsn` — it does **not** prove genuine two-octet-
+//! per-ASN wire encoding, since pathvectord's AS_PATH encoder always writes
+//! 4 bytes per ASN regardless of negotiation (a separate, still-open gap;
+//! see `mock_bgp_as4path_peer.rs`'s module doc and `TODO.md`).
 
 use std::time::Duration;
 
@@ -18,12 +26,14 @@ use pathvector_e2e::{
 
 /// A four-byte-ASN-capable confed-member source announces a route whose
 /// AS_PATH leads with `AS_CONFED_SEQUENCE` followed by a 4-byte ASN.
-/// pathvectord relays it to a two-byte-ASN-only fellow confed-member
-/// observer. The observer's own decode of the real wire bytes must show:
-/// the confed segment still present in AS_PATH (RFC 5065 §5.3), AS_TRANS
-/// substituted for the 4-byte ASN in AS_PATH (RFC 6793 §4), AS4_PATH
-/// present and carrying the real 4-byte ASN, and AS4_PATH excluding the
-/// confed segment entirely (RFC 6793 §§3, 4.2.2).
+/// pathvectord relays it to a fellow confed-member observer that hasn't
+/// negotiated `FourByteAsn`. The observer's own decode of the real wire
+/// bytes must show: the confed segment still present in the AS_PATH value
+/// (RFC 5065 §5.3), AS_TRANS substituted for the 4-byte ASN in AS_PATH
+/// (RFC 6793 §4), AS4_PATH present and carrying the real 4-byte ASN, and
+/// AS4_PATH excluding the confed segment entirely (RFC 6793 §§3, 4.2.2).
+/// See the module doc's scope note: this does not exercise genuine
+/// two-octet-per-ASN wire encoding, only the logical downgrade decision.
 #[tokio::test]
 async fn as4_path_excludes_confed_segment_while_wire_as_path_keeps_it() {
     let mut h = As4PathConfedHarness::new().await;
