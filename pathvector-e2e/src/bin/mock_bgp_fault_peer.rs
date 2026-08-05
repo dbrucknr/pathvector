@@ -81,6 +81,47 @@
 //!   sent as the *only* UPDATE, with no announced NLRI at all. RFC 7606
 //!   §5.2: treat-as-withdraw would be a no-op here, so this must instead
 //!   reset the session with a `MalformedAsPath` NOTIFICATION.
+//! - `rfc5065-confed-member-wrong-first-segment-with-nlri` — RFC 5065 §5
+//!   condition 2: "a UPDATE... received... with an AS_PATH attribute that
+//!   does not start with an AS_CONFED_SEQUENCE... from a neighbor that is
+//!   located in the same confederation." This fault peer is configured on
+//!   pathvectord's side as `confederation_member = true` (see
+//!   `FaultInjectionHarness::new_confed_member`), so a first UPDATE with a
+//!   correct leading `AS_CONFED_SEQUENCE` is accepted normally, then a
+//!   second UPDATE for the same prefix whose AS_PATH's first segment is an
+//!   ordinary `AS_SEQUENCE` instead is malformed — treat-as-withdraw per RFC
+//!   7606 §3(e) since the UPDATE has reachable NLRI.
+//! - `rfc5065-confed-member-wrong-first-segment-no-nlri` — same malformed
+//!   AS_PATH as above, but sent as the *only* UPDATE, with no announced
+//!   NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op here, so
+//!   this must instead reset the session with a `MalformedAsPath`
+//!   NOTIFICATION.
+//! - `confederation-id-loop` — a real OPEN/KEEPALIVE handshake to
+//!   Established, then a single well-formed UPDATE whose AS_PATH contains
+//!   the confederation identifier (RFC 5065 §4: a route can loop back into
+//!   the confederation via the identifier itself, e.g. relayed out to a
+//!   genuine external peer and back in through a different Member-AS).
+//!   This peer is configured plain `External` on pathvectord's side — the
+//!   check applies to AS_PATH content regardless of peer type. Unlike every
+//!   other scenario above, this UPDATE is not malformed at all: the loop is
+//!   silently dropped (the announced NLRI never reaches Loc-RIB), and the
+//!   session stays Established throughout. Tests policy-violating-but-
+//!   well-formed input, not corrupted wire format — same shape as
+//!   `ebgp-local-pref`.
+//! - `unrecognized-well-known-attribute` — a real OPEN/KEEPALIVE handshake to
+//!   Established, then a single UPDATE carrying the mandatory well-known
+//!   attributes plus one extra `PathAttribute::Unknown` with the Optional
+//!   bit clear (RFC 4271 §6.3: "Unrecognized Well-known Attribute" — a
+//!   sender claiming an unrecognized attribute type is well-known, not
+//!   optional). Unlike the confederation/LOCAL_PREF scenarios above, this
+//!   is a session-reset case (RFC 4271 §6.3's original, unamended
+//!   procedure — RFC 7606 does not touch this specific error), so this
+//!   scenario doubles as this project's first Docker/testcontainers-level
+//!   proof of it (`pathvector-session`'s own coverage is a real-TCP
+//!   loopback test within a single process, not a separate container).
+//!   Run via `FaultInjectionHarness::new`, which always pairs the fault
+//!   peer with a well-behaved GoBGP control peer — this scenario's test
+//!   also asserts that control peer's session is unaffected.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -89,7 +130,7 @@ use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{
     BgpMessage, Capability, GracefulRestartFamily, MpReachNlri, NotificationError, OpenMessage,
-    OpenMsgError, PathAttribute, Prefix, UpdateMessage,
+    OpenMsgError, PathAttribute, Prefix, UpdateMessage, UpdateMsgError,
 };
 use pathvector_types::{AfiSafi, AsPath, AsPathSegment, Asn, NextHop, Origin, Role};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -139,6 +180,16 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "role-differing-duplicates" => role_differing_duplicates_open(stream).await,
         "rfc5065-confed-segment-with-nlri" => rfc5065_confed_segment_with_nlri_update(stream).await,
         "rfc5065-confed-segment-no-nlri" => rfc5065_confed_segment_no_nlri_update(stream).await,
+        "rfc5065-confed-member-wrong-first-segment-with-nlri" => {
+            rfc5065_confed_member_wrong_first_segment_with_nlri_update(stream).await;
+        }
+        "rfc5065-confed-member-wrong-first-segment-no-nlri" => {
+            rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream).await;
+        }
+        "confederation-id-loop" => confederation_id_loop_update(stream).await,
+        "unrecognized-well-known-attribute" => {
+            unrecognized_well_known_attribute_update(stream).await;
+        }
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -1235,7 +1286,431 @@ async fn rfc5065_confed_segment_no_nlri_update(stream: TcpStream) {
             msg = framed.next() => {
                 match msg {
                     Some(Ok(BgpMessage::Notification(n))) => {
-                        println!("received NOTIFICATION as expected: {n:?}");
+                        println!("received NOTIFICATION: {n:?}");
+                        if matches!(
+                            n.error,
+                            NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath)
+                        ) {
+                            println!("SCENARIO_OUTCOME: malformed_as_path_notification_received");
+                        } else {
+                            println!("SCENARIO_OUTCOME: unexpected_notification_received");
+                        }
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return,
+                }
+            }
+        }
+    }
+}
+
+/// RFC 5065 §5 condition 2: a peer pathvectord is configured to treat as a
+/// fellow confederation Member-AS (`confederation_member = true`) must lead
+/// its AS_PATH with an `AS_CONFED_SEQUENCE` segment. A first, well-formed
+/// UPDATE establishes this baseline (leading `AS_CONFED_SEQUENCE`, accepted
+/// normally), then a second UPDATE for the same prefix swaps in an ordinary
+/// `AS_SEQUENCE` as the first segment instead — malformed per condition 2.
+/// Since the UPDATE carries reachable NLRI, RFC 7606 §3(e) reclassifies
+/// this as treat-as-withdraw — the session must stay Established.
+async fn rfc5065_confed_member_wrong_first_segment_with_nlri_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Well-formed per condition 2: leading AS_CONFED_SEQUENCE, from a peer
+    // configured as confederation_member = true.
+    let clean = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_segments(vec![AsPathSegment::ConfedSequence(
+                vec![Asn::new(u32::from(FAULT_PEER_AS))],
+            )])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(clean)).await.is_err() {
+        return;
+    }
+    println!("sent clean UPDATE (leading AS_CONFED_SEQUENCE) for {TEST_PREFIX}");
+
+    // Give the test a real window to observe the clean route present in
+    // Loc-RIB before it gets withdrawn below.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // RFC 5065 §5 condition 2: an ordinary AS_SEQUENCE as the first segment
+    // from a confed-member peer is malformed. Well-formed as a wire message
+    // — the fault is purely relational (this peer IS configured as a fellow
+    // Member-AS on pathvectord's side, unlike the condition-1 scenarios).
+    let malformed = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_segments(vec![AsPathSegment::Sequence(vec![
+                Asn::new(u32::from(FAULT_PEER_AS)),
+            ])])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(malformed)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE with AS_SEQUENCE-first AS_PATH from a confed-member peer for {TEST_PREFIX}"
+    );
+
+    // Hold the session open so the test can observe the withdrawal without
+    // racing a session teardown — and to prove the session itself survives
+    // (RFC 7606 §3(e) treat-as-withdraw, not a NOTIFICATION/session reset).
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// RFC 5065 §5 condition 2 again, but sent as the *only* UPDATE with no
+/// announced NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op
+/// with no NLRI to withdraw, so this must instead reset the session with a
+/// `MalformedAsPath` NOTIFICATION.
+async fn rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream: TcpStream) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Give the test a real window to observe Established before the fault
+    // below resets it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let malformed_no_nlri = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_segments(vec![AsPathSegment::Sequence(vec![
+                Asn::new(u32::from(FAULT_PEER_AS)),
+            ])])),
+        ],
+        announced: vec![],
+    };
+    if framed
+        .send(BgpMessage::Update(malformed_no_nlri))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    println!(
+        "sent UPDATE with AS_SEQUENCE-first AS_PATH (confed-member peer) and no reachable NLRI"
+    );
+
+    // Keep sending our own KEEPALIVEs (same 1s cadence and reasoning as
+    // `duplicate_mp_reach_update`) so a broken fix that leaves the session
+    // alive shows up as "no NOTIFICATION arrives" rather than an unrelated
+    // hold-timer expiry.
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if framed.send(BgpMessage::Keepalive).await.is_err() {
+                    return;
+                }
+                ticks += 1;
+                if ticks > 60 {
+                    return;
+                }
+            }
+            msg = framed.next() => {
+                match msg {
+                    Some(Ok(BgpMessage::Notification(n))) => {
+                        println!("received NOTIFICATION: {n:?}");
+                        if matches!(
+                            n.error,
+                            NotificationError::UpdateMessage(UpdateMsgError::MalformedAsPath)
+                        ) {
+                            println!("SCENARIO_OUTCOME: malformed_as_path_notification_received");
+                        } else {
+                            println!("SCENARIO_OUTCOME: unexpected_notification_received");
+                        }
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return,
+                }
+            }
+        }
+    }
+}
+
+/// RFC 5065 §4: a route can loop back into the confederation via the
+/// confederation identifier itself, not just via a Member-AS Number (e.g.
+/// relayed out to a genuine external peer and back in through a different
+/// Member-AS). This peer is configured plain `External` on pathvectord's
+/// side (see `FaultInjectionHarness::new_with_confederation_id`) — the
+/// check applies to AS_PATH content regardless of peer type. A well-formed
+/// UPDATE whose AS_PATH contains the confederation identifier must be
+/// silently dropped (the announced NLRI never reaches Loc-RIB), while the
+/// session itself stays Established throughout.
+async fn confederation_id_loop_update(stream: TcpStream) {
+    /// Kept in sync manually with `CONFEDERATION_ID` in
+    /// `pathvector-e2e/src/lib.rs` — there is no shared crate boundary
+    /// between the mock binary and the harness.
+    const CONFEDERATION_ID: u32 = 64_512;
+
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    let update = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![
+                Asn::new(u32::from(FAULT_PEER_AS)),
+                Asn::new(CONFEDERATION_ID),
+            ])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(update)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE with confederation identifier ({CONFEDERATION_ID}) in AS_PATH for {TEST_PREFIX}"
+    );
+
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// RFC 4271 §6.3 "Unrecognized Well-known Attribute": an unrecognized
+/// attribute type with the Optional bit clear (the sender is claiming it is
+/// well-known) must reset the session with NOTIFICATION(UPDATE Error,
+/// subcode 2), Data = the unrecognized attribute (type, length, value) — not
+/// silently accepted as `PathAttribute::Unknown` the way an unrecognized
+/// *optional* attribute would be.
+#[allow(clippy::too_many_lines)]
+async fn unrecognized_well_known_attribute_update(stream: TcpStream) {
+    /// Optional bit clear, Transitive bit set — "well-known" per RFC 4271
+    /// §4.3's flag semantics. Matches the flags used by
+    /// `pathvector-session`'s own
+    /// `test_unrecognized_well_known_attribute_is_session_reset`.
+    const FLAG_TRANSITIVE_ONLY: u8 = 0x40;
+    const UNRECOGNIZED_TYPE_CODE: u8 = 210;
+    const UNRECOGNIZED_VALUE: [u8; 3] = [1, 2, 3];
+
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    // Give the e2e test a real window to observe this session as
+    // Established (via gRPC) before the fault below resets it — same
+    // reasoning as `duplicate_mp_reach_update`'s identical sleep.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let update = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(u32::from(
+                FAULT_PEER_AS,
+            ))])),
+            PathAttribute::NextHop(FAULT_PEER_BGP_ID),
+            PathAttribute::Unknown {
+                flags: FLAG_TRANSITIVE_ONLY,
+                type_code: UNRECOGNIZED_TYPE_CODE,
+                value: UNRECOGNIZED_VALUE.to_vec(),
+            },
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+    if framed.send(BgpMessage::Update(update)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent UPDATE with unrecognized well-known attribute (type {UNRECOGNIZED_TYPE_CODE}, \
+         Optional bit clear)"
+    );
+
+    // Same 1s-keepalive reasoning as `duplicate_mp_reach_update`: a broken
+    // fix that leaves the session alive must show up as "no NOTIFICATION
+    // arrives," not an unrelated hold-timer expiry.
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if framed.send(BgpMessage::Keepalive).await.is_err() {
+                    return;
+                }
+                ticks += 1;
+                if ticks > 60 {
+                    return;
+                }
+            }
+            msg = framed.next() => {
+                match msg {
+                    Some(Ok(BgpMessage::Notification(n))) => {
+                        println!("received NOTIFICATION: {n:?}");
+                        let correct_error = matches!(
+                            n.error,
+                            NotificationError::UpdateMessage(
+                                UpdateMsgError::UnrecognizedWellKnownAttribute
+                            )
+                        );
+                        let expected_data = {
+                            // `UNRECOGNIZED_VALUE`'s length is fixed at compile time
+                            // ([u8; 3]), so the length byte is a literal, not a cast.
+                            let mut d = vec![UNRECOGNIZED_TYPE_CODE, 3u8];
+                            d.extend_from_slice(&UNRECOGNIZED_VALUE);
+                            d
+                        };
+                        let correct_data = n.data == expected_data;
+                        if correct_error && correct_data {
+                            println!(
+                                "SCENARIO_OUTCOME: unrecognized_well_known_attribute_notification_received"
+                            );
+                        } else {
+                            println!(
+                                "SCENARIO_OUTCOME: unexpected_notification_received \
+                                 (correct_error={correct_error}, correct_data={correct_data})"
+                            );
+                        }
                         return;
                     }
                     Some(Ok(_)) => {}

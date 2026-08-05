@@ -4,6 +4,492 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
+
+Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s
+fixed mock-EOR sleep with a real control-socket signal, and its doc
+comment claimed this made the test's sequencing "fully deterministic."
+Re-review found that claim too strong: pathvectord's own
+`Selection_Deferral_Timer` is a second, independent clock anchored at
+daemon *process* startup (`daemon/deferral.rs::new`), running the entire
+time the harness spends starting three containers and performing two
+sequential `wait_for_established` calls plus `wait_for_route`. At the
+previous `DEFERRAL_SECS = 30`, sufficiently slow harness startup could
+still let the daemon's own timer force-release before the test's negative
+check ever ran — a real, if narrower, residual gap the round-2 fix's own
+comment didn't account for.
+
+Since the EOR release is now test-controlled, the happy path's runtime no
+longer depends on `DEFERRAL_SECS` at all — raising it costs nothing.
+Raised to 120s (comfortably exceeding any realistic harness-startup time)
+and corrected the doc comment to state precisely what's now deterministic
+(the mock's own EOR release) versus what still has a margin, however
+generous (the daemon's independent timer not auto-firing first). Full
+`selection_deferral` suite (3/3) reconfirmed passing, with the fixed test
+still completing in ~7s regardless of the higher ceiling.
+
+## 2026-08-05 (PR #52 code review, round 2: a distinct synchronization bug survived the round-1 fix)
+
+Round-1 review response (below) raised `DEFERRAL_SECS` from 8 to 20 in both
+Selection Deferral e2e tests to give more margin against harness-startup
+wall-clock overhead. Re-review found this did not close the gap for
+`restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`: that
+test's race is against `mock_bgp_gr_peer.rs`'s own fixed 3-second
+`EOR_DELAY` (started the instant the mock announces its route, right
+after *its own* session establishes), not against
+`SelectionDeferral`'s `DEFERRAL_SECS` timer (which starts at daemon
+*process* startup). The harness starts the mock source's session first,
+then separately waits for a second (observer) session to establish before
+the test's negative assertion runs — if that second session takes longer
+than 3 seconds to come up (a real possibility under load), the mock's EOR
+had already fired before the test ever checked for its absence. Raising
+`DEFERRAL_SECS` doesn't touch this because it's a different clock
+entirely.
+
+Fixed properly per the reviewer's suggested approach (real synchronization
+point, not a longer wall-clock guess): `mock_bgp_gr_peer.rs`'s
+`restart-time-zero-delayed-eor` scenario now blocks on an explicit release
+signal (`tokio::sync::Notify`, fed by a small control-port listener on
+`EOR_RELEASE_CONTROL_PORT` = 1790) instead of a fixed sleep. The test calls
+`SelectionDeferralHarness::release_delayed_eor()` — added to
+`pathvector-e2e/src/lib.rs` — only after its own negative ("not yet
+released") check has already run, so the mock is deterministically
+guaranteed to still be blocked at that point; there is no wall-clock
+window to lose a race against at all.
+
+First implementation of `release_delayed_eor()` connected directly from
+the test process to the container's docker-network IP via
+`tokio::net::TcpStream::connect` — this failed with a connection timeout
+on Docker Desktop for macOS, since the host has no route to a container's
+internal bridge-network IP there (containers run inside a VM). Fixed by
+going through `docker exec <container> nc -z 127.0.0.1 1790` instead,
+matching every other cross-container signal already in this file (e.g.
+`external_withdraw`'s `docker exec gobgp ...` pattern) — this is a
+platform constraint of Docker Desktop specifically, not something bare-Linux
+Docker hosts (including this project's own CI runners) would necessarily
+hit, but the `docker exec` approach works identically on both.
+
+Real-teeth verified: temporarily made `recompute_selection_deferral`
+source its `restart_time > 0`-only peer set (`gr_capable_peers`) instead
+of the full GR-advertised set (`gr_advertised_peers`) — reproducing the
+exact PR #50 P1 regression this test guards against — confirmed the test
+failed with the route reaching the observer immediately, reverted (clean
+no-op diff) and reconfirmed passing. Full targeted regression check
+(`selection_deferral`, `unknown_transitive_attribute`, `as4path_confed`,
+`fault_injection`, `confederation` — 32 tests) green.
+
+## 2026-08-05 (PR #52 code review: fix Docs CI + 3 test-quality gaps)
+
+External code review of PR #52 (the round-2 e2e coverage gaps below) found
+a broken Docs CI job plus three real coverage/robustness issues in that
+same PR's new tests. All four addressed before merge.
+
+### [pathvector-e2e] Docs CI failure: broken intra-doc links from a `bin` target to the lib crate
+
+`mock_bgp_fault_peer.rs` (a `[[bin]]` target in the `pathvector-e2e`
+package) had three doc comments referencing `[`FaultInjectionHarness::*`]`
+— a type defined in the package's own `lib.rs`. Rustdoc's intra-doc-link
+resolution operates per compilation unit; a bin target doesn't
+automatically have the sibling lib crate's items in scope for link
+resolution unless explicitly `use`d, so `cargo doc --workspace --no-deps`
+(the CI `Docs` job, `-D warnings`) failed with three `unresolved link`
+errors. Fixed by rendering the three references as plain inline code
+(no link brackets) instead of intra-doc links — matches Codex's suggested
+resolution; no other doc comments in the `pathvector-e2e` bin targets had
+the same issue.
+
+### [pathvector-e2e] Unknown-transitive-attribute test's "Partial bit clear on the wire" claim was never actually true
+
+`mock_bgp_attr_peer.rs`'s `source` role built its UPDATE through
+`pathvector_session`'s typed `BgpMessage`/`PathAttribute` encoder, which
+unconditionally ORs the Partial bit into any Optional+Transitive
+`PathAttribute::Unknown` on encode (RFC 4271 §5's forwarding rule, applied
+indiscriminately by that shared encoder regardless of whether the caller
+is originating or relaying). That means `source`'s own wire bytes already
+had Partial=1 before pathvectord ever received them — the test proved
+storage/relay/value-preservation and that the *observer* sees Partial set,
+but never proved pathvectord itself performs the clear-to-set transition,
+since the source could not produce a genuinely Partial-clear instance
+through that encoder in the first place.
+
+Fixed by hand-rolling `source`'s raw UPDATE frame bytes directly (mirroring
+`mock_bgp_fault_peer.rs`'s `attribute_flags_conflict_frame()` pattern —
+reclaim the raw `TcpStream` via `Framed::into_inner()`, write a
+purpose-built byte sequence), so the unknown-transitive attribute's
+Partial bit is genuinely clear on the wire the source sends. The
+observer's decode-side assertions are unchanged.
+
+### [pathvector-e2e] AS4_PATH confederation-stripping test overclaimed genuine two-byte wire interop
+
+The `two-byte-observer` role name and doc comments in
+`mock_bgp_as4path_peer.rs`/`as4path_confed.rs` implied the test proved
+interop with a real two-octet-per-ASN peer. Review found pathvectord's
+AS_PATH encoder (`encode_as_path_segments`) always writes 4 bytes per ASN
+regardless of capability negotiation — encode-side capability downgrade
+is implemented for AGGREGATOR only (a separate, already-tracked open gap;
+see `TODO.md`'s "No e2e test for AS_TRANS wire encoding against a real
+2-byte-only peer" item). The observer's own `BgpCodec` is likewise never
+switched into a genuine 2-byte decode mode, so it parses the (still
+4-byte-wide) wire bytes correctly by construction, not because real 2-byte
+interop was exercised.
+
+Rather than implementing full encode-side AS_PATH downgrade (a
+substantial, separately-scoped production feature), corrected the doc
+comments in both files plus this file's own RFC.md entries to state
+precisely what the test proves: the *logical* AS_TRANS-substitution/
+AS4_PATH-split decision is triggered correctly by capability
+non-negotiation, and the confed-segment inclusion/exclusion split between
+AS_PATH and AS4_PATH is correct. Real two-byte-only wire interop remains
+an explicitly open gap.
+
+### [pathvector-e2e] Selection Deferral e2e tests had a wall-clock race against real harness startup overhead
+
+Both Selection Deferral e2e tests' "route not yet released to the
+observer" snapshot assertion runs after 3-4 containers have started,
+passed healthchecks, and 2-3 BGP sessions have reached Established — but
+the Selection_Deferral_Timer's deadline is `daemon_start + DEFERRAL_SECS`
+(`daemon_start` captured at pathvectord *process* startup, not at session
+Established; see `daemon/deferral.rs::new`). At the original
+`DEFERRAL_SECS = 8`, a slow/loaded CI runner could exhaust that margin
+before the snapshot check runs, turning it into a real (not spurious)
+intermittent failure. The tests passed in PR #52's actual CI run, but the
+synchronization was not deterministic.
+
+Mitigated by raising both tests' `DEFERRAL_SECS` to 20 for more headroom
+against realistic harness-startup overhead — this reduces the probability
+of the race but does not eliminate it structurally; a fully deterministic
+fix would need an explicit synchronization point (e.g. a gRPC-exposed
+deferral-pending status) instead of inferring "still pending" from a
+timed snapshot. Filed as an explicit open item in `TODO.md` rather than
+implemented here, given the scope of adding a new gRPC surface.
+
+## 2026-08-05 (round 2: additional e2e coverage gaps, Codex follow-up review)
+
+### [pathvector-e2e] PR #48's "exact NOTIFICATION" claim had no Docker-level proof, only a single-process real-TCP test
+
+The lowest-priority of the round-2 follow-ups per Codex's own ranking
+("its marginal value is lower than the three gaps above"), but still real
+coverage this project lacked: `pathvector-session`'s own RFC 4271 §6.3
+"Unrecognized Well-known Attribute" coverage
+(`test_raw_unrecognized_well_known_attribute_sends_real_notification_bytes`)
+proves the real wire codec on both ends, but as a raw-loopback-TCP test
+within a single process — it has no separate mock-peer container and no
+unaffected control peer running alongside it.
+
+Added an `unrecognized-well-known-attribute` scenario to
+`mock_bgp_fault_peer.rs` (real OPEN/KEEPALIVE handshake, then an UPDATE
+carrying the mandatory well-known attributes plus one
+`PathAttribute::Unknown` with the Optional bit clear) and
+`unrecognized_well_known_attribute_resets_session`
+(`pathvector-e2e/tests/fault_injection.rs`), which asserts, via the fault
+peer's `SCENARIO_OUTCOME:` log line, both the exact `NotificationError`
+variant and the exact Data field bytes (type, length, value) — plus that
+`FaultInjectionHarness`'s paired GoBGP control peer stays Established
+throughout.
+
+Real-teeth verified: temporarily disabled the `flags & FLAG_OPTIONAL == 0`
+check in `pathvector-session`'s `update.rs` decoder, confirmed the test
+failed (NOTIFICATION never arrived, `wait_for_docker_log` timed out after
+15s), reverted (clean no-op diff) and reconfirmed passing. Full
+`fault_injection` suite (20/20) regression-clean.
+
+### [pathvector-e2e] Selection Deferral wait-set must cover the full configured peer set, not just one peer's EOR
+
+A follow-up Codex review of the PR #50 gap closure (below) pointed out that
+the single-source `SelectionDeferralHarness` cannot distinguish "the
+wait-set correctly waits on every configured GR peer" from "the wait-set
+incorrectly releases as soon as any one peer sends EOR" — both produce
+identical observable behavior with only one GR peer configured. The
+underlying `daemon/deferral.rs::recompute` algorithm already iterates the
+full configured peer set correctly (a first design draft that only checked
+established peers was caught during planning review — see that module's
+doc comment), but nothing had proven this at the real-session level.
+
+Added an `eor-immediately` scenario to `mock_bgp_gr_peer.rs` (sends its EOR
+the instant the handshake completes, no route announced) and a
+`TwoSourceSelectionDeferralHarness` (`pathvector-e2e/src/lib.rs`) running
+two independent GR-capable mock peers plus a plain GoBGP observer. New test
+`fast_eor_from_one_source_does_not_release_wait_set_for_the_other`
+(`pathvector-e2e/tests/selection_deferral.rs`): one source sends its EOR
+immediately, the other (`withhold-eor`) never does; asserts the observer
+does not receive the route right after the fast EOR, and only receives it
+once the Selection_Deferral_Timer itself expires.
+
+Real-teeth verified: temporarily patched `SelectionDeferral::recompute` so
+that any single peer's EOR release the whole wait-set (ignoring the rest of
+the configured peer set), confirmed the new test failed with the exact
+diagnostic (route present at the observer immediately after the fast EOR,
+well before the timer deadline), reverted (`git diff --stat` confirmed a
+clean no-op diff) and reran green.
+
+### [pathvector-e2e] PR #49 unrecognized-transitive-attribute relay had no full-pipeline e2e coverage
+
+Codex's review of PR #49 found the existing coverage for RFC 4271 §5's
+unrecognized-transitive-attribute handling — accept, store, and re-forward
+with the Partial bit set — was decode-level and daemon-storage-level only.
+Nothing proved the complete decode → daemon storage → RIB →
+outbound-reconstruction → encode pipeline through a real relay, and a GoBGP
+CLI's rendered RIB text can't assert an exact re-encoded flags octet anyway.
+
+Added a new mock binary, `mock_bgp_attr_peer.rs`, playing either a `source`
+role (injects an unrecognized Optional+Transitive attribute with the
+Partial bit deliberately clear, plus an unrecognized Optional-only
+non-transitive attribute as a negative control) or an `observer` role
+(decodes pathvectord's re-advertised UPDATE with the real wire codec and
+logs a `SCENARIO_OUTCOME:` line). New `UnknownTransitiveAttrHarness`
+(`pathvector-e2e/src/lib.rs`) and test
+`unknown_transitive_attribute_relayed_with_partial_bit_set`
+(`pathvector-e2e/tests/unknown_transitive_attribute.rs`) assert the
+transitive attribute survives with its value unchanged and the Partial bit
+now set, while the non-transitive one never reaches the observer.
+
+Real-teeth verified in two independent places: (1) temporarily disabled
+`pathvector-session`'s Partial-bit-setting logic on re-encode — confirmed
+the test failed with `partial_bit_set=false`; (2) temporarily widened
+`pathvectord`'s attribute-storage guard to also store non-transitive
+unknown attributes — confirmed the test failed with
+`nontransitive_present=true`. Both reverted (clean no-op diffs) and
+reconfirmed passing.
+
+### [pathvector-e2e] RFC 5065 §5 condition 2 (confed-member peer, wrong-first-segment AS_PATH) had no e2e coverage
+
+The RFC 5065 confederation-member support PR added e2e coverage for §5
+condition 1 (an ordinary `External` peer sending a confederation segment),
+but condition 2 — a peer pathvectord is actually configured to treat as a
+fellow confederation Member-AS, whose AS_PATH doesn't lead with
+`AS_CONFED_SEQUENCE` — had none.
+
+Added two `mock_bgp_fault_peer.rs` scenarios
+(`rfc5065-confed-member-wrong-first-segment-with-nlri`/`-no-nlri`, mirroring
+condition 1's pair) and `FaultInjectionHarness::new_confed_member`, which
+configures pathvectord with a `confederation_id` and marks the fault peer
+`confederation_member = true` so it's genuinely classified as
+`PeerType::ConfedMember`. Also added `write_gobgp_config_confed_control`:
+once `confederation_id` is set, pathvectord presents that value — not its
+private Member-AS number — toward peers it classifies as `External` (RFC
+5065 §4.1(c)), so the plain control peer's GoBGP config needs a matching
+`peer-as` or it rejects pathvectord's OPEN with Bad Peer AS. Diagnosed via
+a temporary `RUST_LOG=debug` container env var before finding the real
+cause (not a pathvectord bug — a test-harness config mismatch).
+
+Real-teeth verified: disabled the `malformed_from_confed_member` check in
+`daemon/route.rs`, confirmed both new tests failed for the right reason,
+reverted (clean no-op diff) and reconfirmed passing. Full `fault_injection`
+suite (18/18) regression-clean.
+
+### [pathvector-e2e] RFC 5065 §5 no-NLRI session-reset tests only asserted "left Established"
+
+Codex noted `rfc5065_confed_segment_no_nlri_resets_session` and its
+condition-2 sibling (above) only checked that the session left
+`Established`, which would also false-pass on an unrelated disconnect
+(e.g. a hold-timer race) — not proof pathvectord actually sent the
+`MalformedAsPath` NOTIFICATION RFC 7606 §5.2 requires.
+
+Both `mock_bgp_fault_peer.rs` no-NLRI scenarios now log a
+`SCENARIO_OUTCOME:` line naming the exact NOTIFICATION subcode received;
+both tests now require `malformed_as_path_notification_received`
+specifically via `wait_for_docker_log`, matching the precedent set by
+`role_differing_duplicates_are_rejected`.
+
+Real-teeth verified: temporarily swapped the session-reset NOTIFICATION in
+`daemon/route.rs` to a different subcode (`MissingWellKnownAttribute`),
+confirmed both tests failed waiting for the expected log line, reverted
+(clean no-op diff) and reconfirmed passing.
+
+### [pathvector-e2e] RFC 6793 §4 / RFC 5065 §5.3 AS4_PATH confederation-stripping had no wire-level proof
+
+`pathvectord/src/outbound.rs`'s `as4.strip_confed_segments()` call (RFC 6793
+§§3, 4.2.2: confed segments "MUST NOT be included" in AS4_PATH) had unit
+coverage only. Nothing proved the real wire codec on both ends produces the
+expected shape: a confed segment surviving the downgraded wire AS_PATH
+toward a fellow `ConfedMember` peer (RFC 5065 §5.3 — the opposite of the
+`External` case) while AS4_PATH excludes it entirely.
+
+Added `mock_bgp_as4path_peer.rs` (a `confed-source` role advertising
+`FourByteAsn` that sends an UPDATE with AS_PATH = `[AS_CONFED_SEQUENCE,
+4-byte ASN]`; a `two-byte-observer` role that deliberately omits
+`FourByteAsn` so pathvectord downgrades that specific session, then decodes
+the real wire bytes it receives) and `As4PathConfedHarness` — both mock
+peers configured as fellow confederation Member-AS peers on pathvectord's
+side. New test
+`as4_path_excludes_confed_segment_while_wire_as_path_keeps_it`
+(`pathvector-e2e/tests/as4path_confed.rs`).
+
+Real-teeth verified: temporarily removed the `strip_confed_segments()`
+call, confirmed the test failed with `as4_path_excludes_confed_segments=false`,
+reverted (clean no-op diff) and reconfirmed passing. Also caught and fixed
+an overly-strict assertion of my own during development: pathvectord's
+`prepend_confed()` extends the existing leading `AS_CONFED_SEQUENCE` with
+its own Member-AS number rather than appending a new segment, so the
+source's own AS is not necessarily the *first* ASN in that segment — only
+still present within it.
+
+**Scope correction (PR #52 code review):** the write-up above and the
+`two-byte-observer` role name overclaimed genuine two-octet-per-ASN wire
+interop. Review found that pathvectord's AS_PATH encoder
+(`encode_as_path_segments`) always writes 4 bytes per ASN regardless of
+capability negotiation — encode-side capability downgrade is implemented
+for AGGREGATOR only, a separate, still-open gap (see `TODO.md`'s "No e2e
+test for AS_TRANS wire encoding against a real 2-byte-only peer" item).
+The observer's own `BgpCodec` is also never switched into a genuine 2-byte
+decode mode, so it parses the (still 4-byte-wide) wire bytes correctly by
+construction. What the test validly proves: pathvectord's *logical*
+decision to substitute AS_TRANS and split AS4_PATH out is triggered
+correctly by the peer not negotiating `FourByteAsn`, and the confed-segment
+inclusion/exclusion split between AS_PATH and AS4_PATH is correct. Real
+two-byte-only wire interop remains open. Doc comments in
+`mock_bgp_as4path_peer.rs`, `as4path_confed.rs`, and this file's `RFC.md`
+table row were corrected to state this scope precisely.
+
+### [pathvector-e2e] Confederation-identifier loop detection had no e2e coverage
+
+`daemon/route.rs`'s `has_loop` check — extending RFC 4271 §9.1.2 loop
+detection to also match the confederation identifier, not just `local_as`
+(RFC 5065 §4) — was unit-tested only.
+
+Added a `confederation-id-loop` scenario to `mock_bgp_fault_peer.rs` (a
+plain `External` peer sends a well-formed UPDATE whose AS_PATH contains the
+confederation identifier) and `FaultInjectionHarness::new_with_confederation_id`
+(confederation_id set on the daemon, fault peer stays `External` — the
+check applies to AS_PATH content regardless of peer type). New test
+`confederation_id_in_as_path_is_treated_as_loop_and_dropped` asserts the
+route never reaches pathvectord's own Loc-RIB while the session stays
+Established throughout.
+
+Real-teeth verified: disabled the confederation-ID half of `has_loop`,
+confirmed the test failed with the route present in Loc-RIB (AS_PATH
+visibly containing the confederation identifier), reverted (clean no-op
+diff) and reconfirmed passing. Full `fault_injection` suite (19/19)
+regression-clean.
+
+### [pathvector-e2e] Confederation withdrawal propagation had no e2e coverage
+
+The existing `ConfederationHarness` tests verify announcements and AS_PATH
+transforms crossing both confederation boundaries, but never withdrawal
+propagation — a route stuck in a peer's RIB after its source withdrew it
+would be a stale/leaked route, exactly the failure mode withdrawal
+propagation exists to prevent.
+
+Added `ConfederationHarness::external_withdraw()` and a new
+`wait_for_frr_rib_withdrawn` helper (mirroring `wait_for_frr_rib_entry`'s
+polling shape). New test
+`withdrawal_from_external_peer_propagates_to_confed_member`: the genuinely
+external GoBGP peer withdraws its route after it has already reached FRR
+(the fellow Member-AS) via pathvectord; asserts the route disappears from
+FRR's own RIB.
+
+Real-teeth verified: temporarily changed `propagate_prefix`'s
+`loc_rib.best() == None` branch (the code path that fires when a
+withdrawal empties Loc-RIB for a prefix) to swallow the withdrawal into
+`NoChange` instead of generating a real `Withdraw` decision, confirmed the
+test failed (timed out waiting for FRR to drop the route), reverted (clean
+no-op diff) and reconfirmed passing. Full `confederation` suite (4/4)
+regression-clean.
+
+### [pathvector-e2e] Confederation-specific attribute exceptions (LOCAL_PREF/NEXT_HOP/MED/NO_EXPORT_SUBCONFED) had no e2e coverage
+
+The `ConfederationHarness` suite proved AS_PATH transforms and withdrawal
+propagation but never exercised the four attribute-handling exceptions
+RFC 5065 §5.1/§5.2 and RFC 1997 carve out specifically for a
+`ConfedMember` peer (as opposed to plain `External`): LOCAL_PREF is
+accepted rather than ignored, NEXT_HOP is left unchanged by default,
+MED is not stripped, and `NO_EXPORT_SUBCONFED` (unlike plain `NO_EXPORT`)
+still blocks advertisement.
+
+Extended `route_from_external_relayed_to_confed_member_prepends_confed_sequence`
+with a NEXT_HOP assertion, and added `local_pref_survives_relay_from_confed_member`,
+`med_is_preserved_when_relayed_to_confed_member`, and
+`no_export_subconfed_suppresses_advertisement_to_confed_member`
+(`pathvector-e2e/tests/confederation.rs`), backed by two new
+`ConfederationHarness` methods (`external_announce_with_med`,
+`external_announce_no_export_subconfed`) and two new well-known-prefix
+constants in `pathvector-e2e/src/lib.rs`.
+
+Real-teeth verified independently for all four: LOCAL_PREF by narrowing
+`daemon/route.rs`'s accept guard back to `Internal`-only; NEXT_HOP by
+removing the `next_hop_self` gate on `prepare_outbound`'s `ConfedMember`
+branch; MED by widening `outbound.rs`'s `strip_med` to include
+`ConfedMember`; `NO_EXPORT_SUBCONFED` by narrowing
+`is_export_suppressed`'s check back to `External`-only. Each confirmed to
+fail for the stated reason, then reverted to a clean (`git diff --stat`-
+empty) diff and reconfirmed green. The MED assertion needed a second
+iteration: a first-draft `route.contains("50")` false-positived against
+the broken code because the external peer's own AS number (65099)
+contains "50" as a substring — fixed by matching the literal `"metric 50"`
+FRR renders for the real attribute, then re-verified RED/GREEN against the
+corrected assertion. Full `confederation` suite (7/7) regression-clean.
+
+## 2026-08-05 (e2e/integration test gaps identified by Codex review of PR #48 and PR #50)
+
+### [pathvector-session] PR #48 (docs-only) — one test's "real NOTIFICATION bytes on the wire" claim was inaccurate
+
+Review of PR #48 found that `test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+uses `MockTransport` and injects a pre-decoded `MalformedUpdate` directly —
+it proves the FSM picks the right NOTIFICATION given that input, but never
+exercises the actual byte-level decoder that classifies a raw attribute as
+"unrecognized well-known" in the first place, nor the NOTIFICATION's own
+wire encoding.
+
+Added `test_raw_unrecognized_well_known_attribute_sends_real_notification_bytes`
+to `pathvector-session/tests/transport.rs`: a hand-rolled raw UPDATE frame
+(Optional bit clear, Transitive bit set, unrecognized type code — RFC 4271
+§4.3) goes in over a real loopback TCP socket, decoded by the real
+`BgpCodec`, and the NOTIFICATION that comes back out is itself decoded by
+the real codec on the peer's side. Mirrors the existing
+`raw_update_with_attr`/`accept_and_handshake` pattern already used by the
+AGGREGATOR decoding tests in that file.
+
+Real-teeth verified: temporarily disabled the RFC 4271 §6.3
+unrecognized-well-known-attribute check, confirmed the new test failed (the
+attribute silently fell through as `Unknown`, no NOTIFICATION sent),
+restored and reran green. Full transport integration suite (19 tests)
+passes.
+
+### [pathvector-e2e] PR #50 — RFC 4724 §4.1 Selection_Deferral_Timer had no real end-to-end coverage
+
+Review of PR #50 found that its four "integration" tests all operate
+directly on `DaemonState`, bypassing TOML config parsing, real OPEN
+capability negotiation, receiving an actual wire-encoded EOR, the
+`tokio::select!` timer branch in `daemon/mod.rs`, and delivery of the
+catch-up dump over a real BGP session. The existing Docker e2e suite passed
+throughout PR #50 but never configured `selection_deferral_time` at all, so
+it supplied regression coverage without ever exercising the new feature.
+
+Added a new mock binary, `mock_bgp_gr_peer.rs` (+ `mock-bgp-gr-peer` Docker
+stage, Justfile target, and CI step, mirroring `mock_bgp_fault_peer`'s
+established pattern), with two scenarios: `withhold-eor` (advertises GR
+with a nonzero `restart_time`, announces a route, then never sends EOR) and
+`restart-time-zero-delayed-eor` (advertises GR with `restart_time == 0` —
+RFC 4724 §3's EOR-only mode — announces the same route, then sends EOR
+after a fixed delay). `SelectionDeferralHarness` (pathvectord + this mock
+as the GR-capable "source" + a plain GoBGP "observer") and
+`pathvector-e2e/tests/selection_deferral.rs`'s two tests validate the full
+path Codex asked for:
+
+- `route_withheld_from_observer_until_deferral_timer_expires`: the route
+  reaches pathvectord's own Loc-RIB immediately (deferral is scoped to
+  outbound advertisement only) but is withheld from the observer until the
+  Selection_Deferral_Timer force-releases and flushes it.
+- `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`: a
+  `restart_time == 0` peer still blocks the wait-set until its own real EOR
+  arrives (not exempted just because it claims no forwarding-state
+  preservation) — release happens well before a deliberately much longer
+  deferral deadline, distinguishing the wait-set-satisfied path from the
+  timer-expiry path. This is exactly PR #50's own P1 fix (EOR-only GR peers
+  must stay in the deferral wait-set), now proven over a real session.
+
+Real-teeth verified both: reverted PR #50's P1 fix
+(`gr_advertised_peers` insertion gated on `peer_gr_time.is_some()` instead
+of unconditionally on `peer_gr_advertised`), confirmed
+`restart_time_zero_peer_blocks_release_until_its_own_eor_arrives` failed
+(route reached the observer within ~1-2s, before the mock's 3s EOR delay);
+separately forced `SelectionDeferral::new` to always construct disabled,
+confirmed `route_withheld_from_observer_until_deferral_timer_expires`
+failed (route reached the observer immediately); restored both and reran
+green.
+
+---
+
 ## 2026-08-05 (RFC 5065: 4 blocking fixes from external code review of PR #51)
 
 ### [pathvectord, pathvector-session] External code review found four real gaps in the RFC 5065 Member-AS work below — all four confirmed against directly-fetched RFC text and fixed

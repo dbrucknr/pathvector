@@ -68,11 +68,13 @@ COPY proto/               proto/
 RUN if [ "$CARGO_PROFILE" = "release" ]; then \
         cargo build --release -p pathvectord -p pathvector-e2e \
             --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer \
-            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer; \
+            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer --bin mock_bgp_gr_peer \
+            --bin mock_bgp_attr_peer --bin mock_bgp_as4path_peer; \
     else \
         cargo build -p pathvectord -p pathvector-e2e \
             --bin pathvectord --bin mock_rtr_server --bin mock_bgp_peer --bin mock_bgp_dialer \
-            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer; \
+            --bin mock_bgp_fault_peer --bin mock_bgp_collision_peer --bin mock_bgp_gr_peer \
+            --bin mock_bgp_attr_peer --bin mock_bgp_as4path_peer; \
     fi
 
 # ── mock-rtr runtime ───────────────────────────────────────────────────────────
@@ -176,6 +178,104 @@ HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
     CMD nc -z 127.0.0.1 179 || exit 1
 
 ENTRYPOINT ["mock_bgp_fault_peer"]
+
+# ── mock-bgp-gr-peer runtime ────────────────────────────────────────────────────
+#
+# GracefulRestart-capable BGP peer for the pathvector-e2e RFC 4724 §4.1
+# Restarting-Speaker Selection_Deferral_Timer tests. Listens like
+# mock-bgp-peer, but on each connection advertises the GracefulRestart
+# capability and either withholds its End-of-RIB marker indefinitely or
+# sends it after a fixed delay, per the scenario CLI argument (see
+# src/bin/mock_bgp_gr_peer.rs). The scenario name is passed at
+# container-start time via `.with_cmd([scenario])`, mirroring
+# mock-bgp-fault-peer.
+
+FROM debian:bookworm-slim AS mock-bgp-gr-peer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_gr_peer /usr/local/bin/mock_bgp_gr_peer
+
+# 179 — BGP, container-to-container only, never mapped to host.
+# 1790 — EOR-release control signal for the restart-time-zero-delayed-eor
+# scenario only (see SelectionDeferralHarness::release_delayed_eor);
+# harmless no-op listener for every other scenario.
+EXPOSE 179 1790
+
+# The healthcheck only confirms the listener is bound — it passes regardless
+# of which scenario the container is running, since every scenario binds
+# :179 immediately at startup before any scenario-specific logic runs.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 179 || exit 1
+
+ENTRYPOINT ["mock_bgp_gr_peer"]
+
+# ── mock-bgp-attr-peer runtime ───────────────────────────────────────────────────
+#
+# Unrecognized-transitive-attribute relay pair for the pathvector-e2e RFC
+# 4271 §5 test: proves the complete decode → daemon storage → RIB →
+# outbound-reconstruction → encode pipeline, not just any one layer. Plays
+# either the "source" role (injects an UPDATE carrying an unrecognized
+# transitive attribute and an unrecognized non-transitive negative control)
+# or the "observer" role (decodes pathvectord's re-advertised UPDATE and
+# logs a SCENARIO_OUTCOME line), per the role CLI argument (see
+# src/bin/mock_bgp_attr_peer.rs). The role is passed at container-start time
+# via `.with_cmd([role])`, mirroring mock-bgp-gr-peer.
+
+FROM debian:bookworm-slim AS mock-bgp-attr-peer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_attr_peer /usr/local/bin/mock_bgp_attr_peer
+
+# 179 — BGP, container-to-container only, never mapped to host.
+EXPOSE 179
+
+# The healthcheck only confirms the listener is bound — it passes regardless
+# of which role the container is running, since both roles bind :179
+# immediately at startup before any role-specific logic runs.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 179 || exit 1
+
+ENTRYPOINT ["mock_bgp_attr_peer"]
+
+# ── mock-bgp-as4path-peer runtime ────────────────────────────────────────────────
+#
+# RFC 6793 §4 / RFC 5065 AS4_PATH confederation-stripping relay pair for the
+# pathvector-e2e test proving a confed segment survives the wire AS_PATH
+# toward a two-byte-ASN-only fellow Member-AS peer while AS4_PATH excludes
+# it. Plays either the "confed-source" role (advertises FourByteAsn, sends
+# an UPDATE with a leading AS_CONFED_SEQUENCE plus a 4-byte ASN) or the
+# "two-byte-observer" role (deliberately omits FourByteAsn, decodes
+# pathvectord's re-advertised UPDATE and logs a SCENARIO_OUTCOME line —
+# see src/bin/mock_bgp_as4path_peer.rs). The role is passed at
+# container-start time via `.with_cmd([role])`, mirroring mock-bgp-attr-peer.
+
+FROM debian:bookworm-slim AS mock-bgp-as4path-peer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CARGO_PROFILE=debug
+COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_as4path_peer /usr/local/bin/mock_bgp_as4path_peer
+
+# 179 — BGP, container-to-container only, never mapped to host.
+EXPOSE 179
+
+# The healthcheck only confirms the listener is bound — it passes regardless
+# of which role the container is running, since both roles bind :179
+# immediately at startup before any role-specific logic runs.
+HEALTHCHECK --interval=1s --timeout=3s --retries=30 \
+    CMD nc -z 127.0.0.1 179 || exit 1
+
+ENTRYPOINT ["mock_bgp_as4path_peer"]
 
 # ── mock-bgp-collision-peer runtime ─────────────────────────────────────────────
 #

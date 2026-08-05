@@ -453,6 +453,62 @@ async fn duplicate_mp_reach_nlri_resets_session() {
     assert_control_peer_established(&mut h).await;
 }
 
+/// RFC 4271 §6.3 "Unrecognized Well-known Attribute": an unrecognized
+/// attribute type with the Optional bit clear must reset the session with
+/// NOTIFICATION(UPDATE Error, subcode 2), Data = the unrecognized attribute
+/// (type, length, value). `pathvector-session`'s own coverage
+/// (`test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`)
+/// is a real-TCP loopback test within a single process; this is the first
+/// Docker/testcontainers-level proof of the same behavior, over the real
+/// wire codec end to end, alongside a well-behaved control peer that must
+/// stay unaffected (PR #48 gap, Codex follow-up review — lowest priority of
+/// the round-2 follow-ups, but still real coverage this project lacked).
+#[tokio::test]
+async fn unrecognized_well_known_attribute_resets_session() {
+    let mut h = FaultInjectionHarness::new("unrecognized-well-known-attribute").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: unrecognized_well_known_attribute_notification_received",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect(
+        "RFC 4271 §6.3: pathvectord must send a NOTIFICATION(UPDATE Error, \
+         UnrecognizedWellKnownAttribute) whose Data field is exactly the unrecognized \
+         attribute's (type, length, value)",
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = h
+            .client
+            .get_peer(IpAddr::from(fault_peer))
+            .await
+            .expect("get_peer(fault_peer) gRPC call succeeded");
+        if state.session_state != SessionState::Established {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "RFC 4271 §6.3: session with an unrecognized well-known attribute must leave \
+             Established within 15 s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Throughline: the fault must not have wedged the daemon or affected
+    // unrelated sessions — this is the "unaffected control peer" half of
+    // the Codex follow-up review's requested coverage.
+    assert_control_peer_established(&mut h).await;
+}
+
 /// RFC 5065 §5 condition 1: "It is an error for a BGP speaker to receive an
 /// UPDATE message with an AS_PATH attribute that contains AS_CONFED_SEQUENCE
 /// or AS_CONFED_SET segments from a neighbor that is not located in the same
@@ -501,6 +557,12 @@ async fn rfc5065_confed_segment_with_nlri_treated_as_withdraw_session_stays_up()
 /// `MalformedAsPath` NOTIFICATION — the one RFC 5065 §5 case (alongside the
 /// with-NLRI case above) that isn't treat-as-withdraw. Mirrors
 /// `duplicate_mp_reach_nlri_resets_session`'s polling shape.
+///
+/// Asserts on the mock's own decoded view of the NOTIFICATION, not just
+/// "left Established" — a session that drops for an unrelated reason (e.g.
+/// a hold-timer expiry racing the test) would also leave Established,
+/// which is exactly the false-pass shape `role_differing_duplicates_are_rejected`
+/// guards against with the same `wait_for_docker_log` pattern.
 #[tokio::test]
 async fn rfc5065_confed_segment_no_nlri_resets_session() {
     let mut h = FaultInjectionHarness::new("rfc5065-confed-segment-no-nlri").await;
@@ -512,6 +574,17 @@ async fn rfc5065_confed_segment_no_nlri_resets_session() {
     wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
         .await
         .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: malformed_as_path_notification_received",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect(
+        "RFC 7606 §5.2: pathvectord must send a MalformedAsPath NOTIFICATION for a \
+         malformed AS_PATH with no reachable NLRI",
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -527,6 +600,104 @@ async fn rfc5065_confed_segment_no_nlri_resets_session() {
             tokio::time::Instant::now() <= deadline,
             "RFC 7606 §5.2: session with a malformed AS_PATH and no reachable NLRI \
              must leave Established within 15 s, not stay up like the with-NLRI case"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Throughline: the fault must not have wedged the daemon or affected
+    // unrelated sessions.
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 5065 §5 condition 2: "a UPDATE... received... with an AS_PATH
+/// attribute that does not start with an AS_CONFED_SEQUENCE... from a
+/// neighbor that is located in the same confederation." Unlike condition 1
+/// (above), this fault peer IS configured as `confederation_member = true`
+/// (see [`FaultInjectionHarness::new_confed_member`]) — the fault is an
+/// ordinary AS_SEQUENCE-first AS_PATH from a peer pathvectord believes is a
+/// fellow Member-AS. Since the UPDATE carries reachable NLRI, RFC 7606
+/// §3(e) reclassifies this as treat-as-withdraw.
+#[tokio::test]
+async fn rfc5065_confed_member_wrong_first_segment_with_nlri_treated_as_withdraw_session_stays_up()
+{
+    let mut h = FaultInjectionHarness::new_confed_member(
+        "rfc5065-confed-member-wrong-first-segment-with-nlri",
+    )
+    .await;
+    assert_control_peer_established(&mut h).await;
+
+    // The first, clean UPDATE (leading AS_CONFED_SEQUENCE) must land.
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    // The second UPDATE (AS_SEQUENCE-first AS_PATH from a confed-member
+    // peer) must be treated as a withdraw per RFC 5065 §5 condition 2 / RFC
+    // 7606 §3(e) — the route disappears, but the session and the rest of
+    // the daemon stay healthy.
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 was not withdrawn within 15 s after the AS_SEQUENCE-first UPDATE");
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 5065 §5 condition 2 / RFC 7606 §3(e): the fault peer's own session must \
+         stay Established, not be reset with a NOTIFICATION"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// RFC 5065 §5 condition 2 again, but sent as the *only* UPDATE with no
+/// reachable NLRI at all. RFC 7606 §5.2: treat-as-withdraw would be a no-op
+/// with nothing to withdraw, so this must instead reset the session with a
+/// `MalformedAsPath` NOTIFICATION.
+#[tokio::test]
+async fn rfc5065_confed_member_wrong_first_segment_no_nlri_resets_session() {
+    let mut h = FaultInjectionHarness::new_confed_member(
+        "rfc5065-confed-member-wrong-first-segment-no-nlri",
+    )
+    .await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established before the fault UPDATE");
+
+    wait_for_docker_log(
+        &h.fault_peer_container_id,
+        "SCENARIO_OUTCOME: malformed_as_path_notification_received",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect(
+        "RFC 7606 §5.2: pathvectord must send a MalformedAsPath NOTIFICATION for a \
+         malformed (AS_SEQUENCE-first, confed-member peer) AS_PATH with no reachable NLRI",
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = h
+            .client
+            .get_peer(IpAddr::from(fault_peer))
+            .await
+            .expect("get_peer(fault_peer) gRPC call succeeded");
+        if state.session_state != SessionState::Established {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "RFC 7606 §5.2: session with a malformed (AS_SEQUENCE-first, confed-member \
+             peer) AS_PATH and no reachable NLRI must leave Established within 15 s, \
+             not stay up like the with-NLRI case"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -574,4 +745,53 @@ async fn mid_session_tcp_reset_recovers_cleanly() {
     wait_for_established(&mut h.client, peer, Duration::from_secs(30))
         .await
         .expect("session did not re-establish within 30 s of reconnecting");
+}
+
+/// RFC 5065 §4: a route can loop back into a confederation via the
+/// confederation identifier itself (not just via a Member-AS Number) — e.g.
+/// relayed out to a genuine external peer and back in through a different
+/// Member-AS. A well-formed UPDATE whose AS_PATH contains the confederation
+/// identifier must be silently dropped: the announced NLRI never reaches
+/// pathvectord's own Loc-RIB, and the session stays Established throughout.
+/// Currently unit-only in `route.rs`'s `has_loop` check — this proves it
+/// over a real BGP session with the real wire codec on both ends.
+#[tokio::test]
+async fn confederation_id_in_as_path_is_treated_as_loop_and_dropped() {
+    let mut h = FaultInjectionHarness::new_with_confederation_id("confederation-id-loop").await;
+    assert_control_peer_established(&mut h).await;
+
+    let fault_peer = h.fault_peer;
+    wait_for_established(&mut h.client, fault_peer, Duration::from_secs(15))
+        .await
+        .expect("fault peer session did not reach Established within 15 s");
+
+    // Give pathvectord a real window to have processed the UPDATE (and,
+    // if the loop-detection check were broken, to have installed the
+    // route) before asserting its absence.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let route = h
+        .client
+        .get_best_route("10.99.0.0/24")
+        .await
+        .expect("get_best_route gRPC call succeeded");
+    assert!(
+        route.is_none(),
+        "RFC 5065 §4: a route whose AS_PATH contains the confederation identifier must be \
+         silently dropped as a loop, never reaching Loc-RIB; got: {route:?}"
+    );
+
+    // The session itself must stay healthy — this is a policy-violating
+    // but well-formed UPDATE, not a wire-format fault.
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 5065 §4: a confederation-identifier loop must not affect the session itself"
+    );
+
+    assert_control_peer_established(&mut h).await;
 }

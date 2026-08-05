@@ -232,6 +232,39 @@ jobs:
           cache-from: type=gha,scope=e2e-rust
           cache-to: type=gha,mode=max,scope=e2e-rust
 
+      - name: Build mock BGP GR peer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: pathvector-e2e/Dockerfile.pathvectord
+          target: mock-bgp-gr-peer
+          load: true
+          tags: pathvector-mock-bgp-gr-peer-test:latest
+          cache-from: type=gha,scope=e2e-rust
+          cache-to: type=gha,mode=max,scope=e2e-rust
+
+      - name: Build mock BGP attr peer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: pathvector-e2e/Dockerfile.pathvectord
+          target: mock-bgp-attr-peer
+          load: true
+          tags: pathvector-mock-bgp-attr-peer-test:latest
+          cache-from: type=gha,scope=e2e-rust
+          cache-to: type=gha,mode=max,scope=e2e-rust
+
+      - name: Build mock BGP AS4_PATH peer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: pathvector-e2e/Dockerfile.pathvectord
+          target: mock-bgp-as4path-peer
+          load: true
+          tags: pathvector-mock-bgp-as4path-peer-test:latest
+          cache-from: type=gha,scope=e2e-rust
+          cache-to: type=gha,mode=max,scope=e2e-rust
+
       - name: Lint pathvector-e2e
         run: cargo clippy -p pathvector-e2e --all-targets -- -D warnings
 

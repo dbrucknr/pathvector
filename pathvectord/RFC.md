@@ -33,6 +33,7 @@ of UPDATE messages lives in `pathvector-session`.
 | Announcement groups with distinct path attributes go into separate UPDATEs | `src/outbound.rs` | ✅ | `test_flush_different_attrs_two_messages` |
 | Withdrawals sent before announcements; withdrawal list packed within `max_len` | `src/outbound.rs` | ✅ | `test_flush_withdrawals_before_announces`, `test_flush_withdrawal_split_delivers_all_nlris` |
 | Unrecognized transitive optional attributes stored on ingest (Optional+Transitive flags only; non-transitive quietly dropped) and forwarded unconditionally on egress regardless of peer type, with the Partial bit set (RFC 4271 §5) | `src/daemon/route.rs`, `src/outbound.rs` | ✅ | Fixed 2026-08-03 (`feature/rfc4271-unrecognized-transitive-attribute-storage`). See `RFC_AUDIT.md` §5 and `pathvector-rib/RFC.md`'s own section for the storage half. `test_handle_update_stores_unrecognized_transitive_attribute`, `test_handle_update_quietly_ignores_unrecognized_non_transitive_attribute`, `unrecognized_transitive_attribute_is_forwarded_with_optional_transitive_flags` |
+| e2e (2026-08-05, Codex review of PR #49): the complete decode → daemon storage → RIB → outbound-reconstruction → encode pipeline through a real two-hop relay, not just decode-level and daemon-storage-level unit tests — asserting the exact re-encoded flags octet, which a GoBGP CLI's rendered RIB text cannot express | `pathvector-e2e/src/bin/mock_bgp_attr_peer.rs`, `pathvector-e2e/tests/unknown_transitive_attribute.rs` | ✅ | `unknown_transitive_attribute_relayed_with_partial_bit_set` (a `source` mock injects an unrecognized Optional+Transitive attribute, Partial bit clear, plus an unrecognized Optional-only non-transitive negative control; an `observer` mock decodes pathvectord's re-advertised UPDATE with the real wire codec and confirms the transitive attribute survives with its value unchanged and Partial bit now set, while the non-transitive one is absent entirely) |
 
 ---
 
@@ -149,6 +150,8 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | e2e: peer restart with partial RIB — un-refreshed routes pruned on EOR | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` |
 | §8.1 `connect_retry_time` configurable per-peer (TOML: `connect_retry_time`); defaults to 120 s | `src/config.rs`, `src/daemon.rs` | ✅ | `sidecar_round_trips_all_fields`; exercised by fast-retry harness in GR e2e tests |
 | §4.1 MUST: Restarting Speaker defers its own route selection until EOR received from all GR-capable peers or a Selection_Deferral_Timer expires | `src/daemon/deferral.rs`, `src/config.rs` (`selection_deferral_time`), `src/outbound.rs` (`propagate_prefix`/`propagate_prefix_v6`'s `deferred` parameter) | ✅ | `daemon::deferral::tests::*`, `outbound::propagate_tests::test_propagate_prefix{,_v6}_deferred_*`, `daemon::selection_deferral_tests::*`. Scoped to **outbound-advertisement-only** deferral (Loc-RIB/FIB computation stays immediate), matching BIRD's real implementation rather than the RFC's literal "defer route selection" text — see `RFC_AUDIT.md`'s RFC 4724 §4.1 entry for the BIRD-source citation and the wait-set-membership design correction found during review. |
+| e2e (2026-08-05, review of PR #50): the complete config → OPEN negotiation → real wire-encoded EOR → timer/wait-set → catch-up-dump path, not just `DaemonState`-direct unit tests | `pathvector-e2e/src/bin/mock_bgp_gr_peer.rs`, `pathvector-e2e/tests/selection_deferral.rs` | ✅ | `route_withheld_from_observer_until_deferral_timer_expires` (a GR-capable peer that never sends EOR: route reaches Loc-RIB immediately but is withheld from a separate observer peer until the Selection_Deferral_Timer force-releases and flushes it), `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives` (a `restart_time == 0` EOR-only peer still blocks the wait-set until its real, delayed EOR arrives — release happens well before the deliberately much longer timer deadline, distinguishing the wait-set-satisfied path from the timer-expiry path) |
+| e2e (2026-08-05, Codex follow-up round on the PR #50 gap closure): the wait-set is evaluated over the **full configured peer set**, not satisfied by any single peer's EOR — a single-source harness can't distinguish "correctly waits on every configured GR peer" from "incorrectly releases on the first EOR" | `pathvector-e2e/src/bin/mock_bgp_gr_peer.rs` (`eor-immediately` scenario), `pathvector-e2e/src/lib.rs` (`TwoSourceSelectionDeferralHarness`), `pathvector-e2e/tests/selection_deferral.rs` | ✅ | `fast_eor_from_one_source_does_not_release_wait_set_for_the_other` (two independent GR peers — one sends EOR immediately, the other withholds it forever — proves the fast peer's EOR is not mistaken for satisfying the slow peer's; release only happens once the Selection_Deferral_Timer itself expires) |
 
 **Deferred:** §3 SHOULD: suppress GR capability when peer's restart_time = 0 (currently logged
 as warning only). §4.2 (Receiving Speaker role) and §4.1 (Restarting Speaker's own deferred
@@ -520,8 +523,10 @@ initiative (`TODO.md` task #128) rather than folded into the smaller RFC
 | OPEN message `my_as` and the `FourByteAsn` capability also carry `public_as` (Confederation Identifier for `External` peers, Member-AS Number for `Internal`/`ConfedMember`) — RFC 5065 §4 covers *all* transactions with a peer, not just AS_PATH | `src/daemon/mod.rs` (`effective_session_as`, static spawn loop, reconnect capability refresh), `src/daemon/peer.rs` (dynamic `AddPeer`), `src/daemon/capabilities.rs` (`SpawnConfig::capabilities`), `pathvector-session/src/fsm/mod.rs` (`FsmConfig::public_as`, `make_open`) | ✅ | `test_effective_session_as_external_uses_confederation_id`, `test_effective_session_as_internal_uses_member_as`, `test_effective_session_as_confed_member_uses_member_as`, `test_effective_session_as_external_falls_back_to_local_as_when_unconfigured`, `pathvector-session`'s `test_sent_open_uses_public_as_not_local_as` |
 | MED not stripped for `ConfedMember` (RFC 5065 §5.2); ORIGINATOR_ID/CLUSTER_LIST still stripped for `ConfedMember` (deliberate — RR clusters are scoped to a single AS's internal topology; RFC 5065 is silent on the interaction, and letting RR metadata cross a Member-AS boundary risks cluster-ID collisions without serving RR's loop-prevention purpose) | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` | ✅ | `test_route_v6_to_attributes_ibgp_preserves_med`-style coverage extended to the `strip_med`/`strip_rr_metadata` split |
 | AS4_PATH excludes AS_CONFED_SEQUENCE/AS_CONFED_SET (RFC 6793 §§3, 4.2.2) even though the downgraded wire AS_PATH correctly keeps them | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` (`.strip_confed_segments()` on the AS4_PATH value) | ✅ | `as4_path_excludes_confed_segments_for_two_byte_peer`, `test_route_v6_to_attributes_as4path_excludes_confed_segments` |
+| e2e (2026-08-05, round 2, Codex follow-up review): the above was unit-tested only — nothing proved the real wire codec on both ends produces the expected split: a confed segment surviving the AS_PATH value toward a fellow `ConfedMember` peer (RFC 5065 §5.3) while AS4_PATH excludes it entirely | `pathvector-e2e/src/bin/mock_bgp_as4path_peer.rs`, `pathvector-e2e/tests/as4path_confed.rs` | ✅ | `as4_path_excludes_confed_segment_while_wire_as_path_keeps_it` (a four-byte-ASN-capable confed-source sends AS_PATH = [AS_CONFED_SEQUENCE, 4-byte ASN]; a fellow confed-member observer that hasn't negotiated `FourByteAsn` decodes pathvectord's re-advertised UPDATE and confirms the confed segment survives alongside AS_TRANS substitution, while AS4_PATH carries the real ASN with the confed segment excluded). **Scope correction (2026-08-05, PR #52 review):** the observer's `two-byte-observer` role name refers to capability negotiation only — pathvectord's AS_PATH encoder always writes 4 bytes per ASN regardless of negotiation (encode-side downgrade is implemented for AGGREGATOR only), so this test proves the logical AS_TRANS/AS4_PATH-split decision, not genuine two-octet-per-ASN wire interop; that remains an open gap (`TODO.md`) |
 | LOCAL_PREF accept guard widened from `Internal`-only to `Internal \| ConfedMember` (RFC 4271 §5.1.5's confederation exception, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_honored_from_confed_member_peer` |
 | Loop detection (RFC 4271 §9.1.2) extended to also check the confederation ID, not just `local_as` (RFC 5065 §4) | `src/daemon/route.rs` | ✅ | `test_as_path_loop_detection_drops_confederation_id_in_path`, `test_as_path_loop_detection_confederation_id_absent_does_not_block` |
+| e2e (2026-08-05, round 2, Codex follow-up review): the above was unit-tested only | `pathvector-e2e/src/bin/mock_bgp_fault_peer.rs` (`confederation-id-loop` scenario), `pathvector-e2e/tests/fault_injection.rs` | ✅ | `confederation_id_in_as_path_is_treated_as_loop_and_dropped` (a plain `External` peer sends a well-formed UPDATE whose AS_PATH contains the confederation identifier; asserts the route never reaches Loc-RIB while the session stays Established) |
 | RFC 5065 §5 condition 1: confed segment from an `External` peer is malformed — treat-as-withdraw | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_segment_from_external_peer_is_treat_as_withdraw` |
 | RFC 5065 §5 condition 2: an AS_PATH from a `ConfedMember` peer whose first segment is not `AS_CONFED_SEQUENCE` is malformed — treat-as-withdraw. Covers empty AS_PATH too (no exemption: an empty path has no first segment, so it cannot be `AS_CONFED_SEQUENCE`) | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_member_peer_missing_confed_sequence_is_treat_as_withdraw`, `test_malformed_as_path_empty_from_confed_member_peer_is_treat_as_withdraw`, `test_malformed_as_path_confed_member_peer_with_confed_sequence_first_is_accepted` (negative case) |
 | Both §5 conditions are treat-as-withdraw, not session-reset (RFC 7606 §3(e)) | `src/daemon/route.rs` | ✅ | `test_malformed_as_path_confed_conditions_are_treat_as_withdraw_not_session_reset` |
@@ -540,17 +545,36 @@ implementation. Two gaps that unit tests structurally cannot close:
   `bgp confederation peers` directives — FRR is confederation-aware,
   unlike a plain eBGP speaker, and its own outbound AS_PATH handling was
   never something this project's tests controlled) and a genuinely
-  external GoBGP peer. `pathvector-e2e/tests/confederation.rs`'s three
-  tests confirm both sessions establish with the correct visible AS (the
+  external GoBGP peer. `pathvector-e2e/tests/confederation.rs`'s tests
+  confirm both sessions establish with the correct visible AS (the
   external GoBGP peer's config expects the confederation identifier in
   pathvectord's OPEN, not the Member-AS — a `public_as` regression would
   make that specific session fail to establish while the FRR session
   still came up fine), a route from FRR crosses to the external peer with
   confed segments fully stripped (checked against real `gobgp global rib`
-  output), and a route from the external peer crosses to FRR with a
+  output), a route from the external peer crosses to FRR with a
   prepended confederation segment (checked against real FRR `vtysh show
   bgp` output, which renders confederation segments in parentheses and
-  marks the route `confed-external`).
+  marks the route `confed-external`), and — added 2026-08-05, round 2,
+  Codex follow-up review, since the above only covered announcements —
+  a withdrawal from the external peer removes the route from FRR's own
+  RIB (`withdrawal_from_external_peer_propagates_to_confed_member`, via
+  `ConfederationHarness::external_withdraw()` and the new
+  `wait_for_frr_rib_withdrawn` helper) — and, added 2026-08-05, round 2,
+  Codex follow-up review, the confederation-specific attribute exceptions
+  themselves: LOCAL_PREF survives relay from FRR into pathvectord's own
+  Loc-RIB (`local_pref_survives_relay_from_confed_member`, RFC 5065 §5.2),
+  NEXT_HOP toward FRR is left unchanged by default
+  (extended into `route_from_external_relayed_to_confed_member_prepends_confed_sequence`,
+  RFC 5065 §5.1), MED from the external peer survives relay to FRR
+  (`med_is_preserved_when_relayed_to_confed_member`, via new
+  `ConfederationHarness::external_announce_with_med` — RFC 5065 §5.2,
+  unlike pathvectord's own convention of stripping MED for plain
+  `External` peers), and `NO_EXPORT_SUBCONFED` suppresses advertisement to
+  FRR (`no_export_subconfed_suppresses_advertisement_to_confed_member`,
+  via new `ConfederationHarness::external_announce_no_export_subconfed` —
+  RFC 1997, unlike plain `NO_EXPORT` which does not block a fellow
+  Member-AS peer).
 - RFC 5065 §5's two malformed-AS_PATH conditions over a real BGP session:
   `mock_bgp_fault_peer` gained `rfc5065-confed-segment-with-nlri` and
   `rfc5065-confed-segment-no-nlri` scenarios (`pathvector-e2e/src/bin/
@@ -560,13 +584,38 @@ implementation. Two gaps that unit tests structurally cannot close:
   (`pathvector-e2e/tests/fault_injection.rs`) — proving the real wire
   codec on both ends produces the same treat-as-withdraw/session-reset
   split the unit tests assert on hand-built messages.
+- e2e (2026-08-05, round 2, Codex review): condition 1 above only
+  exercised an ordinary `External` peer — condition 2 (a peer pathvectord
+  actually classifies as `ConfedMember`, sending an AS_PATH that doesn't
+  lead with `AS_CONFED_SEQUENCE`) had no e2e coverage at all.
+  `mock_bgp_fault_peer` gained
+  `rfc5065-confed-member-wrong-first-segment-with-nlri` and
+  `rfc5065-confed-member-wrong-first-segment-no-nlri` scenarios, exercised
+  by `FaultInjectionHarness::new_confed_member` (pathvectord configured
+  with `confederation_id`, the fault peer marked `confederation_member =
+  true`) via
+  `rfc5065_confed_member_wrong_first_segment_with_nlri_treated_as_withdraw_session_stays_up`
+  and `rfc5065_confed_member_wrong_first_segment_no_nlri_resets_session`.
 
 Real-teeth verified: the confederation interop test was run with
 `strip_confed_segments()` temporarily disabled in `pathvector-rib`'s
 `prepare_outbound` (confirmed it failed — the malformed export never
 even reached the external GoBGP peer, since GoBGP itself won't accept
 it), restored and reran green; the two fault-injection scenarios were
-verified the same way against `daemon/route.rs`'s RFC 5065 §5 check.
+verified the same way against `daemon/route.rs`'s RFC 5065 §5 check. The
+four confederation-attribute assertions (2026-08-05) were each real-teeth
+verified independently: LOCAL_PREF by narrowing `daemon/route.rs`'s accept
+guard back to `Internal`-only; NEXT_HOP by removing the `next_hop_self`
+gate on `prepare_outbound`'s `ConfedMember` branch so it always rewrote;
+MED by widening `outbound.rs`'s `strip_med` to include `ConfedMember`; and
+`NO_EXPORT_SUBCONFED` by narrowing `is_export_suppressed`'s check back to
+`External`-only — each confirmed to fail for the stated reason, then
+reverted to a clean (`git diff --stat`-empty) state and reconfirmed green.
+The MED assertion needed a second iteration: an initial bare
+`route.contains("50")` false-positived against the broken code because
+the external peer's own AS number (65099) contains "50" as a substring;
+fixed by matching the literal `"metric 50"` FRR renders for the actual
+attribute, re-verified RED then GREEN against the corrected assertion.
 
 **Treat-as-withdraw, not session-reset, for RFC 5065 §5 (corrected
 2026-08-05 after external code review; see `CHANGELOG.md`):** this section

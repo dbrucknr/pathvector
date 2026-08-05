@@ -17,7 +17,8 @@ use pathvector_session::message::{
     PathAttribute, UpdateMessage,
 };
 use pathvector_session::transport::{
-    DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent, SessionHandle, spawn,
+    DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent, SessionHandle,
+    TerminationReason, spawn,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1094,6 +1095,9 @@ fn raw_update_with_attr(flags: u8, type_code: u8, value: &[u8]) -> Vec<u8> {
 
 const FLAGS_OPTIONAL_TRANSITIVE: u8 = 0xC0;
 const ATTR_TYPE_AGGREGATOR: u8 = 7;
+// RFC 4271 §4.3: well-known attribute — Transitive bit set, Optional bit clear.
+const FLAGS_WELL_KNOWN: u8 = 0x40;
+const UNRECOGNIZED_ATTR_TYPE_CODE: u8 = 210;
 
 fn aggregator_value_4byte_asn(asn: u32, ip: [u8; 4]) -> Vec<u8> {
     let mut v = asn.to_be_bytes().to_vec();
@@ -1277,4 +1281,90 @@ async fn test_aggregator_decoding_when_four_byte_asn_not_negotiated() {
     );
 
     peer.abort();
+}
+
+/// [Codex — PR #48 follow-up] RFC 4271 §6.3: "If any of the well-known
+/// mandatory attributes are not recognized, then the Error Subcode MUST be
+/// set to Unrecognized Well-known Attribute. The Data field MUST contain the
+/// unrecognized attribute (type, length, and value)." Not amended by RFC
+/// 7606 (its §3 revisions are an exhaustive (a)-(j) list that never mentions
+/// this subcode), so this remains a full session reset.
+///
+/// The existing unit-level coverage
+/// (`test_unrecognized_well_known_attribute_sends_correct_notification_and_terminates`
+/// in `src/transport/mod.rs`) injects a pre-decoded `MalformedUpdate`
+/// through `MockTransport` — it proves the FSM picks the right NOTIFICATION
+/// given that input, but never exercises the actual byte-level decoder that
+/// classifies a raw attribute as "unrecognized well-known" in the first
+/// place, nor the NOTIFICATION's own wire encoding. This test closes that
+/// gap: a hand-rolled raw UPDATE frame (flags byte with the Optional bit
+/// clear — the exact signal the decoder uses, RFC 4271 §4.3) goes in over a
+/// real TCP socket, decoded by the real `BgpCodec`, and the NOTIFICATION
+/// that comes back out is itself decoded by the real codec on the peer's
+/// side — proving the full raw-bytes-in, raw-bytes-out round trip, not just
+/// the session-layer response-selection logic.
+#[tokio::test]
+async fn test_raw_unrecognized_well_known_attribute_sends_real_notification_bytes() {
+    let (listener, addr) = loopback_listener().await;
+
+    let peer = tokio::spawn(async move {
+        let (mut reader, writer) = accept_and_handshake(listener).await;
+        let mut raw_writer = writer.into_inner();
+
+        // Type code 210 is outside the range of any attribute this codec
+        // recognizes.
+        let value = [1u8, 2, 3];
+        raw_writer
+            .write_all(&raw_update_with_attr(
+                FLAGS_WELL_KNOWN,
+                UNRECOGNIZED_ATTR_TYPE_CODE,
+                &value,
+            ))
+            .await
+            .unwrap();
+
+        // The real NOTIFICATION, decoded by the real codec — not a typed
+        // `BgpMessage::Notification` handed in by the test.
+        let notification = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("timed out waiting for the real NOTIFICATION bytes on the wire")
+            .expect("stream ended before the NOTIFICATION arrived")
+            .expect("failed to decode the NOTIFICATION bytes with the real BgpCodec");
+        assert_eq!(
+            notification,
+            BgpMessage::Notification(NotificationMessage {
+                error: NotificationError::UpdateMessage(
+                    pathvector_session::message::UpdateMsgError::UnrecognizedWellKnownAttribute
+                ),
+                data: vec![UNRECOGNIZED_ATTR_TYPE_CODE, 3, 1, 2, 3],
+            }),
+            "expected UpdateMessage/UnrecognizedWellKnownAttribute NOTIFICATION carrying \
+             the offending attribute (type, length, value) in Data (RFC 4271 §6.3), decoded \
+             from real wire bytes"
+        );
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, SessionEvent::Established(_)));
+
+    let event = tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for Terminated")
+        .expect("session exited without emitting an event");
+    assert!(
+        matches!(
+            event,
+            SessionEvent::Terminated(TerminationReason::OperatorStop)
+        ),
+        "expected Terminated(OperatorStop) after sending the session-reset NOTIFICATION, \
+         got {event:?}"
+    );
+
+    peer.await.unwrap();
 }
