@@ -6614,6 +6614,50 @@ impl SelectionDeferralHarness {
             _network: network,
         }
     }
+
+    /// Signals `mock_bgp_gr_peer`'s `restart-time-zero-delayed-eor` scenario
+    /// to send its held-back End-of-RIB now, via `docker exec ... nc -z`
+    /// against the mock's own control port. Only meaningful when the
+    /// harness was constructed with that scenario.
+    ///
+    /// Replaces an earlier fixed-wall-clock delay inside the mock (flagged
+    /// by code review on PR #52: a fixed sleep there raced against
+    /// harness-startup/session-establishment overhead that isn't bounded by
+    /// anything the mock controls) with a real synchronization point: the
+    /// mock blocks indefinitely until this signal arrives, so a test that
+    /// calls this only after its own negative ("not yet released") check is
+    /// deterministically guaranteed to have observed the pre-EOR state.
+    ///
+    /// Goes through `docker exec` rather than a raw `TcpStream::connect`
+    /// from the test process directly to the container's docker-network IP
+    /// — on Docker Desktop (containers run inside a VM), the host has no
+    /// route to that IP at all, unlike a bare-Linux Docker host; every
+    /// other cross-container signal in this file already goes through
+    /// `docker exec` or a mapped host port for the same reason (see
+    /// `external_withdraw`, `scrape_metrics_text`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec` fails or the command exits non-zero.
+    pub fn release_delayed_eor(&self) {
+        /// Kept in sync manually with `EOR_RELEASE_CONTROL_PORT` in
+        /// `mock_bgp_gr_peer.rs` — no shared crate boundary.
+        const EOR_RELEASE_CONTROL_PORT: u16 = 1790;
+        let status = Command::new("docker")
+            .args(["exec", &self.source_id])
+            .args([
+                "nc",
+                "-z",
+                "127.0.0.1",
+                &EOR_RELEASE_CONTROL_PORT.to_string(),
+            ])
+            .status()
+            .expect("docker exec nc -z against mock_bgp_gr_peer's EOR-release control port");
+        assert!(
+            status.success(),
+            "release_delayed_eor: docker exec nc -z failed: {status}"
+        );
+    }
 }
 
 /// Writes a pathvectord config for [`TwoSourceSelectionDeferralHarness`]:

@@ -200,7 +200,10 @@ ARG CARGO_PROFILE=debug
 COPY --from=builder /workspace/target/${CARGO_PROFILE}/mock_bgp_gr_peer /usr/local/bin/mock_bgp_gr_peer
 
 # 179 — BGP, container-to-container only, never mapped to host.
-EXPOSE 179
+# 1790 — EOR-release control signal for the restart-time-zero-delayed-eor
+# scenario only (see SelectionDeferralHarness::release_delayed_eor);
+# harmless no-op listener for every other scenario.
+EXPOSE 179 1790
 
 # The healthcheck only confirms the listener is bound — it passes regardless
 # of which scenario the container is running, since every scenario binds

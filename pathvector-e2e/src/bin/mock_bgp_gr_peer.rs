@@ -14,12 +14,17 @@
 //! - `restart-time-zero-delayed-eor` — advertises GracefulRestart with
 //!   `restart_time == 0` (RFC 4724 §3's EOR-only mode: "to indicate its
 //!   intention of generating the End-of-RIB marker" with no forwarding-state
-//!   preservation claim), announces the same route, waits
-//!   [`EOR_DELAY`], then sends its End-of-RIB marker. Proves the
-//!   wait-set-satisfied release path treats a `restart_time == 0` peer the
-//!   same as any other GR-capable peer — it must still be waited on until
-//!   its real EOR arrives, not treated as if it never advertised the
-//!   capability at all.
+//!   preservation claim), announces the same route, then blocks until it
+//!   receives an explicit release signal on [`EOR_RELEASE_CONTROL_PORT`]
+//!   before sending its End-of-RIB marker. Proves the wait-set-satisfied
+//!   release path treats a `restart_time == 0` peer the same as any other
+//!   GR-capable peer — it must still be waited on until its real EOR
+//!   arrives, not treated as if it never advertised the capability at all.
+//!   Test-controlled rather than a fixed sleep (flagged by code review on
+//!   PR #52: a fixed-wall-clock delay races against harness-startup and
+//!   session-establishment overhead that isn't bounded by anything the mock
+//!   controls) — see `SelectionDeferralHarness::release_delayed_eor` in
+//!   `pathvector-e2e/src/lib.rs`.
 //! - `eor-immediately` — advertises GracefulRestart with a nonzero
 //!   `restart_time`, sends its End-of-RIB marker as soon as the handshake
 //!   completes (no route announced first), then holds the connection open.
@@ -34,6 +39,7 @@
 //! deferral logic, not `pathvector-session`'s own codec).
 
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -43,19 +49,18 @@ use pathvector_session::message::{
 };
 use pathvector_types::{AfiSafi, AsPath, Asn, Origin};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio_util::codec::Framed;
 
 const MOCK_AS: u16 = 65001;
 const MOCK_BGP_ID: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const TEST_PREFIX: &str = "10.150.0.0/24";
-/// Delay before sending EOR in the `restart-time-zero-delayed-eor` scenario —
-/// long enough to prove pathvectord didn't release immediately (it isn't
-/// exempting this peer from the wait-set just because `restart_time == 0`),
-/// short enough to stay well under any reasonable test's
-/// `selection_deferral_time`, so a route arriving at the observer around
-/// this delay (not at the full deferral deadline) is meaningful evidence of
-/// the wait-set-satisfied path, not the timer-expiry path.
-const EOR_DELAY: Duration = Duration::from_secs(3);
+/// Port the `restart-time-zero-delayed-eor` scenario listens on for an
+/// explicit "release the held-back EOR now" signal from the test — see
+/// `SelectionDeferralHarness::release_delayed_eor` in
+/// `pathvector-e2e/src/lib.rs`. Kept in sync manually with that constant;
+/// no shared crate boundary between this binary and the harness.
+const EOR_RELEASE_CONTROL_PORT: u16 = 1790;
 
 #[tokio::main]
 async fn main() {
@@ -63,19 +68,40 @@ async fn main() {
         .nth(1)
         .expect("usage: mock_bgp_gr_peer <scenario>");
 
+    let eor_release = Arc::new(Notify::new());
+    if scenario == "restart-time-zero-delayed-eor" {
+        let notify = eor_release.clone();
+        tokio::spawn(async move {
+            let control_listener = TcpListener::bind(("0.0.0.0", EOR_RELEASE_CONTROL_PORT))
+                .await
+                .expect("bind EOR-release control port");
+            println!("listening for EOR-release control signal on :{EOR_RELEASE_CONTROL_PORT}");
+            loop {
+                if control_listener.accept().await.is_ok() {
+                    println!("received EOR-release control signal");
+                    notify.notify_one();
+                }
+            }
+        });
+    }
+
     let listener = TcpListener::bind("0.0.0.0:179").await.expect("bind :179");
     println!("mock_bgp_gr_peer ({scenario}) listening on :179");
     loop {
         let (stream, addr) = listener.accept().await.expect("accept connection");
         println!("accepted connection from {addr}, running scenario {scenario}");
-        tokio::spawn(handle_connection(stream, scenario.clone()));
+        tokio::spawn(handle_connection(
+            stream,
+            scenario.clone(),
+            eor_release.clone(),
+        ));
     }
 }
 
-async fn handle_connection(stream: TcpStream, scenario: String) {
+async fn handle_connection(stream: TcpStream, scenario: String, eor_release: Arc<Notify>) {
     match scenario.as_str() {
         "withhold-eor" => withhold_eor(stream, 60).await,
-        "restart-time-zero-delayed-eor" => restart_time_zero_delayed_eor(stream).await,
+        "restart-time-zero-delayed-eor" => restart_time_zero_delayed_eor(stream, eor_release).await,
         "eor-immediately" => eor_immediately(stream).await,
         other => panic!("unknown scenario: {other}"),
     }
@@ -182,19 +208,22 @@ async fn eor_immediately(stream: TcpStream) {
     hold_forever(framed).await;
 }
 
-async fn restart_time_zero_delayed_eor(stream: TcpStream) {
+async fn restart_time_zero_delayed_eor(stream: TcpStream, eor_release: Arc<Notify>) {
     let mut framed = do_handshake(stream, 0).await;
 
     framed
         .send(BgpMessage::Update(route_update()))
         .await
         .unwrap();
-    println!("sent route for {TEST_PREFIX}; delaying End-of-RIB by {EOR_DELAY:?}");
+    println!(
+        "sent route for {TEST_PREFIX}; holding End-of-RIB until an explicit release signal \
+         arrives on :{EOR_RELEASE_CONTROL_PORT}"
+    );
 
-    tokio::time::sleep(EOR_DELAY).await;
+    eor_release.notified().await;
 
     framed.send(BgpMessage::Update(end_of_rib())).await.unwrap();
-    println!("sent End-of-RIB after the delay");
+    println!("sent End-of-RIB after the release signal");
 
     hold_forever(framed).await;
 }

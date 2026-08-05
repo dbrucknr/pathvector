@@ -969,12 +969,32 @@ areas the existing test suite never covered:
   tests passed in the actual PR #52 CI run, but the synchronization is not
   deterministic. **Mitigated 2026-08-05**: raised both tests'
   `DEFERRAL_SECS` to 20 for more headroom, but this only reduces the
-  probability of the race, it does not eliminate it. **Not yet fixed**: a
-  fully deterministic version needs an explicit synchronization point
-  instead of inferring "still pending" from a timed snapshot — e.g. expose
+  probability of the race for `route_withheld_from_observer_until_deferral_timer_expires`
+  and `fast_eor_from_one_source_does_not_release_wait_set_for_the_other`
+  (both genuinely gated on `DEFERRAL_SECS`'s daemon-startup-anchored
+  clock); it does not eliminate it, and a fully deterministic version of
+  those two would still need an explicit synchronization point instead of
+  inferring "still pending" from a timed snapshot — e.g. expose
   `SelectionDeferral`'s pending/released state via gRPC (a new
-  `GetDeferralStatus`-shaped RPC) so the test can poll for "still deferred"
-  directly rather than racing the timer's own wall clock.
+  `GetDeferralStatus`-shaped RPC).
+  **Second round, fixed properly 2026-08-05** (re-review of the above
+  mitigation): `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`
+  was racing a *different* clock entirely — `mock_bgp_gr_peer.rs`'s own
+  fixed 3-second `EOR_DELAY`, started the instant the mock's session
+  establishes, not `DEFERRAL_SECS`. The harness waits for a *second*
+  session (the observer) to establish after the mock's before the test's
+  negative check runs; if that took longer than 3s, the EOR had already
+  fired. Raising `DEFERRAL_SECS` did nothing for this specific test. Fixed
+  for real this time: replaced the fixed sleep with an explicit release
+  signal — `mock_bgp_gr_peer.rs`'s scenario now blocks on a
+  `tokio::sync::Notify` fed by a control-port listener (port 1790), and
+  `SelectionDeferralHarness::release_delayed_eor()` (via `docker exec ...
+  nc -z`, not a raw `TcpStream::connect` — the host has no route to a
+  container's docker-network IP on Docker Desktop for macOS) signals it
+  only after the test's own negative check has already run. This makes
+  the "not yet released" assertion deterministically correct rather than
+  a wall-clock guess, closing the gap the `GetDeferralStatus` idea above
+  was meant to address, at least for this one test.
 - **Minor — duplicate GracefulRestart capability instances use first, not
   last.** §3 says the receiver MUST ignore all but the *last* instance if
   a peer sends 2+ (itself a sender-side RFC violation, so low real-world

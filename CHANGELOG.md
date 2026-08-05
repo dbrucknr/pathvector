@@ -4,6 +4,56 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-05 (PR #52 code review, round 2: a distinct synchronization bug survived the round-1 fix)
+
+Round-1 review response (below) raised `DEFERRAL_SECS` from 8 to 20 in both
+Selection Deferral e2e tests to give more margin against harness-startup
+wall-clock overhead. Re-review found this did not close the gap for
+`restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`: that
+test's race is against `mock_bgp_gr_peer.rs`'s own fixed 3-second
+`EOR_DELAY` (started the instant the mock announces its route, right
+after *its own* session establishes), not against
+`SelectionDeferral`'s `DEFERRAL_SECS` timer (which starts at daemon
+*process* startup). The harness starts the mock source's session first,
+then separately waits for a second (observer) session to establish before
+the test's negative assertion runs — if that second session takes longer
+than 3 seconds to come up (a real possibility under load), the mock's EOR
+had already fired before the test ever checked for its absence. Raising
+`DEFERRAL_SECS` doesn't touch this because it's a different clock
+entirely.
+
+Fixed properly per the reviewer's suggested approach (real synchronization
+point, not a longer wall-clock guess): `mock_bgp_gr_peer.rs`'s
+`restart-time-zero-delayed-eor` scenario now blocks on an explicit release
+signal (`tokio::sync::Notify`, fed by a small control-port listener on
+`EOR_RELEASE_CONTROL_PORT` = 1790) instead of a fixed sleep. The test calls
+`SelectionDeferralHarness::release_delayed_eor()` — added to
+`pathvector-e2e/src/lib.rs` — only after its own negative ("not yet
+released") check has already run, so the mock is deterministically
+guaranteed to still be blocked at that point; there is no wall-clock
+window to lose a race against at all.
+
+First implementation of `release_delayed_eor()` connected directly from
+the test process to the container's docker-network IP via
+`tokio::net::TcpStream::connect` — this failed with a connection timeout
+on Docker Desktop for macOS, since the host has no route to a container's
+internal bridge-network IP there (containers run inside a VM). Fixed by
+going through `docker exec <container> nc -z 127.0.0.1 1790` instead,
+matching every other cross-container signal already in this file (e.g.
+`external_withdraw`'s `docker exec gobgp ...` pattern) — this is a
+platform constraint of Docker Desktop specifically, not something bare-Linux
+Docker hosts (including this project's own CI runners) would necessarily
+hit, but the `docker exec` approach works identically on both.
+
+Real-teeth verified: temporarily made `recompute_selection_deferral`
+source its `restart_time > 0`-only peer set (`gr_capable_peers`) instead
+of the full GR-advertised set (`gr_advertised_peers`) — reproducing the
+exact PR #50 P1 regression this test guards against — confirmed the test
+failed with the route reaching the observer immediately, reverted (clean
+no-op diff) and reconfirmed passing. Full targeted regression check
+(`selection_deferral`, `unknown_transitive_attribute`, `as4path_confed`,
+`fault_injection`, `confederation` — 32 tests) green.
+
 ## 2026-08-05 (PR #52 code review: fix Docs CI + 3 test-quality gaps)
 
 External code review of PR #52 (the round-2 e2e coverage gaps below) found

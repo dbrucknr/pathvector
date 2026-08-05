@@ -85,11 +85,18 @@ async fn route_withheld_from_observer_until_deferral_timer_expires() {
 /// release until its own real EOR arrives — it is not exempt from the
 /// wait-set merely because it claims no forwarding-state preservation.
 ///
-/// Uses a `selection_deferral_time` deliberately much longer than the mock
-/// peer's own EOR delay (`EOR_DELAY` in `mock_bgp_gr_peer.rs`, currently 3s):
-/// if the route reaches the observer well before the configured deferral
-/// deadline, that is direct evidence release was gated on this peer's real
-/// EOR, not on the timer expiring on its own.
+/// The mock peer holds its EOR until this test explicitly releases it via
+/// `SelectionDeferralHarness::release_delayed_eor` (a real control-socket
+/// signal, not a fixed sleep — flagged by code review on PR #52: an
+/// earlier fixed-delay version raced the mock's own wall-clock timer
+/// against unbounded harness-startup/session-establishment overhead). This
+/// makes the sequencing fully deterministic: the negative ("not yet
+/// released") check below is guaranteed to run before the mock has any
+/// possibility of having sent its EOR, since the mock cannot send it until
+/// this test calls `release_delayed_eor()` — which happens strictly after
+/// that check. `DEFERRAL_SECS` is still deliberately large so the
+/// Selection_Deferral_Timer itself has no opportunity to preempt this
+/// test's own release signal.
 #[tokio::test]
 async fn restart_time_zero_peer_blocks_release_until_its_own_eor_arrives() {
     const DEFERRAL_SECS: u16 = 30;
@@ -106,8 +113,10 @@ async fn restart_time_zero_peer_blocks_release_until_its_own_eor_arrives() {
     // The observer must not have the route yet — if pathvectord wrongly
     // excluded a restart_time=0 peer from the wait-set entirely (the exact
     // regression this test guards; see PR #50's P1 fix), release would
-    // happen immediately on Established, well before the mock's own
-    // deliberately-delayed EOR (`EOR_DELAY`, 3s in mock_bgp_gr_peer.rs).
+    // happen immediately on Established, well before this test releases
+    // the mock's held-back EOR below. Deterministically guaranteed: the
+    // mock is still blocked on its own control socket at this point, since
+    // nothing has connected to it yet.
     let rib_text = pathvector_e2e::gobgp_rib_text(&h.observer_id);
     assert!(
         !rib_text.contains(SELECTION_DEFERRAL_TEST_PREFIX),
@@ -116,8 +125,11 @@ async fn restart_time_zero_peer_blocks_release_until_its_own_eor_arrives() {
          early; got RIB:\n{rib_text}"
     );
 
-    // The route must reach the observer well before DEFERRAL_SECS — proving
-    // release was gated on the peer's real (delayed) EOR, not the timer.
+    h.release_delayed_eor();
+
+    // The route must reach the observer promptly after the release signal
+    // (well before DEFERRAL_SECS) — proving release was gated on the
+    // peer's real EOR, not the timer.
     wait_for_gobgp_rib_entry(
         &h.observer_id,
         SELECTION_DEFERRAL_TEST_PREFIX,
