@@ -267,7 +267,7 @@ impl DaemonState {
             // Snapshot which NLRIs were held stale.  Any that aren't refreshed
             // by the peer before its EOR will be withdrawn in on_route_update.
             if gr_v4 {
-                let stale_now: HashSet<Nlri<Ipv4Addr>> = self
+                let stale_now: AHashSet<Nlri<Ipv4Addr>> = self
                     .adj_ribs_in
                     .get(&peer_ip)
                     .map(|ari| ari.routes().map(|(nlri, _)| *nlri).collect())
@@ -277,7 +277,7 @@ impl DaemonState {
                 }
             }
             if gr_v6 {
-                let stale_now_v6: HashSet<Nlri<Ipv6Addr>> = self
+                let stale_now_v6: AHashSet<Nlri<Ipv6Addr>> = self
                     .adj_ribs_in_v6
                     .get(&peer_ip)
                     .map(|ari| ari.routes().map(|(nlri, _)| *nlri).collect())
@@ -288,8 +288,8 @@ impl DaemonState {
             }
             tracing::info!(
                 peer = %peer_ip,
-                stale_v4 = self.gr.stale_nlri.get(&peer_ip).map_or(0, HashSet::len),
-                stale_v6 = self.gr.stale_nlri_v6.get(&peer_ip).map_or(0, HashSet::len),
+                stale_v4 = self.gr.stale_nlri.get(&peer_ip).map_or(0, |s| s.len()),
+                stale_v6 = self.gr.stale_nlri_v6.get(&peer_ip).map_or(0, |s| s.len()),
                 "peer re-established within GR window — stale routes kept until EOR"
             );
         }

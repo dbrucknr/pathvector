@@ -10,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+use ahash::AHashSet;
 use pathvector_policy::{
     AnyCondition, BgpRoute, Decision, DefaultAction, OtcLeakCondition, OtcPropagationCondition,
     Policy, Reject, SetOtc, Term,
@@ -184,9 +185,13 @@ pub(crate) struct RibSnapshot {
     /// IPv6 Loc-RIB — best IPv6 routes, post-import-policy.
     pub(crate) loc_rib_v6: LocRib<Ipv6Addr>,
     /// NLRI set for locally originated IPv4 routes; routes live in `loc_rib`.
-    pub(crate) originated_routes: HashSet<Nlri<Ipv4Addr>>,
+    ///
+    /// `AHashSet` (non-cryptographic hasher) — these keys are internal NLRI
+    /// bookkeeping, never attacker-controlled, matching `LocRib`'s existing
+    /// choice of hasher for the same reason.
+    pub(crate) originated_routes: AHashSet<Nlri<Ipv4Addr>>,
     /// NLRI set for locally originated IPv6 routes; routes live in `loc_rib_v6`.
-    pub(crate) originated_routes_v6: HashSet<Nlri<Ipv6Addr>>,
+    pub(crate) originated_routes_v6: AHashSet<Nlri<Ipv6Addr>>,
     /// Immutable after startup.
     pub(crate) local_as: u32,
     /// Immutable after startup.
@@ -343,9 +348,10 @@ pub(crate) struct DaemonState {
     /// NLRIs suppressed by MRAI that have not yet been sent.
     ///
     /// When an MRAI window elapses, the pending NLRIs for that peer are
-    /// re-propagated. Uses a `HashSet` so repeated updates to the same prefix
-    /// within one suppression window collapse to a single deferred flush.
-    pub(crate) mrai_pending: HashMap<IpAddr, HashSet<Nlri<Ipv4Addr>>>,
+    /// re-propagated. Uses an `AHashSet` (internal NLRI keys, non-attacker-
+    /// controlled) so repeated updates to the same prefix within one
+    /// suppression window collapse to a single deferred flush.
+    pub(crate) mrai_pending: HashMap<IpAddr, AHashSet<Nlri<Ipv4Addr>>>,
     /// Peers whose outbound UPDATE channel overflowed during the current event.
     ///
     /// The event loop drains this list after each event via [`take_stalled_peers`]
@@ -602,8 +608,8 @@ impl DaemonState {
         let rib = Arc::new(RibSnapshot {
             loc_rib: LocRib::new(),
             loc_rib_v6: LocRib::new(),
-            originated_routes: HashSet::new(),
-            originated_routes_v6: HashSet::new(),
+            originated_routes: AHashSet::new(),
+            originated_routes_v6: AHashSet::new(),
             local_as,
             local_bgp_id,
             local_ipv6,
@@ -17763,7 +17769,7 @@ mod test_gr_phase2 {
         establish_with_gr(&mut state, 120);
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        let stale_set = std::collections::HashSet::from([nlri]);
+        let stale_set = ahash::AHashSet::from_iter([nlri]);
 
         // Remove adj_ribs_in so the `if let Some(ari)` branch is skipped.
         state.adj_ribs_in.remove(&IpAddr::V4(PEER_IP));
@@ -17797,7 +17803,7 @@ mod test_gr_phase2 {
         // Remove observer's export policy — defensive `continue` must fire.
         state.export_policies.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        let stale_set = std::collections::HashSet::from([nlri]);
+        let stale_set = ahash::AHashSet::from_iter([nlri]);
         state.prune_stale_nlri(IpAddr::V4(PEER_IP), &stale_set);
     }
 
@@ -17828,7 +17834,7 @@ mod test_gr_phase2 {
         drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        let stale_set = std::collections::HashSet::from([nlri]);
+        let stale_set = ahash::AHashSet::from_iter([nlri]);
         state.prune_stale_nlri(IpAddr::V4(PEER_IP), &stale_set);
 
         assert!(
@@ -18111,10 +18117,7 @@ mod test_gr_phase2 {
 
         state.adj_ribs_out.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        state.prune_stale_nlri(
-            IpAddr::V4(PEER_IP),
-            &std::collections::HashSet::from([nlri]),
-        );
+        state.prune_stale_nlri(IpAddr::V4(PEER_IP), &ahash::AHashSet::from_iter([nlri]));
     }
 
     /// When `prune_stale_nlri_v6` encounters a peer without adj_ribs_in_v6, it must
@@ -18137,7 +18140,7 @@ mod test_gr_phase2 {
         state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
 
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        let stale_set = std::collections::HashSet::from([nlri]);
+        let stale_set = ahash::AHashSet::from_iter([nlri]);
         // Remove adj_ribs_in_v6 so the `if let Some(ari_v6)` branch is skipped.
         state.adj_ribs_in_v6.remove(&IpAddr::V4(PEER_IP));
         state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &stale_set);
@@ -18191,7 +18194,7 @@ mod test_gr_phase2 {
         drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 
         let nlri: Nlri<Ipv6Addr> = "2001:db8:2::/48".parse().unwrap();
-        let stale_set = std::collections::HashSet::from([nlri]);
+        let stale_set = ahash::AHashSet::from_iter([nlri]);
         state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &stale_set);
 
         assert!(
@@ -18298,10 +18301,7 @@ mod test_gr_phase2 {
 
         state.update_senders.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        state.prune_stale_nlri(
-            IpAddr::V4(PEER_IP),
-            &std::collections::HashSet::from([nlri]),
-        );
+        state.prune_stale_nlri(IpAddr::V4(PEER_IP), &ahash::AHashSet::from_iter([nlri]));
     }
 
     /// When the observer's export_policy is missing in prune_stale_nlri_v6,
@@ -18347,10 +18347,7 @@ mod test_gr_phase2 {
 
         state.export_policies.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        state.prune_stale_nlri_v6(
-            IpAddr::V4(PEER_IP),
-            &std::collections::HashSet::from([nlri]),
-        );
+        state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &ahash::AHashSet::from_iter([nlri]));
     }
 
     /// When the observer's adj_ribs_out_v6 is missing in prune_stale_nlri_v6,
@@ -18396,10 +18393,7 @@ mod test_gr_phase2 {
 
         state.adj_ribs_out_v6.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        state.prune_stale_nlri_v6(
-            IpAddr::V4(PEER_IP),
-            &std::collections::HashSet::from([nlri]),
-        );
+        state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &ahash::AHashSet::from_iter([nlri]));
     }
 
     /// When the observer's update_senders is missing in prune_stale_nlri_v6,
@@ -18445,10 +18439,7 @@ mod test_gr_phase2 {
 
         state.update_senders.remove(&IpAddr::V4(OBS_IP));
         let nlri: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        state.prune_stale_nlri_v6(
-            IpAddr::V4(PEER_IP),
-            &std::collections::HashSet::from([nlri]),
-        );
+        state.prune_stale_nlri_v6(IpAddr::V4(PEER_IP), &ahash::AHashSet::from_iter([nlri]));
     }
 
     /// When the observer's export_policy is missing during deadline expiry,

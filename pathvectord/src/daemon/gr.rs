@@ -17,9 +17,11 @@ pub(crate) struct GracefulRestartState {
     ///
     /// Routes that are not refreshed by the peer before its EOR are withdrawn on
     /// EOR receipt.  Cleared on EOR, deadline expiry, or peer removal.
-    pub(crate) stale_nlri: HashMap<IpAddr, HashSet<Nlri<Ipv4Addr>>>,
+    ///
+    /// `AHashSet` — internal NLRI bookkeeping, never attacker-controlled.
+    pub(crate) stale_nlri: HashMap<IpAddr, AHashSet<Nlri<Ipv4Addr>>>,
     /// IPv6 counterpart of `stale_nlri` — same lifecycle, v6 NLRIs only.
-    pub(crate) stale_nlri_v6: HashMap<IpAddr, HashSet<Nlri<Ipv6Addr>>>,
+    pub(crate) stale_nlri_v6: HashMap<IpAddr, AHashSet<Nlri<Ipv6Addr>>>,
     /// Per-family GR info from the most-recent peer OPEN.
     ///
     /// Retained across termination so `on_terminated` knows which AFI/SAFIs the
@@ -138,8 +140,8 @@ impl DaemonState {
         peer_ip: IpAddr,
         prev_prefixes: &[Nlri<Ipv4Addr>],
     ) {
-        // Use a HashSet for O(1) membership tests; the slice-based contains is O(n²).
-        let prev_set: HashSet<Nlri<Ipv4Addr>> = prev_prefixes.iter().copied().collect();
+        // Use an AHashSet for O(1) membership tests; the slice-based contains is O(n²).
+        let prev_set: AHashSet<Nlri<Ipv4Addr>> = prev_prefixes.iter().copied().collect();
         let affected: Vec<Nlri<Ipv4Addr>> = self
             .rib
             .loc_rib
@@ -306,7 +308,7 @@ impl DaemonState {
     /// full table) or on GR deadline expiry (peer did not re-establish in time).
     /// Withdraws each NLRI from AdjRibIn and LocRib, then propagates the
     /// resulting best-path changes to all established peers.
-    pub(super) fn prune_stale_nlri(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv4Addr>>) {
+    pub(super) fn prune_stale_nlri(&mut self, peer_ip: IpAddr, stale: &AHashSet<Nlri<Ipv4Addr>>) {
         let stale_peer = PeerId::from(peer_ip);
 
         // Withdraw kernel null routes for any BLACKHOLE-tagged stale NLRIs before
@@ -424,7 +426,11 @@ impl DaemonState {
     }
 
     /// IPv6 counterpart of `prune_stale_nlri` — same semantics for IPv6 NLRIs.
-    pub(super) fn prune_stale_nlri_v6(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv6Addr>>) {
+    pub(super) fn prune_stale_nlri_v6(
+        &mut self,
+        peer_ip: IpAddr,
+        stale: &AHashSet<Nlri<Ipv6Addr>>,
+    ) {
         let stale_peer = PeerId::from(peer_ip);
 
         // Same as prune_stale_nlri: check for BLACKHOLE routes before removal.
