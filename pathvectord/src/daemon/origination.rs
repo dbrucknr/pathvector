@@ -17,6 +17,11 @@ impl DaemonState {
     /// Export policy still applies on the outbound side.
     pub(crate) fn originate_routes(&mut self, routes: Vec<Route<Ipv4Addr>>) {
         let mut nlris = Vec::with_capacity(routes.len());
+        {
+            let rib = self.rib_mut();
+            rib.loc_rib.reserve(routes.len());
+            rib.originated_routes.reserve(routes.len());
+        }
         for route in routes {
             let nlri = route.nlri;
             self.rib_mut().originated_routes.insert(nlri);
@@ -50,6 +55,11 @@ impl DaemonState {
     /// them in a single pass (one `propagate_to_all_peers_v6` call).
     pub(crate) fn originate_routes_v6(&mut self, routes: Vec<Route<Ipv6Addr>>) {
         let mut nlris = Vec::with_capacity(routes.len());
+        {
+            let rib = self.rib_mut();
+            rib.loc_rib_v6.reserve(routes.len());
+            rib.originated_routes_v6.reserve(routes.len());
+        }
         for route in routes {
             let nlri = route.nlri;
             self.rib_mut().originated_routes_v6.insert(nlri);
