@@ -36,5 +36,13 @@ harness = false
 name    = "outbound_pipeline"
 harness = false
 
+[[bench]]
+name    = "loc_rib_reconcile"
+harness = false
+
+[[bench]]
+name    = "best_index"
+harness = false
+
 [lints]
 workspace = true
