@@ -15,6 +15,15 @@ failed for the exact right reason, then restored). See the per-item
 "Shipped" notes below for exact numbers and `plans/performance-history.md`
 for the consolidated benchmark log. Phases 2-6 remain concept-only.
 
+**Full 10k/100k/500k sweep at Criterion defaults completed 2026-08-08**
+(superseding an initial `--sample-size 10`, n=100k-only pass). Confirms the
+overall direction but surfaced two real, honestly-reported findings that
+weren't visible in the quick pass: `idempotent_reorigination/two_candidates`
+(Item 5) grows into a genuine 10% regression by 500k, and `best_index`'s
+`get` operation (Item 2) reverses at 500k for the `/32`-only shape
+specifically. Neither changes the decisions made — see the "Full-sweep
+update" notes under Items 2 and 5 below.
+
 ## Motivation
 
 BlockingArbiter is a separate reconciler that collects IP addresses from multiple
@@ -276,6 +285,18 @@ inserted prefix's own exact address, at which point the real-teeth check
 (reverting the probe range to `0..A::BITS`, silently skipping the exact
 `/32` case) correctly failed.
 
+**Full-sweep update (10k/100k/500k, Criterion defaults) — one real reversal
+found, reported rather than hidden:** at 500k, `/32`-exact `get` is
+*slower* on `AHashMap` than `RouteMap` (+22.8%) — the only cell in the
+whole `best_index` table that goes the wrong way, and specific to that
+exact combination (pure lookup, `/32`-only keys, 500k scale; the
+mixed-prefix shape's `get` still wins at the same size). Not yet
+root-caused. Doesn't change the decision: `insert`/`remove` — what
+`LocRib::insert`/`withdraw`'s actual hot path is dominated by — still favor
+`AHashMap` at every size and shape, including 500k. See
+`plans/performance-history.md` for the full table and more detail on this
+finding.
+
 ### 3. Reserve capacity for batch origination
 
 `OriginateRoutes` knows the batch size, but the originated set and `LocRib` maps grow
@@ -345,6 +366,22 @@ combined attempt where both bugs were injected at once produced a
 false-pass because the two bugs happened to cancel out on that specific
 test, which is itself worth remembering for future real-teeth passes on
 this file).
+
+**Full-sweep update (10k/100k/500k, Criterion defaults) — a real,
+size-growing regression found in the two-candidate case, reported rather
+than hidden:** `idempotent_reorigination/two_candidates` is `content_eq`'s
+one weak spot — at 500k it's **10.0% slower** than `main`, and the earlier
+`--sample-size 10` pass's +5.5% at 100k (originally suspected to be noise)
+turned out to understate the real trend at 100k (this fuller run shows
+−7.3% there — an improvement, not a regression — but the cost clearly grows
+with table size and flips to a real regression by 500k). The mechanism:
+`content_eq` walks every field of a `Route`, including `rare`'s `Vec`s, on
+every insert by the current winner, and without Item 1's single-candidate
+fast path (which doesn't apply here — this is the two-candidate path) there's
+no avoided clone to offset that cost. The single-candidate case — the one
+that actually matches BlockingArbiter's dominant shape — shows the opposite:
+a clear, size-consistent win (−25.7% to −63.5% across all three sizes). See
+`plans/performance-history.md` for the full table.
 
 ## Phase 2: Intern immutable route attributes
 
