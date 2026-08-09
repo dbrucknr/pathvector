@@ -182,6 +182,54 @@ Below 250k pathvectord uses less; above 500k pathvectord uses significantly less
 
 ---
 
+## BlockingArbiter-shaped throughput (2026-08-08)
+
+Distinct from the memory-focused entries above — this benchmarks `LocRib`
+operation *speed* under a companion reconciler's workload shape (mostly
+locally-originated `/32` host routes, shared attributes, frequent full
+desired-state reassertion), not peak RSS. See
+`plans/blocking-arbiter-performance.md` for the full write-up. Harness:
+`pathvector-rib/benches/loc_rib_reconcile.rs` and `benches/best_index.rs`
+(Criterion, `--sample-size 10 --warm-up-time 1 --measurement-time 2` for
+faster iteration; production benches use Criterion's defaults). Before/after
+compares this commit's `pathvector-rib/src/loc_rib.rs`/`route.rs` against
+`main`, n=100,000, single measurement pass each (not averaged across
+multiple runs — treat as directional, re-run before citing in a release).
+
+| Benchmark | main (before) | this commit (after) | Δ |
+|---|---|---|---|
+| `reconcile_empty_to_full/single_candidate` | 60.66 ms | 39.03 ms | **−36%** |
+| `reconcile_empty_to_full/two_candidates` | 127.37 ms | 107.35 ms | **−16%** |
+| `reconcile_idempotent_reorigination/single_candidate` | 52.89 ms | 31.99 ms | **−40%** |
+| `reconcile_idempotent_reorigination/two_candidates` | 75.79 ms | 80.20 ms | +5.5%¹ |
+| `reconcile_one_percent_churn` (single-candidate table) | 493.86 µs | 300.79 µs | **−39%** |
+
+¹ The one case that didn't improve: Item 5's `content_eq` comparison adds a
+per-insert cost that isn't offset by an avoided clone unless the fast path
+(Item 1, single-candidate only) also applies. At `--sample-size 10` this is
+within plausible noise (2/10 severe outliers on the `two_candidates`
+sample), but recorded honestly rather than omitted — the single-candidate
+case (BlockingArbiter's actual dominant shape) is the one that matters and
+shows a clear win regardless.
+
+`best_index` (RouteMap vs AHashMap for `LocRib::best`, n=100,000):
+
+| Operation | `/32`-heavy | mixed-prefix |
+|---|---|---|
+| insert | **−37%** (13.48ms → 8.46ms) | **−19%** (15.42ms → 12.44ms) |
+| get | **−32%** (11.14ms → 7.55ms) | **−16%** (14.26ms → 11.97ms) |
+| remove | **−48%** (16.73ms → 8.70ms) | **−28%** (17.43ms → 12.61ms) |
+
+`AHashMap` won every operation and shape measured — justified implementing
+the swap (see Item 2 in `plans/blocking-arbiter-performance.md`).
+
+**Follow-up before citing these numbers in a release:** re-run the full
+3-size sweep (10k/100k/500k) at Criterion's default sample size, and add
+the heavier multi-peer/concurrent-read/soak scenarios Phase 0 deferred —
+see `plans/blocking-arbiter-performance.md`'s Phase 0 section.
+
+---
+
 ## Next candidates
 
 | Candidate | Expected saving | Complexity |
