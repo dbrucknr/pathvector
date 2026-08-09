@@ -4,6 +4,52 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-08 (BlockingArbiter-shaped performance, Phase 0 + Phase 1)
+
+Codex authored `plans/blocking-arbiter-performance.md`, a measurement-first
+performance plan for pathvectord's Loc-RIB path targeting BlockingArbiter's
+workload shape (mostly locally-originated `/32` host routes, shared
+attributes, frequent full desired-state reassertion). Its specific factual
+claims about the code were independently fact-checked before any work
+started and held up exactly. Implemented Phase 0 (a BlockingArbiter-shaped
+Criterion bench harness) and all 5 Phase 1 items; Phases 2-6 remain
+deferred pending future need.
+
+- **Item 1** — `LocRib::recompute_best` gained a single-candidate fast path
+  that skips the `AHashMap` clone and `select_best_with_oracle`'s
+  `Vec`/`HashMap` allocations for the dominant locally-originated-route
+  case. Proven behaviorally identical to the general path by a new
+  differential proptest.
+- **Item 2** — benchmarked `RouteMap` vs `AHashMap` for `LocRib::best`
+  (n=100k, `/32`-heavy and mixed-prefix shapes): `AHashMap` won every
+  operation, 16-48% faster. Implemented the swap; `longest_match` is now a
+  bounded exact-probe loop (confirmed production NLRIs are already masked
+  at wire-decode time, so key canonicalization is defense-in-depth, not
+  load-bearing). `pathvector-rpki`'s own `RouteMap` usage is untouched.
+- **Item 3** — `LocRib::with_capacity`/`reserve` added and wired into
+  `originate_routes`/`_v6` with the known batch length.
+- **Item 4** — internal NLRI bookkeeping (`originated_routes`/`_v6`,
+  GR's `stale_nlri`/`_v6`, MRAI's `mrai_pending`) swapped from std
+  `HashMap`/`HashSet` to `AHashMap`/`AHashSet`, matching `LocRib`'s existing
+  rationale (internal, non-attacker-controlled keys).
+- **Item 5** — `LocRib::insert` now short-circuits to `Unchanged` for a
+  byte-identical re-origination by the current winning peer, via a new
+  `Route::content_eq` that deliberately excludes the volatile `received_at`
+  timestamp but keeps `stale` (an RFC 4724 §4.2 fresh/stale transition is a
+  real change). A Plan sub-agent review caught this exact `received_at`
+  pitfall in the original fingerprint design before it shipped.
+
+Every behavior-changing item was real-teeth verified (production logic
+temporarily broken, confirmed the corresponding test failed for the exact
+right reason, then restored) — including one case where two simultaneous
+injected bugs canceled out and produced a false-pass, caught by re-running
+the checks in isolation. Measured 36-63% faster on single-candidate
+workloads (BlockingArbiter's dominant shape) at n=100k; see
+`plans/performance-history.md` for full before/after numbers and the
+`plans/blocking-arbiter-performance.md` per-item notes for design detail.
+Full workspace `cargo test`/`clippy -D warnings`/`fmt --check`, and MSRV
+(1.88) all clean.
+
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 
 Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s

@@ -6,6 +6,7 @@ approach, files to modify, and success criteria. Items in TODO.md describe
 
 | Plan | Summary |
 |---|---|
+| [blocking-arbiter-performance.md](blocking-arbiter-performance.md) | Production-shaped performance and storage concepts for a separately deployed BlockingArbiter reconciler |
 | [stress-test-full-table.md](stress-test-full-table.md) | Three-stage correctness and performance test at internet scale (~950k prefixes) |
 | [criterion-benchmarks.md](criterion-benchmarks.md) | Per-crate criterion benchmark suite across types, policy, RIB, and session codec |
 | [stale-route-cleanup.md](stale-route-cleanup.md) | Delete RTPROT_BGP kernel routes at daemon startup to prevent stale routes after restart |
