@@ -4,6 +4,35 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-08 (BlockingArbiter-shaped performance, full benchmark sweep)
+
+Follow-up to the same-day Phase 0 + Phase 1 entry below: the original
+numbers used `--sample-size 10` and only n=100,000, flagged at the time as
+"directional, re-run before citing in a release." Reran the full
+10k/100k/500k sweep at Criterion's default sampling for both
+`loc_rib_reconcile` and `best_index`. Confirms the overall direction, and
+surfaces two real, size-dependent findings the quick pass didn't show —
+reported honestly rather than smoothed into the "wins across the board"
+narrative:
+
+- `reconcile_idempotent_reorigination/two_candidates` (Item 5) grows into a
+  genuine **+10.0% regression at 500k** — `content_eq`'s per-insert field
+  walk isn't offset by an avoided clone outside Item 1's single-candidate
+  fast path. The single-candidate case (BlockingArbiter's actual dominant
+  shape) still shows a clear, size-consistent win across all three sizes
+  (−25.7% to −63.5%).
+- `best_index_get/ahashmap_slash32/500000` (Item 2) is **+22.8% slower**
+  than `RouteMap` — the one reversal in the entire `best_index` sweep,
+  specific to pure `/32`-exact lookups at 500k scale; not yet root-caused.
+  `insert`/`remove` — what `LocRib::insert`/`withdraw`'s actual hot path is
+  dominated by — still favor `AHashMap` at every size and shape, including
+  500k.
+
+Neither finding changes the decisions already shipped; both are recorded
+in `plans/performance-history.md` (full tables) and
+`plans/blocking-arbiter-performance.md` (per-item "Full-sweep update"
+notes under Items 2 and 5).
+
 ## 2026-08-08 (BlockingArbiter-shaped performance, Phase 0 + Phase 1)
 
 Codex authored `plans/blocking-arbiter-performance.md`, a measurement-first
