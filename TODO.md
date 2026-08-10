@@ -2680,6 +2680,33 @@ sizes; they become bottlenecks at internet scale (tens of peers, ~950k IPv4 pref
    full RIB clone. Ensure streaming handlers never hold a snapshot `Arc` across `await`
    points. Audit any new streaming RPC before merging.
 
+#### BlockingArbiter-shaped `best_index` follow-ups (2026-08-10)
+
+PR #54 fixed two real methodology bugs in `pathvector-rib/benches/best_index.rs`
+(NLRI generation inside the timed region; mixed-prefix dataset collisions at
+scale — see `plans/blocking-arbiter-performance.md`'s Item 2 section) but did
+not re-run the corrected benchmark or complete the follow-up measurements
+raised during review. The `AHashMap` swap for `LocRib::best` is confirmed for
+`insert`/`remove` (unaffected by either bug); the 500k `/32`-exact `get`
+reversal noted in `plans/performance-history.md` is unconfirmed until these
+land:
+
+- Re-run `best_index` with both bugs fixed and record fresh 10k/100k/500k
+  numbers (supersedes the provisional table currently in
+  `plans/performance-history.md`).
+- Sequential vs. shuffled lookup order for `get`, to separate cache-locality
+  effects from raw algorithmic cost.
+- A capacity sweep at 400k/450k/500k/550k/600k with `AHashMap`'s actual
+  capacity recorded at each point, to check whether the 500k reversal tracks
+  a resize boundary rather than being a stable characteristic of that scale.
+- Repeat the 500k reversal across several independent runs to rule out a
+  one-off measurement artifact before treating it as a real characteristic.
+- A composite reconciliation/export benchmark at 1/4/10 peers exercising
+  `pathvectord::outbound::propagate_prefix`'s actual `get`-heavy read path
+  (now via `LocRib::best_with_peer`, added in the same PR) directly, rather
+  than inferring outbound-propagation behavior from `best_index`'s isolated
+  `get` numbers.
+
 #### Per-crate criterion benchmarks
 
 `pathvector-rib` benchmarks (`select_best`, `loc_rib_insert`, `outbound_pipeline`) shipped

@@ -4,6 +4,53 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-10 (BlockingArbiter-shaped performance, Item 5 redesign + Item 2 benchmark fixes)
+
+Follow-up to the two 2026-08-08 entries below, driven by a detailed review
+of the full-sweep numbers. Two changes:
+
+- **Item 5 (idempotent-reorigination suppression) redesigned** — moved from
+  a `content_eq` gate inside `LocRib::insert` to the local-origination
+  boundary (`pathvectord::daemon::origination`). The `insert`-level design
+  didn't actually suppress a wire-level advertisement (its only caller
+  discarded the result) and ran its comparison cost unconditionally on
+  every multi-candidate BGP-learned-route update — which is exactly what
+  produced the +10.0%-at-500k regression reported in the full-sweep entry
+  below. `LocRib::insert` reverted to its original conservative behavior;
+  `Route::content_eq` moved to a new `LocRib::candidate()` lookup at the
+  one call site that both needs the suppression and can act on it before
+  the route event, RIB insertion, and propagation costs are incurred.
+  Real-teeth verified against the peer's actual outbound UPDATE channel
+  (`originate_routes_suppresses_wire_level_duplicate_for_identical_reorigination`),
+  not just `LocRib`'s internal return value — the first version of this
+  test had a wall-clock-coincidence loophole (both routes landing in the
+  same second gave them equal `received_at`, letting `outbound.rs`'s own
+  independent dedup pass even with the gate broken) that's now closed by
+  setting explicit, distinct `received_at` values per route.
+- **Item 2's `best_index` benchmark had two real bugs, now fixed**: NLRI
+  construction was running inside the Criterion-timed closures rather than
+  pre-generated in setup, and the mixed-prefix dataset generator could
+  produce far fewer unique prefixes than its nominal size at scale (only 8
+  unique `/16`s existed at n=500,000 against a nominal 100,000, because a
+  uniform percentage split ignored each length's total address-space
+  budget). The `500k` `get` reversal reported in the full-sweep entry below
+  has not yet been re-measured with the fixes applied and should be treated
+  as provisional. Also added: `LocRib::best_with_peer()`, halving
+  `propagate_prefix`'s per-prefix-per-peer read cost from two lookups to
+  one.
+
+See `plans/blocking-arbiter-performance.md` (Items 2 and 5) and
+`plans/performance-history.md` for the full write-up, and `TODO.md`'s
+"BlockingArbiter-shaped `best_index` follow-ups" for the remaining
+measurements (corrected re-run, sequential vs. shuffled order, capacity
+sweep, repeated-run confirmation, composite peer-scaled benchmark).
+
+Also documented: a `git checkout <branch> -- <path>` staging gotcha hit
+during the full-sweep benchmarking work (it updates the index as well as
+the working tree, which can leave a stale-staged file after restoring the
+optimized version) — see `CONTRIBUTING.md`'s new "Before/after
+benchmarking" section for the pattern to use instead.
+
 ## 2026-08-08 (BlockingArbiter-shaped performance, full benchmark sweep)
 
 Follow-up to the same-day Phase 0 + Phase 1 entry below: the original

@@ -24,6 +24,36 @@ weren't visible in the quick pass: `idempotent_reorigination/two_candidates`
 specifically. Neither changes the decisions made — see the "Full-sweep
 update" notes under Items 2 and 5 below.
 
+**Item 5 redesigned 2026-08-10** after review established that the
+`LocRib::insert`-level `content_eq` gate shipped 2026-08-08 didn't actually
+suppress production advertisements — its only real caller
+(`origination.rs`) discarded the `BestPathChange` return value, and the
+comparison cost still ran unconditionally on the general multi-candidate
+path regardless of whether the fast path applied. Suppression now happens
+at the local-origination boundary instead, before `LocRib::insert` is ever
+called. This also resolves the two-candidate 500k regression noted above,
+since `content_eq` no longer runs on ordinary BGP-learned-route updates at
+all. See the Item 5 section below for the full redesign.
+
+**Item 2 benchmark bugs fixed 2026-08-10, status downgraded to
+provisional.** Two real methodology bugs were found in
+`best_index.rs`: NLRI construction (`format!(...).parse()`) was running
+inside the timed Criterion closures rather than pre-generated in setup, and
+the mixed-prefix-length dataset generator could produce far fewer unique
+prefixes than the nominal sample size at scale (verified via simulation:
+only 8 unique `/16`s existed at n=500,000 against a nominal 100,000,
+because the generator didn't respect each prefix length's total
+address-space budget). Both are fixed (see the Item 2 section below), but
+the corrected numbers have not yet been re-measured, and several follow-up
+measurements requested during review — sequential vs. shuffled lookup
+order, a capacity sweep around the 500k `get` reversal (400k/450k/500k/
+550k/600k with map capacity recorded), repeating the reversal across
+several independent runs, and a composite reconciliation/export benchmark
+at 1/4/10 peers — remain open. Until those land, treat the `AHashMap` swap
+as measured-and-justified for `insert`/`remove` (unaffected by either bug)
+but the `get`-at-500k finding as unconfirmed. See
+`plans/performance-history.md` for what's been re-verified so far.
+
 ## Motivation
 
 BlockingArbiter is a separate reconciler that collects IP addresses from multiple
@@ -297,6 +327,54 @@ root-caused. Doesn't change the decision: `insert`/`remove` — what
 `plans/performance-history.md` for the full table and more detail on this
 finding.
 
+**Benchmark methodology bugs found and fixed 2026-08-10 — status
+downgraded to provisional pending re-measurement.** Two problems in
+`pathvector-rib/benches/best_index.rs` cast doubt on the numbers above,
+particularly the 500k `get` reversal:
+
+1. NLRI construction (`format!("...").parse()`) was happening inside the
+   Criterion-timed closures for all three benchmark functions, not in
+   setup. Fixed: a new `pregenerate()` helper builds the full `Vec<Nlri>`
+   before `group.bench_with_input` runs, so only the map operation itself
+   is timed.
+2. The mixed-prefix-length dataset generator produced far fewer unique
+   prefixes than the benchmark's nominal `n` at scale — a uniform
+   percentage split across five lengths doesn't respect that IPv4 has only
+   65,536 possible `/16`s in total, so at n=500,000 a naive 20% `/16` share
+   demanded 100,000 distinct `/16`s and produced massive unintended key
+   collisions (verified via simulation: only 8 unique `/16`s actually
+   existed). Fixed: `nlri_mixed` now uses an explicit weighted-length
+   distribution (`MIXED_LEN_WEIGHTS`, summing to 100, weighted toward `/24`
+   to match real BGP table shape) with an occurrence counter placed
+   directly in the prefix's network-bit position, guaranteeing zero
+   collisions per length at every size this file benchmarks — see the
+   function's doc comment for the exact address-space-budget bound.
+
+Also addressed in the same pass: `LocRib::best_with_peer()` — a new
+inherent method (and a nested-`Option` variant on the `RibView` trait for
+`propagate_prefix`'s generic v4 caller, which needs to distinguish "no
+route" from "route present but source peer unknown," a state
+`StubRibView` intentionally has in tests) that combines what was
+previously two separate lookups (`best_peer()` + `best()`) in
+`pathvectord::outbound::propagate_prefix`/`_v6` into one. This was raised
+as a concern during Item 2's review independent of the `RouteMap` vs.
+`AHashMap` question: outbound propagation reads scale with peer count, so
+halving the per-prefix-per-peer read cost matters regardless of which map
+backs `LocRib::best`.
+
+Both dataset-generation bugs are fixed, and the corrected benchmark has not
+yet been re-run to produce fresh numbers — the table above should be
+treated as provisional until it is. The remaining follow-ups from review —
+sequential vs. shuffled lookup order (to separate cache-locality effects
+from raw algorithmic cost), a capacity sweep at 400k/450k/500k/550k/600k
+with `AHashMap`'s actual capacity recorded at each point (to check whether
+the 500k reversal tracks a resize boundary), repeating the reversal across
+several independent runs (to rule out a one-off measurement artifact), and
+a composite reconciliation/export benchmark at 1/4/10 peers (to measure the
+`get`-heavy outbound-propagation path directly rather than inferring its
+behavior from `best_index`'s isolated `get` numbers) — are tracked in
+`TODO.md` rather than done ahead of time in this pass.
+
 ### 3. Reserve capacity for batch origination
 
 `OriginateRoutes` knows the batch size, but the originated set and `LocRib` maps grow
@@ -382,6 +460,46 @@ no avoided clone to offset that cost. The single-candidate case — the one
 that actually matches BlockingArbiter's dominant shape — shows the opposite:
 a clear, size-consistent win (−25.7% to −63.5% across all three sizes). See
 `plans/performance-history.md` for the full table.
+
+**Redesigned 2026-08-10 — moved from `LocRib::insert` to the
+local-origination boundary.** The shipped design above was correct as far
+as it went, but review identified two problems: (1) `content_eq`'s cost ran
+unconditionally as part of the general multi-candidate recompute path —
+comparing before overwriting the candidate map — regardless of whether the
+comparison actually changed the outcome, so it was pure overhead on top of
+every BGP-learned-route update from a multi-candidate prefix, not just the
+re-origination case it targeted; (2) the only production caller that could
+plausibly benefit, `pathvectord`'s local-origination path, discarded the
+returned `BestPathChange` value entirely (`propagate_to_all_peers` computes
+its NLRI list independently), so suppressing a spurious `Announced` there
+never actually stopped a wire-level advertisement.
+
+`LocRib::insert` was reverted to its original conservative behavior — a
+same-peer update by the current winner always reports `Announced`, with a
+comment explaining why (see `pathvector-rib/src/loc_rib.rs`). `content_eq`
+itself (`pathvector-rib/src/route.rs`) was kept, but its call site moved to
+`pathvectord::daemon::origination::{originate_routes,originate_routes_v6}`:
+before inserting a locally-originated route, compare it against the
+existing `LOCAL_ORIGIN_PEER` candidate (`LocRib::candidate`, a new
+single-peer exact lookup). If semantically identical, skip the route event,
+the RIB insertion, and the prefix's entry in the batch's propagation list
+entirely — not just report a different `BestPathChange` value while still
+doing the work. This is the one call site that actually needs the
+suppression (BlockingArbiter's periodic full-desired-state reassertion) and
+the one place that can act on it before any downstream cost is incurred.
+
+Real-teeth verified with a wire-level test,
+`originate_routes_suppresses_wire_level_duplicate_for_identical_reorigination`
+(`pathvectord/src/daemon/origination.rs`), which asserts directly on the
+peer's outbound UPDATE channel rather than on `LocRib`'s internal return
+value — closing the original design's actual gap. The first version of
+this test relied on two `route_v4(...)` calls landing in the same
+wall-clock second, which gave both routes an identical `received_at` and
+let `outbound.rs`'s own independent `PartialEq`-based dedup coincidentally
+suppress the "duplicate" regardless of whether this gate worked; the test
+passed even with the gate deliberately broken. Rewritten to set explicit,
+distinct `received_at` values per route, closing that loophole — re-running
+with the gate broken then correctly failed.
 
 ## Phase 2: Intern immutable route attributes
 
