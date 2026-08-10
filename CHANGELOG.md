@@ -4,6 +4,128 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-08-10 (BlockingArbiter-shaped performance, Item 5 redesign + Item 2 benchmark fixes)
+
+Follow-up to the two 2026-08-08 entries below, driven by a detailed review
+of the full-sweep numbers. Two changes:
+
+- **Item 5 (idempotent-reorigination suppression) redesigned** — moved from
+  a `content_eq` gate inside `LocRib::insert` to the local-origination
+  boundary (`pathvectord::daemon::origination`). The `insert`-level design
+  didn't actually suppress a wire-level advertisement (its only caller
+  discarded the result) and ran its comparison cost unconditionally on
+  every multi-candidate BGP-learned-route update — which is exactly what
+  produced the +10.0%-at-500k regression reported in the full-sweep entry
+  below. `LocRib::insert` reverted to its original conservative behavior;
+  `Route::content_eq` moved to a new `LocRib::candidate()` lookup at the
+  one call site that both needs the suppression and can act on it before
+  the route event, RIB insertion, and propagation costs are incurred.
+  Real-teeth verified against the peer's actual outbound UPDATE channel
+  (`originate_routes_suppresses_wire_level_duplicate_for_identical_reorigination`),
+  not just `LocRib`'s internal return value — the first version of this
+  test had a wall-clock-coincidence loophole (both routes landing in the
+  same second gave them equal `received_at`, letting `outbound.rs`'s own
+  independent dedup pass even with the gate broken) that's now closed by
+  setting explicit, distinct `received_at` values per route.
+- **Item 2's `best_index` benchmark had two real bugs, now fixed**: NLRI
+  construction was running inside the Criterion-timed closures rather than
+  pre-generated in setup, and the mixed-prefix dataset generator could
+  produce far fewer unique prefixes than its nominal size at scale (only 8
+  unique `/16`s existed at n=500,000 against a nominal 100,000, because a
+  uniform percentage split ignored each length's total address-space
+  budget). The `500k` `get` reversal reported in the full-sweep entry below
+  has not yet been re-measured with the fixes applied and should be treated
+  as provisional. Also added: `LocRib::best_with_peer()`, halving
+  `propagate_prefix`'s per-prefix-per-peer read cost from two lookups to
+  one.
+
+See `plans/blocking-arbiter-performance.md` (Items 2 and 5) and
+`plans/performance-history.md` for the full write-up, and `TODO.md`'s
+"BlockingArbiter-shaped `best_index` follow-ups" for the remaining
+measurements (corrected re-run, sequential vs. shuffled order, capacity
+sweep, repeated-run confirmation, composite peer-scaled benchmark).
+
+Also documented: a `git checkout <branch> -- <path>` staging gotcha hit
+during the full-sweep benchmarking work (it updates the index as well as
+the working tree, which can leave a stale-staged file after restoring the
+optimized version) — see `CONTRIBUTING.md`'s new "Before/after
+benchmarking" section for the pattern to use instead.
+
+## 2026-08-08 (BlockingArbiter-shaped performance, full benchmark sweep)
+
+Follow-up to the same-day Phase 0 + Phase 1 entry below: the original
+numbers used `--sample-size 10` and only n=100,000, flagged at the time as
+"directional, re-run before citing in a release." Reran the full
+10k/100k/500k sweep at Criterion's default sampling for both
+`loc_rib_reconcile` and `best_index`. Confirms the overall direction, and
+surfaces two real, size-dependent findings the quick pass didn't show —
+reported honestly rather than smoothed into the "wins across the board"
+narrative:
+
+- `reconcile_idempotent_reorigination/two_candidates` (Item 5) grows into a
+  genuine **+10.0% regression at 500k** — `content_eq`'s per-insert field
+  walk isn't offset by an avoided clone outside Item 1's single-candidate
+  fast path. The single-candidate case (BlockingArbiter's actual dominant
+  shape) still shows a clear, size-consistent win across all three sizes
+  (−25.7% to −63.5%).
+- `best_index_get/ahashmap_slash32/500000` (Item 2) is **+22.8% slower**
+  than `RouteMap` — the one reversal in the entire `best_index` sweep,
+  specific to pure `/32`-exact lookups at 500k scale; not yet root-caused.
+  `insert`/`remove` — what `LocRib::insert`/`withdraw`'s actual hot path is
+  dominated by — still favor `AHashMap` at every size and shape, including
+  500k.
+
+Neither finding changes the decisions already shipped; both are recorded
+in `plans/performance-history.md` (full tables) and
+`plans/blocking-arbiter-performance.md` (per-item "Full-sweep update"
+notes under Items 2 and 5).
+
+## 2026-08-08 (BlockingArbiter-shaped performance, Phase 0 + Phase 1)
+
+Codex authored `plans/blocking-arbiter-performance.md`, a measurement-first
+performance plan for pathvectord's Loc-RIB path targeting BlockingArbiter's
+workload shape (mostly locally-originated `/32` host routes, shared
+attributes, frequent full desired-state reassertion). Its specific factual
+claims about the code were independently fact-checked before any work
+started and held up exactly. Implemented Phase 0 (a BlockingArbiter-shaped
+Criterion bench harness) and all 5 Phase 1 items; Phases 2-6 remain
+deferred pending future need.
+
+- **Item 1** — `LocRib::recompute_best` gained a single-candidate fast path
+  that skips the `AHashMap` clone and `select_best_with_oracle`'s
+  `Vec`/`HashMap` allocations for the dominant locally-originated-route
+  case. Proven behaviorally identical to the general path by a new
+  differential proptest.
+- **Item 2** — benchmarked `RouteMap` vs `AHashMap` for `LocRib::best`
+  (n=100k, `/32`-heavy and mixed-prefix shapes): `AHashMap` won every
+  operation, 16-48% faster. Implemented the swap; `longest_match` is now a
+  bounded exact-probe loop (confirmed production NLRIs are already masked
+  at wire-decode time, so key canonicalization is defense-in-depth, not
+  load-bearing). `pathvector-rpki`'s own `RouteMap` usage is untouched.
+- **Item 3** — `LocRib::with_capacity`/`reserve` added and wired into
+  `originate_routes`/`_v6` with the known batch length.
+- **Item 4** — internal NLRI bookkeeping (`originated_routes`/`_v6`,
+  GR's `stale_nlri`/`_v6`, MRAI's `mrai_pending`) swapped from std
+  `HashMap`/`HashSet` to `AHashMap`/`AHashSet`, matching `LocRib`'s existing
+  rationale (internal, non-attacker-controlled keys).
+- **Item 5** — `LocRib::insert` now short-circuits to `Unchanged` for a
+  byte-identical re-origination by the current winning peer, via a new
+  `Route::content_eq` that deliberately excludes the volatile `received_at`
+  timestamp but keeps `stale` (an RFC 4724 §4.2 fresh/stale transition is a
+  real change). A Plan sub-agent review caught this exact `received_at`
+  pitfall in the original fingerprint design before it shipped.
+
+Every behavior-changing item was real-teeth verified (production logic
+temporarily broken, confirmed the corresponding test failed for the exact
+right reason, then restored) — including one case where two simultaneous
+injected bugs canceled out and produced a false-pass, caught by re-running
+the checks in isolation. Measured 36-63% faster on single-candidate
+workloads (BlockingArbiter's dominant shape) at n=100k; see
+`plans/performance-history.md` for full before/after numbers and the
+`plans/blocking-arbiter-performance.md` per-item notes for design detail.
+Full workspace `cargo test`/`clippy -D warnings`/`fmt --check`, and MSRV
+(1.88) all clean.
+
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 
 Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s

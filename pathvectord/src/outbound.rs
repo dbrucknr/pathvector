@@ -180,11 +180,17 @@ pub(crate) fn propagate_prefix(
     if deferred {
         return PrefixDecision::NoChange;
     }
-    // Compute best_peer once; callers that already looked it up for split-horizon
-    // checks pass the same call, but the real savings is removing the internal
-    // second call that used to exist here.
-    let best_peer = loc_rib.best_peer(&nlri);
-    match loc_rib.best(&nlri) {
+    // Single lookup for both the winning peer and its route — was two
+    // separate `best_peer()` + `best()` calls (two reads into LocRib::best
+    // per prefix per peer; this scales with peer count in a way insert/
+    // withdraw's O(1)-per-prefix cost doesn't — see Item 2 of
+    // plans/blocking-arbiter-performance.md). `best_with_peer`'s peer is its
+    // own nested `Option` — a route can be present with the peer unknown
+    // (e.g. `StubRibView` in tests), which must not be treated as "no
+    // route."
+    let best_with_peer = loc_rib.best_with_peer(&nlri);
+    let best_peer = best_with_peer.as_ref().and_then(|(peer, _)| *peer);
+    match best_with_peer.map(|(_, route)| route) {
         Some(best) => {
             // Never re-advertise a route back to the peer it was learned from.
             // This covers both eBGP and iBGP source-peer split horizon; the
@@ -396,8 +402,9 @@ pub(crate) fn propagate_prefix_v6(
     // next-hop, so don't announce — but do withdraw if we previously did.
     let can_announce = peer_type != PeerType::External || local_ipv6.is_some();
 
-    let best_peer = loc_rib.best_peer(&nlri);
-    match loc_rib.best(&nlri) {
+    let best_with_peer = loc_rib.best_with_peer(&nlri);
+    let best_peer = best_with_peer.as_ref().map(|(peer, _)| *peer);
+    match best_with_peer.map(|(_, route)| route) {
         Some(best) if can_announce => {
             // Never re-advertise a route back to the peer it was learned from.
             if best_peer == Some(adj_rib_out.peer()) {

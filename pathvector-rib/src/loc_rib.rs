@@ -1,7 +1,6 @@
 use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
-use routemap::RouteMap;
 use smallvec::SmallVec;
 
 use crate::{
@@ -101,6 +100,24 @@ pub trait RibView<A: IpAddress> {
         let _ = nlri;
         None
     }
+
+    /// Returns the current best route together with its source peer, in one
+    /// call.
+    ///
+    /// The peer is nested in its own `Option` — deliberately independent of
+    /// whether a route exists — because an implementor with no source-peer
+    /// tracking (e.g. a test stub) legitimately returns a route from
+    /// `best()` while `best_peer()` returns `None`; that must still count
+    /// as "route present, peer unknown," not "no route." Default
+    /// implementation composes `best()` and `best_peer()` (two lookups) for
+    /// implementors with no cheaper option. `LocRib` overrides this with a
+    /// genuine single-lookup implementation — see `LocRib::best_with_peer`,
+    /// whose own signature is the simpler, non-nested `Option<(PeerId,
+    /// &Route<A>)>` since a real `LocRib` never has a route without a known
+    /// peer.
+    fn best_with_peer(&self, nlri: &Nlri<A>) -> Option<(Option<PeerId>, &Route<A>)> {
+        self.best(nlri).map(|route| (self.best_peer(nlri), route))
+    }
 }
 
 impl<A: IpAddress> RibView<A> for LocRib<A> {
@@ -110,6 +127,10 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
 
     fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
         LocRib::best_peer(self, nlri)
+    }
+
+    fn best_with_peer(&self, nlri: &Nlri<A>) -> Option<(Option<PeerId>, &Route<A>)> {
+        LocRib::best_with_peer(self, nlri).map(|(peer, route)| (Some(peer), route))
     }
 }
 
@@ -126,6 +147,20 @@ type CandidateMap<A> = AHashMap<(Nlri<A>, PeerId), Route<A>>;
 /// Kept in sync with `candidates` so `recompute_best` is O(k) per prefix.
 type PeerIndex<A> = AHashMap<Nlri<A>, SmallVec<[PeerId; 4]>>;
 
+/// Best-path index: prefix → winning peer.
+///
+/// `AHashMap` rather than `routemap::RouteMap` — every real caller
+/// (`insert`/`withdraw`/`best`/`best_peer`) does exact lookups; the only
+/// consumer of `RouteMap`'s longest-prefix-match capability was
+/// `LocRib::longest_match`, which has no production call site and is now
+/// implemented as a bounded sequence of exact probes instead (see
+/// `longest_match`). Benchmarked ~16-48% faster than `RouteMap` for exact
+/// insert/get/remove under both a `/32`-heavy and a mixed-prefix-length
+/// shape — see `plans/blocking-arbiter-performance.md`, Item 2.
+/// `pathvector-rpki`'s own `RouteMap` usage (genuine LPM-heavy coverage
+/// queries) is unaffected.
+type BestIndex<A> = AHashMap<Nlri<A>, PeerId>;
+
 #[derive(Clone)]
 pub struct LocRib<A: IpAddress> {
     /// All candidate routes, keyed by `(prefix, peer)`.
@@ -134,8 +169,9 @@ pub struct LocRib<A: IpAddress> {
     peer_index: PeerIndex<A>,
     /// Winning peer per prefix.  Stores only the `PeerId` — the actual Route
     /// is always available via `candidates[(prefix, peer)]`.  This avoids
-    /// keeping a second full clone of every best route in memory.
-    best: RouteMap<A, PeerId>,
+    /// keeping a second full clone of every best route in memory.  Keys are
+    /// always canonicalized with [`Nlri::masked`] on insert/query.
+    best: BestIndex<A>,
 }
 
 impl<A: IpAddress> LocRib<A> {
@@ -145,8 +181,36 @@ impl<A: IpAddress> LocRib<A> {
         Self {
             candidates: AHashMap::new(),
             peer_index: AHashMap::new(),
-            best: RouteMap::new(),
+            best: AHashMap::new(),
         }
+    }
+
+    /// Creates an empty `LocRib` with capacity pre-allocated for `n`
+    /// candidate entries and `n` distinct prefixes.
+    ///
+    /// Use when a batch's exact size is known upfront (e.g. a benchmark
+    /// harness building a fixed-size table) to avoid incremental rehashing.
+    /// See [`LocRib::reserve`] for the equivalent operation on an existing,
+    /// already-populated `LocRib`.
+    #[must_use]
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            candidates: AHashMap::with_capacity(n),
+            peer_index: AHashMap::with_capacity(n),
+            best: AHashMap::with_capacity(n),
+        }
+    }
+
+    /// Reserves capacity for at least `additional` more candidate entries
+    /// and distinct prefixes, without changing the current length.
+    ///
+    /// Call before inserting a batch of known size (e.g.
+    /// `OriginateRoutes`'s route list) to avoid incremental rehashing as the
+    /// batch is inserted one route at a time.
+    pub fn reserve(&mut self, additional: usize) {
+        self.candidates.reserve(additional);
+        self.peer_index.reserve(additional);
+        self.best.reserve(additional);
     }
 
     /// Inserts a route from `peer` into the candidate set and recomputes the
@@ -167,7 +231,7 @@ impl<A: IpAddress> LocRib<A> {
         let nlri = route.nlri;
 
         // Snapshot old best peer before mutation so we can detect Unchanged.
-        let old_best_peer = self.best.get(nlri.prefix()).copied();
+        let old_best_peer = self.best.get(&nlri.masked()).copied();
 
         self.candidates.insert((nlri, peer), route);
         let peers = self.peer_index.entry(nlri).or_default();
@@ -176,7 +240,7 @@ impl<A: IpAddress> LocRib<A> {
         }
         self.recompute_best(nlri, oracle);
 
-        match self.best.get(nlri.prefix()).copied() {
+        match self.best.get(&nlri.masked()).copied() {
             None => BestPathChange::Unchanged,
             Some(new_peer) => {
                 let new_route = &self.candidates[&(nlri, new_peer)];
@@ -185,9 +249,24 @@ impl<A: IpAddress> LocRib<A> {
                         // Same winning peer — unchanged unless its route content changed.
                         // We only need to check content when the inserting peer is the
                         // current winner (otherwise its route didn't change this round).
+                        //
+                        // Deliberately conservative: we no longer have the old
+                        // route's content to compare against here (it was just
+                        // overwritten above), so a same-peer update always
+                        // reports Announced. An earlier version added a
+                        // content-comparison gate directly in this function to
+                        // avoid that — reverted (see
+                        // plans/blocking-arbiter-performance.md, Item 5): it
+                        // didn't skip the recompute_best call above (the actual
+                        // cost for the multi-candidate path), and the one real
+                        // caller of this — local origination — discarded the
+                        // BestPathChange result anyway, so it bought nothing in
+                        // production while adding a real cost to every
+                        // multi-candidate BGP-learned-route update. Suppressing
+                        // a genuinely idempotent re-origination now happens one
+                        // layer up, before this function is even called — see
+                        // `pathvectord::daemon::origination`.
                         if peer == new_peer {
-                            // The winning peer just updated its route; we don't have the
-                            // old content anymore so conservatively signal Announced.
                             BestPathChange::Announced(nlri, new_route.clone())
                         } else {
                             BestPathChange::Unchanged
@@ -213,7 +292,7 @@ impl<A: IpAddress> LocRib<A> {
         nlri: &Nlri<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
-        let had_best = self.best.get(nlri.prefix()).is_some();
+        let had_best = self.best.get(&nlri.masked()).is_some();
 
         if self.candidates.remove(&(*nlri, *peer)).is_none() {
             return BestPathChange::Unchanged;
@@ -227,7 +306,7 @@ impl<A: IpAddress> LocRib<A> {
         };
         if !has_remaining {
             self.peer_index.remove(nlri);
-            self.best.remove(nlri.prefix());
+            self.best.remove(&nlri.masked());
             return if had_best {
                 BestPathChange::Withdrawn(*nlri)
             } else {
@@ -235,10 +314,10 @@ impl<A: IpAddress> LocRib<A> {
             };
         }
 
-        let old_best_peer = self.best.get(nlri.prefix()).copied();
+        let old_best_peer = self.best.get(&nlri.masked()).copied();
         self.recompute_best(*nlri, oracle);
 
-        match self.best.get(nlri.prefix()).copied() {
+        match self.best.get(&nlri.masked()).copied() {
             None => BestPathChange::Withdrawn(*nlri),
             Some(new_peer) => {
                 if old_best_peer == Some(new_peer) && old_best_peer != Some(*peer) {
@@ -280,14 +359,30 @@ impl<A: IpAddress> LocRib<A> {
     /// Returns the current best route for `nlri`, if any.
     #[must_use]
     pub fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        let peer = *self.best.get(nlri.prefix())?;
+        let peer = *self.best.get(&nlri.masked())?;
         self.candidates.get(&(*nlri, peer))
     }
 
     /// Returns the peer whose route is currently best for `nlri`.
     #[must_use]
     pub fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        self.best.get(nlri.prefix()).copied()
+        self.best.get(&nlri.masked()).copied()
+    }
+
+    /// Returns both the winning peer and its route for `nlri` in one
+    /// lookup, instead of two.
+    ///
+    /// Outbound propagation (`pathvectord::outbound::propagate_prefix`)
+    /// previously called `best_peer()` then `best()` separately for every
+    /// prefix, for every peer — two `best`-index reads per prefix per peer,
+    /// which scales with peer count the way `insert`/`withdraw`'s O(1)
+    /// per-prefix cost doesn't. This collapses that to one.
+    #[must_use]
+    pub fn best_with_peer(&self, nlri: &Nlri<A>) -> Option<(PeerId, &Route<A>)> {
+        let peer = *self.best.get(&nlri.masked())?;
+        self.candidates
+            .get(&(*nlri, peer))
+            .map(|route| (peer, route))
     }
 
     /// Iterates over all `(prefix, best_route)` pairs.
@@ -295,8 +390,7 @@ impl<A: IpAddress> LocRib<A> {
     /// Useful for building `AdjRibOut` — iterate this, apply export policy,
     /// and insert accepted routes into the peer's outbound table.
     pub fn best_routes(&self) -> impl Iterator<Item = (Nlri<A>, &Route<A>)> {
-        self.best.iter().filter_map(|(prefix, peer)| {
-            let nlri = Nlri::from_prefix(prefix);
+        self.best.iter().filter_map(|(&nlri, peer)| {
             let route = self.candidates.get(&(nlri, *peer))?;
             Some((nlri, route))
         })
@@ -305,16 +399,45 @@ impl<A: IpAddress> LocRib<A> {
     /// Returns the best route whose prefix most specifically covers `addr`.
     ///
     /// This is the forwarding lookup — the same route the data plane would use
-    /// to forward a packet destined for `addr`.
+    /// to forward a packet destined for `addr`. Implemented as a bounded
+    /// sequence of exact-masked probes from most-specific (`A::BITS`) down to
+    /// least-specific (`0`) — up to 33 lookups for IPv4, 129 for IPv6. This
+    /// has no production call site today (confirmed via workspace-wide grep),
+    /// so a rare O(bits) scan is the right trade for keeping `best` a plain
+    /// exact-match `AHashMap` — see Item 2 in
+    /// `plans/blocking-arbiter-performance.md`.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `len` ranges over `0..=A::BITS` by construction,
+    /// which is always a valid prefix length for `A`.
     #[must_use]
     pub fn longest_match(&self, addr: A) -> Option<&Route<A>> {
-        let (prefix, peer) = self.best.longest_match_entry(addr)?;
-        let nlri = Nlri::from_prefix(prefix);
-        self.candidates.get(&(nlri, *peer))
+        for len in (0..=A::BITS).rev() {
+            let candidate = Nlri::new(addr, len)
+                .expect("len is in [0, A::BITS] by loop construction")
+                .masked();
+            if let Some(peer) = self.best.get(&candidate) {
+                return self.candidates.get(&(candidate, *peer));
+            }
+        }
+        None
     }
 
     /// Returns all candidate routes for `nlri`, keyed by peer.
     ///
+    /// Returns the single candidate route contributed by `peer` for `nlri`,
+    /// if any — an exact `(nlri, peer)` lookup, not best-path selection.
+    ///
+    /// Useful for callers that need to compare an incoming route against
+    /// what a specific peer previously contributed (e.g. local origination
+    /// checking whether a re-announced route is content-identical to what's
+    /// already stored) without paying for the full `candidates()` map.
+    #[must_use]
+    pub fn candidate(&self, nlri: &Nlri<A>, peer: PeerId) -> Option<&Route<A>> {
+        self.candidates.get(&(*nlri, peer))
+    }
+
     /// Useful for diagnostics and "show bgp detail" output.
     #[must_use]
     pub fn candidates(&self, nlri: &Nlri<A>) -> Option<AHashMap<PeerId, &Route<A>>> {
@@ -354,9 +477,9 @@ impl<A: IpAddress> LocRib<A> {
         nlris
             .into_iter()
             .filter_map(|nlri| {
-                let old_peer = self.best.get(nlri.prefix()).copied();
+                let old_peer = self.best.get(&nlri.masked()).copied();
                 self.recompute_best(nlri, oracle);
-                let new_peer = self.best.get(nlri.prefix()).copied();
+                let new_peer = self.best.get(&nlri.masked()).copied();
                 match (old_peer, new_peer) {
                     (None, None) => None,
                     (Some(_), None) => Some(BestPathChange::Withdrawn(nlri)),
@@ -371,20 +494,60 @@ impl<A: IpAddress> LocRib<A> {
     }
 
     fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
-        // Use peer_index for O(k) lookup instead of scanning the full flat map.
-        // Clone routes into a temp AHashMap — k is typically 1–8, negligible cost.
-        let peer_map: AHashMap<PeerId, Route<A>> = self
-            .peer_index
-            .get(&nlri)
-            .into_iter()
-            .flatten()
-            .filter_map(|p| Some((*p, self.candidates.get(&(nlri, *p))?.clone())))
-            .collect();
+        let masked = nlri.masked();
+        match self.peer_index.get(&nlri).map(SmallVec::as_slice) {
+            None | Some([]) => {
+                self.best.remove(&masked);
+            }
+            Some([only_peer]) => {
+                // Fast path: exactly one candidate — the dominant case for a
+                // locally-originated host-route workload (see
+                // plans/blocking-arbiter-performance.md, Item 1). Skips the
+                // AHashMap clone below and `select_best_with_oracle`'s
+                // Vec/HashMap allocations entirely.
+                //
+                // For a single candidate, `select_best_with_oracle` reduces
+                // to exactly this: reachable → wins unconditionally (nothing
+                // to compare `prefer()` against — `max_by` on a one-element
+                // iterator never calls the comparator, so LOCAL_PREF/`stale`/
+                // everything else is irrelevant); unreachable → no winner.
+                // Reuses the same `next_hop.as_ref().is_none_or(...)`
+                // expression `best_path.rs`'s Step 1 filter uses, rather than
+                // reimplementing it, to avoid the two copies drifting apart.
+                // Proven equivalent to the general path by
+                // `prop_tests::prop_single_candidate_fast_path_matches_general_path`.
+                let reachable = self
+                    .candidates
+                    .get(&(nlri, *only_peer))
+                    .is_some_and(|route| {
+                        route
+                            .next_hop
+                            .as_ref()
+                            .is_none_or(|nh| oracle.is_reachable(nh))
+                    });
+                if reachable {
+                    self.best.insert(masked, *only_peer);
+                } else {
+                    self.best.remove(&masked);
+                }
+            }
+            Some(_) => {
+                // 2+ candidates — general path, unchanged. Clone routes into a
+                // temp AHashMap — k is typically 1–8, negligible cost.
+                let peer_map: AHashMap<PeerId, Route<A>> = self
+                    .peer_index
+                    .get(&nlri)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| Some((*p, self.candidates.get(&(nlri, *p))?.clone())))
+                    .collect();
 
-        if let Some((peer, _)) = select_best_with_oracle(&peer_map, oracle) {
-            self.best.insert(nlri.prefix(), peer);
-        } else {
-            self.best.remove(nlri.prefix());
+                if let Some((peer, _)) = select_best_with_oracle(&peer_map, oracle) {
+                    self.best.insert(masked, peer);
+                } else {
+                    self.best.remove(&masked);
+                }
+            }
         }
     }
 }
@@ -688,6 +851,24 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_identical_content_by_winner_is_conservatively_announced() {
+        // Deliberately reverted from an earlier version that special-cased
+        // byte-identical re-insertion as Unchanged: that gate didn't skip
+        // the recompute_best cost it was meant to avoid (the general
+        // multi-candidate path still ran unconditionally), and the one real
+        // caller — local origination — never even looked at this return
+        // value. Suppression of a genuinely idempotent re-origination now
+        // happens before LocRib::insert is called at all — see
+        // pathvectord::daemon::origination. This function stays
+        // conservative: any same-peer update is Announced.
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        let n = nlri("10.0.0.0/8");
+        let change = rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
+    }
+
+    #[test]
     fn test_withdraw_sole_candidate_is_withdrawn() {
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         let n = nlri("10.0.0.0/8");
@@ -920,5 +1101,123 @@ mod tests {
             "best-path change expected when winner's next-hop goes down and runner-up is reachable"
         );
         assert_eq!(rib.best_peer(&nlri("10.0.0.0/8")), Some(peer(2)));
+    }
+}
+
+/// Differential proof that `recompute_best`'s single-candidate fast path
+/// (see the `Some([only_peer])` arm) is behaviorally identical to the
+/// general `select_best_with_oracle` path for every single-candidate input —
+/// see `plans/blocking-arbiter-performance.md`, Item 1.
+#[cfg(test)]
+mod prop_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pathvector_types::{AsPath, LocalPref, NextHop, Origin};
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::{RouteBuilder, best_path::select_best_with_oracle, oracle::NextHopOracle};
+
+    fn peer_at(n: u8) -> PeerId {
+        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    }
+
+    fn nlri() -> Nlri<Ipv4Addr> {
+        "10.0.0.0/8".parse().unwrap()
+    }
+
+    struct ToggleOracle(bool);
+
+    impl NextHopOracle for ToggleOracle {
+        fn is_reachable(&self, _: &NextHop) -> bool {
+            self.0
+        }
+
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+            None
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_single_candidate_fast_path_matches_general_path(
+            has_next_hop in any::<bool>(),
+            reachable in any::<bool>(),
+            lp in 0u32..=500u32,
+            stale in any::<bool>(),
+        ) {
+            let n = nlri();
+            let mut route = RouteBuilder::new(n, Origin::Igp, AsPath::new())
+                .local_pref(LocalPref::new(lp))
+                .build();
+            route.stale = stale;
+            if has_next_hop {
+                route.next_hop = Some(NextHop::V4(Ipv4Addr::new(192, 0, 2, 1)));
+            }
+            let oracle = ToggleOracle(reachable);
+
+            // Via the real LocRib — exercises whichever code path is
+            // actually wired in (the fast path, as of this commit).
+            let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+            rib.insert(peer_at(1), route.clone(), &oracle);
+            let via_loc_rib = rib.best_peer(&n);
+
+            // Via the general path directly, on an equivalent one-entry map.
+            let mut candidates = std::collections::HashMap::new();
+            candidates.insert(peer_at(1), route);
+            let via_general_path = select_best_with_oracle(&candidates, &oracle).map(|(p, _)| p);
+
+            prop_assert_eq!(via_loc_rib, via_general_path);
+        }
+    }
+
+    // Differential proof that `LocRib::longest_match`'s bounded exact-probe
+    // implementation (Item 2 of `plans/blocking-arbiter-performance.md`)
+    // agrees with `routemap::RouteMap`'s genuine treebitmap LPM — used here
+    // only as a test oracle, not swapped into production (`LocRib::best`'s
+    // new `AHashMap` is the one under test).
+    proptest! {
+        #[test]
+        fn prop_longest_match_matches_routemap_oracle(
+            prefixes in proptest::collection::vec(
+                (any::<[u8; 4]>(), 0u8..=32u8, 1u8..=250u8),
+                0..30usize,
+            ),
+            query in any::<[u8; 4]>(),
+        ) {
+            let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+            let mut oracle: routemap::RouteMap<Ipv4Addr, PeerId> = routemap::RouteMap::new();
+            let mut inserted_addrs: Vec<Ipv4Addr> = Vec::new();
+
+            for (addr_bytes, len, peer_last_octet) in &prefixes {
+                let candidate = Nlri::new(Ipv4Addr::from(*addr_bytes), *len)
+                    .expect("len is in [0, 32] by the strategy's range")
+                    .masked();
+                let p = peer_at(*peer_last_octet);
+                rib.insert(
+                    p,
+                    RouteBuilder::new(candidate, Origin::Igp, AsPath::new()).build(),
+                    &crate::oracle::AlwaysReachable,
+                );
+                oracle.insert(candidate.prefix(), p);
+                inserted_addrs.push(Ipv4Addr::from(*addr_bytes));
+            }
+
+            // A fully random query exercises the general case; each inserted
+            // prefix's own (unmasked) address is also queried directly so an
+            // exact-boundary regression (e.g. an off-by-one in the probe
+            // range that skips checking `/32`) is caught deterministically —
+            // a purely random query almost never coincides exactly with a
+            // stored prefix's address, which let an earlier, deliberately
+            // broken version of this probe range pass unnoticed.
+            let mut queries = vec![Ipv4Addr::from(query)];
+            queries.extend(inserted_addrs);
+
+            for addr in queries {
+                let rib_hit = rib.longest_match(addr).is_some();
+                let oracle_hit = oracle.longest_match_entry(addr).is_some();
+                prop_assert_eq!(rib_hit, oracle_hit, "mismatch for query {}", addr);
+            }
+        }
     }
 }

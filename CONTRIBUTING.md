@@ -231,6 +231,37 @@ Quick reference:
 
 ---
 
+## Before/after benchmarking
+
+When a change claims a performance improvement, measure `main` and the
+branch under the same conditions and cite both numbers — see
+`plans/performance-history.md` for the expected format.
+
+**Don't temporarily swap file contents in place to get a "before" number.**
+`git checkout <branch> -- <path>` updates both the working tree *and* the
+index — it's not a working-tree-only preview. If you use it to drop in
+`main`'s version of a file for a quick baseline run, then restore your
+optimized version by copying it back over the top, `git status` will show
+the file as staged-different-from-working-tree (`MM`) even though the
+working tree is correct, because the index still has `main`'s content
+staged. This was caught before a bad commit landed during PR #54's
+benchmark sweep by comparing `git diff --cached` (showed the stale
+reverted diff) against `git diff HEAD` (empty, confirming the working tree
+was actually correct) — but it's easy to miss. Prefer:
+
+- `git worktree add ../pathvector-baseline main` and benchmark there
+  instead of swapping files in your working tree; or
+- `git restore --source=main --worktree -- <path>` (working tree only, does
+  **not** touch the index) if a worktree is overkill for a one-off check —
+  and `git restore --staged <path>` to recover if you've already hit the
+  `git checkout ... --` trap.
+
+A pre-commit check of `git diff --cached --exit-code -- <path>` before
+committing benchmark-adjacent changes will also catch a stale-staged file
+before it ships.
+
+---
+
 ## Adding Linux-gated code
 
 If you add a new `#[cfg(target_os = "linux")]` block:

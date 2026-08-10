@@ -182,6 +182,134 @@ Below 250k pathvectord uses less; above 500k pathvectord uses significantly less
 
 ---
 
+## BlockingArbiter-shaped throughput (2026-08-08, full sweep)
+
+Distinct from the memory-focused entries above — this benchmarks `LocRib`
+operation *speed* under a companion reconciler's workload shape (mostly
+locally-originated `/32` host routes, shared attributes, frequent full
+desired-state reassertion), not peak RSS. See
+`plans/blocking-arbiter-performance.md` for the full write-up. Harness:
+`pathvector-rib/benches/loc_rib_reconcile.rs` and `benches/best_index.rs`,
+Criterion defaults (this supersedes an earlier same-day pass that used
+`--sample-size 10` and only n=100,000 — kept below for the record, but the
+tables here are the ones to cite). Before/after compares this branch's
+`pathvector-rib/src/loc_rib.rs`/`route.rs` against `main`, all three sizes,
+single measurement pass each (not averaged across repeated runs — Criterion
+already reports a confidence interval per point; re-run if a number here
+looks surprising before relying on it for capacity planning).
+
+### `loc_rib_reconcile`
+
+| Benchmark | size | main (before) | this branch (after) | Δ |
+|---|---|---|---|---|
+| `empty_to_full/single_candidate` | 10k | 5.5209 ms | 2.6044 ms | **−52.8%** |
+| `empty_to_full/single_candidate` | 100k | 63.149 ms | 35.784 ms | **−43.3%** |
+| `empty_to_full/single_candidate` | 500k | 360.89 ms | 234.52 ms | **−35.0%** |
+| `empty_to_full/two_candidates` | 10k | 11.569 ms | 7.7068 ms | **−33.4%** |
+| `empty_to_full/two_candidates` | 100k | 132.87 ms | 98.629 ms | **−25.8%** |
+| `empty_to_full/two_candidates` | 500k | 760.91 ms | 563.10 ms | **−26.0%** |
+| `idempotent_reorigination/single_candidate` | 10k | 4.9865 ms | 1.8180 ms | **−63.5%** |
+| `idempotent_reorigination/single_candidate` | 100k | 60.837 ms | 32.473 ms | **−46.6%** |
+| `idempotent_reorigination/single_candidate` | 500k | 330.09 ms | 227.04 ms | **−31.2%** |
+| `idempotent_reorigination/two_candidates` | 10k | 6.3611 ms | 4.7293 ms | **−25.7%** |
+| `idempotent_reorigination/two_candidates` | 100k | 85.366 ms | 79.146 ms | **−7.3%** |
+| `idempotent_reorigination/two_candidates` | 500k | 469.06 ms | 516.20 ms | **+10.0%¹** |
+| `one_percent_churn` (single-candidate table) | 10k | 48.375 µs | 19.928 µs | **−58.8%** |
+| `one_percent_churn` (single-candidate table) | 100k | 490.85 µs | 212.21 µs | **−56.8%** |
+| `one_percent_churn` (single-candidate table) | 500k | 2.8907 ms | 1.2684 ms | **−56.1%** |
+
+¹ **A real, growing regression, not noise** — the fuller sample here
+actually *reverses* the earlier `--sample-size 10` pass's +5.5% at 100k
+(which was itself likely noise; this run shows −7.3% at 100k) but confirms
+a genuine cost at 500k: Item 5's `content_eq` comparison walks every field
+of a `Route` (including `rare`'s `Vec`s) on every insert by the current
+winner, and that cost isn't offset by an avoided clone unless Item 1's
+single-candidate fast path also applies — which it doesn't in the
+two-candidate case. This is the one scenario in this PR where the numbers
+say "regression," and it's reported as such rather than folded into the
+overall "single-candidate workloads win" summary. Single-candidate
+`idempotent_reorigination` — the case that actually matches BlockingArbiter's
+dominant shape — still shows a clear, size-consistent win (−31% to −64%).
+
+### `best_index` (RouteMap vs AHashMap for `LocRib::best`)
+
+| Operation | size | `/32`-heavy | mixed-prefix |
+|---|---|---|---|
+| insert | 10k | **−37.3%** (1.3383ms → 839.08µs) | **−20.3%** (1.5286ms → 1.2186ms) |
+| insert | 100k | **−36.7%** (13.676ms → 8.6543ms) | **−20.3%** (15.759ms → 12.557ms) |
+| insert | 500k | **−27.5%** (69.183ms → 50.138ms) | **−18.4%** (79.014ms → 64.495ms) |
+| get | 10k | **−35.3%** (1.1347ms → 734.37µs) | **−19.1%** (1.4483ms → 1.1712ms) |
+| get | 100k | **−32.7%** (11.480ms → 7.7265ms) | **−18.0%** (14.686ms → 12.037ms) |
+| get | 500k | **+22.8%²** (58.292ms → 71.560ms) | **−15.0%** (73.323ms → 62.290ms) |
+| remove | 10k | **−49.2%** (1.6792ms → 852.28µs) | **−28.6%** (1.7524ms → 1.2507ms) |
+| remove | 100k | **−46.6%** (17.037ms → 9.0944ms) | **−27.2%** (17.738ms → 12.916ms) |
+| remove | 500k | **−16.5%** (85.317ms → 71.248ms) | **−22.3%** (89.832ms → 69.839ms) |
+
+² **The one reversal in the whole sweep, reported honestly rather than
+smoothed over**: at 500k, pure `/32`-exact `get` is actually *slower* on
+`AHashMap` than on `RouteMap` — the opposite of every other cell in this
+table, including `get` on the mixed-prefix shape at the same size. Not yet
+root-caused; plausible candidates are hash-table load-factor/resize
+behavior or cache-locality differences between `AHashMap`'s effectively
+random bucket placement and `RouteMap`'s trie locality, specifically for a
+lookup-only workload with maximally-specific, densely-packed `/32` keys —
+worth a follow-up if `LocRib`'s `get` path is ever profiled as hot at
+full-table scale. It does not change the decision to keep the `AHashMap`
+swap: `insert` and `remove` — the operations `LocRib::insert`/`withdraw`'s
+hot path actually dominates — favor `AHashMap` at every size and shape
+measured, including 500k, and `get` still wins on the mixed-prefix shape
+even at 500k.
+
+### Item 5 redesign and Item 2 benchmark fixes (2026-08-10)
+
+**Item 5 (`content_eq` idempotent-reorigination suppression) moved from
+`LocRib::insert` to the local-origination boundary** — see
+`plans/blocking-arbiter-performance.md`'s Item 5 section for the full
+rationale. No new numbers are recorded here for this change specifically:
+its effect is that `content_eq`'s cost no longer runs at all on the
+multi-candidate `LocRib::insert` path, which retroactively resolves the
+`idempotent_reorigination/two_candidates` regression reported above (that
+benchmark exercised exactly the code path this redesign removed the cost
+from). The single-candidate numbers above are unaffected — Item 1's fast
+path and Item 3/4's capacity/hasher work are untouched by this redesign.
+
+**Item 2's `best_index` benchmark had two real bugs, now fixed but not yet
+re-run** — NLRI generation was happening inside the timed Criterion
+closures, and the mixed-prefix dataset could produce far fewer unique
+prefixes than its nominal size at scale (only 8 unique `/16`s existed at
+n=500,000 against a nominal 100,000). Both are fixed in
+`pathvector-rib/benches/best_index.rs`, but the `best_index` table above —
+including the 500k `get` reversal — has not been re-measured with the
+fixes applied, so **treat that table as provisional**. Also added in this
+pass: `LocRib::best_with_peer()`, halving `pathvectord::outbound::
+propagate_prefix`'s per-prefix-per-peer read cost from two lookups
+(`best_peer()` + `best()`) to one — raised during review as a concern
+independent of which map backs `LocRib::best`, since outbound propagation
+reads scale with peer count. See `TODO.md`'s "BlockingArbiter-shaped
+`best_index` follow-ups" for the full list of remaining measurements
+(corrected re-run, sequential vs. shuffled order, 400k-600k capacity sweep,
+repeated-run confirmation, composite peer-scaled benchmark).
+
+### Earlier, superseded pass (`--sample-size 10`, n=100,000 only)
+
+Kept for the record; do not cite for capacity planning — see the full
+sweep above instead.
+
+| Benchmark | main (before) | this commit (after) | Δ |
+|---|---|---|---|
+| `reconcile_empty_to_full/single_candidate` | 60.66 ms | 39.03 ms | −36% |
+| `reconcile_empty_to_full/two_candidates` | 127.37 ms | 107.35 ms | −16% |
+| `reconcile_idempotent_reorigination/single_candidate` | 52.89 ms | 31.99 ms | −40% |
+| `reconcile_idempotent_reorigination/two_candidates` | 75.79 ms | 80.20 ms | +5.5% |
+| `reconcile_one_percent_churn` (single-candidate table) | 493.86 µs | 300.79 µs | −39% |
+
+**Follow-up before citing these numbers in a release:** re-run the full
+3-size sweep (10k/100k/500k) at Criterion's default sample size, and add
+the heavier multi-peer/concurrent-read/soak scenarios Phase 0 deferred —
+see `plans/blocking-arbiter-performance.md`'s Phase 0 section.
+
+---
+
 ## Next candidates
 
 | Candidate | Expected saving | Complexity |

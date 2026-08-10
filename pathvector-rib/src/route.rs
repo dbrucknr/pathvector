@@ -150,6 +150,56 @@ impl<A: IpAddress> Route<A> {
     pub fn rare_mut(&mut self) -> &mut RareAttrs {
         self.rare.get_or_insert_with(Box::default)
     }
+
+    /// Compares two routes for content equality, ignoring `received_at`.
+    ///
+    /// `received_at` is a wall-clock construction timestamp
+    /// (`RouteBuilder::build`'s `now_unix_secs()`) that differs between two
+    /// independently-built but otherwise-identical routes — e.g. a
+    /// locally-originated route re-announced with unchanged content on every
+    /// reconciliation pass. Derived `PartialEq` would never treat such a pair
+    /// as equal. Every other field, including `stale` (RFC 4724 §4.2 — a
+    /// fresh/stale transition is a real best-path-relevant change),
+    /// participates.
+    ///
+    /// Used by `pathvectord`'s local-origination path to suppress a
+    /// byte-identical re-origination before it ever reaches `LocRib::insert`
+    /// — not by `LocRib::insert` itself. An earlier version wired this
+    /// directly into `insert`, but that only changed the returned
+    /// `BestPathChange`; the general multi-candidate recomputation still ran
+    /// unconditionally, so the comparison cost was pure overhead on every
+    /// BGP-learned-route update without avoiding the work it was meant to
+    /// skip.
+    ///
+    /// Uses an exhaustive destructure (no `..`) so a future new field on
+    /// `Route<A>` fails to compile here until someone decides whether it
+    /// belongs in content equality.
+    #[must_use]
+    pub fn content_eq(&self, other: &Self) -> bool {
+        let Self {
+            nlri,
+            origin,
+            as_path,
+            next_hop,
+            local_pref,
+            med,
+            peer_type,
+            received_at: _,
+            peer_bgp_id,
+            rare,
+            stale,
+        } = self;
+        *nlri == other.nlri
+            && *origin == other.origin
+            && *as_path == other.as_path
+            && *next_hop == other.next_hop
+            && *local_pref == other.local_pref
+            && *med == other.med
+            && *peer_type == other.peer_type
+            && *peer_bgp_id == other.peer_bgp_id
+            && *rare == other.rare
+            && *stale == other.stale
+    }
 }
 
 static RARE_DEFAULT: RareAttrs = RareAttrs {
