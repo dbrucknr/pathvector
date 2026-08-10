@@ -260,6 +260,36 @@ hot path actually dominates — favor `AHashMap` at every size and shape
 measured, including 500k, and `get` still wins on the mixed-prefix shape
 even at 500k.
 
+### Item 5 redesign and Item 2 benchmark fixes (2026-08-10)
+
+**Item 5 (`content_eq` idempotent-reorigination suppression) moved from
+`LocRib::insert` to the local-origination boundary** — see
+`plans/blocking-arbiter-performance.md`'s Item 5 section for the full
+rationale. No new numbers are recorded here for this change specifically:
+its effect is that `content_eq`'s cost no longer runs at all on the
+multi-candidate `LocRib::insert` path, which retroactively resolves the
+`idempotent_reorigination/two_candidates` regression reported above (that
+benchmark exercised exactly the code path this redesign removed the cost
+from). The single-candidate numbers above are unaffected — Item 1's fast
+path and Item 3/4's capacity/hasher work are untouched by this redesign.
+
+**Item 2's `best_index` benchmark had two real bugs, now fixed but not yet
+re-run** — NLRI generation was happening inside the timed Criterion
+closures, and the mixed-prefix dataset could produce far fewer unique
+prefixes than its nominal size at scale (only 8 unique `/16`s existed at
+n=500,000 against a nominal 100,000). Both are fixed in
+`pathvector-rib/benches/best_index.rs`, but the `best_index` table above —
+including the 500k `get` reversal — has not been re-measured with the
+fixes applied, so **treat that table as provisional**. Also added in this
+pass: `LocRib::best_with_peer()`, halving `pathvectord::outbound::
+propagate_prefix`'s per-prefix-per-peer read cost from two lookups
+(`best_peer()` + `best()`) to one — raised during review as a concern
+independent of which map backs `LocRib::best`, since outbound propagation
+reads scale with peer count. See `TODO.md`'s "BlockingArbiter-shaped
+`best_index` follow-ups" for the full list of remaining measurements
+(corrected re-run, sequential vs. shuffled order, 400k-600k capacity sweep,
+repeated-run confirmation, composite peer-scaled benchmark).
+
 ### Earlier, superseded pass (`--sample-size 10`, n=100,000 only)
 
 Kept for the record; do not cite for capacity planning — see the full
