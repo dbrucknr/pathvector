@@ -100,6 +100,24 @@ pub trait RibView<A: IpAddress> {
         let _ = nlri;
         None
     }
+
+    /// Returns the current best route together with its source peer, in one
+    /// call.
+    ///
+    /// The peer is nested in its own `Option` — deliberately independent of
+    /// whether a route exists — because an implementor with no source-peer
+    /// tracking (e.g. a test stub) legitimately returns a route from
+    /// `best()` while `best_peer()` returns `None`; that must still count
+    /// as "route present, peer unknown," not "no route." Default
+    /// implementation composes `best()` and `best_peer()` (two lookups) for
+    /// implementors with no cheaper option. `LocRib` overrides this with a
+    /// genuine single-lookup implementation — see `LocRib::best_with_peer`,
+    /// whose own signature is the simpler, non-nested `Option<(PeerId,
+    /// &Route<A>)>` since a real `LocRib` never has a route without a known
+    /// peer.
+    fn best_with_peer(&self, nlri: &Nlri<A>) -> Option<(Option<PeerId>, &Route<A>)> {
+        self.best(nlri).map(|route| (self.best_peer(nlri), route))
+    }
 }
 
 impl<A: IpAddress> RibView<A> for LocRib<A> {
@@ -109,6 +127,10 @@ impl<A: IpAddress> RibView<A> for LocRib<A> {
 
     fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
         LocRib::best_peer(self, nlri)
+    }
+
+    fn best_with_peer(&self, nlri: &Nlri<A>) -> Option<(Option<PeerId>, &Route<A>)> {
+        LocRib::best_with_peer(self, nlri).map(|(peer, route)| (Some(peer), route))
     }
 }
 
@@ -211,18 +233,6 @@ impl<A: IpAddress> LocRib<A> {
         // Snapshot old best peer before mutation so we can detect Unchanged.
         let old_best_peer = self.best.get(&nlri.masked()).copied();
 
-        // Content-compare against the previously stored route for this exact
-        // (nlri, peer) *before* it's overwritten below — this is what lets
-        // an idempotent re-origination (`BlockingArbiter` reasserting its full
-        // desired state with unchanged content) short-circuit to `Unchanged`
-        // instead of unconditionally reporting `Announced`. Only relevant
-        // when this peer is already the winner; see the branch below.
-        let unchanged_reorigination = old_best_peer == Some(peer)
-            && self
-                .candidates
-                .get(&(nlri, peer))
-                .is_some_and(|old| old.content_eq(&route));
-
         self.candidates.insert((nlri, peer), route);
         let peers = self.peer_index.entry(nlri).or_default();
         if !peers.contains(&peer) {
@@ -239,7 +249,24 @@ impl<A: IpAddress> LocRib<A> {
                         // Same winning peer — unchanged unless its route content changed.
                         // We only need to check content when the inserting peer is the
                         // current winner (otherwise its route didn't change this round).
-                        if peer == new_peer && !unchanged_reorigination {
+                        //
+                        // Deliberately conservative: we no longer have the old
+                        // route's content to compare against here (it was just
+                        // overwritten above), so a same-peer update always
+                        // reports Announced. An earlier version added a
+                        // content-comparison gate directly in this function to
+                        // avoid that — reverted (see
+                        // plans/blocking-arbiter-performance.md, Item 5): it
+                        // didn't skip the recompute_best call above (the actual
+                        // cost for the multi-candidate path), and the one real
+                        // caller of this — local origination — discarded the
+                        // BestPathChange result anyway, so it bought nothing in
+                        // production while adding a real cost to every
+                        // multi-candidate BGP-learned-route update. Suppressing
+                        // a genuinely idempotent re-origination now happens one
+                        // layer up, before this function is even called — see
+                        // `pathvectord::daemon::origination`.
+                        if peer == new_peer {
                             BestPathChange::Announced(nlri, new_route.clone())
                         } else {
                             BestPathChange::Unchanged
@@ -342,6 +369,22 @@ impl<A: IpAddress> LocRib<A> {
         self.best.get(&nlri.masked()).copied()
     }
 
+    /// Returns both the winning peer and its route for `nlri` in one
+    /// lookup, instead of two.
+    ///
+    /// Outbound propagation (`pathvectord::outbound::propagate_prefix`)
+    /// previously called `best_peer()` then `best()` separately for every
+    /// prefix, for every peer — two `best`-index reads per prefix per peer,
+    /// which scales with peer count the way `insert`/`withdraw`'s O(1)
+    /// per-prefix cost doesn't. This collapses that to one.
+    #[must_use]
+    pub fn best_with_peer(&self, nlri: &Nlri<A>) -> Option<(PeerId, &Route<A>)> {
+        let peer = *self.best.get(&nlri.masked())?;
+        self.candidates
+            .get(&(*nlri, peer))
+            .map(|route| (peer, route))
+    }
+
     /// Iterates over all `(prefix, best_route)` pairs.
     ///
     /// Useful for building `AdjRibOut` — iterate this, apply export policy,
@@ -383,6 +426,18 @@ impl<A: IpAddress> LocRib<A> {
 
     /// Returns all candidate routes for `nlri`, keyed by peer.
     ///
+    /// Returns the single candidate route contributed by `peer` for `nlri`,
+    /// if any — an exact `(nlri, peer)` lookup, not best-path selection.
+    ///
+    /// Useful for callers that need to compare an incoming route against
+    /// what a specific peer previously contributed (e.g. local origination
+    /// checking whether a re-announced route is content-identical to what's
+    /// already stored) without paying for the full `candidates()` map.
+    #[must_use]
+    pub fn candidate(&self, nlri: &Nlri<A>, peer: PeerId) -> Option<&Route<A>> {
+        self.candidates.get(&(*nlri, peer))
+    }
+
     /// Useful for diagnostics and "show bgp detail" output.
     #[must_use]
     pub fn candidates(&self, nlri: &Nlri<A>) -> Option<AHashMap<PeerId, &Route<A>>> {
@@ -796,28 +851,20 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_identical_content_by_winner_is_unchanged() {
-        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
-        // Same peer re-announces byte-identical content (aside from
-        // `received_at`, which `Route::content_eq` deliberately ignores) —
-        // must be Unchanged, not a spurious Announced.
-        let change = rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
-        assert_eq!(change, BestPathChange::Unchanged);
-    }
-
-    #[test]
-    fn test_insert_stale_flip_by_winner_is_announced() {
+    fn test_insert_identical_content_by_winner_is_conservatively_announced() {
+        // Deliberately reverted from an earlier version that special-cased
+        // byte-identical re-insertion as Unchanged: that gate didn't skip
+        // the recompute_best cost it was meant to avoid (the general
+        // multi-candidate path still ran unconditionally), and the one real
+        // caller — local origination — never even looked at this return
+        // value. Suppression of a genuinely idempotent re-origination now
+        // happens before LocRib::insert is called at all — see
+        // pathvectord::daemon::origination. This function stays
+        // conservative: any same-peer update is Announced.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
         rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
         let n = nlri("10.0.0.0/8");
-        let mut stale_route = route_with_lp("10.0.0.0/8", 200);
-        stale_route.stale = true;
-        // Same peer, same content otherwise, but `stale` flipped — RFC 4724
-        // §4.2 fresh/stale is a real best-path-relevant change and must
-        // still be reported as Announced, not swallowed by the
-        // idempotent-re-origination fast path.
-        let change = rib.insert(peer(1), stale_route, &AlwaysReachable);
+        let change = rib.insert(peer(1), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
         assert!(matches!(change, BestPathChange::Announced(nlri, _) if nlri == n));
     }
 

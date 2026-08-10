@@ -158,10 +158,18 @@ impl<A: IpAddress> Route<A> {
     /// independently-built but otherwise-identical routes — e.g. a
     /// locally-originated route re-announced with unchanged content on every
     /// reconciliation pass. Derived `PartialEq` would never treat such a pair
-    /// as equal, which would defeat [`LocRib::insert`](crate::LocRib::insert)'s
-    /// idempotent-re-origination fast path entirely. Every other field,
-    /// including `stale` (RFC 4724 §4.2 — a fresh/stale transition is a real
-    /// best-path-relevant change), participates.
+    /// as equal. Every other field, including `stale` (RFC 4724 §4.2 — a
+    /// fresh/stale transition is a real best-path-relevant change),
+    /// participates.
+    ///
+    /// Used by `pathvectord`'s local-origination path to suppress a
+    /// byte-identical re-origination before it ever reaches `LocRib::insert`
+    /// — not by `LocRib::insert` itself. An earlier version wired this
+    /// directly into `insert`, but that only changed the returned
+    /// `BestPathChange`; the general multi-candidate recomputation still ran
+    /// unconditionally, so the comparison cost was pure overhead on every
+    /// BGP-learned-route update without avoiding the work it was meant to
+    /// skip.
     ///
     /// Uses an exhaustive destructure (no `..`) so a future new field on
     /// `Route<A>` fails to compile here until someone decides whether it
