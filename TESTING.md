@@ -234,8 +234,9 @@ The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPL
 `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
 `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
 and 100 in both orders, for both families, incrementally and through the initial dump.
-They also cover a static and a BGP route in one IPv6 ECMP set, and a BGP alias
-prepended ahead of a static alias and then replaced.
+They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
+and a BGP-first mixed set learned from the initial dump (which reports a set only
+once), and a BGP alias prepended ahead of a static alias and then replaced.
 They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 

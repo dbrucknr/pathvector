@@ -4,6 +4,23 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (PR #122 review round 2: IPv6 ECMP siblings are dumped once)
+
+The round-1 fix assumed every IPv6 ECMP sibling gets its own dump message, and kept
+non-leading legs unused until one arrived. That was wrong: `fib6_dump_node` dumps a
+sibling set once, as one `RTA_MULTIPATH` message, then jumps past the siblings ("no need
+to dump the sibling routes again"). An ordinary all-static ECMP set therefore lost its
+second path: after deleting the first route the prefix read as unreachable although the
+kernel still had the second. With BGP added first, the static sibling was missed straight
+after the dump. Both were reproduced on a live kernel.
+
+`KernelRouteV6::protocol` is now `Option<u8>`. `None` means no message has described the
+route (a sibling seen only as a leg), and such a route counts as a path. The cost is in
+mixed BGP/IGP ECMP sets only: a BGP leg of unknown protocol counts until it is deleted.
+Two new live-kernel tests (all-static set, BGP-first mixed set) fail on the previous
+commit and pass now; the adapter test that simulated per-sibling dump messages now uses
+the single aggregate message the kernel actually sends.
+
 ## 2026-11-23 (PR #122 review: untracked routes in a slot or ECMP set)
 
 Review found two cases where routes the snapshot does not use for reachability still
@@ -18,8 +35,8 @@ The snapshot now mirrors every route in the tracked table and applies the tracki
 (unicast, not BGP) at lookup time. Untracked routes are stored as an identity hash, so
 the cost is about 86 MB per million kernel BGP routes; inserts and deletes are now
 hashed. An IPv6 multipath message's first leg is described by its header; other legs
-not yet seen take the header's protocol only for a create/replace (same request) and
-are otherwise untracked until described. Mutations report a change exactly when the
+not yet seen take the header's protocol only for a create/replace (same request). (The
+handling of the remaining legs was corrected in round 2 above.) Mutations report a change exactly when the
 tracked routes change. Proof: property tests against a kernel slot-list model including
 untracked routes and replaces, adapter tests, and two new live-kernel tests that fail on
 the previous commit.

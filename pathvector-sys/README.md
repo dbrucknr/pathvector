@@ -130,9 +130,11 @@ table: about 86 MB for 1M BGP routes in the tracked table (≈170 MB peak while 
 table grows; release build, M2 Max). Inserts and deletes are hashed, about 0.26 µs each.
 
 An IPv6 multipath message describes only its first leg; the other legs carry no protocol
-of their own, and Linux lets one ECMP set mix static and BGP routes. Legs the message
-does not describe are mirrored as untracked until a message that describes them arrives
-(each sibling's own dump message does that).
+of their own, and Linux lets one ECMP set mix static and BGP routes. Dumps do not help:
+`fib6_dump_node` dumps a sibling set once and skips the other siblings. A leg whose
+protocol no message has given is recorded with `protocol: None` and **counts as a path**,
+because the kernel forwards over every sibling and all-IGP ECMP sets are the common case.
+A later message that describes the leg settles its protocol.
 
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
 as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
@@ -142,10 +144,12 @@ use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes and
 
 Known limits:
 
-- A leg added by an IPv6 multipath `NLM_F_APPEND` request is reported under the set's
-  first (older) sibling, so its protocol is unknown. It stays untracked until a dump
-  or delete describes it, so a static leg added that way is not used for reachability
-  until then.
+- An IPv6 ECMP sibling of unknown protocol (learned from the initial dump, or added by a
+  multipath `NLM_F_APPEND`) counts as a path even if it is in fact a BGP route. This
+  only matters for an ECMP set that mixes BGP and IGP routes: after the IGP siblings are
+  deleted, such a BGP leg keeps the prefix reachable until it is deleted too. The kernel
+  does not report the protocol, so this cannot be resolved from netlink.
+  `FibWriter` replaces rather than appends, so it never creates mixed sets.
 - Untracked identities are compared by a 64-bit hash within one slot; a collision
   between two routes of the same slot is possible in principle but negligible.
 - IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
