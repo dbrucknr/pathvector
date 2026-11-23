@@ -21,7 +21,8 @@ use tokio::sync::watch;
 
 use super::{
     FibSnapshot, FibWrite, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg,
-    NextHopPath, NextHopV4, NextHopV6, RouteSlotV4, RouteSlotV6, TableId,
+    NextHopPath, NextHopV4, NextHopV6, RouteKind, RouteSlotV4, RouteSlotV6, TableId,
+    route::qualifies_for_ecmp_v6,
 };
 
 // ── FibWriter ─────────────────────────────────────────────────────────────────
@@ -249,8 +250,9 @@ pub(super) async fn run(
 
 /// Returns `(network, prefix_len)` for every `RTPROT_BGP` IPv4 route in `table`.
 ///
-/// This is the inverse of `is_tracked`: it selects *only* BGP-protocol routes,
-/// which were installed by a previous daemon run and are now stale.
+/// It selects *only* BGP-protocol routes (of any type), which `is_tracked`
+/// always excludes; they were installed by a previous daemon run and are now
+/// stale.
 pub(super) async fn dump_stale_bgp_v4(
     handle: &rtnetlink::Handle,
     table: u32,
@@ -354,11 +356,21 @@ fn in_table(msg: &RouteMessage, table: u32) -> bool {
     table == 0 || route_table(msg) == table
 }
 
-/// Whether the snapshot tracks this route: unicast and not installed by BGP.
+/// The route's type, if it is one the snapshot mirrors (unicast or negative).
+fn route_kind(msg: &RouteMessage) -> Option<RouteKind> {
+    RouteKind::from_rtm_type(u8::from(msg.header.kind))
+}
+
+/// Whether the snapshot tracks this route: a mirrored type (unicast,
+/// blackhole, unreachable, prohibit or throw) not installed by BGP.
 ///
-/// Non-unicast routes are left out for now; see TODO.md for negative routes.
+/// Negative routes must be tracked: a lookup selects the longest-prefix route
+/// first and only then looks at its type, so a negative route beneath a
+/// covering unicast route makes the covered destinations unreachable (issue
+/// #57). BGP-installed routes, negative ones included, stay excluded for the
+/// reasons given on [`is_bgp_route`].
 fn is_tracked(msg: &RouteMessage) -> bool {
-    msg.header.kind == RouteType::Unicast && !is_bgp_route(msg)
+    route_kind(msg).is_some() && !is_bgp_route(msg)
 }
 
 // ── Decoding: netlink message → kernel route identity ─────────────────────────
@@ -446,17 +458,26 @@ fn path(attributes: &[RouteAttribute], oif: Option<u32>) -> NextHopPath {
     }
 }
 
-/// Decodes an IPv4 route into its kernel identity.
+/// The IPv4 alias group of a route of any type.
 ///
 /// Returns `None` for a table of 0 or a destination the kernel would itself
 /// reject (`fib_valid_key_len`); neither occurs in a kernel-generated message.
-fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
-    let slot = RouteSlotV4 {
+fn slot_v4(msg: &RouteMessage) -> Option<RouteSlotV4> {
+    Some(RouteSlotV4 {
         table: TableId::new(route_table(msg))?,
         dst: Ipv4Prefix::new(destination_v4(msg), msg.header.destination_prefix_length).ok()?,
         tos: msg.header.tos,
         priority: metric_of(msg),
-    };
+    })
+}
+
+/// Decodes an IPv4 route into its kernel identity.
+///
+/// Returns `None` for a route type the snapshot does not mirror and for the
+/// cases [`slot_v4`] rejects.
+fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
+    let kind = route_kind(msg)?;
+    let slot = slot_v4(msg)?;
     let next_hop = if let Some(id) = nexthop_object(msg) {
         NextHopV4::Object(id)
     } else if let Some(legs) = multipath(msg) {
@@ -474,6 +495,7 @@ fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
     };
     Some(KernelRouteV4 {
         slot,
+        kind,
         protocol: u8::from(msg.header.protocol),
         scope: u8::from(msg.header.scope),
         prefsrc: prefsrc_v4(msg),
@@ -481,50 +503,54 @@ fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
     })
 }
 
-/// Decodes an IPv6 route message into one route per ECMP sibling.
+/// The parts of an IPv6 route message that do not depend on its type: the
+/// metric group and one next hop per ECMP sibling.
 ///
 /// The kernel stores each IPv6 ECMP sibling as its own `fib6_info` but reports
 /// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`). It
 /// also deletes and dumps siblings one at a time. Splitting the message makes
 /// all of these line up. A route using a nexthop object is never split.
 ///
-/// Returns an empty `Vec` for a table of 0 or a non-canonical prefix.
-fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
-    let Some(table) = TableId::new(route_table(msg)) else {
-        return Vec::new();
-    };
-    let Ok(dst) = Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length) else {
-        return Vec::new();
-    };
-    let Ok(src) = Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length) else {
-        return Vec::new();
-    };
+/// Returns `None` for a table of 0 or a non-canonical prefix.
+fn slot_and_next_hops_v6(msg: &RouteMessage) -> Option<(RouteSlotV6, Vec<NextHopV6>)> {
     let slot = RouteSlotV6 {
-        table,
-        dst,
-        src,
+        table: TableId::new(route_table(msg))?,
+        dst: Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length).ok()?,
+        src: Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length).ok()?,
         priority: metric_of(msg),
     };
-    let protocol = u8::from(msg.header.protocol);
-    let route = |next_hop| KernelRouteV6 {
-        slot,
-        protocol,
-        next_hop,
-    };
-    if let Some(id) = nexthop_object(msg) {
-        vec![route(NextHopV6::Object(id))]
+    let next_hops = if let Some(id) = nexthop_object(msg) {
+        vec![NextHopV6::Object(id)]
     } else if let Some(legs) = multipath(msg) {
         legs.iter()
-            .map(|leg| {
-                route(NextHopV6::Path(path(
-                    &leg.attributes,
-                    Some(leg.interface_index),
-                )))
-            })
+            .map(|leg| NextHopV6::Path(path(&leg.attributes, Some(leg.interface_index))))
             .collect()
     } else {
-        vec![route(NextHopV6::Path(path(&msg.attributes, None)))]
-    }
+        vec![NextHopV6::Path(path(&msg.attributes, None))]
+    };
+    Some((slot, next_hops))
+}
+
+/// Decodes an IPv6 route message into one route per ECMP sibling (see
+/// [`slot_and_next_hops_v6`]).
+///
+/// Returns an empty `Vec` for a route type the snapshot does not mirror, a
+/// table of 0 or a non-canonical prefix.
+fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
+    let (Some(kind), Some((slot, next_hops))) = (route_kind(msg), slot_and_next_hops_v6(msg))
+    else {
+        return Vec::new();
+    };
+    let protocol = u8::from(msg.header.protocol);
+    next_hops
+        .into_iter()
+        .map(|next_hop| KernelRouteV6 {
+            slot,
+            kind,
+            protocol,
+            next_hop,
+        })
+        .collect()
 }
 
 fn metric_of(msg: &RouteMessage) -> u32 {
@@ -581,38 +607,44 @@ fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32)
     let replace = flags & NLM_F_REPLACE != 0;
     match msg.header.address_family {
         AddressFamily::Inet => {
-            let Some(route) = decode_v4(msg) else {
+            // The slot is needed even for an untracked route, whose replace
+            // still displaces a tracked one.
+            let Some(slot) = slot_v4(msg) else {
                 return false;
             };
+            let route = if tracked { decode_v4(msg) } else { None };
             if replace {
-                let slot = route.slot;
-                snap.v4.replace(&slot, tracked.then_some(route))
-            } else if !tracked {
-                false
-            } else if flags & NLM_F_APPEND != 0 {
-                snap.v4.insert_back(route)
+                snap.v4.replace(&slot, route)
             } else {
-                snap.v4.insert_front(route)
+                route.is_some_and(|route| {
+                    if flags & NLM_F_APPEND != 0 {
+                        snap.v4.insert_back(route)
+                    } else {
+                        snap.v4.insert_front(route)
+                    }
+                })
             }
         }
         AddressFamily::Inet6 => {
-            let mut routes = decode_v6(msg).into_iter();
-            let Some(first) = routes.next() else {
+            let Some((slot, next_hops)) = slot_and_next_hops_v6(msg) else {
                 return false;
             };
+            let Some(first_hop) = next_hops.first() else {
+                return false;
+            };
+            let protocol = u8::from(msg.header.protocol);
+            let mut routes = if tracked { decode_v6(msg) } else { Vec::new() }.into_iter();
+            let first = routes.next();
             let mut changed = if replace {
                 // ip6_route_multipath_add replaces with the first leg and
                 // appends the rest, then reports them in one message.
-                let slot = first.slot;
-                let ecmp = first.qualifies_for_ecmp();
-                snap.v6.replace(&slot, ecmp, tracked.then_some(first))
+                let ecmp = qualifies_for_ecmp_v6(protocol, first_hop);
+                snap.v6.replace(&slot, ecmp, first)
             } else {
-                tracked && snap.v6.insert_back(first)
+                first.is_some_and(|first| snap.v6.insert_back(first))
             };
-            if tracked {
-                for route in routes {
-                    changed |= snap.v6.insert_back(route);
-                }
+            for route in routes {
+                changed |= snap.v6.insert_back(route);
             }
             changed
         }
@@ -862,6 +894,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::fib::RejectKind;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1125,6 +1158,43 @@ mod tests {
         msg
     }
 
+    /// The negative route types, in `ip-route(8)` order.
+    const NEGATIVE_TYPES: [RouteType; 4] = [
+        RouteType::BlackHole,
+        RouteType::Unreachable,
+        RouteType::Prohibit,
+        RouteType::Throw,
+    ];
+
+    /// A negative IPv4 route as the kernel reports it: `ip route add
+    /// blackhole ...` uses `RTPROT_BOOT` and universe scope, and the kernel
+    /// refuses a gateway or device for these types (`fib_create_info`).
+    fn negative_v4_msg(
+        network: &str,
+        prefix_len: u8,
+        metric: u32,
+        kind: RouteType,
+    ) -> RouteMessage {
+        let mut msg = igp_v4_msg(network, prefix_len, metric, 254);
+        msg.header.kind = kind;
+        msg.header.protocol = RouteProtocol::Boot;
+        msg
+    }
+
+    /// A negative IPv6 route as the kernel reports it: on the loopback device
+    /// (`fib6_nh_init` holds `net->loopback_dev`), which is ifindex 1.
+    fn negative_v6_msg(
+        network: &str,
+        prefix_len: u8,
+        metric: u32,
+        kind: RouteType,
+    ) -> RouteMessage {
+        let mut msg = with_oif(igp_v6_msg(network, prefix_len, metric, 254), 1);
+        msg.header.kind = kind;
+        msg.header.protocol = RouteProtocol::Boot;
+        msg
+    }
+
     fn metric_v4(snap: &FibSnapshot, addr: &str) -> Option<u32> {
         snap.igp_metric_v4(addr.parse().unwrap())
     }
@@ -1136,13 +1206,39 @@ mod tests {
     // ── Tracking policy ──────────────────────────────────────────────────────
 
     #[test]
-    fn bgp_and_non_unicast_routes_are_not_tracked() {
+    fn unicast_and_negative_routes_are_tracked_bgp_and_local_types_are_not() {
+        assert!(is_tracked(&igp_v4_msg("10.0.0.0", 8, 100, 254)));
         assert!(!is_tracked(&bgp_v4_msg("10.0.0.0", 8, 254)));
         assert!(!is_tracked(&bgp_v6_msg("2001:db8::", 32, 254)));
-        let mut blackhole = igp_v4_msg("10.0.0.0", 8, 100, 254);
-        blackhole.header.kind = RouteType::BlackHole;
-        assert!(!is_tracked(&blackhole));
-        assert!(is_tracked(&igp_v4_msg("10.0.0.0", 8, 100, 254)));
+        // Issue #57: a negative route decides reachability for what it covers.
+        for kind in NEGATIVE_TYPES {
+            assert!(
+                is_tracked(&negative_v4_msg("10.0.0.0", 8, 100, kind)),
+                "{kind:?}"
+            );
+            assert!(
+                is_tracked(&negative_v6_msg("2001:db8::", 32, 100, kind)),
+                "{kind:?}"
+            );
+            // FibWriter's own RFC 7999 blackholes stay excluded like every
+            // other BGP route.
+            let mut bgp = negative_v4_msg("10.0.0.0", 8, 100, kind);
+            bgp.header.protocol = RouteProtocol::Bgp;
+            assert!(!is_tracked(&bgp), "BGP {kind:?}");
+        }
+        for kind in [
+            RouteType::Local,
+            RouteType::Broadcast,
+            RouteType::Anycast,
+            RouteType::Multicast,
+            RouteType::Nat,
+            RouteType::Unspec,
+        ] {
+            let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+            msg.header.kind = kind;
+            assert!(!is_tracked(&msg), "{kind:?}");
+            assert!(decode_v4(&msg).is_none(), "{kind:?}");
+        }
     }
 
     #[test]
@@ -1657,6 +1753,171 @@ mod tests {
         assert!(apply_new(&mut snap, &replacement, REPLACE, 254));
         assert_eq!(snap.v6.len(), 2);
         assert_eq!(metric_v6(&snap, "2001:db8::1"), Some(10));
+    }
+
+    // ── Issue #57 acceptance: negative routes beneath a covering route ───────
+    //
+    // ip-route(8): blackhole/unreachable/prohibit destinations "are
+    // unreachable"; a selected throw route terminates the lookup in the table
+    // "pretending that no route was found". fib_table_lookup returns the
+    // selected alias's fib_props error without backtracking to the covering
+    // route; fib6_table_lookup likewise backtracks only when no route of the
+    // node is selected.
+
+    #[test]
+    fn decode_reads_the_route_type() {
+        let cases = [
+            (
+                RouteType::BlackHole,
+                RouteKind::Reject(RejectKind::Blackhole),
+            ),
+            (
+                RouteType::Unreachable,
+                RouteKind::Reject(RejectKind::Unreachable),
+            ),
+            (RouteType::Prohibit, RouteKind::Reject(RejectKind::Prohibit)),
+            (RouteType::Throw, RouteKind::Throw),
+        ];
+        for (rtm_type, kind) in cases {
+            let v4 = decode_v4(&negative_v4_msg("10.0.0.0", 8, 5, rtm_type)).unwrap();
+            assert_eq!(v4.kind, kind);
+            assert_eq!(
+                v4.next_hop,
+                NextHopV4::Path(NextHopPath {
+                    gateway: None,
+                    oif: None
+                })
+            );
+            let v6 = decode_v6(&negative_v6_msg("2001:db8::", 32, 5, rtm_type));
+            assert_eq!(v6.len(), 1);
+            assert_eq!(v6[0].kind, kind);
+            assert!(!v6[0].qualifies_for_ecmp());
+        }
+        assert_eq!(
+            decode_v4(&igp_v4_msg("10.0.0.0", 8, 5, 254)).unwrap().kind,
+            RouteKind::Unicast
+        );
+    }
+
+    /// Covering unicast route, then each negative route beneath it, then the
+    /// negative route's deletion, through the same entry points the event
+    /// loop uses.
+    fn negative_lifecycle(
+        covering: &RouteMessage,
+        negative: impl Fn(RouteType) -> RouteMessage,
+        reachable: impl Fn(&FibSnapshot) -> bool,
+        outside: impl Fn(&FibSnapshot) -> bool,
+    ) {
+        for kind in NEGATIVE_TYPES {
+            let mut snap = FibSnapshot::new();
+            assert!(apply_new(&mut snap, covering, CREATE, 254));
+            assert!(reachable(&snap), "covered by the unicast route");
+
+            let neg = negative(kind);
+            assert!(
+                apply_new(&mut snap, &neg, CREATE, 254),
+                "{kind:?} is tracked"
+            );
+            assert!(
+                !reachable(&snap),
+                "{kind:?} beneath a covering route: unreachable"
+            );
+            assert!(outside(&snap), "{kind:?} only affects what it covers");
+
+            assert!(apply_del(&mut snap, &neg, 254), "{kind:?} deleted");
+            assert!(reachable(&snap), "{kind:?} deleted: reachability recovers");
+
+            // The initial dump gives the same answer as the events.
+            let mut dumped = FibSnapshot::new();
+            apply_dumped(&mut dumped, &neg, 254);
+            apply_dumped(&mut dumped, covering, 254);
+            assert!(!reachable(&dumped), "{kind:?} from the dump");
+        }
+    }
+
+    #[test]
+    fn ipv4_negative_route_beneath_a_covering_route_is_unreachable() {
+        negative_lifecycle(
+            &with_gateway(igp_v4_msg("0.0.0.0", 0, 0, 254), "192.0.2.1"),
+            |kind| negative_v4_msg("10.1.0.0", 16, 0, kind),
+            |s| s.is_v4_reachable("10.1.2.3".parse().unwrap()),
+            |s| s.igp_metric_v4("10.2.0.1".parse().unwrap()) == Some(0),
+        );
+    }
+
+    #[test]
+    fn ipv6_negative_route_beneath_a_covering_route_is_unreachable() {
+        negative_lifecycle(
+            &with_oif(with_gateway(igp_v6_msg("::", 0, 1024, 254), "fe80::1"), 2),
+            |kind| negative_v6_msg("2001:db8:1::", 48, 1024, kind),
+            |s| s.is_v6_reachable("2001:db8:1::3".parse().unwrap()),
+            |s| s.igp_metric_v6("2001:db8:2::1".parse().unwrap()) == Some(1024),
+        );
+    }
+
+    #[test]
+    fn replacing_a_unicast_route_with_a_negative_one_is_followed() {
+        // `ip route replace blackhole <prefix> metric <m>`: one RTM_NEWROUTE
+        // with NLM_F_REPLACE and no RTM_DELROUTE for the unicast route.
+        for kind in NEGATIVE_TYPES {
+            let mut snap = FibSnapshot::new();
+            apply_new(&mut snap, &igp_v4_msg("0.0.0.0", 0, 0, 254), CREATE, 254);
+            apply_new(&mut snap, &igp_v4_msg("10.0.0.0", 8, 10, 254), CREATE, 254);
+            let neg = negative_v4_msg("10.0.0.0", 8, 10, kind);
+            assert!(apply_new(&mut snap, &neg, REPLACE, 254));
+            assert_eq!(snap.v4.len(), 2, "{kind:?} took the unicast alias's place");
+            assert_eq!(metric_v4(&snap, "10.1.1.1"), None, "{kind:?}");
+
+            let mut snap = FibSnapshot::new();
+            let gw = with_oif(
+                with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::1"),
+                2,
+            );
+            apply_new(&mut snap, &gw, CREATE, 254);
+            assert!(apply_new(
+                &mut snap,
+                &negative_v6_msg("2001:db8::", 32, 10, kind),
+                REPLACE,
+                254
+            ));
+            assert_eq!(snap.v6.len(), 1, "{kind:?}");
+            assert_eq!(metric_v6(&snap, "2001:db8::1"), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn negative_route_in_another_table_is_ignored() {
+        let mut snap = FibSnapshot::new();
+        apply_new(&mut snap, &igp_v4_msg("0.0.0.0", 0, 0, 254), CREATE, 254);
+        let mut other = negative_v4_msg("10.0.0.0", 8, 0, RouteType::Unreachable);
+        other.header.table = 100;
+        assert!(!apply_new(&mut snap, &other, CREATE, 254));
+        assert_eq!(metric_v4(&snap, "10.1.1.1"), Some(0));
+    }
+
+    #[test]
+    fn untracked_replace_still_needs_a_valid_slot() {
+        // A local route (not mirrored) replacing into an empty slot changes
+        // nothing; a malformed one is ignored.
+        let mut snap = FibSnapshot::new();
+        let mut local = igp_v4_msg("10.0.0.0", 8, 0, 254);
+        local.header.kind = RouteType::Local;
+        assert!(!apply_new(&mut snap, &local, REPLACE, 254));
+        let mut local6 = igp_v6_msg("2001:db8::", 32, 0, 254);
+        local6.header.kind = RouteType::Local;
+        assert!(!apply_new(&mut snap, &local6, REPLACE, 254));
+        assert!(!apply_new(
+            &mut snap,
+            &igp_v4_msg("10.0.0.1", 8, 0, 254),
+            REPLACE,
+            254
+        ));
+        assert!(!apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::1", 32, 0, 254),
+            REPLACE,
+            254
+        ));
     }
 
     // ── dump_stale_bgp filter logic ───────────────────────────────────────────

@@ -56,6 +56,46 @@
 //! Ineligible routes are still stored so that their identity and position are
 //! right for later replacements and deletions.
 //!
+//! # Negative routes
+//!
+//! A lookup selects a route **before** it decides whether the destination is
+//! reachable. `ip-route(8)` describes the route types:
+//!
+//! > "blackhole - these destinations are unreachable. Packets are discarded
+//! > silently."
+//! >
+//! > "unreachable - these destinations are unreachable. Packets are discarded
+//! > and the ICMP message host unreachable is generated."
+//! >
+//! > "prohibit - these destinations are unreachable. Packets are discarded and
+//! > the ICMP message communication administratively prohibited is generated."
+//! >
+//! > "throw - a special control route used together with policy rules. If such
+//! > a route is selected, lookup in this table is terminated pretending that no
+//! > route was found."
+//!
+//! In the kernel each type has a fixed lookup error (`fib_props` in
+//! `net/ipv4/fib_semantics.c`, `fib6_prop` in `net/ipv6/route.c`): blackhole
+//! `-EINVAL`, unreachable `-EHOSTUNREACH`, prohibit `-EACCES`, throw
+//! `-EAGAIN`, unicast `0`. `fib_table_lookup` returns that error as soon as the
+//! winning alias is chosen (`err = fib_props[fa->fa_type].error; if
+//! (unlikely(err < 0)) { out_reject: ... return err; }`); it does **not**
+//! backtrack to a shorter prefix. IPv6 is the same: `fib6_table_lookup` only
+//! backtracks when no route of the node was selected, and the selected reject
+//! route's error ends the lookup (`ip6_rt_init_dst_reject`). So a negative
+//! route beneath a covering unicast route makes the covered destinations
+//! unreachable. [`RouteList::resolve`] reports this as a [`FibLookup`], so a
+//! negative route can never be read as a forwarding one.
+//!
+//! **Throw.** `-EAGAIN` is also what a table returns when nothing matches, and
+//! the rule walk (`fib_rules_lookup`) moves on to the next policy rule on
+//! `-EAGAIN`. With the default rules (`fib_default_rules_init`: local, main,
+//! then default for IPv4; local, main for IPv6) a throw in `main` leaves only
+//! the `default` table, which is normally empty, and the lookup fails with
+//! `-ENETUNREACH`. The snapshot mirrors a single table and does not model
+//! policy rules, so it reports a throw as [`FibLookup::Throw`]: no route in
+//! the mirrored table, therefore not reachable through it.
+//!
 //! [`FibSnapshot`]: super::FibSnapshot
 
 use std::{
@@ -317,6 +357,136 @@ pub enum NextHopV6 {
     Path(NextHopPath),
 }
 
+// ── Route types ───────────────────────────────────────────────────────────────
+
+/// `RTN_*` values from `<linux/rtnetlink.h>`.
+const RTN_UNICAST: u8 = 1;
+const RTN_BLACKHOLE: u8 = 6;
+const RTN_UNREACHABLE: u8 = 7;
+const RTN_PROHIBIT: u8 = 8;
+const RTN_THROW: u8 = 9;
+
+/// A route type whose lookup ends in a discard: the kernel does not forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RejectKind {
+    /// `RTN_BLACKHOLE`: discarded silently; local senders get `EINVAL`.
+    Blackhole,
+    /// `RTN_UNREACHABLE`: discarded with ICMP host unreachable; local senders
+    /// get `EHOSTUNREACH`.
+    Unreachable,
+    /// `RTN_PROHIBIT`: discarded with ICMP administratively prohibited; local
+    /// senders get `EACCES`.
+    Prohibit,
+}
+
+/// The type (`rtm_type`) of a route the snapshot mirrors.
+///
+/// Only the types that can live in a routing table used for forwarding and
+/// that decide what happens to forwarded traffic are represented: unicast and
+/// the negative types. `local`, `broadcast`, `anycast` and `multicast` routes
+/// (normally in the `local` table) and the obsolete `nat` and `xresolve` types
+/// are not mirrored; [`RouteKind::from_rtm_type`] returns `None` for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteKind {
+    /// `RTN_UNICAST`: "real paths to the destinations covered by the route
+    /// prefix".
+    Unicast,
+    /// `RTN_BLACKHOLE`, `RTN_UNREACHABLE` or `RTN_PROHIBIT`.
+    Reject(RejectKind),
+    /// `RTN_THROW`: ends the lookup in this table as if no route was found.
+    Throw,
+}
+
+impl RouteKind {
+    /// Maps an `rtm_type` to a mirrored kind, or `None` for a type the
+    /// snapshot does not mirror.
+    #[must_use]
+    pub const fn from_rtm_type(rtm_type: u8) -> Option<Self> {
+        match rtm_type {
+            RTN_UNICAST => Some(Self::Unicast),
+            RTN_BLACKHOLE => Some(Self::Reject(RejectKind::Blackhole)),
+            RTN_UNREACHABLE => Some(Self::Reject(RejectKind::Unreachable)),
+            RTN_PROHIBIT => Some(Self::Reject(RejectKind::Prohibit)),
+            RTN_THROW => Some(Self::Throw),
+            _ => None,
+        }
+    }
+
+    /// The `rtm_type` value of this kind.
+    #[must_use]
+    pub const fn rtm_type(self) -> u8 {
+        match self {
+            Self::Unicast => RTN_UNICAST,
+            Self::Reject(RejectKind::Blackhole) => RTN_BLACKHOLE,
+            Self::Reject(RejectKind::Unreachable) => RTN_UNREACHABLE,
+            Self::Reject(RejectKind::Prohibit) => RTN_PROHIBIT,
+            Self::Throw => RTN_THROW,
+        }
+    }
+}
+
+// ── Lookup result ─────────────────────────────────────────────────────────────
+
+/// How a best-effort kernel lookup for one destination ends.
+///
+/// The route is chosen first (longest prefix, then lowest priority) and only
+/// then does its kind decide the outcome, as in `fib_table_lookup`. Only
+/// [`FibLookup::Forward`] means the destination is reachable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FibLookup<'a, R> {
+    /// The selected route is unicast: traffic is forwarded along it.
+    Forward(&'a R),
+    /// The selected route discards the traffic.
+    Reject {
+        /// The selected negative route.
+        route: &'a R,
+        /// Which kind of negative route it is.
+        kind: RejectKind,
+    },
+    /// The selected route is a throw route: the lookup in the mirrored table
+    /// ends with no route. The kernel would go on to the next policy rule's
+    /// table, which the snapshot does not mirror.
+    Throw(&'a R),
+    /// No mirrored route covers the destination.
+    NoRoute,
+}
+
+// Manual impls: the enum only holds references, so it is `Copy` whatever `R`
+// is; a derive would require `R: Copy`.
+impl<R> Clone for FibLookup<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for FibLookup<'_, R> {}
+
+impl<'a, R> FibLookup<'a, R> {
+    /// The route traffic is forwarded along, if the lookup ends in one.
+    #[must_use]
+    pub const fn forwarding(self) -> Option<&'a R> {
+        match self {
+            Self::Forward(route) => Some(route),
+            _ => None,
+        }
+    }
+
+    /// Whether the lookup ends in a forwarding route.
+    #[must_use]
+    pub const fn is_reachable(self) -> bool {
+        matches!(self, Self::Forward(_))
+    }
+
+    /// The route the lookup selected, of any kind.
+    #[must_use]
+    pub const fn selected(self) -> Option<&'a R> {
+        match self {
+            Self::Forward(route) | Self::Reject { route, .. } | Self::Throw(route) => Some(route),
+            Self::NoRoute => None,
+        }
+    }
+}
+
 // ── Route identity ────────────────────────────────────────────────────────────
 
 /// The kernel's IPv4 alias group: `[prefix, dscp, priority]` within one table.
@@ -337,14 +507,24 @@ pub struct RouteSlotV4 {
 
 /// One IPv4 route alias as the kernel identifies it.
 ///
-/// Two aliases in the same slot are the same route when their scope, protocol,
-/// preferred source and next hops match. That mirrors the kernel's duplicate
-/// test, minus `RTA_METRICS`, which only `ip route append` with identical next
-/// hops and different metrics could make significant.
+/// Two aliases in the same slot are the same route when their type, scope,
+/// protocol, preferred source and next hops match. That mirrors the kernel's
+/// duplicate test ("a perfect match which uses the same scope, type, and
+/// nexthop information": `fa->fa_type == cfg->fc_type && fa->fa_info == fi`),
+/// minus `RTA_METRICS`, which only `ip route append` with identical next hops
+/// and different metrics could make significant.
+///
+/// A negative route has no gateway or device: `fib_create_info` rejects them
+/// ("Gateway, device and multipath can not be specified for this route
+/// type"). A unicast route through a blackhole nexthop object is reported by
+/// the kernel as `RTN_BLACKHOLE` (`fib_dump_info`), so it arrives here as a
+/// [`RejectKind::Blackhole`] route with [`NextHopV4::Object`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelRouteV4 {
     /// The alias group.
     pub slot: RouteSlotV4,
+    /// `rtm_type`. Part of the identity.
+    pub kind: RouteKind,
     /// `rtm_protocol`.
     pub protocol: u8,
     /// `rtm_scope`.
@@ -369,10 +549,18 @@ pub struct RouteSlotV6 {
 }
 
 /// One IPv6 route (a single `fib6_info`, so one ECMP sibling at most).
+///
+/// The kernel creates every negative IPv6 route on the loopback device with
+/// no gateway (`fib6_nh_init`: "hold loopback dev/idev"), so negative routes
+/// of the same metric are duplicates of each other whatever their type, and a
+/// negative route is never an ECMP sibling.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelRouteV6 {
     /// The metric group.
     pub slot: RouteSlotV6,
+    /// `rtm_type`. Not part of the identity: `rt6_duplicate_nexthop` compares
+    /// device, gateway and encapsulation only.
+    pub kind: RouteKind,
     /// `rtm_protocol`. Not part of the identity (`rt6_duplicate_nexthop`
     /// ignores it), but needed to tell router-advertisement routes apart.
     pub protocol: u8,
@@ -392,9 +580,16 @@ impl KernelRouteV6 {
     /// `RTPROT_RA`, which stands in for it here.
     #[must_use]
     pub fn qualifies_for_ecmp(&self) -> bool {
-        self.protocol != RTPROT_RA
-            && matches!(self.next_hop, NextHopV6::Path(p) if p.gateway.is_some())
+        qualifies_for_ecmp_v6(self.protocol, &self.next_hop)
     }
+}
+
+/// `rt6_qualify_for_ecmp` for a route with this protocol and next hop. The
+/// route type plays no part; negative routes have no gateway and so never
+/// qualify.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn qualifies_for_ecmp_v6(protocol: u8, next_hop: &NextHopV6) -> bool {
+    protocol != RTPROT_RA && matches!(next_hop, NextHopV6::Path(p) if p.gateway.is_some())
 }
 
 // ── Ordered route mirror ──────────────────────────────────────────────────────
@@ -424,6 +619,9 @@ pub(crate) trait MirroredRoute: Clone + PartialEq {
 
     /// The route priority (metric).
     fn priority(&self) -> u32;
+
+    /// The route type.
+    fn kind(&self) -> RouteKind;
 }
 
 impl MirroredRoute for KernelRouteV4 {
@@ -449,6 +647,10 @@ impl MirroredRoute for KernelRouteV4 {
     fn priority(&self) -> u32 {
         self.slot.priority
     }
+
+    fn kind(&self) -> RouteKind {
+        self.kind
+    }
 }
 
 impl MirroredRoute for KernelRouteV6 {
@@ -473,6 +675,10 @@ impl MirroredRoute for KernelRouteV6 {
 
     fn priority(&self) -> u32 {
         self.slot.priority
+    }
+
+    fn kind(&self) -> RouteKind {
+        self.kind
     }
 }
 
@@ -571,11 +777,13 @@ impl<R: MirroredRoute> RouteList<R> {
         }
     }
 
-    /// The route a best-effort kernel lookup would use for `addr`.
+    /// The route a best-effort kernel lookup would select for `addr`, of any
+    /// kind.
     ///
     /// Longest matching prefix first, then lowest priority, then mirror order.
-    /// With several tables mirrored, they are compared as one table: policy
-    /// routing rules are not modelled.
+    /// Negative routes take part like any other: the kernel picks the alias
+    /// before it looks at its type. With several tables mirrored, they are
+    /// compared as one table: policy routing rules are not modelled.
     #[must_use]
     pub fn lookup(&self, addr: R::Addr) -> Option<&R> {
         // `min_by_key` returns the first of several equal minima, which keeps
@@ -584,6 +792,20 @@ impl<R: MirroredRoute> RouteList<R> {
             .iter()
             .filter(|r| r.matches(addr))
             .min_by_key(|r| (Reverse(r.prefix_len()), r.priority()))
+    }
+
+    /// How a best-effort kernel lookup for `addr` ends: the selected route
+    /// (see [`lookup`](Self::lookup)) classified by its kind.
+    #[must_use]
+    pub fn resolve(&self, addr: R::Addr) -> FibLookup<'_, R> {
+        match self.lookup(addr) {
+            None => FibLookup::NoRoute,
+            Some(route) => match route.kind() {
+                RouteKind::Unicast => FibLookup::Forward(route),
+                RouteKind::Reject(kind) => FibLookup::Reject { route, kind },
+                RouteKind::Throw => FibLookup::Throw(route),
+            },
+        }
     }
 }
 

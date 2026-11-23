@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bacff86503cb27062a4ac7cedda43da6e944879b991114ae8809a7945ec1a9dc # shrinks to ops = [Add { route: KernelRouteV4 { slot: RouteSlotV4 { table: TableId(254), dst: Ipv4Prefix { addr: 0.0.0.0, len: 0 }, tos: 0, priority: 0 }, kind: Reject(Blackhole), protocol: 3, scope: 0, prefsrc: None, next_hop: Path(NextHopPath { gateway: None, oif: None }) }, front: false }]
+cc 539ec9d8cba20bcd2f1153a86e044400a9168443f2e5f264a4666522cea76250 # shrinks to ops = [Add { route: KernelRouteV6 { slot: RouteSlotV6 { table: TableId(254), dst: Ipv6Prefix { addr: ::, len: 0 }, src: Ipv6Prefix { addr: ::, len: 0 }, priority: 1 }, kind: Reject(Blackhole), protocol: 3, next_hop: Path(NextHopPath { gateway: None, oif: Some(1) }) }, front: false }]

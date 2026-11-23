@@ -158,8 +158,8 @@ pub trait FibWrite {
 mod route;
 pub(crate) use route::RouteList;
 pub use route::{
-    Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg, NextHopPath, NextHopV4,
-    NextHopV6, PrefixError, RouteSlotV4, RouteSlotV6, TableId,
+    FibLookup, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg, NextHopPath,
+    NextHopV4, NextHopV6, PrefixError, RejectKind, RouteKind, RouteSlotV4, RouteSlotV6, TableId,
 };
 
 /// Returns `true` if `addr` is a link-local IPv6 address (`fe80::/10`).
@@ -190,10 +190,18 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
 ///
 /// Reachability queries use longest-prefix match. Among the routes for the
 /// longest matching prefix, the one with the lowest priority wins, as in the
-/// kernel. Its priority is returned as the IGP metric for the RFC 4271
-/// §9.1.2.2 step 8 tiebreaker. IPv4 routes with a non-zero TOS and IPv6
-/// routes with a source prefix are kept but never selected, because a
-/// best-effort lookup from an unspecified source cannot match them.
+/// kernel. IPv4 routes with a non-zero TOS and IPv6 routes with a source
+/// prefix are kept but never selected, because a best-effort lookup from an
+/// unspecified source cannot match them.
+///
+/// The selected route's [`RouteKind`] then decides the outcome
+/// ([`FibLookup`]). Only a unicast route makes the destination reachable; its
+/// priority is returned as the IGP metric for the RFC 4271 §9.1.2.2 step 8
+/// tiebreaker. A `blackhole`, `unreachable`, `prohibit` or `throw` route
+/// makes every destination it covers unreachable, even when a shorter unicast
+/// route also covers them, because the kernel does not fall back to a shorter
+/// prefix once a negative route is selected. See the `route` module docs for
+/// the kernel source and for how `throw` is treated.
 #[derive(Debug, Default, Clone)]
 pub struct FibSnapshot {
     pub(crate) v4: RouteList<KernelRouteV4>,
@@ -217,32 +225,49 @@ impl FibSnapshot {
         self.v6.iter()
     }
 
-    /// The IPv4 route the kernel would use for best-effort traffic to `addr`.
+    /// How the kernel's lookup for best-effort IPv4 traffic to `addr` ends.
+    #[must_use]
+    pub fn lookup_v4(&self, addr: Ipv4Addr) -> FibLookup<'_, KernelRouteV4> {
+        self.v4.resolve(addr)
+    }
+
+    /// How the kernel's lookup for IPv6 traffic to `addr` from an unspecified
+    /// source ends. Link-local addresses are not special-cased here.
+    #[must_use]
+    pub fn lookup_v6(&self, addr: Ipv6Addr) -> FibLookup<'_, KernelRouteV6> {
+        self.v6.resolve(addr)
+    }
+
+    /// The unicast IPv4 route the kernel would forward best-effort traffic to
+    /// `addr` along, or `None` if the lookup ends in no route or a negative
+    /// route.
     #[must_use]
     pub fn route_to_v4(&self, addr: Ipv4Addr) -> Option<&KernelRouteV4> {
-        self.v4.lookup(addr)
+        self.lookup_v4(addr).forwarding()
     }
 
-    /// The IPv6 route the kernel would use for traffic to `addr` from an
-    /// unspecified source. Link-local addresses are not special-cased here.
+    /// The unicast IPv6 route the kernel would forward traffic to `addr` from
+    /// an unspecified source along, or `None` if the lookup ends in no route
+    /// or a negative route. Link-local addresses are not special-cased here.
     #[must_use]
     pub fn route_to_v6(&self, addr: Ipv6Addr) -> Option<&KernelRouteV6> {
-        self.v6.lookup(addr)
+        self.lookup_v6(addr).forwarding()
     }
 
-    /// Returns `true` if `addr` is covered by an eligible IPv4 route.
+    /// Returns `true` if the lookup for `addr` ends in a unicast IPv4 route.
     #[must_use]
     pub fn is_v4_reachable(&self, addr: Ipv4Addr) -> bool {
-        self.route_to_v4(addr).is_some()
+        self.lookup_v4(addr).is_reachable()
     }
 
-    /// Returns the priority of the IPv4 route the kernel would use for `addr`.
+    /// Returns the priority of the unicast IPv4 route the kernel would use for
+    /// `addr`, or `None` if `addr` is not reachable.
     #[must_use]
     pub fn igp_metric_v4(&self, addr: Ipv4Addr) -> Option<u32> {
         self.route_to_v4(addr).map(|r| r.slot.priority)
     }
 
-    /// Returns `true` if `addr` is covered by an eligible IPv6 route.
+    /// Returns `true` if the lookup for `addr` ends in a unicast IPv6 route.
     ///
     /// Link-local addresses (`fe80::/10`) are always considered reachable —
     /// they are on-link by definition and do not appear in the main routing
@@ -252,10 +277,11 @@ impl FibSnapshot {
         if is_link_local_v6(addr) {
             return true;
         }
-        self.route_to_v6(addr).is_some()
+        self.lookup_v6(addr).is_reachable()
     }
 
-    /// Returns the priority of the IPv6 route the kernel would use for `addr`.
+    /// Returns the priority of the unicast IPv6 route the kernel would use for
+    /// `addr`, or `None` if `addr` is not reachable through a route.
     #[must_use]
     pub fn igp_metric_v6(&self, addr: Ipv6Addr) -> Option<u32> {
         self.route_to_v6(addr).map(|r| r.slot.priority)
@@ -468,6 +494,7 @@ mod tests {
                 tos: 0,
                 priority: metric,
             },
+            kind: RouteKind::Unicast,
             protocol: 3, // RTPROT_BOOT, what `ip route add` uses
             scope: 0,
             prefsrc: None,
@@ -487,6 +514,7 @@ mod tests {
                 src: Ipv6Prefix::DEFAULT,
                 priority: metric,
             },
+            kind: RouteKind::Unicast,
             protocol: 3,
             next_hop: NextHopV6::Path(NextHopPath {
                 gateway: None,
@@ -642,6 +670,174 @@ mod tests {
         );
         // Completely uncovered
         assert_eq!(snap.igp_metric_v6("2001:db9::1".parse().unwrap()), None);
+    }
+
+    // ── Negative routes (issue #57) ──────────────────────────────────────────
+    //
+    // ip-route(8): blackhole, unreachable and prohibit destinations "are
+    // unreachable"; a selected throw route ends the lookup in the table
+    // "pretending that no route was found". fib_table_lookup returns the
+    // selected alias's fib_props error without backtracking, and
+    // fib6_table_lookup backtracks only when the node yields no route, so a
+    // negative route hides every shorter route that also covers the address.
+
+    const NEGATIVE_KINDS: [RouteKind; 4] = [
+        RouteKind::Reject(RejectKind::Blackhole),
+        RouteKind::Reject(RejectKind::Unreachable),
+        RouteKind::Reject(RejectKind::Prohibit),
+        RouteKind::Throw,
+    ];
+
+    fn neg4(network: &str, prefix_len: u8, metric: u32, kind: RouteKind) -> KernelRouteV4 {
+        KernelRouteV4 {
+            kind,
+            ..r4(network, prefix_len, metric)
+        }
+    }
+
+    fn neg6(network: &str, prefix_len: u8, metric: u32, kind: RouteKind) -> KernelRouteV6 {
+        KernelRouteV6 {
+            kind,
+            ..r6(network, prefix_len, metric)
+        }
+    }
+
+    /// The lookup outcome must name the negative route and its kind.
+    fn assert_negative<R: std::fmt::Debug + PartialEq>(
+        got: FibLookup<'_, R>,
+        route: &R,
+        kind: RouteKind,
+    ) {
+        match (got, kind) {
+            (FibLookup::Reject { route: r, kind: k }, RouteKind::Reject(want)) => {
+                assert_eq!(r, route);
+                assert_eq!(k, want);
+            }
+            (FibLookup::Throw(r), RouteKind::Throw) => assert_eq!(r, route),
+            (other, _) => panic!("expected {kind:?} via {route:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv4_negative_route_beneath_a_covering_route_is_unreachable_until_removed() {
+        let covered: Ipv4Addr = "10.1.2.3".parse().unwrap();
+        let elsewhere: Ipv4Addr = "10.2.0.1".parse().unwrap();
+        for kind in NEGATIVE_KINDS {
+            let neg = neg4("10.1.0.0", 16, 1024, kind);
+            let mut snap = snap_with_v4(&[("0.0.0.0", 0, 0)]);
+            assert!(snap.v4.insert_back(neg.clone()));
+
+            assert!(
+                !snap.is_v4_reachable(covered),
+                "{kind:?} must not fall through"
+            );
+            assert_eq!(snap.igp_metric_v4(covered), None, "{kind:?}");
+            assert_eq!(snap.route_to_v4(covered), None, "{kind:?}");
+            assert_negative(snap.lookup_v4(covered), &neg, kind);
+            // Outside the negative prefix the default route still forwards.
+            assert_eq!(snap.igp_metric_v4(elsewhere), Some(0), "{kind:?}");
+
+            assert!(snap.v4.remove(&neg));
+            assert!(snap.is_v4_reachable(covered), "{kind:?} removed");
+            assert_eq!(snap.igp_metric_v4(covered), Some(0));
+        }
+    }
+
+    #[test]
+    fn ipv6_negative_route_beneath_a_covering_route_is_unreachable_until_removed() {
+        let covered: Ipv6Addr = "2001:db8:1::3".parse().unwrap();
+        let elsewhere: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+        for kind in NEGATIVE_KINDS {
+            let neg = neg6("2001:db8:1::", 48, 1024, kind);
+            let mut snap = snap_with_v6(&[("::", 0, 1)]);
+            assert!(snap.v6.insert_back(neg.clone()));
+
+            assert!(
+                !snap.is_v6_reachable(covered),
+                "{kind:?} must not fall through"
+            );
+            assert_eq!(snap.igp_metric_v6(covered), None, "{kind:?}");
+            assert_eq!(snap.route_to_v6(covered), None, "{kind:?}");
+            assert_negative(snap.lookup_v6(covered), &neg, kind);
+            assert_eq!(snap.igp_metric_v6(elsewhere), Some(1), "{kind:?}");
+
+            assert!(snap.v6.remove(&neg));
+            assert!(snap.is_v6_reachable(covered), "{kind:?} removed");
+            assert_eq!(snap.igp_metric_v6(covered), Some(1));
+        }
+    }
+
+    #[test]
+    fn negative_and_unicast_routes_for_one_prefix_compete_on_priority() {
+        // fib_table_lookup walks a leaf's aliases in ascending priority and
+        // stops at the first one, whatever its type; IPv6 nodes are sorted by
+        // metric the same way.
+        let addr4: Ipv4Addr = "198.51.100.7".parse().unwrap();
+        let addr6: Ipv6Addr = "2001:db8:1::7".parse().unwrap();
+        for kind in NEGATIVE_KINDS {
+            let mut snap = snap_with_v4(&[("198.51.100.0", 24, 100)]);
+            snap.v4.insert_back(neg4("198.51.100.0", 24, 10, kind));
+            snap.v6.insert_back(r6("2001:db8:1::", 64, 100));
+            snap.v6.insert_back(neg6("2001:db8:1::", 64, 10, kind));
+            assert!(!snap.is_v4_reachable(addr4), "{kind:?} at metric 10 wins");
+            assert!(!snap.is_v6_reachable(addr6), "{kind:?} at metric 10 wins");
+
+            let mut snap = snap_with_v4(&[("198.51.100.0", 24, 10)]);
+            snap.v4.insert_back(neg4("198.51.100.0", 24, 100, kind));
+            snap.v6.insert_back(r6("2001:db8:1::", 64, 10));
+            snap.v6.insert_back(neg6("2001:db8:1::", 64, 100, kind));
+            assert_eq!(snap.igp_metric_v4(addr4), Some(10), "{kind:?} at 100 loses");
+            assert_eq!(snap.igp_metric_v6(addr6), Some(10), "{kind:?} at 100 loses");
+        }
+    }
+
+    #[test]
+    fn a_longer_unicast_route_inside_a_negative_prefix_still_forwards() {
+        // Longest prefix first: the negative route only decides for addresses
+        // where it is the longest match.
+        for kind in NEGATIVE_KINDS {
+            let mut snap = snap_with_v4(&[("10.1.0.0", 16, 50)]);
+            snap.v4.insert_back(neg4("10.0.0.0", 8, 0, kind));
+            assert_eq!(snap.igp_metric_v4("10.1.9.9".parse().unwrap()), Some(50));
+            assert!(!snap.is_v4_reachable("10.2.9.9".parse().unwrap()));
+
+            let mut snap = snap_with_v6(&[("2001:db8:1::", 48, 50)]);
+            snap.v6.insert_back(neg6("2001:db8::", 32, 0, kind));
+            assert_eq!(
+                snap.igp_metric_v6("2001:db8:1::9".parse().unwrap()),
+                Some(50)
+            );
+            assert!(!snap.is_v6_reachable("2001:db8:2::9".parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn kernel_oracle_reports_a_negative_route_as_unreachable() {
+        let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
+        let oracle = fib.oracle();
+        {
+            let mut snap = fib.snapshot.write().unwrap();
+            snap.v4.insert_back(r4("0.0.0.0", 0, 0));
+            snap.v4.insert_back(neg4(
+                "192.0.2.0",
+                24,
+                0,
+                RouteKind::Reject(RejectKind::Blackhole),
+            ));
+            snap.v6.insert_back(r6("::", 0, 1));
+            snap.v6.insert_back(neg6(
+                "2001:db8::",
+                32,
+                1,
+                RouteKind::Reject(RejectKind::Prohibit),
+            ));
+        }
+        assert!(!oracle.is_v4_reachable("192.0.2.1".parse().unwrap()));
+        assert_eq!(oracle.igp_metric_v4("192.0.2.1".parse().unwrap()), None);
+        assert!(oracle.is_v4_reachable("198.51.100.1".parse().unwrap()));
+        assert!(!oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
+        assert_eq!(oracle.igp_metric_v6("2001:db8::1".parse().unwrap()), None);
+        assert!(oracle.is_v6_reachable("2001:db9::1".parse().unwrap()));
     }
 
     // ── KernelOracle ─────────────────────────────────────────────────────────
