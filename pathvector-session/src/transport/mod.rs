@@ -860,6 +860,9 @@ impl<T: BgpTransport> Session<T> {
                 }
 
                 () = keepalive => {
+                    if let Some(deadline) = self.keepalive_deadline {
+                        record_keepalive_lateness(self.config.peer_addr.ip(), deadline);
+                    }
                     self.keepalive_deadline = None;
                     return FsmInput::KeepaliveTimerExpired;
                 }
@@ -1377,16 +1380,28 @@ impl<T: BgpTransport> Session<T> {
                         t.set_four_byte_asn(four_byte_asn);
                     }
                     info.local_addr = self.local_addr;
-                    let _ = self.event_tx.send(SessionEvent::Established(info)).await;
+                    send_event_timed(
+                        &self.event_tx,
+                        SessionEvent::Established(info),
+                        self.config.peer_addr.ip(),
+                    )
+                    .await;
                 }
                 FsmOutput::SessionTerminated => {
-                    let _ = self
-                        .event_tx
-                        .send(SessionEvent::Terminated(self.termination_reason.clone()))
-                        .await;
+                    send_event_timed(
+                        &self.event_tx,
+                        SessionEvent::Terminated(self.termination_reason.clone()),
+                        self.config.peer_addr.ip(),
+                    )
+                    .await;
                 }
                 FsmOutput::RouteUpdate(update) => {
-                    let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
+                    send_event_timed(
+                        &self.event_tx,
+                        SessionEvent::RouteUpdate(update),
+                        self.config.peer_addr.ip(),
+                    )
+                    .await;
                 }
             }
         }
@@ -1513,7 +1528,12 @@ impl<T: BgpTransport> Session<T> {
             m.update
         };
 
-        let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
+        send_event_timed(
+            &self.event_tx,
+            SessionEvent::RouteUpdate(update),
+            self.config.peer_addr.ip(),
+        )
+        .await;
         None
     }
 
@@ -1667,6 +1687,57 @@ async fn tcp_connect(addr: SocketAddr, password: Option<&str>) -> io::Result<Tcp
 }
 
 // ── Free async helpers ────────────────────────────────────────────────────────
+
+/// Delivers `event` to the daemon, recording how long the session task was
+/// parked waiting for channel capacity.
+///
+/// The session task owns the hold and keepalive timers, the socket read and
+/// the socket write in one `select!` loop. While it is parked in
+/// `event_tx.send().await` it can do none of those, so a slow consumer on the
+/// other end of this channel (the daemon event loop under its write lock,
+/// see `PRODUCTION_READINESS.md` PR-1) turns directly into KEEPALIVEs not being
+/// sent. The fast path is a non-blocking `try_send` with no clock read, so the
+/// uncontended cost is nil; only a genuinely blocked send is timed and
+/// recorded as `pathvector_session_event_send_blocked_seconds{peer}` (the
+/// histogram's count is the number of times the session blocked, its sum the
+/// total time).
+///
+/// Behaviour is otherwise identical to `let _ = tx.send(event).await`: a
+/// closed channel is ignored.
+async fn send_event_timed(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent, peer: IpAddr) {
+    match tx.try_send(event) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            let start = std::time::Instant::now();
+            let _ = tx.send(event).await;
+            metrics::histogram!(
+                "pathvector_session_event_send_blocked_seconds",
+                "peer" => peer.to_string()
+            )
+            .record(start.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// How far past its deadline a timer is being serviced. Zero if serviced
+/// early or exactly on time (`saturating_duration_since`).
+fn timer_lateness(now: Instant, deadline: Instant) -> std::time::Duration {
+    now.saturating_duration_since(deadline)
+}
+
+/// Records `pathvector_session_keepalive_lateness_seconds{peer}`: the gap
+/// between when the keepalive timer was due and when the session loop
+/// actually got to service it. Near zero on a healthy session; grows when the
+/// task is parked in a blocked `send_event_timed`, or when the `biased;`
+/// `select!` keeps picking an always-ready earlier arm (e.g. `recv_message`
+/// during a full-table receive) ahead of the timer arms.
+fn record_keepalive_lateness(peer: IpAddr, deadline: Instant) {
+    metrics::histogram!(
+        "pathvector_session_keepalive_lateness_seconds",
+        "peer" => peer.to_string()
+    )
+    .record(timer_lateness(Instant::now(), deadline).as_secs_f64());
+}
 
 /// Resolves at `deadline`, or never if `None`.
 async fn deadline_fut(deadline: Option<Instant>) {
@@ -4274,5 +4345,144 @@ mod tests {
             matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after stop(), got {event:?}"
         );
+    }
+}
+
+// ── Instrumentation tests (PRODUCTION_READINESS.md PR-1) ─────────────────────
+
+#[cfg(test)]
+mod instrumentation_tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+
+    use super::{
+        SessionEvent, TerminationReason, record_keepalive_lateness, send_event_timed,
+        timer_lateness,
+    };
+
+    const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+    fn terminated() -> SessionEvent {
+        SessionEvent::Terminated(TerminationReason::OperatorStop)
+    }
+
+    /// Every histogram recorded so far, keyed by metric name, as raw samples.
+    fn histograms(snapshotter: &Snapshotter) -> HashMap<String, Vec<f64>> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _unit, _desc, value)| match value {
+                DebugValue::Histogram(samples) => Some((
+                    key.key().name().to_string(),
+                    samples.iter().map(|s| s.into_inner()).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timer_lateness_is_the_overshoot_and_never_negative() {
+        let base = Instant::now();
+        let late = timer_lateness(base + Duration::from_millis(40), base);
+        assert_eq!(late, Duration::from_millis(40));
+        // Serviced before its deadline → zero, not an underflow panic.
+        assert_eq!(
+            timer_lateness(base, base + Duration::from_secs(5)),
+            Duration::ZERO
+        );
+        assert_eq!(timer_lateness(base, base), Duration::ZERO);
+    }
+
+    /// With capacity available the event is delivered and *no* blocked-send
+    /// sample is emitted — the metric's count must mean "number of times the
+    /// session actually blocked", not "number of sends".
+    #[tokio::test(flavor = "current_thread")]
+    async fn unblocked_send_delivers_without_recording() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        send_event_timed(&tx, terminated(), PEER).await;
+
+        assert!(matches!(rx.recv().await, Some(SessionEvent::Terminated(_))));
+        assert!(
+            !histograms(&snapshotter).contains_key("pathvector_session_event_send_blocked_seconds")
+        );
+    }
+
+    /// When the channel is full the send parks until the consumer makes room;
+    /// the parked time is recorded once, the event is still delivered, and
+    /// delivery order is preserved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_send_records_parked_time_and_still_delivers() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(terminated()).expect("prefill to capacity");
+
+        let drainer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let mut n = 0;
+            while let Some(_ev) = rx.recv().await {
+                n += 1;
+                if n == 2 {
+                    break;
+                }
+            }
+            n
+        });
+
+        send_event_timed(&tx, terminated(), PEER).await;
+        assert_eq!(drainer.await.expect("drainer"), 2, "both events delivered");
+
+        let samples = histograms(&snapshotter)
+            .remove("pathvector_session_event_send_blocked_seconds")
+            .expect("blocked send must be recorded");
+        assert_eq!(samples.len(), 1);
+        assert!(
+            samples[0] >= 0.035,
+            "parked ~40ms but recorded {}",
+            samples[0]
+        );
+    }
+
+    /// A closed channel is swallowed exactly as the old `let _ = tx.send(..)`
+    /// did: no panic, and nothing recorded (it never blocked).
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_channel_is_ignored() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        send_event_timed(&tx, terminated(), PEER).await;
+
+        assert!(histograms(&snapshotter).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keepalive_lateness_is_recorded_per_peer() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        record_keepalive_lateness(PEER, Instant::now() - Duration::from_millis(250));
+
+        let samples = histograms(&snapshotter)
+            .remove("pathvector_session_keepalive_lateness_seconds")
+            .expect("lateness recorded");
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0] >= 0.25, "recorded {}", samples[0]);
     }
 }

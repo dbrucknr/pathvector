@@ -4,6 +4,32 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (PR-1 control-plane stall instrumentation — measurement only, no behaviour change)
+
+First step of `PRODUCTION_READINESS.md` PR-1: make the stalls measurable before
+changing the architecture. New Prometheus histograms (real buckets, 100 µs–30 s,
+so `histogram_quantile()` works):
+
+- `pathvectord_state_lock_wait_seconds{kind}` / `pathvectord_state_lock_hold_seconds{kind}` —
+  every production write-lock acquisition on `DaemonState` (event loop,
+  RPKI install/re-evaluation, FIB change, GR deadline, selection deferral,
+  max-prefix idle, MRAI, and the mutating gRPC handlers) via the new
+  `lock_timing::write_timed` guard. `kind` is the call site, never peer-derived.
+- `pathvectord_event_loop_batch_events` — events coalesced under one
+  `event_batch` hold (the drain loop is currently uncapped).
+- `pathvector_session_event_send_blocked_seconds{peer}` — time a session task
+  was parked on a full event channel. That task also owns the hold/keepalive
+  timers, so this is the direct backpressure path from a slow daemon loop to
+  missed KEEPALIVEs. Fast path is a `try_send`; only genuinely blocked sends
+  are timed.
+- `pathvector_session_keepalive_lateness_seconds{peer}` — how far past due the
+  keepalive timer was serviced (also exposes starvation by the `biased;`
+  `select!` ordering, independent of the daemon loop).
+
+`pathvector-session` gains a dependency on the `metrics` facade crate (a no-op
+unless the embedding application installs a recorder). Not yet done: the
+two-full-table-peers + control-peer load run that PR-1's exit criteria require.
+
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 
 Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s

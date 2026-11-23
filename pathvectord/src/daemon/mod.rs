@@ -1040,7 +1040,7 @@ async fn install_rpki(
     let changed = reject_invalid.then(|| handle.subscribe());
 
     {
-        let mut guard = state.write().await;
+        let mut guard = crate::lock_timing::write_timed(state, "rpki_install").await;
         if reject_invalid {
             guard.install_rpki_import_terms(&handle);
         }
@@ -1053,7 +1053,9 @@ async fn install_rpki(
         // subscription. Catch that case explicitly rather than relying on
         // subscribe() having won the race against the background task.
         if handle.status().connected {
-            state.write().await.reevaluate_all_import_policies();
+            crate::lock_timing::write_timed(state, "rpki_reeval")
+                .await
+                .reevaluate_all_import_policies();
         }
         // Re-evaluates every peer's import policy whenever the ROA cache
         // changes (any later update) — closes the window between "route
@@ -1065,7 +1067,9 @@ async fn install_rpki(
         let reeval_state = Arc::clone(state);
         tokio::spawn(async move {
             while changed.changed().await.is_ok() {
-                reeval_state.write().await.reevaluate_all_import_policies();
+                crate::lock_timing::write_timed(&reeval_state, "rpki_reeval")
+                    .await
+                    .reevaluate_all_import_policies();
             }
         });
     }
@@ -1223,7 +1227,9 @@ pub(crate) async fn run_event_loop(
         tokio::select! {
             event = event_rx.recv() => {
                 let Some((peer_ip, event)) = event else { break; };
-                let mut s = state.write().await;
+                // `event_batch` covers the whole lock hold: the triggering
+                // event plus every event coalesced by the drain loop below.
+                let mut s = crate::lock_timing::write_timed(&state, "event_batch").await;
                 match event {
                     SessionEvent::Established(info) => {
                         // RFC 4486 §4 — max-prefix idle-hold: if the peer is
@@ -1397,7 +1403,14 @@ pub(crate) async fn run_event_loop(
                 // to avoid dropping and re-acquiring the write lock mid-iteration.
                 let mut idle_hold_rejected: Vec<IpAddr> = Vec::new();
 
+                // PR-1: the drain loop has no cap, so batch size is the main
+                // driver of `event_batch` lock-hold time. Counted here
+                // (primary event + each coalesced one) and recorded once the
+                // channel is empty; the early-exit error paths skip it.
+                let mut batch_events: u32 = 1;
+
                 while let Ok((extra_ip, extra_event)) = event_rx.try_recv() {
+                    batch_events += 1;
                     match extra_event {
                         SessionEvent::Established(info) => {
                             // Same idle-hold guard as the primary Established arm.
@@ -1470,6 +1483,8 @@ pub(crate) async fn run_event_loop(
                         }
                     }
                 }
+                metrics::histogram!("pathvectord_event_loop_batch_events")
+                    .record(f64::from(batch_events));
                 // Channel is empty — flush all accumulated outbound decisions.
                 s.flush_pending();
                 crate::metrics::update_rib_sizes(
@@ -1503,7 +1518,7 @@ pub(crate) async fn run_event_loop(
             }
 
             Ok(()) = fib_changed => {
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "fib_change").await;
                 s.on_fib_change();
                 s.flush_pending();
                 let stalled = s.take_stalled_peers();
@@ -1534,7 +1549,7 @@ pub(crate) async fn run_event_loop(
             } => {
                 let now = Instant::now();
                 let expired: Vec<IpAddr> = {
-                    let mut s = state.write().await;
+                    let mut s = crate::lock_timing::write_timed(&state, "gr_deadline").await;
                     let expired = s.gr.drain_expired(now);
                     for peer_ip in &expired {
                         s.on_gr_deadline_expired(*peer_ip);
@@ -1542,7 +1557,9 @@ pub(crate) async fn run_event_loop(
                     expired
                 };
                 if !expired.is_empty() {
-                    let stalled = state.write().await.take_stalled_peers();
+                    let stalled = crate::lock_timing::write_timed(&state, "gr_deadline")
+                        .await
+                        .take_stalled_peers();
                     for peer in stalled {
                         tracing::error!(
                             peer = %peer,
@@ -1571,7 +1588,7 @@ pub(crate) async fn run_event_loop(
                     None    => std::future::pending::<()>().await,
                 }
             } => {
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "selection_deferral").await;
                 tracing::warn!(
                     "RFC 4724 §4.1: selection-deferral timer expired — \
                      releasing any still-deferred address family unconditionally"
@@ -1609,7 +1626,7 @@ pub(crate) async fn run_event_loop(
                 }
             } => {
                 let now = Instant::now();
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "max_prefix_idle").await;
                 let expired: Vec<IpAddr> = s
                     .max_prefix_idle
                     .iter()
@@ -1626,7 +1643,7 @@ pub(crate) async fn run_event_loop(
             }
 
             _ = mrai_timer.tick() => {
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "mrai").await;
                 // Flush any coalesced decisions before MRAI processing so the
                 // MRAI check sees the fully-accumulated outbound state.
                 s.flush_pending();

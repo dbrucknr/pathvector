@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod fib;
 mod grpc;
+mod lock_timing;
 mod metrics;
 mod outbound;
 mod proto;

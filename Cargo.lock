@@ -1870,6 +1870,8 @@ dependencies = [
  "bytes",
  "criterion",
  "futures",
+ "metrics",
+ "metrics-util",
  "pathvector-sys",
  "pathvector-types",
  "proptest",

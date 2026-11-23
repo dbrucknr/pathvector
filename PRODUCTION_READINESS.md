@@ -70,7 +70,9 @@ before a high-consequence deployment.
 ### PR-1: Bound control-plane stalls under production load
 
 **Status:** Open; underlying architecture and several hot paths are already
-tracked in [`TODO.md`](TODO.md).
+tracked in [`TODO.md`](TODO.md). Lock-hold, event-batch, session-send-blocked
+and keepalive-lateness histograms landed 2026-11-23 (see CHANGELOG.md); the
+load run against them has not been done yet.
 
 All peer events currently converge on one daemon event loop and a broad
 `DaemonState` write lock. Full-table advertisement, Graceful Restart stale-route
