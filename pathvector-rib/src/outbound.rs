@@ -5,7 +5,7 @@ use std::{
 
 use pathvector_types::{Asn, Community, NextHop, PeerType};
 
-use crate::Route;
+use crate::{Route, Staleness};
 
 /// Returns `true` if `communities` carries an RFC 1997 well-known community
 /// that forbids advertising the route to a peer of `peer_type`.
@@ -49,6 +49,14 @@ pub fn is_export_suppressed(communities: &[Community], peer_type: PeerType) -> b
 ///   reflector sits between iBGP clients that cannot reach the original
 ///   eBGP next-hop directly.
 ///
+/// For every `peer_type`, [`Route::staleness`] is reset to
+/// [`Staleness::Fresh`]: staleness is local Graceful Restart state, not a
+/// path attribute, so it is never part of what is advertised. Without this,
+/// marking a selected route stale (RFC 4724 §4.2) would make the outbound
+/// copy differ from the one already in `AdjRibOut` and re-send an identical
+/// UPDATE to every peer — the churn RFC 9494 §1 says conventional GR avoids
+/// ("resolved in favor of not advertising").
+///
 /// `local_as` is this daemon's own (possibly private) Member-AS Number;
 /// `public_as` is the AS number advertised to genuine external peers —
 /// the confederation identifier when confederations are configured, or
@@ -64,6 +72,7 @@ pub fn prepare_outbound(
     local_next_hop: Ipv4Addr,
     next_hop_self: bool,
 ) -> Route<Ipv4Addr> {
+    route.staleness = Staleness::Fresh;
     match peer_type {
         PeerType::External => {
             route.as_path = Arc::new(route.as_path.strip_confed_segments());
@@ -87,8 +96,9 @@ pub fn prepare_outbound(
 }
 
 /// Applies eBGP outbound transforms to an IPv6 route clone. See
-/// [`prepare_outbound`] for the full per-`peer_type` behavior — this is the
-/// same logic against `Ipv6Addr` `NEXT_HOP`s (RFC 4760 §4.3).
+/// [`prepare_outbound`] for the full per-`peer_type` behavior (including
+/// resetting [`Route::staleness`]) — this is the same logic against
+/// `Ipv6Addr` `NEXT_HOP`s (RFC 4760 §4.3).
 ///
 /// When `local_ipv6` is `None`, `NEXT_HOP` rewrites are skipped entirely
 /// (both the `External` and `next_hop_self` cases); callers are
@@ -103,6 +113,7 @@ pub fn prepare_outbound_v6(
     local_ipv6: Option<Ipv6Addr>,
     next_hop_self: bool,
 ) -> Route<Ipv6Addr> {
+    route.staleness = Staleness::Fresh;
     match peer_type {
         PeerType::External => {
             route.as_path = Arc::new(route.as_path.strip_confed_segments());
@@ -514,5 +525,65 @@ mod tests {
             AsPathSegment::ConfedSequence(_)
         ));
         assert_eq!(out.as_path.path_length(), 0);
+    }
+
+    /// Staleness is local RIB state (RFC 4724 §4.2 "mark them as stale
+    /// routing information"), never a path attribute: the outbound copy of
+    /// a `GrStale` route must equal the outbound copy of the same route
+    /// fresh, for every peer type and both families, so `AdjRibOut`'s
+    /// equality check sees no change (RFC 9494 §1: conventional GR resolves
+    /// the trade-off "in favor of not advertising").
+    #[test]
+    fn test_prepare_outbound_never_carries_staleness() {
+        use std::net::Ipv6Addr;
+        let local_nh = Ipv4Addr::new(10, 0, 0, 1);
+        let local_v6: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        for peer_type in [
+            PeerType::External,
+            PeerType::ConfedMember,
+            PeerType::Internal,
+            PeerType::Local,
+        ] {
+            for next_hop_self in [false, true] {
+                let fresh = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+                    .local_pref(LocalPref::new(300))
+                    .build();
+                let mut stale = fresh.clone();
+                stale.staleness = Staleness::GrStale;
+                let out_fresh =
+                    prepare_outbound(fresh, peer_type, 65001, 65001, local_nh, next_hop_self);
+                let out_stale =
+                    prepare_outbound(stale, peer_type, 65001, 65001, local_nh, next_hop_self);
+                assert_eq!(out_stale.staleness, Staleness::Fresh, "{peer_type:?}");
+                assert_eq!(out_stale, out_fresh, "{peer_type:?}");
+
+                let fresh6 = RouteBuilder::new(
+                    "2001:db8:1::/48".parse::<Nlri<Ipv6Addr>>().unwrap(),
+                    Origin::Igp,
+                    AsPath::new(),
+                )
+                .build();
+                let mut stale6 = fresh6.clone();
+                stale6.staleness = Staleness::GrStale;
+                let out_fresh6 = prepare_outbound_v6(
+                    fresh6,
+                    peer_type,
+                    65001,
+                    65001,
+                    Some(local_v6),
+                    next_hop_self,
+                );
+                let out_stale6 = prepare_outbound_v6(
+                    stale6,
+                    peer_type,
+                    65001,
+                    65001,
+                    Some(local_v6),
+                    next_hop_self,
+                );
+                assert_eq!(out_stale6.staleness, Staleness::Fresh, "{peer_type:?}");
+                assert_eq!(out_stale6, out_fresh6, "{peer_type:?}");
+            }
+        }
     }
 }

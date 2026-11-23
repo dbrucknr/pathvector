@@ -30,6 +30,14 @@ use crate::{
 /// Steps 1 and 8 require IGP reachability information not available at the
 /// RIB layer. See `TODO.md`.
 ///
+/// # Graceful Restart
+///
+/// A route retained during conventional Graceful Restart
+/// ([`Staleness::GrStale`](crate::Staleness::GrStale)) is not a separate
+/// step: it competes on its attributes exactly like a fresh route (RFC 4724
+/// §4.2, RFC 9494 §1). It is removed — not depreferenced — when the peer
+/// replaces it, sends End-of-RIB, or fails to return within its Restart Time.
+///
 /// # Examples
 ///
 /// ```
@@ -164,6 +172,15 @@ fn peer_type_rank(pt: PeerType) -> u8 {
 /// Compares two (peer, route) pairs and returns the ordering from the
 /// perspective of route preference — `Ordering::Greater` means the first
 /// pair is preferred.
+///
+/// [`Route::staleness`](crate::Route::staleness) is deliberately not read.
+/// The only staleness this crate represents is conventional Graceful Restart
+/// ([`Staleness::GrStale`](crate::Staleness::GrStale)), and RFC 9494 §1 says
+/// of it: "in conventional GR, route preference is not affected" (RFC 4724
+/// §4.2: "MUST NOT differentiate between stale and other routing information
+/// during forwarding"). The least-preferred rule of RFC 9494 §4.4 belongs to
+/// Long-Lived GR, which is not implemented; see
+/// [`Staleness`](crate::Staleness).
 fn prefer<A: IpAddress>(
     peer_a: &PeerId,
     a: &Route<A>,
@@ -171,15 +188,6 @@ fn prefer<A: IpAddress>(
     b: &Route<A>,
     oracle: &dyn NextHopOracle,
 ) -> Ordering {
-    // Step 0 (RFC 4724 §4.2): non-stale beats stale before all other criteria.
-    // Mirrors FRR's BGP_PATH_STALE and BIRD's RS_STALE handling: a fresh route
-    // from any peer immediately wins over a GR-retained stale route.
-    match (a.stale, b.stale) {
-        (false, true) => return Ordering::Greater,
-        (true, false) => return Ordering::Less,
-        _ => {}
-    }
-
     // Step 2: Highest LOCAL_PREF (missing treated as the conventional default of 100).
     let lp = a
         .local_pref
@@ -278,11 +286,13 @@ mod prop_tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
+    use std::cmp::Ordering;
+
     use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
     use proptest::prelude::*;
 
-    use super::select_best;
-    use crate::{PeerId, RouteBuilder};
+    use super::{prefer, select_best};
+    use crate::{PeerId, Route, RouteBuilder, Staleness, oracle::AlwaysReachable};
 
     // ── Shared helpers ────────────────────────────────────────────────────────
 
@@ -637,6 +647,207 @@ mod prop_tests {
             prop_assert_eq!(winner, peer(2), "Local must beat eBGP regardless of peer IP");
         }
     }
+
+    // ── Conventional GR staleness (RFC 4724 §4.2, RFC 9494 §1) ───────────────
+    //
+    // Arbitrary candidates over every attribute `prefer` reads, drawn from
+    // deliberately narrow ranges so that ties — and therefore the later
+    // decision steps — are common.
+
+    /// Everything `prefer` reads from one candidate, plus its staleness.
+    #[derive(Debug, Clone)]
+    struct Candidate {
+        local_pref: Option<u32>,
+        neighbor_as: u32,
+        path_len: usize,
+        origin: Origin,
+        med: Option<u32>,
+        peer_type: PeerType,
+        received_at: u32,
+        bgp_id: u8,
+        staleness: Staleness,
+    }
+
+    fn arb_candidate() -> impl Strategy<Value = Candidate> {
+        (
+            prop::option::of(99u32..=101),
+            1u32..=3,
+            1usize..=3,
+            arb_origin(),
+            prop::option::of(0u32..=2),
+            prop_oneof![
+                Just(PeerType::Internal),
+                Just(PeerType::ConfedMember),
+                Just(PeerType::External),
+                Just(PeerType::Local),
+            ],
+            0u32..=2,
+            1u8..=3,
+            prop_oneof![Just(Staleness::Fresh), Just(Staleness::GrStale)],
+        )
+            .prop_map(
+                |(
+                    local_pref,
+                    neighbor_as,
+                    path_len,
+                    origin,
+                    med,
+                    peer_type,
+                    received_at,
+                    bgp_id,
+                    staleness,
+                )| Candidate {
+                    local_pref,
+                    neighbor_as,
+                    path_len,
+                    origin,
+                    med,
+                    peer_type,
+                    received_at,
+                    bgp_id,
+                    staleness,
+                },
+            )
+    }
+
+    /// Builds the route. `known_bgp_ids` applies to every candidate in a
+    /// set at once — see `prop_prefer_is_a_strict_total_order` for why a
+    /// set never mixes known and unknown identifiers.
+    fn build(c: &Candidate, known_bgp_ids: bool) -> Route<Ipv4Addr> {
+        let mut asns = vec![Asn::new(65_000 + c.neighbor_as)];
+        asns.extend((1..c.path_len).map(|i| Asn::new(64_512 + u32::try_from(i).unwrap())));
+        let mut b =
+            RouteBuilder::new(nlri(), c.origin, AsPath::from_sequence(asns)).peer_type(c.peer_type);
+        if let Some(lp) = c.local_pref {
+            b = b.local_pref(LocalPref::new(lp));
+        }
+        if let Some(med) = c.med {
+            b = b.med(Med::new(med));
+        }
+        let mut route = b.build();
+        route.received_at = c.received_at;
+        route.peer_bgp_id = known_bgp_ids.then(|| Ipv4Addr::new(10, 255, 0, c.bgp_id));
+        route.staleness = c.staleness;
+        route
+    }
+
+    proptest! {
+        /// RFC 9494 §1: "in conventional GR, route preference is not
+        /// affected"; RFC 4724 §4.2: "MUST NOT differentiate between stale
+        /// and other routing information during forwarding". Marking any
+        /// subset of the candidates `GrStale` must leave the selected peer
+        /// exactly where it was with every candidate fresh.
+        #[test]
+        fn prop_conventional_gr_staleness_never_changes_the_winner(
+            specs in prop::collection::vec(arb_candidate(), 1..=6),
+            known_bgp_ids in any::<bool>(),
+        ) {
+            let with_staleness: HashMap<_, _> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (peer(u8::try_from(i + 1).unwrap()), build(c, known_bgp_ids)))
+                .collect();
+            let all_fresh: HashMap<_, _> = with_staleness
+                .iter()
+                .map(|(p, r)| {
+                    let mut r = r.clone();
+                    r.staleness = Staleness::Fresh;
+                    (*p, r)
+                })
+                .collect();
+
+            prop_assert_eq!(
+                select_best(&with_staleness).map(|(p, _)| p),
+                select_best(&all_fresh).map(|(p, _)| p),
+            );
+        }
+
+        /// `prefer` must be a strict weak ordering — here, because every
+        /// candidate has a distinct peer address and step (g) never ties,
+        /// a strict total order — with staleness in the mix: irreflexive,
+        /// asymmetric, total over distinct peers, and transitive over every
+        /// ordered triple of 3–6 candidates. `max_by` over a relation that
+        /// is not transitive returns an iteration-order-dependent winner.
+        ///
+        /// Two domains are checked, matching how `select_best_with_oracle`
+        /// calls `prefer`: within one neighboring-AS group (MED compared),
+        /// and across groups with MED absent (MED never decides). Across
+        /// groups *with* MED, RFC 4271 §9.1.2.2 (c) is not transitive by
+        /// design — that is why selection groups by neighboring AS first.
+        ///
+        /// Each set has either every BGP Identifier known or none known.
+        /// Step (f) is skipped when only one side's identifier is known,
+        /// which is not transitive for a mixed set (tracked separately;
+        /// it is unrelated to staleness).
+        #[test]
+        fn prop_prefer_is_a_strict_total_order(
+            mut specs in prop::collection::vec(arb_candidate(), 3..=6),
+            one_neighbor_group in any::<bool>(),
+            known_bgp_ids in any::<bool>(),
+        ) {
+            for c in &mut specs {
+                if one_neighbor_group {
+                    c.neighbor_as = 1;
+                } else {
+                    c.med = None;
+                }
+            }
+            let cands: Vec<(PeerId, Route<Ipv4Addr>)> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (peer(u8::try_from(i + 1).unwrap()), build(c, known_bgp_ids)))
+                .collect();
+            let cmp = |i: usize, j: usize| {
+                prefer(&cands[i].0, &cands[i].1, &cands[j].0, &cands[j].1, &AlwaysReachable)
+            };
+            let n = cands.len();
+            for i in 0..n {
+                prop_assert_eq!(cmp(i, i), Ordering::Equal, "irreflexive");
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    prop_assert_ne!(cmp(i, j), Ordering::Equal, "total over distinct peers");
+                    prop_assert_eq!(cmp(i, j), cmp(j, i).reverse(), "asymmetric");
+                    for k in 0..n {
+                        if k == i || k == j {
+                            continue;
+                        }
+                        if cmp(i, j) == Ordering::Greater && cmp(j, k) == Ordering::Greater {
+                            prop_assert_eq!(
+                                cmp(i, k),
+                                Ordering::Greater,
+                                "transitive: {} > {} > {}", i, j, k
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The pairwise form of the invariance property: flipping either
+        /// side's staleness never changes the outcome of a comparison.
+        #[test]
+        fn prop_prefer_ignores_conventional_gr_staleness(
+            a in arb_candidate(),
+            b in arb_candidate(),
+            known_bgp_ids in any::<bool>(),
+        ) {
+            let (pa, pb) = (peer(1), peer(2));
+            let ra = build(&a, known_bgp_ids);
+            let rb = build(&b, known_bgp_ids);
+            let expected = prefer(&pa, &ra, &pb, &rb, &AlwaysReachable);
+            for sa in [Staleness::Fresh, Staleness::GrStale] {
+                for sb in [Staleness::Fresh, Staleness::GrStale] {
+                    let mut ra = ra.clone();
+                    let mut rb = rb.clone();
+                    ra.staleness = sa;
+                    rb.staleness = sb;
+                    prop_assert_eq!(prefer(&pa, &ra, &pb, &rb, &AlwaysReachable), expected);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -646,7 +857,7 @@ mod tests {
 
     use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
 
-    use crate::RouteBuilder;
+    use crate::{RouteBuilder, Staleness};
 
     fn peer(last_octet: u8) -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)))
@@ -1139,51 +1350,147 @@ mod tests {
         assert_eq!(winner, peer(2)); // eBGP wins at step 3/7 before step 9 fires
     }
 
-    /// RFC 4724 §4.2 — a non-stale route beats a stale route regardless of
-    /// all other attributes (higher `LOCAL_PREF`, shorter AS path, etc.).
-    #[test]
-    fn stale_loses_to_non_stale_before_all_other_criteria() {
-        // Stale peer has every other advantage: higher LOCAL_PREF (300 vs 100),
-        // shorter AS path (0 vs 2), better origin (IGP vs Incomplete).
-        let mut stale = basic(Origin::Igp, 0, Some(300), None);
-        stale.stale = true;
-        let fresh = basic(Origin::Incomplete, 2, Some(100), None);
+    // ── Conventional Graceful Restart staleness (RFC 4724 §4.2) ──────────────
+    //
+    // RFC 4724 §4.2: the Receiving Speaker "MUST retain the routes received
+    // from the peer [...] and MUST mark them as stale routing information
+    // [...] The router MUST NOT differentiate between stale and other
+    // routing information during forwarding." RFC 8538 §4.1 restates that
+    // sentence unchanged. RFC 9494 §1: "in conventional GR, route preference
+    // is not affected." Only Long-Lived GR depreferences retained routes
+    // (RFC 9494 §4.3/§4.4), and only for a speaker that advertised the LLGR
+    // Capability, which pathvectord does not. Every expectation below follows
+    // from that: a `GrStale` route is compared exactly as if it were fresh.
 
+    fn gr_stale(mut route: Route<Ipv4Addr>) -> Route<Ipv4Addr> {
+        route.staleness = Staleness::GrStale;
+        route
+    }
+
+    /// Issue #68 acceptance case: the selected `LOCAL_PREF` 300 route is
+    /// marked stale while a fresh `LOCAL_PREF` 100 alternative exists. RFC
+    /// 9494 §1 ("route preference is not affected") plus RFC 4271 §9.1.1
+    /// (`LOCAL_PREF` is the degree of preference) → the stale route keeps
+    /// winning. The stale route is on the *higher* peer address so the
+    /// final tie-breaker (§9.1.2.2 (g)) cannot be what decides it.
+    #[test]
+    fn conventional_gr_stale_route_keeps_its_higher_local_pref_preference() {
         let mut candidates = HashMap::new();
-        candidates.insert(peer(1), stale);
-        candidates.insert(peer(2), fresh);
-        let (winner, _) = select_best(&candidates).unwrap();
+        candidates.insert(peer(2), gr_stale(basic(Origin::Igp, 1, Some(300), None)));
+        candidates.insert(peer(1), basic(Origin::Igp, 1, Some(100), None));
+
+        let (winner, route) = select_best(&candidates).unwrap();
         assert_eq!(
             winner,
             peer(2),
-            "fresh route must win over stale regardless of attributes"
+            "RFC 9494 §1: a conventional-GR stale route keeps its LOCAL_PREF preference"
+        );
+        assert_eq!(route.staleness, Staleness::GrStale);
+    }
+
+    /// The reverse direction: a stale route with *lower* preference still
+    /// loses to a fresh, more-preferred route — staleness neither helps nor
+    /// hurts.
+    #[test]
+    fn conventional_gr_stale_route_with_lower_local_pref_still_loses() {
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), gr_stale(basic(Origin::Igp, 1, Some(100), None)));
+        candidates.insert(peer(2), basic(Origin::Igp, 1, Some(300), None));
+
+        assert_eq!(select_best(&candidates).unwrap().0, peer(2));
+    }
+
+    /// Each later decision step still decides between a stale and a fresh
+    /// route: AS path length (§9.1.2.2 (a)), ORIGIN (b), MED (c). In every
+    /// case the stale route holds the advantage and must win.
+    #[test]
+    fn conventional_gr_stale_route_wins_on_every_later_decision_step() {
+        let cases = [
+            (
+                "AS_PATH length",
+                basic(Origin::Igp, 1, None, None),
+                basic(Origin::Igp, 3, None, None),
+            ),
+            (
+                "ORIGIN",
+                basic(Origin::Igp, 1, None, None),
+                basic(Origin::Incomplete, 1, None, None),
+            ),
+            (
+                "MED",
+                basic(Origin::Igp, 1, None, Some(10)),
+                basic(Origin::Igp, 1, None, Some(20)),
+            ),
+        ];
+        for (step, better, worse) in cases {
+            let mut candidates = HashMap::new();
+            // Stale route on the higher address so (g) would pick the fresh one.
+            candidates.insert(peer(9), gr_stale(better));
+            candidates.insert(peer(1), worse);
+            assert_eq!(
+                select_best(&candidates).unwrap().0,
+                peer(9),
+                "{step}: the stale route's better attribute must decide, not its staleness"
+            );
+        }
+    }
+
+    /// With every attribute equal, ordinary RFC 4271 §9.1.2.2 tie-breaking
+    /// applies: (f) lowest BGP Identifier, else (g) lowest peer address.
+    /// Staleness is not an extra tie-breaker in either direction.
+    #[test]
+    fn conventional_gr_staleness_is_not_a_tie_breaker() {
+        // (g) lowest peer address: the stale route on peer(1) wins.
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), gr_stale(basic(Origin::Igp, 1, Some(100), None)));
+        candidates.insert(peer(2), basic(Origin::Igp, 1, Some(100), None));
+        assert_eq!(
+            select_best(&candidates).unwrap().0,
+            peer(1),
+            "§9.1.2.2 (g): lower peer address wins even though it is stale"
+        );
+
+        // Swap which side is stale: the answer must not move.
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(1), basic(Origin::Igp, 1, Some(100), None));
+        candidates.insert(peer(2), gr_stale(basic(Origin::Igp, 1, Some(100), None)));
+        assert_eq!(select_best(&candidates).unwrap().0, peer(1));
+
+        // (f) lowest BGP Identifier: the stale route on the higher peer
+        // address but with the lower router-id wins.
+        let mut stale = gr_stale(basic(Origin::Igp, 1, Some(100), None));
+        stale.peer_bgp_id = Some(Ipv4Addr::new(1, 1, 1, 1));
+        let mut fresh = basic(Origin::Igp, 1, Some(100), None);
+        fresh.peer_bgp_id = Some(Ipv4Addr::new(9, 9, 9, 9));
+        let mut candidates = HashMap::new();
+        candidates.insert(peer(2), stale);
+        candidates.insert(peer(1), fresh);
+        assert_eq!(
+            select_best(&candidates).unwrap().0,
+            peer(2),
+            "§9.1.2.2 (f): lower BGP Identifier wins even though it is stale"
         );
     }
 
-    /// A stale route wins when it is the only candidate — it still provides
-    /// reachability until the GR window expires or the peer re-announces.
+    /// RFC 4724 §4.2: retained routes remain usable, so a stale route is
+    /// selected when it is the only candidate.
     #[test]
     fn stale_route_wins_when_only_candidate() {
-        let mut only = basic(Origin::Igp, 1, Some(100), None);
-        only.stale = true;
         let mut candidates = HashMap::new();
-        candidates.insert(peer(1), only);
+        candidates.insert(peer(1), gr_stale(basic(Origin::Igp, 1, Some(100), None)));
         assert!(
             select_best(&candidates).is_some(),
             "stale-only RIB must still yield a winner"
         );
     }
 
-    /// Two stale candidates fall through to normal criteria (`LOCAL_PREF` wins).
+    /// Two stale candidates are compared by the ordinary criteria
+    /// (`LOCAL_PREF` here).
     #[test]
     fn two_stale_routes_compared_normally() {
-        let mut high_lp = basic(Origin::Igp, 1, Some(200), None);
-        high_lp.stale = true;
-        let mut low_lp = basic(Origin::Igp, 1, Some(100), None);
-        low_lp.stale = true;
         let mut candidates = HashMap::new();
-        candidates.insert(peer(1), high_lp);
-        candidates.insert(peer(2), low_lp);
+        candidates.insert(peer(1), gr_stale(basic(Origin::Igp, 1, Some(200), None)));
+        candidates.insert(peer(2), gr_stale(basic(Origin::Igp, 1, Some(100), None)));
         let (winner, _) = select_best(&candidates).unwrap();
         assert_eq!(
             winner,

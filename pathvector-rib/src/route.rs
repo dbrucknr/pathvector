@@ -7,6 +7,73 @@ use pathvector_types::{
     Nlri, Origin, PeerType, UnknownAttribute,
 };
 
+/// Whether a route is current or is being retained across a peer restart,
+/// and what that means for route selection.
+///
+/// Staleness is local RIB state: it is never encoded on the wire, and
+/// [`prepare_outbound`](crate::outbound::prepare_outbound) resets it to
+/// [`Fresh`](Self::Fresh) on the copy that is advertised.
+///
+/// # Selection semantics
+///
+/// | Variant | Set by | Effect on best-path selection |
+/// |---|---|---|
+/// | [`Fresh`](Self::Fresh) | every received or originated route | none |
+/// | [`GrStale`](Self::GrStale) | [`AdjRibIn::mark_all_stale`](crate::AdjRibIn::mark_all_stale) | **none** — compared on its attributes like any other route |
+///
+/// A conventional Graceful Restart stale route keeps its ordinary
+/// preference. RFC 4724 §4.2 requires the Receiving Speaker to "retain the
+/// routes received from the peer [...] and [...] mark them as stale routing
+/// information", and "MUST NOT differentiate between stale and other
+/// routing information during forwarding" (restated unchanged by RFC 8538
+/// §4.1). RFC 9494 §1 states the consequence for selection directly: "in
+/// conventional GR, route preference is not affected."
+///
+/// # Long-Lived Graceful Restart is not implemented
+///
+/// RFC 9494 (LLGR) is the mechanism that *does* depreference retained
+/// routes: "A least preferred route MUST be treated as less preferred than
+/// any other route that is not also least preferred" (§4.4). That rule only
+/// applies to a speaker that has advertised the LLGR Capability (§4.3),
+/// which pathvectord never does, so there is no LLGR variant here. Adding
+/// LLGR means adding a separate variant (with its own negotiation, timer,
+/// and propagation rules) and a least-preferred step in
+/// [`best_path`](crate::best_path) — not reusing [`GrStale`](Self::GrStale).
+/// The enum is `#[non_exhaustive]` so that variant can be added without a
+/// breaking change.
+///
+/// # Examples
+///
+/// ```
+/// use pathvector_rib::Staleness;
+///
+/// assert_eq!(Staleness::default(), Staleness::Fresh);
+/// assert!(Staleness::GrStale.is_stale());
+/// assert!(!Staleness::Fresh.is_stale());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Staleness {
+    /// Current routing information from an established session, or a
+    /// locally originated route.
+    #[default]
+    Fresh,
+    /// Retained from a peer whose session ended while Graceful Restart
+    /// (RFC 4724 §4.2) was in effect. The route stays a normal candidate for
+    /// selection and forwarding until the peer replaces it, the peer's
+    /// End-of-RIB sweeps it, or the restart/stale timer deletes it.
+    GrStale,
+}
+
+impl Staleness {
+    /// Returns `true` for any retained (non-[`Fresh`](Self::Fresh)) route.
+    #[must_use]
+    #[inline]
+    pub const fn is_stale(self) -> bool {
+        !matches!(self, Self::Fresh)
+    }
+}
+
 /// A concrete BGP route stored in the RIB.
 ///
 /// `Route<A>` is the type that lives in [`AdjRibIn`](crate::AdjRibIn),
@@ -129,12 +196,15 @@ pub struct Route<A: IpAddress> {
     /// `None` when all rare attributes are at their default values, saving
     /// ~96 bytes per route (four empty `Vec`s + padding) on the common path.
     pub rare: Option<Box<RareAttrs>>,
-    /// RFC 4724 §4.2 — set when this route is being held during a peer's GR
-    /// restart window.  Stale routes are de-preferred in best-path selection
-    /// (non-stale beats stale before all other criteria), so a fresh alternate
-    /// path from another peer wins immediately.  Cleared when the peer
-    /// re-announces the route during re-establishment.  Never encoded on wire.
-    pub stale: bool,
+    /// Whether this route is current or retained across a peer restart.
+    ///
+    /// [`Staleness::GrStale`] is set by
+    /// [`AdjRibIn::mark_all_stale`](crate::AdjRibIn::mark_all_stale) when a
+    /// Graceful-Restart-capable peer's session ends (RFC 4724 §4.2), and is
+    /// replaced when the peer re-announces the route. It does **not** change
+    /// the route's preference in best-path selection — see [`Staleness`] for
+    /// the RFC basis. Never encoded on the wire.
+    pub staleness: Staleness,
 }
 
 impl<A: IpAddress> Route<A> {
@@ -465,7 +535,7 @@ impl<A: IpAddress> RouteBuilder<A> {
             received_at: self.received_at,
             peer_bgp_id: self.peer_bgp_id,
             rare: self.rare,
-            stale: false,
+            staleness: Staleness::Fresh,
         }
     }
 }
