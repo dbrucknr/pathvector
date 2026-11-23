@@ -50,6 +50,10 @@ mod peer;
 mod policy;
 mod route;
 
+// Issue #68: conventional-GR stale routes keep their ordinary preference.
+#[cfg(test)]
+mod gr_preference_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use capabilities::{SpawnConfig, build_local_capabilities};
