@@ -8,3 +8,4 @@ cc cb848353fd3e1c3ac86e712857aa733ba1fa38f6ac55f533d829c63ab8c6cf57 # shrinks to
 cc 755bae7dfbb0fc1fd3d1f00109892f65ffaf990d1aca66dc76ee663e0164ab02 # shrinks to initial = [], ops = [Toggle(0), Dump(SkipDuring(0)), Toggle(1), Lose(1)]
 cc 9fabc1e75067ebcb7a5c0bf16224e8ea7f3772d63e473d636c40e6ee01a52e15 # shrinks to initial = [6], ops = [Dump(ChangeDuring(4))]
 cc 41ed791d5570ae5ffe9a3d2480999de9f8f3ad985e6b3a5e286c1bbd1381d688 # shrinks to initial = [], ops = [Dump(ChangeDuring(4)), Toggle(0), Toggle(0), Toggle(0), Dump(ChangeDuring(0))]
+cc d8817a674351ec44d931fe7efc2dee02c799bf742dfc21b4d0866c8cb1f7f827 # shrinks to initial = [], ops = [Dump(Stall)]
