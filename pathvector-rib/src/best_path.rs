@@ -44,7 +44,7 @@ use crate::{
 /// An unknown identifier (a route with neither `ORIGINATOR_ID` nor
 /// [`Route::peer_bgp_id`]) ranks after every known one at step (f) rather
 /// than skipping the step, which would not be transitive — see
-/// [`EffectiveRouterId`](crate::EffectiveRouterId).
+/// [`EffectiveRouterId`].
 ///
 /// # Graceful Restart
 ///

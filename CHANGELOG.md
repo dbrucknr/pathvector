@@ -4,6 +4,72 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (pathvector-rib, pathvectord: RFC 4456 §9 reflected-route tie-breakers — issue #69)
+
+### [pathvector-rib] ORIGINATOR_ID and CLUSTER_LIST now take part in selection
+
+`best_path::prefer` compared the advertising peer's BGP Identifier at RFC 4271
+§9.1.2.2 (f) and then the peer address. It ignored the ORIGINATOR_ID and
+CLUSTER_LIST stored on the route, so two reflected routes were ordered by their
+reflectors' identifiers. RFC 4456 §9: "If a route carries the ORIGINATOR_ID
+attribute, then in Step f) the ORIGINATOR_ID SHOULD be treated as the BGP
+Identifier of the BGP speaker that has advertised the route", and "a BGP Speaker
+SHOULD prefer a route with the shorter CLUSTER_LIST length" between (f) and (g),
+with an absent list counting as zero.
+
+- New `EffectiveRouterId` (re-exported from the crate root). Its constructor
+  `for_route(peer_bgp_id, originator_id)` is the only place the substitution
+  rule lives. Its `Ord` is preference order: the RFC 4271 §6.8 unsigned-integer
+  comparison, with an unknown identifier ranked after every known one.
+- New accessors `Route::originator_id`, `Route::cluster_list_len` and
+  `Route::effective_router_id`, and builder setters
+  `RouteBuilder::originator_id` / `RouteBuilder::cluster_list`.
+- **Behavior change:** step (f) is no longer *skipped* when only one side's
+  identifier is known. That rule was not transitive: a = 1.1.1.1 on .3,
+  b = unknown on .2 and c = 1.1.1.2 on .1 formed a cycle, so `max_by` picked an
+  iteration-order-dependent winner. The test asserting the skip was rewritten
+  as `test_select_best_known_bgp_identifier_beats_unknown`.
+
+### [pathvectord] Ingestion stores the attributes selection now depends on
+
+- The IPv6 path parsed ORIGINATOR_ID and CLUSTER_LIST but never stored them. A
+  route reflector therefore re-advertised IPv6 routes without the attributes it
+  had inserted on ingress, which defeats RFC 4456 §8 loop prevention downstream.
+- RFC 7606 §7.9/§7.10: these attributes "received from an external neighbor
+  [...] SHALL be discarded using the approach of 'attribute discard'". They were
+  stored from any peer. Once they decide step (f), an eBGP peer could win the
+  tie-break with a forged ORIGINATOR_ID. They are now kept only from `Internal`
+  peers. A confederation Member-AS peer gets no RFC 5065 exception for them,
+  which matches the existing outbound stripping toward `ConfedMember`.
+
+### Tests
+
+- `pathvector-rib` `best_path::reflection_tests`: both issue acceptance cases;
+  absent CLUSTER_LIST = 0; (f) before CLUSTER_LIST before (g); direct versus
+  reflected; ORIGINATOR_ID without a known peer identifier; unknown identifiers;
+  earlier steps still dominate. Proptests: an RFC reference model, and a strict
+  total order over tied candidates. `prop_prefer_is_a_strict_total_order` now
+  mixes known/unknown identifiers and RR attributes, and its saved seed is the
+  pre-fix cycle. `route::tests` covers `EffectiveRouterId` ordering and
+  substitution.
+- `pathvectord` `daemon/rr_tie_break_tests.rs`, through real UPDATE ingestion:
+  IPv4 and IPv6 selection, attribute discard from External and ConfedMember
+  peers (both families, plus selection), and RR reflection of IPv6 routes with
+  ORIGINATOR_ID and CLUSTER_LIST.
+- Every new test fails against either the old selector or the old ingestion.
+
+### Performance
+
+New `select_best_reflected_tie` benchmark (M2 Max). The candidates tie through
+step (e), so every comparison reaches the tie-breakers. The existing
+`select_best` group is unchanged (within ±0.7%). With equal decision work (no
+ORIGINATOR_ID) the tie-break path costs +0% / +1.7% / +8.4% at 2 / 10 / 100
+candidates, about 2.5 ns per comparison that reaches step (f). The extra cost is
+the heap read of the boxed `RareAttrs` that ORIGINATOR_ID now requires. Keys are
+built only once every earlier step has tied, without allocation.
+
+---
+
 ## 2026-11-23 (pathvector-rib, pathvectord: conventional Graceful Restart keeps ordinary route preference — issue #68)
 
 ### [pathvector-rib] Stale routes are no longer depreferenced
