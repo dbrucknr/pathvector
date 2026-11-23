@@ -2264,6 +2264,28 @@ semantic separation of IGP and BGP RIBs).
   with every other BGP route, so a next hop beneath one is still reported reachable
   through the IGP route. Belongs with recursive next-hop resolution above.
 
+**Snapshot recovery: what the supervisor still cannot see** (follow-ups to #59):
+
+- *Silent kernel flushes.* When a link goes down, `fib_table_flush` removes the IPv4
+  routes through it and sends `RTM_DELROUTE` only if their preferred source address was
+  removed (`fi->pfsrc_removed`). Subscribing to link / address groups and resyncing (or
+  applying the flush) on a link-down event would close this.
+- *No periodic verification.* A divergence that is never signalled lasts until the next
+  detected loss. An optional low-rate verification dump that compares and, on mismatch,
+  degrades and resyncs would bound it.
+- *Metrics.* `FibStatus` (health, losses, resyncs) is logged by `pathvectord` but not
+  exported to Prometheus.
+- *Readiness gate.* `pathvectord` does not wait for the first `Ready` before starting
+  sessions; it relies on the change notification to re-evaluate next hops when the
+  first dump lands.
+- *Stale-route dump.* `KernelFib::stale_bgp_routes` uses `rtnetlink`'s dump, which
+  cannot tell a complete dump from one cut short by a closed connection; it should use
+  the supervisor's `read_dump`.
+- *Resync cost.* A resync dumps every route of both families, BGP-installed ones
+  included (they are filtered after decoding). With a full table in the kernel that is
+  a large dump; `NETLINK_GET_STRICT_CHK` with a protocol filter, or dumping only the
+  tracked table, would shrink it.
+
 **Testing gaps:**
 
 - E2e test (Gap 8): after session with GoBGP establishes and a prefix is learned,

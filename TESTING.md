@@ -237,6 +237,7 @@ tests in `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes:
 
 - metrics 10 and 100 in both orders, for both families, incrementally and through the
   initial dump (#56);
+- a burst of notifications lost to `ENOBUFS`, recovered by a resync (#59);
 - each negative type beneath a covering unicast route, its deletion, and
   `ip route replace <type>` over a unicast route, for both families; plus an initial
   dump with negative routes at lower and higher metrics than a unicast route and a
@@ -244,6 +245,40 @@ tests in `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes:
   verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
   `ip route get` sends): the expected errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and
   `ENETUNREACH`.
+
+#### Kernel FIB recovery after netlink loss (issue #59)
+
+The supervisor that keeps the snapshot in step with the kernel is platform-independent
+and talks to the kernel through a port (`RouteSource` / `RouteFeed`), so
+`pathvector-sys/src/fib/supervisor/tests.rs` drives it on every platform with a scripted
+fake kernel under paused tokio time (every backoff is exact). The fake reproduces how
+each fault surfaces according to netlink(7), `net/netlink/af_netlink.c` and
+`netlink-proto` 0.12: a full buffer starts a congestion episode with one `Overrun` and
+then drops every notification until the reader empties the queue; a terminated
+connection ends the feed; a dump can fail, stop without `NLMSG_DONE`, carry
+`NLM_F_DUMP_INTR`, race a change, or skip an unchanged route the way `fib6_dump_table`
+does after a tree change.
+
+| Invariant | Why it matters |
+|---|---|
+| Whenever the status is `Ready`, the snapshot equals the kernel's table (proptest over any history of changes and faults, checked at every quiescent point) | `Ready` is what callers trust; it must never be claimed after a loss |
+| Once faults stop, the status returns to `Ready` and the snapshot equals a fresh dump | Recovery is automatic and complete |
+| An overrun, a closed connection, a failed / cut-short / interrupted / racing dump each produce the matching `DegradedCause` | Degradation is observable, with the reason |
+| A cut-short dump or an attempt hit by an overrun is never installed; lookups during a resync see the previous snapshot | No partial or empty snapshot is ever visible |
+| Notifications for the other family during a dump are not inconsistencies, and later ones are applied to the fresh snapshot | Exactly the changes a dump cannot show are replayed |
+| Retry delays are `initial · 2ⁿ` capped at the maximum; a burst of overruns costs one resync; a quiet period resets the sequence | Bounded recovery without redumping on every transient |
+| Only the first failed connect is returned to the caller | Later failures are retried, not fatal |
+
+The detection and replay rules were checked by mutation (same-family inconsistency,
+`NLM_F_DUMP_INTR`, which notifications are replayed, overruns while following): removing
+any one makes at least one of these tests fail. The Linux adapter tests (`linux.rs`)
+cover the dump reader (complete only with `NLMSG_DONE`; `NLM_F_DUMP_INTR` on any reply; errors in `NLMSG_ERROR` and
+`NLMSG_DONE`) and message classification (overrun, new/delete with header flags, other
+families ignored). The live test `notifications_lost_to_enobufs_are_recovered_by_a_resync`
+in `kernel_fib_netns.rs` blocks its single-threaded runtime while another thread adds
+1000 routes, so the kernel really drops notifications; the snapshot must count the loss,
+resync, and then equal a fresh dump. The same scenario fails against the code before the
+fix.
 
 The tests run in parallel in one namespace, so each uses its own prefixes and interfaces
 (prefixed `pvtest`) and none adds a real default route. They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network

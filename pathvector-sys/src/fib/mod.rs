@@ -43,8 +43,10 @@
 //!
 //! # Platform behaviour
 //!
-//! On Linux the implementation uses `rtnetlink` for the initial route dump and
-//! a raw `NETLINK_ROUTE` multicast socket for ongoing change events.
+//! On Linux the implementation uses one `rtnetlink` connection per
+//! supervised session: a `NETLINK_ROUTE` socket subscribed to the IPv4 and
+//! IPv6 route groups, which also carries the route dumps so that dump replies
+//! and change events arrive in one ordered stream.
 //!
 //! On non-Linux platforms (macOS, used for development) the module compiles but
 //! [`KernelFib::spawn`] is a no-op. The snapshot stays empty and the

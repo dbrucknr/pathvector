@@ -4,6 +4,35 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #59: the FIB snapshot recovers from netlink loss)
+
+`pathvector-sys`'s `KernelFib` ignored `NLMSG_OVERRUN` (how `netlink-proto` reports
+`ENOBUFS`), treated the end of its notification stream as success, ran its netlink
+connection as a detached task, and accepted any dump whose reply stream ended, including
+one cut short by a closed connection. netlink(7) is explicit that the kernel drops
+notifications when the receive buffer is full and that "It is up to the application to
+detect when this happens [...] and resynchronize"; nothing did, so one dropped
+notification left the next-hop oracle answering from stale state for good. Confirmed on
+a live kernel: after a 1000-route burst while the reader was blocked, the old snapshot
+never learned the dropped routes.
+
+A supervisor (`fib/supervisor.rs`, behind a `RouteSource` / `RouteFeed` port) now
+detects overruns, connection loss, dumps that end without `NLMSG_DONE` or fail, and
+dumps that may have missed routes (`NLM_F_DUMP_INTR`, or a notification for the same
+family during that family's dump: the kernel's route dumpers never set
+`NLM_F_DUMP_INTR`, and `fib6_dump_table` can skip an unchanged route after a tree
+change). It marks the snapshot `Degraded`, waits with bounded exponential backoff while
+still applying notifications, redumps both families, and swaps the result in with one
+move under the write lock; it reconnects the same way. New public API: `SnapshotHealth`,
+`DegradedCause`, `FibStatus`, `ResyncBackoff`, `KernelFib::builder` (backoff,
+`SO_RCVBUF`), `KernelFib::status`, `KernelOracle::health` / `status`. Lookups while
+degraded answer from the last snapshot (stale but flagged). `KernelFib::spawn` now
+returns only if the first netlink socket cannot be opened; `pathvectord` logs that and
+every health transition. Proof: 20 supervisor tests against a scripted fake kernel that
+models the congestion bit, a proptest model check (Ready always means the snapshot equals
+the kernel table; convergence once faults stop), Linux adapter tests, and a live-kernel
+test that forces `ENOBUFS` and checks agreement with a fresh dump.
+
 ## 2026-11-23 (issue #57: negative kernel routes decide reachability)
 
 `pathvector-sys`'s FIB snapshot dropped every non-unicast route, so with a unicast
