@@ -4,6 +4,30 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (IPv6 ECMP: re-read a set after a delete leaves an inferred head)
+
+Follow-up to PR #122. A dump describes an IPv6 ECMP set only through its first sibling,
+so a mixed-protocol set learned from a dump was misclassified for as long as it existed:
+a BGP-first static+BGP set never used its static route, even after the BGP route was
+deleted, and a static-first set counted its BGP route until that route was deleted.
+
+A delete changes which sibling the kernel describes. When an `RTM_DELROUTE` leaves a set
+headed by a route whose protocol is inferred (`RouteMirror::inferred_set_head`), the
+event loop dumps that route's table again and applies the set with
+`RouteMirror::redescribe`: the new head's protocol is reported, a lone route is
+described in full, and the remaining inferred siblings take the new head's protocol.
+The dump runs on a second netlink connection with `NETLINK_GET_STRICT_CHK`, filtered by
+table and device, because no request can select one prefix (`ip_valid_fib_dump_req`
+rejects a nonzero `rtm_dst_len`; `RTM_F_FIB_MATCH` describes the sibling the multipath
+hash picks). Queued events are applied first, so a burst of deletes costs one dump per
+table and device, and the snapshot lock is not held across the dump. Untracked routes
+with an inferred protocol are now kept whole instead of as a hash.
+
+Live tests: a BGP-first mixed set regains its static path after the BGP delete, and a
+static-first set stops counting its BGP route after the static delete; both fail on the
+previous commit. Still unresolved: the misclassification while the head is installed,
+non-head siblings of sets of three or more, and failed re-reads (see the crate README).
+
 ## 2026-11-23 (issue #58: TCP MD5 never reports an unenforced key as enabled)
 
 `pathvector-sys::apply_tcp_md5sig` returned `Ok(())` when the kernel rejected

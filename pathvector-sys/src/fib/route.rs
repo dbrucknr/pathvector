@@ -92,10 +92,11 @@
 //! - A message that later reports the leg's protocol replaces the inference.
 //!   An inference never overwrites a known protocol.
 //!
-//! - When a delete leaves a slot holding a route whose protocol is inferred,
-//!   the adapter reads the set back from the kernel and applies it with
-//!   [`RouteMirror::redescribe`]. A dump now describes a different sibling
-//!   (the deleted one is gone), and describes a lone remaining route fully.
+//! - When a delete leaves a sibling set headed by a route whose protocol is
+//!   inferred ([`RouteMirror::inferred_set_head`]), the adapter reads the set
+//!   back from the kernel and applies it with [`RouteMirror::redescribe`]. A
+//!   dump now describes that route (the old head is gone), and describes a
+//!   lone remaining route fully.
 //!
 //! Only an ECMP set that mixes protocols and is learned from a dump (or an
 //! append) can be misclassified: its unreported siblings take the first

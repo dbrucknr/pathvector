@@ -239,7 +239,14 @@ They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECM
 learned from the initial dump (which reports a set only once), an all-BGP ECMP set
 that must give no IGP path both live and after a dump, a check that the kernel dumps a
 BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
-policy), and a BGP alias prepended ahead of a static alias and then replaced. For #57 they compare the oracle's
+policy), a BGP alias prepended ahead of a static alias and then replaced, and the
+re-read after a delete: a BGP-first static+BGP set learned from the dump regains its
+static path once the BGP route is deleted, and a static-first set stops counting its BGP
+route once the static route is deleted (both fail without the re-read). The adapter's unit
+tests cover when a delete triggers a re-read (only when the set's new head has an
+inferred protocol), how slots are grouped into dumps, the dump request against the
+kernel's strict-check rules, and applying the answer; the domain tests cover
+`RouteMirror::inferred_set_head` and `RouteMirror::redescribe`. For #57 they compare the oracle's
 verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
 `ip route get` sends) for each negative type beneath a covering route, its deletion,
 `ip route replace <type>` over a unicast route, an initial dump with mixed metrics and a
