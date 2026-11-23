@@ -68,7 +68,8 @@ fn v6(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV6 {
             priority,
         },
         kind: RTN_UNICAST,
-        protocol: Some(RTPROT_STATIC),
+        protocol: RTPROT_STATIC,
+        protocol_inferred: false,
         next_hop: NextHopV6::Path(via(gateway)),
     }
 }
@@ -82,7 +83,7 @@ fn bgp4(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV4 {
 
 fn bgp6(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV6 {
     KernelRouteV6 {
-        protocol: Some(RTPROT_BGP),
+        protocol: RTPROT_BGP,
         ..v6(prefix, priority, gateway)
     }
 }
@@ -374,30 +375,44 @@ fn untracked_routes_are_mirrored_but_never_used_or_signalled() {
 }
 
 #[test]
-fn unknown_protocol_counts_until_a_message_settles_it() {
-    // An IPv6 ECMP leg seen only inside another sibling's message has an
-    // unknown protocol (fib6_dump_node never dumps it on its own). It counts
-    // as a path; a message that describes it settles its protocol in place.
+fn inferred_protocol_is_used_until_a_message_reports_it() {
+    // An IPv6 ECMP leg seen only inside another sibling's message has no
+    // reported protocol (fib6_dump_node never dumps it on its own); it takes
+    // the described sibling's protocol as an inference.
     let a = v6("2001:db8::/32", 10, Some("fe80::1"));
-    let unknown = KernelRouteV6 {
-        protocol: None,
+    let inferred_static = KernelRouteV6 {
+        protocol_inferred: true,
         ..v6("2001:db8::/32", 10, Some("fe80::2"))
     };
-    assert!(unknown.is_tracked() && unknown.qualifies_for_ecmp());
+    let inferred_bgp = KernelRouteV6 {
+        protocol_inferred: true,
+        ..bgp6("2001:db8::/32", 10, Some("fe80::2"))
+    };
+    assert!(inferred_static.is_tracked() && !inferred_bgp.is_tracked());
+
     let mut m = Mirror6::default();
     m.insert(a.clone(), Position::Back);
-    assert!(m.insert(unknown.clone(), Position::Back));
-    assert_eq!(m.iter().count(), 2);
+    assert!(
+        !m.insert(inferred_bgp, Position::Back),
+        "an inferred BGP leg is not a path"
+    );
+    assert_eq!(m.iter().count(), 1);
+    // A message reporting it as static settles it, in place.
     let b = v6("2001:db8::/32", 10, Some("fe80::2"));
-    assert!(m.upsert(b.clone(), Position::Back), "protocol now known");
+    assert!(m.upsert(b.clone(), Position::Back));
     assert!(order6(&m, &[&a, &b]), "keeps its position");
     assert!(!m.upsert(b, Position::Back), "nothing new");
-    // Described as BGP: no longer used.
+    // An inference never overwrites a reported protocol.
+    assert!(!m.insert(
+        KernelRouteV6 {
+            protocol_inferred: true,
+            ..bgp6("2001:db8::/32", 10, Some("fe80::2"))
+        },
+        Position::Back
+    ));
+    assert_eq!(m.iter().count(), 2);
+    // Reported as BGP: no longer a path.
     assert!(m.upsert(bgp6("2001:db8::/32", 10, Some("fe80::2")), Position::Back));
-    assert_eq!(m.iter().count(), 1);
-    // A later aggregate message must not erase what is known: `insert` of the
-    // same next hop with unknown protocol is a no-op.
-    assert!(!m.insert(unknown, Position::Back));
     assert_eq!(m.iter().count(), 1);
 }
 
@@ -471,7 +486,7 @@ fn ipv6_ecmp_eligibility_follows_rt6_qualify_for_ecmp() {
     assert!(v6("2001:db8::/32", 1, Some("fe80::1")).qualifies_for_ecmp());
     assert!(!v6("2001:db8::/32", 1, None).qualifies_for_ecmp());
     let mut ra = v6("::/0", 1024, Some("fe80::1"));
-    ra.protocol = Some(RTPROT_RA);
+    ra.protocol = RTPROT_RA;
     assert!(!ra.qualifies_for_ecmp());
     let mut object = v6("2001:db8::/32", 1, None);
     object.next_hop = NextHopV6::Object(7);
@@ -570,9 +585,7 @@ fn reference_lookup_v6<'a>(
     addr: Ipv6Addr,
 ) -> Option<(u8, u32)> {
     let routes: Vec<_> = routes
-        .filter(|r| {
-            r.kind == RTN_UNICAST && r.protocol != Some(RTPROT_BGP) && r.slot.src.is_default()
-        })
+        .filter(|r| r.kind == RTN_UNICAST && r.protocol != RTPROT_BGP && r.slot.src.is_default())
         .collect();
     let bits = u128::from(addr);
     (0..=128u8).rev().find_map(|len| {
@@ -748,13 +761,8 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> + Clone {
         prefixes,
         prop::sample::select(vec![1u32, 10]),
         prop::sample::select(vec![None, None, None, Some("2001:db8:ffff::/48")]),
-        prop::sample::select(vec![
-            Some(RTPROT_STATIC),
-            Some(RTPROT_STATIC),
-            Some(RTPROT_BGP),
-            Some(RTPROT_RA),
-            None,
-        ]),
+        prop::sample::select(vec![RTPROT_STATIC, RTPROT_STATIC, RTPROT_BGP, RTPROT_RA]),
+        any::<bool>(),
         prop::sample::select(vec![
             None,
             Some("fe80::1"),
@@ -762,12 +770,13 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> + Clone {
             Some("fe80::3"),
         ]),
     )
-        .prop_map(|(prefix, priority, src, protocol, gw)| {
+        .prop_map(|(prefix, priority, src, protocol, inferred, gw)| {
             let mut r = v6(prefix, priority, gw);
             if let Some(src) = src {
                 r.slot.src = p6(src);
             }
             r.protocol = protocol;
+            r.protocol_inferred = inferred;
             r
         })
 }

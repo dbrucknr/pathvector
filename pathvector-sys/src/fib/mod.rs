@@ -500,7 +500,8 @@ mod tests {
                 priority: metric,
             },
             kind: RTN_UNICAST,
-            protocol: Some(3),
+            protocol: 3,
+            protocol_inferred: false,
             next_hop: NextHopV6::Path(NextHopPath {
                 gateway: None,
                 oif: None,

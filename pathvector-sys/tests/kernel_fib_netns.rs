@@ -36,7 +36,7 @@ use netlink_packet_core::{
 use netlink_packet_route::{
     RouteNetlinkMessage,
     link::{LinkAttribute, LinkFlags},
-    route::{RouteMessage, RouteProtocol, RouteScope},
+    route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope},
 };
 use pathvector_sys::{FibSnapshot, KernelFib, RT_TABLE_MAIN};
 use rtnetlink::{Handle, LinkDummy, RouteMessageBuilder};
@@ -544,33 +544,87 @@ async fn dumped_static_ecmp_set_keeps_the_surviving_sibling() {
     task.abort();
 }
 
+/// The kernel's dump message for the IPv6 route set at `dst`, with the
+/// destination removed so sets at different prefixes can be compared.
+async fn dumped_set_without_destination(handle: &Handle, dst: Ipv6Addr) -> RouteMessage {
+    let all: Vec<RouteMessage> = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .execute()
+        .try_collect()
+        .await
+        .expect("IPv6 route dump");
+    let mut matching = all.into_iter().filter(|m| {
+        m.attributes
+            .iter()
+            .any(|a| matches!(a, RouteAttribute::Destination(RouteAddress::Inet6(d)) if *d == dst))
+    });
+    let mut msg = matching.next().expect("set is dumped");
+    assert!(matching.next().is_none(), "fib6_dump_node dumps a set once");
+    msg.attributes
+        .retain(|a| !matches!(a, RouteAttribute::Destination(_)));
+    msg
+}
+
 #[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
-async fn dumped_ecmp_set_headed_by_bgp_keeps_the_static_sibling() {
-    // BGP added first heads the dump; the static sibling behind it must count.
+async fn bgp_first_mixed_set_dumps_identically_to_an_all_bgp_set() {
+    // Review round 3: the inference policy is forced by the ABI. A BGP-first
+    // static+BGP set and an all-BGP set produce the same dump message, so
+    // the static sibling cannot be told apart and is inferred to be BGP.
     let handle = connect();
     let oif = dummy(&handle, "pv56g").await;
-    let dst: Ipv6Addr = "2001:db8:202::".parse().unwrap();
-    let probe: Ipv6Addr = "2001:db8:202::1".parse().unwrap();
+    let mixed: Ipv6Addr = "2001:db8:202::".parse().unwrap();
+    let all_bgp: Ipv6Addr = "2001:db8:206::".parse().unwrap();
     ecmp_pair(
         &handle,
-        dst,
+        mixed,
         oif,
         [RouteProtocol::Bgp, RouteProtocol::Static],
     )
     .await;
+    ecmp_pair(
+        &handle,
+        all_bgp,
+        oif,
+        [RouteProtocol::Bgp, RouteProtocol::Bgp],
+    )
+    .await;
+
+    assert_eq!(
+        dumped_set_without_destination(&handle, mixed).await,
+        dumped_set_without_destination(&handle, all_bgp).await,
+        "the kernel reports both sets with the same bytes"
+    );
 
     let (snap, task) = start_fib().await;
+    let s = snap.read().unwrap();
+    assert_eq!(s.igp_metric_v6("2001:db8:206::1".parse().unwrap()), None);
     assert_eq!(
-        snap.read().unwrap().igp_metric_v6(probe),
-        Some(10),
-        "static sibling usable right after the dump"
+        s.igp_metric_v6("2001:db8:202::1".parse().unwrap()),
+        None,
+        "documented: the unreported static sibling is inferred to be BGP"
     );
-    del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Bgp)).await;
-    barrier_v6(&handle, &snap, oif, "2001:db8:204::".parse().unwrap()).await;
-    assert_eq!(snap.read().unwrap().igp_metric_v6(probe), Some(10));
-    del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Static)).await;
-    barrier_v6(&handle, &snap, oif, "2001:db8:205::".parse().unwrap()).await;
-    assert_eq!(snap.read().unwrap().igp_metric_v6(probe), None);
+    drop(s);
     task.abort();
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn all_bgp_ecmp_set_is_not_igp_reachability_live_or_after_a_dump() {
+    // Review round 3: an all-BGP ECMP set gives no IGP path, whether learned
+    // from events or from a restart's dump.
+    let handle = connect();
+    let oif = dummy(&handle, "pv56h").await;
+    let dst: Ipv6Addr = "2001:db8:207::".parse().unwrap();
+    let probe: Ipv6Addr = "2001:db8:207::1".parse().unwrap();
+    let (live, live_task) = start_fib().await;
+    ecmp_pair(&handle, dst, oif, [RouteProtocol::Bgp, RouteProtocol::Bgp]).await;
+    barrier_v6(&handle, &live, oif, "2001:db8:208::".parse().unwrap()).await;
+    assert_eq!(live.read().unwrap().igp_metric_v6(probe), None);
+
+    let (dumped, dumped_task) = start_fib().await;
+    assert_eq!(dumped.read().unwrap().igp_metric_v6(probe), None);
+    live_task.abort();
+    dumped_task.abort();
 }
