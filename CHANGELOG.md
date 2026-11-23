@@ -4,6 +4,26 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (PR #122 review: untracked routes in a slot or ECMP set)
+
+Review found two cases where routes the snapshot does not use for reachability still
+mattered, both reproduced on a live kernel. (1) An IPv6 ECMP set mixing a static and a
+BGP route: `rt6_fill_node` reports the set under one route's protocol, so the BGP leg
+was recorded as static, its delete was then ignored, and the prefix stayed reachable
+after both routes were gone. (2) A BGP alias prepended ahead of a static alias: an
+`NLM_F_REPLACE` of the BGP alias removed the static alias from the snapshot, because the
+mirror did not know the BGP alias was first.
+
+The snapshot now mirrors every route in the tracked table and applies the tracking rule
+(unicast, not BGP) at lookup time. Untracked routes are stored as an identity hash, so
+the cost is about 86 MB per million kernel BGP routes; inserts and deletes are now
+hashed. An IPv6 multipath message's first leg is described by its header; other legs
+not yet seen take the header's protocol only for a create/replace (same request) and
+are otherwise untracked until described. Mutations report a change exactly when the
+tracked routes change. Proof: property tests against a kernel slot-list model including
+untracked routes and replaces, adapter tests, and two new live-kernel tests that fail on
+the previous commit.
+
 ## 2026-11-23 (issue #56: FIB snapshot keeps every route for a prefix)
 
 `pathvector-sys`'s `FibSnapshot` identified kernel routes by prefix alone. Adding a

@@ -218,21 +218,24 @@ any syscall, keeping them cross-platform (they pass on macOS and Linux alike).
 
 The FIB snapshot mirrors kernel routes under their full Linux identity, not just
 their prefix. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
-platform and compare the mirror against a reference model written directly from the
-kernel's lookup rule (`net/ipv4/fib_trie.c`, `net/ipv6/ip6_fib.c`):
+platform and compare the mirror against a model of the kernel's slot lists written
+directly from `fib_table_insert` / `fib_table_delete` and `fib6_add_rt2node` / `fib6_del`,
+and against a reference lookup written from the kernel's lookup rule:
 
 | Invariant | Why it matters |
 |---|---|
-| Any add/delete sequence leaves exactly the set of routes the kernel holds, and every lookup equals the reference (longest prefix, then lowest priority) | A backup route overwriting the primary, or one delete removing every route for a prefix, gives wrong IGP metrics and spurious unreachability |
+| After any sequence of adds (front/back), replaces and deletes of tracked *and* untracked (BGP, blackhole) routes, every slot holds the kernel model's routes in the kernel model's order | A backup route must not overwrite the primary, a delete must remove only the named route, and a replace must displace the route the kernel displaced, even when that is an untracked BGP alias |
+| The tracked routes and every lookup equal the model's (longest prefix, then lowest priority) | Wrong IGP metrics and spurious (un)reachability |
+| Each mutation reports a change exactly when the tracked routes changed | BGP churn must not wake the decision process; IGP changes must |
 | Lookups do not depend on load (dump) order | Dump and incremental state must agree |
-| Adding then deleting a route restores every lookup | Deletes remove only the named route |
-| Routes of one slot stay contiguous through inserts, replaces and deletes | `NLM_F_REPLACE` targets "the first route of the slot" |
 | `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
 
 The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPLACE` /
 `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
 `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
 and 100 in both orders, for both families, incrementally and through the initial dump.
+They also cover a static and a BGP route in one IPv6 ECMP set, and a BGP alias
+prepended ahead of a static alias and then replaced.
 They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 
