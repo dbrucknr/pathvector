@@ -1245,7 +1245,10 @@ mod tests {
         );
         // fib_valid_key_len: "Invalid prefix for given prefix length".
         assert!(decode_v4(&igp_v4_msg("10.0.0.1", 8, 1, 254)).is_none());
-        assert_eq!(decode_v6(&igp_v6_msg("2001:db8::1", 32, 1, 254)), Vec::new());
+        assert_eq!(
+            decode_v6(&igp_v6_msg("2001:db8::1", 32, 1, 254)),
+            Vec::new()
+        );
     }
 
     #[test]
