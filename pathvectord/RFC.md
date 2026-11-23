@@ -39,26 +39,40 @@ of UPDATE messages lives in `pathvector-session`.
 
 ## RFC 4271 §9.2.1.1 — Minimum Route Advertisement Interval (MRAI)
 
-**Owns:** eBGP MRAI enforcement: suppressing repeated announcements of the same NLRI
-within a 30-second window to dampen UPDATE bursts toward eBGP peers. Withdrawals bypass
-MRAI unconditionally.  
-**Boundary:** Wire serialisation lives in `pathvector-session`. AdjRibOut is updated
-before the MRAI gate, so the RIB reflects correct state even while wire transmission is
-deferred.  
+**Owns:** eBGP MRAI enforcement, per destination, for IPv4 and IPv6 unicast: a
+re-announcement of a destination inside the 30-second interval is held back and the
+last route selected is announced when the interval expires. Withdrawals bypass MRAI
+(documented deviation, below).  
+**Boundary:** Wire serialisation lives in `pathvector-session`. The gate
+(`MraiTracker::gate` in `src/daemon/route.rs`) wraps each destination's Adj-RIB-Out
+diff: a held-back announcement is rolled back out of the Adj-RIB-Out, so the
+Adj-RIB-Out always holds what the peer was actually sent, and the release at expiry
+diffs against that.  
+**Amendments checked (2026-11-23):** none of RFC 4271's updating RFCs (4724, 6286,
+6608, 6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687, 9774) touches §9.2.1.1. RFC 4760
+does not exempt MP_REACH_NLRI, and the clause is per destination, so it applies to
+IPv6 unicast as well.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9.2.1.1
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| 30 s MRAI for eBGP peers; repeated announcement within window suppressed | `src/daemon.rs` | ✅ | `mrai_suppresses_ebgp_announcement_within_window` |
-| Announcement allowed after MRAI window elapses | `src/daemon.rs` | ✅ | `mrai_passes_after_window_elapsed` |
-| Suppressed NLRIs tracked in `mrai_pending`; flushed by half-MRAI timer | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending`, `has_mrai_pending_true_when_set_nonempty` |
-| Per-NLRI readiness: only NLRIs whose individual window elapsed are flushed | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending` |
-| Withdrawals bypass MRAI | `src/daemon.rs` | ⚠️ | `mrai_withdrawal_bypasses_suppression` — **citation corrected 2026-07-16 by `RFC_AUDIT.md` §9.2.1.1: there is no "explicit exemption" for withdrawals in the actual RFC 4271 §9.2.1.1 text.** It says the opposite — "Two UPDATE messages... that advertise feasible routes **and/or withdrawal of unfeasible routes**... MUST be separated by at least MinRouteAdvertisementIntervalTimer." The behavior itself (send withdrawals immediately, unthrottled) is common, defensible real-world practice — delaying a withdrawal keeps a stale/blackholed route alive longer, a real safety cost — but it is not what the RFC's literal text says, and the previous ✅/"explicit exemption" framing overstated the RFC basis for this design choice. See `RFC_AUDIT.md` §9.2.1.1. |
-| iBGP MRAI (SHOULD ≥5 s per RFC 4271 §9.2.1.1) | — | ❌ | — |
+| 30 s MRAI for eBGP peers; re-announcement of a destination within the interval held back | `src/daemon/route.rs` | ✅ | `suppressed_replacement_is_sent_when_mrai_expires_v4` (`daemon/mrai_flush_tests.rs`), `destination_sent_just_now_is_not_ready` |
+| "the last route selected SHALL be advertised at the end of MinRouteAdvertisementIntervalTimer" — the held-back replacement actually reaches the peer at expiry | `src/daemon/route.rs` | ✅ | `suppressed_replacement_is_sent_when_mrai_expires_v4`, `last_route_selected_during_window_is_the_one_sent_v4` — **fixed 2026-11-23:** the replacement used to be committed to the Adj-RIB-Out before the MRAI check, so the release at expiry diffed to `NoChange` and the peer kept the stale path indefinitely |
+| Selection that reverts to the advertised route within the interval sends nothing extra | `src/daemon/route.rs` | ✅ | `replacement_reverted_within_window_never_sends_intermediate_v4` |
+| Adj-RIB-Out (and `show adj-rib-out` / advertised counters) reflects what was sent, not what is held back | `src/daemon/route.rs` | ✅ | `adj_rib_out_holds_route_actually_sent_while_suppressed_v4` |
+| Same interval for IPv6 unicast (MP_REACH_NLRI) | `src/daemon/route.rs` | ✅ | `suppressed_replacement_is_sent_when_mrai_expires_v6` — **added 2026-11-23**; the IPv6 path previously applied no MRAI at all |
+| Held-back destinations released by the MRAI/2 timer; per-destination readiness | `src/daemon/route.rs` | ✅ | `take_ready_releases_only_elapsed_destinations`, `flush_mrai_pending_clears_elapsed_pending`, `regression_flush_mrai_pending_requires_subsequent_flush_pending` |
+| Withdrawals bypass MRAI; a withdrawal cancels a held-back announcement | `src/daemon/route.rs` | ⚠️ | `withdrawal_within_window_is_sent_immediately_v4`/`_v6`, `suppressed_replacement_then_withdrawal_sends_only_withdrawal_v4`/`_v6` — **deliberate deviation.** RFC 4271 §9.2.1.1 applies the interval to "advertise feasible routes **and/or withdrawal of unfeasible routes**" (see `RFC_AUDIT.md` §9.2.1.1). The behaviour follows RFC 1771 §9.2.3.1, which RFC 4271 replaced: "To avoid long-lived black holes, the procedure does not apply to the explicit withdrawal of unfeasible routes." Holding back a withdrawal keeps a blackholed path alive at the peer, so pathvectord accepts the deviation. |
+| iBGP MRAI (SHOULD be shorter than eBGP, or not applied, per RFC 4271 §9.2.1.1) | `src/daemon/route.rs` | ✅ | `ibgp_peer_is_not_rate_limited_v4` — option (b), "the procedure [...] SHOULD NOT apply to routes sent to internal peers": the gate is skipped for iBGP peers |
 
-**Deferred:** iBGP MRAI. The RFC says SHOULD ≥5 s for iBGP; current implementation applies
-no MRAI to iBGP peers. Low operational impact at typical iBGP topologies; deferred until
-route dampening is implemented (both share the `Clock` trait prerequisite).
+**Not covered:** only `propagate_to_all_peers`/`_v6` (UPDATE processing, policy
+changes, origination, FIB-driven next-hop changes, and the MRAI release itself) pass
+through the gate. Announcements made by the session-termination
+(`on_terminated`), graceful-restart, and selection-deferral release paths call
+`propagate_prefix` directly. They are neither rate-limited nor recorded as starting an
+interval, and neither is the initial table dump. They commit exactly what they send,
+so they cannot strand a peer on a stale path. A withdrawal clears the destination's
+last-sent stamp, so a re-announcement right after a withdrawal goes out immediately.
 
 ---
 
