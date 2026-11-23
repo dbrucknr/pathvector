@@ -213,6 +213,47 @@ cross-platform (they pass on macOS and Linux alike).
 | Every byte string of 1–80 bytes is a `TcpMd5Key`, byte for byte | RFC 2385 §2.0 leaves the key's form open; Linux stores it as binary |
 | Every byte string over 80 bytes is rejected with `TooLong { len }` | `TCP_MD5SIG_MAXKEYLEN`; the kernel would return `EINVAL` |
 
+#### Kernel FIB route identity (issue #56)
+
+The FIB snapshot mirrors kernel routes under their full Linux identity, not just
+their prefix. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
+platform and compare the mirror against a model of the kernel's slot lists written
+directly from `fib_table_insert` / `fib_table_delete` and `fib6_add_rt2node` / `fib6_del`,
+and against a reference lookup written from the kernel's lookup rule:
+
+| Invariant | Why it matters |
+|---|---|
+| After any sequence of adds (front/back), replaces and deletes of tracked *and* untracked (BGP, blackhole) routes, every slot holds the kernel model's routes in the kernel model's order | A backup route must not overwrite the primary, a delete must remove only the named route, and a replace must displace the route the kernel displaced, even when that is an untracked BGP alias |
+| The tracked routes and every lookup equal the model's (longest prefix, then lowest priority) | Wrong IGP metrics and spurious (un)reachability |
+| Each mutation reports a change exactly when the tracked routes changed | BGP churn must not wake the decision process; IGP changes must |
+| Lookups do not depend on load (dump) order | Dump and incremental state must agree |
+| `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
+
+The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPLACE` /
+`NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
+`pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
+and 100 in both orders, for both families, incrementally and through the initial dump.
+They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
+learned from the initial dump (which reports a set only once), an all-BGP ECMP set
+that must give no IGP path both live and after a dump, a check that the kernel dumps a
+BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
+policy), and a BGP alias prepended ahead of a static alias and then replaced.
+They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
+namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
+
+```bash
+cargo test -p pathvector-sys --test kernel_fib_netns --no-run   # prints the binary path
+sudo unshare --net -- <binary> --ignored
+```
+
+or from macOS via Docker:
+
+```bash
+docker run --rm --network none --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 -v "$PWD":/src -w /src rust:1.88 \
+  cargo test -p pathvector-sys --test kernel_fib_netns -- --ignored
+```
+
 ---
 
 ## Fuzz testing

@@ -11,8 +11,9 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
-libc  = { workspace = true }
-tokio = { workspace = true }
+libc     = { workspace = true }
+smallvec = { workspace = true }
+tokio    = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
