@@ -528,12 +528,7 @@ pub(crate) async fn watch_fib_status<T>(
 /// Logs the kernel FIB snapshot's health transitions until the status
 /// channel closes.
 pub(crate) async fn log_fib_status(status: watch::Receiver<FibStatus>) {
-    watch_fib_status(
-        status,
-        |s| (s.health(), s.resyncs()),
-        log_fib_event,
-    )
-    .await;
+    watch_fib_status(status, |s| (s.health(), s.resyncs()), log_fib_event).await;
 }
 
 fn log_fib_event(event: FibStatusEvent, status: &FibStatus) {
