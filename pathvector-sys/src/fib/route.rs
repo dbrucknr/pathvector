@@ -41,12 +41,17 @@
 //! the packet (`fib_table_lookup`, "Process the leaf"). Because priority sorts
 //! ascending, the route that wins for a prefix is the one with the **lowest
 //! priority**. When no alias of a leaf matches, the lookup backtracks to a
-//! shorter prefix. [`RouteMirror::lookup`] reproduces this: longest prefix
-//! first, then lowest priority, then kernel list order.
+//! shorter prefix. IPv6 is the same except that, within the lowest-metric
+//! group, `rt6_score_route` ranks routes by their router preference
+//! (`RTA_PREF`), so a high-preference route beats an earlier medium one
+//! ([`RoutePreference`]). [`RouteMirror::lookup`] reproduces this: longest
+//! prefix first, then lowest priority, then (IPv6) highest preference, then
+//! kernel list order.
 //!
-//! Only *tracked* routes are used: unicast routes not installed by BGP. The
-//! oracle answers for best-effort traffic from an unspecified source, so of
-//! those only routes that such a lookup can match are eligible:
+//! Only *tracked* routes are used: unicast and negative routes (see below)
+//! not installed by BGP. The oracle answers for best-effort traffic from an
+//! unspecified source, so of those only routes that such a lookup can match
+//! are eligible:
 //!
 //! - IPv4 aliases with a non-zero TOS/DSCP are skipped. The kernel only uses
 //!   them for packets carrying that DSCP (`if (fa->fa_dscp &&
@@ -93,6 +98,46 @@
 //! as IGP instead would make each all-BGP ECMP set count as IGP reachability
 //! after a restart; treating it as BGP would lose the second path of every
 //! all-static set. Both are worse in the common case.
+//!
+//! # Negative routes
+//!
+//! A lookup selects a route **before** it decides whether the destination is
+//! reachable. `ip-route(8)` describes the route types:
+//!
+//! > "blackhole - these destinations are unreachable. Packets are discarded
+//! > silently."
+//! >
+//! > "unreachable - these destinations are unreachable. Packets are discarded
+//! > and the ICMP message host unreachable is generated."
+//! >
+//! > "prohibit - these destinations are unreachable. Packets are discarded and
+//! > the ICMP message communication administratively prohibited is generated."
+//! >
+//! > "throw - a special control route used together with policy rules. If such
+//! > a route is selected, lookup in this table is terminated pretending that no
+//! > route was found."
+//!
+//! In the kernel each type has a fixed lookup error (`fib_props` in
+//! `net/ipv4/fib_semantics.c`, `fib6_prop` in `net/ipv6/route.c`): blackhole
+//! `-EINVAL`, unreachable `-EHOSTUNREACH`, prohibit `-EACCES`, throw
+//! `-EAGAIN`, unicast `0`. `fib_table_lookup` returns that error as soon as the
+//! winning alias is chosen (`err = fib_props[fa->fa_type].error; if
+//! (unlikely(err < 0)) { out_reject: ... return err; }`); it does **not**
+//! backtrack to a shorter prefix. IPv6 is the same: `fib6_table_lookup` only
+//! backtracks when no route of the node was selected, and the selected reject
+//! route's error ends the lookup (`ip6_rt_init_dst_reject`). So a negative
+//! route beneath a covering unicast route makes the covered destinations
+//! unreachable. [`RouteMirror::resolve`] reports this as a [`FibLookup`], so a
+//! negative route can never be read as a forwarding one.
+//!
+//! **Throw.** `-EAGAIN` is also what a table returns when nothing matches, and
+//! the rule walk (`fib_rules_lookup`) moves on to the next policy rule on
+//! `-EAGAIN`. With the default rules (`fib_default_rules_init`: local, main,
+//! then default for IPv4; local, main for IPv6) a throw in `main` leaves only
+//! the `default` table, which is normally empty, and the lookup fails with
+//! `-ENETUNREACH`. The snapshot mirrors a single table and does not model
+//! policy rules, so it reports a throw as [`FibLookup::Throw`]: no route in
+//! the mirrored table, therefore not reachable through it.
 //!
 //! [`FibSnapshot`]: super::FibSnapshot
 
@@ -359,8 +404,6 @@ pub enum NextHopV6 {
     Path(NextHopPath),
 }
 
-// ── Route identity ────────────────────────────────────────────────────────────
-
 /// `RTN_UNICAST` in `<linux/rtnetlink.h>`.
 pub const RTN_UNICAST: u8 = 1;
 /// `RTPROT_BGP` in `<linux/rtnetlink.h>`.
@@ -368,14 +411,152 @@ pub const RTPROT_BGP: u8 = 186;
 /// `RTPROT_RA` in `<linux/rtnetlink.h>`.
 const RTPROT_RA: u8 = 9;
 
-/// Whether the snapshot uses a route of this type and protocol for next-hop
-/// reachability: unicast, and not installed by BGP.
+// ── Route types ───────────────────────────────────────────────────────────────
+
+/// `RTN_*` values from `<linux/rtnetlink.h>` (`RTN_UNICAST` is above).
+const RTN_BLACKHOLE: u8 = 6;
+const RTN_UNREACHABLE: u8 = 7;
+const RTN_PROHIBIT: u8 = 8;
+const RTN_THROW: u8 = 9;
+
+/// A route type whose lookup ends in a discard: the kernel does not forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RejectKind {
+    /// `RTN_BLACKHOLE`: discarded silently; local senders get `EINVAL`.
+    Blackhole,
+    /// `RTN_UNREACHABLE`: discarded with ICMP host unreachable; local senders
+    /// get `EHOSTUNREACH`.
+    Unreachable,
+    /// `RTN_PROHIBIT`: discarded with ICMP administratively prohibited; local
+    /// senders get `EACCES`.
+    Prohibit,
+}
+
+/// The type (`rtm_type`) of a route the snapshot mirrors.
+///
+/// Only the types that decide what happens to forwarded traffic are
+/// represented: unicast and the negative types. `local`, `broadcast`,
+/// `anycast` and `multicast` routes (normally in the `local` table) and the
+/// obsolete `nat` and `xresolve` types are mirrored for slot order but never
+/// used by lookups; [`RouteKind::from_rtm_type`] returns `None` for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteKind {
+    /// `RTN_UNICAST`: "real paths to the destinations covered by the route
+    /// prefix".
+    Unicast,
+    /// `RTN_BLACKHOLE`, `RTN_UNREACHABLE` or `RTN_PROHIBIT`.
+    Reject(RejectKind),
+    /// `RTN_THROW`: ends the lookup in this table as if no route was found.
+    Throw,
+}
+
+impl RouteKind {
+    /// Maps an `rtm_type` to a mirrored kind, or `None` for a type the
+    /// snapshot does not mirror.
+    #[must_use]
+    pub const fn from_rtm_type(rtm_type: u8) -> Option<Self> {
+        match rtm_type {
+            RTN_UNICAST => Some(Self::Unicast),
+            RTN_BLACKHOLE => Some(Self::Reject(RejectKind::Blackhole)),
+            RTN_UNREACHABLE => Some(Self::Reject(RejectKind::Unreachable)),
+            RTN_PROHIBIT => Some(Self::Reject(RejectKind::Prohibit)),
+            RTN_THROW => Some(Self::Throw),
+            _ => None,
+        }
+    }
+
+    /// The `rtm_type` value of this kind.
+    #[must_use]
+    pub const fn rtm_type(self) -> u8 {
+        match self {
+            Self::Unicast => RTN_UNICAST,
+            Self::Reject(RejectKind::Blackhole) => RTN_BLACKHOLE,
+            Self::Reject(RejectKind::Unreachable) => RTN_UNREACHABLE,
+            Self::Reject(RejectKind::Prohibit) => RTN_PROHIBIT,
+            Self::Throw => RTN_THROW,
+        }
+    }
+}
+
+// ── Lookup result ─────────────────────────────────────────────────────────────
+
+/// How a best-effort kernel lookup for one destination ends.
+///
+/// The route is chosen first (longest prefix, then lowest priority) and only
+/// then does its kind decide the outcome, as in `fib_table_lookup`. Only
+/// [`FibLookup::Forward`] means the destination is reachable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FibLookup<'a, R> {
+    /// The selected route is unicast: traffic is forwarded along it.
+    Forward(&'a R),
+    /// The selected route discards the traffic.
+    Reject {
+        /// The selected negative route.
+        route: &'a R,
+        /// Which kind of negative route it is.
+        kind: RejectKind,
+    },
+    /// The selected route is a throw route: the lookup in the mirrored table
+    /// ends with no route. The kernel would go on to the next policy rule's
+    /// table, which the snapshot does not mirror.
+    Throw(&'a R),
+    /// No mirrored route covers the destination.
+    NoRoute,
+}
+
+// Manual impls: the enum only holds references, so it is `Copy` whatever `R`
+// is; a derive would require `R: Copy`.
+impl<R> Clone for FibLookup<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for FibLookup<'_, R> {}
+
+impl<'a, R> FibLookup<'a, R> {
+    /// The route traffic is forwarded along, if the lookup ends in one.
+    #[must_use]
+    pub const fn forwarding(self) -> Option<&'a R> {
+        match self {
+            Self::Forward(route) => Some(route),
+            _ => None,
+        }
+    }
+
+    /// Whether the lookup ends in a forwarding route.
+    #[must_use]
+    pub const fn is_reachable(self) -> bool {
+        matches!(self, Self::Forward(_))
+    }
+
+    /// The route the lookup selected, of any kind.
+    #[must_use]
+    pub const fn selected(self) -> Option<&'a R> {
+        match self {
+            Self::Forward(route) | Self::Reject { route, .. } | Self::Throw(route) => Some(route),
+            Self::NoRoute => None,
+        }
+    }
+}
+
+// ── Route identity ────────────────────────────────────────────────────────────
+
+/// The kind of a route the snapshot uses for next-hop reachability: unicast
+/// or negative (blackhole, unreachable, prohibit, throw), and not installed by
+/// BGP. `None` for every other route, which is mirrored for slot order only.
 ///
 /// BGP routes are destinations we compute, not the IGP paths that reach BGP
 /// next hops; counting them would also make every `FibWriter` install wake the
-/// decision process. Non-unicast routes are not used for reachability yet.
-const fn is_igp_unicast(kind: u8, protocol: u8) -> bool {
-    kind == RTN_UNICAST && protocol != RTPROT_BGP
+/// decision process. Negative routes must be used: a lookup selects the route
+/// before it looks at its type, so a negative route beneath a covering
+/// unicast route makes the covered destinations unreachable (issue #57).
+const fn tracked_kind(kind: u8, protocol: u8) -> Option<RouteKind> {
+    if protocol == RTPROT_BGP {
+        None
+    } else {
+        RouteKind::from_rtm_type(kind)
+    }
 }
 
 /// The kernel's IPv4 alias group: `[prefix, dscp, priority]` within one table.
@@ -401,6 +582,12 @@ pub struct RouteSlotV4 {
 /// duplicate test (`fa->fa_type == cfg->fc_type && fa->fa_info == fi`), minus
 /// `RTA_METRICS`, which only `ip route append` with identical next hops and
 /// different metrics could make significant.
+///
+/// A negative route has no gateway or device: `fib_create_info` rejects them
+/// ("Gateway, device and multipath can not be specified for this route
+/// type"). A unicast route through a blackhole nexthop object is reported by
+/// the kernel as `RTN_BLACKHOLE` (`fib_dump_info`), so it arrives here as a
+/// blackhole route with [`NextHopV4::Object`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelRouteV4 {
     /// The alias group.
@@ -418,12 +605,19 @@ pub struct KernelRouteV4 {
 }
 
 impl KernelRouteV4 {
-    /// Whether the snapshot uses this route for reachability (unicast, not
-    /// BGP). Other routes are still mirrored, so that their position in the
-    /// slot is known.
+    /// The route's type, if it is one the snapshot can use (unicast or
+    /// negative), whatever its protocol.
+    #[must_use]
+    pub const fn route_kind(&self) -> Option<RouteKind> {
+        RouteKind::from_rtm_type(self.kind)
+    }
+
+    /// Whether the snapshot uses this route for reachability (unicast or
+    /// negative, not BGP). Other routes are still mirrored, so that their
+    /// position in the slot is known.
     #[must_use]
     pub const fn is_tracked(&self) -> bool {
-        is_igp_unicast(self.kind, self.protocol)
+        tracked_kind(self.kind, self.protocol).is_some()
     }
 }
 
@@ -440,10 +634,54 @@ pub struct RouteSlotV6 {
     pub priority: u32,
 }
 
+/// IPv6 router preference (`RTA_PREF`, RFC 4191), which ranks routes of
+/// equal prefix and metric.
+///
+/// `rt6_score_route` (under `CONFIG_IPV6_ROUTER_PREF`) adds
+/// `IPV6_DECODE_PREF(IPV6_EXTRACT_PREF(fib6_flags)) << 2` to a route's score,
+/// where `IPV6_DECODE_PREF` is "1:low,2:med,3:high", and `find_match` keeps a
+/// route only if its score is strictly higher than the best so far. So within
+/// the lowest-metric group a higher preference wins, and equal preferences
+/// keep list order. The kernel stores only these three values:
+/// `rtm_to_fib6_config` turns anything but low or high into medium.
+///
+/// A negative route is always medium: `ip6_route_info_create` copies the
+/// preference into `fib6_flags` and then, for a reject route, overwrites them
+/// with `RTF_REJECT | RTF_NONEXTHOP`, so an `RTA_PREF` given with `ip -6 route
+/// add blackhole ...` is dropped and the route is reported as medium.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum RoutePreference {
+    /// `ICMPV6_ROUTER_PREF_LOW` (3).
+    Low,
+    /// `ICMPV6_ROUTER_PREF_MEDIUM` (0), the value when `RTA_PREF` is absent.
+    #[default]
+    Medium,
+    /// `ICMPV6_ROUTER_PREF_HIGH` (1).
+    High,
+}
+
+impl RoutePreference {
+    /// Maps an `RTA_PREF` value the way `rtm_to_fib6_config` does: low and
+    /// high are kept, anything else becomes medium.
+    #[must_use]
+    pub const fn from_rta_pref(pref: u8) -> Self {
+        match pref {
+            3 => Self::Low,
+            1 => Self::High,
+            _ => Self::Medium,
+        }
+    }
+}
+
 /// One IPv6 route (a single `fib6_info`, so one ECMP sibling at most).
 ///
-/// Its identity is the slot plus the next hop (`rt6_duplicate_nexthop`); type
-/// and protocol are attributes.
+/// Its identity is the slot plus the next hop (`rt6_duplicate_nexthop`); type,
+/// protocol and preference are attributes.
+///
+/// The kernel creates every negative IPv6 route on the loopback device with
+/// no gateway (`fib6_nh_init`: "hold loopback dev/idev"), so negative routes
+/// of the same metric are duplicates of each other whatever their type, and a
+/// negative route is never an ECMP sibling.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelRouteV6 {
     /// The metric group.
@@ -456,6 +694,9 @@ pub struct KernelRouteV6 {
     /// taken from the sibling the message described (see the module docs on
     /// IPv6 multipath messages).
     pub protocol_inferred: bool,
+    /// `RTA_PREF`. Ranks routes of one metric group during lookup. Medium for
+    /// every negative route (see [`RoutePreference`]).
+    pub preference: RoutePreference,
     /// Next hop.
     pub next_hop: NextHopV6,
 }
@@ -473,11 +714,19 @@ impl KernelRouteV6 {
             && matches!(self.next_hop, NextHopV6::Path(p) if p.gateway.is_some())
     }
 
-    /// Whether the snapshot uses this route for reachability: unicast, and not
-    /// installed by BGP. An inferred protocol is used like a reported one.
+    /// The route's type, if it is one the snapshot can use (unicast or
+    /// negative), whatever its protocol.
+    #[must_use]
+    pub const fn route_kind(&self) -> Option<RouteKind> {
+        RouteKind::from_rtm_type(self.kind)
+    }
+
+    /// Whether the snapshot uses this route for reachability: unicast or
+    /// negative, and not installed by BGP. An inferred protocol is used like
+    /// a reported one.
     #[must_use]
     pub const fn is_tracked(&self) -> bool {
-        is_igp_unicast(self.kind, self.protocol)
+        tracked_kind(self.kind, self.protocol).is_some()
     }
 }
 
@@ -500,8 +749,12 @@ pub(crate) trait MirroredRoute: Clone + PartialEq {
     /// Whether `other` is the same kernel route. Both must be in one slot.
     fn same_identity(&self, other: &Self) -> bool;
 
-    /// Whether lookups may use this route at all.
-    fn tracked(&self) -> bool;
+    /// The route's kind if lookups may use it at all, else `None`.
+    fn tracked_kind(&self) -> Option<RouteKind>;
+
+    /// Rank among the tracked routes of one slot; higher wins. Always medium
+    /// for IPv4, which has no such ranking.
+    fn preference(&self) -> RoutePreference;
 
     /// Whether this route is an IPv6 ECMP sibling candidate (always `false`
     /// for IPv4, where a multipath route is a single alias).
@@ -545,8 +798,12 @@ impl MirroredRoute for KernelRouteV4 {
         self == other
     }
 
-    fn tracked(&self) -> bool {
-        self.is_tracked()
+    fn tracked_kind(&self) -> Option<RouteKind> {
+        tracked_kind(self.kind, self.protocol)
+    }
+
+    fn preference(&self) -> RoutePreference {
+        RoutePreference::Medium
     }
 
     fn ecmp(&self) -> bool {
@@ -582,8 +839,12 @@ impl MirroredRoute for KernelRouteV6 {
         self.next_hop == other.next_hop
     }
 
-    fn tracked(&self) -> bool {
-        self.is_tracked()
+    fn tracked_kind(&self) -> Option<RouteKind> {
+        tracked_kind(self.kind, self.protocol)
+    }
+
+    fn preference(&self) -> RoutePreference {
+        self.preference
     }
 
     fn ecmp(&self) -> bool {
@@ -604,17 +865,22 @@ impl MirroredRoute for KernelRouteV6 {
 }
 
 /// One mirrored route. Routes lookups never use are kept only as an identity
-/// hash, so a full BGP table installed in the kernel costs little memory.
+/// hash, so a full BGP table installed in the kernel costs little memory. A
+/// tracked route keeps its typed kind, so a lookup can classify it without a
+/// fallible conversion.
 #[derive(Debug, Clone, PartialEq)]
 enum Entry<R> {
-    Tracked(Box<R>),
+    Tracked { kind: RouteKind, route: Box<R> },
     Untracked { identity: u64, ecmp: bool },
 }
 
 impl<R: MirroredRoute> Entry<R> {
     fn new(route: R) -> Self {
-        if route.tracked() {
-            Self::Tracked(Box::new(route))
+        if let Some(kind) = route.tracked_kind() {
+            Self::Tracked {
+                kind,
+                route: Box::new(route),
+            }
         } else {
             Self::Untracked {
                 identity: route.identity(),
@@ -625,25 +891,29 @@ impl<R: MirroredRoute> Entry<R> {
 
     fn is(&self, route: &R) -> bool {
         match self {
-            Self::Tracked(r) => r.same_identity(route),
+            Self::Tracked { route: r, .. } => r.same_identity(route),
             Self::Untracked { identity, .. } => *identity == route.identity(),
         }
     }
 
     fn is_tracked(&self) -> bool {
-        matches!(self, Self::Tracked(_))
+        matches!(self, Self::Tracked { .. })
     }
 
     fn ecmp(&self) -> bool {
         match self {
-            Self::Tracked(r) => r.ecmp(),
+            Self::Tracked { route, .. } => route.ecmp(),
             Self::Untracked { ecmp, .. } => *ecmp,
         }
     }
 
     fn route(&self) -> Option<&R> {
+        self.tracked().map(|(route, _)| route)
+    }
+
+    fn tracked(&self) -> Option<(&R, RouteKind)> {
         match self {
-            Self::Tracked(r) => Some(r),
+            Self::Tracked { kind, route } => Some((route, *kind)),
             Self::Untracked { .. } => None,
         }
     }
@@ -710,7 +980,7 @@ impl<R: MirroredRoute> RouteMirror<R> {
         self.slots.get(slot).map_or_else(Vec::new, |g| {
             g.iter()
                 .map(|e| match e {
-                    Entry::Tracked(r) => (r.identity(), true),
+                    Entry::Tracked { route, .. } => (route.identity(), true),
                     Entry::Untracked { identity, .. } => (*identity, false),
                 })
                 .collect()
@@ -732,18 +1002,45 @@ impl<R: MirroredRoute> RouteMirror<R> {
             .is_some_and(|g| g.iter().any(|e| e.is(route)))
     }
 
-    /// The route a best-effort kernel lookup would use for `addr`: longest
-    /// matching prefix, then lowest priority, then the first tracked route of
-    /// that slot in kernel order. With several tables mirrored, they are
-    /// compared as one table (lowest ID wins a tie): policy routing rules are
-    /// not modelled.
-    pub fn lookup(&self, addr: R::Addr) -> Option<&R> {
+    /// The route a best-effort kernel lookup would select for `addr`, of any
+    /// tracked kind, with that kind: longest matching prefix, then lowest
+    /// priority, then (IPv6) the highest [`RoutePreference`] among the slot's
+    /// tracked routes, then the first of those in kernel order. Negative
+    /// routes take part like any other: the kernel picks the route before it
+    /// looks at its type. With several tables mirrored, they are compared as
+    /// one table (lowest ID wins a tie): policy routing rules are not
+    /// modelled.
+    fn select(&self, addr: R::Addr) -> Option<(&R, RouteKind)> {
         let slot = self
             .tracked
             .iter()
             .filter(|s| R::slot_matches(s, addr))
             .min_by_key(|s| R::slot_rank(s))?;
-        self.slots.get(slot)?.iter().find_map(Entry::route)
+        // `min_by_key` returns the first of several equal minima, which keeps
+        // kernel order as the last tie-breaker.
+        self.slots
+            .get(slot)?
+            .iter()
+            .filter_map(Entry::tracked)
+            .min_by_key(|(route, _)| Reverse(route.preference()))
+    }
+
+    /// The route a best-effort kernel lookup would select for `addr`, of any
+    /// tracked kind (see [`resolve`](Self::resolve) for the outcome).
+    #[cfg(test)]
+    pub fn lookup(&self, addr: R::Addr) -> Option<&R> {
+        self.select(addr).map(|(route, _)| route)
+    }
+
+    /// How a best-effort kernel lookup for `addr` ends: the selected route
+    /// classified by its kind.
+    pub fn resolve(&self, addr: R::Addr) -> FibLookup<'_, R> {
+        match self.select(addr) {
+            None => FibLookup::NoRoute,
+            Some((route, RouteKind::Unicast)) => FibLookup::Forward(route),
+            Some((route, RouteKind::Reject(kind))) => FibLookup::Reject { route, kind },
+            Some((route, RouteKind::Throw)) => FibLookup::Throw(route),
+        }
     }
 
     /// The tracked routes of `slot`, in kernel order. Slots are tiny, so
@@ -784,7 +1081,7 @@ impl<R: MirroredRoute> RouteMirror<R> {
         if self.contains(&route) {
             return false;
         }
-        let tracked = route.tracked();
+        let tracked = route.tracked_kind().is_some();
         let slot = *route.slot();
         self.insert_entry(slot, Entry::new(route), at);
         tracked

@@ -2249,6 +2249,21 @@ plus loop-detection to prevent infinite recursion. Explicitly not implemented; t
 current design excludes BGP routes from `FibSnapshot` for correctness (no feedback loop,
 semantic separation of IGP and BGP RIBs).
 
+**Negative routes: what the snapshot still cannot see** (follow-ups to #57):
+
+- *Policy routing.* A `throw` route, or any route in a table other than the mirrored
+  one, is resolved against the mirrored table alone: thrown traffic is reported
+  unreachable even if a later `ip rule` table would carry it. Modelling the rule chain
+  (`fib_rules_lookup`) would need a rule dump and per-table snapshots.
+- *Nexthop objects.* A route through `RTA_NH_ID` is classified by the type the kernel
+  reports; changing the object (for example to a blackhole nexthop) sends no route
+  notification. Needs an `RTM_NEWNEXTHOP` subscription.
+- *IPv6 unicast via `lo`.* `fib6_is_reject` turns it into a reject route but it is still
+  reported as unicast.
+- *BGP-installed blackholes.* RFC 7999 null routes installed by `FibWriter` are excluded
+  with every other BGP route, so a next hop beneath one is still reported reachable
+  through the IGP route. Belongs with recursive next-hop resolution above.
+
 **Testing gaps:**
 
 - E2e test (Gap 8): after session with GoBGP establishes and a prefix is learned,
