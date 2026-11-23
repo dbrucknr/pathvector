@@ -4,6 +4,22 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (PR #122 review round 3: unreported IPv6 siblings inherit the protocol)
+
+Round 2 counted every IPv6 ECMP sibling whose protocol the kernel did not report as an
+IGP path. Review showed that this lets an **all-BGP** ECMP set supply IGP reachability
+after a restart: live events reported both BGP routes and gave no path, but a fresh
+dump gave `Some(10)`. So restarting changed next-hop eligibility with no FIB change.
+
+The kernel's dump of a BGP-first static+BGP set is byte-for-byte the same as an all-BGP
+set (now checked by a live test), so no decoder can be right for both. The policy is now
+explicit: an unreported sibling takes the described sibling's protocol, marked with the
+new `KernelRouteV6::protocol_inferred` flag (`protocol` is a plain `u8` again), and a
+message reporting the real protocol replaces the inference. This is exact for every
+single-protocol set. Only mixed-protocol sets learned from a dump can be misclassified,
+documented in the crate README with both directions. Live tests: all-BGP set live vs.
+after a dump (fails on the previous commit), and the byte-identity check.
+
 ## 2026-11-23 (PR #122 review round 2: IPv6 ECMP siblings are dumped once)
 
 The round-1 fix assumed every IPv6 ECMP sibling gets its own dump message, and kept
@@ -15,8 +31,8 @@ kernel still had the second. With BGP added first, the static sibling was missed
 after the dump. Both were reproduced on a live kernel.
 
 `KernelRouteV6::protocol` is now `Option<u8>`. `None` means no message has described the
-route (a sibling seen only as a leg), and such a route counts as a path. The cost is in
-mixed BGP/IGP ECMP sets only: a BGP leg of unknown protocol counts until it is deleted.
+route (a sibling seen only as a leg), and such a route counts as a path. (Superseded by
+round 3 above: that also admitted all-BGP sets.)
 Two new live-kernel tests (all-static set, BGP-first mixed set) fail on the previous
 commit and pass now; the adapter test that simulated per-sibling dump messages now uses
 the single aggregate message the kernel actually sends.

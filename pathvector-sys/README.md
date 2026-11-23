@@ -131,10 +131,18 @@ table grows; release build, M2 Max). Inserts and deletes are hashed, about 0.26 
 
 An IPv6 multipath message describes only its first leg; the other legs carry no protocol
 of their own, and Linux lets one ECMP set mix static and BGP routes. Dumps do not help:
-`fib6_dump_node` dumps a sibling set once and skips the other siblings. A leg whose
-protocol no message has given is recorded with `protocol: None` and **counts as a path**,
-because the kernel forwards over every sibling and all-IGP ECMP sets are the common case.
-A later message that describes the leg settles its protocol.
+`fib6_dump_node` dumps a sibling set once and skips the other siblings. The dump of a
+BGP-first static+BGP set is byte-for-byte the dump of an all-BGP set (a live test checks
+this), so a policy has to decide what an unreported sibling is.
+
+**Policy:** an unreported sibling takes the protocol of the sibling the message describes,
+marked `protocol_inferred: true`, and a message that later reports its protocol replaces
+the inference. ECMP sets are almost always installed by one daemon, so this is exact for
+every single-protocol set, BGP or IGP. Those sets give the same answer after a restart's
+dump as from live events, and the BGP exclusion holds for all-BGP ECMP sets. The
+alternatives are worse in the common case: counting every unreported sibling as IGP makes
+each all-BGP ECMP set count as IGP reachability after a restart, and counting none loses
+the second path of every all-static set.
 
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
 as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
@@ -144,12 +152,16 @@ use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes and
 
 Known limits:
 
-- An IPv6 ECMP sibling of unknown protocol (learned from the initial dump, or added by a
-  multipath `NLM_F_APPEND`) counts as a path even if it is in fact a BGP route. This
-  only matters for an ECMP set that mixes BGP and IGP routes: after the IGP siblings are
-  deleted, such a BGP leg keeps the prefix reachable until it is deleted too. The kernel
-  does not report the protocol, so this cannot be resolved from netlink.
-  `FibWriter` replaces rather than appends, so it never creates mixed sets.
+- **Mixed-protocol IPv6 ECMP sets learned from a dump (or a multipath `NLM_F_APPEND`)**
+  are the one case the inference gets wrong, in either direction, because netlink never
+  reports the unreported siblings' protocols:
+  - static first, BGP second: the BGP sibling counts as a path until it is deleted;
+  - BGP first, static second: the static sibling is not used until a message reports it,
+    even after the BGP sibling is deleted.
+
+  Such sets need two daemons (or an operator) appending into one ECMP set. `FibWriter`
+  replaces rather than appends, so it never creates them. Re-reading the set after its
+  first sibling is deleted would narrow the second case; that is a possible follow-up.
 - Untracked identities are compared by a 64-bit hash within one slot; a collision
   between two routes of the same slot is possible in principle but negligible.
 - IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.

@@ -235,8 +235,10 @@ The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPL
 `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
 and 100 in both orders, for both families, incrementally and through the initial dump.
 They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
-and a BGP-first mixed set learned from the initial dump (which reports a set only
-once), and a BGP alias prepended ahead of a static alias and then replaced.
+learned from the initial dump (which reports a set only once), an all-BGP ECMP set
+that must give no IGP path both live and after a dump, a check that the kernel dumps a
+BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
+policy), and a BGP alias prepended ahead of a static alias and then replaced.
 They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 
