@@ -1211,14 +1211,15 @@ async fn static_first_mixed_set_stops_counting_the_bgp_route_once_the_static_rou
     assert_eq!(count_v6(&snap.read().unwrap(), dst), 2, "inferred static");
     del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Static)).await;
     barrier_v6(&handle, &snap, oif, "2001:db8:224::".parse().unwrap()).await;
-    let s = snap.read().unwrap();
-    assert_eq!(
-        s.igp_metric_v6(probe),
-        None,
-        "only the BGP route via fe80::2 is left in the kernel"
-    );
-    assert_eq!(count_v6(&s, dst), 0);
-    drop(s);
+    {
+        let s = snap.read().unwrap();
+        assert_eq!(
+            s.igp_metric_v6(probe),
+            None,
+            "only the BGP route via fe80::2 is left in the kernel"
+        );
+        assert_eq!(count_v6(&s, dst), 0);
+    }
     del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Bgp)).await;
     task.abort();
 }

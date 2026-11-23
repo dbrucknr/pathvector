@@ -791,11 +791,9 @@ fn inferred_protocol_is_used_until_a_message_reports_it() {
 // deleted, a dump describes the next one, and a lone route is described in
 // full. `redescribe` applies such a message.
 
-fn inferred(r: KernelRouteV6) -> KernelRouteV6 {
-    KernelRouteV6 {
-        protocol_inferred: true,
-        ..r
-    }
+fn inferred(mut r: KernelRouteV6) -> KernelRouteV6 {
+    r.protocol_inferred = true;
+    r
 }
 
 const SET: &str = "2001:db8::/32";

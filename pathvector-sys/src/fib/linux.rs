@@ -2096,7 +2096,7 @@ mod tests {
         decode_v6(msg)[0].slot
     }
 
-    /// Applies an RTM_DELROUTE the way the event loop does.
+    /// Applies an `RTM_DELROUTE` the way the event loop does.
     fn delete_event(snap: &mut FibSnapshot, msg: &RouteMessage) -> HashSet<RouteSlotV6> {
         let lock = RwLock::new(std::mem::take(snap));
         let mut reread = HashSet::new();
