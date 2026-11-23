@@ -156,12 +156,14 @@ pub trait FibWrite {
 // ── FibSnapshot ──────────────────────────────────────────────────────────────
 
 mod route;
-pub(crate) use route::RouteList;
 pub use route::{
     FibLookup, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg, NextHopPath,
-    NextHopV4, NextHopV6, PrefixError, RejectKind, RouteKind, RoutePreference, RouteSlotV4,
-    RouteSlotV6, TableId,
+    NextHopV4, NextHopV6, PrefixError, RTN_UNICAST, RTPROT_BGP, RejectKind, RouteKind,
+    RoutePreference, RouteSlotV4, RouteSlotV6, TableId,
 };
+// `Position` is used only by the Linux adapter and the tests.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
+pub(crate) use route::{Position, RouteMirror};
 
 /// Returns `true` if `addr` is a link-local IPv6 address (`fe80::/10`).
 ///
@@ -187,13 +189,21 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
 /// leaves the others in place. See the `route` module docs for the kernel
 /// source this follows.
 ///
+/// Every kernel route in the tracked table(s) is mirrored, including BGP and
+/// `local`-type routes, because an `NLM_F_REPLACE` displaces whichever route
+/// is first in its slot. Only *tracked* routes (unicast, blackhole,
+/// unreachable, prohibit or throw, not `RTPROT_BGP`) are used for lookups, listed by [`routes_v4`](Self::routes_v4) /
+/// [`routes_v6`](Self::routes_v6), or signal a change; the rest are stored as
+/// an identity hash only.
+///
 /// # Lookup
 ///
 /// Reachability queries use longest-prefix match. Among the routes for the
 /// longest matching prefix, the one with the lowest priority wins, as in the
-/// kernel. IPv4 routes with a non-zero TOS and IPv6 routes with a source
-/// prefix are kept but never selected, because a best-effort lookup from an
-/// unspecified source cannot match them.
+/// kernel; for IPv6, routes of that priority are then ranked by router
+/// preference ([`RoutePreference`]). IPv4 routes with a non-zero TOS and IPv6
+/// routes with a source prefix are kept but never selected, because a
+/// best-effort lookup from an unspecified source cannot match them.
 ///
 /// The selected route's [`RouteKind`] then decides the outcome
 /// ([`FibLookup`]). Only a unicast route makes the destination reachable; its
@@ -205,8 +215,8 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
 /// the kernel source and for how `throw` is treated.
 #[derive(Debug, Default, Clone)]
 pub struct FibSnapshot {
-    pub(crate) v4: RouteList<KernelRouteV4>,
-    pub(crate) v6: RouteList<KernelRouteV6>,
+    pub(crate) v4: RouteMirror<KernelRouteV4>,
+    pub(crate) v6: RouteMirror<KernelRouteV6>,
 }
 
 impl FibSnapshot {
@@ -216,12 +226,14 @@ impl FibSnapshot {
         Self::default()
     }
 
-    /// Every IPv4 route in the snapshot, in kernel order within each slot.
+    /// Every tracked IPv4 route, in kernel order within each slot (slots in no
+    /// particular order).
     pub fn routes_v4(&self) -> impl Iterator<Item = &KernelRouteV4> {
         self.v4.iter()
     }
 
-    /// Every IPv6 route in the snapshot, in kernel order within each slot.
+    /// Every tracked IPv6 route, in kernel order within each slot (slots in no
+    /// particular order).
     pub fn routes_v6(&self) -> impl Iterator<Item = &KernelRouteV6> {
         self.v6.iter()
     }
@@ -500,7 +512,7 @@ mod tests {
                 tos: 0,
                 priority: metric,
             },
-            kind: RouteKind::Unicast,
+            kind: RTN_UNICAST,
             protocol: 3, // RTPROT_BOOT, what `ip route add` uses
             scope: 0,
             prefsrc: None,
@@ -520,7 +532,7 @@ mod tests {
                 src: Ipv6Prefix::DEFAULT,
                 priority: metric,
             },
-            kind: RouteKind::Unicast,
+            kind: RTN_UNICAST,
             protocol: 3,
             preference: RoutePreference::Medium,
             next_hop: NextHopV6::Path(NextHopPath {
@@ -533,7 +545,8 @@ mod tests {
     fn snap_with_v4(entries: &[(&str, u8, u32)]) -> FibSnapshot {
         let mut snap = FibSnapshot::new();
         for &(network, prefix_len, metric) in entries {
-            snap.v4.insert_back(r4(network, prefix_len, metric));
+            snap.v4
+                .insert(r4(network, prefix_len, metric), Position::Back);
         }
         snap
     }
@@ -541,7 +554,8 @@ mod tests {
     fn snap_with_v6(entries: &[(&str, u8, u32)]) -> FibSnapshot {
         let mut snap = FibSnapshot::new();
         for &(network, prefix_len, metric) in entries {
-            snap.v6.insert_back(r6(network, prefix_len, metric));
+            snap.v6
+                .insert(r6(network, prefix_len, metric), Position::Back);
         }
         snap
     }
@@ -697,7 +711,7 @@ mod tests {
 
     fn neg4(network: &str, prefix_len: u8, metric: u32, kind: RouteKind) -> KernelRouteV4 {
         KernelRouteV4 {
-            kind,
+            kind: kind.rtm_type(),
             ..r4(network, prefix_len, metric)
         }
     }
@@ -707,7 +721,7 @@ mod tests {
     /// unicast route under `rt6_duplicate_nexthop`.
     fn neg6(network: &str, prefix_len: u8, metric: u32, kind: RouteKind) -> KernelRouteV6 {
         KernelRouteV6 {
-            kind,
+            kind: kind.rtm_type(),
             next_hop: NextHopV6::Path(NextHopPath {
                 gateway: None,
                 oif: std::num::NonZeroU32::new(1),
@@ -739,7 +753,7 @@ mod tests {
         for kind in NEGATIVE_KINDS {
             let neg = neg4("10.1.0.0", 16, 1024, kind);
             let mut snap = snap_with_v4(&[("0.0.0.0", 0, 0)]);
-            assert!(snap.v4.insert_back(neg.clone()));
+            assert!(snap.v4.insert(neg.clone(), Position::Back));
 
             assert!(
                 !snap.is_v4_reachable(covered),
@@ -764,7 +778,7 @@ mod tests {
         for kind in NEGATIVE_KINDS {
             let neg = neg6("2001:db8:1::", 48, 1024, kind);
             let mut snap = snap_with_v6(&[("::", 0, 1)]);
-            assert!(snap.v6.insert_back(neg.clone()));
+            assert!(snap.v6.insert(neg.clone(), Position::Back));
 
             assert!(
                 !snap.is_v6_reachable(covered),
@@ -790,16 +804,20 @@ mod tests {
         let addr6: Ipv6Addr = "2001:db8:1::7".parse().unwrap();
         for kind in NEGATIVE_KINDS {
             let mut snap = snap_with_v4(&[("198.51.100.0", 24, 100)]);
-            snap.v4.insert_back(neg4("198.51.100.0", 24, 10, kind));
-            snap.v6.insert_back(r6("2001:db8:1::", 64, 100));
-            snap.v6.insert_back(neg6("2001:db8:1::", 64, 10, kind));
+            snap.v4
+                .insert(neg4("198.51.100.0", 24, 10, kind), Position::Back);
+            snap.v6.insert(r6("2001:db8:1::", 64, 100), Position::Back);
+            snap.v6
+                .insert(neg6("2001:db8:1::", 64, 10, kind), Position::Back);
             assert!(!snap.is_v4_reachable(addr4), "{kind:?} at metric 10 wins");
             assert!(!snap.is_v6_reachable(addr6), "{kind:?} at metric 10 wins");
 
             let mut snap = snap_with_v4(&[("198.51.100.0", 24, 10)]);
-            snap.v4.insert_back(neg4("198.51.100.0", 24, 100, kind));
-            snap.v6.insert_back(r6("2001:db8:1::", 64, 10));
-            snap.v6.insert_back(neg6("2001:db8:1::", 64, 100, kind));
+            snap.v4
+                .insert(neg4("198.51.100.0", 24, 100, kind), Position::Back);
+            snap.v6.insert(r6("2001:db8:1::", 64, 10), Position::Back);
+            snap.v6
+                .insert(neg6("2001:db8:1::", 64, 100, kind), Position::Back);
             assert_eq!(snap.igp_metric_v4(addr4), Some(10), "{kind:?} at 100 loses");
             assert_eq!(snap.igp_metric_v6(addr6), Some(10), "{kind:?} at 100 loses");
         }
@@ -811,12 +829,13 @@ mod tests {
         // where it is the longest match.
         for kind in NEGATIVE_KINDS {
             let mut snap = snap_with_v4(&[("10.1.0.0", 16, 50)]);
-            snap.v4.insert_back(neg4("10.0.0.0", 8, 0, kind));
+            snap.v4.insert(neg4("10.0.0.0", 8, 0, kind), Position::Back);
             assert_eq!(snap.igp_metric_v4("10.1.9.9".parse().unwrap()), Some(50));
             assert!(!snap.is_v4_reachable("10.2.9.9".parse().unwrap()));
 
             let mut snap = snap_with_v6(&[("2001:db8:1::", 48, 50)]);
-            snap.v6.insert_back(neg6("2001:db8::", 32, 0, kind));
+            snap.v6
+                .insert(neg6("2001:db8::", 32, 0, kind), Position::Back);
             assert_eq!(
                 snap.igp_metric_v6("2001:db8:1::9".parse().unwrap()),
                 Some(50)
@@ -835,7 +854,7 @@ mod tests {
         for kind in NEGATIVE_KINDS {
             let neg = neg6("fe80:1234::", 64, 100, kind);
             let mut snap = FibSnapshot::new();
-            snap.v6.insert_back(neg.clone());
+            snap.v6.insert(neg.clone(), Position::Back);
             assert!(!snap.is_v6_reachable(covered), "{kind:?}");
             assert_negative(snap.lookup_v6(covered), &neg, kind);
             assert!(
@@ -845,7 +864,11 @@ mod tests {
 
             let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
             let oracle = fib.oracle();
-            fib.snapshot.write().unwrap().v6.insert_back(neg.clone());
+            fib.snapshot
+                .write()
+                .unwrap()
+                .v6
+                .insert(neg.clone(), Position::Back);
             assert!(
                 !oracle.is_v6_reachable(covered),
                 "{kind:?} via KernelOracle"
@@ -906,8 +929,8 @@ mod tests {
         ];
         for (first, second, reachable) in cases {
             let mut snap = FibSnapshot::new();
-            snap.v6.insert_back(first.clone());
-            snap.v6.insert_back(second.clone());
+            snap.v6.insert(first.clone(), Position::Back);
+            snap.v6.insert(second.clone(), Position::Back);
             assert_eq!(
                 snap.is_v6_reachable(addr),
                 reachable,
@@ -922,20 +945,16 @@ mod tests {
         let oracle = fib.oracle();
         {
             let mut snap = fib.snapshot.write().unwrap();
-            snap.v4.insert_back(r4("0.0.0.0", 0, 0));
-            snap.v4.insert_back(neg4(
-                "192.0.2.0",
-                24,
-                0,
-                RouteKind::Reject(RejectKind::Blackhole),
-            ));
-            snap.v6.insert_back(r6("::", 0, 1));
-            snap.v6.insert_back(neg6(
-                "2001:db8::",
-                32,
-                1,
-                RouteKind::Reject(RejectKind::Prohibit),
-            ));
+            snap.v4.insert(r4("0.0.0.0", 0, 0), Position::Back);
+            snap.v4.insert(
+                neg4("192.0.2.0", 24, 0, RouteKind::Reject(RejectKind::Blackhole)),
+                Position::Back,
+            );
+            snap.v6.insert(r6("::", 0, 1), Position::Back);
+            snap.v6.insert(
+                neg6("2001:db8::", 32, 1, RouteKind::Reject(RejectKind::Prohibit)),
+                Position::Back,
+            );
         }
         assert!(!oracle.is_v4_reachable("192.0.2.1".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v4("192.0.2.1".parse().unwrap()), None);
@@ -959,7 +978,7 @@ mod tests {
             .write()
             .unwrap()
             .v4
-            .insert_back(r4("10.0.0.0", 8, 42));
+            .insert(r4("10.0.0.0", 8, 42), Position::Back);
 
         assert!(oracle.is_v4_reachable("10.1.2.3".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v4("10.1.2.3".parse().unwrap()), Some(42));
@@ -980,7 +999,7 @@ mod tests {
             .write()
             .unwrap()
             .v6
-            .insert_back(r6("2001:db8::", 32, 7));
+            .insert(r6("2001:db8::", 32, 7), Position::Back);
 
         assert!(oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
         assert_eq!(
@@ -1041,7 +1060,7 @@ mod tests {
         // Inject a route directly
         {
             let mut snap = fib.snapshot.write().unwrap();
-            snap.v4.insert_back(r4("10.0.0.0", 8, 10));
+            snap.v4.insert(r4("10.0.0.0", 8, 10), Position::Back);
         }
 
         // Oracle now sees the injected route
@@ -1060,7 +1079,7 @@ mod tests {
             .write()
             .unwrap()
             .v4
-            .insert_back(r4("192.168.1.0", 24, 20));
+            .insert(r4("192.168.1.0", 24, 20), Position::Back);
         let _ = fib.change_tx.send(());
 
         assert!(rx.has_changed().unwrap());

@@ -44,12 +44,14 @@
 //! shorter prefix. IPv6 is the same except that, within the lowest-metric
 //! group, `rt6_score_route` ranks routes by their router preference
 //! (`RTA_PREF`), so a high-preference route beats an earlier medium one
-//! ([`RoutePreference`]). [`RouteList::lookup`] reproduces this: longest
+//! ([`RoutePreference`]). [`RouteMirror::lookup`] reproduces this: longest
 //! prefix first, then lowest priority, then (IPv6) highest preference, then
 //! kernel list order.
 //!
-//! The oracle answers for best-effort traffic from an unspecified source, so
-//! only routes that such a lookup can match are eligible:
+//! Only *tracked* routes are used: unicast and negative routes (see below)
+//! not installed by BGP. The oracle answers for best-effort traffic from an
+//! unspecified source, so of those only routes that such a lookup can match
+//! are eligible:
 //!
 //! - IPv4 aliases with a non-zero TOS/DSCP are skipped. The kernel only uses
 //!   them for packets carrying that DSCP (`if (fa->fa_dscp &&
@@ -57,8 +59,26 @@
 //! - IPv6 routes with a source prefix are skipped, since they only match
 //!   packets from that source.
 //!
-//! Ineligible routes are still stored so that their identity and position are
-//! right for later replacements and deletions.
+//! # Every route is mirrored
+//!
+//! Untracked and ineligible routes are still mirrored, because the kernel's
+//! replace rules act on a slot's real order. If a BGP alias sits ahead of a
+//! static alias in one IPv4 slot, an `NLM_F_REPLACE` of the BGP alias must not
+//! remove the static one. Untracked routes are kept only as an identity hash.
+//!
+//! # IPv6 multipath messages
+//!
+//! `rt6_fill_node` sets `rtm_protocol` and `rtm_type` from the one route the
+//! message represents and lists it first in `RTA_MULTIPATH`, followed by its
+//! siblings. A leg carries only its interface, weight, flags and gateway, so
+//! the siblings' own protocols are not in the message, and Linux allows one
+//! ECMP set to mix, say, static and BGP routes. The adapter therefore treats
+//! the first leg as described by the header. Another leg it has not seen takes
+//! the header's type and protocol only if the message comes from the request
+//! that created it (a create or replace without `NLM_F_APPEND`, where
+//! `ip6_route_multipath_add` reports the first new route). Otherwise, such as
+//! in a dump or an append, the leg is mirrored as untracked until a message
+//! describing it arrives. Each sibling's own dump message does that.
 //!
 //! # Negative routes
 //!
@@ -88,7 +108,7 @@
 //! backtracks when no route of the node was selected, and the selected reject
 //! route's error ends the lookup (`ip6_rt_init_dst_reject`). So a negative
 //! route beneath a covering unicast route makes the covered destinations
-//! unreachable. [`RouteList::resolve`] reports this as a [`FibLookup`], so a
+//! unreachable. [`RouteMirror::resolve`] reports this as a [`FibLookup`], so a
 //! negative route can never be read as a forwarding one.
 //!
 //! **Throw.** `-EAGAIN` is also what a table returns when nothing matches, and
@@ -104,11 +124,15 @@
 
 use std::{
     cmp::Reverse,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt,
+    hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
 };
+
+use smallvec::SmallVec;
 
 // ── Prefixes ──────────────────────────────────────────────────────────────────
 
@@ -361,10 +385,16 @@ pub enum NextHopV6 {
     Path(NextHopPath),
 }
 
+/// `RTN_UNICAST` in `<linux/rtnetlink.h>`.
+pub const RTN_UNICAST: u8 = 1;
+/// `RTPROT_BGP` in `<linux/rtnetlink.h>`.
+pub const RTPROT_BGP: u8 = 186;
+/// `RTPROT_RA` in `<linux/rtnetlink.h>`.
+const RTPROT_RA: u8 = 9;
+
 // ── Route types ───────────────────────────────────────────────────────────────
 
-/// `RTN_*` values from `<linux/rtnetlink.h>`.
-const RTN_UNICAST: u8 = 1;
+/// `RTN_*` values from `<linux/rtnetlink.h>` (`RTN_UNICAST` is above).
 const RTN_BLACKHOLE: u8 = 6;
 const RTN_UNREACHABLE: u8 = 7;
 const RTN_PROHIBIT: u8 = 8;
@@ -385,11 +415,11 @@ pub enum RejectKind {
 
 /// The type (`rtm_type`) of a route the snapshot mirrors.
 ///
-/// Only the types that can live in a routing table used for forwarding and
-/// that decide what happens to forwarded traffic are represented: unicast and
-/// the negative types. `local`, `broadcast`, `anycast` and `multicast` routes
-/// (normally in the `local` table) and the obsolete `nat` and `xresolve` types
-/// are not mirrored; [`RouteKind::from_rtm_type`] returns `None` for them.
+/// Only the types that decide what happens to forwarded traffic are
+/// represented: unicast and the negative types. `local`, `broadcast`,
+/// `anycast` and `multicast` routes (normally in the `local` table) and the
+/// obsolete `nat` and `xresolve` types are mirrored for slot order but never
+/// used by lookups; [`RouteKind::from_rtm_type`] returns `None` for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RouteKind {
     /// `RTN_UNICAST`: "real paths to the destinations covered by the route
@@ -493,6 +523,23 @@ impl<'a, R> FibLookup<'a, R> {
 
 // ── Route identity ────────────────────────────────────────────────────────────
 
+/// The kind of a route the snapshot uses for next-hop reachability: unicast
+/// or negative (blackhole, unreachable, prohibit, throw), and not installed by
+/// BGP. `None` for every other route, which is mirrored for slot order only.
+///
+/// BGP routes are destinations we compute, not the IGP paths that reach BGP
+/// next hops; counting them would also make every `FibWriter` install wake the
+/// decision process. Negative routes must be used: a lookup selects the route
+/// before it looks at its type, so a negative route beneath a covering
+/// unicast route makes the covered destinations unreachable (issue #57).
+const fn tracked_kind(kind: u8, protocol: u8) -> Option<RouteKind> {
+    if protocol == RTPROT_BGP {
+        None
+    } else {
+        RouteKind::from_rtm_type(kind)
+    }
+}
+
 /// The kernel's IPv4 alias group: `[prefix, dscp, priority]` within one table.
 ///
 /// `NLM_F_EXCL` rejects a second route in an occupied slot, and
@@ -513,22 +560,21 @@ pub struct RouteSlotV4 {
 ///
 /// Two aliases in the same slot are the same route when their type, scope,
 /// protocol, preferred source and next hops match. That mirrors the kernel's
-/// duplicate test ("a perfect match which uses the same scope, type, and
-/// nexthop information": `fa->fa_type == cfg->fc_type && fa->fa_info == fi`),
-/// minus `RTA_METRICS`, which only `ip route append` with identical next hops
-/// and different metrics could make significant.
+/// duplicate test (`fa->fa_type == cfg->fc_type && fa->fa_info == fi`), minus
+/// `RTA_METRICS`, which only `ip route append` with identical next hops and
+/// different metrics could make significant.
 ///
 /// A negative route has no gateway or device: `fib_create_info` rejects them
 /// ("Gateway, device and multipath can not be specified for this route
 /// type"). A unicast route through a blackhole nexthop object is reported by
 /// the kernel as `RTN_BLACKHOLE` (`fib_dump_info`), so it arrives here as a
-/// [`RejectKind::Blackhole`] route with [`NextHopV4::Object`].
+/// blackhole route with [`NextHopV4::Object`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelRouteV4 {
     /// The alias group.
     pub slot: RouteSlotV4,
-    /// `rtm_type`. Part of the identity.
-    pub kind: RouteKind,
+    /// `rtm_type` (`RTN_UNICAST`, `RTN_BLACKHOLE`, ...).
+    pub kind: u8,
     /// `rtm_protocol`.
     pub protocol: u8,
     /// `rtm_scope`.
@@ -537,6 +583,23 @@ pub struct KernelRouteV4 {
     pub prefsrc: Option<Ipv4Addr>,
     /// Next hops.
     pub next_hop: NextHopV4,
+}
+
+impl KernelRouteV4 {
+    /// The route's type, if it is one the snapshot can use (unicast or
+    /// negative), whatever its protocol.
+    #[must_use]
+    pub const fn route_kind(&self) -> Option<RouteKind> {
+        RouteKind::from_rtm_type(self.kind)
+    }
+
+    /// Whether the snapshot uses this route for reachability (unicast or
+    /// negative, not BGP). Other routes are still mirrored, so that their
+    /// position in the slot is known.
+    #[must_use]
+    pub const fn is_tracked(&self) -> bool {
+        tracked_kind(self.kind, self.protocol).is_some()
+    }
 }
 
 /// The kernel's IPv6 "same priority level": one metric within one node.
@@ -593,6 +656,9 @@ impl RoutePreference {
 
 /// One IPv6 route (a single `fib6_info`, so one ECMP sibling at most).
 ///
+/// Its identity is the slot plus the next hop (`rt6_duplicate_nexthop`); type,
+/// protocol and preference are attributes.
+///
 /// The kernel creates every negative IPv6 route on the loopback device with
 /// no gateway (`fib6_nh_init`: "hold loopback dev/idev"), so negative routes
 /// of the same metric are duplicates of each other whatever their type, and a
@@ -601,22 +667,16 @@ impl RoutePreference {
 pub struct KernelRouteV6 {
     /// The metric group.
     pub slot: RouteSlotV6,
-    /// `rtm_type`. Not part of the identity: `rt6_duplicate_nexthop` compares
-    /// device, gateway and encapsulation only.
-    pub kind: RouteKind,
-    /// `rtm_protocol`. Not part of the identity (`rt6_duplicate_nexthop`
-    /// ignores it), but needed to tell router-advertisement routes apart.
+    /// `rtm_type`.
+    pub kind: u8,
+    /// `rtm_protocol`.
     pub protocol: u8,
-    /// `RTA_PREF`. Not part of the identity, but ranks routes of one metric
-    /// group during lookup. Medium for every negative route (see
-    /// [`RoutePreference`]).
+    /// `RTA_PREF`. Ranks routes of one metric group during lookup. Medium for
+    /// every negative route (see [`RoutePreference`]).
     pub preference: RoutePreference,
     /// Next hop.
     pub next_hop: NextHopV6,
 }
-
-/// `RTPROT_RA` in `<linux/rtnetlink.h>`.
-const RTPROT_RA: u8 = 9;
 
 impl KernelRouteV6 {
     /// Whether the kernel would make this route an ECMP sibling.
@@ -627,52 +687,69 @@ impl KernelRouteV6 {
     /// `RTPROT_RA`, which stands in for it here.
     #[must_use]
     pub fn qualifies_for_ecmp(&self) -> bool {
-        qualifies_for_ecmp_v6(self.protocol, &self.next_hop)
+        self.protocol != RTPROT_RA
+            && matches!(self.next_hop, NextHopV6::Path(p) if p.gateway.is_some())
+    }
+
+    /// The route's type, if it is one the snapshot can use (unicast or
+    /// negative), whatever its protocol.
+    #[must_use]
+    pub const fn route_kind(&self) -> Option<RouteKind> {
+        RouteKind::from_rtm_type(self.kind)
+    }
+
+    /// Whether the snapshot uses this route for reachability (unicast or
+    /// negative, not BGP).
+    #[must_use]
+    pub const fn is_tracked(&self) -> bool {
+        tracked_kind(self.kind, self.protocol).is_some()
     }
 }
 
-/// `rt6_qualify_for_ecmp` for a route with this protocol and next hop. The
-/// route type plays no part; negative routes have no gateway and so never
-/// qualify.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-pub(crate) fn qualifies_for_ecmp_v6(protocol: u8, next_hop: &NextHopV6) -> bool {
-    protocol != RTPROT_RA && matches!(next_hop, NextHopV6::Path(p) if p.gateway.is_some())
-}
+// ── Mirror ────────────────────────────────────────────────────────────────────
 
-// ── Ordered route mirror ──────────────────────────────────────────────────────
-
-/// A kernel route that [`RouteList`] can mirror: [`KernelRouteV4`] or
+/// A kernel route that [`RouteMirror`] can hold: [`KernelRouteV4`] or
 /// [`KernelRouteV6`].
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub(crate) trait MirroredRoute: Clone + PartialEq {
     /// The group a route belongs to.
-    type Slot: Copy + Eq;
+    type Slot: Copy + Eq + Hash;
     /// The address type lookups are made with.
     type Addr: Copy;
 
     /// The group this route belongs to.
     fn slot(&self) -> &Self::Slot;
 
-    /// Whether `other` is the same kernel route (possibly with different
-    /// non-identifying attributes).
-    fn is_same_route(&self, other: &Self) -> bool;
+    /// Hash of the identity fields other than the slot.
+    fn identity(&self) -> u64;
 
-    /// Whether a best-effort lookup for `addr` from an unspecified source can
-    /// match this route.
-    fn matches(&self, addr: Self::Addr) -> bool;
+    /// Whether `other` is the same kernel route. Both must be in one slot.
+    fn same_identity(&self, other: &Self) -> bool;
 
-    /// Prefix length of the destination.
-    fn prefix_len(&self) -> u8;
+    /// The route's kind if lookups may use it at all, else `None`.
+    fn tracked_kind(&self) -> Option<RouteKind>;
 
-    /// The route priority (metric).
-    fn priority(&self) -> u32;
-
-    /// Rank among routes with the same prefix and priority; higher wins.
-    /// Always equal for IPv4, which has no such ranking.
+    /// Rank among the tracked routes of one slot; higher wins. Always medium
+    /// for IPv4, which has no such ranking.
     fn preference(&self) -> RoutePreference;
 
-    /// The route type.
-    fn kind(&self) -> RouteKind;
+    /// Whether this route is an IPv6 ECMP sibling candidate (always `false`
+    /// for IPv4, where a multipath route is a single alias).
+    fn ecmp(&self) -> bool;
+
+    /// Whether a best-effort lookup for `addr` from an unspecified source can
+    /// match routes in `slot`.
+    fn slot_matches(slot: &Self::Slot, addr: Self::Addr) -> bool;
+
+    /// Lookup preference of a slot; smaller wins. Longest prefix first, then
+    /// lowest priority, then lowest table ID so that ties are deterministic.
+    fn slot_rank(slot: &Self::Slot) -> (Reverse<u8>, u32, u32);
+}
+
+fn hash_of(value: &impl Hash) -> u64 {
+    // SipHash with fixed keys: deterministic for the life of the process.
+    let mut h = DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish()
 }
 
 impl MirroredRoute for KernelRouteV4 {
@@ -683,28 +760,42 @@ impl MirroredRoute for KernelRouteV4 {
         &self.slot
     }
 
-    fn is_same_route(&self, other: &Self) -> bool {
+    fn identity(&self) -> u64 {
+        hash_of(&(
+            self.kind,
+            self.protocol,
+            self.scope,
+            self.prefsrc,
+            &self.next_hop,
+        ))
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
         self == other
     }
 
-    fn matches(&self, addr: Ipv4Addr) -> bool {
-        self.slot.tos == 0 && self.slot.dst.contains(addr)
-    }
-
-    fn prefix_len(&self) -> u8 {
-        self.slot.dst.prefix_len()
-    }
-
-    fn priority(&self) -> u32 {
-        self.slot.priority
+    fn tracked_kind(&self) -> Option<RouteKind> {
+        tracked_kind(self.kind, self.protocol)
     }
 
     fn preference(&self) -> RoutePreference {
         RoutePreference::Medium
     }
 
-    fn kind(&self) -> RouteKind {
-        self.kind
+    fn ecmp(&self) -> bool {
+        false
+    }
+
+    fn slot_matches(slot: &RouteSlotV4, addr: Ipv4Addr) -> bool {
+        slot.tos == 0 && slot.dst.contains(addr)
+    }
+
+    fn slot_rank(slot: &RouteSlotV4) -> (Reverse<u8>, u32, u32) {
+        (
+            Reverse(slot.dst.prefix_len()),
+            slot.priority,
+            slot.table.get(),
+        )
     }
 }
 
@@ -716,252 +807,377 @@ impl MirroredRoute for KernelRouteV6 {
         &self.slot
     }
 
-    fn is_same_route(&self, other: &Self) -> bool {
-        self.slot == other.slot && self.next_hop == other.next_hop
+    fn identity(&self) -> u64 {
+        hash_of(&self.next_hop)
     }
 
-    fn matches(&self, addr: Ipv6Addr) -> bool {
-        self.slot.src.is_default() && self.slot.dst.contains(addr)
+    fn same_identity(&self, other: &Self) -> bool {
+        self.next_hop == other.next_hop
     }
 
-    fn prefix_len(&self) -> u8 {
-        self.slot.dst.prefix_len()
-    }
-
-    fn priority(&self) -> u32 {
-        self.slot.priority
+    fn tracked_kind(&self) -> Option<RouteKind> {
+        tracked_kind(self.kind, self.protocol)
     }
 
     fn preference(&self) -> RoutePreference {
         self.preference
     }
 
-    fn kind(&self) -> RouteKind {
-        self.kind
+    fn ecmp(&self) -> bool {
+        self.qualifies_for_ecmp()
+    }
+
+    fn slot_matches(slot: &RouteSlotV6, addr: Ipv6Addr) -> bool {
+        slot.src.is_default() && slot.dst.contains(addr)
+    }
+
+    fn slot_rank(slot: &RouteSlotV6) -> (Reverse<u8>, u32, u32) {
+        (
+            Reverse(slot.dst.prefix_len()),
+            slot.priority,
+            slot.table.get(),
+        )
     }
 }
 
-/// An ordered mirror of one family's kernel routes.
-///
-/// Routes in the same slot are kept next to each other and in kernel order,
-/// so "the first route of a slot" means the same thing here as in the kernel.
-/// Every mutation returns `true` only when the stored routes changed.
-#[derive(Debug, Clone)]
-pub(crate) struct RouteList<R> {
-    routes: Vec<R>,
+/// One mirrored route. Routes lookups never use are kept only as an identity
+/// hash, so a full BGP table installed in the kernel costs little memory. A
+/// tracked route keeps its typed kind, so a lookup can classify it without a
+/// fallible conversion.
+#[derive(Debug, Clone, PartialEq)]
+enum Entry<R> {
+    Tracked { kind: RouteKind, route: Box<R> },
+    Untracked { identity: u64, ecmp: bool },
 }
 
-impl<R> Default for RouteList<R> {
+impl<R: MirroredRoute> Entry<R> {
+    fn new(route: R) -> Self {
+        if let Some(kind) = route.tracked_kind() {
+            Self::Tracked {
+                kind,
+                route: Box::new(route),
+            }
+        } else {
+            Self::Untracked {
+                identity: route.identity(),
+                ecmp: route.ecmp(),
+            }
+        }
+    }
+
+    /// An entry for a route whose type and protocol are unknown (an IPv6
+    /// sibling leg the message does not describe). It is never used for
+    /// lookups until a message describing it arrives.
+    fn unknown_origin(route: &R) -> Self {
+        Self::Untracked {
+            identity: route.identity(),
+            ecmp: route.ecmp(),
+        }
+    }
+
+    fn is(&self, route: &R) -> bool {
+        match self {
+            Self::Tracked { route: r, .. } => r.same_identity(route),
+            Self::Untracked { identity, .. } => *identity == route.identity(),
+        }
+    }
+
+    fn is_tracked(&self) -> bool {
+        matches!(self, Self::Tracked { .. })
+    }
+
+    fn ecmp(&self) -> bool {
+        match self {
+            Self::Tracked { route, .. } => route.ecmp(),
+            Self::Untracked { ecmp, .. } => *ecmp,
+        }
+    }
+
+    fn route(&self) -> Option<&R> {
+        self.tracked().map(|(route, _)| route)
+    }
+
+    fn tracked(&self) -> Option<(&R, RouteKind)> {
+        match self {
+            Self::Tracked { kind, route } => Some((route, *kind)),
+            Self::Untracked { .. } => None,
+        }
+    }
+}
+
+/// The routes of one slot, in kernel order. Almost every slot holds one route.
+type Group<R> = SmallVec<[Entry<R>; 1]>;
+
+/// Where a new route goes within its slot.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Position {
+    /// Before the slot's routes (IPv4 `NLM_F_CREATE` without `NLM_F_APPEND`).
+    Front,
+    /// After the slot's routes (IPv4 `NLM_F_APPEND`, every IPv6 add, dumps).
+    Back,
+}
+
+/// A mirror of one family's kernel routes, grouped by slot in kernel order.
+///
+/// It holds **every** route the kernel reports, including ones lookups never
+/// use (BGP, non-unicast), because the kernel's replace rules act on the
+/// slot's real order: a replacement displaces "the first alias", whatever it
+/// is. Lookups only visit slots that hold a tracked route.
+///
+/// Every mutation returns `true` only when the tracked routes changed, so BGP
+/// route churn never signals a change.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteMirror<R: MirroredRoute> {
+    slots: HashMap<R::Slot, Group<R>>,
+    /// Slots holding at least one tracked route.
+    tracked: HashSet<R::Slot>,
+}
+
+impl<R: MirroredRoute> Default for RouteMirror<R> {
     fn default() -> Self {
-        Self { routes: Vec::new() }
+        Self {
+            slots: HashMap::new(),
+            tracked: HashSet::new(),
+        }
     }
 }
 
 // The mutation methods are called only by the Linux netlink adapter (and the
 // tests); on other platforms the snapshot stays empty.
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-impl<R: MirroredRoute> RouteList<R> {
-    /// Number of stored routes.
+impl<R: MirroredRoute> RouteMirror<R> {
+    /// Number of mirrored routes, tracked or not.
     #[cfg(test)]
-    #[must_use]
     pub fn len(&self) -> usize {
-        self.routes.len()
+        self.slots.values().map(SmallVec::len).sum()
     }
 
-    /// Returns `true` when no routes are stored.
+    /// Returns `true` when no routes are mirrored.
     #[cfg(test)]
-    #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.slots.is_empty()
     }
 
-    /// Stored routes in mirror order.
+    /// The identity hash of each route in `slot`, in kernel order, with
+    /// whether it is tracked.
+    #[cfg(test)]
+    pub fn slot_order(&self, slot: &R::Slot) -> Vec<(u64, bool)> {
+        self.slots.get(slot).map_or_else(Vec::new, |g| {
+            g.iter()
+                .map(|e| match e {
+                    Entry::Tracked { route, .. } => (route.identity(), true),
+                    Entry::Untracked { identity, .. } => (*identity, false),
+                })
+                .collect()
+        })
+    }
+
+    /// Tracked routes; within a slot in kernel order.
     pub fn iter(&self) -> impl Iterator<Item = &R> {
-        self.routes.iter()
+        self.tracked
+            .iter()
+            .filter_map(|s| self.slots.get(s))
+            .flat_map(|g| g.iter().filter_map(Entry::route))
     }
 
-    /// Returns `true` if the same kernel route is stored.
-    #[must_use]
+    /// Returns `true` if the same kernel route is mirrored, tracked or not.
     pub fn contains(&self, route: &R) -> bool {
-        self.routes.iter().any(|r| r.is_same_route(route))
-    }
-
-    fn first_in_slot(&self, slot: &R::Slot) -> Option<usize> {
-        self.routes.iter().position(|r| r.slot() == slot)
-    }
-
-    fn last_in_slot(&self, slot: &R::Slot) -> Option<usize> {
-        self.routes.iter().rposition(|r| r.slot() == slot)
-    }
-
-    /// Adds `route` at the front of its slot, unless it is already stored.
-    ///
-    /// This is IPv4 `NLM_F_CREATE` without `NLM_F_APPEND`: the kernel inserts
-    /// before the slot's first alias.
-    pub fn insert_front(&mut self, route: R) -> bool {
-        if self.contains(&route) {
-            return false;
-        }
-        match self.first_in_slot(route.slot()) {
-            Some(i) => self.routes.insert(i, route),
-            None => self.routes.push(route),
-        }
-        true
-    }
-
-    /// Adds `route` at the end of its slot, unless it is already stored.
-    ///
-    /// This is IPv4 `NLM_F_APPEND`, every IPv6 add (`fib6_add_rt2node` links a
-    /// new route after all routes of the same metric), and kernel dump order.
-    pub fn insert_back(&mut self, route: R) -> bool {
-        if self.contains(&route) {
-            return false;
-        }
-        match self.last_in_slot(route.slot()) {
-            Some(i) => self.routes.insert(i + 1, route),
-            None => self.routes.push(route),
-        }
-        true
-    }
-
-    /// Removes exactly the kernel route `route`. Other routes in the same slot
-    /// survive.
-    pub fn remove(&mut self, route: &R) -> bool {
-        match self.routes.iter().position(|r| r.is_same_route(route)) {
-            Some(i) => {
-                self.routes.remove(i);
-                true
-            }
-            None => false,
-        }
+        self.slots
+            .get(route.slot())
+            .is_some_and(|g| g.iter().any(|e| e.is(route)))
     }
 
     /// The route a best-effort kernel lookup would select for `addr`, of any
-    /// kind.
-    ///
-    /// Longest matching prefix first, then lowest priority, then (IPv6) the
-    /// highest [`RoutePreference`], then mirror order. Negative routes take
-    /// part like any other: the kernel picks the route before it looks at its
-    /// type. With several tables mirrored, they are compared as one table:
-    /// policy routing rules are not modelled.
-    #[must_use]
-    pub fn lookup(&self, addr: R::Addr) -> Option<&R> {
+    /// tracked kind, with that kind: longest matching prefix, then lowest
+    /// priority, then (IPv6) the highest [`RoutePreference`] among the slot's
+    /// tracked routes, then the first of those in kernel order. Negative
+    /// routes take part like any other: the kernel picks the route before it
+    /// looks at its type. With several tables mirrored, they are compared as
+    /// one table (lowest ID wins a tie): policy routing rules are not
+    /// modelled.
+    fn select(&self, addr: R::Addr) -> Option<(&R, RouteKind)> {
+        let slot = self
+            .tracked
+            .iter()
+            .filter(|s| R::slot_matches(s, addr))
+            .min_by_key(|s| R::slot_rank(s))?;
         // `min_by_key` returns the first of several equal minima, which keeps
         // kernel order as the last tie-breaker.
-        self.routes
+        self.slots
+            .get(slot)?
             .iter()
-            .filter(|r| r.matches(addr))
-            .min_by_key(|r| {
-                (
-                    Reverse(r.prefix_len()),
-                    r.priority(),
-                    Reverse(r.preference()),
-                )
-            })
+            .filter_map(Entry::tracked)
+            .min_by_key(|(route, _)| Reverse(route.preference()))
+    }
+
+    /// The route a best-effort kernel lookup would select for `addr`, of any
+    /// tracked kind (see [`resolve`](Self::resolve) for the outcome).
+    #[cfg(test)]
+    pub fn lookup(&self, addr: R::Addr) -> Option<&R> {
+        self.select(addr).map(|(route, _)| route)
     }
 
     /// How a best-effort kernel lookup for `addr` ends: the selected route
-    /// (see [`lookup`](Self::lookup)) classified by its kind.
-    #[must_use]
+    /// classified by its kind.
     pub fn resolve(&self, addr: R::Addr) -> FibLookup<'_, R> {
-        match self.lookup(addr) {
+        match self.select(addr) {
             None => FibLookup::NoRoute,
-            Some(route) => match route.kind() {
-                RouteKind::Unicast => FibLookup::Forward(route),
-                RouteKind::Reject(kind) => FibLookup::Reject { route, kind },
-                RouteKind::Throw => FibLookup::Throw(route),
-            },
+            Some((route, RouteKind::Unicast)) => FibLookup::Forward(route),
+            Some((route, RouteKind::Reject(kind))) => FibLookup::Reject { route, kind },
+            Some((route, RouteKind::Throw)) => FibLookup::Throw(route),
         }
+    }
+
+    /// The tracked routes of `slot`, in kernel order. Slots are tiny, so
+    /// comparing this before and after a replace is cheap and exact.
+    fn tracked_in(&self, slot: &R::Slot) -> Vec<R> {
+        self.slots.get(slot).map_or_else(Vec::new, |g| {
+            g.iter().filter_map(Entry::route).cloned().collect()
+        })
+    }
+
+    /// Recomputes `slot`'s tracked flag and drops it if empty.
+    fn settle(&mut self, slot: R::Slot) {
+        match self.slots.get(&slot) {
+            Some(g) if g.is_empty() => {
+                self.slots.remove(&slot);
+                self.tracked.remove(&slot);
+            }
+            Some(g) if g.iter().any(Entry::is_tracked) => {
+                self.tracked.insert(slot);
+            }
+            _ => {
+                self.tracked.remove(&slot);
+            }
+        }
+    }
+
+    fn insert_entry(&mut self, slot: R::Slot, entry: Entry<R>, at: Position) {
+        let group = self.slots.entry(slot).or_default();
+        match at {
+            Position::Front => group.insert(0, entry),
+            Position::Back => group.push(entry),
+        }
+        self.settle(slot);
+    }
+
+    /// Adds `route` to its slot unless it is already mirrored.
+    pub fn insert(&mut self, route: R, at: Position) -> bool {
+        if self.contains(&route) {
+            return false;
+        }
+        let tracked = route.tracked_kind().is_some();
+        let slot = *route.slot();
+        self.insert_entry(slot, Entry::new(route), at);
+        tracked
+    }
+
+    /// Adds `route`, or updates it in place if already mirrored. Used when the
+    /// message describes this very route, so its type and protocol are known.
+    pub fn upsert(&mut self, route: R, at: Position) -> bool {
+        let slot = *route.slot();
+        let Some(i) = self
+            .slots
+            .get(&slot)
+            .and_then(|g| g.iter().position(|e| e.is(&route)))
+        else {
+            return self.insert(route, at);
+        };
+        let before = self.tracked_in(&slot);
+        let group = self.slots.get_mut(&slot).expect("slot exists");
+        group[i] = Entry::new(route);
+        self.settle(slot);
+        self.tracked_in(&slot) != before
+    }
+
+    /// Adds a route whose type and protocol the message does not give (see
+    /// [`Entry::unknown_origin`]) unless it is already mirrored.
+    pub fn insert_unknown_origin(&mut self, route: &R) -> bool {
+        if !self.contains(route) {
+            self.insert_entry(*route.slot(), Entry::unknown_origin(route), Position::Back);
+        }
+        false
+    }
+
+    /// Removes exactly the kernel route `route`; other routes of the slot stay.
+    pub fn remove(&mut self, route: &R) -> bool {
+        let slot = *route.slot();
+        let Some(group) = self.slots.get_mut(&slot) else {
+            return false;
+        };
+        let Some(i) = group.iter().position(|e| e.is(route)) else {
+            return false;
+        };
+        let removed = group.remove(i);
+        self.settle(slot);
+        removed.is_tracked()
     }
 }
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-impl RouteList<KernelRouteV4> {
+impl RouteMirror<KernelRouteV4> {
     /// Applies an IPv4 `RTM_NEWROUTE` carrying `NLM_F_REPLACE`.
     ///
-    /// `fib_table_insert` replaces the first alias of the slot in place and
-    /// sends no `RTM_DELROUTE` for it. `new` is `None` when the replacing route
-    /// is one this mirror does not track; the displaced route is still removed.
-    /// If no stored route is displaced (the kernel displaced an untracked one),
-    /// `new` is added to the slot.
-    pub fn replace(&mut self, slot: &RouteSlotV4, new: Option<KernelRouteV4>) -> bool {
-        let Some(first) = self.first_in_slot(slot) else {
-            return new.is_some_and(|n| self.insert_back(n));
+    /// `fib_table_insert` replaces the slot's first alias in place (`fa =
+    /// fa_first`), whatever its type or protocol, and sends no `RTM_DELROUTE`
+    /// for it. If the new alias already exists in the slot the kernel changes
+    /// nothing (`fa_match`).
+    pub fn replace(&mut self, new: KernelRouteV4) -> bool {
+        let slot = new.slot;
+        let Some(group) = self.slots.get_mut(&slot) else {
+            return self.insert(new, Position::Back);
         };
-        match new {
-            // Already the slot's first alias, or a duplicate further down: the
-            // kernel returns 0 or -EEXIST and changes nothing.
-            Some(n) if self.contains(&n) => false,
-            Some(n) => {
-                self.routes[first] = n;
-                true
-            }
-            None => {
-                self.routes.remove(first);
-                true
-            }
+        if group.iter().any(|e| e.is(&new)) {
+            return false;
         }
+        let before = self.tracked_in(&slot);
+        self.slots.get_mut(&slot).expect("slot exists")[0] = Entry::new(new);
+        self.settle(slot);
+        self.tracked_in(&slot) != before
     }
 }
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-impl RouteList<KernelRouteV6> {
-    /// Applies an IPv6 `RTM_NEWROUTE` carrying `NLM_F_REPLACE`.
+impl RouteMirror<KernelRouteV6> {
+    /// Applies an IPv6 `RTM_NEWROUTE` carrying `NLM_F_REPLACE` for `new`.
     ///
     /// `fib6_add_rt2node` replaces the first route of the metric group whose
     /// ECMP eligibility equals the new route's, or the group's first route if
     /// none does. If the displaced route had ECMP siblings, every ECMP route of
     /// the group is removed too ("Replacing an ECMP route, remove all
-    /// siblings"). No `RTM_DELROUTE` is sent for any of them.
-    ///
-    /// `new_is_ecmp` is the replacing route's ECMP eligibility, which is needed
-    /// even when `new` is `None` because the route is not tracked.
-    pub fn replace(
-        &mut self,
-        slot: &RouteSlotV6,
-        new_is_ecmp: bool,
-        new: Option<KernelRouteV6>,
-    ) -> bool {
-        let victim = self
-            .routes
-            .iter()
-            .position(|r| &r.slot == slot && r.qualifies_for_ecmp() == new_is_ecmp)
-            .or_else(|| self.first_in_slot(slot));
-        let Some(victim) = victim else {
-            return new.is_some_and(|n| self.insert_back(n));
+    /// siblings"). No `RTM_DELROUTE` is sent for any of them, and there is no
+    /// duplicate check.
+    pub fn replace(&mut self, new: KernelRouteV6) -> bool {
+        let slot = new.slot;
+        let Some(group) = self.slots.get_mut(&slot) else {
+            return self.insert(new, Position::Back);
         };
-
-        let had_siblings = self.routes[victim].qualifies_for_ecmp()
-            && self
-                .routes
+        let new_is_ecmp = new.qualifies_for_ecmp();
+        let victim = group
+            .iter()
+            .position(|e| e.ecmp() == new_is_ecmp)
+            .unwrap_or(0);
+        let had_siblings = group[victim].ecmp()
+            && group
                 .iter()
                 .enumerate()
-                .any(|(i, r)| i != victim && &r.slot == slot && r.qualifies_for_ecmp());
-
-        if !had_siblings && new.as_ref() == Some(&self.routes[victim]) {
-            return false;
-        }
-
-        // Siblings sit after the victim (it is the group's first ECMP route),
-        // so removing them leaves the victim's index unchanged.
+                .any(|(i, e)| i != victim && e.ecmp());
+        let before = self.tracked_in(&slot);
+        let group = self.slots.get_mut(&slot).expect("slot exists");
         if had_siblings {
+            // Siblings follow the victim (it is the group's first ECMP route),
+            // so removing them leaves the victim's index unchanged.
             let mut i = 0;
-            self.routes.retain(|r| {
-                let sibling = i != victim && &r.slot == slot && r.qualifies_for_ecmp();
+            group.retain(|e| {
+                let sibling = i != victim && e.ecmp();
                 i += 1;
                 !sibling
             });
         }
-        // `fib6_add_rt2node` does no duplicate check on replace, so neither
-        // does this: an identical route elsewhere in the group is left alone,
-        // exactly as the kernel leaves it.
-        match new {
-            Some(n) => self.routes[victim] = n,
-            None => {
-                self.routes.remove(victim);
-            }
-        }
-        true
+        group[victim] = Entry::new(new);
+        self.settle(slot);
+        self.tracked_in(&slot) != before
     }
 }
 

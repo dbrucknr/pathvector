@@ -103,9 +103,9 @@ or IGP routes when running tools like `ip route show proto bgp`.
 
 ### Reading the kernel FIB: route identity
 
-`KernelFib` keeps a `FibSnapshot` of the kernel's IGP routes (unicast, blackhole,
-unreachable, prohibit and throw routes not tagged `RTPROT_BGP`) and answers next-hop
-reachability and IGP-metric queries from it.
+`KernelFib` keeps a `FibSnapshot` of the kernel routing table and answers next-hop
+reachability and IGP-metric queries from its *tracked* routes: unicast, blackhole,
+unreachable, prohibit and throw routes not installed by BGP (`RTPROT_BGP`).
 
 A prefix does not identify a kernel route. Linux keeps several routes for one prefix,
 and the snapshot stores each under the identity the kernel itself uses:
@@ -113,7 +113,7 @@ and the snapshot stores each under the identity the kernel itself uses:
 | Family | Slot (the kernel's grouping) | Route within the slot |
 |---|---|---|
 | IPv4 | table, prefix, TOS, priority (`fib_table_insert`: "[prefix,dscp,priority]") | type, protocol, scope, preferred source, next hop(s) |
-| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route); the type is recorded but, as in `rt6_duplicate_nexthop`, not compared |
+| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route); type, protocol and preference are recorded but, as in `rt6_duplicate_nexthop`, not compared |
 
 Prefixes are validated newtypes (`Ipv4Prefix`, `Ipv6Prefix`: length within range, no
 host bits) and table IDs cannot be zero (`TableId`), so a route identity can only hold
@@ -121,14 +121,28 @@ values the kernel can report. `RTM_DELROUTE` removes exactly the route it names.
 `RTM_NEWROUTE` with `NLM_F_REPLACE` displaces the route the kernel replaced, which never
 gets an `RTM_DELROUTE` of its own.
 
+Every route is mirrored, tracked or not, because the kernel's replace rules act on a
+slot's real order: if a BGP alias sits ahead of a static alias, replacing the BGP alias
+must leave the static one in place. Untracked routes are kept only as a 64-bit identity
+hash. They never count for reachability and never signal a change, so BGP route churn
+does not wake the decision process. The cost is memory proportional to the kernel
+table: about 86 MB for 1M BGP routes in the tracked table (≈170 MB peak while the hash
+table grows; release build, M2 Max). Inserts and deletes are hashed, about 0.26 µs each.
+
+An IPv6 multipath message describes only its first leg; the other legs carry no protocol
+of their own, and Linux lets one ECMP set mix static and BGP routes. Legs the message
+does not describe are mirrored as untracked until a message that describes them arrives
+(each sibling's own dump message does that).
+
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
 as the kernel does. For IPv6, routes of that priority are then ranked by router
 preference (`RTA_PREF`; `rt6_score_route` adds `IPV6_DECODE_PREF(pref) << 2`, and
 `find_match` keeps only a strictly better score), and only then by list order. Negative
 IPv6 routes are always medium preference: `ip6_route_info_create` overwrites a reject
-route's flags with `RTF_REJECT | RTF_NONEXTHOP`, dropping `RTF_PREF`. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
-kept but not selected, because a best-effort lookup from an unspecified source cannot
-use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes.
+route's flags with `RTF_REJECT | RTF_NONEXTHOP`, dropping `RTF_PREF`. IPv4 routes with a
+non-zero TOS and IPv6 source-specific routes are kept but not selected, because a
+best-effort lookup from an unspecified source cannot use them.
+`FibSnapshot::routes_v4` / `routes_v6` list the tracked routes.
 
 ### Reading the kernel FIB: negative routes
 
@@ -168,19 +182,25 @@ one table and does not model rules, so it reports a throw as "no route in the mi
 table": not reachable. If you use policy rules that send thrown traffic to another
 table, the oracle does not follow them.
 
-`FibWriter`'s own RFC 7999 blackholes carry `RTPROT_BGP` and stay excluded, like every
+`FibWriter`'s own RFC 7999 blackholes carry `RTPROT_BGP` and stay untracked, like every
 BGP route (see "BGP route exclusion" in the `fib` module docs).
 
 Known limits:
 
-- Routes the snapshot does not track (BGP-installed routes and the `local`,
-  `broadcast`, `anycast`, `multicast` types) are not mirrored, so if one sits ahead of a
-  tracked route in the same IPv4 slot, an `NLM_F_REPLACE` may displace the wrong one in
-  the mirror.
+- A leg added by an IPv6 multipath `NLM_F_APPEND` request is reported under the set's
+  first (older) sibling, so its protocol is unknown. It stays untracked until a dump
+  or delete describes it, so a static leg added that way is not used for reachability
+  until then.
+- Untracked identities are compared by a 64-bit hash within one slot; a collision
+  between two routes of the same slot is possible in principle but negligible.
+- IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
+- With table `0` (all tables) the tables are compared as one; policy routing rules are
+  not modelled.
+- IPv6 ECMP eligibility uses `RTPROT_RA` as a stand-in for the kernel's `RTF_ADDRCONF`
+  flag, which netlink does not expose.
 - A route through a nexthop object (`RTA_NH_ID`) is classified by the type the kernel
   reports. The kernel reports a route through a blackhole nexthop as `blackhole`, but
-  changing the nexthop object later sends no route notification, and the object's own
-  state (dead, link down) is not checked.
+  changing the nexthop object later sends no route notification.
 - An IPv6 unicast route via the loopback device is turned into a reject route by the
   kernel (`fib6_is_reject`) but still reported as unicast, so the oracle treats it as
   reachable.
@@ -188,11 +208,6 @@ Known limits:
   kernel's round-robin pointer (`fn->rr_ptr`, moved only when a gateway's neighbour
   fails), neighbour reachability, or the early return `__find_rr_leaf` takes for a route
   through a blackhole nexthop object.
-- IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
-- With table `0` (all tables) the tables are compared as one; policy routing rules are
-  not modelled.
-- IPv6 ECMP eligibility uses `RTPROT_RA` as a stand-in for the kernel's `RTF_ADDRCONF`
-  flag, which netlink does not expose.
 
 ---
 

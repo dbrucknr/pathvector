@@ -7,6 +7,9 @@
 //!   unreachable. These tests compare the oracle with the kernel's own lookup
 //!   (`RTM_GETROUTE` for one destination, which is what `ip route get` sends).
 //!
+//! The tests run in parallel in one namespace, so each uses its own prefixes
+//! and interfaces (prefixed `pvtest`), and none adds a real default route.
+//!
 //! These tests add and delete real routes, so they are `#[ignore]`d and must
 //! run inside a **disposable network namespace** with `CAP_NET_ADMIN`:
 //!
@@ -23,10 +26,9 @@
 //! (`tunl0`, `sit0`, ...), which start down; a host namespace has up NICs.
 //!
 //! What the kernel does here is described in `net/ipv4/fib_trie.c`
-//! (`fib_table_insert` keys aliases by "[prefix,dscp,priority]";
-//! `fib_table_lookup` returns the selected alias's `fib_props` error) and
+//! (`fib_table_insert` keys aliases by "[prefix,dscp,priority]") and
 //! `net/ipv6/ip6_fib.c` (`fib6_add_rt2node` keeps one route per metric for a
-//! given next hop), with `net/ipv6/route.c` (`fib6_prop`) for IPv6 errors.
+//! given next hop).
 
 #![cfg(target_os = "linux")]
 
@@ -36,11 +38,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::TryStreamExt;
-use netlink_packet_route::route::RouteMessage;
+use futures::{StreamExt, TryStreamExt};
+use netlink_packet_core::{
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+};
 use netlink_packet_route::{
+    RouteNetlinkMessage,
     link::{LinkAttribute, LinkFlags},
-    route::{RouteAttribute, RoutePreference, RouteScope, RouteType},
+    route::{RouteAttribute, RouteMessage, RoutePreference, RouteProtocol, RouteScope, RouteType},
 };
 use pathvector_sys::{
     FibSnapshot, KernelFib, RT_TABLE_MAIN,
@@ -316,6 +321,186 @@ async fn initial_dump_keeps_both_priorities() {
     );
     drop(s);
     task.abort();
+}
+
+// ── PR #122 review: untracked routes sharing a slot or ECMP set ──────────────
+
+/// Sends `RTM_NEWROUTE` with exactly `flags` (rtnetlink's builder only offers
+/// EXCL or REPLACE) and panics if the kernel rejects it.
+async fn new_route_with_flags(handle: &Handle, route: RouteMessage, flags: u16) {
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(route));
+    req.header.flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+    let mut responses = handle.clone().request(req).expect("send RTM_NEWROUTE");
+    while let Some(msg) = responses.next().await {
+        if let NetlinkPayload::Error(e) = msg.payload {
+            assert!(e.code.is_none(), "kernel rejected RTM_NEWROUTE: {e:?}");
+        }
+    }
+}
+
+fn v6_via(dst: Ipv6Addr, gw: &str, oif: u32, protocol: RouteProtocol) -> RouteMessage {
+    RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(dst, 64)
+        .gateway(gw.parse().unwrap())
+        .output_interface(oif)
+        .priority(10)
+        .protocol(protocol)
+        .build()
+}
+
+fn v4_route(dst: Ipv4Addr, gw: Option<&str>, oif: u32, protocol: RouteProtocol) -> RouteMessage {
+    let mut b = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(dst, 24)
+        .output_interface(oif)
+        .priority(10)
+        .protocol(protocol);
+    b = match gw {
+        Some(gw) => b.gateway(gw.parse().unwrap()),
+        None => b.scope(RouteScope::Link),
+    };
+    b.build()
+}
+
+async fn del(handle: &Handle, route: RouteMessage) {
+    handle
+        .route()
+        .del(route)
+        .execute()
+        .await
+        .expect("delete route");
+}
+
+/// Adds a marker route and waits for it, so every earlier event has been
+/// applied (the kernel delivers notifications in order).
+async fn barrier_v4(handle: &Handle, snap: &Arc<RwLock<FibSnapshot>>, oif: u32, dst: Ipv4Addr) {
+    add_v4(handle, dst, 24, oif, 1).await;
+    eventually(snap, "marker route", |s| count_v4(s, dst) == 1).await;
+}
+
+async fn barrier_v6(handle: &Handle, snap: &Arc<RwLock<FibSnapshot>>, oif: u32, dst: Ipv6Addr) {
+    add_v6(handle, dst, 64, oif, 1).await;
+    eventually(snap, "marker route", |s| count_v6(s, dst) == 1).await;
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn mixed_protocol_ipv6_ecmp_leaves_nothing_after_both_deletes() {
+    // A static and a BGP route appended into one ECMP set. rt6_fill_node
+    // reports each with the other as an RTA_MULTIPATH leg under its own
+    // protocol, so the BGP leg must not be taken for static.
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest56d").await;
+    let dump_dst: Ipv6Addr = "2001:db8:99::".parse().unwrap();
+    let live_dst: Ipv6Addr = "2001:db8:9a::".parse().unwrap();
+    let append = NLM_F_CREATE | NLM_F_APPEND;
+
+    // Present before the initial dump.
+    new_route_with_flags(
+        &handle,
+        v6_via(dump_dst, "fe80::1", oif, RouteProtocol::Static),
+        append,
+    )
+    .await;
+    new_route_with_flags(
+        &handle,
+        v6_via(dump_dst, "fe80::2", oif, RouteProtocol::Bgp),
+        append,
+    )
+    .await;
+    let (snap, task) = start_fib().await;
+    // And added while running.
+    new_route_with_flags(
+        &handle,
+        v6_via(live_dst, "fe80::1", oif, RouteProtocol::Static),
+        append,
+    )
+    .await;
+    new_route_with_flags(
+        &handle,
+        v6_via(live_dst, "fe80::2", oif, RouteProtocol::Bgp),
+        append,
+    )
+    .await;
+    barrier_v6(&handle, &snap, oif, "2001:db8:98::".parse().unwrap()).await;
+
+    for (dst, probe) in [(dump_dst, "2001:db8:99::1"), (live_dst, "2001:db8:9a::1")] {
+        let probe: Ipv6Addr = probe.parse().unwrap();
+        {
+            let s = snap.read().unwrap();
+            assert_eq!(count_v6(&s, dst), 1, "only the static sibling is tracked");
+            assert_eq!(s.igp_metric_v6(probe), Some(10));
+        }
+        del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Static)).await;
+        del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Bgp)).await;
+    }
+    barrier_v6(&handle, &snap, oif, "2001:db8:97::".parse().unwrap()).await;
+    let s = snap.read().unwrap();
+    assert_eq!(s.igp_metric_v6("2001:db8:99::1".parse().unwrap()), None);
+    assert_eq!(s.igp_metric_v6("2001:db8:9a::1".parse().unwrap()), None);
+    drop(s);
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn replacing_a_leading_bgp_alias_keeps_the_static_alias() {
+    // Slot order [BGP, static] (BGP prepended with NLM_F_CREATE only). An
+    // NLM_F_REPLACE of BGP replaces `fa_first`, the BGP alias.
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest56e").await;
+    handle
+        .address()
+        .add(oif, "192.0.2.100".parse().unwrap(), 24)
+        .execute()
+        .await
+        .expect("address for the BGP gateways");
+    let dump_dst: Ipv4Addr = "198.18.1.0".parse().unwrap();
+    let live_dst: Ipv4Addr = "198.18.3.0".parse().unwrap();
+
+    let setup = |dst| {
+        let handle = handle.clone();
+        async move {
+            add_static_then_prepend_bgp(&handle, dst, oif).await;
+        }
+    };
+    setup(dump_dst).await;
+    let (snap, task) = start_fib().await;
+    setup(live_dst).await;
+    barrier_v4(&handle, &snap, oif, "198.18.2.0".parse().unwrap()).await;
+
+    for dst in [dump_dst, live_dst] {
+        let replacement = v4_route(dst, Some("192.0.2.2"), oif, RouteProtocol::Bgp);
+        handle
+            .route()
+            .add(replacement)
+            .replace()
+            .execute()
+            .await
+            .expect("replace the BGP alias");
+    }
+    barrier_v4(&handle, &snap, oif, "198.18.4.0".parse().unwrap()).await;
+
+    // The kernel still has both aliases; the static one must still count.
+    let s = snap.read().unwrap();
+    assert_eq!(s.igp_metric_v4("198.18.1.7".parse().unwrap()), Some(10));
+    assert_eq!(s.igp_metric_v4("198.18.3.7".parse().unwrap()), Some(10));
+    drop(s);
+    task.abort();
+}
+
+async fn add_static_then_prepend_bgp(handle: &Handle, dst: Ipv4Addr, oif: u32) {
+    handle
+        .route()
+        .add(v4_route(dst, None, oif, RouteProtocol::Static))
+        .execute()
+        .await
+        .expect("static alias");
+    new_route_with_flags(
+        handle,
+        v4_route(dst, Some("192.0.2.1"), oif, RouteProtocol::Bgp),
+        NLM_F_CREATE,
+    )
+    .await;
 }
 
 // ── Issue #57: negative routes, compared with the kernel's own lookup ────────
@@ -629,7 +814,7 @@ async fn ipv6_negative_routes_beneath_a_covering_route_agree_with_the_kernel() {
 /// The initial dump: negative routes already present when the snapshot is
 /// built, in several arrangements, all checked against the kernel.
 ///
-/// The covering routes are `198.18.0.0/15` and `fd58::/16` rather than a
+/// The covering routes are `172.16.0.0/15` and `fd58::/16` rather than a
 /// default route, because the other tests in this file run in parallel in the
 /// same namespace and expect their own probes to be uncovered once they
 /// delete their routes.
@@ -639,46 +824,46 @@ async fn initial_dump_of_negative_routes_agrees_with_the_kernel() {
     let handle = connect();
     let oif = dummy(&handle, "pvtest57c").await;
     let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-    add_unicast(&handle, ip("198.18.0.0"), 15, oif, 0).await;
+    add_unicast(&handle, ip("172.16.0.0"), 15, oif, 0).await;
     add_unicast(&handle, ip("fd58::"), 16, oif, 1024).await;
 
     let mut probes = Vec::new();
     // One negative route per type beneath the covering route.
     for (i, kind) in NEGATIVE_TYPES.into_iter().enumerate() {
-        add_negative(&handle, ip(&format!("198.18.{i}.0")), 24, kind, 0).await;
+        add_negative(&handle, ip(&format!("172.16.{i}.0")), 24, kind, 0).await;
         add_negative(&handle, ip(&format!("fd58:{i}::")), 48, kind, 1024).await;
-        probes.push((ip(&format!("198.18.{i}.1")), rejected_with(kind)));
+        probes.push((ip(&format!("172.16.{i}.1")), rejected_with(kind)));
         probes.push((ip(&format!("fd58:{i}::1")), rejected_with(kind)));
     }
 
     // Same prefix, negative at the lower metric: the negative route wins.
-    add_unicast(&handle, ip("198.19.2.0"), 24, oif, 100).await;
-    add_negative(&handle, ip("198.19.2.0"), 24, RouteType::BlackHole, 10).await;
-    probes.push((ip("198.19.2.1"), rejected_with(RouteType::BlackHole)));
+    add_unicast(&handle, ip("172.17.2.0"), 24, oif, 100).await;
+    add_negative(&handle, ip("172.17.2.0"), 24, RouteType::BlackHole, 10).await;
+    probes.push((ip("172.17.2.1"), rejected_with(RouteType::BlackHole)));
     add_unicast(&handle, ip("fd58:100::"), 48, oif, 100).await;
     add_negative(&handle, ip("fd58:100::"), 48, RouteType::Prohibit, 10).await;
     probes.push((ip("fd58:100::1"), rejected_with(RouteType::Prohibit)));
 
     // Same prefix, negative at the higher metric: the unicast route wins.
-    add_unicast(&handle, ip("198.19.3.0"), 24, oif, 10).await;
-    add_negative(&handle, ip("198.19.3.0"), 24, RouteType::Unreachable, 100).await;
-    probes.push((ip("198.19.3.1"), Ok(())));
+    add_unicast(&handle, ip("172.17.3.0"), 24, oif, 10).await;
+    add_negative(&handle, ip("172.17.3.0"), 24, RouteType::Unreachable, 100).await;
+    probes.push((ip("172.17.3.1"), Ok(())));
     add_unicast(&handle, ip("fd58:101::"), 48, oif, 10).await;
     add_negative(&handle, ip("fd58:101::"), 48, RouteType::Unreachable, 100).await;
     probes.push((ip("fd58:101::1"), Ok(())));
 
     // A longer unicast route inside a negative prefix still forwards.
-    add_negative(&handle, ip("198.19.128.0"), 17, RouteType::Throw, 0).await;
-    add_unicast(&handle, ip("198.19.129.0"), 24, oif, 0).await;
-    probes.push((ip("198.19.129.1"), Ok(())));
-    probes.push((ip("198.19.130.1"), rejected_with(RouteType::Throw)));
+    add_negative(&handle, ip("172.17.128.0"), 17, RouteType::Throw, 0).await;
+    add_unicast(&handle, ip("172.17.129.0"), 24, oif, 0).await;
+    probes.push((ip("172.17.129.1"), Ok(())));
+    probes.push((ip("172.17.130.1"), rejected_with(RouteType::Throw)));
     add_negative(&handle, ip("fd58:200::"), 24, RouteType::Throw, 1024).await;
     add_unicast(&handle, ip("fd58:201::"), 32, oif, 1024).await;
     probes.push((ip("fd58:201::1"), Ok(())));
     probes.push((ip("fd58:202::1"), rejected_with(RouteType::Throw)));
 
     // Outside every negative route the covering route forwards.
-    probes.push((ip("198.19.0.1"), Ok(())));
+    probes.push((ip("172.17.0.1"), Ok(())));
     probes.push((ip("fd58:ffff::1"), Ok(())));
 
     let (snap, task) = start_fib().await;
@@ -690,23 +875,9 @@ async fn initial_dump_of_negative_routes_agrees_with_the_kernel() {
 
 /// `ip -6 route append`: `NLM_F_CREATE | NLM_F_APPEND` without `NLM_F_EXCL`,
 /// which `fib6_add_rt2node` would answer with `-EEXIST` for a second route of
-/// the same metric. rtnetlink's add request always sets one of `NLM_F_EXCL` /
-/// `NLM_F_REPLACE`, so the request is built here.
+/// the same metric.
 async fn append(handle: &Handle, msg: RouteMessage) {
-    use futures::StreamExt;
-    use netlink_packet_core::{
-        NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
-    };
-    use netlink_packet_route::RouteNetlinkMessage;
-
-    let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(msg));
-    req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND;
-    let mut responses = handle.clone().request(req).expect("send append request");
-    while let Some(resp) = responses.next().await {
-        if let NetlinkPayload::Error(e) = resp.payload {
-            assert!(e.code.is_none(), "append rejected: {e:?}");
-        }
-    }
+    new_route_with_flags(handle, msg, NLM_F_CREATE | NLM_F_APPEND).await;
 }
 
 fn unicast_v6_msg(dst: Ipv6Addr, len: u8, oif: u32, metric: u32) -> RouteMessage {

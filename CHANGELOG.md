@@ -6,7 +6,7 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ## 2026-11-23 (issue #57: negative kernel routes decide reachability)
 
-`pathvector-sys`'s FIB snapshot dropped every non-unicast route, so with a unicast
+`pathvector-sys`'s FIB snapshot ignored every non-unicast route for reachability, so with a unicast
 default route and a more-specific `blackhole`, `unreachable`, `prohibit` or `throw`
 route the oracle fell back to the default and reported the destination reachable, and
 BGP could pick a next hop the kernel deliberately cannot forward to. Confirmed on a live
@@ -16,9 +16,9 @@ kernel: beneath a blackhole the old snapshot said reachable while `RTM_GETROUTE`
 Linux selects the route first and only then looks at its type: `fib_table_lookup`
 returns the selected alias's `fib_props` error without backtracking to a shorter prefix,
 and `fib6_table_lookup` backtracks only when a node yields no route. The snapshot now
-tracks the four negative types (non-BGP), records the type in `KernelRouteV4` /
-`KernelRouteV6` (`RouteKind`; part of the IPv4 alias identity, not the IPv6 one, as in
-the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
+tracks the four negative types (non-BGP; `KernelRouteV4` / `KernelRouteV6::route_kind`
+gives the typed `RouteKind`; the type is part of the IPv4 alias identity, not the IPv6
+one, as in the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
 `NoRoute`). Only `Forward` counts as reachable or yields an IGP metric. A `throw` is
 reported as no route in the mirrored table, since policy rules are not modelled. New
 public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
@@ -26,14 +26,35 @@ public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
 forwarding routes.
 
 Review follow-up (Codex on PR #123, both reproduced on a live kernel): IPv6 selection
-now ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`)
-before list order, so a high-preference unicast route is no longer hidden by an earlier
-blackhole; and `is_v6_reachable` applies its link-local fallback only when no route
-covers the address, so a negative route over link-local space is honoured. IPv6
-`RTM_NEWROUTE` handling decodes each message once instead of twice. Proof:
+ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`) before
+list order, so a high-preference unicast route is not hidden by an earlier blackhole;
+and `is_v6_reachable` applies its link-local fallback only when no route covers the
+address, so a negative route over link-local space is honoured. Built on #122's
+full-table mirror: negative routes were already mirrored there, as untracked hashes;
+they are now tracked, and a tracked entry keeps its typed `RouteKind`. Proof:
 domain and property tests (the reference model now includes route types), netlink
 adapter tests, and live-kernel tests that compare every verdict with the kernel's own
 lookup.
+
+## 2026-11-23 (PR #122 review: untracked routes in a slot or ECMP set)
+
+Review found two cases where routes the snapshot does not use for reachability still
+mattered, both reproduced on a live kernel. (1) An IPv6 ECMP set mixing a static and a
+BGP route: `rt6_fill_node` reports the set under one route's protocol, so the BGP leg
+was recorded as static, its delete was then ignored, and the prefix stayed reachable
+after both routes were gone. (2) A BGP alias prepended ahead of a static alias: an
+`NLM_F_REPLACE` of the BGP alias removed the static alias from the snapshot, because the
+mirror did not know the BGP alias was first.
+
+The snapshot now mirrors every route in the tracked table and applies the tracking rule
+(unicast, not BGP) at lookup time. Untracked routes are stored as an identity hash, so
+the cost is about 86 MB per million kernel BGP routes; inserts and deletes are now
+hashed. An IPv6 multipath message's first leg is described by its header; other legs
+not yet seen take the header's protocol only for a create/replace (same request) and
+are otherwise untracked until described. Mutations report a change exactly when the
+tracked routes change. Proof: property tests against a kernel slot-list model including
+untracked routes and replaces, adapter tests, and two new live-kernel tests that fail on
+the previous commit.
 
 ## 2026-11-23 (issue #56: FIB snapshot keeps every route for a prefix)
 
