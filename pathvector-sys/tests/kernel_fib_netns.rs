@@ -5,7 +5,10 @@
 //! - issue #57: a negative route (blackhole, unreachable, prohibit, throw)
 //!   beneath a covering unicast route makes the covered destinations
 //!   unreachable. These tests compare the oracle with the kernel's own lookup
-//!   (`RTM_GETROUTE` for one destination, which is what `ip route get` sends).
+//!   (`RTM_GETROUTE` for one destination, which is what `ip route get` sends);
+//! - issue #59: when the kernel drops notifications because the socket's
+//!   receive buffer is full (`ENOBUFS`, netlink(7)), the snapshot reports the
+//!   loss and resynchronizes until it agrees with a fresh dump.
 //!
 //! The tests run in parallel in one namespace, so each uses its own prefixes
 //! and interfaces (prefixed `pvtest`), and none adds a real default route.
@@ -34,6 +37,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZeroU32,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -52,7 +56,7 @@ use netlink_packet_route::{
 };
 use pathvector_sys::{
     FibSnapshot, KernelFib, RT_TABLE_MAIN,
-    fib::{FibLookup, RejectKind},
+    fib::{FibLookup, FibStatus, KernelFibBuilder, RejectKind, ResyncBackoff},
 };
 use rtnetlink::{Handle, LinkDummy, RouteMessageBuilder};
 
@@ -188,18 +192,46 @@ async fn eventually(
     }
 }
 
-/// Starts a `KernelFib` on the main table and waits for its initial dump.
+/// Starts a `KernelFib` on the main table and waits until it is ready.
 async fn start_fib() -> (Arc<RwLock<FibSnapshot>>, tokio::task::JoinHandle<()>) {
-    let (fib, mut changes) = KernelFib::new(RT_TABLE_MAIN);
+    let (snap, _, task) = start_built_fib(KernelFib::builder(RT_TABLE_MAIN)).await;
+    (snap, task)
+}
+
+/// Starts a configured `KernelFib` and waits until it is ready.
+async fn start_built_fib(
+    builder: KernelFibBuilder,
+) -> (
+    Arc<RwLock<FibSnapshot>>,
+    tokio::sync::watch::Receiver<FibStatus>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (fib, mut changes) = builder.build();
     let snap = fib.snapshot();
+    let mut status = fib.status();
     let task = tokio::spawn(async move {
-        fib.spawn().await.expect("KernelFib event loop");
+        let err = fib.spawn().await.expect_err("only returns on failure");
+        panic!("KernelFib could not open a netlink socket: {err}");
     });
     tokio::time::timeout(Duration::from_secs(5), changes.changed())
         .await
         .expect("initial dump within 5 s")
         .expect("change channel open");
-    (snap, task)
+    wait_status(&mut status, "ready", |s| s.health().is_ready()).await;
+    (snap, status, task)
+}
+
+/// Waits until `pred` holds for the status, or panics after 30 s.
+async fn wait_status(
+    status: &mut tokio::sync::watch::Receiver<FibStatus>,
+    what: &str,
+    pred: impl FnMut(&FibStatus) -> bool,
+) -> FibStatus {
+    let waited = tokio::time::timeout(Duration::from_secs(30), async {
+        *status.wait_for(pred).await.expect("status channel open")
+    })
+    .await;
+    waited.unwrap_or_else(|_| panic!("timed out waiting for {what}: {:?}", *status.borrow()))
 }
 
 fn count_v4(s: &FibSnapshot, dst: Ipv4Addr) -> usize {
@@ -1148,5 +1180,89 @@ async fn negative_route_over_link_local_space_agrees_with_the_kernel() {
         // fallback, not a kernel comparison.
         assert!(reachable(&snap.read().unwrap(), probe), "{kind:?} removed");
     }
+    task.abort();
+}
+
+// ── Issue #59: recovery after notification loss ──────────────────────────────
+
+/// The snapshot's routes inside `10.59.0.0/16`, the prefix the loss test uses
+/// (no other test in this file touches it), sorted: the mirror is a hash map,
+/// so two snapshots may list the same slots in different orders.
+fn routes_in_10_59(s: &FibSnapshot) -> Vec<pathvector_sys::fib::KernelRouteV4> {
+    let mut routes: Vec<_> = s
+        .routes_v4()
+        .filter(|r| {
+            let o = r.slot.dst.addr().octets();
+            o[0] == 10 && o[1] == 59
+        })
+        .cloned()
+        .collect();
+    routes.sort_by_key(|r| (r.slot.dst.addr(), r.slot.dst.prefix_len(), r.slot.priority));
+    routes
+}
+
+/// netlink(7): "The kernel can't send a netlink message if the socket buffer
+/// is full: the message will be dropped [...] It is up to the application to
+/// detect when this happens (via the `ENOBUFS` error returned by recvmsg(2))
+/// and resynchronize."
+///
+/// The test's runtime is single-threaded, so while it blocks on another
+/// thread that adds 1000 routes, the `KernelFib` connection task cannot read
+/// its socket. A 1000-route burst does not fit in the (deliberately small)
+/// receive buffer, so the kernel drops notifications and reports `ENOBUFS`
+/// once the reader comes back. The snapshot must count the loss, recover
+/// without help, and then hold exactly what a fresh dump holds.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn notifications_lost_to_enobufs_are_recovered_by_a_resync() {
+    const ROUTES: u16 = 1000;
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest59a").await;
+    let backoff =
+        ResyncBackoff::new(Duration::from_millis(20), Duration::from_millis(500)).unwrap();
+    let (snap, mut status, task) = start_built_fib(
+        KernelFib::builder(RT_TABLE_MAIN)
+            .resync_backoff(backoff)
+            .receive_buffer(NonZeroU32::new(32 * 1024).unwrap()),
+    )
+    .await;
+    let before = *status.borrow();
+    assert_eq!(routes_in_10_59(&snap.read().unwrap()), []);
+
+    // Block this runtime (and so the connection task) while routes are added.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let writer = connect();
+            for i in 0..ROUTES {
+                let [hi, lo] = i.to_be_bytes();
+                add_v4(&writer, Ipv4Addr::new(10, 59, hi, lo), 32, oif, 0).await;
+            }
+        });
+    })
+    .join()
+    .expect("route writer thread");
+
+    // `losses` counts overruns and connection losses; the connection
+    // stays up here, so this is the ENOBUFS.
+    wait_status(&mut status, "the loss to be detected", |s| {
+        s.losses() > before.losses()
+    })
+    .await;
+    let ready = wait_status(&mut status, "recovery", |s| {
+        s.health().is_ready() && s.resyncs() > before.resyncs()
+    })
+    .await;
+    assert!(ready.resyncs() > before.resyncs(), "recovered by a redump");
+
+    // Agreement with a fresh dump, which never saw the loss.
+    let recovered = routes_in_10_59(&snap.read().unwrap());
+    assert_eq!(recovered.len(), usize::from(ROUTES), "every route is known");
+    let (fresh, _, fresh_task) = start_built_fib(KernelFib::builder(RT_TABLE_MAIN)).await;
+    assert_eq!(recovered, routes_in_10_59(&fresh.read().unwrap()));
+    fresh_task.abort();
     task.abort();
 }

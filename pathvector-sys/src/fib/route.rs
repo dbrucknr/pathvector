@@ -941,7 +941,10 @@ pub(crate) enum Position {
 ///
 /// Every mutation returns `true` only when the tracked routes changed, so BGP
 /// route churn never signals a change.
-#[derive(Debug, Clone)]
+///
+/// Two mirrors are equal when every slot holds the same routes in the same
+/// order, untracked identities included.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RouteMirror<R: MirroredRoute> {
     slots: HashMap<R::Slot, Group<R>>,
     /// Slots holding at least one tracked route.
@@ -985,6 +988,17 @@ impl<R: MirroredRoute> RouteMirror<R> {
                 })
                 .collect()
         })
+    }
+
+    /// Whether both mirrors hold the same tracked routes, slot by slot in
+    /// kernel order. Untracked routes (BGP, non-unicast) are ignored, as they
+    /// are by every lookup.
+    pub fn same_tracked(&self, other: &Self) -> bool {
+        self.tracked == other.tracked
+            && self
+                .tracked
+                .iter()
+                .all(|slot| self.tracked_in(slot) == other.tracked_in(slot))
     }
 
     /// Tracked routes; within a slot in kernel order.
