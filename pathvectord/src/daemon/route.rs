@@ -779,83 +779,6 @@ impl DaemonState {
     }
 }
 
-pub(crate) fn reapply_import_policy(
-    peer: PeerId,
-    adj_rib_in: &AdjRibIn<Ipv4Addr>,
-    loc_rib: &mut LocRib<Ipv4Addr>,
-    policy: &Policy<Route<Ipv4Addr>>,
-    oracle: &dyn NextHopOracle,
-) -> Vec<BestPathChange<Ipv4Addr>> {
-    let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-
-    for (nlri, raw_route) in adj_rib_in.routes() {
-        let mut route = raw_route.clone();
-        match policy.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route, oracle));
-                accepted += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle));
-                rejected += 1;
-            }
-        }
-    }
-
-    crate::metrics::on_import_reject(peer.ip(), rejected);
-    tracing::info!(
-        peer = %peer,
-        accepted,
-        rejected,
-        rib_size = loc_rib.len(),
-        "soft reconfig complete"
-    );
-    fib_changes
-}
-
-/// IPv6 counterpart of [`reapply_import_policy`].
-///
-/// Re-evaluates all IPv6 routes stored in `adj_rib_in` against `policy` and
-/// reconciles `loc_rib` with the result.  Called by [`DaemonState::set_import_default`]
-/// so that a policy reload applies to both address families without a session reset.
-pub(crate) fn reapply_import_policy_v6(
-    peer: PeerId,
-    adj_rib_in: &AdjRibIn<Ipv6Addr>,
-    loc_rib: &mut LocRib<Ipv6Addr>,
-    policy: &Policy<Route<Ipv6Addr>>,
-    oracle: &dyn NextHopOracle,
-) -> Vec<BestPathChange<Ipv6Addr>> {
-    let mut fib_changes: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-
-    for (nlri, raw_route) in adj_rib_in.routes() {
-        let mut route = raw_route.clone();
-        match policy.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route, oracle));
-                accepted += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle));
-                rejected += 1;
-            }
-        }
-    }
-
-    crate::metrics::on_import_reject(peer.ip(), rejected);
-    tracing::info!(
-        peer = %peer,
-        accepted,
-        rejected,
-        rib_size = loc_rib.len(),
-        "soft reconfig v6 complete"
-    );
-    fib_changes
-}
-
 // RFC 4271 §5.1.3 / §9.1.2 — NEXT_HOP validation.
 // Returns false for addresses that are forbidden as next-hops: unspecified,
 // loopback, multicast, and broadcast. The "own address" check (receiving
@@ -1374,14 +1297,14 @@ pub(super) fn handle_update(
     // difference is the next-hop source: traditional NLRIs use the NEXT_HOP
     // path attribute (optional); MP_REACH_NLRI carries next-hop inline
     // (mandatory) and takes precedence when present.
-    let mut accepted = 0usize;
+    // `rejected` counts announcements dropped *before* import policy (the
+    // `skip_announces`/invalid-NEXT_HOP transport-level drops and the RFC
+    // 7999 BLACKHOLE special case). `import_v4` counts import-policy
+    // outcomes; only its `rejected` feeds
+    // `pathvectord_bgp_import_policy_rejected_total`. The log line reports
+    // the sum.
     let mut rejected = 0usize;
-    // Tracks *only* routes rejected by an actual `Decision::Reject`/`Next`
-    // from import policy — unlike `rejected` above (used for the existing
-    // log line), this excludes the `skip_announces`/invalid-NEXT_HOP
-    // transport-level drops and the RFC 7999 BLACKHOLE special case, none of
-    // which are policy decisions. Feeds `pathvectord_bgp_import_policy_rejected_total`.
-    let mut policy_rejected = 0usize;
+    let mut import_v4 = ImportTally::default();
 
     // Wrap once; every route in this UPDATE shares the same Arc<AsPath>.
     let shared_as_path = Arc::new(as_path);
@@ -1476,21 +1399,18 @@ pub(super) fn handle_update(
             continue;
         }
 
-        // Store the pre-policy route for soft reconfiguration.
-        adj_rib_in.insert(raw.clone());
-
-        // Apply import policy to a working copy; only insert if accepted.
-        let mut route = raw;
-        match policy.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route, oracle_v4));
-                accepted += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                rejected += 1;
-                policy_rejected += 1;
-            }
-        }
+        // RFC 4271 §9 + §9.1.1: replace the peer's Adj-RIB-In route, run
+        // import policy, and reconcile the Loc-RIB with the outcome — a
+        // rejected replacement withdraws the peer's older candidate.
+        fib_changes.push(import_announcement(
+            peer,
+            raw,
+            adj_rib_in,
+            loc_rib,
+            policy,
+            oracle_v4,
+            &mut import_v4,
+        ));
     }
 
     // ── MP_UNREACH_NLRI IPv6 withdrawals (RFC 4760) ──────────────────────────
@@ -1511,11 +1431,9 @@ pub(super) fn handle_update(
     // ── IPv6 announcements from MP_REACH_NLRI ─────────────────────────────
     // Same BLACKHOLE + import-policy gate as IPv4. RFC 8212: eBGP peers with no
     // explicit policy default to Reject via `policy_v6` default action.
-    let mut accepted_v6 = 0usize;
+    // Same split as `rejected` / `import_v4` above.
     let mut rejected_v6 = 0usize;
-    // See `policy_rejected`'s comment above — same v4/v6 asymmetry between
-    // "rejected for any reason" (logging) and "rejected by policy" (metric).
-    let mut policy_rejected_v6 = 0usize;
+    let mut import_v6 = ImportTally::default();
     for (nlri, nh) in mp_v6_announced {
         // RFC 4271 §5.1.3 / RFC 4291 §2.5 / RFC 2545 §3: validate the IPv6 next-hop.
         // Own-address check: reject if global next-hop matches our configured IPv6 address.
@@ -1591,32 +1509,29 @@ pub(super) fn handle_update(
             continue;
         }
 
-        adj_rib_in_v6.insert(raw.clone());
-
-        let mut route = raw;
-        match policy_v6.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes_v6.push(loc_rib_v6.insert(peer, route, oracle_v6));
-                accepted_v6 += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                rejected_v6 += 1;
-                policy_rejected_v6 += 1;
-            }
-        }
+        // Same import path as IPv4 (RFC 4271 §9 + §9.1.1).
+        fib_changes_v6.push(import_announcement(
+            peer,
+            raw,
+            adj_rib_in_v6,
+            loc_rib_v6,
+            policy_v6,
+            oracle_v6,
+            &mut import_v6,
+        ));
     }
 
-    crate::metrics::on_import_reject(peer.ip(), policy_rejected);
-    crate::metrics::on_import_reject(peer.ip(), policy_rejected_v6);
+    crate::metrics::on_import_reject(peer.ip(), import_v4.rejected);
+    crate::metrics::on_import_reject(peer.ip(), import_v6.rejected);
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
         mp_withdrawn = mp_withdrawn_count,
         mp_v6_withdrawn = mp_v6_withdrawn_count,
-        accepted,
-        rejected,
-        accepted_v6,
-        rejected_v6,
+        accepted = import_v4.accepted,
+        rejected = rejected + import_v4.rejected,
+        accepted_v6 = import_v6.accepted,
+        rejected_v6 = rejected_v6 + import_v6.rejected,
         rib_size = loc_rib.len(),
         rib_v6_size = loc_rib_v6.len(),
         "processed UPDATE"

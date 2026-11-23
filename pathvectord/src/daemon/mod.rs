@@ -45,6 +45,7 @@ mod capabilities;
 mod deferral;
 mod fib;
 mod gr;
+mod import;
 #[cfg(test)]
 mod last_feasible_tests;
 mod origination;
@@ -58,10 +59,10 @@ use capabilities::{SpawnConfig, build_local_capabilities};
 use deferral::SelectionDeferral;
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
+use import::{ImportTally, import_announcement, reapply_import_policy};
 use peer::{run_bgp_listener, run_command_processor};
 #[cfg(test)]
 use route::handle_update;
-use route::{reapply_import_policy, reapply_import_policy_v6};
 
 /// Synthetic `PeerId` used as the source for locally originated routes.
 ///
@@ -4861,13 +4862,8 @@ mod tests {
         ari.insert(route_v6("2001:db8::/32"));
         let mut rib: LocRib<Ipv6Addr> = LocRib::new();
         let snap = capture(|| {
-            let _ = reapply_import_policy_v6(
-                peer(),
-                &ari,
-                &mut rib,
-                &reject_all_v6(),
-                &AlwaysReachable,
-            );
+            let _ =
+                reapply_import_policy(peer(), &ari, &mut rib, &reject_all_v6(), &AlwaysReachable);
         });
         assert_eq!(
             import_reject_counter(&snap, "10.0.0.1"),
@@ -6609,7 +6605,7 @@ mod tests {
         );
         assert!(rib_v6.is_empty(), "route rejected by initial policy");
 
-        reapply_import_policy_v6(
+        reapply_import_policy(
             peer(),
             &ari_v6,
             &mut rib_v6,
@@ -6659,7 +6655,7 @@ mod tests {
         );
         assert!(rib_v6.best(&nlri_v6("2001:db8::/32")).is_some());
 
-        reapply_import_policy_v6(
+        reapply_import_policy(
             peer(),
             &ari_v6,
             &mut rib_v6,

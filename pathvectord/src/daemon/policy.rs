@@ -89,7 +89,7 @@ impl DaemonState {
 
         let oracle_v6 = Arc::clone(&self.oracle_v6);
         let loc_rib_v6 = &mut Arc::make_mut(&mut self.rib).loc_rib_v6;
-        let fib_changes_v6 = reapply_import_policy_v6(
+        let fib_changes_v6 = reapply_import_policy(
             PeerId::from(peer_ip),
             &self.adj_ribs_in_v6[&peer_ip],
             loc_rib_v6,
