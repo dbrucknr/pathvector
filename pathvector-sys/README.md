@@ -103,17 +103,17 @@ or IGP routes when running tools like `ip route show proto bgp`.
 
 ### Reading the kernel FIB: route identity
 
-`KernelFib` keeps a `FibSnapshot` of the kernel's IGP routes (everything except
-`RTPROT_BGP` and non-unicast routes) and answers next-hop reachability and IGP-metric
-queries from it.
+`KernelFib` keeps a `FibSnapshot` of the kernel's IGP routes (unicast, blackhole,
+unreachable, prohibit and throw routes not tagged `RTPROT_BGP`) and answers next-hop
+reachability and IGP-metric queries from it.
 
 A prefix does not identify a kernel route. Linux keeps several routes for one prefix,
 and the snapshot stores each under the identity the kernel itself uses:
 
 | Family | Slot (the kernel's grouping) | Route within the slot |
 |---|---|---|
-| IPv4 | table, prefix, TOS, priority (`fib_table_insert`: "[prefix,dscp,priority]") | protocol, scope, preferred source, next hop(s) |
-| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route) |
+| IPv4 | table, prefix, TOS, priority (`fib_table_insert`: "[prefix,dscp,priority]") | type, protocol, scope, preferred source, next hop(s) |
+| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route); the type is recorded but, as in `rt6_duplicate_nexthop`, not compared |
 
 Prefixes are validated newtypes (`Ipv4Prefix`, `Ipv6Prefix`: length within range, no
 host bits) and table IDs cannot be zero (`TableId`), so a route identity can only hold
@@ -124,14 +124,56 @@ gets an `RTM_DELROUTE` of its own.
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
 as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
 kept but not selected, because a best-effort lookup from an unspecified source cannot
-use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes and
-`route_to_v4` / `route_to_v6` return the route a lookup selects.
+use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes.
+
+### Reading the kernel FIB: negative routes
+
+The route is selected **before** its type is looked at, so a negative route beneath a
+covering unicast route makes the destinations it covers unreachable. `ip-route(8)`:
+blackhole, unreachable and prohibit destinations "are unreachable"; a selected throw
+route ends the lookup in the table "pretending that no route was found". In the kernel,
+`fib_table_lookup` returns the selected alias's `fib_props` error without backtracking to
+a shorter prefix, and `fib6_table_lookup` only backtracks when a node yields no route.
+
+`FibSnapshot::lookup_v4` / `lookup_v6` return a `FibLookup`:
+
+| Selected route | `FibLookup` | Reachable | Kernel error for local senders |
+|---|---|---|---|
+| unicast | `Forward(route)` | yes | none |
+| blackhole | `Reject { kind: Blackhole, .. }` | no | `EINVAL` |
+| unreachable | `Reject { kind: Unreachable, .. }` | no | `EHOSTUNREACH` |
+| prohibit | `Reject { kind: Prohibit, .. }` | no | `EACCES` |
+| throw | `Throw(route)` | no (see below) | `ENETUNREACH` with the default rules |
+| none | `NoRoute` | no | `ENETUNREACH` |
+
+`is_v4_reachable` / `is_v6_reachable`, `igp_metric_v4` / `igp_metric_v6` and
+`route_to_v4` / `route_to_v6` only ever use a `Forward` result, so a negative route can
+never supply an IGP metric.
+
+**Throw.** A throw route ends the lookup in its table with `-EAGAIN`, which is also what
+a table returns when nothing matches; the kernel then tries the next policy rule. With
+the default rules (local, main, default for IPv4; local, main for IPv6) a throw in `main`
+leaves only the normally empty `default` table, so the lookup fails. The snapshot mirrors
+one table and does not model rules, so it reports a throw as "no route in the mirrored
+table": not reachable. If you use policy rules that send thrown traffic to another
+table, the oracle does not follow them.
+
+`FibWriter`'s own RFC 7999 blackholes carry `RTPROT_BGP` and stay excluded, like every
+BGP route (see "BGP route exclusion" in the `fib` module docs).
 
 Known limits:
 
-- Routes the snapshot does not track (BGP-installed and non-unicast routes) are not
-  mirrored, so if one sits ahead of a tracked route in the same IPv4 slot, an
-  `NLM_F_REPLACE` may displace the wrong one in the mirror.
+- Routes the snapshot does not track (BGP-installed routes and the `local`,
+  `broadcast`, `anycast`, `multicast` types) are not mirrored, so if one sits ahead of a
+  tracked route in the same IPv4 slot, an `NLM_F_REPLACE` may displace the wrong one in
+  the mirror.
+- A route through a nexthop object (`RTA_NH_ID`) is classified by the type the kernel
+  reports. The kernel reports a route through a blackhole nexthop as `blackhole`, but
+  changing the nexthop object later sends no route notification, and the object's own
+  state (dead, link down) is not checked.
+- An IPv6 unicast route via the loopback device is turned into a reject route by the
+  kernel (`fib6_is_reject`) but still reported as unicast, so the oracle treats it as
+  reachable.
 - IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
 - With table `0` (all tables) the tables are compared as one; policy routing rules are
   not modelled.

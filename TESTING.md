@@ -214,26 +214,39 @@ any syscall, keeping them cross-platform (they pass on macOS and Linux alike).
 | Keys longer than 80 bytes always produce `InvalidInput` | RFC 2385 key length limit; must be enforced before the kernel call |
 | Any IPv6 address always returns `Unsupported` | IPv6 peer MD5 is not yet implemented; must not silently succeed |
 
-#### Kernel FIB route identity (issue #56)
+#### Kernel FIB route identity and negative routes (issues #56, #57)
 
 The FIB snapshot mirrors kernel routes under their full Linux identity, not just
-their prefix. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
+their prefix, including negative routes (blackhole, unreachable, prohibit, throw). The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
 platform and compare the mirror against a reference model written directly from the
 kernel's lookup rule (`net/ipv4/fib_trie.c`, `net/ipv6/ip6_fib.c`):
 
 | Invariant | Why it matters |
 |---|---|
 | Any add/delete sequence leaves exactly the set of routes the kernel holds, and every lookup equals the reference (longest prefix, then lowest priority) | A backup route overwriting the primary, or one delete removing every route for a prefix, gives wrong IGP metrics and spurious unreachability |
+| The route type plays no part in selection; the selected route's type alone decides the outcome, and only a unicast route is reachable | A negative route beneath a covering route must not fall through to it (`fib_table_lookup` returns the selected alias's `fib_props` error) |
 | Lookups do not depend on load (dump) order | Dump and incremental state must agree |
 | Adding then deleting a route restores every lookup | Deletes remove only the named route |
 | Routes of one slot stay contiguous through inserts, replaces and deletes | `NLM_F_REPLACE` targets "the first route of the slot" |
 | `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
 
-The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPLACE` /
-`NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
-`pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
-and 100 in both orders, for both families, incrementally and through the initial dump.
-They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
+The netlink adapter's tests (`linux.rs`, Linux only) cover decoding (route type
+included), the tracking policy (negative routes tracked, BGP and `local`-type routes
+not), `NLM_F_REPLACE` / `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel
+tests in `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes:
+
+- metrics 10 and 100 in both orders, for both families, incrementally and through the
+  initial dump (#56);
+- each negative type beneath a covering unicast route, its deletion, and
+  `ip route replace <type>` over a unicast route, for both families; plus an initial
+  dump with negative routes at lower and higher metrics than a unicast route and a
+  longer unicast route inside a throw prefix (#57). Every probe compares the oracle's
+  verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
+  `ip route get` sends): the expected errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and
+  `ENETUNREACH`.
+
+The tests run in parallel in one namespace, so each uses its own prefixes and interfaces
+(prefixed `pvtest`) and none adds a real default route. They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 
 ```bash

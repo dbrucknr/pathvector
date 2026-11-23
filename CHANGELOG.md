@@ -4,6 +4,29 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #57: negative kernel routes decide reachability)
+
+`pathvector-sys`'s FIB snapshot dropped every non-unicast route, so with a unicast
+default route and a more-specific `blackhole`, `unreachable`, `prohibit` or `throw`
+route the oracle fell back to the default and reported the destination reachable, and
+BGP could pick a next hop the kernel deliberately cannot forward to. Confirmed on a live
+kernel: beneath a blackhole the old snapshot said reachable while `RTM_GETROUTE` (what
+`ip route get` sends) failed with `EINVAL`.
+
+Linux selects the route first and only then looks at its type: `fib_table_lookup`
+returns the selected alias's `fib_props` error without backtracking to a shorter prefix,
+and `fib6_table_lookup` backtracks only when a node yields no route. The snapshot now
+tracks the four negative types (non-BGP), records the type in `KernelRouteV4` /
+`KernelRouteV6` (`RouteKind`; part of the IPv4 alias identity, not the IPv6 one, as in
+the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
+`NoRoute`). Only `Forward` counts as reachable or yields an IGP metric. A `throw` is
+reported as no route in the mirrored table, since policy rules are not modelled. New
+public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
+`RejectKind`; `route_to_v4` / `route_to_v6` now return only forwarding routes. Proof:
+domain and property tests (the reference model now includes route types), netlink
+adapter tests, and live-kernel tests that compare every verdict with the kernel's own
+lookup.
+
 ## 2026-11-23 (issue #56: FIB snapshot keeps every route for a prefix)
 
 `pathvector-sys`'s `FibSnapshot` identified kernel routes by prefix alone. Adding a
