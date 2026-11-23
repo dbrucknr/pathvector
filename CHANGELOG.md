@@ -41,7 +41,7 @@ test that forces `ENOBUFS` and checks agreement with a fresh dump.
 
 ## 2026-11-23 (issue #57: negative kernel routes decide reachability)
 
-`pathvector-sys`'s FIB snapshot dropped every non-unicast route, so with a unicast
+`pathvector-sys`'s FIB snapshot ignored every non-unicast route for reachability, so with a unicast
 default route and a more-specific `blackhole`, `unreachable`, `prohibit` or `throw`
 route the oracle fell back to the default and reported the destination reachable, and
 BGP could pick a next hop the kernel deliberately cannot forward to. Confirmed on a live
@@ -51,9 +51,9 @@ kernel: beneath a blackhole the old snapshot said reachable while `RTM_GETROUTE`
 Linux selects the route first and only then looks at its type: `fib_table_lookup`
 returns the selected alias's `fib_props` error without backtracking to a shorter prefix,
 and `fib6_table_lookup` backtracks only when a node yields no route. The snapshot now
-tracks the four negative types (non-BGP), records the type in `KernelRouteV4` /
-`KernelRouteV6` (`RouteKind`; part of the IPv4 alias identity, not the IPv6 one, as in
-the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
+tracks the four negative types (non-BGP; `KernelRouteV4` / `KernelRouteV6::route_kind`
+gives the typed `RouteKind`; the type is part of the IPv4 alias identity, not the IPv6
+one, as in the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
 `NoRoute`). Only `Forward` counts as reachable or yields an IGP metric. A `throw` is
 reported as no route in the mirrored table, since policy rules are not modelled. New
 public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
@@ -61,14 +61,68 @@ public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
 forwarding routes.
 
 Review follow-up (Codex on PR #123, both reproduced on a live kernel): IPv6 selection
-now ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`)
-before list order, so a high-preference unicast route is no longer hidden by an earlier
-blackhole; and `is_v6_reachable` applies its link-local fallback only when no route
-covers the address, so a negative route over link-local space is honoured. IPv6
-`RTM_NEWROUTE` handling decodes each message once instead of twice. Proof:
+ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`) before
+list order, so a high-preference unicast route is not hidden by an earlier blackhole;
+and `is_v6_reachable` applies its link-local fallback only when no route covers the
+address, so a negative route over link-local space is honoured. Built on #122's
+full-table mirror: negative routes were already mirrored there, as untracked hashes;
+they are now tracked, and a tracked entry keeps its typed `RouteKind`. Proof:
 domain and property tests (the reference model now includes route types), netlink
 adapter tests, and live-kernel tests that compare every verdict with the kernel's own
 lookup.
+
+## 2026-11-23 (PR #122 review round 3: unreported IPv6 siblings inherit the protocol)
+
+Round 2 counted every IPv6 ECMP sibling whose protocol the kernel did not report as an
+IGP path. Review showed that this lets an **all-BGP** ECMP set supply IGP reachability
+after a restart: live events reported both BGP routes and gave no path, but a fresh
+dump gave `Some(10)`. So restarting changed next-hop eligibility with no FIB change.
+
+The kernel's dump of a BGP-first static+BGP set is byte-for-byte the same as an all-BGP
+set (now checked by a live test), so no decoder can be right for both. The policy is now
+explicit: an unreported sibling takes the described sibling's protocol, marked with the
+new `KernelRouteV6::protocol_inferred` flag (`protocol` is a plain `u8` again), and a
+message reporting the real protocol replaces the inference. This is exact for every
+single-protocol set. Only mixed-protocol sets learned from a dump can be misclassified,
+documented in the crate README with both directions. Live tests: all-BGP set live vs.
+after a dump (fails on the previous commit), and the byte-identity check.
+
+## 2026-11-23 (PR #122 review round 2: IPv6 ECMP siblings are dumped once)
+
+The round-1 fix assumed every IPv6 ECMP sibling gets its own dump message, and kept
+non-leading legs unused until one arrived. That was wrong: `fib6_dump_node` dumps a
+sibling set once, as one `RTA_MULTIPATH` message, then jumps past the siblings ("no need
+to dump the sibling routes again"). An ordinary all-static ECMP set therefore lost its
+second path: after deleting the first route the prefix read as unreachable although the
+kernel still had the second. With BGP added first, the static sibling was missed straight
+after the dump. Both were reproduced on a live kernel.
+
+`KernelRouteV6::protocol` is now `Option<u8>`. `None` means no message has described the
+route (a sibling seen only as a leg), and such a route counts as a path. (Superseded by
+round 3 above: that also admitted all-BGP sets.)
+Two new live-kernel tests (all-static set, BGP-first mixed set) fail on the previous
+commit and pass now; the adapter test that simulated per-sibling dump messages now uses
+the single aggregate message the kernel actually sends.
+
+## 2026-11-23 (PR #122 review: untracked routes in a slot or ECMP set)
+
+Review found two cases where routes the snapshot does not use for reachability still
+mattered, both reproduced on a live kernel. (1) An IPv6 ECMP set mixing a static and a
+BGP route: `rt6_fill_node` reports the set under one route's protocol, so the BGP leg
+was recorded as static, its delete was then ignored, and the prefix stayed reachable
+after both routes were gone. (2) A BGP alias prepended ahead of a static alias: an
+`NLM_F_REPLACE` of the BGP alias removed the static alias from the snapshot, because the
+mirror did not know the BGP alias was first.
+
+The snapshot now mirrors every route in the tracked table and applies the tracking rule
+(unicast, not BGP) at lookup time. Untracked routes are stored as an identity hash, so
+the cost is about 86 MB per million kernel BGP routes; inserts and deletes are now
+hashed. An IPv6 multipath message's first leg is described by its header; other legs
+not yet seen take the header's protocol only for a create/replace (same request). (The
+handling of the remaining legs was corrected in round 2 above.) Mutations report a change exactly when the
+tracked routes change. Proof: property tests against a kernel slot-list model including
+untracked routes and replaces, adapter tests, and two new live-kernel tests that fail on
+the previous commit.
 
 ## 2026-11-23 (issue #56: FIB snapshot keeps every route for a prefix)
 

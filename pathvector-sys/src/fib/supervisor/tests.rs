@@ -38,8 +38,7 @@ use tokio::{
 
 use super::*;
 use crate::fib::{
-    FibSnapshot, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, NextHopPath, NextHopV4,
-    NextHopV6, RouteKind, RoutePreference, RouteSlotV4, RouteSlotV6, TableId,
+    FibSnapshot, KernelRouteV4, KernelRouteV6, Position,
     health::{DegradedCause, DumpTimeout, FibStatus, ResyncBackoff, SnapshotHealth},
 };
 
@@ -51,41 +50,13 @@ enum Route {
     V6(KernelRouteV6),
 }
 
+/// A unicast route, built the way the snapshot's own tests build one.
 fn v4(network: &str, len: u8, metric: u32) -> Route {
-    Route::V4(KernelRouteV4 {
-        slot: RouteSlotV4 {
-            table: TableId::MAIN,
-            dst: Ipv4Prefix::new(network.parse().unwrap(), len).unwrap(),
-            tos: 0,
-            priority: metric,
-        },
-        kind: RouteKind::Unicast,
-        protocol: 3,
-        scope: 0,
-        prefsrc: None,
-        next_hop: NextHopV4::Path(NextHopPath {
-            gateway: None,
-            oif: None,
-        }),
-    })
+    Route::V4(crate::fib::tests::r4(network, len, metric))
 }
 
 fn v6(network: &str, len: u8, metric: u32) -> Route {
-    Route::V6(KernelRouteV6 {
-        slot: RouteSlotV6 {
-            table: TableId::MAIN,
-            dst: Ipv6Prefix::new(network.parse().unwrap(), len).unwrap(),
-            src: Ipv6Prefix::DEFAULT,
-            priority: metric,
-        },
-        kind: RouteKind::Unicast,
-        protocol: 3,
-        preference: RoutePreference::Medium,
-        next_hop: NextHopV6::Path(NextHopPath {
-            gateway: None,
-            oif: None,
-        }),
-    })
+    Route::V6(crate::fib::tests::r6(network, len, metric))
 }
 
 /// A small universe of distinct routes, both families, some sharing a prefix.
@@ -126,8 +97,8 @@ impl RouteUpdate for Change {
 
     fn apply(&self, s: &mut FibSnapshot) -> bool {
         match self {
-            Self::Add(Route::V4(r)) => s.v4.insert_back(r.clone()),
-            Self::Add(Route::V6(r)) => s.v6.insert_back(r.clone()),
+            Self::Add(Route::V4(r)) => s.v4.insert(r.clone(), Position::Back),
+            Self::Add(Route::V6(r)) => s.v6.insert(r.clone(), Position::Back),
             Self::Del(Route::V4(r)) => s.v4.remove(r),
             Self::Del(Route::V6(r)) => s.v6.remove(r),
         }
@@ -227,14 +198,14 @@ impl Kernel {
             Family::V4 => {
                 for r in self.truth.v4.iter() {
                     if skip != Some(&Route::V4(r.clone())) {
-                        into.v4.insert_back(r.clone());
+                        into.v4.insert(r.clone(), Position::Back);
                     }
                 }
             }
             Family::V6 => {
                 for r in self.truth.v6.iter() {
                     if skip != Some(&Route::V6(r.clone())) {
-                        into.v6.insert_back(r.clone());
+                        into.v6.insert(r.clone(), Position::Back);
                     }
                 }
             }

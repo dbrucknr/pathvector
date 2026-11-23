@@ -32,9 +32,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     FibSnapshot, FibWrite, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg,
-    NextHopPath, NextHopV4, NextHopV6, RouteKind, RoutePreference, RouteSlotV4, RouteSlotV6,
+    NextHopPath, NextHopV4, NextHopV6, Position, RoutePreference, RouteSlotV4, RouteSlotV6,
     TableId,
-    route::qualifies_for_ecmp_v6,
     supervisor::{
         DumpError, DumpReport, Family, Notification, Received, RouteFeed, RouteSource, RouteUpdate,
     },
@@ -372,14 +371,11 @@ impl RouteUpdate for NetlinkRouteUpdate {
         self.family
     }
 
-    /// `change_tx` fires only when the snapshot actually changes. BGP routes
-    /// (`RTPROT_BGP`) are excluded from the snapshot entirely — they represent
-    /// destinations we reach *via* BGP, not the IGP paths used to reach BGP
-    /// next-hops. Including them would create a feedback loop: every route we
-    /// install via `FibWriter` would trigger a `change_tx`, waking the event
-    /// loop and causing a spurious full `recompute_all` scan over the Loc-RIB.
-    /// This matches the approach used by BIRD (krt.c protocol-tag filter) and
-    /// FRR/Zebra (`rtm_protocol` == `RTPROT_ZEBRA` skip).
+    /// Returns `true` only when the tracked routes changed (see
+    /// [`apply_new`] / [`apply_del`]), so `change_tx` never fires for BGP
+    /// routes: they are mirrored only as identities, which keeps every route
+    /// we install via `FibWriter` from waking the event loop and triggering a
+    /// spurious full `recompute_all` scan over the Loc-RIB.
     ///
     /// The netlink header flags matter: `NLM_F_REPLACE` means the kernel
     /// replaced an existing route without sending `RTM_DELROUTE` for it, and
@@ -397,9 +393,8 @@ impl RouteUpdate for NetlinkRouteUpdate {
 
 /// Returns `(network, prefix_len)` for every `RTPROT_BGP` IPv4 route in `table`.
 ///
-/// It selects *only* BGP-protocol routes (of any type), which `is_tracked`
-/// always excludes; they were installed by a previous daemon run and are now
-/// stale.
+/// This is the inverse of the snapshot's tracking rule: it selects *only* BGP-protocol routes,
+/// which were installed by a previous daemon run and are now stale.
 pub(super) async fn dump_stale_bgp_v4(
     handle: &rtnetlink::Handle,
     table: u32,
@@ -503,23 +498,6 @@ fn in_table(msg: &RouteMessage, table: u32) -> bool {
     table == 0 || route_table(msg) == table
 }
 
-/// The route's type, if it is one the snapshot mirrors (unicast or negative).
-fn route_kind(msg: &RouteMessage) -> Option<RouteKind> {
-    RouteKind::from_rtm_type(u8::from(msg.header.kind))
-}
-
-/// Whether the snapshot tracks this route: a mirrored type (unicast,
-/// blackhole, unreachable, prohibit or throw) not installed by BGP.
-///
-/// Negative routes must be tracked: a lookup selects the longest-prefix route
-/// first and only then looks at its type, so a negative route beneath a
-/// covering unicast route makes the covered destinations unreachable (issue
-/// #57). BGP-installed routes, negative ones included, stay excluded for the
-/// reasons given on [`is_bgp_route`].
-fn is_tracked(msg: &RouteMessage) -> bool {
-    route_kind(msg).is_some() && !is_bgp_route(msg)
-}
-
 // ── Decoding: netlink message → kernel route identity ─────────────────────────
 
 /// `RTA_NH_ID` in `<linux/rtnetlink.h>`. netlink-packet-route 0.30 has no
@@ -605,26 +583,17 @@ fn path(attributes: &[RouteAttribute], oif: Option<u32>) -> NextHopPath {
     }
 }
 
-/// The IPv4 alias group of a route of any type.
+/// Decodes an IPv4 route into its kernel identity.
 ///
 /// Returns `None` for a table of 0 or a destination the kernel would itself
 /// reject (`fib_valid_key_len`); neither occurs in a kernel-generated message.
-fn slot_v4(msg: &RouteMessage) -> Option<RouteSlotV4> {
-    Some(RouteSlotV4 {
+fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
+    let slot = RouteSlotV4 {
         table: TableId::new(route_table(msg))?,
         dst: Ipv4Prefix::new(destination_v4(msg), msg.header.destination_prefix_length).ok()?,
         tos: msg.header.tos,
         priority: metric_of(msg),
-    })
-}
-
-/// Decodes an IPv4 route into its kernel identity.
-///
-/// Returns `None` for a route type the snapshot does not mirror and for the
-/// cases [`slot_v4`] rejects.
-fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
-    let kind = route_kind(msg)?;
-    let slot = slot_v4(msg)?;
+    };
     let next_hop = if let Some(id) = nexthop_object(msg) {
         NextHopV4::Object(id)
     } else if let Some(legs) = multipath(msg) {
@@ -642,12 +611,75 @@ fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
     };
     Some(KernelRouteV4 {
         slot,
-        kind,
+        kind: u8::from(msg.header.kind),
         protocol: u8::from(msg.header.protocol),
         scope: u8::from(msg.header.scope),
         prefsrc: prefsrc_v4(msg),
         next_hop,
     })
+}
+
+/// Decodes an IPv6 route message into one route per ECMP sibling.
+///
+/// The kernel stores each IPv6 ECMP sibling as its own `fib6_info` but reports
+/// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`), in
+/// notifications and in dumps alike (`fib6_dump_node` dumps a set once). It
+/// deletes siblings one at a time, or all at once with one `RTA_MULTIPATH`
+/// message. Splitting the message makes these line up. A route using a
+/// nexthop object is never split.
+///
+/// Every returned route carries the header's type and protocol, but only the
+/// first one is the route the header describes; see [`apply_new`] for how the
+/// others are treated.
+///
+/// Returns an empty `Vec` for a table of 0 or a non-canonical prefix.
+fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
+    let Some(table) = TableId::new(route_table(msg)) else {
+        return Vec::new();
+    };
+    let Ok(dst) = Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length) else {
+        return Vec::new();
+    };
+    let Ok(src) = Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length) else {
+        return Vec::new();
+    };
+    let slot = RouteSlotV6 {
+        table,
+        dst,
+        src,
+        priority: metric_of(msg),
+    };
+    let protocol = u8::from(msg.header.protocol);
+    let kind = u8::from(msg.header.kind);
+    // RTA_PREF, like type and protocol, belongs to the route the header
+    // describes, and an unreported leg takes it from that sibling the same
+    // way its protocol is inferred. Legs created by the same request share it
+    // (ip6_route_multipath_add builds every leg from one fib6_config); for a
+    // leg of another origin it is a best guess, which only matters when the
+    // set competes with another route of its metric.
+    let preference = preference_v6(msg);
+    let route = |next_hop| KernelRouteV6 {
+        slot,
+        kind,
+        protocol,
+        protocol_inferred: false,
+        preference,
+        next_hop,
+    };
+    if let Some(id) = nexthop_object(msg) {
+        vec![route(NextHopV6::Object(id))]
+    } else if let Some(legs) = multipath(msg) {
+        legs.iter()
+            .map(|leg| {
+                route(NextHopV6::Path(path(
+                    &leg.attributes,
+                    Some(leg.interface_index),
+                )))
+            })
+            .collect()
+    } else {
+        vec![route(NextHopV6::Path(path(&msg.attributes, None)))]
+    }
 }
 
 /// `RTA_PREF`, normalised as the kernel stores it; absent means medium
@@ -659,94 +691,6 @@ fn preference_v6(msg: &RouteMessage) -> RoutePreference {
             RouteAttribute::Preference(p) => Some(RoutePreference::from_rta_pref(u8::from(*p))),
             _ => None,
         })
-        .unwrap_or_default()
-}
-
-/// The parts of an IPv6 route message that do not depend on its type: the
-/// metric group, protocol, preference and one next hop per ECMP sibling.
-///
-/// The kernel stores each IPv6 ECMP sibling as its own `fib6_info` but reports
-/// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`). It
-/// also deletes and dumps siblings one at a time. Splitting the message makes
-/// all of these line up. A route using a nexthop object is never split.
-struct PartsV6 {
-    slot: RouteSlotV6,
-    protocol: u8,
-    preference: RoutePreference,
-    next_hops: Vec<NextHopV6>,
-}
-
-impl PartsV6 {
-    /// Decodes the message once. Returns `None` for a table of 0 or a
-    /// non-canonical prefix.
-    fn decode(msg: &RouteMessage) -> Option<Self> {
-        let slot = RouteSlotV6 {
-            table: TableId::new(route_table(msg))?,
-            dst: Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length).ok()?,
-            src: Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length).ok()?,
-            priority: metric_of(msg),
-        };
-        let next_hops = if let Some(id) = nexthop_object(msg) {
-            vec![NextHopV6::Object(id)]
-        } else if let Some(legs) = multipath(msg) {
-            legs.iter()
-                .map(|leg| NextHopV6::Path(path(&leg.attributes, Some(leg.interface_index))))
-                .collect()
-        } else {
-            vec![NextHopV6::Path(path(&msg.attributes, None))]
-        };
-        Some(Self {
-            slot,
-            protocol: u8::from(msg.header.protocol),
-            preference: preference_v6(msg),
-            next_hops,
-        })
-    }
-
-    /// `rt6_qualify_for_ecmp` of the first sibling, which is the one an
-    /// `NLM_F_REPLACE` replaces with. `None` for a message with no next hop.
-    fn first_is_ecmp(&self) -> Option<bool> {
-        self.next_hops
-            .first()
-            .map(|nh| qualifies_for_ecmp_v6(self.protocol, nh))
-    }
-
-    /// One typed route per sibling, built from the parts already decoded.
-    fn into_routes(self, kind: RouteKind) -> impl Iterator<Item = KernelRouteV6> {
-        let Self {
-            slot,
-            protocol,
-            preference,
-            next_hops,
-        } = self;
-        next_hops.into_iter().map(move |next_hop| KernelRouteV6 {
-            slot,
-            kind,
-            protocol,
-            preference,
-            next_hop,
-        })
-    }
-}
-
-/// The routes of an IPv6 message the snapshot mirrors: one per ECMP sibling,
-/// none for an untracked route (BGP or an unmirrored type), a table of 0 or a
-/// non-canonical prefix.
-fn tracked_routes_v6(msg: &RouteMessage) -> impl Iterator<Item = KernelRouteV6> {
-    let kind = route_kind(msg).filter(|_| !is_bgp_route(msg));
-    kind.zip(PartsV6::decode(msg))
-        .map(|(kind, parts)| parts.into_routes(kind))
-        .into_iter()
-        .flatten()
-}
-
-/// Every route of an IPv6 message of a mirrored type, BGP included (for the
-/// decoding tests).
-#[cfg(test)]
-fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
-    route_kind(msg)
-        .zip(PartsV6::decode(msg))
-        .map(|(kind, parts)| parts.into_routes(kind).collect())
         .unwrap_or_default()
 }
 
@@ -768,85 +712,24 @@ fn metric_of(msg: &RouteMessage) -> u32 {
 
 /// Adds a route from the initial dump. Dumps list routes in kernel order, so
 /// each route goes to the end of its slot.
+///
+/// An IPv6 dump message describes its first leg only. `fib6_dump_node` never
+/// dumps the other siblings separately, so their protocol is inferred from
+/// the first (see the `route` module docs) until a message reports it.
 fn apply_dumped(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
-    if !in_table(msg, table) || !is_tracked(msg) {
-        return false;
-    }
-    match msg.header.address_family {
-        AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.insert_back(r)),
-        AddressFamily::Inet6 => {
-            tracked_routes_v6(msg).fold(false, |changed, r| snap.v6.insert_back(r) | changed)
-        }
-        _ => false,
-    }
-}
-
-/// Applies a `RTM_NEWROUTE` notification whose netlink header carried `flags`.
-///
-/// Returns `true` if the snapshot changed.
-///
-/// - `NLM_F_REPLACE`: the kernel replaced an existing route in place and sent
-///   no `RTM_DELROUTE` for it. The displaced route is removed even when the
-///   new one is not tracked (for example a BGP route that replaced an IGP
-///   route with the same prefix and priority).
-/// - IPv4 without `NLM_F_REPLACE`: inserted at the end of its slot with
-///   `NLM_F_APPEND`, otherwise at the front (`fib_table_insert`).
-/// - IPv6 without `NLM_F_REPLACE`: always at the end of its slot
-///   (`fib6_add_rt2node`).
-///
-/// A route that is already stored is not added again, so replaying an event
-/// that the initial dump already reflected is harmless.
-fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32) -> bool {
     if !in_table(msg, table) {
         return false;
     }
-    let tracked = is_tracked(msg);
-    let replace = flags & NLM_F_REPLACE != 0;
     match msg.header.address_family {
-        AddressFamily::Inet => {
-            // The slot is needed even for an untracked route, whose replace
-            // still displaces a tracked one.
-            let Some(slot) = slot_v4(msg) else {
-                return false;
-            };
-            let route = if tracked { decode_v4(msg) } else { None };
-            if replace {
-                snap.v4.replace(&slot, route)
-            } else {
-                route.is_some_and(|route| {
-                    if flags & NLM_F_APPEND != 0 {
-                        snap.v4.insert_back(route)
-                    } else {
-                        snap.v4.insert_front(route)
-                    }
-                })
-            }
-        }
+        AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.insert(r, Position::Back)),
         AddressFamily::Inet6 => {
-            // Decoded once: the slot and ECMP eligibility are needed even for
-            // an untracked route, whose replace still displaces a tracked one.
-            let Some(parts) = PartsV6::decode(msg) else {
+            let mut legs = decode_v6(msg).into_iter();
+            let Some(first) = legs.next() else {
                 return false;
             };
-            let Some(ecmp) = parts.first_is_ecmp() else {
-                return false;
-            };
-            let slot = parts.slot;
-            let kind = route_kind(msg).filter(|_| tracked);
-            let mut routes = kind
-                .map(|kind| parts.into_routes(kind))
-                .into_iter()
-                .flatten();
-            let first = routes.next();
-            let mut changed = if replace {
-                // ip6_route_multipath_add replaces with the first leg and
-                // appends the rest, then reports them in one message.
-                snap.v6.replace(&slot, ecmp, first)
-            } else {
-                first.is_some_and(|first| snap.v6.insert_back(first))
-            };
-            for route in routes {
-                changed |= snap.v6.insert_back(route);
+            let mut changed = snap.v6.upsert(first, Position::Back);
+            for leg in legs {
+                changed |= snap.v6.insert(protocol_inferred(leg), Position::Back);
             }
             changed
         }
@@ -854,20 +737,91 @@ fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32)
     }
 }
 
+/// Applies a `RTM_NEWROUTE` notification whose netlink header carried `flags`.
+///
+/// Returns `true` if the tracked routes changed. Every route is mirrored, so
+/// that replacements displace the right one, but untracked routes (BGP, and
+/// types other than unicast and the negative types) never count as a change.
+///
+/// - `NLM_F_REPLACE`: the kernel replaced an existing route in place and sent
+///   no `RTM_DELROUTE` for it (`fib_table_insert`, `fib6_add_rt2node`).
+/// - IPv4 without `NLM_F_REPLACE`: inserted at the end of its slot with
+///   `NLM_F_APPEND`, otherwise at the front (`fib_table_insert`).
+/// - IPv6 without `NLM_F_REPLACE`: always at the end of its slot
+///   (`fib6_add_rt2node`).
+///
+/// For IPv6 the header describes the first `RTA_MULTIPATH` leg. Without
+/// `NLM_F_APPEND`, every leg not yet mirrored comes from the same request
+/// (`ip6_route_multipath_add` reports its first new route), so it shares the
+/// header's protocol. With `NLM_F_APPEND`, `ip6_route_mpath_notify` reports
+/// the set's *first* sibling instead, which may be an older route of another
+/// protocol, so new legs get that protocol as an inference. Legs already
+/// mirrored keep what is known about them.
+///
+/// A route that is already mirrored is not added again, so replaying an event
+/// that the initial dump already reflected is harmless.
+fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32) -> bool {
+    if !in_table(msg, table) {
+        return false;
+    }
+    let replace = flags & NLM_F_REPLACE != 0;
+    let append = flags & NLM_F_APPEND != 0;
+    match msg.header.address_family {
+        AddressFamily::Inet => {
+            let Some(route) = decode_v4(msg) else {
+                return false;
+            };
+            if replace {
+                snap.v4.replace(route)
+            } else if append {
+                snap.v4.insert(route, Position::Back)
+            } else {
+                snap.v4.insert(route, Position::Front)
+            }
+        }
+        AddressFamily::Inet6 => {
+            let mut legs = decode_v6(msg).into_iter();
+            let Some(first) = legs.next() else {
+                return false;
+            };
+            let mut changed = if replace {
+                snap.v6.replace(first)
+            } else {
+                snap.v6.upsert(first, Position::Back)
+            };
+            for leg in legs {
+                let leg = if append { protocol_inferred(leg) } else { leg };
+                changed |= snap.v6.insert(leg, Position::Back);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// An IPv6 ECMP leg whose message describes another sibling: its protocol is
+/// not in the message, so the described sibling's protocol (already on the
+/// leg from the header) is marked as an inference.
+fn protocol_inferred(mut leg: KernelRouteV6) -> KernelRouteV6 {
+    leg.protocol_inferred = true;
+    leg
+}
+
 /// Applies a `RTM_DELROUTE` notification.
 ///
-/// The kernel reports the full identity of the route it removed, so exactly
-/// that route is removed here and other routes for the same prefix remain.
-/// Returns `true` if the snapshot changed.
+/// The kernel reports the identity of the route it removed, so exactly that
+/// route is removed here and other routes for the same prefix remain. This
+/// applies to BGP routes too: a BGP leg can share an ECMP set with a static one.
+/// Returns `true` if the tracked routes changed.
 fn apply_del(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
-    if !in_table(msg, table) || !is_tracked(msg) {
+    if !in_table(msg, table) {
         return false;
     }
     match msg.header.address_family {
         AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.remove(&r)),
-        AddressFamily::Inet6 => {
-            tracked_routes_v6(msg).fold(false, |changed, r| snap.v6.remove(&r) | changed)
-        }
+        AddressFamily::Inet6 => decode_v6(msg)
+            .iter()
+            .fold(false, |changed, r| snap.v6.remove(r) | changed),
         _ => false,
     }
 }
@@ -1096,7 +1050,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::fib::RejectKind;
+    use crate::fib::{RejectKind, RouteKind};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1409,24 +1363,28 @@ mod tests {
 
     #[test]
     fn unicast_and_negative_routes_are_tracked_bgp_and_local_types_are_not() {
-        assert!(is_tracked(&igp_v4_msg("10.0.0.0", 8, 100, 254)));
-        assert!(!is_tracked(&bgp_v4_msg("10.0.0.0", 8, 254)));
-        assert!(!is_tracked(&bgp_v6_msg("2001:db8::", 32, 254)));
+        assert!(
+            !decode_v4(&bgp_v4_msg("10.0.0.0", 8, 254))
+                .unwrap()
+                .is_tracked()
+        );
+        assert!(!decode_v6(&bgp_v6_msg("2001:db8::", 32, 254))[0].is_tracked());
+        assert!(
+            decode_v4(&igp_v4_msg("10.0.0.0", 8, 100, 254))
+                .unwrap()
+                .is_tracked()
+        );
         // Issue #57: a negative route decides reachability for what it covers.
         for kind in NEGATIVE_TYPES {
-            assert!(
-                is_tracked(&negative_v4_msg("10.0.0.0", 8, 100, kind)),
-                "{kind:?}"
-            );
-            assert!(
-                is_tracked(&negative_v6_msg("2001:db8::", 32, 100, kind)),
-                "{kind:?}"
-            );
+            let v4 = negative_v4_msg("10.0.0.0", 8, 100, kind);
+            assert!(decode_v4(&v4).unwrap().is_tracked(), "{kind:?}");
+            let v6 = negative_v6_msg("2001:db8::", 32, 100, kind);
+            assert!(decode_v6(&v6)[0].is_tracked(), "{kind:?}");
             // FibWriter's own RFC 7999 blackholes stay excluded like every
             // other BGP route.
-            let mut bgp = negative_v4_msg("10.0.0.0", 8, 100, kind);
+            let mut bgp = v4;
             bgp.header.protocol = RouteProtocol::Bgp;
-            assert!(!is_tracked(&bgp), "BGP {kind:?}");
+            assert!(!decode_v4(&bgp).unwrap().is_tracked(), "BGP {kind:?}");
         }
         for kind in [
             RouteType::Local,
@@ -1438,8 +1396,9 @@ mod tests {
         ] {
             let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
             msg.header.kind = kind;
-            assert!(!is_tracked(&msg), "{kind:?}");
-            assert!(decode_v4(&msg).is_none(), "{kind:?}");
+            assert!(!decode_v4(&msg).unwrap().is_tracked(), "{kind:?}");
+            let mut snap = FibSnapshot::new();
+            assert!(!apply_new(&mut snap, &msg, CREATE, 254), "{kind:?}");
         }
     }
 
@@ -1458,7 +1417,10 @@ mod tests {
             CREATE,
             254
         ));
-        assert!(snap.v4.is_empty() && snap.v6.is_empty());
+        // Mirrored for slot bookkeeping, but never used or reported.
+        assert_eq!(snap.routes_v4().count() + snap.routes_v6().count(), 0);
+        assert_eq!(snap.igp_metric_v4("10.1.1.1".parse().unwrap()), None);
+        assert_eq!(snap.igp_metric_v6("2001:db8::1".parse().unwrap()), None);
     }
 
     #[test]
@@ -1506,6 +1468,7 @@ mod tests {
                 "192.0.2.9".parse().unwrap(),
             )));
         let r = decode_v4(&msg).unwrap();
+        assert_eq!(r.kind, u8::from(RouteType::Unicast));
         assert_eq!(r.slot.table, TableId::MAIN);
         assert_eq!(r.slot.dst.to_string(), "10.1.0.0/16");
         assert_eq!(r.slot.tos, 0x10);
@@ -1874,7 +1837,284 @@ mod tests {
             REPLACE,
             254
         ));
-        assert!(snap.v4.is_empty() && snap.v6.is_empty());
+        assert_eq!(snap.routes_v4().count() + snap.routes_v6().count(), 0);
+    }
+
+    // ── PR #122 review: untracked routes in the same slot / ECMP set ─────────
+
+    #[test]
+    fn replacing_a_leading_bgp_alias_keeps_the_static_alias_behind_it() {
+        // Kernel slot order [BGP via .1, static dev]. fib_table_insert with
+        // NLM_F_REPLACE swaps `fa_first` — the BGP alias — and leaves the
+        // static alias in place.
+        let bgp1 = with_oif(
+            with_gateway(bgp_v4_msg("198.18.1.0", 24, 254), "192.0.2.1"),
+            2,
+        );
+        let bgp2 = with_oif(
+            with_gateway(bgp_v4_msg("198.18.1.0", 24, 254), "192.0.2.2"),
+            2,
+        );
+        let mut static_route = with_oif(igp_v4_msg("198.18.1.0", 24, 20, 254), 2);
+        static_route.header.protocol = RouteProtocol::Static;
+
+        // Through the initial dump (kernel order) ...
+        let mut dumped = FibSnapshot::new();
+        apply_dumped(&mut dumped, &bgp1, 254);
+        apply_dumped(&mut dumped, &static_route, 254);
+        // ... and incrementally: static first, then BGP prepended
+        // (NLM_F_CREATE without NLM_F_APPEND goes to the front).
+        let mut incremental = FibSnapshot::new();
+        apply_new(&mut incremental, &static_route, CREATE, 254);
+        assert!(!apply_new(
+            &mut incremental,
+            &bgp1,
+            netlink_packet_core::NLM_F_CREATE,
+            254
+        ));
+
+        for snap in [&mut dumped, &mut incremental] {
+            assert_eq!(metric_v4(snap, "198.18.1.7"), Some(20));
+            assert!(
+                !apply_new(snap, &bgp2, REPLACE, 254),
+                "only the BGP alias was replaced"
+            );
+            assert_eq!(
+                metric_v4(snap, "198.18.1.7"),
+                Some(20),
+                "static alias survives"
+            );
+            assert!(!apply_del(snap, &bgp1, 254), "the old BGP alias is gone");
+            assert!(
+                !apply_del(snap, &bgp2, 254),
+                "untracked: no change signalled"
+            );
+            assert!(apply_del(snap, &static_route, 254));
+            assert_eq!(metric_v4(snap, "198.18.1.7"), None);
+        }
+    }
+
+    /// A one-leg IPv6 message (`RTM_DELROUTE` of one sibling, or a single add).
+    fn v6_leg(prefix: &str, gw: &str, protocol: RouteProtocol) -> RouteMessage {
+        let mut msg = with_oif(with_gateway(igp_v6_msg(prefix, 64, 10, 254), gw), 2);
+        msg.header.protocol = protocol;
+        msg
+    }
+
+    /// The single dump message for an ECMP set: `fib6_dump_node` dumps the set
+    /// once, headed by its first sibling, then skips the other siblings.
+    fn v6_set_dump(prefix: &str, first: RouteProtocol, legs: &[&str]) -> RouteMessage {
+        let legs: Vec<_> = legs.iter().map(|gw| (*gw, 2)).collect();
+        let mut msg = ecmp_v6_msg(prefix, 64, 10, &legs);
+        msg.header.protocol = first;
+        msg
+    }
+
+    #[test]
+    fn dumped_static_ecmp_set_keeps_the_surviving_sibling() {
+        // PR #122 review round 2: both siblings are static, but the dump
+        // describes only the first. Deleting it must leave the second usable.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:200::",
+                RouteProtocol::Static,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(snap.routes_v6().count(), 2);
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:200::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:200::1"), Some(10));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:200::", "fe80::2", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:200::1"), None);
+    }
+
+    #[test]
+    fn dumped_all_bgp_ecmp_set_is_not_igp_reachability() {
+        // PR #122 review round 3: two BGP siblings and nothing else. Live
+        // events report each BGP route, so the running snapshot has no path;
+        // a restart's dump must agree.
+        let mut live = FibSnapshot::new();
+        apply_new(
+            &mut live,
+            &v6_leg("2001:db8:203::", "fe80::1", RouteProtocol::Bgp),
+            APPEND,
+            254,
+        );
+        let second = v6_set_dump(
+            "2001:db8:203::",
+            RouteProtocol::Bgp,
+            &["fe80::2", "fe80::1"],
+        );
+        apply_new(&mut live, &second, APPEND, 254);
+        assert_eq!(metric_v6(&live, "2001:db8:203::1"), None);
+
+        let mut dumped = FibSnapshot::new();
+        apply_dumped(
+            &mut dumped,
+            &v6_set_dump(
+                "2001:db8:203::",
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(
+            metric_v6(&dumped, "2001:db8:203::1"),
+            None,
+            "dump agrees with live"
+        );
+        assert_eq!(dumped.v6.len(), 2, "both siblings mirrored");
+    }
+
+    #[test]
+    fn dumped_mixed_ecmp_set_headed_by_bgp_follows_the_documented_inference() {
+        // The dump message for a BGP-first static+BGP set is the same as for
+        // an all-BGP set, so the static sibling is inferred to be BGP. That is
+        // the documented cost of keeping all-BGP sets out (see the `route`
+        // module docs). A later message reporting the static route fixes it.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:202::",
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), None);
+        let reported = v6_leg("2001:db8:202::", "fe80::2", RouteProtocol::Static);
+        assert!(apply_new(&mut snap, &reported, REPLACE, 254));
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), Some(10));
+        assert!(apply_del(&mut snap, &reported, 254));
+        assert!(!apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:202::", "fe80::1", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn dumped_mixed_ecmp_set_headed_by_static_clears_after_both_deletes() {
+        // Review round 1: the BGP sibling's protocol is not in the dump, so it
+        // is inferred to be static (the documented mixed-set limit) and counts
+        // until deleted; its delete must be applied.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:99::",
+                RouteProtocol::Static,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), Some(10));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::2", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), None);
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn incremental_mixed_ecmp_set_knows_each_siblings_protocol() {
+        // Single-route appends: each RTM_NEWROUTE is headed by the route it
+        // adds (fib6_add_rt2node → inet6_rt_notify(rt)), so protocols are known.
+        let mut snap = FibSnapshot::new();
+        apply_new(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            APPEND,
+            254,
+        );
+        let mut bgp_added =
+            v6_set_dump("2001:db8:99::", RouteProtocol::Bgp, &["fe80::2", "fe80::1"]);
+        bgp_added.header.protocol = RouteProtocol::Bgp;
+        assert!(!apply_new(&mut snap, &bgp_added, APPEND, 254));
+        assert_eq!(
+            snap.routes_v6().count(),
+            1,
+            "only the static sibling is tracked"
+        );
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8:99::1"),
+            None,
+            "the remaining sibling is BGP"
+        );
+        assert!(!apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::2", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn multipath_append_legs_infer_the_described_siblings_protocol() {
+        // ip6_route_mpath_notify reports the set's *first* sibling for an
+        // NLM_F_APPEND multipath add, so the header says nothing about the
+        // appended legs.
+        let mut snap = FibSnapshot::new();
+        let a = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::1"),
+            2,
+        );
+        apply_new(&mut snap, &a, CREATE, 254);
+        let appended = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 2)]);
+        assert!(apply_new(&mut snap, &appended, APPEND, 254));
+        let inferred: Vec<_> = snap.routes_v6().map(|r| r.protocol_inferred).collect();
+        assert!(inferred.contains(&true) && inferred.contains(&false));
+        assert!(
+            snap.routes_v6()
+                .all(|r| r.protocol == u8::from(RouteProtocol::Ospf))
+        );
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8::1"),
+            Some(10),
+            "appended leg still a path"
+        );
+    }
+
+    #[test]
+    fn multipath_create_legs_share_the_header_protocol() {
+        // Without NLM_F_APPEND, ip6_route_multipath_add reports its first new
+        // route, and every leg not yet seen comes from the same request.
+        let mut snap = FibSnapshot::new();
+        let set = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 3)]);
+        assert!(apply_new(&mut snap, &set, CREATE, 254));
+        assert_eq!(snap.routes_v6().count(), 2);
+        let a = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::1"),
+            2,
+        );
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(metric_v6(&snap, "2001:db8::1"), Some(10));
     }
 
     #[test]
@@ -1982,7 +2222,7 @@ mod tests {
         ];
         for (rtm_type, kind) in cases {
             let v4 = decode_v4(&negative_v4_msg("10.0.0.0", 8, 5, rtm_type)).unwrap();
-            assert_eq!(v4.kind, kind);
+            assert_eq!(v4.route_kind(), Some(kind));
             assert_eq!(
                 v4.next_hop,
                 NextHopV4::Path(NextHopPath {
@@ -1992,12 +2232,14 @@ mod tests {
             );
             let v6 = decode_v6(&negative_v6_msg("2001:db8::", 32, 5, rtm_type));
             assert_eq!(v6.len(), 1);
-            assert_eq!(v6[0].kind, kind);
+            assert_eq!(v6[0].route_kind(), Some(kind));
             assert!(!v6[0].qualifies_for_ecmp());
         }
         assert_eq!(
-            decode_v4(&igp_v4_msg("10.0.0.0", 8, 5, 254)).unwrap().kind,
-            RouteKind::Unicast
+            decode_v4(&igp_v4_msg("10.0.0.0", 8, 5, 254))
+                .unwrap()
+                .route_kind(),
+            Some(RouteKind::Unicast)
         );
     }
 

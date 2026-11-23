@@ -250,14 +250,22 @@ impl Shared {
         }
     }
 
-    /// Replaces the live snapshot with a freshly dumped one.
+    /// Replaces the live snapshot with a freshly dumped one, and signals a
+    /// change if any tracked route differs.
     ///
     /// The comparison runs under a read lock (this task is the only writer),
     /// the swap is a move under the write lock, and the old snapshot is freed
     /// after the lock is released.
     fn install(&self, fresh: FibSnapshot) {
         let first = self.status_tx.borrow().resyncs == 0;
-        let changed = first || *self.snapshot.read().expect("FibSnapshot poisoned") != fresh;
+        // Only tracked routes matter to lookups: a full BGP table that moved
+        // between dumps must not wake every watcher.
+        let changed = first
+            || !self
+                .snapshot
+                .read()
+                .expect("FibSnapshot poisoned")
+                .same_tracked(&fresh);
         let old = mem::replace(
             &mut *self.snapshot.write().expect("FibSnapshot poisoned"),
             fresh,

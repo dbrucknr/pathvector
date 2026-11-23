@@ -2282,9 +2282,10 @@ semantic separation of IGP and BGP RIBs).
   cannot tell a complete dump from one cut short by a closed connection; it should use
   the supervisor's `read_dump`.
 - *Resync cost.* A resync dumps every route of both families, BGP-installed ones
-  included (they are filtered after decoding). With a full table in the kernel that is
-  a large dump; `NETLINK_GET_STRICT_CHK` with a protocol filter, or dumping only the
-  tracked table, would shrink it.
+  included: the mirror keeps them as identities so replaces displace the right route,
+  so a protocol filter is not an option. With a full table in the kernel that is a large
+  dump (and the dump deadline must allow for it); with `NETLINK_GET_STRICT_CHK`,
+  dumping only the tracked table would shrink it.
 
 **Testing gaps:**
 

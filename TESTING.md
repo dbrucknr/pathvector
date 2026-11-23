@@ -217,38 +217,39 @@ any syscall, keeping them cross-platform (they pass on macOS and Linux alike).
 #### Kernel FIB route identity and negative routes (issues #56, #57)
 
 The FIB snapshot mirrors kernel routes under their full Linux identity, not just
-their prefix, including negative routes (blackhole, unreachable, prohibit, throw). The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
-platform and compare the mirror against a reference model written directly from the
-kernel's lookup rule (`net/ipv4/fib_trie.c`, `net/ipv6/ip6_fib.c`):
+their prefix, and uses negative routes (blackhole, unreachable, prohibit, throw) for
+reachability. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
+platform and compare the mirror against a model of the kernel's slot lists written
+directly from `fib_table_insert` / `fib_table_delete` and `fib6_add_rt2node` / `fib6_del`,
+and against a reference lookup written from the kernel's lookup rule:
 
 | Invariant | Why it matters |
 |---|---|
-| Any add/delete sequence leaves exactly the set of routes the kernel holds, and every lookup equals the reference (longest prefix, then lowest priority) | A backup route overwriting the primary, or one delete removing every route for a prefix, gives wrong IGP metrics and spurious unreachability |
-| The route type plays no part in selection; the selected route's type alone decides the outcome, and only a unicast route is reachable | A negative route beneath a covering route must not fall through to it (`fib_table_lookup` returns the selected alias's `fib_props` error) |
-| IPv6: within the lowest metric of the longest prefix, the highest router preference wins, then list order (generated routes carry preferences; negatives are medium) | `rt6_score_route` / `find_match`; ignoring it let an earlier blackhole hide a high-preference unicast route |
+| After any sequence of adds (front/back), replaces and deletes of tracked *and* untracked (BGP, blackhole) routes, every slot holds the kernel model's routes in the kernel model's order | A backup route must not overwrite the primary, a delete must remove only the named route, and a replace must displace the route the kernel displaced, even when that is an untracked BGP alias |
+| The tracked routes and every lookup equal the model's: the reference picks the exact route (longest prefix, lowest priority, lowest table, then for IPv6 the highest router preference, then kernel order) from the model's slot lists, and the outcome (`Forward` / `Reject` / `Throw` / `NoRoute`) follows from that route's `rtm_type` alone | Wrong IGP metrics and spurious (un)reachability; a negative route beneath a covering route must not fall through to it (`fib_table_lookup` returns the selected alias's `fib_props` error) |
+| Each mutation reports a change exactly when the tracked routes changed | BGP churn must not wake the decision process; IGP changes must |
 | Lookups do not depend on load (dump) order | Dump and incremental state must agree |
-| Adding then deleting a route restores every lookup | Deletes remove only the named route |
-| Routes of one slot stay contiguous through inserts, replaces and deletes | `NLM_F_REPLACE` targets "the first route of the slot" |
 | `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
 
-The netlink adapter's tests (`linux.rs`, Linux only) cover decoding (route type
-included), the tracking policy (negative routes tracked, BGP and `local`-type routes
-not), `NLM_F_REPLACE` / `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel
-tests in `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes:
-
-- metrics 10 and 100 in both orders, for both families, incrementally and through the
-  initial dump (#56);
-- a burst of notifications lost to `ENOBUFS`, recovered by a resync (#59);
-- each negative type beneath a covering unicast route, its deletion, and
-  `ip route replace <type>` over a unicast route, for both families; plus an initial
-  dump with negative routes at lower and higher metrics than a unicast route and a
-  longer unicast route inside a throw prefix (#57). Every probe compares the oracle's
-  verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
-  `ip route get` sends): the expected errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and
-  `ENETUNREACH`;
-- IPv6 router preference deciding between negative and unicast routes of one metric
-  (including that the kernel drops `RTA_PREF` on negative routes), and negative routes
-  over link-local space, which must override the link-local fallback (PR #123 review).
+The netlink adapter's tests (`linux.rs`, Linux only) cover decoding (route type and
+`RTA_PREF` included), the tracking rule (negative routes tracked; BGP and `local`-type
+routes not), `NLM_F_REPLACE` / `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
+`pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
+and 100 in both orders, for both families, incrementally and through the initial dump.
+They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
+learned from the initial dump (which reports a set only once), an all-BGP ECMP set
+that must give no IGP path both live and after a dump, a check that the kernel dumps a
+BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
+policy), and a BGP alias prepended ahead of a static alias and then replaced. For #57 they compare the oracle's
+verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
+`ip route get` sends) for each negative type beneath a covering route, its deletion,
+`ip route replace <type>` over a unicast route, an initial dump with mixed metrics and a
+unicast route inside a throw prefix, IPv6 router preference between negative and
+unicast routes of one metric, and negative routes over link-local space; the expected
+errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and `ENETUNREACH`. For #59 a burst of
+notifications lost to `ENOBUFS` must be recovered by a resync. The tests run in
+parallel in one namespace, so each uses its own prefixes and interfaces (prefixed
+`pvtest`) and none adds a real default route.
 
 #### Kernel FIB recovery after netlink loss (issue #59)
 
@@ -288,8 +289,7 @@ in `kernel_fib_netns.rs` blocks its single-threaded runtime while another thread
 resync, and then equal a fresh dump. The same scenario fails against the code before the
 fix.
 
-The tests run in parallel in one namespace, so each uses its own prefixes and interfaces
-(prefixed `pvtest`) and none adds a real default route. They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
+They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 
 ```bash
