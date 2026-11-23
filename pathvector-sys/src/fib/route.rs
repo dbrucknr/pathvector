@@ -687,7 +687,7 @@ impl MirroredRoute for KernelRouteV6 {
 /// Routes in the same slot are kept next to each other and in kernel order,
 /// so "the first route of a slot" means the same thing here as in the kernel.
 /// Every mutation returns `true` only when the stored routes changed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteList<R> {
     routes: Vec<R>,
 }

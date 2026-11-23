@@ -10,9 +10,14 @@
 //! - [`KernelFib`] — drives the snapshot: dumps the initial kernel FIB on
 //!   startup and then applies `RTM_NEWROUTE` / `RTM_DELROUTE` netlink events as
 //!   they arrive. Signals change via a `watch` channel so the daemon can
-//!   re-evaluate best-paths whose next-hops were affected.
+//!   re-evaluate best-paths whose next-hops were affected. It supervises its
+//!   netlink connection: when notifications are lost (`ENOBUFS`), the
+//!   connection ends, or a dump is incomplete or inconsistent, it marks the
+//!   snapshot [`Degraded`](SnapshotHealth::Degraded) and dumps the table again
+//!   (see [Recovery](#recovery)).
 //! - [`KernelOracle`] — a thin wrapper that consumers can hold to query
-//!   the snapshot; see `pathvectord::fib` for the `NextHopOracle` impl.
+//!   the snapshot and its [`SnapshotHealth`]; see `pathvectord::fib` for the
+//!   `NextHopOracle` impl.
 //!
 //! # BGP route exclusion
 //!
@@ -50,20 +55,57 @@
 //! To avoid a race between the initial dump and arriving change events:
 //!
 //! 1. Open the multicast socket and subscribe to route groups **first**.
-//! 2. Dump the current kernel FIB into the snapshot.
-//! 3. Apply any events that arrived during or after the dump (idempotent).
+//! 2. Dump the current kernel FIB into a fresh snapshot, over the same socket.
+//! 3. Apply the events that arrived during or after the dump (idempotent).
 //!
 //! This guarantees the snapshot is always at least as fresh as the kernel
 //! table at the time the dump completed.
+//!
+//! # Recovery
+//!
+//! netlink(7): "Netlink is not a reliable protocol", and when a listener's
+//! receive buffer is full "the message will be dropped and the kernel and the
+//! user-space process will no longer have the same view of kernel state. It
+//! is up to the application to detect when this happens (via the `ENOBUFS`
+//! error returned by recvmsg(2)) and resynchronize." Subscribing before the
+//! first dump does not prevent later losses, so [`KernelFib::spawn`] runs a
+//! supervisor that:
+//!
+//! - detects an overrun (`ENOBUFS`, which `netlink-proto` reports as an
+//!   `NLMSG_OVERRUN` message), the end of the connection, a dump that stops
+//!   without `NLMSG_DONE` or fails, and a dump that may have missed routes
+//!   because the table changed while it ran (or the kernel set
+//!   `NLM_F_DUMP_INTR`);
+//! - reports each through [`FibStatus`] / [`SnapshotHealth`];
+//! - waits with [`ResyncBackoff`] delays (applying the notifications it still
+//!   receives), dumps both families again and swaps the result in with a
+//!   single move under the write lock;
+//! - reconnects with the same delays when the connection is gone.
+//!
+//! While degraded, lookups answer from the last snapshot (stale but
+//! flagged); see [`SnapshotHealth`] for why they are not refused. The
+//! supervisor and the evidence for each detection rule are in the
+//! `supervisor` module.
 
 use std::{
     future::Future,
     io,
     net::{Ipv4Addr, Ipv6Addr},
+    num::NonZeroU32,
     sync::{Arc, RwLock},
 };
 
 use tokio::sync::watch;
+
+mod health;
+pub use health::{
+    DegradedCause, FibStatus, IoFailure, ResyncBackoff, ResyncBackoffError, SnapshotHealth,
+};
+
+// Generic over the kernel port; on other platforms only the tests instantiate
+// it.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+mod supervisor;
 
 // ── Platform-specific FibWriter ───────────────────────────────────────────────
 
@@ -202,7 +244,7 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
 /// route also covers them, because the kernel does not fall back to a shorter
 /// prefix once a negative route is selected. See the `route` module docs for
 /// the kernel source and for how `throw` is treated.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FibSnapshot {
     pub(crate) v4: RouteList<KernelRouteV4>,
     pub(crate) v6: RouteList<KernelRouteV6>,
@@ -295,13 +337,30 @@ impl FibSnapshot {
 /// Cheap to clone — shares the `Arc<RwLock<FibSnapshot>>` with
 /// [`KernelFib`]. The daemon wraps this in its `NextHopOracle` impl.
 ///
+/// Queries answer from the current snapshot whatever its
+/// [`health`](Self::health): stale but flagged, never refused (see
+/// [`SnapshotHealth`]).
+///
 /// See `pathvectord::fib::KernelOracle` for the `NextHopOracle` impl.
 #[derive(Clone)]
 pub struct KernelOracle {
     pub(crate) snapshot: Arc<RwLock<FibSnapshot>>,
+    pub(crate) status: watch::Receiver<FibStatus>,
 }
 
 impl KernelOracle {
+    /// Whether the snapshot behind this oracle currently mirrors the kernel.
+    #[must_use]
+    pub fn health(&self) -> SnapshotHealth {
+        self.status.borrow().health()
+    }
+
+    /// The snapshot's health and loss / resync counters.
+    #[must_use]
+    pub fn status(&self) -> FibStatus {
+        *self.status.borrow()
+    }
+
     /// Returns `true` if `addr` is reachable according to the live snapshot.
     ///
     /// # Panics
@@ -372,17 +431,22 @@ pub const RT_TABLE_MAIN: u32 = 254;
 /// ```ignore
 /// let (fib, change_rx) = KernelFib::new(RT_TABLE_MAIN);
 /// let oracle = fib.oracle();              // share with decision process
-/// tokio::spawn(fib.spawn());             // starts the event loop
+/// let mut status = fib.status();          // health and counters
+/// tokio::spawn(fib.spawn());              // starts the supervised event loop
 /// // change_rx fires whenever the FIB changes
+/// status.wait_for(|s| s.health().is_ready()).await?;
 /// ```
 pub struct KernelFib {
-    pub(crate) snapshot: Arc<RwLock<FibSnapshot>>,
-    pub(crate) change_tx: watch::Sender<()>,
+    pub(crate) shared: supervisor::Shared,
+    pub(crate) status_rx: watch::Receiver<FibStatus>,
     pub(crate) table: u32,
+    pub(crate) backoff: ResyncBackoff,
+    pub(crate) receive_buffer: Option<NonZeroU32>,
 }
 
 impl KernelFib {
-    /// Creates a `KernelFib` for the given routing `table`.
+    /// Creates a `KernelFib` for the given routing `table` with the default
+    /// [`ResyncBackoff`] and the system's default socket receive buffer.
     ///
     /// Returns the `KernelFib` and a `watch::Receiver` that fires whenever the
     /// FIB snapshot changes. The receiver can be cloned and shared with any
@@ -393,16 +457,16 @@ impl KernelFib {
     /// calling [`spawn`][`KernelFib::spawn`] (spawning consumes `self`).
     #[must_use]
     pub fn new(table: u32) -> (Self, watch::Receiver<()>) {
-        let snapshot = Arc::new(RwLock::new(FibSnapshot::new()));
-        let (tx, rx) = watch::channel(());
-        (
-            KernelFib {
-                snapshot,
-                change_tx: tx,
-                table,
-            },
-            rx,
-        )
+        Self::builder(table).build()
+    }
+
+    /// Starts a [`KernelFibBuilder`] for the given routing `table`.
+    pub fn builder(table: u32) -> KernelFibBuilder {
+        KernelFibBuilder {
+            table,
+            backoff: ResyncBackoff::DEFAULT,
+            receive_buffer: None,
+        }
     }
 
     /// Returns a [`KernelOracle`] backed by this FIB's live snapshot.
@@ -411,29 +475,45 @@ impl KernelFib {
     #[must_use]
     pub fn oracle(&self) -> KernelOracle {
         KernelOracle {
-            snapshot: self.snapshot.clone(),
+            snapshot: self.shared.snapshot.clone(),
+            status: self.status_rx.clone(),
         }
+    }
+
+    /// Returns a receiver for the snapshot's [`FibStatus`]. It starts at
+    /// [`SnapshotHealth::Starting`] and changes on every health transition and
+    /// every completed resynchronization.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<FibStatus> {
+        self.status_rx.clone()
     }
 
     /// Returns a direct handle to the shared snapshot (for testing).
     #[must_use]
     pub fn snapshot(&self) -> Arc<RwLock<FibSnapshot>> {
-        self.snapshot.clone()
+        self.shared.snapshot.clone()
     }
 
-    /// Starts the netlink event loop.
+    /// Runs the supervised netlink event loop. Drop or abort the future to
+    /// stop it.
     ///
-    /// On Linux: dumps the current kernel FIB, then processes `RTM_NEWROUTE`
-    /// and `RTM_DELROUTE` events indefinitely, updating the snapshot and
-    /// notifying watchers on each change.
+    /// On Linux: opens a socket subscribed to IPv4 and IPv6 route
+    /// notifications, dumps the kernel FIB into the snapshot, then applies
+    /// `RTM_NEWROUTE` and `RTM_DELROUTE` events indefinitely, notifying
+    /// watchers on each change. Losses, connection failures and bad dumps are
+    /// recovered from as described in [Recovery](self#recovery) and reported
+    /// through [`status`](Self::status).
     ///
-    /// On non-Linux: returns immediately (no-op stub for development builds).
+    /// On non-Linux: returns `Ok(())` immediately (no-op stub for development
+    /// builds); the status stays [`SnapshotHealth::Starting`].
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the initial netlink connection or route dump fails.
-    /// After the dump succeeds, errors on individual route-change events are
-    /// logged and skipped rather than terminating the loop.
+    /// Returns `Err` only if the **first** netlink socket cannot be opened or
+    /// subscribed, which means this process cannot use netlink at all; the
+    /// status is then [`DegradedCause::ConnectFailed`]. Once running it never
+    /// returns: every later failure, including the initial dump, is retried
+    /// with [`ResyncBackoff`] delays.
     // async is needed for the Linux branch (which awaits the route dump and event
     // loop). On non-Linux builds the body has no await points; the allow keeps
     // the API surface uniform across platforms.
@@ -441,11 +521,12 @@ impl KernelFib {
     pub async fn spawn(self) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            linux::run(self.snapshot, self.change_tx, self.table).await
+            let source = linux::NetlinkSource::new(self.table, self.receive_buffer);
+            Err(supervisor::supervise(source, self.shared, self.backoff).await)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (self.snapshot, self.change_tx, self.table);
+            let _ = (self.shared, self.table, self.backoff, self.receive_buffer);
             Ok(())
         }
     }
@@ -476,6 +557,53 @@ impl KernelFib {
         {
             Ok((vec![], vec![]))
         }
+    }
+}
+
+/// Configures a [`KernelFib`]. Created by [`KernelFib::builder`].
+#[derive(Debug, Clone, Copy)]
+#[must_use]
+pub struct KernelFibBuilder {
+    table: u32,
+    backoff: ResyncBackoff,
+    receive_buffer: Option<NonZeroU32>,
+}
+
+impl KernelFibBuilder {
+    /// The delays between resynchronization and reconnection attempts.
+    /// Defaults to [`ResyncBackoff::DEFAULT`].
+    pub fn resync_backoff(mut self, backoff: ResyncBackoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Sets `SO_RCVBUF` on the notification socket, in bytes.
+    ///
+    /// A larger buffer makes `ENOBUFS` overruns rarer during bursts of route
+    /// changes. socket(7): the kernel doubles the value, the result is capped
+    /// by `/proc/sys/net/core/rmem_max`, and the default comes from
+    /// `/proc/sys/net/core/rmem_default` (used when this is not called).
+    /// Failing to set it fails the connection attempt.
+    pub fn receive_buffer(mut self, bytes: NonZeroU32) -> Self {
+        self.receive_buffer = Some(bytes);
+        self
+    }
+
+    /// Builds the `KernelFib` and a receiver that fires whenever the snapshot
+    /// changes (see [`KernelFib::new`]).
+    #[must_use]
+    pub fn build(self) -> (KernelFib, watch::Receiver<()>) {
+        let (shared, change_rx, status_rx) = supervisor::Shared::new();
+        (
+            KernelFib {
+                shared,
+                status_rx,
+                table: self.table,
+                backoff: self.backoff,
+                receive_buffer: self.receive_buffer,
+            },
+            change_rx,
+        )
     }
 }
 
@@ -816,7 +944,7 @@ mod tests {
         let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
         let oracle = fib.oracle();
         {
-            let mut snap = fib.snapshot.write().unwrap();
+            let mut snap = fib.shared.snapshot.write().unwrap();
             snap.v4.insert_back(r4("0.0.0.0", 0, 0));
             snap.v4.insert_back(neg4(
                 "192.0.2.0",
@@ -850,7 +978,8 @@ mod tests {
         assert!(!oracle.is_v4_reachable("10.0.0.1".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v4("10.0.0.1".parse().unwrap()), None);
 
-        fib.snapshot
+        fib.shared
+            .snapshot
             .write()
             .unwrap()
             .v4
@@ -871,7 +1000,8 @@ mod tests {
         assert!(!oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v6("2001:db8::1".parse().unwrap()), None);
 
-        fib.snapshot
+        fib.shared
+            .snapshot
             .write()
             .unwrap()
             .v6
@@ -935,7 +1065,7 @@ mod tests {
 
         // Inject a route directly
         {
-            let mut snap = fib.snapshot.write().unwrap();
+            let mut snap = fib.shared.snapshot.write().unwrap();
             snap.v4.insert_back(r4("10.0.0.0", 8, 10));
         }
 
@@ -951,12 +1081,13 @@ mod tests {
         assert!(!rx.has_changed().unwrap());
 
         // Simulate what the event loop does: write to snapshot and send.
-        fib.snapshot
+        fib.shared
+            .snapshot
             .write()
             .unwrap()
             .v4
             .insert_back(r4("192.168.1.0", 24, 20));
-        let _ = fib.change_tx.send(());
+        let _ = fib.shared.change_tx.send(());
 
         assert!(rx.has_changed().unwrap());
     }

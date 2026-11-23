@@ -16,6 +16,8 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Paused virtual time for the supervisor's backoff tests.
+tokio    = { workspace = true, features = ["test-util"] }
 
 # This crate's sole purpose is to encapsulate unsafe OS-level syscalls and
 # expose a safe public API. It deliberately does NOT inherit the workspace
