@@ -1,22 +1,23 @@
 //! Linux [`FibWriter`]: installs and withdraws BGP-learned routes via rtnetlink.
 
 use std::{
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
     sync::{Arc, RwLock},
 };
 
-use futures::{StreamExt, TryStreamExt};
-use netlink_packet_core::{NLM_F_APPEND, NLM_F_REPLACE, NetlinkPayload, Nla};
+use futures::{FutureExt, StreamExt, TryStreamExt};
+use netlink_packet_core::{NLM_F_APPEND, NLM_F_REPLACE, NetlinkMessage, NetlinkPayload, Nla};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{
-        RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol, RouteType,
-        RouteVia,
+        RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteNextHop, RouteProtocol,
+        RouteScope, RouteType, RouteVia,
     },
 };
-use rtnetlink::{MulticastGroup, RouteMessageBuilder};
+use rtnetlink::{MulticastGroup, RouteMessageBuilder, sys::AsyncSocket};
 use tokio::sync::watch;
 
 use super::{
@@ -170,6 +171,18 @@ pub(super) async fn run(
     ])?;
     tokio::spawn(conn);
 
+    // A second connection re-reads IPv6 sibling sets (see `reread_sets`).
+    // NETLINK_GET_STRICT_CHK (Linux 4.20+) makes the kernel apply the dump's
+    // table and device filters (`ip_valid_fib_dump_req`); without it the
+    // dump is unfiltered, which costs more but gives the same result,
+    // because the sets are picked out by slot here.
+    let (mut reread_conn, reread_handle, _) = rtnetlink::new_connection()?;
+    let _ = reread_conn
+        .socket_mut()
+        .socket_ref()
+        .set_netlink_get_strict_chk(true);
+    tokio::spawn(reread_conn);
+
     // Step 2 — Populate snapshot from current kernel FIB.
     //
     // Build into a local snapshot while awaiting so the RwLockWriteGuard is
@@ -215,35 +228,173 @@ pub(super) async fn run(
     // The netlink header flags matter: NLM_F_REPLACE means the kernel replaced
     // an existing route without sending RTM_DELROUTE for it, and NLM_F_APPEND
     // says where in its slot an IPv4 route was inserted.
-    while let Some((msg, _addr)) = events.next().await {
-        let flags = msg.header.flags;
-        match msg.payload {
-            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
-                let changed = apply_new(
-                    &mut snapshot.write().expect("FibSnapshot poisoned"),
-                    &route,
-                    flags,
-                    table,
-                );
-                if changed {
-                    let _ = change_tx.send(());
-                }
-            }
-            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route)) => {
-                let changed = apply_del(
-                    &mut snapshot.write().expect("FibSnapshot poisoned"),
-                    &route,
-                    table,
-                );
-                if changed {
-                    let _ = change_tx.send(());
-                }
-            }
-            _ => {}
+    //
+    // Events already queued are applied together before any re-read, so a
+    // burst of deletes costs one dump per table and device.
+    while let Some(event) = events.next().await {
+        let mut changed = false;
+        let mut reread = HashSet::new();
+        let mut next = Some(event);
+        while let Some((msg, _addr)) = next {
+            changed |= apply_event(&snapshot, msg, table, &mut reread);
+            next = events.next().now_or_never().flatten();
+        }
+        if !reread.is_empty() {
+            changed |= reread_sets(&reread_handle, &snapshot, reread).await;
+        }
+        if changed {
+            let _ = change_tx.send(());
         }
     }
 
     Ok(())
+}
+
+/// Applies one multicast route event. An IPv6 delete that leaves a route with
+/// an inferred protocol in its slot adds the slot to `reread`.
+fn apply_event(
+    snapshot: &RwLock<FibSnapshot>,
+    msg: NetlinkMessage<RouteNetlinkMessage>,
+    table: u32,
+    reread: &mut HashSet<RouteSlotV6>,
+) -> bool {
+    let flags = msg.header.flags;
+    let mut snap = snapshot.write().expect("FibSnapshot poisoned");
+    match msg.payload {
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
+            apply_new(&mut snap, &route, flags, table)
+        }
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route)) => {
+            let changed = apply_del(&mut snap, &route, table);
+            reread.extend(slot_to_reread(&snap, &route, table));
+            changed
+        }
+        _ => false,
+    }
+}
+
+// ── Re-reading IPv6 sibling sets ──────────────────────────────────────────────
+//
+// An IPv6 ECMP sibling's protocol is reported only when a message describes
+// that sibling, and a dump describes a set only through its first sibling
+// (`fib6_dump_node`: "no need to dump the sibling routes again"). The other
+// siblings carry an inferred protocol (see the `route` module docs).
+//
+// A delete changes what the kernel describes: once the first sibling is gone
+// the next one heads the set, and a lone remaining route is described in
+// full. So after a delete that leaves an inferred route in its slot, the set
+// is read back and applied with `RouteMirror::redescribe`.
+//
+// No request can target one prefix:
+// - A strict-checked dump rejects a prefix (`ip_valid_fib_dump_req`:
+//   `rtm_dst_len || rtm_src_len || rtm_tos || rtm_scope` is "Invalid values
+//   in header for FIB dump request"); it filters only by table, protocol,
+//   type and device, and `rt6_dump_route` tests the protocol of the described
+//   route alone.
+// - `RTM_GETROUTE` with `RTM_F_FIB_MATCH` runs a full policy lookup for an
+//   address, and `fib6_select_path` picks the sibling by multipath hash
+//   (`match = sibling`), which `rt6_fill_node` then describes. It cannot ask
+//   for a given table, metric or sibling.
+//
+// So the re-read is a dump filtered by table and by the device of the
+// inferred route (`fib6_info_uses_dev` matches a set through any sibling),
+// and the wanted sets are picked out by slot.
+
+/// The slot to re-read after an IPv6 `RTM_DELROUTE` has been applied: the
+/// deleted route's slot, if a route whose protocol is inferred remains there.
+fn slot_to_reread(snap: &FibSnapshot, msg: &RouteMessage, table: u32) -> Option<RouteSlotV6> {
+    if !in_table(msg, table) || msg.header.address_family != AddressFamily::Inet6 {
+        return None;
+    }
+    let slot = decode_v6(msg).first()?.slot;
+    snap.v6.first_inferred(&slot).map(|_| slot)
+}
+
+/// A re-read dump: one routing table, optionally only routes using a device.
+type DumpFilter = (TableId, Option<NonZeroU32>);
+
+/// Groups the slots that still hold an inferred route by the dump that will
+/// re-read them. Slots settled by later events in the same burst are dropped.
+fn reread_groups(
+    snap: &FibSnapshot,
+    slots: HashSet<RouteSlotV6>,
+) -> HashMap<DumpFilter, HashSet<RouteSlotV6>> {
+    let mut groups: HashMap<DumpFilter, HashSet<RouteSlotV6>> = HashMap::new();
+    for slot in slots {
+        let Some(route) = snap.v6.first_inferred(&slot) else {
+            continue;
+        };
+        let oif = match route.next_hop {
+            NextHopV6::Path(p) => p.oif,
+            NextHopV6::Object(_) => None,
+        };
+        groups.entry((slot.table, oif)).or_default().insert(slot);
+    }
+    groups
+}
+
+/// An `RTM_GETROUTE` dump request for IPv6 routes in `table`, limited to
+/// routes using `oif` if given. The header obeys `ip_valid_fib_dump_req`:
+/// zero prefix lengths, TOS and scope, and no protocol or type filter.
+fn reread_request(table: TableId, oif: Option<NonZeroU32>) -> RouteMessage {
+    let mut msg = RouteMessage::default();
+    msg.header.address_family = AddressFamily::Inet6;
+    msg.header.table = RouteHeader::RT_TABLE_UNSPEC;
+    msg.header.protocol = RouteProtocol::Unspec;
+    msg.header.kind = RouteType::Unspec;
+    msg.header.scope = RouteScope::Universe;
+    msg.attributes.push(RouteAttribute::Table(table.get()));
+    if let Some(oif) = oif {
+        msg.attributes.push(RouteAttribute::Oif(oif.get()));
+    }
+    msg
+}
+
+/// The routes of a dumped message, if it describes a set in one of `slots`.
+fn wanted_set(msg: &RouteMessage, slots: &HashSet<RouteSlotV6>) -> Option<Vec<KernelRouteV6>> {
+    if msg.header.address_family != AddressFamily::Inet6 {
+        return None;
+    }
+    let set = decode_v6(msg);
+    slots.contains(&set.first()?.slot).then_some(set)
+}
+
+/// Dumps the IPv6 routes `filter` selects and returns the sets in `slots`.
+async fn dump_sets(
+    handle: &rtnetlink::Handle,
+    (table, oif): DumpFilter,
+    slots: &HashSet<RouteSlotV6>,
+) -> io::Result<Vec<Vec<KernelRouteV6>>> {
+    let mut stream = handle.route().get(reread_request(table, oif)).execute();
+    let mut sets = Vec::new();
+    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
+        sets.extend(wanted_set(&msg, slots));
+    }
+    Ok(sets)
+}
+
+/// Re-reads the sibling sets in `slots` and applies them. The snapshot lock is
+/// not held while the kernel is read. If a dump fails, its slots keep their
+/// inferred protocols until a later delete re-reads them.
+///
+/// Returns `true` if the tracked routes changed.
+async fn reread_sets(
+    handle: &rtnetlink::Handle,
+    snapshot: &RwLock<FibSnapshot>,
+    slots: HashSet<RouteSlotV6>,
+) -> bool {
+    let groups = reread_groups(&snapshot.read().expect("FibSnapshot poisoned"), slots);
+    let mut changed = false;
+    for (filter, slots) in groups {
+        let Ok(sets) = dump_sets(handle, filter, &slots).await else {
+            continue;
+        };
+        let mut snap = snapshot.write().expect("FibSnapshot poisoned");
+        for set in sets {
+            changed |= snap.v6.redescribe(set);
+        }
+    }
+    changed
 }
 
 // ── Stale BGP route dump ──────────────────────────────────────────────────────
@@ -1929,6 +2080,239 @@ mod tests {
             254
         ));
         assert_eq!(snap.v6.len(), 0);
+    }
+
+    // ── Re-reading a set after a delete ──────────────────────────────────────
+    //
+    // fib6_dump_node describes a set through its first sibling; after that
+    // sibling is deleted a dump describes the next one, and a lone route in
+    // full (rt6_fill_node with no siblings emits no RTA_MULTIPATH).
+
+    fn slot_of(msg: &RouteMessage) -> RouteSlotV6 {
+        decode_v6(msg)[0].slot
+    }
+
+    /// Applies an RTM_DELROUTE the way the event loop does.
+    fn delete_event(snap: &mut FibSnapshot, msg: &RouteMessage) -> HashSet<RouteSlotV6> {
+        let lock = RwLock::new(std::mem::take(snap));
+        let mut reread = HashSet::new();
+        apply_event(
+            &lock,
+            NetlinkMessage::from(RouteNetlinkMessage::DelRoute(msg.clone())),
+            254,
+            &mut reread,
+        );
+        *snap = lock.into_inner().unwrap();
+        reread
+    }
+
+    /// Applies the kernel's answer to a re-read the way `reread_sets` does.
+    fn reread_answer(
+        snap: &mut FibSnapshot,
+        slots: HashSet<RouteSlotV6>,
+        dump: &[RouteMessage],
+    ) -> bool {
+        let mut changed = false;
+        for (filter, slots) in reread_groups(snap, slots) {
+            assert_eq!(filter.0, TableId::MAIN);
+            for set in dump.iter().filter_map(|m| wanted_set(m, &slots)) {
+                changed |= snap.v6.redescribe(set);
+            }
+        }
+        changed
+    }
+
+    #[test]
+    fn deleting_the_described_bgp_sibling_rereads_and_restores_the_static_path() {
+        let prefix = "2001:db8:202::";
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(prefix, RouteProtocol::Bgp, &["fe80::1", "fe80::2"]),
+            254,
+        );
+        let bgp = v6_leg(prefix, "fe80::1", RouteProtocol::Bgp);
+        let reread = delete_event(&mut snap, &bgp);
+        assert_eq!(reread, HashSet::from([slot_of(&bgp)]));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8:202::1"),
+            None,
+            "before the re-read"
+        );
+
+        // The dump now holds the static route on its own, among others.
+        let unrelated = v6_leg("2001:db8:300::", "fe80::2", RouteProtocol::Static);
+        let lone_static = v6_leg(prefix, "fe80::2", RouteProtocol::Static);
+        assert!(reread_answer(&mut snap, reread, &[unrelated, lone_static]));
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), Some(10));
+        assert_eq!(
+            snap.routes_v6().count(),
+            1,
+            "the unrelated route is not added"
+        );
+    }
+
+    #[test]
+    fn deleting_the_described_static_sibling_rereads_and_drops_the_bgp_path() {
+        let prefix = "2001:db8:99::";
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(prefix, RouteProtocol::Static, &["fe80::1", "fe80::2"]),
+            254,
+        );
+        let reread = delete_event(&mut snap, &v6_leg(prefix, "fe80::1", RouteProtocol::Static));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8:99::1"),
+            Some(10),
+            "inferred static"
+        );
+        let lone_bgp = v6_leg(prefix, "fe80::2", RouteProtocol::Bgp);
+        assert!(reread_answer(&mut snap, reread, &[lone_bgp]));
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), None);
+        assert_eq!(snap.v6.len(), 1, "still mirrored, as BGP");
+    }
+
+    #[test]
+    fn reread_of_a_larger_set_settles_its_new_first_sibling() {
+        // [B, S, S] dumped: both static siblings are inferred BGP. After B is
+        // deleted the kernel describes the first static route and lists the
+        // other under its protocol.
+        let prefix = "2001:db8:210::";
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                prefix,
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2", "fe80::3"],
+            ),
+            254,
+        );
+        let reread = delete_event(&mut snap, &v6_leg(prefix, "fe80::1", RouteProtocol::Bgp));
+        let answer = v6_set_dump(prefix, RouteProtocol::Static, &["fe80::2", "fe80::3"]);
+        assert!(reread_answer(&mut snap, reread, &[answer]));
+        let got: Vec<_> = snap.routes_v6().map(|r| r.protocol_inferred).collect();
+        assert_eq!(got, [false, true], "the third is still a guess");
+        assert_eq!(metric_v6(&snap, "2001:db8:210::1"), Some(10));
+    }
+
+    #[test]
+    fn deletes_that_leave_no_inferred_route_are_not_reread() {
+        let prefix = "2001:db8:211::";
+        // A set created by one request: every leg's protocol is known.
+        let mut created = FibSnapshot::new();
+        apply_new(
+            &mut created,
+            &v6_set_dump(prefix, RouteProtocol::Static, &["fe80::1", "fe80::2"]),
+            CREATE,
+            254,
+        );
+        let first = v6_leg(prefix, "fe80::1", RouteProtocol::Static);
+        assert!(delete_event(&mut created, &first).is_empty());
+
+        // Deleting the inferred leg leaves only the described one.
+        let mut dumped = FibSnapshot::new();
+        let set = v6_set_dump(prefix, RouteProtocol::Bgp, &["fe80::1", "fe80::2"]);
+        apply_dumped(&mut dumped, &set, 254);
+        let mut other = dumped.clone();
+        assert!(
+            delete_event(
+                &mut dumped,
+                &v6_leg(prefix, "fe80::2", RouteProtocol::Static)
+            )
+            .is_empty()
+        );
+        // Deleting the whole set in one message leaves nothing.
+        assert!(delete_event(&mut other, &set).is_empty());
+        assert!(other.v6.is_empty());
+
+        // IPv4, and routes in a table we do not track, never are.
+        let mut snap = FibSnapshot::new();
+        let v4 = igp_v4_msg("10.0.0.0", 8, 10, 254);
+        apply_new(&mut snap, &v4, CREATE, 254);
+        assert!(delete_event(&mut snap, &v4).is_empty());
+        assert_eq!(
+            slot_to_reread(
+                &FibSnapshot::new(),
+                &igp_v6_msg("2001:db8::", 32, 10, 200),
+                254
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reread_groups_by_table_and_device_and_skips_settled_slots() {
+        let mut snap = FibSnapshot::new();
+        let mut on_oif = |prefix: &str, oif: u32, table: u32| {
+            let mut msg = v6_set_dump(prefix, RouteProtocol::Bgp, &["fe80::1", "fe80::2"]);
+            if let Some(RouteAttribute::MultiPath(legs)) = msg
+                .attributes
+                .iter_mut()
+                .find(|a| matches!(a, RouteAttribute::MultiPath(_)))
+            {
+                for leg in legs {
+                    leg.interface_index = oif;
+                }
+            }
+            msg.attributes.push(RouteAttribute::Table(table));
+            apply_dumped(&mut snap, &msg, 0);
+            slot_of(&msg)
+        };
+        let a = on_oif("2001:db8:1::", 2, 254);
+        let b = on_oif("2001:db8:2::", 2, 254);
+        let c = on_oif("2001:db8:3::", 3, 254);
+        let d = on_oif("2001:db8:4::", 2, 300);
+        let settled = on_oif("2001:db8:5::", 2, 254);
+        let reported = KernelRouteV6 {
+            protocol_inferred: false,
+            ..snap.v6.first_inferred(&settled).unwrap().clone()
+        };
+        snap.v6.upsert(reported, Position::Back);
+
+        let groups = reread_groups(&snap, HashSet::from([a, b, c, d, settled]));
+        let main = TableId::MAIN;
+        let other = TableId::new(300).unwrap();
+        let oif = |i| NonZeroU32::new(i);
+        assert_eq!(
+            groups,
+            HashMap::from([
+                ((main, oif(2)), HashSet::from([a, b])),
+                ((main, oif(3)), HashSet::from([c])),
+                ((other, oif(2)), HashSet::from([d])),
+            ])
+        );
+    }
+
+    #[test]
+    fn reread_request_obeys_the_strict_dump_rules() {
+        // ip_valid_fib_dump_req rejects a nonzero rtm_dst_len, rtm_src_len,
+        // rtm_tos or rtm_scope and accepts only RTA_TABLE and RTA_OIF; a
+        // nonzero rtm_protocol or rtm_type would filter by the described
+        // route's protocol or type. Without RTA_DST rtnetlink sends
+        // NLM_F_DUMP.
+        let msg = reread_request(TableId::new(300).unwrap(), NonZeroU32::new(7));
+        assert_eq!(msg.header.address_family, AddressFamily::Inet6);
+        assert_eq!(
+            (
+                msg.header.destination_prefix_length,
+                msg.header.source_prefix_length,
+                msg.header.tos,
+                u8::from(msg.header.scope),
+                u8::from(msg.header.protocol),
+                u8::from(msg.header.kind),
+                msg.header.table,
+            ),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
+        assert!(msg.header.flags.is_empty());
+        assert_eq!(
+            msg.attributes,
+            [RouteAttribute::Table(300), RouteAttribute::Oif(7)]
+        );
+        let any_device = reread_request(TableId::MAIN, None);
+        assert_eq!(any_device.attributes, [RouteAttribute::Table(254)]);
     }
 
     #[test]
