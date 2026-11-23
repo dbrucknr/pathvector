@@ -12,7 +12,7 @@
 //! `CONFIG_TCP_MD5SIG`, so `setsockopt(TCP_MD5SIG)` fails with `ENOPROTOOPT`.
 //! Since issue #58 pathvectord treats that as "cannot enforce" and, with the
 //! default `tcp_md5_enforcement = "required"`, refuses to connect instead of
-//! running the session unauthenticated. Both tests therefore run only when
+//! running the session unauthenticated. All tests here therefore run only when
 //! the `CI` environment variable is set (GitHub Actions sets it).
 
 /// Returns `true` (after printing why) when this host cannot enforce TCP MD5.
@@ -32,9 +32,9 @@ use std::{net::IpAddr, time::Duration};
 
 use pathvector_client::{DaemonClient, types::SessionState};
 use pathvector_e2e::{
-    DockerNetwork, GOBGPD_IMAGE, Md5Harness, PATHVECTORD_IMAGE, alloc_grpc_port, alloc_test_id,
-    docker_start, wait_container_healthy, wait_for_established, write_daemon_config_md5,
-    write_gobgp_config,
+    DockerNetwork, GOBGPD_IMAGE, Md5Harness, Md5InboundHarness, PATHVECTORD_IMAGE, alloc_grpc_port,
+    alloc_test_id, docker_start, wait_container_healthy, wait_for_established,
+    write_daemon_config_md5, write_gobgp_config,
 };
 
 /// RFC 2385 §2.0 — when both sides share the same MD5 key the TCP connection
@@ -150,5 +150,58 @@ async fn md5_key_mismatch_session_never_establishes() {
     assert!(
         result.is_err(),
         "BGP session must NOT establish when pathvectord has an MD5 key but GoBGP does not"
+    );
+}
+
+// ── Inbound connections (issue #66) ──────────────────────────────────────────
+//
+// In these tests only GoBGP initiates: pathvectord dials a port where nothing
+// listens, so a session can only come up through pathvectord's BGP listener.
+// RFC 5925 §8: required TCP MD5 must be "validated on all incoming segments";
+// RFC 2385 §2.0: a failing segment is "dropped" with no response.
+
+/// GoBGP dials pathvectord with the shared key: the listener has the key, so
+/// the kernel accepts the signed handshake and the session establishes.
+#[tokio::test]
+async fn md5_inbound_matching_key_session_establishes() {
+    if skip_without_native_linux_md5("md5_inbound_matching_key_session_establishes") {
+        return;
+    }
+    let mut h = Md5InboundHarness::new("inbound-shared-key", Some("inbound-shared-key"));
+    wait_for_established(&mut h.client, h.gobgp_ip, Duration::from_secs(30))
+        .await
+        .expect("inbound MD5 session with matching keys must reach Established");
+}
+
+/// Issue #66: GoBGP dials pathvectord **without** a key while pathvectord has
+/// one for GoBGP's address. Before the fix the listener had no key, so this
+/// unsigned connection was accepted and the session established
+/// unauthenticated. Now the listener's kernel drops the unsigned SYN
+/// (`TCP_MD5NOTFOUND`) and the session never establishes.
+#[tokio::test]
+async fn md5_inbound_unsigned_peer_never_establishes() {
+    if skip_without_native_linux_md5("md5_inbound_unsigned_peer_never_establishes") {
+        return;
+    }
+    let mut h = Md5InboundHarness::new("pathvector-only-key", None);
+    let result = wait_for_established(&mut h.client, h.gobgp_ip, Duration::from_secs(15)).await;
+    assert!(
+        result.is_err(),
+        "an unsigned inbound connection must not establish a session with an MD5 peer"
+    );
+}
+
+/// GoBGP dials pathvectord with the wrong key: the digest check fails
+/// (`TCP_MD5FAILURE`) and the session never establishes.
+#[tokio::test]
+async fn md5_inbound_wrong_key_never_establishes() {
+    if skip_without_native_linux_md5("md5_inbound_wrong_key_never_establishes") {
+        return;
+    }
+    let mut h = Md5InboundHarness::new("pathvector-key", Some("a-different-key"));
+    let result = wait_for_established(&mut h.client, h.gobgp_ip, Duration::from_secs(15)).await;
+    assert!(
+        result.is_err(),
+        "an inbound connection signed with the wrong key must not establish a session"
     );
 }
