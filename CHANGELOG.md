@@ -4,6 +4,56 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #58: TCP MD5 never reports an unenforced key as enabled)
+
+`pathvector-sys::apply_tcp_md5sig` returned `Ok(())` when the kernel rejected
+`TCP_MD5SIG` with `ENOPROTOOPT`/`EOPNOTSUPP` and on every non-Linux build, so callers
+could not tell an enforced key from no key at all, and the warning its docs promised was
+never logged. It also accepted an empty password, which Linux reads as "delete this
+peer's key" (`tcp_v4_parse_md5_keys`: zero `tcpm_keylen` → `tcp_md5_do_del`).
+Reproduced on macOS and in a Linux container whose kernel lacks `CONFIG_TCP_MD5SIG`:
+both an empty key and an unenforceable key returned `Ok(())`. The gRPC client and CLI had
+the same hole one layer up: `Some("")` was sent as proto3's unset string, adding the peer
+without MD5.
+
+**Breaking API changes.**
+
+- `pathvector-sys`: `apply_tcp_md5sig` is replaced by
+  `install_tcp_md5_key(BorrowedFd, IpAddr, &TcpMd5Key) -> Result<(), TcpMd5Error>` and a
+  separately named `remove_tcp_md5_key`. `TcpMd5Key` (1–80 bytes, `Debug`-redacted) makes
+  empty and over-length keys unrepresentable. `TcpMd5Error::Unsupported(TcpMd5Unsupported)`
+  (`Kernel { errno }`, `Platform`, `Ipv6Peer`) is distinct from `TcpMd5Error::Os`. The
+  `TcpMd5Port` trait / `KernelTcpMd5` adapter let callers test their policy with a fake.
+- `pathvector-session`: `SessionConfig::md5_password: Option<String>` is now
+  `tcp_md5: Option<TcpMd5Auth>` (key + `Md5Enforcement`). New module
+  `transport::tcp_md5` holds the policy: `protect_socket` returns
+  `Md5Protection::{Enforced, Unenforced(reason)}`, and under `Md5Enforcement::Required`
+  (the default) an unenforceable key fails the connect before the SYN is sent
+  (RFC 5925 §8). The `apply_tcp_md5sig` re-export is gone.
+- `pathvectord`: `md5_password` is validated when the config or sidecar is parsed
+  (empty or over 80 bytes is an error; gRPC `AddPeer` returns `INVALID_ARGUMENT` for
+  over 80 bytes). New `[daemon] tcp_md5_enforcement = "required" | "best-effort"`
+  (default `"required"`): `"best-effort"` is the explicit development opt-in, logged at
+  startup and on every unauthenticated connection attempt. An unparseable dynamic-peer
+  sidecar is now logged instead of being silently ignored.
+- `pathvector-client` rejects `AddPeerParams { md5_password: Some("") }` with
+  `INVALID_ARGUMENT` before sending; `pathvector peer add --md5-password ""` is a CLI
+  error.
+
+**Behaviour change.** A peer with `md5_password` on a host that cannot enforce it (Docker
+Desktop, macOS, IPv6 peer) no longer connects unless `tcp_md5_enforcement =
+"best-effort"`. Both e2e MD5 tests are now CI-only.
+
+**Proof.** Key, errno-classification and platform unit tests; session policy tests with a
+fake port, including "no SYN reaches the peer when a required key is unenforceable";
+daemon wiring tests for static and dynamic peers; config, gRPC, client and CLI rejection
+tests; and `pathvector-sys/tests/tcp_md5_loopback.rs`, which opens real loopback
+connections to show that matching keys connect while unsigned, wrong-key and
+unexpectedly signed SYNs are dropped, that re-installing rotates the key, and that
+removal stops enforcement. Those live tests fail rather than skip when `CI` is set.
+
+Not in scope: inbound listener keys (#66), exact UAPI struct layout (#60), IPv6 MD5.
+
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 
 Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s
