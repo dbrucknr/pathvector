@@ -1,5 +1,11 @@
-//! Live-kernel checks for issue #56: routes with the same prefix but different
-//! priorities are separate kernel routes, and the snapshot must keep both.
+//! Live-kernel checks for the FIB snapshot:
+//!
+//! - issue #56: routes with the same prefix but different priorities are
+//!   separate kernel routes, and the snapshot must keep both;
+//! - issue #57: a negative route (blackhole, unreachable, prohibit, throw)
+//!   beneath a covering unicast route makes the covered destinations
+//!   unreachable. These tests compare the oracle with the kernel's own lookup
+//!   (`RTM_GETROUTE` for one destination, which is what `ip route get` sends).
 //!
 //! These tests add and delete real routes, so they are `#[ignore]`d and must
 //! run inside a **disposable network namespace** with `CAP_NET_ADMIN`:
@@ -17,27 +23,33 @@
 //! (`tunl0`, `sit0`, ...), which start down; a host namespace has up NICs.
 //!
 //! What the kernel does here is described in `net/ipv4/fib_trie.c`
-//! (`fib_table_insert` keys aliases by "[prefix,dscp,priority]") and
+//! (`fib_table_insert` keys aliases by "[prefix,dscp,priority]";
+//! `fib_table_lookup` returns the selected alias's `fib_props` error) and
 //! `net/ipv6/ip6_fib.c` (`fib6_add_rt2node` keeps one route per metric for a
-//! given next hop).
+//! given next hop), with `net/ipv6/route.c` (`fib6_prop`) for IPv6 errors.
 
 #![cfg(target_os = "linux")]
 
 use std::{
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use futures::TryStreamExt;
+use netlink_packet_route::route::RouteMessage;
 use netlink_packet_route::{
     link::{LinkAttribute, LinkFlags},
-    route::RouteScope,
+    route::{RouteScope, RouteType},
 };
-use pathvector_sys::{FibSnapshot, KernelFib, RT_TABLE_MAIN};
+use pathvector_sys::{
+    FibSnapshot, KernelFib, RT_TABLE_MAIN,
+    fib::{FibLookup, RejectKind},
+};
 use rtnetlink::{Handle, LinkDummy, RouteMessageBuilder};
 
-const OWN_LINK_PREFIX: &str = "pv56";
+/// Every interface these tests create starts with this.
+const OWN_LINK_PREFIX: &str = "pvtest";
 
 fn connect() -> Handle {
     let (conn, handle, _) = rtnetlink::new_connection().expect("netlink socket");
@@ -194,7 +206,7 @@ fn count_v6(s: &FibSnapshot, dst: Ipv6Addr) -> usize {
 #[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
 async fn ipv4_incremental_updates_keep_both_priorities() {
     let handle = connect();
-    let oif = dummy(&handle, "pv56a").await;
+    let oif = dummy(&handle, "pvtest56a").await;
     let (snap, task) = start_fib().await;
     let dst: Ipv4Addr = "198.51.100.0".parse().unwrap();
     let probe: Ipv4Addr = "198.51.100.7".parse().unwrap();
@@ -233,7 +245,7 @@ async fn ipv4_incremental_updates_keep_both_priorities() {
 #[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
 async fn ipv6_incremental_updates_keep_both_priorities() {
     let handle = connect();
-    let oif = dummy(&handle, "pv56b").await;
+    let oif = dummy(&handle, "pvtest56b").await;
     let (snap, task) = start_fib().await;
     let dst: Ipv6Addr = "2001:db8:56::".parse().unwrap();
     let probe: Ipv6Addr = "2001:db8:56::7".parse().unwrap();
@@ -270,7 +282,7 @@ async fn ipv6_incremental_updates_keep_both_priorities() {
 #[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
 async fn initial_dump_keeps_both_priorities() {
     let handle = connect();
-    let oif = dummy(&handle, "pv56c").await;
+    let oif = dummy(&handle, "pvtest56c").await;
     let dst4: Ipv4Addr = "203.0.113.0".parse().unwrap();
     let dst6: Ipv6Addr = "2001:db8:57::".parse().unwrap();
     // The kernel orders these by priority whatever the insertion order.
@@ -303,5 +315,373 @@ async fn initial_dump_keeps_both_priorities() {
         Some(100)
     );
     drop(s);
+    task.abort();
+}
+
+// ── Issue #57: negative routes, compared with the kernel's own lookup ────────
+
+/// The negative route types, in `ip-route(8)` order.
+const NEGATIVE_TYPES: [RouteType; 4] = [
+    RouteType::BlackHole,
+    RouteType::Unreachable,
+    RouteType::Prohibit,
+    RouteType::Throw,
+];
+
+/// What a lookup ends in: `Ok` for a forwarding route, `Err(errno)` otherwise.
+type Verdict = Result<(), i32>;
+
+/// The kernel's verdict for `dst`: an `RTM_GETROUTE` request for that one
+/// destination (no `NLM_F_DUMP`), as `ip route get` sends it. The kernel runs
+/// its full output lookup, policy rules included (`inet_rtm_getroute`,
+/// `inet6_rtm_getroute`), and answers with the route or the lookup's error.
+async fn kernel_verdict(handle: &Handle, dst: IpAddr) -> Verdict {
+    let msg = match dst {
+        IpAddr::V4(a) => RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(a, 32)
+            .build(),
+        IpAddr::V6(a) => RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(a, 128)
+            .build(),
+    };
+    match handle.route().get(msg).execute().try_next().await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => panic!("RTM_GETROUTE for {dst} returned nothing"),
+        Err(rtnetlink::Error::NetlinkError(e)) => {
+            Err(-e.code.expect("netlink error carries an errno").get())
+        }
+        Err(e) => panic!("RTM_GETROUTE for {dst}: {e}"),
+    }
+}
+
+/// The verdict the snapshot predicts. The errors are the ones `ip-route(8)`
+/// says local senders get, which are the `fib_props` / `fib6_prop` errors:
+/// blackhole `EINVAL`, unreachable `EHOSTUNREACH`, prohibit `EACCES`. A throw
+/// ends the table lookup with `-EAGAIN`, which the rule walk treats as "no
+/// route here"; with no later table holding a route, `__fib_lookup` turns the
+/// final `-ESRCH` into `-ENETUNREACH` (IPv6 returns `ip6_null_entry`, whose
+/// error is also `-ENETUNREACH`), exactly as when there is no route at all.
+fn oracle_verdict<R>(lookup: FibLookup<'_, R>) -> Verdict {
+    match lookup {
+        FibLookup::Forward(_) => Ok(()),
+        FibLookup::Reject { kind, .. } => Err(match kind {
+            RejectKind::Blackhole => libc::EINVAL,
+            RejectKind::Unreachable => libc::EHOSTUNREACH,
+            RejectKind::Prohibit => libc::EACCES,
+        }),
+        FibLookup::Throw(_) | FibLookup::NoRoute => Err(libc::ENETUNREACH),
+    }
+}
+
+fn snapshot_verdict(s: &FibSnapshot, dst: IpAddr) -> Verdict {
+    match dst {
+        IpAddr::V4(a) => oracle_verdict(s.lookup_v4(a)),
+        IpAddr::V6(a) => oracle_verdict(s.lookup_v6(a)),
+    }
+}
+
+fn reachable(s: &FibSnapshot, dst: IpAddr) -> bool {
+    match dst {
+        IpAddr::V4(a) => s.is_v4_reachable(a),
+        IpAddr::V6(a) => s.is_v6_reachable(a),
+    }
+}
+
+/// Asserts that the snapshot and the kernel agree on every probe, and that
+/// both give `expected`.
+async fn assert_agrees(
+    handle: &Handle,
+    snap: &Arc<RwLock<FibSnapshot>>,
+    probes: &[(IpAddr, Verdict)],
+    context: &str,
+) {
+    for &(dst, expected) in probes {
+        let kernel = kernel_verdict(handle, dst).await;
+        let (oracle, is_reachable) = {
+            let s = snap.read().unwrap();
+            (snapshot_verdict(&s, dst), reachable(&s, dst))
+        };
+        assert_eq!(kernel, expected, "{context}: kernel verdict for {dst}");
+        assert_eq!(oracle, kernel, "{context}: oracle vs kernel for {dst}");
+        assert_eq!(
+            is_reachable,
+            kernel.is_ok(),
+            "{context}: is_reachable for {dst}"
+        );
+    }
+}
+
+/// The expected errno for traffic covered by a negative route of `kind`.
+fn rejected_with(kind: RouteType) -> Verdict {
+    Err(match kind {
+        RouteType::BlackHole => libc::EINVAL,
+        RouteType::Unreachable => libc::EHOSTUNREACH,
+        RouteType::Prohibit => libc::EACCES,
+        RouteType::Throw => libc::ENETUNREACH,
+        other => panic!("{other:?} is not a negative type"),
+    })
+}
+
+/// A negative route message. No gateway or device: `fib_create_info` refuses
+/// them for these types ("Gateway, device and multipath can not be specified
+/// for this route type").
+fn negative_msg(dst: IpAddr, len: u8, kind: RouteType, metric: u32) -> RouteMessage {
+    match dst {
+        IpAddr::V4(a) => RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(a, len)
+            .kind(kind)
+            .priority(metric)
+            .build(),
+        IpAddr::V6(a) => RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(a, len)
+            .kind(kind)
+            .priority(metric)
+            .build(),
+    }
+}
+
+async fn add_negative(handle: &Handle, dst: IpAddr, len: u8, kind: RouteType, metric: u32) {
+    handle
+        .route()
+        .add(negative_msg(dst, len, kind, metric))
+        .execute()
+        .await
+        .unwrap_or_else(|e| panic!("add {kind:?} {dst}/{len}: {e}"));
+}
+
+/// `ip route replace <kind> ...`: `NLM_F_REPLACE`, so the kernel swaps the
+/// slot's route in place and sends no `RTM_DELROUTE` for the old one.
+async fn replace_with_negative(
+    handle: &Handle,
+    dst: IpAddr,
+    len: u8,
+    kind: RouteType,
+    metric: u32,
+) {
+    handle
+        .route()
+        .add(negative_msg(dst, len, kind, metric))
+        .replace()
+        .execute()
+        .await
+        .unwrap_or_else(|e| panic!("replace with {kind:?} {dst}/{len}: {e}"));
+}
+
+async fn del_negative(handle: &Handle, dst: IpAddr, len: u8, kind: RouteType, metric: u32) {
+    handle
+        .route()
+        .del(negative_msg(dst, len, kind, metric))
+        .execute()
+        .await
+        .unwrap_or_else(|e| panic!("delete {kind:?} {dst}/{len}: {e}"));
+}
+
+/// Adds a unicast device route.
+async fn add_unicast(handle: &Handle, dst: IpAddr, len: u8, oif: u32, metric: u32) {
+    match dst {
+        IpAddr::V4(a) => add_v4(handle, a, len, oif, metric).await,
+        IpAddr::V6(a) => add_v6(handle, a, len, oif, metric).await,
+    }
+}
+
+async fn del_unicast(handle: &Handle, dst: IpAddr, len: u8, oif: u32, metric: u32) {
+    match dst {
+        IpAddr::V4(a) => del_v4(handle, a, len, oif, metric).await,
+        IpAddr::V6(a) => del_v6(handle, a, len, oif, metric).await,
+    }
+}
+
+/// Number of snapshot routes for `dst` (any length, any type).
+fn count(s: &FibSnapshot, dst: IpAddr) -> usize {
+    match dst {
+        IpAddr::V4(a) => count_v4(s, a),
+        IpAddr::V6(a) => count_v6(s, a),
+    }
+}
+
+/// One family's addresses for the negative-route lifecycle.
+///
+/// The tests in this file run in parallel in one namespace, so each uses its
+/// own prefixes; only [`initial_dump_of_negative_routes_agrees_with_the_kernel`]
+/// adds a real default route, and every covering route here is more specific
+/// than it.
+struct Plan {
+    /// The covering unicast route.
+    covering: IpAddr,
+    covering_len: u8,
+    covering_metric: u32,
+    negative: IpAddr,
+    negative_len: u8,
+    /// Inside the negative prefix.
+    covered: IpAddr,
+    /// Outside the negative prefix, so only the default covers it.
+    outside: IpAddr,
+}
+
+/// The issue #57 acceptance sequence for one family, against the kernel:
+/// a covering unicast route; each negative type beneath it makes the covered
+/// address unreachable; deleting it restores reachability; replacing a
+/// unicast route for the same prefix with a negative one does the same.
+async fn negative_lifecycle(handle: &Handle, oif: u32, plan: &Plan) {
+    let Plan {
+        covering,
+        covering_len,
+        covering_metric,
+        negative,
+        negative_len: len,
+        covered,
+        outside,
+    } = *plan;
+    add_unicast(handle, covering, covering_len, oif, covering_metric).await;
+    let (snap, task) = start_fib().await;
+    assert_agrees(
+        handle,
+        &snap,
+        &[(covered, Ok(())), (outside, Ok(()))],
+        "covering route only",
+    )
+    .await;
+
+    for kind in NEGATIVE_TYPES {
+        let metric = 50;
+        add_negative(handle, negative, len, kind, metric).await;
+        eventually(&snap, "negative route tracked", |s| count(s, negative) == 1).await;
+        assert_agrees(
+            handle,
+            &snap,
+            &[(covered, rejected_with(kind)), (outside, Ok(()))],
+            &format!("{kind:?} beneath the covering route"),
+        )
+        .await;
+
+        del_negative(handle, negative, len, kind, metric).await;
+        eventually(&snap, "negative route removed", |s| count(s, negative) == 0).await;
+        assert_agrees(
+            handle,
+            &snap,
+            &[(covered, Ok(())), (outside, Ok(()))],
+            &format!("{kind:?} deleted"),
+        )
+        .await;
+
+        // A unicast route for the prefix, then `ip route replace <kind>`.
+        add_unicast(handle, negative, len, oif, metric).await;
+        eventually(&snap, "unicast route tracked", |s| count(s, negative) == 1).await;
+        replace_with_negative(handle, negative, len, kind, metric).await;
+        eventually(&snap, "replaced by the negative route", |s| {
+            !reachable(s, covered)
+        })
+        .await;
+        assert_eq!(
+            count(&snap.read().unwrap(), negative),
+            1,
+            "{kind:?} replaced"
+        );
+        assert_agrees(
+            handle,
+            &snap,
+            &[(covered, rejected_with(kind)), (outside, Ok(()))],
+            &format!("unicast replaced by {kind:?}"),
+        )
+        .await;
+        del_negative(handle, negative, len, kind, metric).await;
+        eventually(&snap, "replacement removed", |s| count(s, negative) == 0).await;
+    }
+
+    del_unicast(handle, covering, covering_len, oif, covering_metric).await;
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn ipv4_negative_routes_beneath_a_covering_route_agree_with_the_kernel() {
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest57a").await;
+    let plan = Plan {
+        covering: "100.64.0.0".parse().unwrap(),
+        covering_len: 10,
+        covering_metric: 0,
+        negative: "100.64.57.0".parse().unwrap(),
+        negative_len: 24,
+        covered: "100.64.57.7".parse().unwrap(),
+        outside: "100.65.0.7".parse().unwrap(),
+    };
+    negative_lifecycle(&handle, oif, &plan).await;
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn ipv6_negative_routes_beneath_a_covering_route_agree_with_the_kernel() {
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest57b").await;
+    let plan = Plan {
+        covering: "fd57::".parse().unwrap(),
+        covering_len: 16,
+        covering_metric: 1024,
+        negative: "fd57:1::".parse().unwrap(),
+        negative_len: 48,
+        covered: "fd57:1::7".parse().unwrap(),
+        outside: "fd57:2::7".parse().unwrap(),
+    };
+    negative_lifecycle(&handle, oif, &plan).await;
+}
+
+/// The initial dump: negative routes already present when the snapshot is
+/// built, in several arrangements, all checked against the kernel.
+///
+/// The covering routes are `198.18.0.0/15` and `fd58::/16` rather than a
+/// default route, because the other tests in this file run in parallel in the
+/// same namespace and expect their own probes to be uncovered once they
+/// delete their routes.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn initial_dump_of_negative_routes_agrees_with_the_kernel() {
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest57c").await;
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    add_unicast(&handle, ip("198.18.0.0"), 15, oif, 0).await;
+    add_unicast(&handle, ip("fd58::"), 16, oif, 1024).await;
+
+    let mut probes = Vec::new();
+    // One negative route per type beneath the covering route.
+    for (i, kind) in NEGATIVE_TYPES.into_iter().enumerate() {
+        add_negative(&handle, ip(&format!("198.18.{i}.0")), 24, kind, 0).await;
+        add_negative(&handle, ip(&format!("fd58:{i}::")), 48, kind, 1024).await;
+        probes.push((ip(&format!("198.18.{i}.1")), rejected_with(kind)));
+        probes.push((ip(&format!("fd58:{i}::1")), rejected_with(kind)));
+    }
+
+    // Same prefix, negative at the lower metric: the negative route wins.
+    add_unicast(&handle, ip("198.19.2.0"), 24, oif, 100).await;
+    add_negative(&handle, ip("198.19.2.0"), 24, RouteType::BlackHole, 10).await;
+    probes.push((ip("198.19.2.1"), rejected_with(RouteType::BlackHole)));
+    add_unicast(&handle, ip("fd58:100::"), 48, oif, 100).await;
+    add_negative(&handle, ip("fd58:100::"), 48, RouteType::Prohibit, 10).await;
+    probes.push((ip("fd58:100::1"), rejected_with(RouteType::Prohibit)));
+
+    // Same prefix, negative at the higher metric: the unicast route wins.
+    add_unicast(&handle, ip("198.19.3.0"), 24, oif, 10).await;
+    add_negative(&handle, ip("198.19.3.0"), 24, RouteType::Unreachable, 100).await;
+    probes.push((ip("198.19.3.1"), Ok(())));
+    add_unicast(&handle, ip("fd58:101::"), 48, oif, 10).await;
+    add_negative(&handle, ip("fd58:101::"), 48, RouteType::Unreachable, 100).await;
+    probes.push((ip("fd58:101::1"), Ok(())));
+
+    // A longer unicast route inside a negative prefix still forwards.
+    add_negative(&handle, ip("198.19.128.0"), 17, RouteType::Throw, 0).await;
+    add_unicast(&handle, ip("198.19.129.0"), 24, oif, 0).await;
+    probes.push((ip("198.19.129.1"), Ok(())));
+    probes.push((ip("198.19.130.1"), rejected_with(RouteType::Throw)));
+    add_negative(&handle, ip("fd58:200::"), 24, RouteType::Throw, 1024).await;
+    add_unicast(&handle, ip("fd58:201::"), 32, oif, 1024).await;
+    probes.push((ip("fd58:201::1"), Ok(())));
+    probes.push((ip("fd58:202::1"), rejected_with(RouteType::Throw)));
+
+    // Outside every negative route the covering route forwards.
+    probes.push((ip("198.19.0.1"), Ok(())));
+    probes.push((ip("fd58:ffff::1"), Ok(())));
+
+    let (snap, task) = start_fib().await;
+    assert_agrees(&handle, &snap, &probes, "initial dump").await;
     task.abort();
 }
