@@ -26,6 +26,18 @@ and the winning route is recorded as the current best. The best routes are
 what the router uses for forwarding decisions and what it makes available to
 export policy for redistribution to other peers.
 
+Candidates whose NEXT_HOP the `NextHopOracle` reports unresolvable stay in the
+candidate set (so they can be re-selected when they become resolvable) but are
+excluded from selection, per RFC 4271 §9.1.2.
+
+Every mutation (`insert`, `withdraw`, `withdraw_peer`, `recompute_all`)
+returns a `BestPathChange` per affected prefix. The stream is a complete,
+minimal delta of the best-path table: replaying it onto an empty map always
+reproduces `best_routes()`. In particular, a prefix that had a best route and
+is left with no feasible candidate — whether by an explicit withdrawal or by a
+replacement route with an unresolvable NEXT_HOP — always yields `Withdrawn`,
+and a prefix that never had a best route never does.
+
 ### Adj-RIB-Out — the outbound view
 
 One table per peer. Contains the routes that will be (or have been) advertised

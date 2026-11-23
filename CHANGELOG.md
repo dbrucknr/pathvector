@@ -4,6 +4,36 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #67: withdraw when an UPDATE removes the last feasible path)
+
+`LocRib::insert` returned `BestPathChange::Unchanged` whenever no best route
+remained after the insert, without checking whether one existed before. A
+replacement UPDATE (RFC 4271 §9 implicit withdrawal) whose NEXT_HOP is
+unresolvable could therefore remove the only selected route from the Loc-RIB
+(§9.1.2: "Unresolvable routes SHALL be removed from the Loc-RIB and the
+routing table") without the FIB writer ever hearing about it — the kernel kept
+forwarding via the old next hop. Outbound withdrawal to peers was already
+correct, because propagation re-reads the Loc-RIB per affected prefix.
+
+The replay-model property test written for this fix also found the mirror
+bug in `LocRib::withdraw`: removing one of several candidates that were *all*
+unresolvable emitted a spurious `Withdrawn` for a prefix that was never
+selected, which would make the FIB writer delete a kernel route BGP never
+installed.
+
+Both are fixed structurally: `insert`, `withdraw` and `recompute_all` now
+derive their `BestPathChange` from one private
+`BestTransition::between(previous, next, replaced)`, an exhaustive match on
+the `(Option<PeerId>, Option<PeerId>)` selected-peer pair. No extra clones
+on the insert path. Regression tests: RIB unit tests (both families), a
+`BestTransition` truth table, `prop_loc_rib_change_stream_replays_to_best_table`
+(change stream replayed onto an empty map equals `best_routes()` after every
+insert / withdraw / peer-down / reachability operation), and
+`pathvectord::daemon::last_feasible_tests` (FIB `Withdrawn`, WITHDRAWN ROUTES /
+MP_UNREACH_NLRI to peers, Adj-RIB-In retention, both families).
+
+---
+
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 
 Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s
