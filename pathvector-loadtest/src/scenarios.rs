@@ -1,4 +1,4 @@
-//! The PR-1 scenarios. Each one opens a measurement [`Window`], does its
+//! The PR-1 scenarios. Each one opens a measurement `Window`, does its
 //! work against the live daemon, waits for the daemon to settle, and closes
 //! the window into a [`WindowReport`].
 //!

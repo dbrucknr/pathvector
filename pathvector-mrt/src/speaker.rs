@@ -74,7 +74,7 @@ impl BgpSpeaker {
     ///
     /// Prefixes with identical attribute bytes are batched into the same UPDATE
     /// message (see [`build_update_messages`]). A KEEPALIVE is sent every
-    /// [`KEEPALIVE_EVERY_N_UPDATES`] messages to keep the session alive during
+    /// `KEEPALIVE_EVERY_N_UPDATES` messages to keep the session alive during
     /// long announcement runs.
     ///
     /// # Errors
