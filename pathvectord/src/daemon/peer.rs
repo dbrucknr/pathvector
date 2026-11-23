@@ -838,12 +838,13 @@ impl DaemonState {
 /// Applies `AddPeer` / `RemovePeer` commands at runtime.
 ///
 /// TCP MD5 keys for inbound connections follow the peer set through
-/// `listener_keys`, on the live listening sockets (no rebind):
+/// `listener_keys`, on the live listening sockets:
 ///
 /// - `AddPeer` with an `md5_password` installs the key on the listener
-///   *before* the peer is added to `incoming_senders`, so no inbound
-///   connection from the peer is handed to its session before the listener
-///   enforces the key.
+///   *before* the peer is added to `incoming_senders`. The listener then
+///   replaces its socket, and [`route_inbound`] drops a connection screened
+///   before the key change, so no inbound connection from the peer reaches
+///   its session unless the listener enforced the key on it.
 /// - `RemovePeer` takes the peer out of `incoming_senders` first, then
 ///   removes its key.
 /// - Key rotation is `RemovePeer` followed by `AddPeer` with the new key
@@ -1031,12 +1032,13 @@ pub(super) async fn run_command_processor<H, F, P>(
 /// session.
 ///
 /// The socket is a [`BgpListener`]: it installs `keys`' TCP MD5 keys for
-/// this address family before it starts listening, picks up keys added,
-/// rotated or removed later without rebinding, and only hands over
+/// this address family before it starts listening, puts keys added or
+/// rotated later on the live socket and then replaces the socket (so no
+/// connection that predates a key can get through), and only hands over
 /// connections the key table admits. In particular, a peer whose required
 /// key could not be installed on this socket is rejected, since the kernel
 /// would not have checked its handshake. A connection from an address that
-/// is not a configured peer is closed.
+/// is not a configured peer is closed; see [`route_inbound`].
 ///
 /// Callers that want both IPv4 and IPv6 inbound connections run two
 /// instances of this function concurrently, one bound to `0.0.0.0:<port>`
@@ -1065,19 +1067,49 @@ pub(super) async fn run_bgp_listener<P: TcpMd5Port>(
 
     loop {
         match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let tx = incoming_senders.read().await.get(&peer_addr.ip()).cloned();
-                if let Some(tx) = tx {
-                    tracing::debug!(peer = %peer_addr, "accepted inbound BGP connection");
-                    let _ = tx.send(SessionCommand::IncomingConnection(stream)).await;
-                } else {
-                    tracing::debug!(peer = %peer_addr, "rejected inbound BGP connection from unknown peer");
-                    // stream dropped here → TCP RST
-                }
-            }
+            Ok(inbound) => route_inbound(&listener, inbound, &incoming_senders).await,
             Err(e) => {
                 tracing::warn!(error = %e, "BGP listener accept error");
+                // Do not spin on a persistent error (for example, a failed
+                // socket replacement); `accept` retries on the next call.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+        }
+    }
+}
+
+/// Hands `inbound` to its peer's session, or closes it.
+///
+/// The connection must still be [current](BgpListener::is_current) *after*
+/// the session is looked up. `AddPeer` installs the peer's TCP MD5 key
+/// before adding the peer to `incoming_senders`, so if the lookup finds the
+/// peer, any key change made for it is visible here; a connection screened
+/// before that change (for example, accepted unkeyed just before `AddPeer`)
+/// is closed instead of reaching the new session.
+pub(super) async fn route_inbound<P: TcpMd5Port>(
+    listener: &BgpListener<P>,
+    inbound: Inbound,
+    incoming_senders: &RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
+) {
+    let peer = inbound.peer();
+    let tx = incoming_senders.read().await.get(&peer.ip()).cloned();
+    match tx {
+        Some(_) if !listener.is_current(&inbound) => {
+            tracing::warn!(
+                %peer,
+                "rejecting inbound BGP connection: the peer's TCP MD5 key changed while it was \
+                 being accepted"
+            );
+        }
+        Some(tx) => {
+            tracing::debug!(%peer, "accepted inbound BGP connection");
+            let _ = tx
+                .send(SessionCommand::IncomingConnection(inbound.into_stream()))
+                .await;
+        }
+        None => {
+            tracing::debug!(%peer, "rejected inbound BGP connection from unknown peer");
+            // dropped here → TCP RST
         }
     }
 }

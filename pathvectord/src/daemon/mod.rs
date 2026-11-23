@@ -27,7 +27,7 @@ use pathvector_session::{
     transport::{
         self, DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent,
         SessionHandle, TerminationReason,
-        listener::{BgpListener, ListenerKeys, ListenerProtection},
+        listener::{BgpListener, Inbound, ListenerKeys, ListenerProtection},
         tcp_md5::{KernelTcpMd5, Md5Enforcement, TcpMd5Auth, TcpMd5Port},
     },
 };

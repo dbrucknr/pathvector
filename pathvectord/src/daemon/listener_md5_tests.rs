@@ -35,8 +35,8 @@ const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const CONNECT_WAIT: Duration = Duration::from_millis(1500);
 
 /// Long enough for the command processor to apply a command and for the
-/// listener to settle a key change (it rejects the peer for about 100 ms
-/// after a change; see `pathvector_session::transport::listener`).
+/// listener to replace its socket after a key change (see
+/// `pathvector_session::transport::listener`).
 const APPLY_WAIT: Duration = Duration::from_millis(300);
 
 // ── test doubles ─────────────────────────────────────────────────────────────
@@ -351,6 +351,7 @@ async fn remove_peer_removes_the_listener_key() {
         .send(DaemonCommand::AddPeer(peer_config(LOOPBACK, Some("k"))))
         .await
         .unwrap();
+    tokio::time::sleep(APPLY_WAIT).await;
     cmd_tx
         .send(DaemonCommand::RemovePeer(LOOPBACK))
         .await
@@ -359,9 +360,46 @@ async fn remove_peer_removes_the_listener_key() {
 
     assert_eq!(
         keys.port().calls(),
-        vec![("install", LOOPBACK), ("remove", LOOPBACK)]
+        vec![
+            ("install", LOOPBACK), // on the live listener by AddPeer
+            ("install", LOOPBACK), // on the listener's replacement socket
+            ("remove", LOOPBACK),
+        ]
     );
     assert_eq!(keys.configured(LOOPBACK), None);
+}
+
+/// Codex review of PR #127: a connection accepted unkeyed just before
+/// `AddPeer` installs the peer's key could be looked up in `incoming_senders`
+/// just after `AddPeer` added the session, and so reach it without ever
+/// having been authenticated. `route_inbound` re-checks the connection's
+/// stamp after the lookup; `AddPeer` sets the key before adding the session,
+/// so a connection that finds the session also sees the key change.
+#[tokio::test]
+async fn connection_accepted_before_add_peer_is_not_routed_to_the_new_session() {
+    let keys: Md5Keys<FakePort> = Arc::new(ListenerKeys::new(FakePort::new(true)));
+    let mut listener =
+        BgpListener::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&keys)).unwrap();
+    let (tx, mut session_rx) = mpsc::channel(4);
+    let incoming: Incoming = Arc::default();
+
+    // Positive control: an unkeyed peer's connection is routed.
+    incoming.write().await.insert(LOOPBACK, tx.clone());
+    let _routed = TcpStream::connect(listener.local_addr()).await.unwrap();
+    let inbound = listener.accept().await.unwrap();
+    super::peer::route_inbound(&listener, inbound, &incoming).await;
+    assert!(session_got_connection(&mut session_rx).await);
+    incoming.write().await.clear();
+
+    // The race: accepted before AddPeer, routed after it.
+    let client = TcpStream::connect(listener.local_addr()).await.unwrap();
+    let inbound = listener.accept().await.unwrap();
+    set_listener_key(&keys, LOOPBACK, TcpMd5Auth::required(key("k")));
+    incoming.write().await.insert(LOOPBACK, tx);
+    super::peer::route_inbound(&listener, inbound, &incoming).await;
+
+    assert!(!session_got_connection(&mut session_rx).await);
+    assert!(closed_by_daemon(client).await);
 }
 
 /// A peer without `md5_password` puts nothing on the listener.
