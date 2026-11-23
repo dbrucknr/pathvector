@@ -157,8 +157,8 @@ impl DaemonState {
         self.rib_mut().gr_advertised_peers.remove(&peer_ip);
         self.rib_mut().gr_peer_restarting.remove(&peer_ip);
         self.gr.remove_peer(peer_ip);
-        self.mrai_last_sent.remove(&peer_ip);
-        self.mrai_pending.remove(&peer_ip);
+        self.mrai.remove_peer(peer_ip);
+        self.mrai_v6.remove_peer(peer_ip);
         self.pending_decisions.remove(&peer_ip);
         self.pending_decisions_v6.remove(&peer_ip);
         self.shutdown_messages.remove(&peer_ip);
@@ -614,8 +614,8 @@ impl DaemonState {
         self.four_byte_peers.remove(&peer_ip);
         self.route_refresh_peers.remove(&peer_ip);
         self.rib_mut().gr_capable_peers.remove(&peer_ip);
-        self.mrai_last_sent.remove(&peer_ip);
-        self.mrai_pending.remove(&peer_ip);
+        self.mrai.remove_peer(peer_ip);
+        self.mrai_v6.remove_peer(peer_ip);
         self.pending_decisions.remove(&peer_ip);
         self.pending_decisions_v6.remove(&peer_ip);
 

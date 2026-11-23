@@ -45,6 +45,8 @@ mod capabilities;
 mod deferral;
 mod fib;
 mod gr;
+#[cfg(test)]
+mod mrai_flush_tests;
 mod origination;
 mod peer;
 mod policy;
@@ -59,7 +61,7 @@ use gr::GracefulRestartState;
 use peer::{run_bgp_listener, run_command_processor};
 #[cfg(test)]
 use route::handle_update;
-use route::{reapply_import_policy, reapply_import_policy_v6};
+use route::{MraiTracker, reapply_import_policy, reapply_import_policy_v6};
 
 /// Synthetic `PeerId` used as the source for locally originated routes.
 ///
@@ -334,18 +336,11 @@ pub(crate) struct DaemonState {
     /// this set. RFC 2918 §4: a router MUST NOT send ROUTE-REFRESH without
     /// having received the corresponding capability from the peer.
     pub(crate) route_refresh_peers: HashSet<IpAddr>,
-    /// RFC 4271 §9.2.1.1: Minimum Route Advertisement Interval.
-    ///
-    /// Tracks when each prefix was last announced to each eBGP peer so that
-    /// re-announcements are suppressed within the MRAI window (default: 30 s).
-    /// Withdrawals bypass MRAI — they must be sent immediately.
-    mrai_last_sent: HashMap<IpAddr, HashMap<Nlri<Ipv4Addr>, Instant>>,
-    /// NLRIs suppressed by MRAI that have not yet been sent.
-    ///
-    /// When an MRAI window elapses, the pending NLRIs for that peer are
-    /// re-propagated. Uses a `HashSet` so repeated updates to the same prefix
-    /// within one suppression window collapse to a single deferred flush.
-    pub(crate) mrai_pending: HashMap<IpAddr, HashSet<Nlri<Ipv4Addr>>>,
+    /// RFC 4271 §9.2.1.1 Minimum Route Advertisement Interval state for IPv4
+    /// unicast toward eBGP peers. See [`MraiTracker`].
+    pub(crate) mrai: MraiTracker<Ipv4Addr>,
+    /// RFC 4271 §9.2.1.1 MRAI state for IPv6 unicast toward eBGP peers.
+    pub(crate) mrai_v6: MraiTracker<Ipv6Addr>,
     /// Peers whose outbound UPDATE channel overflowed during the current event.
     ///
     /// The event loop drains this list after each event via [`take_stalled_peers`]
@@ -645,8 +640,8 @@ impl DaemonState {
             ipv6_capable_peers: HashSet::new(),
             four_byte_peers: HashSet::new(),
             route_refresh_peers: HashSet::new(),
-            mrai_last_sent: HashMap::new(),
-            mrai_pending: HashMap::new(),
+            mrai: MraiTracker::new(),
+            mrai_v6: MraiTracker::new(),
             stalled_peers: Vec::new(),
             pending_decisions: HashMap::new(),
             pending_decisions_v6: HashMap::new(),
@@ -12212,11 +12207,7 @@ mod coalescing_tests {
 
         // Manufacture an mrai_pending entry for peer_b so flush_mrai_pending
         // has something to process.
-        state
-            .mrai_pending
-            .entry(IpAddr::V4(peer_b))
-            .or_default()
-            .insert(prefix);
+        state.mrai.defer(IpAddr::V4(peer_b), prefix);
 
         // Call flush_mrai_pending without the subsequent flush_pending.
         state.flush_mrai_pending();
@@ -15012,15 +15003,14 @@ mod rib_consistency_prop_tests {
 
 #[cfg(test)]
 mod mrai_tests {
+    //! Unit tests of [`MraiTracker`]'s bookkeeping. End-to-end behaviour
+    //! (what reaches the peer) is in `daemon/mrai_flush_tests.rs`.
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::outbound::PrefixDecision;
 
-    fn peer_ip(last: u8) -> Ipv4Addr {
-        Ipv4Addr::new(10, 0, 0, last)
-    }
+    const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
@@ -15039,62 +15029,52 @@ mod mrai_tests {
         )
     }
 
-    /// Manually backdate the last-sent time for a prefix so the MRAI window
-    /// appears elapsed.
-    fn backdate(state: &mut DaemonState, peer: Ipv4Addr, n: Nlri<Ipv4Addr>, ago: Duration) {
-        let entry = state
-            .mrai_last_sent
-            .entry(IpAddr::V4(peer))
-            .or_default()
-            .entry(n)
-            .or_insert_with(Instant::now);
-        // We can't set `Instant` backwards, but we can check whether a
-        // simulated past time would pass the MRAI guard in tests by directly
-        // inserting via the internal map.  Instead, we mark the prefix as
-        // having been sent `ago` in the past by subtracting from `MRAI`.
-        // Because `Instant` is monotonic, we insert a time that is just barely
-        // past the MRAI window by computing `now - ago`.
-        *entry = Instant::now().checked_sub(ago).unwrap_or(*entry);
+    fn ago(d: Duration) -> Instant {
+        Instant::now().checked_sub(d).expect("clock far from epoch")
     }
 
     #[test]
-    fn mrai_suppresses_ebgp_announcement_within_window() {
-        let mut state = make_state();
-        let peer = peer_ip(2);
+    fn destination_sent_just_now_is_not_ready() {
+        let mut t = MraiTracker::<Ipv4Addr>::new();
         let n = nlri("10.0.0.0/24");
-
-        // Prime last_sent to "just now" so the MRAI window hasn't elapsed.
-        state
-            .mrai_last_sent
-            .entry(IpAddr::V4(peer))
-            .or_default()
-            .insert(n, Instant::now());
-
-        // Simulate the MRAI gating logic directly — call the inner logic used
-        // in propagate_to_all_peers for an eBGP peer.
-        let now = Instant::now();
-        let last_sent = state.mrai_last_sent.get(&IpAddr::V4(peer)).unwrap();
-        let elapsed = last_sent
-            .get(&n)
-            .map_or(MRAI, |t| now.saturating_duration_since(*t));
-        assert!(elapsed < MRAI, "should be suppressed within window");
+        t.set_last_sent(PEER, n, Instant::now());
+        t.defer(PEER, n);
+        assert!(t.take_ready(Instant::now()).is_empty());
+        assert!(t.has_pending(), "still held back inside the interval");
     }
 
     #[test]
-    fn mrai_passes_after_window_elapsed() {
-        let mut state = make_state();
-        let peer = peer_ip(2);
+    fn destination_is_ready_once_interval_elapsed() {
+        let mut t = MraiTracker::<Ipv4Addr>::new();
         let n = nlri("10.0.0.0/24");
+        t.set_last_sent(PEER, n, ago(MRAI + Duration::from_secs(1)));
+        t.defer(PEER, n);
+        assert_eq!(t.take_ready(Instant::now()), vec![n]);
+        assert!(!t.has_pending());
+    }
 
-        // Back-date by MRAI + 1 second.
-        backdate(&mut state, peer, n, MRAI + Duration::from_secs(1));
+    /// §9.2.1.1 is per destination: a recently-sent destination stays held
+    /// back even when another destination for the same peer is released.
+    #[test]
+    fn take_ready_releases_only_elapsed_destinations() {
+        let mut t = MraiTracker::<Ipv4Addr>::new();
+        let old = nlri("10.0.0.0/24");
+        let fresh = nlri("10.0.1.0/24");
+        t.set_last_sent(PEER, old, ago(MRAI + Duration::from_secs(1)));
+        t.set_last_sent(PEER, fresh, Instant::now());
+        t.defer(PEER, old);
+        t.defer(PEER, fresh);
+        assert_eq!(t.take_ready(Instant::now()), vec![old]);
+        assert!(t.has_pending(), "the fresh destination is still held back");
+        assert!(t.take_ready(Instant::now()).is_empty());
+    }
 
-        let now = Instant::now();
-        let last_sent = state.mrai_last_sent.get(&IpAddr::V4(peer)).unwrap();
-        let elapsed = last_sent
-            .get(&n)
-            .map_or(MRAI, |t| now.saturating_duration_since(*t));
-        assert!(elapsed >= MRAI, "should be allowed after window elapsed");
+    #[test]
+    fn remove_peer_drops_pending() {
+        let mut t = MraiTracker::<Ipv4Addr>::new();
+        t.defer(PEER, nlri("10.0.0.0/24"));
+        t.remove_peer(PEER);
+        assert!(!t.has_pending());
     }
 
     #[test]
@@ -15104,49 +15084,30 @@ mod mrai_tests {
     }
 
     #[test]
-    fn has_mrai_pending_true_when_set_nonempty() {
+    fn has_mrai_pending_covers_both_families() {
         let mut state = make_state();
-        let peer = peer_ip(2);
-        let n = nlri("10.0.0.0/24");
-        state
-            .mrai_pending
-            .entry(IpAddr::V4(peer))
-            .or_default()
-            .insert(n);
+        state.mrai.defer(PEER, nlri("10.0.0.0/24"));
+        assert!(state.has_mrai_pending());
+
+        let mut state = make_state();
+        state.mrai_v6.defer(PEER, "2001:db8::/32".parse().unwrap());
         assert!(state.has_mrai_pending());
     }
 
     #[test]
     fn flush_mrai_pending_clears_elapsed_pending() {
         let mut state = make_state();
-        let peer = peer_ip(2);
         let n = nlri("10.0.0.0/24");
-
-        // Mark as pending and back-date so window is elapsed.
+        state.mrai.defer(PEER, n);
         state
-            .mrai_pending
-            .entry(IpAddr::V4(peer))
-            .or_default()
-            .insert(n);
-        backdate(&mut state, peer, n, MRAI + Duration::from_secs(1));
+            .mrai
+            .set_last_sent(PEER, n, ago(MRAI + Duration::from_secs(1)));
 
-        // flush_mrai_pending calls propagate_to_all_peers which needs a
-        // peer config; since we have no peers configured the inner call is a
-        // no-op, but the pending set must be cleared.
+        // No peers are configured, so the re-propagation is a no-op, but the
+        // pending set must be drained.
         state.flush_mrai_pending();
 
         assert!(!state.has_mrai_pending(), "pending cleared after flush");
-    }
-
-    #[test]
-    fn mrai_withdrawal_bypasses_suppression() {
-        // Withdrawals must bypass MRAI (RFC 4271 §9.2.1.1).
-        // The MRAI gate only applies to PrefixDecision::Announce branches.
-        // Verify that a Withdraw variant passes through unchanged.
-        let n = nlri("10.0.0.0/24");
-        let decision = PrefixDecision::Withdraw(n);
-        // No MRAI state needed — Withdraw is passed through unconditionally.
-        assert!(matches!(decision, PrefixDecision::Withdraw(_)));
     }
 }
 
