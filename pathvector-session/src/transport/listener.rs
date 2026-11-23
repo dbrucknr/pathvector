@@ -45,15 +45,22 @@
 //! go on the socket before `listen()`, so for them no such connection can
 //! exist. A key added or changed later, with [`ListenerKeys::set_peer`],
 //! could be preceded by connections already waiting in the accept queue.
-//! Until [`BgpListener`] has emptied its accept queue after the change, it
-//! rejects every connection from that peer (the key is "unsettled"). The
-//! cost is that a correctly signed connection that arrives in that short
-//! window is also rejected, and the peer retries.
+//! Until [`BgpListener`] has cleared its accept queue after the change, it
+//! rejects every connection from that peer (the key is "unsettled").
+//!
+//! "Cleared" means: after the change, the listener took connections off the
+//! queue until it was empty (or until it had taken as many as the queue can
+//! hold, since Linux's queue is first-in first-out: `inet_csk_reqsk_queue_add`
+//! appends, `reqsk_queue_remove` takes the head), and did so again at least
+//! 100 ms later, to catch a connection created before the change but queued
+//! just after the first pass. The cost is that a correctly signed connection
+//! from that peer arriving in that window is also rejected, and the peer
+//! retries.
 //!
 //! # When the key cannot be enforced
 //!
 //! The policy is the same as for outbound connections
-//! ([`Md5Enforcement`](super::tcp_md5::Md5Enforcement)):
+//! ([`Md5Enforcement`]):
 //!
 //! - `Required`: the peer's connections are rejected after `accept()`, and
 //!   [`ListenerKeys::set_peer`] returns an error. The kernel does not drop
@@ -75,10 +82,12 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use super::tcp_md5::{
     KernelTcpMd5, Md5Enforcement, TcpMd5Auth, TcpMd5Error, TcpMd5Port, TcpMd5Unsupported,
@@ -86,6 +95,22 @@ use super::tcp_md5::{
 
 /// Backlog passed to `listen()`.
 const LISTEN_BACKLOG: i32 = 1024;
+
+/// Most connections the accept queue can hold. Linux caps the backlog at
+/// `net.core.somaxconn` (`__sys_listen_socket`) and stops creating
+/// connections once the queue holds more than the backlog
+/// (`sk_acceptq_is_full`: `sk_ack_backlog > sk_max_ack_backlog`, checked in
+/// `tcp_v4_syn_recv_sock`), so it never holds more than this many.
+const MAX_QUEUED: usize = LISTEN_BACKLOG.unsigned_abs() as usize + 1;
+
+/// How long a key change waits for a second look at the accept queue before
+/// it counts as settled. In Linux, a new connection's key is copied from the
+/// listener (`tcp_v4_syn_recv_sock`) a moment before the connection is
+/// appended to the accept queue (`inet_csk_reqsk_queue_add`), in the same
+/// packet's processing. A connection created just before the key was
+/// installed can therefore reach the queue just after it was seen empty; the
+/// second look, this long after the first, takes it off the queue too.
+const SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 /// An IP address family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -612,6 +637,15 @@ pub struct BgpListener<P: TcpMd5Port = KernelTcpMd5> {
     notify: Arc<Notify>,
     /// Admitted connections taken off the queue while draining it.
     ready: VecDeque<(TcpStream, SocketAddr)>,
+    /// The first time the queue was cleared after key change `epoch`; the
+    /// change settles on a later clearing [`SETTLE_DELAY`] after it.
+    settling: Option<Settling>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Settling {
+    epoch: u64,
+    cleared_at: Instant,
 }
 
 impl<P: TcpMd5Port> fmt::Debug for BgpListener<P> {
@@ -671,6 +705,7 @@ impl<P: TcpMd5Port> BgpListener<P> {
             keys,
             notify,
             ready: VecDeque::new(),
+            settling: None,
         })
     }
 
@@ -703,10 +738,15 @@ impl<P: TcpMd5Port> BgpListener<P> {
                 if let Some(conn) = self.ready.pop_front() {
                     return Ok(conn);
                 }
+            } else {
+                // Nothing left to settle (for example, the peer was removed).
+                self.settling = None;
             }
+            let recheck = self.settling.map(|s| s.cleared_at + SETTLE_DELAY);
             tokio::select! {
                 biased;
                 () = self.notify.notified() => {}
+                () = sleep_until(recheck) => {}
                 accepted = self.listener.accept() => {
                     let (stream, addr) = accepted?;
                     if self.admit(addr) {
@@ -717,17 +757,49 @@ impl<P: TcpMd5Port> BgpListener<P> {
         }
     }
 
-    /// Takes every connection off the accept queue, screening each, until
-    /// the queue is empty, then settles the keys installed before the drain
-    /// began. Any connection that completed before such a key was installed
-    /// was in the queue when the drain began, and was rejected because its
-    /// key was unsettled.
+    /// Clears the accept queue and advances the settling of key changes.
+    ///
+    /// Key changes up to `epoch` (read before clearing) are settled when the
+    /// queue has been cleared twice, [`SETTLE_DELAY`] apart, both times after
+    /// `epoch` was read. Every connection taken off the queue meanwhile was
+    /// screened while those keys were unsettled, so connections from their
+    /// peers were rejected.
     fn drain(&mut self) {
         let epoch = self.keys.epoch();
+        if !self.clear_queue() {
+            return;
+        }
+        let now = Instant::now();
+        match self.settling {
+            None => {
+                self.settling = Some(Settling {
+                    epoch,
+                    cleared_at: now,
+                });
+            }
+            Some(s) if now >= s.cleared_at + SETTLE_DELAY => {
+                self.keys.settle(self.family, s.epoch);
+                // Changes made since `s` was recorded start their own wait.
+                self.settling = (epoch > s.epoch).then_some(Settling {
+                    epoch,
+                    cleared_at: now,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Takes connections off the accept queue, screening each, until it is
+    /// empty or [`MAX_QUEUED`] have been taken (by then, every connection
+    /// that was queued when this began has been taken). Returns `false` if
+    /// an accept error stopped it first.
+    fn clear_queue(&mut self) -> bool {
         let socket = socket2::SockRef::from(&self.listener);
-        loop {
+        let mut taken = 0;
+        while taken < MAX_QUEUED {
             match socket.accept() {
                 Ok((conn, addr)) => {
+                    taken += 1;
                     let Some(addr) = addr.as_socket() else {
                         continue;
                     };
@@ -744,23 +816,19 @@ impl<P: TcpMd5Port> BgpListener<P> {
                             "dropping inbound BGP connection"),
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.keys.settle(self.family, epoch);
-                    return;
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
-                    ) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+                // The queued connection was reset before we took it.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => taken += 1,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    // The queue was not seen empty, so nothing is settled;
-                    // the next `accept` call tries again.
+                    // Not cleared, so nothing settles; the next `accept`
+                    // call tries again.
                     tracing::warn!(error = %e, "BGP listener accept error while draining");
-                    return;
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// Whether a connection from `addr` may be used. Logs rejections.
@@ -785,6 +853,14 @@ impl<P: TcpMd5Port> BgpListener<P> {
                 false
             }
         }
+    }
+}
+
+/// Resolves at `deadline`, or never if `None`.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
     }
 }
 

@@ -34,6 +34,11 @@ use super::*;
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const CONNECT_WAIT: Duration = Duration::from_millis(1500);
 
+/// Long enough for the command processor to apply a command and for the
+/// listener to settle a key change (it rejects the peer for about 100 ms
+/// after a change; see `pathvector_session::transport::listener`).
+const APPLY_WAIT: Duration = Duration::from_millis(300);
+
 // ── test doubles ─────────────────────────────────────────────────────────────
 
 /// A session handle whose inbound connections arrive on a test channel.
@@ -295,7 +300,7 @@ async fn add_peer_installs_listener_key_before_routing_inbound() {
         .send(DaemonCommand::AddPeer(peer_config(LOOPBACK, Some("k"))))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(APPLY_WAIT).await;
 
     assert_eq!(*installed_before_spawn.lock().unwrap(), Some(true));
     assert_eq!(
@@ -321,7 +326,7 @@ async fn add_peer_with_unenforceable_required_key_refuses_inbound() {
         .send(DaemonCommand::AddPeer(peer_config(LOOPBACK, Some("k"))))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(APPLY_WAIT).await;
     assert!(
         incoming.read().await.contains_key(&LOOPBACK),
         "the peer is configured; only its inbound path is refused"
@@ -350,7 +355,7 @@ async fn remove_peer_removes_the_listener_key() {
         .send(DaemonCommand::RemovePeer(LOOPBACK))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(APPLY_WAIT).await;
 
     assert_eq!(
         keys.port().calls(),
@@ -372,7 +377,7 @@ async fn add_peer_without_password_installs_nothing() {
         .send(DaemonCommand::AddPeer(peer_config(LOOPBACK, None)))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(APPLY_WAIT).await;
     assert!(keys.port().calls().is_empty());
 }
 
@@ -430,7 +435,7 @@ async fn dynamic_peer_inbound_requires_the_key_until_removed() {
         )))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(APPLY_WAIT).await;
 
     if enforced {
         assert!(connect(addr, None).await.is_none(), "unsigned SYN dropped");
@@ -445,7 +450,7 @@ async fn dynamic_peer_inbound_requires_the_key_until_removed() {
             .send(DaemonCommand::RemovePeer(LOOPBACK))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(APPLY_WAIT).await;
         assert!(
             connect(addr, Some(&key("dynamic-key"))).await.is_none(),
             "key removed from the listener"

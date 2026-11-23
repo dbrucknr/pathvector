@@ -177,6 +177,10 @@ async fn dynamically_added_key_is_enforced() {
         keys.set_peer(LOOPBACK, required("added-key")),
         Ok(ListenerProtection::Enforced)
     );
+    // Let the listener settle the change: it rejects the peer for about
+    // 100 ms after a key change (see `transport::listener`).
+    assert!(try_accept(&mut l).await.is_none());
+    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
 
     assert!(connect(addr, None).await.is_none(), "unsigned SYN dropped");
     assert!(connect(addr, Some(&key("wrong-key"))).await.is_none());
@@ -205,6 +209,9 @@ async fn rotated_key_replaces_the_old_one() {
         keys.set_peer(LOOPBACK, required("new-key")),
         Ok(ListenerProtection::Enforced)
     );
+    // Settle the change (about 100 ms, see `transport::listener`).
+    assert!(try_accept(&mut l).await.is_none());
+    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
 
     assert!(connect(addr, Some(&key("old-key"))).await.is_none());
     let client = connect(addr, Some(&key("new-key")))
@@ -259,6 +266,7 @@ async fn connection_completed_before_a_dynamic_key_is_rejected() {
         "early connection held back"
     );
     assert!(closed_by_server(early).await, "and closed");
+    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
     let client = connect(addr, Some(&key("late-key")))
         .await
         .expect("matching key connects");

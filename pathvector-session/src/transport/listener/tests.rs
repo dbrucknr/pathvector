@@ -473,6 +473,65 @@ async fn settling_covers_only_keys_installed_before_the_drain() {
     assert!(!keys.has_unsettled(AddressFamily::V6));
 }
 
+/// One clearing of the queue is not enough: a connection whose key lookup
+/// happened before the install can be appended to the queue just after it
+/// was seen empty (`tcp_v4_syn_recv_sock`, then `inet_csk_reqsk_queue_add`).
+/// The key settles only on a second clearing at least `SETTLE_DELAY` later.
+#[tokio::test]
+async fn a_key_change_settles_only_on_a_second_clearing_after_the_delay() {
+    let keys = keys(Outcome::Ok);
+    let mut l = bind(&keys);
+    let _ = keys.set_peer(LOOPBACK, required("k"));
+
+    l.drain();
+    assert_eq!(
+        keys.admission(LOOPBACK),
+        Admission::Rejected(Rejection::KeyChangePending),
+        "first clearing only starts the wait"
+    );
+    l.drain();
+    assert_eq!(
+        keys.admission(LOOPBACK),
+        Admission::Rejected(Rejection::KeyChangePending),
+        "a second clearing too soon does not settle"
+    );
+
+    tokio::time::sleep(SETTLE_DELAY + Duration::from_millis(20)).await;
+    l.drain();
+    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
+    assert!(l.settling.is_none());
+}
+
+/// A connection that reaches the queue between the first and second
+/// clearing (the late append above) is rejected by the second.
+#[tokio::test]
+async fn connection_queued_between_the_two_clearings_is_rejected() {
+    let keys = keys(Outcome::Ok);
+    let mut l = bind(&keys);
+    let addr = l.local_addr().unwrap();
+    let _ = keys.set_peer(LOOPBACK, required("k"));
+    l.drain();
+
+    let late = queued_connection(addr).await;
+    assert!(try_accept(&mut l).await.is_none());
+    assert!(closed_by_server(late).await);
+}
+
+/// Removing a peer whose key change is still settling ends the wait, so the
+/// listener does not keep waking up for it.
+#[tokio::test]
+async fn removing_a_settling_peer_ends_the_wait() {
+    let keys = keys(Outcome::Ok);
+    let mut l = bind(&keys);
+    let _ = keys.set_peer(LOOPBACK, required("k"));
+    l.drain();
+    assert!(l.settling.is_some());
+
+    assert!(keys.remove_peer(LOOPBACK).unwrap());
+    assert!(try_accept(&mut l).await.is_none());
+    assert!(l.settling.is_none());
+}
+
 // ── removal ──────────────────────────────────────────────────────────────────
 
 /// Removal takes the key off the socket with the separate remove operation
