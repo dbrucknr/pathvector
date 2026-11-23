@@ -213,10 +213,11 @@ cross-platform (they pass on macOS and Linux alike).
 | Every byte string of 1–80 bytes is a `TcpMd5Key`, byte for byte | RFC 2385 §2.0 leaves the key's form open; Linux stores it as binary |
 | Every byte string over 80 bytes is rejected with `TooLong { len }` | `TCP_MD5SIG_MAXKEYLEN`; the kernel would return `EINVAL` |
 
-#### Kernel FIB route identity (issue #56)
+#### Kernel FIB route identity and negative routes (issues #56, #57)
 
 The FIB snapshot mirrors kernel routes under their full Linux identity, not just
-their prefix. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
+their prefix, and uses negative routes (blackhole, unreachable, prohibit, throw) for
+reachability. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
 platform and compare the mirror against a model of the kernel's slot lists written
 directly from `fib_table_insert` / `fib_table_delete` and `fib6_add_rt2node` / `fib6_del`,
 and against a reference lookup written from the kernel's lookup rule:
@@ -224,20 +225,29 @@ and against a reference lookup written from the kernel's lookup rule:
 | Invariant | Why it matters |
 |---|---|
 | After any sequence of adds (front/back), replaces and deletes of tracked *and* untracked (BGP, blackhole) routes, every slot holds the kernel model's routes in the kernel model's order | A backup route must not overwrite the primary, a delete must remove only the named route, and a replace must displace the route the kernel displaced, even when that is an untracked BGP alias |
-| The tracked routes and every lookup equal the model's (longest prefix, then lowest priority) | Wrong IGP metrics and spurious (un)reachability |
+| The tracked routes and every lookup equal the model's: the reference picks the exact route (longest prefix, lowest priority, lowest table, then for IPv6 the highest router preference, then kernel order) from the model's slot lists, and the outcome (`Forward` / `Reject` / `Throw` / `NoRoute`) follows from that route's `rtm_type` alone | Wrong IGP metrics and spurious (un)reachability; a negative route beneath a covering route must not fall through to it (`fib_table_lookup` returns the selected alias's `fib_props` error) |
 | Each mutation reports a change exactly when the tracked routes changed | BGP churn must not wake the decision process; IGP changes must |
 | Lookups do not depend on load (dump) order | Dump and incremental state must agree |
 | `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
 
-The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPLACE` /
-`NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
+The netlink adapter's tests (`linux.rs`, Linux only) cover decoding (route type and
+`RTA_PREF` included), the tracking rule (negative routes tracked; BGP and `local`-type
+routes not), `NLM_F_REPLACE` / `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
 `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
 and 100 in both orders, for both families, incrementally and through the initial dump.
 They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
 learned from the initial dump (which reports a set only once), an all-BGP ECMP set
 that must give no IGP path both live and after a dump, a check that the kernel dumps a
 BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
-policy), and a BGP alias prepended ahead of a static alias and then replaced.
+policy), and a BGP alias prepended ahead of a static alias and then replaced. For #57 they compare the oracle's
+verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
+`ip route get` sends) for each negative type beneath a covering route, its deletion,
+`ip route replace <type>` over a unicast route, an initial dump with mixed metrics and a
+unicast route inside a throw prefix, IPv6 router preference between negative and
+unicast routes of one metric, and negative routes over link-local space; the expected
+errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and `ENETUNREACH`. The tests run in
+parallel in one namespace, so each uses its own prefixes and interfaces (prefixed
+`pvtest`) and none adds a real default route.
 They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 
