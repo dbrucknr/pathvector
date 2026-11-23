@@ -155,16 +155,12 @@ pub trait FibWrite {
 
 // ── FibSnapshot ──────────────────────────────────────────────────────────────
 
-/// An entry in the FIB snapshot: (network address, prefix length, metric).
-///
-/// Metric corresponds to the Linux route priority (lower = preferred). Used to
-/// implement RFC 4271 §9.1.2.2 step 8 (prefer lower IGP metric).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FibEntry4 {
-    pub network: Ipv4Addr,
-    pub prefix_len: u8,
-    pub metric: u32,
-}
+mod route;
+pub(crate) use route::RouteList;
+pub use route::{
+    Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg, NextHopPath, NextHopV4,
+    NextHopV6, PrefixError, RouteSlotV4, RouteSlotV6, TableId,
+};
 
 /// Returns `true` if `addr` is a link-local IPv6 address (`fe80::/10`).
 ///
@@ -175,26 +171,33 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
     o[0] == 0xfe && (o[1] & 0xc0) == 0x80
 }
 
-/// IPv6 equivalent of [`FibEntry4`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FibEntry6 {
-    pub network: Ipv6Addr,
-    pub prefix_len: u8,
-    pub metric: u32,
-}
-
 /// In-memory copy of the kernel routing table.
 ///
-/// Updated atomically by [`KernelFib`] under a write lock; read concurrently
-/// by [`KernelOracle`] instances in the decision process.
+/// Updated by [`KernelFib`] under a write lock; read concurrently by
+/// [`KernelOracle`] instances in the decision process.
 ///
-/// Reachability queries use longest-prefix match (LPM): a next-hop is
-/// considered reachable if any route in the snapshot covers it. The metric of
-/// the covering route is returned for the step-8 tiebreaker.
+/// # Route identity
+///
+/// A destination prefix does **not** identify a kernel route: Linux keeps
+/// several routes per prefix, distinguished by table, priority (metric),
+/// IPv4 TOS, IPv6 source prefix and next hop. The snapshot stores each route
+/// under its full kernel identity ([`KernelRouteV4`], [`KernelRouteV6`]), so
+/// adding a backup route never overwrites the primary and deleting one route
+/// leaves the others in place. See the `route` module docs for the kernel
+/// source this follows.
+///
+/// # Lookup
+///
+/// Reachability queries use longest-prefix match. Among the routes for the
+/// longest matching prefix, the one with the lowest priority wins, as in the
+/// kernel. Its priority is returned as the IGP metric for the RFC 4271
+/// §9.1.2.2 step 8 tiebreaker. IPv4 routes with a non-zero TOS and IPv6
+/// routes with a source prefix are kept but never selected, because a
+/// best-effort lookup from an unspecified source cannot match them.
 #[derive(Debug, Default, Clone)]
 pub struct FibSnapshot {
-    pub(crate) v4: Vec<FibEntry4>,
-    pub(crate) v6: Vec<FibEntry6>,
+    pub(crate) v4: RouteList<KernelRouteV4>,
+    pub(crate) v6: RouteList<KernelRouteV6>,
 }
 
 impl FibSnapshot {
@@ -204,19 +207,42 @@ impl FibSnapshot {
         Self::default()
     }
 
-    /// Returns `true` if `addr` is covered by any IPv4 route in the snapshot.
+    /// Every IPv4 route in the snapshot, in kernel order within each slot.
+    pub fn routes_v4(&self) -> impl Iterator<Item = &KernelRouteV4> {
+        self.v4.iter()
+    }
+
+    /// Every IPv6 route in the snapshot, in kernel order within each slot.
+    pub fn routes_v6(&self) -> impl Iterator<Item = &KernelRouteV6> {
+        self.v6.iter()
+    }
+
+    /// The IPv4 route the kernel would use for best-effort traffic to `addr`.
+    #[must_use]
+    pub fn route_to_v4(&self, addr: Ipv4Addr) -> Option<&KernelRouteV4> {
+        self.v4.lookup(addr)
+    }
+
+    /// The IPv6 route the kernel would use for traffic to `addr` from an
+    /// unspecified source. Link-local addresses are not special-cased here.
+    #[must_use]
+    pub fn route_to_v6(&self, addr: Ipv6Addr) -> Option<&KernelRouteV6> {
+        self.v6.lookup(addr)
+    }
+
+    /// Returns `true` if `addr` is covered by an eligible IPv4 route.
     #[must_use]
     pub fn is_v4_reachable(&self, addr: Ipv4Addr) -> bool {
-        self.lpm_v4(addr).is_some()
+        self.route_to_v4(addr).is_some()
     }
 
-    /// Returns the metric of the most-specific IPv4 route covering `addr`.
+    /// Returns the priority of the IPv4 route the kernel would use for `addr`.
     #[must_use]
     pub fn igp_metric_v4(&self, addr: Ipv4Addr) -> Option<u32> {
-        self.lpm_v4(addr).map(|e| e.metric)
+        self.route_to_v4(addr).map(|r| r.slot.priority)
     }
 
-    /// Returns `true` if `addr` is covered by any IPv6 route in the snapshot.
+    /// Returns `true` if `addr` is covered by an eligible IPv6 route.
     ///
     /// Link-local addresses (`fe80::/10`) are always considered reachable —
     /// they are on-link by definition and do not appear in the main routing
@@ -226,43 +252,13 @@ impl FibSnapshot {
         if is_link_local_v6(addr) {
             return true;
         }
-        self.lpm_v6(addr).is_some()
+        self.route_to_v6(addr).is_some()
     }
 
-    /// Returns the metric of the most-specific IPv6 route covering `addr`.
+    /// Returns the priority of the IPv6 route the kernel would use for `addr`.
     #[must_use]
     pub fn igp_metric_v6(&self, addr: Ipv6Addr) -> Option<u32> {
-        self.lpm_v6(addr).map(|e| e.metric)
-    }
-
-    /// Longest-prefix match over IPv4 entries.
-    fn lpm_v4(&self, addr: Ipv4Addr) -> Option<&FibEntry4> {
-        let addr_u32 = u32::from(addr);
-        self.v4
-            .iter()
-            .filter(|e| {
-                if e.prefix_len == 0 {
-                    return true;
-                }
-                let shift = 32u32.saturating_sub(u32::from(e.prefix_len));
-                (u32::from(e.network) >> shift) == (addr_u32 >> shift)
-            })
-            .max_by_key(|e| e.prefix_len)
-    }
-
-    /// Longest-prefix match over IPv6 entries.
-    fn lpm_v6(&self, addr: Ipv6Addr) -> Option<&FibEntry6> {
-        let addr_u128 = u128::from(addr);
-        self.v6
-            .iter()
-            .filter(|e| {
-                if e.prefix_len == 0 {
-                    return true;
-                }
-                let shift = 128u32.saturating_sub(u32::from(e.prefix_len));
-                (u128::from(e.network) >> shift) == (addr_u128 >> shift)
-            })
-            .max_by_key(|e| e.prefix_len)
+        self.route_to_v6(addr).map(|r| r.slot.priority)
     }
 }
 
@@ -463,32 +459,56 @@ impl KernelFib {
 mod tests {
     use super::*;
 
-    fn snap_with_v4(entries: &[(Ipv4Addr, u8, u32)]) -> FibSnapshot {
-        FibSnapshot {
-            v4: entries
-                .iter()
-                .map(|&(network, prefix_len, metric)| FibEntry4 {
-                    network,
-                    prefix_len,
-                    metric,
-                })
-                .collect(),
-            v6: vec![],
+    /// A unicast route in the main table with no TOS, source or gateway.
+    pub(crate) fn r4(network: &str, prefix_len: u8, metric: u32) -> KernelRouteV4 {
+        KernelRouteV4 {
+            slot: RouteSlotV4 {
+                table: TableId::MAIN,
+                dst: Ipv4Prefix::new(network.parse().unwrap(), prefix_len).unwrap(),
+                tos: 0,
+                priority: metric,
+            },
+            protocol: 3, // RTPROT_BOOT, what `ip route add` uses
+            scope: 0,
+            prefsrc: None,
+            next_hop: NextHopV4::Path(NextHopPath {
+                gateway: None,
+                oif: None,
+            }),
         }
     }
 
-    fn snap_with_v6(entries: &[(Ipv6Addr, u8, u32)]) -> FibSnapshot {
-        FibSnapshot {
-            v4: vec![],
-            v6: entries
-                .iter()
-                .map(|&(network, prefix_len, metric)| FibEntry6 {
-                    network,
-                    prefix_len,
-                    metric,
-                })
-                .collect(),
+    /// IPv6 counterpart of [`r4`].
+    pub(crate) fn r6(network: &str, prefix_len: u8, metric: u32) -> KernelRouteV6 {
+        KernelRouteV6 {
+            slot: RouteSlotV6 {
+                table: TableId::MAIN,
+                dst: Ipv6Prefix::new(network.parse().unwrap(), prefix_len).unwrap(),
+                src: Ipv6Prefix::DEFAULT,
+                priority: metric,
+            },
+            protocol: 3,
+            next_hop: NextHopV6::Path(NextHopPath {
+                gateway: None,
+                oif: None,
+            }),
         }
+    }
+
+    fn snap_with_v4(entries: &[(&str, u8, u32)]) -> FibSnapshot {
+        let mut snap = FibSnapshot::new();
+        for &(network, prefix_len, metric) in entries {
+            snap.v4.insert_back(r4(network, prefix_len, metric));
+        }
+        snap
+    }
+
+    fn snap_with_v6(entries: &[(&str, u8, u32)]) -> FibSnapshot {
+        let mut snap = FibSnapshot::new();
+        for &(network, prefix_len, metric) in entries {
+            snap.v6.insert_back(r6(network, prefix_len, metric));
+        }
+        snap
     }
 
     // ── FibSnapshot reachability ──────────────────────────────────────────────
@@ -502,14 +522,14 @@ mod tests {
 
     #[test]
     fn exact_host_route_matches() {
-        let snap = snap_with_v4(&[("192.0.2.1".parse().unwrap(), 32, 10)]);
+        let snap = snap_with_v4(&[("192.0.2.1", 32, 10)]);
         assert!(snap.is_v4_reachable("192.0.2.1".parse().unwrap()));
         assert!(!snap.is_v4_reachable("192.0.2.2".parse().unwrap()));
     }
 
     #[test]
     fn subnet_route_matches_all_hosts_in_range() {
-        let snap = snap_with_v4(&[("10.0.0.0".parse().unwrap(), 8, 100)]);
+        let snap = snap_with_v4(&[("10.0.0.0", 8, 100)]);
         assert!(snap.is_v4_reachable("10.1.2.3".parse().unwrap()));
         assert!(snap.is_v4_reachable("10.255.255.255".parse().unwrap()));
         assert!(!snap.is_v4_reachable("11.0.0.1".parse().unwrap()));
@@ -517,7 +537,7 @@ mod tests {
 
     #[test]
     fn default_route_matches_everything() {
-        let snap = snap_with_v4(&[("0.0.0.0".parse().unwrap(), 0, 200)]);
+        let snap = snap_with_v4(&[("0.0.0.0", 0, 200)]);
         assert!(snap.is_v4_reachable("1.2.3.4".parse().unwrap()));
         assert!(snap.is_v4_reachable("255.255.255.255".parse().unwrap()));
     }
@@ -525,10 +545,7 @@ mod tests {
     #[test]
     fn longest_prefix_wins() {
         // /8 with metric 100, /24 with metric 50 — /24 is more specific
-        let snap = snap_with_v4(&[
-            ("10.0.0.0".parse().unwrap(), 8, 100),
-            ("10.20.30.0".parse().unwrap(), 24, 50),
-        ]);
+        let snap = snap_with_v4(&[("10.0.0.0", 8, 100), ("10.20.30.0", 24, 50)]);
         // Address in the /24 subnet → metric 50 (the more-specific route)
         assert_eq!(snap.igp_metric_v4("10.20.30.5".parse().unwrap()), Some(50));
         // Address in /8 but outside /24 → metric 100
@@ -536,21 +553,53 @@ mod tests {
     }
 
     #[test]
+    fn same_prefix_lowest_priority_wins_whatever_the_load_order() {
+        // Issue #56. fib_table_lookup walks a leaf's aliases in ascending
+        // priority and uses the first, so metric 10 must win over 100 no
+        // matter which order the routes were dumped or added in.
+        for entries in [
+            [("198.51.100.0", 24, 10), ("198.51.100.0", 24, 100)],
+            [("198.51.100.0", 24, 100), ("198.51.100.0", 24, 10)],
+        ] {
+            let snap = snap_with_v4(&entries);
+            assert_eq!(snap.routes_v4().count(), 2, "both routes are kept");
+            assert_eq!(
+                snap.igp_metric_v4("198.51.100.7".parse().unwrap()),
+                Some(10)
+            );
+            let route = snap.route_to_v4("198.51.100.7".parse().unwrap()).unwrap();
+            assert_eq!(route.slot.dst.to_string(), "198.51.100.0/24");
+        }
+        for entries in [
+            [("2001:db8:1::", 64, 10), ("2001:db8:1::", 64, 100)],
+            [("2001:db8:1::", 64, 100), ("2001:db8:1::", 64, 10)],
+        ] {
+            let snap = snap_with_v6(&entries);
+            assert_eq!(snap.routes_v6().count(), 2);
+            assert_eq!(
+                snap.igp_metric_v6("2001:db8:1::7".parse().unwrap()),
+                Some(10)
+            );
+            assert!(snap.route_to_v6("2001:db8:2::1".parse().unwrap()).is_none());
+        }
+    }
+
+    #[test]
     fn no_match_returns_none_metric() {
-        let snap = snap_with_v4(&[("192.168.0.0".parse().unwrap(), 16, 10)]);
+        let snap = snap_with_v4(&[("192.168.0.0", 16, 10)]);
         assert_eq!(snap.igp_metric_v4("10.0.0.1".parse().unwrap()), None);
     }
 
     #[test]
     fn ipv6_subnet_matches() {
-        let snap = snap_with_v6(&[("2001:db8::".parse().unwrap(), 32, 5)]);
+        let snap = snap_with_v6(&[("2001:db8::", 32, 5)]);
         assert!(snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
         assert!(!snap.is_v6_reachable("2001:db9::1".parse().unwrap()));
     }
 
     #[test]
     fn ipv6_default_route_matches_everything() {
-        let snap = snap_with_v6(&[(Ipv6Addr::UNSPECIFIED, 0, 1)]);
+        let snap = snap_with_v6(&[("::", 0, 1)]);
         assert!(snap.is_v6_reachable("::1".parse().unwrap()));
         assert!(snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
     }
@@ -574,16 +623,13 @@ mod tests {
         let snap = FibSnapshot::new();
         // 2001:db8:: is not link-local; needs a route.
         assert!(!snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
-        let snap = snap_with_v6(&[("2001:db8::".parse().unwrap(), 32, 10)]);
+        let snap = snap_with_v6(&[("2001:db8::", 32, 10)]);
         assert!(snap.is_v6_reachable("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
     fn igp_metric_v6_returns_metric_of_covering_route() {
-        let snap = snap_with_v6(&[
-            ("2001:db8::".parse().unwrap(), 32, 100),
-            ("2001:db8:1::".parse().unwrap(), 48, 20),
-        ]);
+        let snap = snap_with_v6(&[("2001:db8::", 32, 100), ("2001:db8:1::", 48, 20)]);
         // /48 is more specific → metric 20
         assert_eq!(
             snap.igp_metric_v6("2001:db8:1::1".parse().unwrap()),
@@ -608,11 +654,11 @@ mod tests {
         assert!(!oracle.is_v4_reachable("10.0.0.1".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v4("10.0.0.1".parse().unwrap()), None);
 
-        fib.snapshot.write().unwrap().v4.push(FibEntry4 {
-            network: "10.0.0.0".parse().unwrap(),
-            prefix_len: 8,
-            metric: 42,
-        });
+        fib.snapshot
+            .write()
+            .unwrap()
+            .v4
+            .insert_back(r4("10.0.0.0", 8, 42));
 
         assert!(oracle.is_v4_reachable("10.1.2.3".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v4("10.1.2.3".parse().unwrap()), Some(42));
@@ -629,11 +675,11 @@ mod tests {
         assert!(!oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v6("2001:db8::1".parse().unwrap()), None);
 
-        fib.snapshot.write().unwrap().v6.push(FibEntry6 {
-            network: "2001:db8::".parse().unwrap(),
-            prefix_len: 32,
-            metric: 7,
-        });
+        fib.snapshot
+            .write()
+            .unwrap()
+            .v6
+            .insert_back(r6("2001:db8::", 32, 7));
 
         assert!(oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
         assert_eq!(
@@ -694,11 +740,7 @@ mod tests {
         // Inject a route directly
         {
             let mut snap = fib.snapshot.write().unwrap();
-            snap.v4.push(FibEntry4 {
-                network: "10.0.0.0".parse().unwrap(),
-                prefix_len: 8,
-                metric: 10,
-            });
+            snap.v4.insert_back(r4("10.0.0.0", 8, 10));
         }
 
         // Oracle now sees the injected route
@@ -713,11 +755,11 @@ mod tests {
         assert!(!rx.has_changed().unwrap());
 
         // Simulate what the event loop does: write to snapshot and send.
-        fib.snapshot.write().unwrap().v4.push(FibEntry4 {
-            network: "192.168.1.0".parse().unwrap(),
-            prefix_len: 24,
-            metric: 20,
-        });
+        fib.snapshot
+            .write()
+            .unwrap()
+            .v4
+            .insert_back(r4("192.168.1.0", 24, 20));
         let _ = fib.change_tx.send(());
 
         assert!(rx.has_changed().unwrap());
