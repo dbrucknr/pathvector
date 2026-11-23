@@ -330,6 +330,12 @@ impl<P> ListenerKeys<P> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The OS adapter.
+    #[must_use]
+    pub fn port(&self) -> &P {
+        &self.port
+    }
+
     /// The configured authentication for `peer`, if any.
     #[must_use]
     pub fn configured(&self, peer: IpAddr) -> Option<TcpMd5Auth> {
