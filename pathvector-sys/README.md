@@ -28,10 +28,10 @@ be distinguished from kernel-native (`KERNEL`), static (`STATIC`), or IGP routes
 
 ### TCP MD5SIG (RFC 2385)
 
-BGP speakers can authenticate sessions by adding an HMAC-MD5 signature to every TCP
+BGP speakers can authenticate sessions by adding an MD5 signature to every TCP
 segment. This requires the `setsockopt(TCP_MD5SIG)` syscall on the listening and
-connecting sockets. `pathvector-sys` provides `apply_tcp_md5sig` which wraps this call
-and handles all validation.
+connecting sockets. `pathvector-sys` provides `install_tcp_md5_key` and
+`remove_tcp_md5_key`, which wrap this call and report exactly what happened.
 
 ---
 
@@ -40,51 +40,68 @@ and handles all validation.
 This crate is **Linux-only in production**. On non-Linux platforms:
 
 - All FIB operations compile to no-ops
-- `apply_tcp_md5sig` is a no-op (sessions establish without MD5 enforcement)
-- All tests still compile and pass (the validation guards fire before any syscall)
+- `install_tcp_md5_key` / `remove_tcp_md5_key` return
+  `Err(TcpMd5Error::Unsupported(TcpMd5Unsupported::Platform))`: no key is installed,
+  and the crate says so instead of returning success
+- All tests still compile and pass
 
 This design lets `pathvectord` compile and run on macOS for development without needing
 a Linux kernel.
 
-The FIB and TCP MD5 paths are gated with `#[cfg(target_os = "linux")]`. On macOS, if you
-configure `md5_password` on a peer, the socket option call is skipped and the session
-establishes without authentication — which is the correct behaviour for a development host
-that cannot enforce it.
+The FIB and TCP MD5 paths are gated with `#[cfg(target_os = "linux")]`. What a peer
+with `md5_password` does on a host that cannot enforce it is decided by the caller, not
+this crate: pathvectord refuses to connect unless `[daemon] tcp_md5_enforcement =
+"best-effort"` is set (see `pathvectord/README.md`).
 
 ---
 
-## TCP MD5 (`apply_tcp_md5sig`)
+## TCP MD5 (`install_tcp_md5_key` / `remove_tcp_md5_key`)
 
 ```rust,ignore
-// Called by pathvectord when configuring a peer with md5_password
-apply_tcp_md5sig(&listener, &peer_addr, b"shared-bgp-secret")
+use std::os::fd::AsFd;
+use pathvector_sys::{TcpMd5Key, install_tcp_md5_key, remove_tcp_md5_key};
+
+let key: TcpMd5Key = "shared-bgp-secret".parse()?;   // 1–80 bytes, Debug-redacted
+install_tcp_md5_key(socket.as_fd(), peer_ip, &key)?; // before connect() / before SYNs arrive
+remove_tcp_md5_key(socket.as_fd(), peer_ip)?;        // explicit, separately named delete
 ```
 
-### Validation
+`TcpMd5Port` is the port (trait) over these two calls and `KernelTcpMd5` is the real
+adapter, so callers can test their policy with a fake.
 
-| Check | Condition | Result |
+### Outcomes
+
+| Input / kernel answer | Result | Source |
 |---|---|---|
-| Key length | > 80 bytes | `Err(InvalidInput)` — RFC 2385 §3 limit |
-| Address family | IPv6 | `Err(Unsupported)` — not yet implemented |
-| Syscall | `ENOPROTOOPT` / `EOPNOTSUPP` | `Ok(())` with a warning — kernel lacks `CONFIG_TCP_MD5SIG` |
-| Syscall | Other OS error | `Err(Os(errno))` |
-| Syscall | Success | `Ok(())` |
+| Empty key | `TcpMd5Key` construction fails (`TcpMd5KeyError::Empty`) | Linux `tcp_v4_parse_md5_keys`: zero `tcpm_keylen` → `tcp_md5_do_del` (delete) |
+| Key over 80 bytes | `TcpMd5KeyError::TooLong` | `TCP_MD5SIG_MAXKEYLEN 80`; kernel returns `EINVAL` |
+| Non-Linux build | `Err(Unsupported(Platform))` | no adapter |
+| IPv6 peer | `Err(Unsupported(Ipv6Peer))` | not implemented yet |
+| `ENOPROTOOPT` / `EOPNOTSUPP` | `Err(Unsupported(Kernel { errno }))` | `do_tcp_setsockopt`: `TCP_MD5SIG` only handled under `CONFIG_TCP_MD5SIG`, else `-ENOPROTOOPT` |
+| `remove` with no key installed | `Err(Os(e))`, `e.kind() == NotFound` | `tcp_md5_do_del` returns `-ENOENT` |
+| Other OS error | `Err(Os(e))` | |
+| Success | `Ok(())`: the kernel now signs and verifies every segment for that peer | RFC 2385 §2.0 |
 
-The graceful-degrade on `ENOPROTOOPT` is why the positive e2e test passes on macOS:
-both sides have MD5 configured consistently, the no-op call succeeds, and the session
-establishes without kernel-level authentication.
+`Ok(())` never means "not enforced". RFC 5925 §8: an endpoint configured to require
+TCP MD5 must add it "to all outgoing segments and validate[] [it] on all incoming
+segments".
+
+Docker Desktop's `LinuxKit` kernel is built with `# CONFIG_TCP_MD5SIG is not set`, so
+there every install reports `Unsupported(Kernel { errno: ENOPROTOOPT })`.
 
 ### Why a local `TcpMd5Sig` struct instead of `libc::tcp_md5sig`
 
 `libc::tcp_md5sig` is not exposed on all Linux target architectures in all `libc`
-versions (notably absent on `aarch64` in `libc 0.2.x`). The local definition in
-`tcp.rs` matches `<linux/tcp.h>` exactly with documented field offsets and sizes, making
-it both portable and auditable.
+versions (notably absent on `aarch64` in `libc 0.2.x`), so `src/tcp/linux.rs` defines
+it locally. Its middle bytes use an older padding layout that only encodes the same
+`tcpm_keylen` as `<linux/tcp.h>` on little-endian targets; issue #60 tracks mirroring the
+UAPI exactly.
 
 ### Linux permissions
 
-`setsockopt(TCP_MD5SIG)` requires `CAP_NET_ADMIN`. In production, run `pathvectord` as
-root or grant the capability with `setcap cap_net_admin+ep ./target/release/pathvectord`.
+`setsockopt(TCP_MD5SIG)` needs no capability: `tcp_v4_parse_md5_keys` performs no
+permission check, and the loopback tests below run unprivileged. (Binding port 179 still
+needs `CAP_NET_BIND_SERVICE`.)
 
 ---
 
@@ -294,8 +311,9 @@ Known limits:
 
 ## Unsafe code audit
 
-All `unsafe` in the workspace lives in `pathvector-sys/src/tcp.rs`, in the
-`apply_linux` function (approximately 60 lines). The unsafe surface is:
+All `unsafe` for TCP MD5 lives in `pathvector-sys/src/tcp/linux.rs`, in
+`set_md5sig_v4` (approximately 60 lines). The socket is passed as a `BorrowedFd`, so it
+is guaranteed open for the duration of the call. The unsafe surface is:
 
 1. Constructing a `TcpMd5Sig` struct by zero-initialising and filling fields — safe
    because `MaybeUninit::zeroed()` is valid for `#[repr(C)]` structs with no padding
@@ -314,9 +332,16 @@ blocks are needed there.
 # All tests (runs on macOS and Linux)
 cargo test -p pathvector-sys
 
-# Linux-only tests require native Linux (not macOS Docker Desktop)
-# They run in CI on ubuntu-latest automatically
+# Live TCP MD5 enforcement over loopback (Linux, no privileges needed)
+cargo test -p pathvector-sys --test tcp_md5_loopback
 ```
+
+`tests/tcp_md5_loopback.rs` opens real connections and checks that matching keys connect
+while unsigned, wrongly signed and unexpectedly signed SYNs are dropped, that a second
+install replaces the key, and that `remove_tcp_md5_key` really stops enforcement. On a
+kernel without `CONFIG_TCP_MD5SIG` (Docker Desktop) these tests check that `Unsupported`
+was reported and skip the rest; with `CI` set (GitHub Actions) an unsupported kernel fails
+them instead.
 
 See [TESTING.md](../TESTING.md#tcp-md5-authentication-safety-pathvector-sys) for the
 full validation layer description.

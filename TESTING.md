@@ -203,16 +203,15 @@ failing cases to the smallest reproducing input automatically.
 
 ### `pathvector-sys`
 
-`pathvector-sys` is the sole crate in the workspace permitted to write `unsafe` code. All
-unsafe lives in one place — the `apply_tcp_md5sig` Linux path — making it easy to audit
-and reason about. The property tests focus on the validation boundary that fires before
-any syscall, keeping them cross-platform (they pass on macOS and Linux alike).
+`pathvector-sys` is the sole crate in the workspace permitted to write `unsafe` code. The
+TCP MD5 unsafe lives in one place — `set_md5sig_v4` in `src/tcp/linux.rs` — making it easy
+to audit. The property tests cover the `TcpMd5Key` validation boundary, which is
+cross-platform (they pass on macOS and Linux alike).
 
 | Invariant | Why it matters |
 |---|---|
-| Keys of 0–80 bytes never produce `InvalidInput` | All keys in the valid range must pass length guard; EBADF (fd=-1) or Ok(()) are acceptable |
-| Keys longer than 80 bytes always produce `InvalidInput` | RFC 2385 key length limit; must be enforced before the kernel call |
-| Any IPv6 address always returns `Unsupported` | IPv6 peer MD5 is not yet implemented; must not silently succeed |
+| Every byte string of 1–80 bytes is a `TcpMd5Key`, byte for byte | RFC 2385 §2.0 leaves the key's form open; Linux stores it as binary |
+| Every byte string over 80 bytes is rejected with `TooLong { len }` | `TCP_MD5SIG_MAXKEYLEN`; the kernel would return `EINVAL` |
 
 #### Kernel FIB route identity and negative routes (issues #56, #57)
 
@@ -646,21 +645,18 @@ just e2e-down  # stop and clean up
 
 | Test | RFC | What it proves |
 |---|---|---|
-| `md5_matching_key_session_establishes` | RFC 2385 | Matching `md5_password` on both sides → BGP session reaches Established |
-| `md5_key_mismatch_session_never_establishes` | RFC 2385 | Mismatched keys → session cannot establish; **CI-only** (see note below) |
+| `md5_matching_key_session_establishes` | RFC 2385 §2.0 | Matching `md5_password` on both sides → BGP session reaches Established; **CI-only** |
+| `md5_key_mismatch_session_never_establishes` | RFC 2385 §2.0 | Mismatched keys → session cannot establish; **CI-only** |
 
-> **CI-only gate on the negative MD5 test.** TCP MD5SIG is enforced at the Linux kernel
-> level. Docker Desktop on macOS runs inside a Linux VM whose kernel is built without
-> `CONFIG_TCP_MD5SIG`. On that host, `setsockopt(TCP_MD5SIG)` in the container succeeds
-> (the call is accepted by the kernel and silently ignored), so mismatched keys still
-> allow the TCP handshake through — the negative test would pass for the wrong reason.
-> GitHub Actions CI runners use native Linux Docker where `CONFIG_TCP_MD5SIG` is always
-> compiled in. `md5_key_mismatch_session_never_establishes` is gated on `CI=1` so it
-> only asserts on a host that can actually enforce the kernel-level check.
->
-> The positive test (`md5_matching_key_session_establishes`) runs everywhere: even when
-> `setsockopt` is a no-op, both sides have TCP MD5SIG configured consistently and the
-> session reaches Established.
+> **CI-only gate on both MD5 tests.** TCP MD5SIG is enforced by the Linux kernel. Docker
+> Desktop on macOS runs a `LinuxKit` kernel built with `# CONFIG_TCP_MD5SIG is not set`,
+> where `setsockopt(TCP_MD5SIG)` fails with `ENOPROTOOPT`. Since issue #58, pathvectord
+> reports that as "cannot enforce" and, with the default `tcp_md5_enforcement =
+> "required"`, refuses to connect — so the positive test cannot establish there, and the
+> negative one would pass for the wrong reason. Both are gated on the `CI` environment
+> variable, which GitHub Actions sets on native Linux runners where TCP MD5 is compiled in.
+> Kernel-level enforcement itself is also proven without Docker by
+> `pathvector-sys/tests/tcp_md5_loopback.rs` (below).
 
 #### Outbound propagation (`outbound.rs`)
 
@@ -706,40 +702,63 @@ are worth recording even though the Docker suite now handles automated testing.
 ## TCP MD5 authentication safety (`pathvector-sys`)
 
 RFC 2385 (TCP MD5) is a security feature. We hold it to a higher standard than ordinary
-protocol code: the same bug that accepts a wrong key would silently let a spoofed session
-through. This section documents every layer of assurance applied to `apply_tcp_md5sig`.
+protocol code: the same bug that accepts a wrong key — or reports a key as installed when
+it is not — would silently let a spoofed session through. This section documents every
+layer of assurance applied to `install_tcp_md5_key` / `remove_tcp_md5_key` and to the
+session's enforcement policy.
 
 ### Isolation
 
 All `unsafe` code in the workspace lives in `pathvector-sys` and nowhere else. Every
 other crate, including `pathvectord`, inherits `unsafe_code = "forbid"` from the
-workspace `Cargo.toml`. `pathvector-sys` overrides this to `unsafe_code = "allow"` only
-for the one function that calls `setsockopt`. The isolation means a code reviewer can
-audit the entire unsafe surface by reading a single 60-line function.
+workspace `Cargo.toml`. For TCP MD5 the unsafe surface is one ~60-line function,
+`set_md5sig_v4` in `pathvector-sys/src/tcp/linux.rs`. It takes the socket as a
+`BorrowedFd`, so an invalid descriptor cannot be passed in.
 
-The kernel struct (`tcp_md5sig`) is defined locally in `pathvector-sys/src/tcp.rs` as
-`#[repr(C)] struct TcpMd5Sig` rather than using `libc::tcp_md5sig`. This is because
-`libc::tcp_md5sig` is not exposed on all Linux target architectures in all `libc`
-versions (notably absent on `aarch64` in `libc 0.2.x`). The local definition matches
-the kernel ABI exactly (`<linux/tcp.h>`), documented with field offsets and sizes.
+The kernel struct (`tcp_md5sig`) is defined locally as `#[repr(C)] struct TcpMd5Sig`
+rather than using `libc::tcp_md5sig`, because `libc::tcp_md5sig` is not exposed on all
+Linux target architectures in all `libc` versions. Its middle bytes encode
+`tcpm_keylen` correctly on little-endian targets only; issue #60 tracks mirroring the
+UAPI exactly.
 
-### Validation layers
+### Layers
 
 | Layer | What it checks | Test |
 |---|---|---|
-| Input validation (pre-syscall) | Key > 80 bytes → `InvalidInput` before any kernel call | `test_key_too_long_returns_error` |
-| Input validation (pre-syscall) | Key at exactly 80 bytes passes the guard | `test_key_at_exact_limit_passes_length_guard` |
-| Input validation (pre-syscall) | IPv6 address → `Unsupported` (not yet implemented) | `test_ipv6_returns_unsupported` |
-| Syscall success path (Linux) | Real `TcpListener` fd → `setsockopt` succeeds | `test_apply_succeeds_on_real_socket_linux` |
-| Syscall idempotence (Linux) | Calling twice on the same peer updates the key | `test_apply_twice_same_peer_succeeds_linux` |
-| Syscall error path (Linux) | Invalid fd → OS error, not panic or `InvalidInput` | `test_invalid_fd_returns_os_error_linux` |
-| Property: valid key range | All keys 0–80 bytes never produce `InvalidInput` | `prop_key_within_limit_never_rejected_for_length` |
-| Property: over-limit key | All keys > 80 bytes always produce `InvalidInput` | `prop_key_over_limit_always_rejected` |
-| Property: IPv6 | Any IPv6 address always returns `Unsupported` | `prop_ipv6_always_unsupported` |
-| E2E interop (positive) | Matching keys → BGP session reaches Established against real GoBGP | `md5_matching_key_session_establishes` |
-| E2E interop (negative, CI) | Mismatched keys → session never establishes on native Linux | `md5_key_mismatch_session_never_establishes` |
+| Key type | Empty key rejected — Linux reads zero `tcpm_keylen` as delete (`tcp_v4_parse_md5_keys` → `tcp_md5_do_del`) | `empty_key_is_rejected`, `test_md5_password_empty_is_rejected`, `add_peer_rejects_empty_md5_password`, `peer_add_rejects_empty_md5_password` |
+| Key type | Over 80 bytes rejected (`TCP_MD5SIG_MAXKEYLEN`) | `key_longer_than_80_bytes_is_rejected`, `prop_over_80_bytes_is_rejected`, `test_md5_password_over_80_bytes_is_rejected`, `test_add_peer_rejects_md5_password_over_80_bytes` |
+| Key type | 1–80 arbitrary bytes accepted; `Debug` redacts the key | `prop_any_1_to_80_bytes_is_a_key`, `debug_output_redacts_the_key` |
+| Adapter | `ENOPROTOOPT`/`EOPNOTSUPP` → `Unsupported(Kernel)`, other errnos → `Os` | `enoprotoopt_and_eopnotsupp_mean_unsupported`, `other_errnos_are_os_errors` |
+| Adapter | Non-Linux → `Unsupported(Platform)`; IPv6 → `Unsupported(Ipv6Peer)` | `non_linux_reports_platform_unsupported`, `ipv6_peer_reports_unsupported` |
+| Live kernel (any Linux) | Install/remove either succeed or both report `Unsupported(Kernel)` | `unsupported_kernel_is_never_reported_as_enforced` |
+| Live kernel (CI) | Matching keys connect and exchange data | `matching_keys_connect_and_exchange_data` |
+| Live kernel (CI) | Unsigned / wrong-key / unexpectedly signed SYNs dropped without reply | `unsigned_client_cannot_reach_keyed_listener`, `wrong_key_cannot_connect`, `signed_client_cannot_reach_unkeyed_listener` |
+| Live kernel (CI) | Re-install replaces the key; removal stops enforcement; second removal → `NotFound` | `reinstalling_replaces_the_key`, `removing_the_key_stops_enforcement` |
+| Session policy | `Required` (default) + unenforceable → error, no SYN sent | `required_key_that_cannot_be_enforced_is_an_error`, `required_but_unenforceable_never_connects` |
+| Session policy | `BestEffort` → `Unenforced(reason)` + warning; never hides `Os` errors | `best_effort_reports_unenforced_with_reason`, `best_effort_connects_when_unenforceable`, `best_effort_does_not_hide_os_errors` |
+| Session policy | A spawned session whose required key is unenforceable logs peer and reason | `required_md5_failure_is_logged_by_running_session` |
+| Config / sidecar | Parse errors never print a password (syntax error, over-length, bare value) | `test_config_errors_do_not_reveal_md5_password`, `unparseable_sidecar_log_does_not_reveal_passwords`, `rejected_sidecar_password_is_not_logged` |
+| Config / sidecar | One invalid sidecar entry keeps the others and is preserved on write; an unparseable file is never overwritten | `invalid_entry_does_not_drop_valid_peers`, `unparseable_sidecar_is_never_overwritten` |
+| Daemon wiring | Key and policy reach static and dynamic sessions | `build_daemon_md5_password_reaches_session_config`, `build_daemon_best_effort_md5_reaches_session_config`, `add_peer_wires_md5_key_and_enforcement_into_session_config` |
+| E2E interop (CI) | Matching keys → Established against GoBGP; mismatch never establishes | `md5_matching_key_session_establishes`, `md5_key_mismatch_session_never_establishes` |
+
+The live-kernel tests are in `pathvector-sys/tests/tcp_md5_loopback.rs` and run over
+loopback with no privileges. On a kernel without `CONFIG_TCP_MD5SIG` they check the
+`Unsupported` report and skip; when `CI` is set they fail instead, so CI cannot pass
+without proving enforcement.
 
 ### Platform behaviour
+
+| Platform | `install_tcp_md5_key` | Enforcement | Session (default `required`) |
+|---|---|---|---|
+| Linux with `CONFIG_TCP_MD5SIG` | `Ok(())` (no capability needed) | Kernel signs and verifies every segment | Connects |
+| Linux without it (Docker Desktop `LinuxKit`) | `Err(Unsupported(Kernel { errno: ENOPROTOOPT }))` | None | Refuses to connect; `best-effort` connects unauthenticated with a warning |
+| macOS / other | `Err(Unsupported(Platform))` | None | Same as above |
+| IPv6 peer (any OS) | `Err(Unsupported(Ipv6Peer))` | None | Same as above |
+
+---
+
+## Platform behaviour
 
 | Platform | `setsockopt(TCP_MD5SIG)` | Enforcement | Notes |
 |---|---|---|---|

@@ -891,7 +891,7 @@ pub(super) async fn run_command_processor<H, F>(
                     peer_as: Some(peer.remote_as),
                     confederation_member: confed_member,
                     peer_addr: SocketAddr::new(peer.address, peer.port),
-                    md5_password: peer.md5_password.clone(),
+                    tcp_md5: session_tcp_md5(&peer, cfg.md5_enforcement),
                     connect_retry_time: peer
                         .connect_retry_time
                         .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
@@ -1056,7 +1056,7 @@ fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpL
 pub(super) async fn run_bgp_listener(
     bind_addr: std::net::SocketAddr,
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
-    _md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>>,
+    _md5_passwords: Md5Keys,
 ) {
     let listener = match bind_listener(bind_addr) {
         Ok(l) => {
