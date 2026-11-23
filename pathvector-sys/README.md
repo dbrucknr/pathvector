@@ -199,6 +199,7 @@ subscribed to IPv4 and IPv6 route notifications and also carries the dumps:
 | Dump cut short | the reply stream ends without `NLMSG_DONE` (`NLMSG_DONE` forwarding is switched on for this) | `ConnectionLost` |
 | Dump failed | `NLMSG_ERROR`, or a negative error in `NLMSG_DONE` | `DumpFailed(errno)` |
 | Dump may have missed routes | `NLM_F_DUMP_INTR`, or a notification for the same family arriving during that family's dump | `DumpInconsistent` |
+| Dump stopped | an overrun while the dump runs, or no `NLMSG_DONE` within `DumpTimeout` (60 s by default) | `NotificationsLost` / `DumpStalled` |
 | New socket refused | `socket` / `bind` / `setsockopt` failed | `ConnectFailed(errno)` |
 
 The last detection rule matters because the kernel's route dumpers never set
@@ -206,6 +207,13 @@ The last detection rule matters because the kernel's route dumpers never set
 `fib6_dump_table` restarts from the root after a tree change and skips as many routes as
 it had already sent, which can drop an unchanged route. Every such change is also
 notified on the subscribed socket, so it is visible.
+
+A dump can also stop without ending: when `netlink_dump` cannot allocate or charge its
+next chunk it returns `-ENOBUFS`, leaves the dump running, and `netlink_recvmsg` retries
+it only after it has received another queued message. The supervisor therefore reads
+notifications while a dump runs, gives each dump a deadline, and replaces the socket when
+it abandons a running dump (a new dump on that socket would get `EBUSY` from
+`__netlink_dump_start`).
 
 After a detection the snapshot becomes `Degraded`, the supervisor waits (`ResyncBackoff`:
 100 ms doubling to 10 s by default, applying the notifications it still receives), dumps
@@ -220,8 +228,10 @@ same delays; an overrun keeps the socket.
 plus counters of losses and completed resyncs. **Lookups never refuse:** while degraded
 they answer from the last snapshot (stale but flagged), because declaring every next hop
 unreachable would make BGP withdraw everything on a transient overrun. `spawn` returns
-only if the very first socket cannot be opened. `KernelFib::builder` sets the backoff
-and the socket's `SO_RCVBUF` (`receive_buffer`).
+only if the very first socket cannot be opened. `KernelFib::builder` sets the backoff,
+the per-dump deadline (`dump_timeout`) and the socket's `SO_RCVBUF` (`receive_buffer`).
+`pathvectord` logs the status it finds when its logger starts, every change of cause,
+recovery, and a reminder when a single-cause outage reaches 4, 8, 16, … retries.
 
 Known limits:
 

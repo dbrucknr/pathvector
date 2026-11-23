@@ -23,12 +23,16 @@ family during that family's dump: the kernel's route dumpers never set
 `NLM_F_DUMP_INTR`, and `fib6_dump_table` can skip an unchanged route after a tree
 change). It marks the snapshot `Degraded`, waits with bounded exponential backoff while
 still applying notifications, redumps both families, and swaps the result in with one
-move under the write lock; it reconnects the same way. New public API: `SnapshotHealth`,
-`DegradedCause`, `FibStatus`, `ResyncBackoff`, `KernelFib::builder` (backoff,
-`SO_RCVBUF`), `KernelFib::status`, `KernelOracle::health` / `status`. Lookups while
+move under the write lock; it reconnects the same way. Notifications are read while a
+dump runs and each dump has a deadline (`DumpTimeout`), because `netlink_dump` can stop
+a dump with `-ENOBUFS` and resume it only after another message is read; abandoning a
+running dump replaces the socket, since a new dump on it would get `EBUSY`. New public API: `SnapshotHealth`,
+`DegradedCause`, `FibStatus`, `ResyncBackoff`, `DumpTimeout`, `KernelFib::builder`
+(backoff, dump deadline, `SO_RCVBUF`), `KernelFib::status`, `KernelOracle::health` / `status`. Lookups while
 degraded answer from the last snapshot (stale but flagged). `KernelFib::spawn` now
-returns only if the first netlink socket cannot be opened; `pathvectord` logs that and
-every health transition. Proof: 20 supervisor tests against a scripted fake kernel that
+returns only if the first netlink socket cannot be opened; `pathvectord` logs that, the
+status present when its logger starts, every health transition, and reminders during a
+long outage. Proof: 22 supervisor tests against a scripted fake kernel that
 models the congestion bit, a proptest model check (Ready always means the snapshot equals
 the kernel table; convergence once faults stop), Linux adapter tests, and a live-kernel
 test that forces `ENOBUFS` and checks agreement with a fresh dump.

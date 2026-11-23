@@ -265,12 +265,14 @@ does after a tree change.
 | Once faults stop, the status returns to `Ready` and the snapshot equals a fresh dump | Recovery is automatic and complete |
 | An overrun, a closed connection, a failed / cut-short / interrupted / racing dump each produce the matching `DegradedCause` | Degradation is observable, with the reason |
 | A cut-short dump or an attempt hit by an overrun is never installed; lookups during a resync see the previous snapshot | No partial or empty snapshot is ever visible |
+| An overrun while a dump is pending abandons it and replaces the socket (no dump is retried on it: the fake answers `EBUSY` like `__netlink_dump_start`); a dump that never answers hits its deadline | A dump `netlink_dump` stopped with `-ENOBUFS` would otherwise block recovery forever |
 | Notifications for the other family during a dump are not inconsistencies, and later ones are applied to the fresh snapshot | Exactly the changes a dump cannot show are replayed |
 | Retry delays are `initial · 2ⁿ` capped at the maximum; a burst of overruns costs one resync; a quiet period resets the sequence | Bounded recovery without redumping on every transient |
 | Only the first failed connect is returned to the caller | Later failures are retried, not fatal |
 
 The detection and replay rules were checked by mutation (same-family inconsistency,
-`NLM_F_DUMP_INTR`, which notifications are replayed, overruns while following): removing
+`NLM_F_DUMP_INTR`, which notifications are replayed, overruns while following, overruns
+during a dump, reconnecting after abandoning a dump, the dump deadline): removing
 any one makes at least one of these tests fail. The Linux adapter tests (`linux.rs`)
 cover the dump reader (complete only with `NLMSG_DONE`; `NLM_F_DUMP_INTR` on any reply; errors in `NLMSG_ERROR` and
 `NLMSG_DONE`) and message classification (overrun, new/delete with header flags, other
