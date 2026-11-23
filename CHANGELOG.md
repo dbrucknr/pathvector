@@ -4,6 +4,58 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (PR-1 load harness `pathvector-loadtest` + first full-table measurements)
+
+New crate `pathvector-loadtest` (binary `loadtest`, `just loadtest`): spawns a
+real `pathvectord`, connects N loader peers that each announce a full MRT table
+plus one quiet control peer with a 9 s hold timer, and runs `idle`, `converge`,
+`cow`, `teardown`, `reconverge` and `export` scenarios. Each reports the control
+peer's longest keepalive silence, gRPC `list_peers` latency, peak RSS and the
+daemon's own lock-hold / event-batch / session-blocked histograms, diffed over
+exactly that scenario's window. See `pathvector-loadtest/README.md`.
+`pathvector-mrt` became lib + bin so the UPDATE builder
+(`build_update_messages`, `build_withdraw_messages`) is shared.
+
+**First measurements** — one loader announcing a 1,133,510-prefix RIPE RIS
+dump over loopback, Apple M2 Max, release build. *Not* the PR-1 exit-criteria
+run (that needs ≥ 2 loaders; see below). The control peer's keepalive silence
+stayed at 3.0–3.2 s in every window; it never approached the 9 s hold time.
+
+| Scenario | Longest single write-lock hold (upper bucket bound) | gRPC `list_peers` worst |
+|---|---|---|
+| Initial convergence | ≤ 2.5 s (3.1–3.7 s total over 4–8 k batches; > 1,024 events coalesced into one hold) | 1.0–1.9 s |
+| Teardown of a full-table peer | **one hold of 1.1–1.5 s** | 1.0–1.2 s |
+| Reconvergence into a populated RIB | ≤ 2.5 s | 2.4 s |
+| Churn of 2,000 prefixes, no management client | ≤ 25 ms | — |
+
+- **Session backpressure is real and measured.** During convergence the
+  loader's session task was parked on the full event channel 96,486 times for
+  2.72 s in total (up to 250 ms at a stretch). That task owns the session's
+  keepalive timer, so a busy *sending* peer delays its own keepalives.
+- **A `list_peers` call makes the daemon clone the RIB under the write lock.**
+  `build_peer_state` scans the whole Loc-RIB per peer (~230 ms on this table)
+  while holding the `Arc<RibSnapshot>`, so the next event-loop mutation hits
+  `Arc::make_mut`'s copy-on-write. A/B on identical churn: with the 10 Hz
+  probe, single holds up to 500 ms and RSS 1.24 → 1.9 GiB; with it off, holds
+  ≤ 25 ms and flat RSS. Cause inferred from the code path plus those two
+  signatures, not isolated with a profiler. `watch_routes` snapshots do not
+  have this effect on hold time (they cost ~760 MiB of RSS instead).
+- **Daemon metrics bug, found by this harness (unfixed).** The event loop
+  calls `on_route_update`, `on_session_established` and
+  `on_session_terminated` only for the first event of each coalesced batch;
+  its drain loop handles the same events without them. Observed: the
+  Adj-RIB-In gauge reads 785,254 when the daemon holds 1,133,510, and a
+  coalesced Terminated left `pathvectord_bgp_session_up{peer}` at **1** for a
+  peer the daemon's own log and gRPC state showed as down.
+- **Reconnect delay after an Established session ends.** The FSM goes to
+  `Idle` and ignores inbound connections until its ConnectRetry timer fires
+  (120 s by default), so a peer that flaps and redials gets no OPEN for that
+  long. Observed directly; not changed.
+
+**Not yet done** (PR-1 exit criteria): a run with ≥ 2 simultaneous full-table
+peers (needs `lo0` aliases on macOS), the `export` scenario (needs ≥ 2
+loaders), Graceful Restart recovery, route refresh and RPKI cache replacement.
+
 ## 2026-11-23 (PR-1 control-plane stall instrumentation — measurement only, no behaviour change)
 
 First step of `PRODUCTION_READINESS.md` PR-1: make the stalls measurable before

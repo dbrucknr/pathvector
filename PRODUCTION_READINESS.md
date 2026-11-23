@@ -71,8 +71,11 @@ before a high-consequence deployment.
 
 **Status:** Open; underlying architecture and several hot paths are already
 tracked in [`TODO.md`](TODO.md). Lock-hold, event-batch, session-send-blocked
-and keepalive-lateness histograms landed 2026-11-23 (see CHANGELOG.md); the
-load run against them has not been done yet.
+and keepalive-lateness histograms landed 2026-11-23, along with the
+`pathvector-loadtest` harness and first single-loader full-table measurements
+(see CHANGELOG.md: a full-table peer teardown holds the write lock for
+1.1–1.5 s, and a `list_peers` call can make the daemon clone the RIB under
+it). The two-full-table-peer run the exit criteria require has not been done.
 
 All peer events currently converge on one daemon event loop and a broad
 `DaemonState` write lock. Full-table advertisement, Graceful Restart stale-route

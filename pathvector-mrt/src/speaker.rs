@@ -53,6 +53,11 @@ pub struct BgpSpeaker {
 
 impl BgpSpeaker {
     /// Connect to `peer_addr` and complete the BGP Open-Confirm handshake.
+    ///
+    /// # Errors
+    ///
+    /// Fails on connect/IO error or if the peer sends a NOTIFICATION or
+    /// something other than OPEN/KEEPALIVE during the handshake.
     pub async fn connect(
         peer_addr: SocketAddr,
         my_as: u32,
@@ -68,66 +73,30 @@ impl BgpSpeaker {
     /// Announce all `entries` to the peer and return statistics.
     ///
     /// Prefixes with identical attribute bytes are batched into the same UPDATE
-    /// message.  A KEEPALIVE is sent every [`KEEPALIVE_EVERY_N_UPDATES`]
-    /// messages to keep the session alive during long announcement runs.
+    /// message (see [`build_update_messages`]). A KEEPALIVE is sent every
+    /// [`KEEPALIVE_EVERY_N_UPDATES`] messages to keep the session alive during
+    /// long announcement runs.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a write to the peer fails.
     pub async fn announce(
         &mut self,
         entries: &[RibEntry],
     ) -> Result<AnnounceResult, Box<dyn std::error::Error>> {
-        // Group prefixes by attribute bytes for efficient batching.
-        let mut by_attrs: HashMap<&[u8], Vec<(Ipv4Addr, u8)>> = HashMap::new();
-        for e in entries {
-            by_attrs
-                .entry(e.attrs.as_slice())
-                .or_default()
-                .push((e.prefix, e.prefix_len));
-        }
-
-        let unique_attr_sets = by_attrs.len();
-        let mut prefixes_sent: u64 = 0;
+        let batch = build_update_messages(entries);
         let mut updates_sent: u64 = 0;
-
-        for (attrs, prefixes) in &by_attrs {
-            let mut batch: Vec<(Ipv4Addr, u8)> = Vec::new();
-            let mut batch_nlri_bytes: usize = 0;
-
-            // Bytes available for NLRIs given this attr set.
-            let available_for_nlri = MAX_MSG_LEN
-                .saturating_sub(HEADER_LEN)
-                .saturating_sub(4) // withdrawn_len(2) + attr_len(2)
-                .saturating_sub(attrs.len());
-
-            for &(prefix, plen) in prefixes {
-                let nlri_size = 1 + (plen as usize).div_ceil(8);
-
-                if !batch.is_empty() && batch_nlri_bytes + nlri_size > available_for_nlri {
-                    self.send_update(attrs, &batch).await?;
-                    updates_sent += 1;
-                    prefixes_sent += batch.len() as u64;
-
-                    if updates_sent.is_multiple_of(KEEPALIVE_EVERY_N_UPDATES) {
-                        self.send_keepalive().await?;
-                    }
-
-                    batch.clear();
-                    batch_nlri_bytes = 0;
-                }
-
-                batch.push((prefix, plen));
-                batch_nlri_bytes += nlri_size;
-            }
-
-            if !batch.is_empty() {
-                self.send_update(attrs, &batch).await?;
-                updates_sent += 1;
-                prefixes_sent += batch.len() as u64;
+        for msg in &batch.messages {
+            self.write_bytes(msg).await?;
+            updates_sent += 1;
+            if updates_sent.is_multiple_of(KEEPALIVE_EVERY_N_UPDATES) {
+                self.send_keepalive().await?;
             }
         }
-
         Ok(AnnounceResult {
-            prefixes_sent,
+            prefixes_sent: batch.prefixes,
             updates_sent,
-            unique_attr_sets,
+            unique_attr_sets: batch.unique_attr_sets,
         })
     }
 
@@ -181,36 +150,6 @@ impl BgpSpeaker {
         self.write_bytes(&BgpMessage::Keepalive.encode()).await
     }
 
-    /// Assemble a raw BGP UPDATE message and send it.
-    ///
-    /// The attribute bytes are taken verbatim from the MRT entry — they are
-    /// already in BGP wire format (RFC 4271 §4.3).
-    async fn send_update(
-        &mut self,
-        attrs: &[u8],
-        prefixes: &[(Ipv4Addr, u8)],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let nlri_bytes = encode_nlris(prefixes);
-        // body = withdrawn_len(2=0) + attr_len(2) + attrs + NLRIs
-        let body_len = 2 + 2 + attrs.len() + nlri_bytes.len();
-        let total_len = HEADER_LEN + body_len;
-
-        let mut msg = Vec::with_capacity(total_len);
-        msg.extend_from_slice(&BGP_MARKER);
-        // total_len ≤ MAX_MSG_LEN = 4096, so fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
-        msg.extend_from_slice(&(total_len as u16).to_be_bytes());
-        msg.push(MSG_TYPE_UPDATE);
-        msg.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_routes_length = 0
-        // attrs.len() ≤ available_for_nlri ≤ MAX_MSG_LEN, so fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
-        msg.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
-        msg.extend_from_slice(attrs);
-        msg.extend_from_slice(&nlri_bytes);
-
-        self.write_bytes(&msg).await
-    }
-
     async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         self.stream.write_all(bytes).await?;
         Ok(())
@@ -235,6 +174,143 @@ impl BgpSpeaker {
 
         BgpMessage::decode(&full).map_err(|e| format!("BGP decode error: {e:?}").into())
     }
+}
+
+// ── UPDATE construction ───────────────────────────────────────────────────────
+
+/// A set of fully encoded BGP UPDATE messages ready to write to a socket.
+pub struct UpdateBatch {
+    /// Complete wire messages (header included), each ≤ 4096 bytes.
+    pub messages: Vec<Vec<u8>>,
+    /// Total prefixes carried across all messages.
+    pub prefixes: u64,
+    /// Number of distinct attribute byte-strings in the input.
+    pub unique_attr_sets: usize,
+}
+
+/// Encodes `entries` as BGP UPDATE messages without sending anything.
+///
+/// Prefixes with identical attribute bytes share an UPDATE, filled up to the
+/// RFC 4271 §4.3 4096-byte message limit. Attribute bytes are taken verbatim
+/// from the MRT entries (already in BGP wire format), so there is no
+/// parse→re-encode round trip. Building once and writing the same
+/// `Vec<Vec<u8>>` to several peers is what lets a load generator drive many
+/// peers at full speed without being bound by encoding cost.
+#[must_use]
+pub fn build_update_messages(entries: &[RibEntry]) -> UpdateBatch {
+    let mut by_attrs: HashMap<&[u8], Vec<(Ipv4Addr, u8)>> = HashMap::new();
+    for e in entries {
+        by_attrs
+            .entry(e.attrs.as_slice())
+            .or_default()
+            .push((e.prefix, e.prefix_len));
+    }
+
+    let unique_attr_sets = by_attrs.len();
+    let mut messages: Vec<Vec<u8>> = Vec::new();
+    let mut prefixes: u64 = 0;
+
+    for (attrs, group) in &by_attrs {
+        let mut batch: Vec<(Ipv4Addr, u8)> = Vec::new();
+        let mut batch_nlri_bytes: usize = 0;
+
+        // Bytes available for NLRIs given this attr set.
+        let available_for_nlri = MAX_MSG_LEN
+            .saturating_sub(HEADER_LEN)
+            .saturating_sub(4) // withdrawn_len(2) + attr_len(2)
+            .saturating_sub(attrs.len());
+
+        for &(prefix, plen) in group {
+            let nlri_size = 1 + (plen as usize).div_ceil(8);
+
+            if !batch.is_empty() && batch_nlri_bytes + nlri_size > available_for_nlri {
+                messages.push(encode_update(attrs, &batch));
+                prefixes += batch.len() as u64;
+                batch.clear();
+                batch_nlri_bytes = 0;
+            }
+
+            batch.push((prefix, plen));
+            batch_nlri_bytes += nlri_size;
+        }
+
+        if !batch.is_empty() {
+            messages.push(encode_update(attrs, &batch));
+            prefixes += batch.len() as u64;
+        }
+    }
+
+    UpdateBatch {
+        messages,
+        prefixes,
+        unique_attr_sets,
+    }
+}
+
+/// Assemble one raw BGP UPDATE message (RFC 4271 §4.3): no withdrawn routes,
+/// `attrs` verbatim, then the NLRIs.
+fn encode_update(attrs: &[u8], prefixes: &[(Ipv4Addr, u8)]) -> Vec<u8> {
+    let nlri_bytes = encode_nlris(prefixes);
+    // body = withdrawn_len(2=0) + attr_len(2) + attrs + NLRIs
+    let body_len = 2 + 2 + attrs.len() + nlri_bytes.len();
+    let total_len = HEADER_LEN + body_len;
+
+    let mut msg = Vec::with_capacity(total_len);
+    msg.extend_from_slice(&BGP_MARKER);
+    // total_len ≤ MAX_MSG_LEN = 4096, so fits in u16.
+    #[allow(clippy::cast_possible_truncation)]
+    msg.extend_from_slice(&(total_len as u16).to_be_bytes());
+    msg.push(MSG_TYPE_UPDATE);
+    msg.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_routes_length = 0
+    // attrs.len() ≤ available_for_nlri ≤ MAX_MSG_LEN, so fits in u16.
+    #[allow(clippy::cast_possible_truncation)]
+    msg.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    msg.extend_from_slice(attrs);
+    msg.extend_from_slice(&nlri_bytes);
+    msg
+}
+
+/// Encodes `prefixes` as WITHDRAW-only UPDATE messages (RFC 4271 §4.3: a
+/// withdrawn-routes field, zero-length path attributes, no NLRI), split to
+/// respect the 4096-byte message limit.
+#[must_use]
+pub fn build_withdraw_messages(prefixes: &[(Ipv4Addr, u8)]) -> Vec<Vec<u8>> {
+    // withdrawn_len(2) + attr_len(2) of fixed body overhead.
+    let budget = MAX_MSG_LEN - HEADER_LEN - 4;
+    let mut out = Vec::new();
+    let mut chunk: Vec<(Ipv4Addr, u8)> = Vec::new();
+    let mut chunk_bytes = 0usize;
+
+    let flush = |chunk: &[(Ipv4Addr, u8)], out: &mut Vec<Vec<u8>>| {
+        let withdrawn = encode_nlris(chunk);
+        let total_len = HEADER_LEN + 2 + withdrawn.len() + 2;
+        let mut msg = Vec::with_capacity(total_len);
+        msg.extend_from_slice(&BGP_MARKER);
+        #[allow(clippy::cast_possible_truncation)]
+        msg.extend_from_slice(&(total_len as u16).to_be_bytes());
+        msg.push(MSG_TYPE_UPDATE);
+        // budget ≤ 4073, so the withdrawn length fits in u16.
+        #[allow(clippy::cast_possible_truncation)]
+        msg.extend_from_slice(&(withdrawn.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&withdrawn);
+        msg.extend_from_slice(&0u16.to_be_bytes()); // total path attribute length = 0
+        out.push(msg);
+    };
+
+    for &(prefix, plen) in prefixes {
+        let size = 1 + (plen as usize).div_ceil(8);
+        if !chunk.is_empty() && chunk_bytes + size > budget {
+            flush(&chunk, &mut out);
+            chunk.clear();
+            chunk_bytes = 0;
+        }
+        chunk.push((prefix, plen));
+        chunk_bytes += size;
+    }
+    if !chunk.is_empty() {
+        flush(&chunk, &mut out);
+    }
+    out
 }
 
 // ── NLRI encoding ─────────────────────────────────────────────────────────────
@@ -275,5 +351,106 @@ mod tests {
         // 0.0.0.0/0 → prefix_len(1) only, zero prefix bytes
         let nlri = encode_nlris(&[(Ipv4Addr::UNSPECIFIED, 0)]);
         assert_eq!(nlri, &[0]);
+    }
+
+    // ── build_update_messages / build_withdraw_messages ──────────────────────
+
+    /// `ORIGIN`=IGP, empty `AS_PATH`, `NEXT_HOP`=`nh` — the minimum well-formed
+    /// attribute set an eBGP UPDATE needs to decode cleanly.
+    fn attrs(nh: u8) -> Vec<u8> {
+        vec![
+            0x40, 1, 1, 0, // ORIGIN
+            0x40, 2, 0, // AS_PATH (empty)
+            0x40, 3, 4, 192, 0, 2, nh, // NEXT_HOP
+        ]
+    }
+
+    fn entry(a: u8, b: u8, plen: u8, nh: u8) -> RibEntry {
+        RibEntry {
+            prefix: Ipv4Addr::new(10, a, b, 0),
+            prefix_len: plen,
+            attrs: attrs(nh),
+        }
+    }
+
+    /// RFC 4271 §4.3: every produced message is a well-formed UPDATE no
+    /// larger than 4096 octets, the prefix count is conserved exactly, and
+    /// prefixes with different attribute sets never share a message.
+    #[test]
+    fn build_update_messages_conserves_prefixes_and_respects_limits() {
+        // 3,000 /24s under one attr set forces several messages (each /24
+        // costs 4 NLRI bytes; ~1,000 fit per 4096-byte message), plus one
+        // prefix under a second attr set.
+        let mut entries: Vec<RibEntry> = (0..3000u32)
+            .map(|i| {
+                entry(
+                    u8::try_from(i / 256).unwrap(),
+                    u8::try_from(i % 256).unwrap(),
+                    24,
+                    1,
+                )
+            })
+            .collect();
+        entries.push(entry(250, 250, 24, 2));
+
+        let batch = build_update_messages(&entries);
+
+        assert_eq!(batch.prefixes, 3001);
+        assert_eq!(batch.unique_attr_sets, 2);
+        assert!(
+            batch.messages.len() >= 4,
+            "3,000 /24s need more than one UPDATE"
+        );
+
+        let mut announced = 0usize;
+        for raw in &batch.messages {
+            assert!(raw.len() <= MAX_MSG_LEN, "message of {} bytes", raw.len());
+            let BgpMessage::Update(u) = BgpMessage::decode(raw).expect("decodes") else {
+                panic!("not an UPDATE");
+            };
+            assert_eq!(u.withdrawn.len(), 0);
+            announced += u.announced.len();
+        }
+        assert_eq!(announced, 3001);
+    }
+
+    /// RFC 4271 §4.3: a withdraw-only UPDATE carries withdrawn routes and a
+    /// zero-length path-attribute field; chunking keeps every message in
+    /// bounds and loses no prefix.
+    #[test]
+    fn build_withdraw_messages_round_trips_and_chunks() {
+        let prefixes: Vec<(Ipv4Addr, u8)> = (0..2500u32)
+            .map(|i| {
+                (
+                    Ipv4Addr::new(
+                        10,
+                        u8::try_from(i / 256).unwrap(),
+                        u8::try_from(i % 256).unwrap(),
+                        0,
+                    ),
+                    24,
+                )
+            })
+            .collect();
+
+        let msgs = build_withdraw_messages(&prefixes);
+        assert!(msgs.len() >= 3, "2,500 /24s need several withdraw UPDATEs");
+
+        let mut withdrawn = 0usize;
+        for raw in &msgs {
+            assert!(raw.len() <= MAX_MSG_LEN);
+            let BgpMessage::Update(u) = BgpMessage::decode(raw).expect("decodes") else {
+                panic!("not an UPDATE");
+            };
+            assert_eq!(u.announced.len(), 0);
+            assert_eq!(u.attributes.len(), 0);
+            withdrawn += u.withdrawn.len();
+        }
+        assert_eq!(withdrawn, 2500);
+    }
+
+    #[test]
+    fn build_withdraw_messages_empty_input_yields_no_messages() {
+        assert_eq!(build_withdraw_messages(&[]).len(), 0);
     }
 }
