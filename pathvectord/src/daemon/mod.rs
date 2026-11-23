@@ -860,7 +860,18 @@ where
                     tracing::warn!("failed to query stale BGP routes: {e}");
                 }
             }
-            tokio::spawn(kernel_fib.spawn());
+            // The supervisor recovers from netlink loss on its own and
+            // reports through the status channel; it returns only if no
+            // netlink socket can be opened at all.
+            tokio::spawn(crate_fib::log_fib_status(kernel_fib.status()));
+            tokio::spawn(async move {
+                if let Err(e) = kernel_fib.spawn().await {
+                    tracing::error!(
+                        "kernel FIB tracking unavailable: {e} — next-hop reachability will \
+                         not reflect the kernel routing table"
+                    );
+                }
+            });
             Some(w)
         }
         Err(e) => {

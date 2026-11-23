@@ -2249,6 +2249,44 @@ plus loop-detection to prevent infinite recursion. Explicitly not implemented; t
 current design excludes BGP routes from `FibSnapshot` for correctness (no feedback loop,
 semantic separation of IGP and BGP RIBs).
 
+**Negative routes: what the snapshot still cannot see** (follow-ups to #57):
+
+- *Policy routing.* A `throw` route, or any route in a table other than the mirrored
+  one, is resolved against the mirrored table alone: thrown traffic is reported
+  unreachable even if a later `ip rule` table would carry it. Modelling the rule chain
+  (`fib_rules_lookup`) would need a rule dump and per-table snapshots.
+- *Nexthop objects.* A route through `RTA_NH_ID` is classified by the type the kernel
+  reports; changing the object (for example to a blackhole nexthop) sends no route
+  notification. Needs an `RTM_NEWNEXTHOP` subscription.
+- *IPv6 unicast via `lo`.* `fib6_is_reject` turns it into a reject route but it is still
+  reported as unicast.
+- *BGP-installed blackholes.* RFC 7999 null routes installed by `FibWriter` are excluded
+  with every other BGP route, so a next hop beneath one is still reported reachable
+  through the IGP route. Belongs with recursive next-hop resolution above.
+
+**Snapshot recovery: what the supervisor still cannot see** (follow-ups to #59):
+
+- *Silent kernel flushes.* When a link goes down, `fib_table_flush` removes the IPv4
+  routes through it and sends `RTM_DELROUTE` only if their preferred source address was
+  removed (`fi->pfsrc_removed`). Subscribing to link / address groups and resyncing (or
+  applying the flush) on a link-down event would close this.
+- *No periodic verification.* A divergence that is never signalled lasts until the next
+  detected loss. An optional low-rate verification dump that compares and, on mismatch,
+  degrades and resyncs would bound it.
+- *Metrics.* `FibStatus` (health, losses, resyncs) is logged by `pathvectord` but not
+  exported to Prometheus.
+- *Readiness gate.* `pathvectord` does not wait for the first `Ready` before starting
+  sessions; it relies on the change notification to re-evaluate next hops when the
+  first dump lands.
+- *Stale-route dump.* `KernelFib::stale_bgp_routes` uses `rtnetlink`'s dump, which
+  cannot tell a complete dump from one cut short by a closed connection; it should use
+  the supervisor's `read_dump`.
+- *Resync cost.* A resync dumps every route of both families, BGP-installed ones
+  included: the mirror keeps them as identities so replaces displace the right route,
+  so a protocol filter is not an option. With a full table in the kernel that is a large
+  dump (and the dump deadline must allow for it); with `NETLINK_GET_STRICT_CHK`,
+  dumping only the tracked table would shrink it.
+
 **Testing gaps:**
 
 - E2e test (Gap 8): after session with GoBGP establishes and a prefix is learned,

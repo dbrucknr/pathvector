@@ -80,6 +80,41 @@ establishes; unsigned (the #66 bug: it used to establish) and wrong key never do
 Also corrected TESTING.md's second "Platform behaviour" table, left over from before #58,
 which said `ENOPROTOOPT` was treated as success.
 
+## 2026-11-23 (issue #59: the FIB snapshot recovers from netlink loss)
+
+`pathvector-sys`'s `KernelFib` ignored `NLMSG_OVERRUN` (how `netlink-proto` reports
+`ENOBUFS`), treated the end of its notification stream as success, ran its netlink
+connection as a detached task, and accepted any dump whose reply stream ended, including
+one cut short by a closed connection. netlink(7) is explicit that the kernel drops
+notifications when the receive buffer is full and that "It is up to the application to
+detect when this happens [...] and resynchronize"; nothing did, so one dropped
+notification left the next-hop oracle answering from stale state for good. Confirmed on
+a live kernel: after a 1000-route burst while the reader was blocked, the old snapshot
+never learned the dropped routes.
+
+A supervisor (`fib/supervisor.rs`, behind a `RouteSource` / `RouteFeed` port) now
+detects overruns, connection loss, dumps that end without `NLMSG_DONE` or fail, and
+dumps that may have missed routes (`NLM_F_DUMP_INTR`, or a notification for the same
+family during that family's dump: the kernel's route dumpers never set
+`NLM_F_DUMP_INTR`, and `fib6_dump_table` can skip an unchanged route after a tree
+change). It marks the snapshot `Degraded`, waits with bounded exponential backoff while
+still applying notifications, redumps both families, and swaps the result in with one
+move under the write lock; it reconnects the same way. Notifications are read while a
+dump runs and each dump has a deadline (`DumpTimeout`), because `netlink_dump` can stop
+a dump with `-ENOBUFS` and resume it only after another message is read; abandoning a
+running dump replaces the socket, since a new dump on it would get `EBUSY`. The dump and
+its deadline are polled ahead of the notification channel and the supervisor yields
+cooperatively, so sustained route churn cannot starve them. New public API: `SnapshotHealth`,
+`DegradedCause`, `FibStatus`, `ResyncBackoff`, `DumpTimeout`, `KernelFib::builder`
+(backoff, dump deadline, `SO_RCVBUF`), `KernelFib::status`, `KernelOracle::health` / `status`. Lookups while
+degraded answer from the last snapshot (stale but flagged). `KernelFib::spawn` now
+returns only if the first netlink socket cannot be opened; `pathvectord` logs that, the
+status present when its logger starts, every health transition, and reminders during a
+long outage. Proof: 26 supervisor tests against a scripted fake kernel that
+models the congestion bit, a proptest model check (Ready always means the snapshot equals
+the kernel table; convergence once faults stop), Linux adapter tests, and a live-kernel
+test that forces `ENOBUFS` and checks agreement with a fresh dump.
+
 ## 2026-11-23 (issue #58: TCP MD5 never reports an unenforced key as enabled)
 
 `pathvector-sys::apply_tcp_md5sig` returned `Ok(())` when the kernel rejected
@@ -140,6 +175,111 @@ required key cannot be enforced now logs the peer and reason at `error` level (t
 session loop only reports `TcpFailed`), proven through a spawned session.
 
 Not in scope: inbound listener keys (#66), exact UAPI struct layout (#60), IPv6 MD5.
+
+## 2026-11-23 (issue #57: negative kernel routes decide reachability)
+
+`pathvector-sys`'s FIB snapshot ignored every non-unicast route for reachability, so with a unicast
+default route and a more-specific `blackhole`, `unreachable`, `prohibit` or `throw`
+route the oracle fell back to the default and reported the destination reachable, and
+BGP could pick a next hop the kernel deliberately cannot forward to. Confirmed on a live
+kernel: beneath a blackhole the old snapshot said reachable while `RTM_GETROUTE` (what
+`ip route get` sends) failed with `EINVAL`.
+
+Linux selects the route first and only then looks at its type: `fib_table_lookup`
+returns the selected alias's `fib_props` error without backtracking to a shorter prefix,
+and `fib6_table_lookup` backtracks only when a node yields no route. The snapshot now
+tracks the four negative types (non-BGP; `KernelRouteV4` / `KernelRouteV6::route_kind`
+gives the typed `RouteKind`; the type is part of the IPv4 alias identity, not the IPv6
+one, as in the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
+`NoRoute`). Only `Forward` counts as reachable or yields an IGP metric. A `throw` is
+reported as no route in the mirrored table, since policy rules are not modelled. New
+public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
+`RejectKind`, `RoutePreference`; `route_to_v4` / `route_to_v6` now return only
+forwarding routes.
+
+Review follow-up (Codex on PR #123, both reproduced on a live kernel): IPv6 selection
+ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`) before
+list order, so a high-preference unicast route is not hidden by an earlier blackhole;
+and `is_v6_reachable` applies its link-local fallback only when no route covers the
+address, so a negative route over link-local space is honoured. Built on #122's
+full-table mirror: negative routes were already mirrored there, as untracked hashes;
+they are now tracked, and a tracked entry keeps its typed `RouteKind`. Proof:
+domain and property tests (the reference model now includes route types), netlink
+adapter tests, and live-kernel tests that compare every verdict with the kernel's own
+lookup.
+
+## 2026-11-23 (PR #122 review round 3: unreported IPv6 siblings inherit the protocol)
+
+Round 2 counted every IPv6 ECMP sibling whose protocol the kernel did not report as an
+IGP path. Review showed that this lets an **all-BGP** ECMP set supply IGP reachability
+after a restart: live events reported both BGP routes and gave no path, but a fresh
+dump gave `Some(10)`. So restarting changed next-hop eligibility with no FIB change.
+
+The kernel's dump of a BGP-first static+BGP set is byte-for-byte the same as an all-BGP
+set (now checked by a live test), so no decoder can be right for both. The policy is now
+explicit: an unreported sibling takes the described sibling's protocol, marked with the
+new `KernelRouteV6::protocol_inferred` flag (`protocol` is a plain `u8` again), and a
+message reporting the real protocol replaces the inference. This is exact for every
+single-protocol set. Only mixed-protocol sets learned from a dump can be misclassified,
+documented in the crate README with both directions. Live tests: all-BGP set live vs.
+after a dump (fails on the previous commit), and the byte-identity check.
+
+## 2026-11-23 (PR #122 review round 2: IPv6 ECMP siblings are dumped once)
+
+The round-1 fix assumed every IPv6 ECMP sibling gets its own dump message, and kept
+non-leading legs unused until one arrived. That was wrong: `fib6_dump_node` dumps a
+sibling set once, as one `RTA_MULTIPATH` message, then jumps past the siblings ("no need
+to dump the sibling routes again"). An ordinary all-static ECMP set therefore lost its
+second path: after deleting the first route the prefix read as unreachable although the
+kernel still had the second. With BGP added first, the static sibling was missed straight
+after the dump. Both were reproduced on a live kernel.
+
+`KernelRouteV6::protocol` is now `Option<u8>`. `None` means no message has described the
+route (a sibling seen only as a leg), and such a route counts as a path. (Superseded by
+round 3 above: that also admitted all-BGP sets.)
+Two new live-kernel tests (all-static set, BGP-first mixed set) fail on the previous
+commit and pass now; the adapter test that simulated per-sibling dump messages now uses
+the single aggregate message the kernel actually sends.
+
+## 2026-11-23 (PR #122 review: untracked routes in a slot or ECMP set)
+
+Review found two cases where routes the snapshot does not use for reachability still
+mattered, both reproduced on a live kernel. (1) An IPv6 ECMP set mixing a static and a
+BGP route: `rt6_fill_node` reports the set under one route's protocol, so the BGP leg
+was recorded as static, its delete was then ignored, and the prefix stayed reachable
+after both routes were gone. (2) A BGP alias prepended ahead of a static alias: an
+`NLM_F_REPLACE` of the BGP alias removed the static alias from the snapshot, because the
+mirror did not know the BGP alias was first.
+
+The snapshot now mirrors every route in the tracked table and applies the tracking rule
+(unicast, not BGP) at lookup time. Untracked routes are stored as an identity hash, so
+the cost is about 86 MB per million kernel BGP routes; inserts and deletes are now
+hashed. An IPv6 multipath message's first leg is described by its header; other legs
+not yet seen take the header's protocol only for a create/replace (same request). (The
+handling of the remaining legs was corrected in round 2 above.) Mutations report a change exactly when the
+tracked routes change. Proof: property tests against a kernel slot-list model including
+untracked routes and replaces, adapter tests, and two new live-kernel tests that fail on
+the previous commit.
+
+## 2026-11-23 (issue #56: FIB snapshot keeps every route for a prefix)
+
+`pathvector-sys`'s `FibSnapshot` identified kernel routes by prefix alone. Adding a
+metric-100 route after a metric-10 route for the same prefix overwrote the snapshot
+entry with metric 100; deleting either route removed the prefix even though the other
+was still in the kernel; and a dump that listed both could select metric 100. Confirmed
+on a live kernel in a network namespace: after `add metric 10`, `add metric 100`, the
+old snapshot reported 100, and after deleting the 100 route it reported the prefix as
+unreachable.
+
+The snapshot now mirrors routes under the identity Linux uses (`fib_table_insert` /
+`fib6_add_rt2node`): table, prefix, IPv4 TOS or IPv6 source prefix, priority, and next
+hop, with IPv6 ECMP siblings stored separately. `RTM_DELROUTE` removes exactly the named
+route; `NLM_F_REPLACE` notifications displace the replaced route; lookups take the
+longest prefix and then the lowest priority. New validated types: `Ipv4Prefix`,
+`Ipv6Prefix`, `TableId`, `KernelRouteV4`, `KernelRouteV6`. The public `FibEntry4` /
+`FibEntry6` types are removed (nothing outside the crate used them). Proof: domain unit
+and property tests against an independent reference model, netlink adapter tests, and
+live-kernel tests run in a network namespace in CI.
 
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 

@@ -1904,6 +1904,7 @@ dependencies = [
  "netlink-packet-route",
  "proptest",
  "rtnetlink",
+ "smallvec",
  "tokio",
 ]
 

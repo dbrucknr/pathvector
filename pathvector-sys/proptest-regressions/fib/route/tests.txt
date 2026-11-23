@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ab9995a07730ded7ebaaae314c96215174ede0c169c82ece2de18d3ff9b7a279 # shrinks to ops = [Replace(KernelRouteV6 { slot: RouteSlotV6 { table: TableId(254), dst: Ipv6Prefix { addr: 2001:db8::, len: 32 }, src: Ipv6Prefix { addr: ::, len: 0 }, priority: 1 }, kind: 1, protocol: 186, next_hop: Path(NextHopPath { gateway: Some(fe80::1), oif: Some(1) }) }), Add { route: KernelRouteV6 { slot: RouteSlotV6 { table: TableId(254), dst: Ipv6Prefix { addr: 2001:db8::, len: 32 }, src: Ipv6Prefix { addr: ::, len: 0 }, priority: 1 }, kind: 1, protocol: 4, next_hop: Path(NextHopPath { gateway: Some(fe80::3), oif: Some(1) }) }, front: false }, Replace(KernelRouteV6 { slot: RouteSlotV6 { table: TableId(254), dst: Ipv6Prefix { addr: 2001:db8::, len: 32 }, src: Ipv6Prefix { addr: ::, len: 0 }, priority: 1 }, kind: 1, protocol: 4, next_hop: Path(NextHopPath { gateway: Some(fe80::3), oif: Some(1) }) })]

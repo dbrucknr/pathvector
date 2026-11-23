@@ -213,6 +213,97 @@ cross-platform (they pass on macOS and Linux alike).
 | Every byte string of 1–80 bytes is a `TcpMd5Key`, byte for byte | RFC 2385 §2.0 leaves the key's form open; Linux stores it as binary |
 | Every byte string over 80 bytes is rejected with `TooLong { len }` | `TCP_MD5SIG_MAXKEYLEN`; the kernel would return `EINVAL` |
 
+#### Kernel FIB route identity and negative routes (issues #56, #57)
+
+The FIB snapshot mirrors kernel routes under their full Linux identity, not just
+their prefix, and uses negative routes (blackhole, unreachable, prohibit, throw) for
+reachability. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
+platform and compare the mirror against a model of the kernel's slot lists written
+directly from `fib_table_insert` / `fib_table_delete` and `fib6_add_rt2node` / `fib6_del`,
+and against a reference lookup written from the kernel's lookup rule:
+
+| Invariant | Why it matters |
+|---|---|
+| After any sequence of adds (front/back), replaces and deletes of tracked *and* untracked (BGP, blackhole) routes, every slot holds the kernel model's routes in the kernel model's order | A backup route must not overwrite the primary, a delete must remove only the named route, and a replace must displace the route the kernel displaced, even when that is an untracked BGP alias |
+| The tracked routes and every lookup equal the model's: the reference picks the exact route (longest prefix, lowest priority, lowest table, then for IPv6 the highest router preference, then kernel order) from the model's slot lists, and the outcome (`Forward` / `Reject` / `Throw` / `NoRoute`) follows from that route's `rtm_type` alone | Wrong IGP metrics and spurious (un)reachability; a negative route beneath a covering route must not fall through to it (`fib_table_lookup` returns the selected alias's `fib_props` error) |
+| Each mutation reports a change exactly when the tracked routes changed | BGP churn must not wake the decision process; IGP changes must |
+| Lookups do not depend on load (dump) order | Dump and incremental state must agree |
+| `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
+
+The netlink adapter's tests (`linux.rs`, Linux only) cover decoding (route type and
+`RTA_PREF` included), the tracking rule (negative routes tracked; BGP and `local`-type
+routes not), `NLM_F_REPLACE` / `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
+`pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
+and 100 in both orders, for both families, incrementally and through the initial dump.
+They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
+learned from the initial dump (which reports a set only once), an all-BGP ECMP set
+that must give no IGP path both live and after a dump, a check that the kernel dumps a
+BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
+policy), and a BGP alias prepended ahead of a static alias and then replaced. For #57 they compare the oracle's
+verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
+`ip route get` sends) for each negative type beneath a covering route, its deletion,
+`ip route replace <type>` over a unicast route, an initial dump with mixed metrics and a
+unicast route inside a throw prefix, IPv6 router preference between negative and
+unicast routes of one metric, and negative routes over link-local space; the expected
+errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and `ENETUNREACH`. For #59 a burst of
+notifications lost to `ENOBUFS` must be recovered by a resync. The tests run in
+parallel in one namespace, so each uses its own prefixes and interfaces (prefixed
+`pvtest`) and none adds a real default route.
+
+#### Kernel FIB recovery after netlink loss (issue #59)
+
+The supervisor that keeps the snapshot in step with the kernel is platform-independent
+and talks to the kernel through a port (`RouteSource` / `RouteFeed`), so
+`pathvector-sys/src/fib/supervisor/tests.rs` drives it on every platform with a scripted
+fake kernel under paused tokio time (every backoff is exact). The fake reproduces how
+each fault surfaces according to netlink(7), `net/netlink/af_netlink.c` and
+`netlink-proto` 0.12: a full buffer starts a congestion episode with one `Overrun` and
+then drops every notification until the reader empties the queue; a terminated
+connection ends the feed; a dump can fail, stop without `NLMSG_DONE`, carry
+`NLM_F_DUMP_INTR`, race a change, or skip an unchanged route the way `fib6_dump_table`
+does after a tree change.
+
+| Invariant | Why it matters |
+|---|---|
+| Whenever the status is `Ready`, the snapshot equals the kernel's table (proptest over any history of changes and faults, checked at every quiescent point) | `Ready` is what callers trust; it must never be claimed after a loss |
+| Once faults stop, the status returns to `Ready` and the snapshot equals a fresh dump | Recovery is automatic and complete |
+| An overrun, a closed connection, a failed / cut-short / interrupted / racing dump each produce the matching `DegradedCause` | Degradation is observable, with the reason |
+| A cut-short dump or an attempt hit by an overrun is never installed; lookups during a resync see the previous snapshot | No partial or empty snapshot is ever visible |
+| A channel that never runs dry cannot delay a finished dump, the dump deadline, or other tasks on the thread (the dump and the deadline are polled before each notification, the deadline is also checked against the clock, and the supervisor yields cooperatively) | tokio's `biased` select starves later branches, and the notification channel is outside tokio's cooperative budget |
+| An overrun while a dump is pending abandons it and replaces the socket (no dump is retried on it: the fake answers `EBUSY` like `__netlink_dump_start`); a dump that never answers hits its deadline | A dump `netlink_dump` stopped with `-ENOBUFS` would otherwise block recovery forever |
+| Notifications for the other family during a dump are not inconsistencies, and later ones are applied to the fresh snapshot | Exactly the changes a dump cannot show are replayed |
+| Retry delays are `initial · 2ⁿ` capped at the maximum; a burst of overruns costs one resync; a quiet period resets the sequence | Bounded recovery without redumping on every transient |
+| Only the first failed connect is returned to the caller | Later failures are retried, not fatal |
+
+The detection and replay rules were checked by mutation (same-family inconsistency,
+`NLM_F_DUMP_INTR`, which notifications are replayed, overruns while following, overruns
+during a dump, reconnecting after abandoning a dump, the dump deadline, polling order and
+cooperative yielding under a busy channel, the drain cap): removing
+any one makes at least one of these tests fail. The Linux adapter tests (`linux.rs`)
+cover the dump reader (complete only with `NLMSG_DONE`; `NLM_F_DUMP_INTR` on any reply; errors in `NLMSG_ERROR` and
+`NLMSG_DONE`) and message classification (overrun, new/delete with header flags, other
+families ignored). The live test `notifications_lost_to_enobufs_are_recovered_by_a_resync`
+in `kernel_fib_netns.rs` blocks its single-threaded runtime while another thread adds
+1000 routes, so the kernel really drops notifications; the snapshot must count the loss,
+resync, and then equal a fresh dump. The same scenario fails against the code before the
+fix.
+
+They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
+namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
+
+```bash
+cargo test -p pathvector-sys --test kernel_fib_netns --no-run   # prints the binary path
+sudo unshare --net -- <binary> --ignored
+```
+
+or from macOS via Docker:
+
+```bash
+docker run --rm --network none --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 -v "$PWD":/src -w /src rust:1.88 \
+  cargo test -p pathvector-sys --test kernel_fib_netns -- --ignored
+```
+
 ---
 
 ## Fuzz testing
