@@ -106,13 +106,10 @@ land in `--work-dir` (default `target/loadtest`).
   real management client; on a loaded table it is not free (see the PR-1
   findings in `CHANGELOG.md`). Treat it as a realistic background client,
   not a zero-cost observer.
-- **Daemon metrics are unreliable under load** (found by this harness). The
-  event loop calls its metrics hooks (`on_route_update`,
-  `on_session_established`, `on_session_terminated`) only for the *first*
-  event of each coalesced batch, not for the events its drain loop pulls in
-  behind it. So `pathvectord_bgp_adj_rib_in_prefixes` and
-  `updates_received_total` undercount, and — worse — a coalesced Terminated
-  event leaves `pathvectord_bgp_session_up` stuck at 1 for a peer that is
-  gone. The harness therefore settles on Loc-RIB size and reads per-peer
-  state over gRPC, and prints a `METRIC DISCREPANCY` note when the gauge and
-  the daemon's own state disagree.
+- **Daemon metrics were unreliable under load** (found by this harness; fixed
+  in GH #105). The event loop used to call its metrics hooks only for the first
+  event of each coalesced batch, so gauges went stale and `session_up` could
+  stick at 1. The harness still settles on Loc-RIB size and reads per-peer
+  state over gRPC rather than trusting a single gauge, and it prints a
+  `METRIC DISCREPANCY` note whenever a gauge disagrees with the daemon's own
+  state, so a regression is visible.

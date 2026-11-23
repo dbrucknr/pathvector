@@ -113,6 +113,25 @@ impl Ctx {
         c.get_peer(addr).await.map_err(|e| e.to_string())
     }
 
+    /// Cross-checks the `pathvectord_bgp_session_up` gauge against reality.
+    /// Returns a `METRIC DISCREPANCY` note if it disagrees with `expect_up`.
+    /// Guards against GH #105: the gauge used to stay stale when the
+    /// Established/Terminated event was coalesced into a batch.
+    async fn session_up_cross_check(&self, i: usize, expect_up: bool) -> Res<Vec<String>> {
+        let ip = self.loader_ip(i);
+        let (_, snap) = self.monitor.scrape().await.map_err(|e| e.to_string())?;
+        let got = snap.value("pathvectord_bgp_session_up", &[("peer", &ip)]);
+        let want = if expect_up { 1.0 } else { 0.0 };
+        Ok(if got == Some(want) {
+            Vec::new()
+        } else {
+            vec![format!(
+                "METRIC DISCREPANCY loader{i}: pathvectord_bgp_session_up is {got:?} but the session is {}",
+                if expect_up { "up" } else { "down" }
+            )]
+        })
+    }
+
     /// Waits until the daemon reports loader `i`'s session as not Established.
     async fn wait_peer_idle(&self, i: usize) -> Res<()> {
         let start = Instant::now();
@@ -499,12 +518,14 @@ pub async fn teardown(ctx: &mut Ctx) -> Res<WindowReport> {
     ctx.wait_daemon_quiet(&w.before, Duration::from_millis(1000))
         .await?;
     let took = started.elapsed();
+    let mut notes = vec![format!(
+        "daemon finished processing the teardown within {took:.2?} of the TCP close (includes 1s of required quiet)"
+    )];
+    notes.extend(ctx.session_up_cross_check(0, false).await?);
     ctx.finish(
         w,
         &format!("peer teardown (loader0, {held} prefixes)"),
-        vec![format!(
-            "daemon finished processing the teardown within {took:.2?} of the TCP close (includes 1s of required quiet)"
-        )],
+        notes,
     )
     .await
 }
@@ -534,6 +555,7 @@ pub async fn reconverge(ctx: &mut Ctx) -> Res<WindowReport> {
     if held != ctx.want_prefixes() {
         notes.push("MISMATCH: reconverged table differs from the original convergence".to_string());
     }
+    notes.extend(ctx.session_up_cross_check(0, true).await?);
     ctx.finish(
         w,
         "reconvergence (loader0 re-announces into an existing table)",

@@ -4,6 +4,39 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (GH #105: metrics hooks now run for every event the event loop coalesces)
+
+`run_event_loop` coalesces every event already queued behind the first into one
+write-lock hold, but called its metrics hooks only for the first. The drain
+loop handled Established, Terminated and RouteUpdate events without them, so
+under load `pathvectord_bgp_session_up` could stay at 1 for a peer that was
+gone, `sessions_established_total` / `sessions_terminated_total` /
+`updates_received_total` undercounted, and `adj_rib_in_prefixes` was stale
+(read 785,254 against a true 1,133,510).
+
+- The coalesced Established, Terminated and RouteUpdate arms now call the same
+  hooks as the first-event arm, in the same order (Terminated records the
+  reason before `on_terminated` consumes it).
+- The first-event Terminated arm `continue`s before the end-of-batch gauge
+  refresh, so `pathvectord_bgp_loc_rib_prefixes` stayed at its pre-teardown
+  value; it now refreshes the RIB-size gauges before returning.
+- Three regression tests drive queued events through `run_event_loop` with a
+  recording metrics recorder; each was confirmed to fail on the old code for
+  the reported reason (`session_up` stuck at 1, no series for a coalesced
+  Established, no Loc-RIB gauge after a first-event teardown).
+- End to end: five full-table `pathvector-loadtest` runs (converge, churn,
+  teardown, reconverge; 1,133,510 prefixes) show no `METRIC DISCREPANCY`, where
+  every convergence previously did and ~3 in 10 teardown checks hit the stuck
+  `session_up`. The harness's teardown and reconverge scenarios now cross-check
+  `session_up` so a regression is flagged. Convergence write-lock totals were
+  3.25-3.52 s versus 3.1-3.7 s before: the per-event hooks add no measurable
+  cost.
+
+**Same root cause, not fixed here:** the coalesced Terminated arm also never
+sends `SessionCommand::SetCapabilities` (the RFC 4724 §3 R-bit refresh the
+first-event arm performs). Two hand-copied versions of the per-event handling
+will keep drifting; that is a protocol-behaviour question, tracked separately.
+
 ## 2026-11-23 (PR-1 load harness `pathvector-loadtest` + first full-table measurements)
 
 New crate `pathvector-loadtest` (binary `loadtest`, `just loadtest`): spawns a
@@ -40,7 +73,7 @@ stayed at 3.0–3.2 s in every window; it never approached the 9 s hold time.
   ≤ 25 ms and flat RSS. Cause inferred from the code path plus those two
   signatures, not isolated with a profiler. `watch_routes` snapshots do not
   have this effect on hold time (they cost ~760 MiB of RSS instead).
-- **Daemon metrics bug, found by this harness (unfixed).** The event loop
+- **Daemon metrics bug, found by this harness (fixed — see the entry above).** The event loop
   calls `on_route_update`, `on_session_established` and
   `on_session_terminated` only for the first event of each coalesced batch;
   its drain loop handles the same events without them. Observed: the
