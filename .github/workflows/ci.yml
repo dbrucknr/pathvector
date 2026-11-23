@@ -50,7 +50,10 @@ jobs:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not @stable): clippy::pedantic + -D warnings means every new
+      # stable release's lints would otherwise fail all open PRs with no code
+      # change. Bump deliberately, fixing any new findings in the same PR.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -90,7 +93,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not @stable): clippy::pedantic + -D warnings means every new
+      # stable release's lints would otherwise fail all open PRs with no code
+      # change. Bump deliberately, fixing any new findings in the same PR.
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -113,7 +119,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not @stable): clippy::pedantic + -D warnings means every new
+      # stable release's lints would otherwise fail all open PRs with no code
+      # change. Bump deliberately, fixing any new findings in the same PR.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
