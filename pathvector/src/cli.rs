@@ -143,8 +143,15 @@ pub enum PeerCommands {
         #[arg(long, value_name = "accept|reject")]
         export_default: Option<Decision>,
 
-        /// RFC 2385 TCP MD5 authentication password.
-        #[arg(long, value_name = "PASSWORD")]
+        /// RFC 2385 TCP MD5 authentication password (1–80 bytes).
+        ///
+        /// An empty value is an error: it would otherwise add the peer
+        /// without authentication.
+        #[arg(
+            long,
+            value_name = "PASSWORD",
+            value_parser = clap::builder::NonEmptyStringValueParser::new()
+        )]
         md5_password: Option<String>,
     },
 
@@ -408,6 +415,25 @@ mod tests {
         } else {
             panic!("expected peer add");
         }
+    }
+
+    /// `--md5-password ""` must not parse: an empty key would reach the daemon
+    /// as proto3's unset string and add the peer without TCP MD5.
+    #[test]
+    fn peer_add_rejects_empty_md5_password() {
+        let err = Cli::try_parse_from([
+            "pathvector",
+            "peer",
+            "add",
+            "--address",
+            "10.0.0.3",
+            "--remote-as",
+            "65003",
+            "--md5-password",
+            "",
+        ])
+        .expect_err("empty --md5-password must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

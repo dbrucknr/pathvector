@@ -100,6 +100,7 @@ remote_as = 65001
 | `metrics_port` | `u16` | — | TCP port for the Prometheus `/metrics` scrape endpoint. Omit to disable. Conventional value: `9179` |
 | `graceful_restart_time` | `u16` | `0` | Seconds peers should hold our routes after an unclean session loss (RFC 4724 §3). `0` disables forwarding-state advertisement — peers withdraw our routes immediately. See [Graceful Restart](#graceful-restart-rfc-4724) |
 | `restarting` | `bool` | `false` | Set to `true` when restarting pathvectord mid-session to signal the RFC 4724 Restart State (R) bit, so peers stop their stale-route timers as soon as the session re-establishes. Remove after restart. Ignored when `graceful_restart_time = 0` |
+| `tcp_md5_enforcement` | `"required"` \| `"best-effort"` | `"required"` | What to do when a peer has `md5_password` but this host cannot enforce TCP MD5 (kernel without `CONFIG_TCP_MD5SIG`, non-Linux, IPv6 peer). `"required"` refuses to connect; `"best-effort"` connects **unauthenticated** and logs a warning. See [TCP MD5 authentication](#tcp-md5-authentication-rfc-2385) |
 
 ### `[[peers]]` fields
 
@@ -110,7 +111,7 @@ remote_as = 65001
 | `port` | `u16` | `179` | TCP port to connect to |
 | `import_default` | `"accept"` \| `"reject"` | eBGP: `"reject"`, iBGP: `"accept"` | What to do with routes that don't match any import policy term. eBGP defaults to reject per RFC 8212 |
 | `export_default` | `"accept"` \| `"reject"` | eBGP: `"reject"`, iBGP: `"accept"` | What to do with routes that don't match any export policy term |
-| `md5_password` | `string` | — | TCP MD5SIG authentication password (RFC 2385). Both sides must use the same password. Linux only; see note below |
+| `md5_password` | `string` | — | TCP MD5SIG authentication password (RFC 2385), 1–80 bytes; an empty or longer value is a config error. Both sides must use the same password. Linux only; see note below |
 
 ### Full example
 
@@ -452,7 +453,7 @@ daemon. Other sessions are never interrupted.
 | `port` | — | TCP port; defaults to 179 |
 | `import_default` | — | `POLICY_ACTION_ACCEPT` or `POLICY_ACTION_REJECT`; defaults to RFC 8212 (reject for eBGP, accept for iBGP) |
 | `export_default` | — | Same semantics as `import_default` |
-| `md5_password` | — | RFC 2385 TCP MD5 authentication key; omit for no MD5 |
+| `md5_password` | — | RFC 2385 TCP MD5 authentication key, 1–80 bytes (longer → `INVALID_ARGUMENT`). Empty or omitted means no MD5, because proto3 cannot tell an empty string from an unset one; `pathvector-client` and the CLI reject `Some("")` / `--md5-password ""` for that reason |
 
 `AddPeer` is idempotent — calling it for an already-configured peer is a no-op.
 `RemovePeer` returns `NOT_FOUND` if the address is not a configured peer.
@@ -849,26 +850,45 @@ GoBGP:
     auth-password    = "shared-bgp-secret"
 ```
 
-**Platform notes:**
-- **Linux (native):** enforced at the kernel level. Requires `CAP_NET_ADMIN`. A key
-  mismatch causes the TCP SYN to be silently dropped — the session will never establish.
-- **Linux in Docker Desktop (macOS):** Docker Desktop's embedded kernel is built without
-  `CONFIG_TCP_MD5SIG`. `setsockopt(TCP_MD5SIG)` returns `ENOPROTOOPT`, which pathvectord
-  treats as non-fatal — the session still establishes but without enforcement.
-- **macOS native:** no-op; the `#[cfg(target_os = "linux")]` block is not compiled.
-  Sessions always establish regardless of `md5_password`.
-- **IPv6 peers:** not yet implemented. Configuring `md5_password` on an IPv6 peer
-  returns an error and the session will not start.
+**Enforcement.** pathvectord only connects to a peer with `md5_password` once the kernel
+has accepted the key, because a configured key must protect every segment (RFC 5925 §8:
+"it must be added to all outgoing segments and validated on all incoming segments").
+When the host cannot enforce the key, the session does not connect and each attempt logs
+`refusing to connect to <peer>: TCP MD5 is required but cannot be enforced: <reason>`.
 
-**Dynamic peer limitation:** the BGP listener socket is bound once at daemon startup.
-Adding a peer with `md5_password` via the `AddPeer` gRPC API only installs the MD5 key
-on pathvectord's *outbound* TCP socket (the one used when pathvectord dials the peer).
-The inbound listener socket is not re-keyed, so if the remote peer initiates the TCP
-connection toward pathvectord, the kernel will reject the handshake because no key is
-registered for that source address. Statically configured peers in `pathvectord.toml`
-do not have this limitation — their keys are installed before the listener starts.
-A full fix requires re-binding the listener socket on each MD5-capable peer add, which
-is tracked in TODO.md.
+For development hosts that cannot enforce TCP MD5 you can opt out explicitly:
+
+```toml
+[daemon]
+tcp_md5_enforcement = "best-effort"   # development only
+```
+
+With `"best-effort"`, pathvectord logs a warning at startup for every peer with
+`md5_password`, and on every connection attempt that goes ahead unauthenticated
+(`TCP MD5 key configured but NOT enforced (...)`). Real `setsockopt` failures
+(for example `ENOBUFS`) still fail the connection.
+
+**Platform notes:**
+- **Linux (native):** enforced by the kernel (no capability is needed to set the key).
+  A key mismatch causes the TCP SYN to be silently dropped — the session will never
+  establish.
+- **Linux in Docker Desktop (macOS):** Docker Desktop's `LinuxKit` kernel is built
+  without `CONFIG_TCP_MD5SIG`, so `setsockopt(TCP_MD5SIG)` returns `ENOPROTOOPT`.
+  The session does not connect unless `tcp_md5_enforcement = "best-effort"`.
+- **macOS native:** no TCP MD5 support in pathvectord; same as above.
+- **IPv6 peers:** not yet implemented; same as above.
+
+**Dynamic-peer sidecar:** an entry in `dynamic_peers.toml` with an invalid
+`md5_password` (empty or over 80 bytes, which older versions accepted) is logged and
+skipped at startup but kept in the file so you can fix it; other peers still load. If the
+file is not valid TOML at all, no dynamic peers load and pathvectord will not overwrite it
+until it is fixed or removed. Config errors report the line number without quoting it, so
+passwords never reach the logs.
+
+**Inbound connections:** keys are currently installed only on the outbound socket
+pathvectord uses to dial the peer. The BGP listener does not install keys yet, for static
+or dynamic peers (issue #66), so do not rely on TCP MD5 to protect connections the peer
+initiates.
 
 ---
 
@@ -953,7 +973,7 @@ INFO removing stale BGP routes v4=42 v6=0
 | Peer stuck in Idle/Active after start | pathvectord started before the peer was listening | Wait for the 120s `ConnectRetry` timer, or restart pathvectord after the peer is up |
 | `unknown service pathvector.v1.PeerService` | CLI is hitting GoBGP's gRPC (port 50051) | Pass `--address http://127.0.0.1:50052` |
 | MD5 session stuck in Active (Linux) | Key mismatch — kernel drops SYN | Verify both sides use the same `md5_password` / `auth-password` |
-| MD5 session establishes despite wrong key (macOS Docker) | No `CONFIG_TCP_MD5SIG` | Expected — test enforcement on native Linux |
+| MD5 peer never connects; log says `TCP MD5 is required but cannot be enforced` | Kernel without `CONFIG_TCP_MD5SIG` (e.g. Docker Desktop), macOS, or IPv6 peer | Run on native Linux, or set `[daemon] tcp_md5_enforcement = "best-effort"` for development |
 
 ---
 
