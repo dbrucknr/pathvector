@@ -204,7 +204,8 @@ mod route;
 pub(crate) use route::RouteList;
 pub use route::{
     FibLookup, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg, NextHopPath,
-    NextHopV4, NextHopV6, PrefixError, RejectKind, RouteKind, RouteSlotV4, RouteSlotV6, TableId,
+    NextHopV4, NextHopV6, PrefixError, RejectKind, RouteKind, RoutePreference, RouteSlotV4,
+    RouteSlotV6, TableId,
 };
 
 /// Returns `true` if `addr` is a link-local IPv6 address (`fe80::/10`).
@@ -314,15 +315,20 @@ impl FibSnapshot {
 
     /// Returns `true` if the lookup for `addr` ends in a unicast IPv6 route.
     ///
-    /// Link-local addresses (`fe80::/10`) are always considered reachable —
-    /// they are on-link by definition and do not appear in the main routing
-    /// table, so LPM would incorrectly return false for them.
+    /// A link-local address (`fe80::/10`) that no route covers is considered
+    /// reachable: it is on-link by definition, and this lookup has no output
+    /// interface to find the per-interface `fe80::/64` route with. The
+    /// fallback applies only when the lookup finds **no** route. A negative
+    /// route that covers the address is honoured like anywhere else, since the
+    /// kernel rejects that traffic too (`RTM_GETROUTE` for an address beneath
+    /// a `prohibit` route answers `EACCES`).
     #[must_use]
     pub fn is_v6_reachable(&self, addr: Ipv6Addr) -> bool {
-        if is_link_local_v6(addr) {
-            return true;
+        match self.lookup_v6(addr) {
+            FibLookup::Forward(_) => true,
+            FibLookup::Reject { .. } | FibLookup::Throw(_) => false,
+            FibLookup::NoRoute => is_link_local_v6(addr),
         }
-        self.lookup_v6(addr).is_reachable()
     }
 
     /// Returns the priority of the unicast IPv6 route the kernel would use for
@@ -668,6 +674,7 @@ mod tests {
             },
             kind: RouteKind::Unicast,
             protocol: 3,
+            preference: RoutePreference::Medium,
             next_hop: NextHopV6::Path(NextHopPath {
                 gateway: None,
                 oif: None,
@@ -787,7 +794,7 @@ mod tests {
     // ── FibSnapshot IPv6 reachability ─────────────────────────────────────────
 
     #[test]
-    fn ipv6_link_local_is_always_reachable() {
+    fn ipv6_link_local_without_a_route_is_reachable() {
         // fe80::/10 addresses are on-link — reachable even with an empty snapshot.
         let snap = FibSnapshot::new();
         assert!(snap.is_v6_reachable("fe80::1".parse().unwrap()));
@@ -847,9 +854,16 @@ mod tests {
         }
     }
 
+    /// A negative IPv6 route as the kernel reports it: on the loopback device
+    /// (ifindex 1), which also keeps it distinct from [`r6`]'s device-less
+    /// unicast route under `rt6_duplicate_nexthop`.
     fn neg6(network: &str, prefix_len: u8, metric: u32, kind: RouteKind) -> KernelRouteV6 {
         KernelRouteV6 {
             kind,
+            next_hop: NextHopV6::Path(NextHopPath {
+                gateway: None,
+                oif: std::num::NonZeroU32::new(1),
+            }),
             ..r6(network, prefix_len, metric)
         }
     }
@@ -960,6 +974,102 @@ mod tests {
                 Some(50)
             );
             assert!(!snap.is_v6_reachable("2001:db8:2::9".parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn ipv6_negative_route_over_link_local_space_is_honoured() {
+        // The link-local fallback is for "no route", not for a route that
+        // rejects: RTM_GETROUTE for an address beneath a prohibit route
+        // answers EACCES (checked against the kernel in kernel_fib_netns.rs).
+        let covered: Ipv6Addr = "fe80:1234::1".parse().unwrap();
+        let other: Ipv6Addr = "fe80::1".parse().unwrap();
+        for kind in NEGATIVE_KINDS {
+            let neg = neg6("fe80:1234::", 64, 100, kind);
+            let mut snap = FibSnapshot::new();
+            snap.v6.insert_back(neg.clone());
+            assert!(!snap.is_v6_reachable(covered), "{kind:?}");
+            assert_negative(snap.lookup_v6(covered), &neg, kind);
+            assert!(
+                snap.is_v6_reachable(other),
+                "{kind:?}: uncovered link-local"
+            );
+
+            let (fib, _rx) = KernelFib::new(RT_TABLE_MAIN);
+            let oracle = fib.oracle();
+            fib.shared
+                .snapshot
+                .write()
+                .unwrap()
+                .v6
+                .insert_back(neg.clone());
+            assert!(
+                !oracle.is_v6_reachable(covered),
+                "{kind:?} via KernelOracle"
+            );
+            assert!(oracle.is_v6_reachable(other));
+            fib.shared.snapshot.write().unwrap().v6.remove(&neg);
+            assert!(
+                oracle.is_v6_reachable(covered),
+                "{kind:?} removed: fallback again"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_route_preference_ranks_routes_of_one_metric() {
+        // rt6_score_route adds IPV6_DECODE_PREF(pref) << 2 ("1:low,2:med,
+        // 3:high") and find_match keeps only a strictly better score, so a
+        // higher preference beats list order within the lowest-metric group,
+        // whatever the route types.
+        let addr: Ipv6Addr = "2001:db8:1::7".parse().unwrap();
+        let blackhole = RouteKind::Reject(RejectKind::Blackhole);
+        let with_pref = |mut r: KernelRouteV6, preference| {
+            r.preference = preference;
+            r
+        };
+        // Negative routes are always medium: ip6_route_info_create overwrites
+        // their fib6_flags, dropping RTF_PREF.
+        let cases = [
+            // (first, second, reachable)
+            (
+                neg6("2001:db8:1::", 64, 100, blackhole),
+                with_pref(r6("2001:db8:1::", 64, 100), RoutePreference::High),
+                true,
+            ),
+            (
+                with_pref(r6("2001:db8:1::", 64, 100), RoutePreference::Low),
+                neg6("2001:db8:1::", 64, 100, blackhole),
+                false,
+            ),
+            // Equal preference: list order (the earlier route).
+            (
+                neg6("2001:db8:1::", 64, 100, blackhole),
+                r6("2001:db8:1::", 64, 100),
+                false,
+            ),
+            (
+                r6("2001:db8:1::", 64, 100),
+                neg6("2001:db8:1::", 64, 100, blackhole),
+                true,
+            ),
+            // A lower metric beats any preference: preference only ranks
+            // routes within one metric group.
+            (
+                neg6("2001:db8:1::", 64, 10, blackhole),
+                with_pref(r6("2001:db8:1::", 64, 100), RoutePreference::High),
+                false,
+            ),
+        ];
+        for (first, second, reachable) in cases {
+            let mut snap = FibSnapshot::new();
+            snap.v6.insert_back(first.clone());
+            snap.v6.insert_back(second.clone());
+            assert_eq!(
+                snap.is_v6_reachable(addr),
+                reachable,
+                "{first:?} then {second:?}"
+            );
         }
     }
 

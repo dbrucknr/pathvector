@@ -67,6 +67,7 @@ fn v6(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV6 {
         },
         kind: RouteKind::Unicast,
         protocol: 3,
+        preference: RoutePreference::Medium,
         next_hop: NextHopV6::Path(via(gateway)),
     }
 }
@@ -405,6 +406,93 @@ fn ipv6_negative_routes_of_one_metric_are_one_route() {
 }
 
 #[test]
+fn route_preference_is_normalised_like_rtm_to_fib6_config() {
+    // <linux/icmpv6.h>: LOW 0x3, MEDIUM 0x0, HIGH 0x1, INVALID 0x2.
+    // rtm_to_fib6_config: "if (pref != ICMPV6_ROUTER_PREF_LOW && pref !=
+    // ICMPV6_ROUTER_PREF_HIGH) pref = ICMPV6_ROUTER_PREF_MEDIUM;"
+    assert_eq!(RoutePreference::from_rta_pref(3), RoutePreference::Low);
+    assert_eq!(RoutePreference::from_rta_pref(1), RoutePreference::High);
+    for other in [0, 2, 4, 255] {
+        assert_eq!(
+            RoutePreference::from_rta_pref(other),
+            RoutePreference::Medium
+        );
+    }
+    assert_eq!(RoutePreference::default(), RoutePreference::Medium);
+}
+
+#[test]
+fn ipv6_preference_ranks_routes_within_a_metric_group() {
+    // rt6_score_route: `m |= IPV6_DECODE_PREF(IPV6_EXTRACT_PREF(fib6_flags))
+    // << 2`; find_match keeps a route only `if (m > *mpri)`. So within the
+    // lowest-metric group the highest preference wins, and among equal
+    // preferences the first in list order. Negative routes are always medium
+    // (ip6_route_info_create overwrites their fib6_flags).
+    let bh = RouteKind::Reject(RejectKind::Blackhole);
+    let pref = |mut r: KernelRouteV6, p| {
+        r.preference = p;
+        r
+    };
+    let neg = neg6("2001:db8:1::/64", 100, bh);
+
+    // A later high-preference unicast route beats an earlier negative one.
+    let high_uni = pref(
+        v6("2001:db8:1::/64", 100, Some("fe80::1")),
+        RoutePreference::High,
+    );
+    let mut list = RouteList::default();
+    list.insert_back(neg.clone());
+    list.insert_back(high_uni.clone());
+    assert_eq!(
+        list.resolve(a6("2001:db8:1::1")),
+        FibLookup::Forward(&high_uni)
+    );
+
+    // An earlier low-preference unicast route loses to a later negative one.
+    let low_uni = pref(
+        v6("2001:db8:1::/64", 100, Some("fe80::1")),
+        RoutePreference::Low,
+    );
+    let mut list = RouteList::default();
+    list.insert_back(low_uni);
+    list.insert_back(neg.clone());
+    assert!(!list.resolve(a6("2001:db8:1::1")).is_reachable());
+
+    // Equal (medium) preference: list order.
+    let uni = v6("2001:db8:1::/64", 100, Some("fe80::1"));
+    let mut list = RouteList::default();
+    list.insert_back(uni.clone());
+    list.insert_back(neg.clone());
+    assert_eq!(list.resolve(a6("2001:db8:1::1")), FibLookup::Forward(&uni));
+
+    // Preference never crosses metric groups or prefix lengths.
+    let mut list = RouteList::default();
+    list.insert_back(high_uni.clone());
+    list.insert_back(neg6("2001:db8:1::/64", 10, bh));
+    assert!(!list.resolve(a6("2001:db8:1::1")).is_reachable());
+    let mut list = RouteList::default();
+    list.insert_back(pref(
+        v6("2001:db8::/32", 100, Some("fe80::1")),
+        RoutePreference::High,
+    ));
+    list.insert_back(neg);
+    assert!(!list.resolve(a6("2001:db8:1::1")).is_reachable());
+}
+
+#[test]
+fn ipv6_preference_is_not_part_of_the_identity() {
+    // rt6_duplicate_nexthop compares device, gateway and encap only.
+    let a = v6("2001:db8::/32", 10, Some("fe80::1"));
+    let mut b = a.clone();
+    b.preference = RoutePreference::High;
+    let mut list = RouteList::default();
+    list.insert_back(a);
+    assert!(list.contains(&b));
+    assert!(!list.insert_back(b.clone()));
+    assert!(list.remove(&b));
+}
+
+#[test]
 fn tos_and_source_specific_negative_routes_do_not_affect_best_effort_lookups() {
     // fib_table_lookup checks the DSCP before the type, so a TOS-specific
     // blackhole only drops traffic with that TOS.
@@ -683,11 +771,30 @@ fn ipv6_replace_edge_cases() {
 
 // ── Property tests ────────────────────────────────────────────────────────────
 
+/// The rank the reference rule selects by: prefix length, priority, and the
+/// IPv6 preference score.
+type Rank = (u8, u32, u8);
+
+/// `IPV6_DECODE_PREF` ("1:low,2:med,3:high"), written out independently of
+/// `RoutePreference`'s ordering.
+fn decode_pref(p: RoutePreference) -> u8 {
+    match p {
+        RoutePreference::Low => 1,
+        RoutePreference::Medium => 2,
+        RoutePreference::High => 3,
+    }
+}
+
+fn rank_of<R: MirroredRoute>(r: &R) -> Rank {
+    (r.prefix_len(), r.priority(), decode_pref(r.preference()))
+}
+
 /// Reference lookup written straight from the kernel rule, independently of
 /// `RouteList::lookup`: try prefix lengths from longest to shortest; the first
 /// length that has an eligible covering route decides, and among those routes
 /// the lowest priority wins. The route type plays no part in the selection.
-fn reference_lookup_v4(routes: &[KernelRouteV4], addr: Ipv4Addr) -> Option<(u8, u32)> {
+/// IPv4 has no preference, so the score is always medium's.
+fn reference_lookup_v4(routes: &[KernelRouteV4], addr: Ipv4Addr) -> Option<Rank> {
     let bits = u32::from(addr);
     (0..=32u8).rev().find_map(|len| {
         let net = if len == 0 { 0 } else { bits >> (32 - len) };
@@ -704,7 +811,7 @@ fn reference_lookup_v4(routes: &[KernelRouteV4], addr: Ipv4Addr) -> Option<(u8, 
             })
             .map(|r| r.slot.priority)
             .min()
-            .map(|p| (len, p))
+            .map(|p| (len, p, 2))
     })
 }
 
@@ -713,12 +820,12 @@ fn reference_lookup_v4(routes: &[KernelRouteV4], addr: Ipv4Addr) -> Option<(u8, 
 /// must be one of these kinds, and exactly it when they all agree.
 fn reference_kinds<R: MirroredRoute>(
     routes: &[R],
-    selected: Option<(u8, u32)>,
+    selected: Option<Rank>,
     addr: R::Addr,
 ) -> HashSet<RouteKind> {
     routes
         .iter()
-        .filter(|r| r.matches(addr) && selected == Some((r.prefix_len(), r.priority())))
+        .filter(|r| r.matches(addr) && selected == Some(rank_of(*r)))
         .map(MirroredRoute::kind)
         .collect()
 }
@@ -727,10 +834,10 @@ fn reference_kinds<R: MirroredRoute>(
 /// tied for selection, and reachability exactly when that kind is unicast.
 fn check_outcome<R: MirroredRoute>(
     outcome: FibLookup<'_, R>,
-    reference: Option<(u8, u32)>,
+    reference: Option<Rank>,
     kinds: &HashSet<RouteKind>,
 ) -> Result<(), TestCaseError> {
-    let got = outcome.selected().map(|r| (r.prefix_len(), r.priority()));
+    let got = outcome.selected().map(rank_of);
     prop_assert_eq!(got, reference);
     let Some(route) = outcome.selected() else {
         prop_assert!(matches!(outcome, FibLookup::NoRoute));
@@ -756,11 +863,15 @@ fn check_outcome<R: MirroredRoute>(
     Ok(())
 }
 
-fn reference_lookup_v6(routes: &[KernelRouteV6], addr: Ipv6Addr) -> Option<(u8, u32)> {
+/// IPv6 reference: the longest length with an eligible covering route; its
+/// lowest metric (the group `find_rr_leaf` starts with, moving to a higher
+/// metric only when nothing matches); within that group the highest
+/// `rt6_score_route` preference.
+fn reference_lookup_v6(routes: &[KernelRouteV6], addr: Ipv6Addr) -> Option<Rank> {
     let bits = u128::from(addr);
     (0..=128u8).rev().find_map(|len| {
         let net = if len == 0 { 0 } else { bits >> (128 - len) };
-        routes
+        let covering: Vec<_> = routes
             .iter()
             .filter(|r| {
                 let d = r.slot.dst;
@@ -771,9 +882,14 @@ fn reference_lookup_v6(routes: &[KernelRouteV6], addr: Ipv6Addr) -> Option<(u8, 
                 };
                 r.slot.src.is_default() && d.prefix_len() == len && dnet == net
             })
-            .map(|r| r.slot.priority)
-            .min()
-            .map(|p| (len, p))
+            .collect();
+        let metric = covering.iter().map(|r| r.slot.priority).min()?;
+        let pref = covering
+            .iter()
+            .filter(|r| r.slot.priority == metric)
+            .map(|r| decode_pref(r.preference))
+            .max()?;
+        Some((len, metric, pref))
     })
 }
 
@@ -836,8 +952,14 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> {
         prop::sample::select(vec![None, None, None, Some("2001:db8:ffff::/48")]),
         prop::sample::select(vec![None, Some("fe80::1"), Some("fe80::2")]),
         arb_kind(),
+        prop::sample::select(vec![
+            RoutePreference::Medium,
+            RoutePreference::Medium,
+            RoutePreference::Low,
+            RoutePreference::High,
+        ]),
     )
-        .prop_map(|(prefix, priority, src, gw, kind)| {
+        .prop_map(|(prefix, priority, src, gw, kind, preference)| {
             let mut r = if kind == RouteKind::Unicast {
                 v6(prefix, priority, gw)
             } else {
@@ -845,6 +967,10 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> {
             };
             if let Some(src) = src {
                 r.slot.src = p6(src);
+            }
+            // The kernel reports every negative route as medium.
+            if kind == RouteKind::Unicast {
+                r.preference = preference;
             }
             r
         })
@@ -1019,8 +1145,8 @@ proptest! {
             other.insert_back(r.clone());
         }
         for addr in probes_v4() {
-            let a = forward.lookup(addr).map(|r| (r.slot.dst.prefix_len(), r.slot.priority));
-            let b = other.lookup(addr).map(|r| (r.slot.dst.prefix_len(), r.slot.priority));
+            let a = forward.lookup(addr).map(rank_of);
+            let b = other.lookup(addr).map(rank_of);
             prop_assert_eq!(a, b);
             // Reachability is order-independent too unless routes of different
             // reachability tie, where the kernel itself decides by list order.

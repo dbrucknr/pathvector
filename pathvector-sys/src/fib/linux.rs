@@ -32,7 +32,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     FibSnapshot, FibWrite, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg,
-    NextHopPath, NextHopV4, NextHopV6, RouteKind, RouteSlotV4, RouteSlotV6, TableId,
+    NextHopPath, NextHopV4, NextHopV6, RouteKind, RoutePreference, RouteSlotV4, RouteSlotV6,
+    TableId,
     route::qualifies_for_ecmp_v6,
     supervisor::{
         DumpError, DumpReport, Family, Notification, Received, RouteFeed, RouteSource, RouteUpdate,
@@ -649,54 +650,104 @@ fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
     })
 }
 
+/// `RTA_PREF`, normalised as the kernel stores it; absent means medium
+/// (`IPV6_EXTRACT_PREF(0)`).
+fn preference_v6(msg: &RouteMessage) -> RoutePreference {
+    msg.attributes
+        .iter()
+        .find_map(|a| match a {
+            RouteAttribute::Preference(p) => Some(RoutePreference::from_rta_pref(u8::from(*p))),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// The parts of an IPv6 route message that do not depend on its type: the
-/// metric group and one next hop per ECMP sibling.
+/// metric group, protocol, preference and one next hop per ECMP sibling.
 ///
 /// The kernel stores each IPv6 ECMP sibling as its own `fib6_info` but reports
 /// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`). It
 /// also deletes and dumps siblings one at a time. Splitting the message makes
 /// all of these line up. A route using a nexthop object is never split.
-///
-/// Returns `None` for a table of 0 or a non-canonical prefix.
-fn slot_and_next_hops_v6(msg: &RouteMessage) -> Option<(RouteSlotV6, Vec<NextHopV6>)> {
-    let slot = RouteSlotV6 {
-        table: TableId::new(route_table(msg))?,
-        dst: Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length).ok()?,
-        src: Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length).ok()?,
-        priority: metric_of(msg),
-    };
-    let next_hops = if let Some(id) = nexthop_object(msg) {
-        vec![NextHopV6::Object(id)]
-    } else if let Some(legs) = multipath(msg) {
-        legs.iter()
-            .map(|leg| NextHopV6::Path(path(&leg.attributes, Some(leg.interface_index))))
-            .collect()
-    } else {
-        vec![NextHopV6::Path(path(&msg.attributes, None))]
-    };
-    Some((slot, next_hops))
+struct PartsV6 {
+    slot: RouteSlotV6,
+    protocol: u8,
+    preference: RoutePreference,
+    next_hops: Vec<NextHopV6>,
 }
 
-/// Decodes an IPv6 route message into one route per ECMP sibling (see
-/// [`slot_and_next_hops_v6`]).
-///
-/// Returns an empty `Vec` for a route type the snapshot does not mirror, a
-/// table of 0 or a non-canonical prefix.
-fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
-    let (Some(kind), Some((slot, next_hops))) = (route_kind(msg), slot_and_next_hops_v6(msg))
-    else {
-        return Vec::new();
-    };
-    let protocol = u8::from(msg.header.protocol);
-    next_hops
-        .into_iter()
-        .map(|next_hop| KernelRouteV6 {
+impl PartsV6 {
+    /// Decodes the message once. Returns `None` for a table of 0 or a
+    /// non-canonical prefix.
+    fn decode(msg: &RouteMessage) -> Option<Self> {
+        let slot = RouteSlotV6 {
+            table: TableId::new(route_table(msg))?,
+            dst: Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length).ok()?,
+            src: Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length).ok()?,
+            priority: metric_of(msg),
+        };
+        let next_hops = if let Some(id) = nexthop_object(msg) {
+            vec![NextHopV6::Object(id)]
+        } else if let Some(legs) = multipath(msg) {
+            legs.iter()
+                .map(|leg| NextHopV6::Path(path(&leg.attributes, Some(leg.interface_index))))
+                .collect()
+        } else {
+            vec![NextHopV6::Path(path(&msg.attributes, None))]
+        };
+        Some(Self {
+            slot,
+            protocol: u8::from(msg.header.protocol),
+            preference: preference_v6(msg),
+            next_hops,
+        })
+    }
+
+    /// `rt6_qualify_for_ecmp` of the first sibling, which is the one an
+    /// `NLM_F_REPLACE` replaces with. `None` for a message with no next hop.
+    fn first_is_ecmp(&self) -> Option<bool> {
+        self.next_hops
+            .first()
+            .map(|nh| qualifies_for_ecmp_v6(self.protocol, nh))
+    }
+
+    /// One typed route per sibling, built from the parts already decoded.
+    fn into_routes(self, kind: RouteKind) -> impl Iterator<Item = KernelRouteV6> {
+        let Self {
+            slot,
+            protocol,
+            preference,
+            next_hops,
+        } = self;
+        next_hops.into_iter().map(move |next_hop| KernelRouteV6 {
             slot,
             kind,
             protocol,
+            preference,
             next_hop,
         })
-        .collect()
+    }
+}
+
+/// The routes of an IPv6 message the snapshot mirrors: one per ECMP sibling,
+/// none for an untracked route (BGP or an unmirrored type), a table of 0 or a
+/// non-canonical prefix.
+fn tracked_routes_v6(msg: &RouteMessage) -> impl Iterator<Item = KernelRouteV6> {
+    let kind = route_kind(msg).filter(|_| !is_bgp_route(msg));
+    kind.zip(PartsV6::decode(msg))
+        .map(|(kind, parts)| parts.into_routes(kind))
+        .into_iter()
+        .flatten()
+}
+
+/// Every route of an IPv6 message of a mirrored type, BGP included (for the
+/// decoding tests).
+#[cfg(test)]
+fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
+    route_kind(msg)
+        .zip(PartsV6::decode(msg))
+        .map(|(kind, parts)| parts.into_routes(kind).collect())
+        .unwrap_or_default()
 }
 
 fn metric_of(msg: &RouteMessage) -> u32 {
@@ -723,9 +774,9 @@ fn apply_dumped(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool 
     }
     match msg.header.address_family {
         AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.insert_back(r)),
-        AddressFamily::Inet6 => decode_v6(msg)
-            .into_iter()
-            .fold(false, |changed, r| snap.v6.insert_back(r) | changed),
+        AddressFamily::Inet6 => {
+            tracked_routes_v6(msg).fold(false, |changed, r| snap.v6.insert_back(r) | changed)
+        }
         _ => false,
     }
 }
@@ -772,19 +823,24 @@ fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32)
             }
         }
         AddressFamily::Inet6 => {
-            let Some((slot, next_hops)) = slot_and_next_hops_v6(msg) else {
+            // Decoded once: the slot and ECMP eligibility are needed even for
+            // an untracked route, whose replace still displaces a tracked one.
+            let Some(parts) = PartsV6::decode(msg) else {
                 return false;
             };
-            let Some(first_hop) = next_hops.first() else {
+            let Some(ecmp) = parts.first_is_ecmp() else {
                 return false;
             };
-            let protocol = u8::from(msg.header.protocol);
-            let mut routes = if tracked { decode_v6(msg) } else { Vec::new() }.into_iter();
+            let slot = parts.slot;
+            let kind = route_kind(msg).filter(|_| tracked);
+            let mut routes = kind
+                .map(|kind| parts.into_routes(kind))
+                .into_iter()
+                .flatten();
             let first = routes.next();
             let mut changed = if replace {
                 // ip6_route_multipath_add replaces with the first leg and
                 // appends the rest, then reports them in one message.
-                let ecmp = qualifies_for_ecmp_v6(protocol, first_hop);
                 snap.v6.replace(&slot, ecmp, first)
             } else {
                 first.is_some_and(|first| snap.v6.insert_back(first))
@@ -809,9 +865,9 @@ fn apply_del(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
     }
     match msg.header.address_family {
         AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.remove(&r)),
-        AddressFamily::Inet6 => decode_v6(msg)
-            .iter()
-            .fold(false, |changed, r| snap.v6.remove(r) | changed),
+        AddressFamily::Inet6 => {
+            tracked_routes_v6(msg).fold(false, |changed, r| snap.v6.remove(&r) | changed)
+        }
         _ => false,
     }
 }
@@ -2028,6 +2084,68 @@ mod tests {
             ));
             assert_eq!(snap.v6.len(), 1, "{kind:?}");
             assert_eq!(metric_v6(&snap, "2001:db8::1"), None, "{kind:?}");
+        }
+    }
+
+    fn with_pref(
+        mut msg: RouteMessage,
+        pref: netlink_packet_route::route::RoutePreference,
+    ) -> RouteMessage {
+        msg.attributes.push(RouteAttribute::Preference(pref));
+        msg
+    }
+
+    #[test]
+    fn decode_v6_reads_route_preference() {
+        use netlink_packet_route::route::RoutePreference as Pref;
+        let plain = igp_v6_msg("2001:db8::", 32, 5, 254);
+        assert_eq!(decode_v6(&plain)[0].preference, RoutePreference::Medium);
+        for (wire, want) in [
+            (Pref::High, RoutePreference::High),
+            (Pref::Low, RoutePreference::Low),
+            (Pref::Medium, RoutePreference::Medium),
+            (Pref::Invalid, RoutePreference::Medium),
+        ] {
+            let msg = with_pref(igp_v6_msg("2001:db8::", 32, 5, 254), wire);
+            assert_eq!(decode_v6(&msg)[0].preference, want, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn ipv6_high_preference_unicast_beats_an_earlier_negative_route_of_its_metric() {
+        // Codex's reproduction on PR #123: blackhole fd59::/64 metric 100, then
+        // a device route for the same prefix and metric appended with
+        // RTA_PREF=high. rt6_score_route ranks the unicast route higher, so
+        // RTM_GETROUTE succeeds; the snapshot must agree.
+        use netlink_packet_route::route::RoutePreference as Pref;
+        for kind in NEGATIVE_TYPES {
+            let mut snap = FibSnapshot::new();
+            assert!(apply_new(
+                &mut snap,
+                &negative_v6_msg("fd59::", 64, 100, kind),
+                CREATE,
+                254
+            ));
+            let uni = with_pref(with_oif(igp_v6_msg("fd59::", 64, 100, 254), 2), Pref::High);
+            assert!(apply_new(&mut snap, &uni, APPEND, 254));
+            assert!(snap.is_v6_reachable("fd59::1".parse().unwrap()), "{kind:?}");
+            assert_eq!(metric_v6(&snap, "fd59::1"), Some(100));
+
+            // A low-preference unicast route loses to a later negative route,
+            // which the kernel always reports as medium.
+            let mut snap = FibSnapshot::new();
+            let low = with_pref(with_oif(igp_v6_msg("fd59::", 64, 100, 254), 2), Pref::Low);
+            apply_new(&mut snap, &low, CREATE, 254);
+            assert!(apply_new(
+                &mut snap,
+                &negative_v6_msg("fd59::", 64, 100, kind),
+                APPEND,
+                254
+            ));
+            assert!(
+                !snap.is_v6_reachable("fd59::1".parse().unwrap()),
+                "{kind:?}"
+            );
         }
     }
 

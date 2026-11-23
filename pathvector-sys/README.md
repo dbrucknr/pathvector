@@ -122,7 +122,11 @@ values the kernel can report. `RTM_DELROUTE` removes exactly the route it names.
 gets an `RTM_DELROUTE` of its own.
 
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
-as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
+as the kernel does. For IPv6, routes of that priority are then ranked by router
+preference (`RTA_PREF`; `rt6_score_route` adds `IPV6_DECODE_PREF(pref) << 2`, and
+`find_match` keeps only a strictly better score), and only then by list order. Negative
+IPv6 routes are always medium preference: `ip6_route_info_create` overwrites a reject
+route's flags with `RTF_REJECT | RTF_NONEXTHOP`, dropping `RTF_PREF`. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
 kept but not selected, because a best-effort lookup from an unspecified source cannot
 use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes.
 
@@ -150,6 +154,12 @@ a shorter prefix, and `fib6_table_lookup` only backtracks when a node yields no 
 `route_to_v4` / `route_to_v6` only ever use a `Forward` result, so a negative route can
 never supply an IGP metric.
 
+`is_v6_reachable` treats a link-local address (`fe80::/10`) as on-link **only when no
+route covers it**, because the oracle has no output interface to find the per-interface
+`fe80::/64` route with. A negative route over link-local space is honoured, as the
+kernel honours it (`RTM_GETROUTE` for an address beneath a `prohibit` route answers
+`EACCES`).
+
 **Throw.** A throw route ends the lookup in its table with `-EAGAIN`, which is also what
 a table returns when nothing matches; the kernel then tries the next policy rule. With
 the default rules (local, main, default for IPv4; local, main for IPv6) a throw in `main`
@@ -174,6 +184,10 @@ Known limits:
 - An IPv6 unicast route via the loopback device is turned into a reject route by the
   kernel (`fib6_is_reject`) but still reported as unicast, so the oracle treats it as
   reachable.
+- IPv6 selection within a metric group follows preference and list order, but not the
+  kernel's round-robin pointer (`fn->rr_ptr`, moved only when a gateway's neighbour
+  fails), neighbour reachability, or the early return `__find_rr_leaf` takes for a route
+  through a blackhole nexthop object.
 - IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
 - With table `0` (all tables) the tables are compared as one; policy routing rules are
   not modelled.

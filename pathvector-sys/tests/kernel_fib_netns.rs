@@ -44,7 +44,7 @@ use futures::TryStreamExt;
 use netlink_packet_route::route::RouteMessage;
 use netlink_packet_route::{
     link::{LinkAttribute, LinkFlags},
-    route::{RouteScope, RouteType},
+    route::{RouteAttribute, RoutePreference, RouteScope, RouteType},
 };
 use pathvector_sys::{
     FibSnapshot, KernelFib, RT_TABLE_MAIN,
@@ -715,6 +715,158 @@ async fn initial_dump_of_negative_routes_agrees_with_the_kernel() {
 
     let (snap, task) = start_fib().await;
     assert_agrees(&handle, &snap, &probes, "initial dump").await;
+    task.abort();
+}
+
+// ── PR #123 review: IPv6 route preference and link-local space ───────────────
+
+/// `ip -6 route append`: `NLM_F_CREATE | NLM_F_APPEND` without `NLM_F_EXCL`,
+/// which `fib6_add_rt2node` would answer with `-EEXIST` for a second route of
+/// the same metric. rtnetlink's add request always sets one of `NLM_F_EXCL` /
+/// `NLM_F_REPLACE`, so the request is built here.
+async fn append(handle: &Handle, msg: RouteMessage) {
+    use futures::StreamExt;
+    use netlink_packet_core::{
+        NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+    };
+    use netlink_packet_route::RouteNetlinkMessage;
+
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(msg));
+    req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND;
+    let mut responses = handle.clone().request(req).expect("send append request");
+    while let Some(resp) = responses.next().await {
+        if let NetlinkPayload::Error(e) = resp.payload {
+            assert!(e.code.is_none(), "append rejected: {e:?}");
+        }
+    }
+}
+
+fn unicast_v6_msg(dst: Ipv6Addr, len: u8, oif: u32, metric: u32) -> RouteMessage {
+    RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(dst, len)
+        .output_interface(oif)
+        .priority(metric)
+        .build()
+}
+
+fn with_pref(mut msg: RouteMessage, pref: RoutePreference) -> RouteMessage {
+    msg.attributes.push(RouteAttribute::Preference(pref));
+    msg
+}
+
+/// Within one metric group IPv6 ranks routes by router preference
+/// (`rt6_score_route`: `m |= IPV6_DECODE_PREF(...) << 2`; `find_match` keeps a
+/// strictly better score) before list order, for negative and unicast routes
+/// alike. Negative routes are always medium: `ip6_route_info_create`
+/// overwrites a reject route's `fib6_flags`, dropping `RTF_PREF`.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn ipv6_route_preference_between_negative_and_unicast_agrees_with_the_kernel() {
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest57d").await;
+    let (snap, task) = start_fib().await;
+    let ip6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+    // Blackhole first, then a high-preference device route: the device route
+    // wins although it comes second (Codex's reproduction).
+    add_negative(&handle, ip("fd59::"), 64, RouteType::BlackHole, 100).await;
+    append(
+        &handle,
+        with_pref(
+            unicast_v6_msg(ip6("fd59::"), 64, oif, 100),
+            RoutePreference::High,
+        ),
+    )
+    .await;
+    // A low-preference device route first, then a prohibit route: the
+    // prohibit route wins, being medium.
+    append(
+        &handle,
+        with_pref(
+            unicast_v6_msg(ip6("fd59:1::"), 64, oif, 100),
+            RoutePreference::Low,
+        ),
+    )
+    .await;
+    append(
+        &handle,
+        negative_msg(ip("fd59:1::"), 64, RouteType::Prohibit, 100),
+    )
+    .await;
+    // An RTA_PREF on a negative route is dropped (ip6_route_info_create
+    // overwrites its fib6_flags): a "low" unreachable route ahead of a medium
+    // device route still wins by list order ...
+    append(
+        &handle,
+        with_pref(
+            negative_msg(ip("fd59:2::"), 64, RouteType::Unreachable, 100),
+            RoutePreference::Low,
+        ),
+    )
+    .await;
+    append(&handle, unicast_v6_msg(ip6("fd59:2::"), 64, oif, 100)).await;
+    // ... and a "high" blackhole behind a device route still loses by it.
+    add_unicast(&handle, ip("fd59:3::"), 64, oif, 100).await;
+    append(
+        &handle,
+        with_pref(
+            negative_msg(ip("fd59:3::"), 64, RouteType::BlackHole, 100),
+            RoutePreference::High,
+        ),
+    )
+    .await;
+
+    let probes = [
+        (ip("fd59::1"), Ok(())),
+        (ip("fd59:1::1"), rejected_with(RouteType::Prohibit)),
+        (ip("fd59:2::1"), rejected_with(RouteType::Unreachable)),
+        (ip("fd59:3::1"), Ok(())),
+    ];
+    eventually(&snap, "all eight routes tracked", |s| {
+        ["fd59::", "fd59:1::", "fd59:2::", "fd59:3::"]
+            .iter()
+            .all(|p| count_v6(s, ip6(p)) == 2)
+    })
+    .await;
+    assert_agrees(&handle, &snap, &probes, "incremental").await;
+    task.abort();
+
+    // The initial dump carries RTA_PREF too.
+    let (dumped, task) = start_fib().await;
+    assert_agrees(&handle, &dumped, &probes, "initial dump").await;
+    task.abort();
+}
+
+/// The link-local fallback in `is_v6_reachable` applies only when no route
+/// covers the address: a negative route over link-local space is honoured,
+/// as the kernel honours it.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn negative_route_over_link_local_space_agrees_with_the_kernel() {
+    let handle = connect();
+    let _oif = dummy(&handle, "pvtest57e").await;
+    let (snap, task) = start_fib().await;
+    let net: IpAddr = "fe80:57::".parse().unwrap();
+    let probe: IpAddr = "fe80:57::1".parse().unwrap();
+    for kind in NEGATIVE_TYPES {
+        add_negative(&handle, net, 64, kind, 100).await;
+        eventually(&snap, "negative route tracked", |s| count(s, net) == 1).await;
+        assert_agrees(
+            &handle,
+            &snap,
+            &[(probe, rejected_with(kind))],
+            &format!("{kind:?} over link-local space"),
+        )
+        .await;
+
+        del_negative(&handle, net, 64, kind, 100).await;
+        eventually(&snap, "negative route removed", |s| count(s, net) == 0).await;
+        // With no route at all the oracle falls back to "on-link"; the kernel
+        // has no route without an output interface. This is the documented
+        // fallback, not a kernel comparison.
+        assert!(reachable(&snap.read().unwrap(), probe), "{kind:?} removed");
+    }
     task.abort();
 }
 

@@ -41,8 +41,12 @@
 //! the packet (`fib_table_lookup`, "Process the leaf"). Because priority sorts
 //! ascending, the route that wins for a prefix is the one with the **lowest
 //! priority**. When no alias of a leaf matches, the lookup backtracks to a
-//! shorter prefix. [`RouteList::lookup`] reproduces this: longest prefix
-//! first, then lowest priority, then kernel list order.
+//! shorter prefix. IPv6 is the same except that, within the lowest-metric
+//! group, `rt6_score_route` ranks routes by their router preference
+//! (`RTA_PREF`), so a high-preference route beats an earlier medium one
+//! ([`RoutePreference`]). [`RouteList::lookup`] reproduces this: longest
+//! prefix first, then lowest priority, then (IPv6) highest preference, then
+//! kernel list order.
 //!
 //! The oracle answers for best-effort traffic from an unspecified source, so
 //! only routes that such a lookup can match are eligible:
@@ -548,6 +552,45 @@ pub struct RouteSlotV6 {
     pub priority: u32,
 }
 
+/// IPv6 router preference (`RTA_PREF`, RFC 4191), which ranks routes of
+/// equal prefix and metric.
+///
+/// `rt6_score_route` (under `CONFIG_IPV6_ROUTER_PREF`) adds
+/// `IPV6_DECODE_PREF(IPV6_EXTRACT_PREF(fib6_flags)) << 2` to a route's score,
+/// where `IPV6_DECODE_PREF` is "1:low,2:med,3:high", and `find_match` keeps a
+/// route only if its score is strictly higher than the best so far. So within
+/// the lowest-metric group a higher preference wins, and equal preferences
+/// keep list order. The kernel stores only these three values:
+/// `rtm_to_fib6_config` turns anything but low or high into medium.
+///
+/// A negative route is always medium: `ip6_route_info_create` copies the
+/// preference into `fib6_flags` and then, for a reject route, overwrites them
+/// with `RTF_REJECT | RTF_NONEXTHOP`, so an `RTA_PREF` given with `ip -6 route
+/// add blackhole ...` is dropped and the route is reported as medium.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum RoutePreference {
+    /// `ICMPV6_ROUTER_PREF_LOW` (3).
+    Low,
+    /// `ICMPV6_ROUTER_PREF_MEDIUM` (0), the value when `RTA_PREF` is absent.
+    #[default]
+    Medium,
+    /// `ICMPV6_ROUTER_PREF_HIGH` (1).
+    High,
+}
+
+impl RoutePreference {
+    /// Maps an `RTA_PREF` value the way `rtm_to_fib6_config` does: low and
+    /// high are kept, anything else becomes medium.
+    #[must_use]
+    pub const fn from_rta_pref(pref: u8) -> Self {
+        match pref {
+            3 => Self::Low,
+            1 => Self::High,
+            _ => Self::Medium,
+        }
+    }
+}
+
 /// One IPv6 route (a single `fib6_info`, so one ECMP sibling at most).
 ///
 /// The kernel creates every negative IPv6 route on the loopback device with
@@ -564,6 +607,10 @@ pub struct KernelRouteV6 {
     /// `rtm_protocol`. Not part of the identity (`rt6_duplicate_nexthop`
     /// ignores it), but needed to tell router-advertisement routes apart.
     pub protocol: u8,
+    /// `RTA_PREF`. Not part of the identity, but ranks routes of one metric
+    /// group during lookup. Medium for every negative route (see
+    /// [`RoutePreference`]).
+    pub preference: RoutePreference,
     /// Next hop.
     pub next_hop: NextHopV6,
 }
@@ -620,6 +667,10 @@ pub(crate) trait MirroredRoute: Clone + PartialEq {
     /// The route priority (metric).
     fn priority(&self) -> u32;
 
+    /// Rank among routes with the same prefix and priority; higher wins.
+    /// Always equal for IPv4, which has no such ranking.
+    fn preference(&self) -> RoutePreference;
+
     /// The route type.
     fn kind(&self) -> RouteKind;
 }
@@ -646,6 +697,10 @@ impl MirroredRoute for KernelRouteV4 {
 
     fn priority(&self) -> u32 {
         self.slot.priority
+    }
+
+    fn preference(&self) -> RoutePreference {
+        RoutePreference::Medium
     }
 
     fn kind(&self) -> RouteKind {
@@ -675,6 +730,10 @@ impl MirroredRoute for KernelRouteV6 {
 
     fn priority(&self) -> u32 {
         self.slot.priority
+    }
+
+    fn preference(&self) -> RoutePreference {
+        self.preference
     }
 
     fn kind(&self) -> RouteKind {
@@ -780,10 +839,11 @@ impl<R: MirroredRoute> RouteList<R> {
     /// The route a best-effort kernel lookup would select for `addr`, of any
     /// kind.
     ///
-    /// Longest matching prefix first, then lowest priority, then mirror order.
-    /// Negative routes take part like any other: the kernel picks the alias
-    /// before it looks at its type. With several tables mirrored, they are
-    /// compared as one table: policy routing rules are not modelled.
+    /// Longest matching prefix first, then lowest priority, then (IPv6) the
+    /// highest [`RoutePreference`], then mirror order. Negative routes take
+    /// part like any other: the kernel picks the route before it looks at its
+    /// type. With several tables mirrored, they are compared as one table:
+    /// policy routing rules are not modelled.
     #[must_use]
     pub fn lookup(&self, addr: R::Addr) -> Option<&R> {
         // `min_by_key` returns the first of several equal minima, which keeps
@@ -791,7 +851,13 @@ impl<R: MirroredRoute> RouteList<R> {
         self.routes
             .iter()
             .filter(|r| r.matches(addr))
-            .min_by_key(|r| (Reverse(r.prefix_len()), r.priority()))
+            .min_by_key(|r| {
+                (
+                    Reverse(r.prefix_len()),
+                    r.priority(),
+                    Reverse(r.preference()),
+                )
+            })
     }
 
     /// How a best-effort kernel lookup for `addr` ends: the selected route

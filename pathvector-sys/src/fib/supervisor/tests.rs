@@ -39,7 +39,7 @@ use tokio::{
 use super::*;
 use crate::fib::{
     FibSnapshot, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, NextHopPath, NextHopV4,
-    NextHopV6, RouteKind, RouteSlotV4, RouteSlotV6, TableId,
+    NextHopV6, RouteKind, RoutePreference, RouteSlotV4, RouteSlotV6, TableId,
     health::{DegradedCause, DumpTimeout, FibStatus, ResyncBackoff, SnapshotHealth},
 };
 
@@ -80,6 +80,7 @@ fn v6(network: &str, len: u8, metric: u32) -> Route {
         },
         kind: RouteKind::Unicast,
         protocol: 3,
+        preference: RoutePreference::Medium,
         next_hop: NextHopV6::Path(NextHopPath {
             gateway: None,
             oif: None,
