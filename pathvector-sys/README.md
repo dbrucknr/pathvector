@@ -101,6 +101,75 @@ netlink communication. Routes are installed with:
 distinguish pathvectord-installed routes from other BGP implementations and from static
 or IGP routes when running tools like `ip route show proto bgp`.
 
+### Reading the kernel FIB: route identity
+
+`KernelFib` keeps a `FibSnapshot` of the kernel routing table and answers next-hop
+reachability and IGP-metric queries from its *tracked* routes: unicast routes not
+installed by BGP (`RTPROT_BGP`).
+
+A prefix does not identify a kernel route. Linux keeps several routes for one prefix,
+and the snapshot stores each under the identity the kernel itself uses:
+
+| Family | Slot (the kernel's grouping) | Route within the slot |
+|---|---|---|
+| IPv4 | table, prefix, TOS, priority (`fib_table_insert`: "[prefix,dscp,priority]") | type, protocol, scope, preferred source, next hop(s) |
+| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route) |
+
+Prefixes are validated newtypes (`Ipv4Prefix`, `Ipv6Prefix`: length within range, no
+host bits) and table IDs cannot be zero (`TableId`), so a route identity can only hold
+values the kernel can report. `RTM_DELROUTE` removes exactly the route it names.
+`RTM_NEWROUTE` with `NLM_F_REPLACE` displaces the route the kernel replaced, which never
+gets an `RTM_DELROUTE` of its own.
+
+Every route is mirrored, tracked or not, because the kernel's replace rules act on a
+slot's real order: if a BGP alias sits ahead of a static alias, replacing the BGP alias
+must leave the static one in place. Untracked routes are kept only as a 64-bit identity
+hash. They never count for reachability and never signal a change, so BGP route churn
+does not wake the decision process. The cost is memory proportional to the kernel
+table: about 86 MB for 1M BGP routes in the tracked table (≈170 MB peak while the hash
+table grows; release build, M2 Max). Inserts and deletes are hashed, about 0.26 µs each.
+
+An IPv6 multipath message describes only its first leg; the other legs carry no protocol
+of their own, and Linux lets one ECMP set mix static and BGP routes. Dumps do not help:
+`fib6_dump_node` dumps a sibling set once and skips the other siblings. The dump of a
+BGP-first static+BGP set is byte-for-byte the dump of an all-BGP set (a live test checks
+this), so a policy has to decide what an unreported sibling is.
+
+**Policy:** an unreported sibling takes the protocol of the sibling the message describes,
+marked `protocol_inferred: true`, and a message that later reports its protocol replaces
+the inference. ECMP sets are almost always installed by one daemon, so this is exact for
+every single-protocol set, BGP or IGP. Those sets give the same answer after a restart's
+dump as from live events, and the BGP exclusion holds for all-BGP ECMP sets. The
+alternatives are worse in the common case: counting every unreported sibling as IGP makes
+each all-BGP ECMP set count as IGP reachability after a restart, and counting none loses
+the second path of every all-static set.
+
+A lookup takes the longest matching prefix and, among its routes, the lowest priority,
+as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
+kept but not selected, because a best-effort lookup from an unspecified source cannot
+use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes and
+`route_to_v4` / `route_to_v6` return the route a lookup selects.
+
+Known limits:
+
+- **Mixed-protocol IPv6 ECMP sets learned from a dump (or a multipath `NLM_F_APPEND`)**
+  are the one case the inference gets wrong, in either direction, because netlink never
+  reports the unreported siblings' protocols:
+  - static first, BGP second: the BGP sibling counts as a path until it is deleted;
+  - BGP first, static second: the static sibling is not used until a message reports it,
+    even after the BGP sibling is deleted.
+
+  Such sets need two daemons (or an operator) appending into one ECMP set. `FibWriter`
+  replaces rather than appends, so it never creates them. Re-reading the set after its
+  first sibling is deleted would narrow the second case; that is a possible follow-up.
+- Untracked identities are compared by a 64-bit hash within one slot; a collision
+  between two routes of the same slot is possible in principle but negligible.
+- IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
+- With table `0` (all tables) the tables are compared as one; policy routing rules are
+  not modelled.
+- IPv6 ECMP eligibility uses `RTPROT_RA` as a stand-in for the kernel's `RTF_ADDRCONF`
+  flag, which netlink does not expose.
+
 ---
 
 ## Unsafe code audit

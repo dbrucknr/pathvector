@@ -2,20 +2,27 @@
 
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZeroU32,
     sync::{Arc, RwLock},
 };
 
 use futures::{StreamExt, TryStreamExt};
-use netlink_packet_core::NetlinkPayload;
+use netlink_packet_core::{NLM_F_APPEND, NLM_F_REPLACE, NetlinkPayload, Nla};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
-    route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteType},
+    route::{
+        RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol, RouteType,
+        RouteVia,
+    },
 };
 use rtnetlink::{MulticastGroup, RouteMessageBuilder};
 use tokio::sync::watch;
 
-use super::{FibEntry4, FibEntry6, FibSnapshot, FibWrite};
+use super::{
+    FibSnapshot, FibWrite, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg,
+    NextHopPath, NextHopV4, NextHopV6, Position, RouteSlotV4, RouteSlotV6, TableId,
+};
 
 // ── FibWriter ─────────────────────────────────────────────────────────────────
 
@@ -164,35 +171,28 @@ pub(super) async fn run(
 
     // Step 2 — Populate snapshot from current kernel FIB.
     //
-    // Collect into local Vecs while awaiting so the RwLockWriteGuard is never
-    // held across an await point (std::sync::RwLockWriteGuard is !Send).
-    let mut v4_entries: Vec<FibEntry4> = Vec::new();
+    // Build into a local snapshot while awaiting so the RwLockWriteGuard is
+    // never held across an await point (std::sync::RwLockWriteGuard is !Send).
+    // The dump lists each slot's routes in kernel order, so appending them
+    // reproduces that order.
+    let mut fresh = FibSnapshot::new();
     let mut stream = handle
         .route()
         .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
         .execute();
     while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
-        if let Some(entry) = parse_v4(&msg, table) {
-            v4_entries.push(entry);
-        }
+        apply_dumped(&mut fresh, &msg, table);
     }
 
-    let mut v6_entries: Vec<FibEntry6> = Vec::new();
     let mut stream = handle
         .route()
         .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
         .execute();
     while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
-        if let Some(entry) = parse_v6(&msg, table) {
-            v6_entries.push(entry);
-        }
+        apply_dumped(&mut fresh, &msg, table);
     }
 
-    {
-        let mut snap = snapshot.write().expect("FibSnapshot poisoned");
-        snap.v4 = v4_entries;
-        snap.v6 = v6_entries;
-    }
+    *snapshot.write().expect("FibSnapshot poisoned") = fresh;
 
     // Notify watchers: initial FIB loaded.
     let _ = change_tx.send(());
@@ -210,12 +210,18 @@ pub(super) async fn run(
     // FRR/Zebra (rtm_protocol == RTPROT_ZEBRA skip) — both daemon suites filter
     // self-installed routes before deciding whether to re-run the decision
     // process.
+    //
+    // The netlink header flags matter: NLM_F_REPLACE means the kernel replaced
+    // an existing route without sending RTM_DELROUTE for it, and NLM_F_APPEND
+    // says where in its slot an IPv4 route was inserted.
     while let Some((msg, _addr)) = events.next().await {
+        let flags = msg.header.flags;
         match msg.payload {
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
                 let changed = apply_new(
                     &mut snapshot.write().expect("FibSnapshot poisoned"),
                     &route,
+                    flags,
                     table,
                 );
                 if changed {
@@ -243,7 +249,7 @@ pub(super) async fn run(
 
 /// Returns `(network, prefix_len)` for every `RTPROT_BGP` IPv4 route in `table`.
 ///
-/// This is the inverse of `parse_v4`: it selects *only* BGP-protocol routes,
+/// This is the inverse of the snapshot's tracking rule: it selects *only* BGP-protocol routes,
 /// which were installed by a previous daemon run and are now stale.
 pub(super) async fn dump_stale_bgp_v4(
     handle: &rtnetlink::Handle,
@@ -348,80 +354,184 @@ fn in_table(msg: &RouteMessage, table: u32) -> bool {
     table == 0 || route_table(msg) == table
 }
 
-/// Parse an IPv4 unicast route. Returns `None` for non-unicast types,
-/// wrong-table routes, BGP-protocol routes, or routes with no parseable
-/// destination.
-fn parse_v4(msg: &RouteMessage, table: u32) -> Option<FibEntry4> {
-    if msg.header.kind != RouteType::Unicast {
-        return None;
-    }
-    if !in_table(msg, table) {
-        return None;
-    }
-    if is_bgp_route(msg) {
-        return None;
-    }
+// ── Decoding: netlink message → kernel route identity ─────────────────────────
 
-    let prefix_len = msg.header.destination_prefix_length;
+/// `RTA_NH_ID` in `<linux/rtnetlink.h>`. netlink-packet-route 0.30 has no
+/// variant for it, so it arrives as `RouteAttribute::Other`.
+const RTA_NH_ID: u16 = 30;
 
-    // Default route (0.0.0.0/0) may carry no Destination attribute.
-    let network = msg
-        .attributes
+fn destination_v4(msg: &RouteMessage) -> Ipv4Addr {
+    // A default route may carry no RTA_DST.
+    msg.attributes
         .iter()
-        .find_map(|a| {
-            if let RouteAttribute::Destination(RouteAddress::Inet(v4)) = a {
-                Some(*v4)
-            } else {
-                None
-            }
+        .find_map(|a| match a {
+            RouteAttribute::Destination(RouteAddress::Inet(v4)) => Some(*v4),
+            _ => None,
         })
-        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        .unwrap_or(Ipv4Addr::UNSPECIFIED)
+}
 
-    let metric = metric_of(msg);
+fn destination_v6(msg: &RouteMessage) -> Ipv6Addr {
+    msg.attributes
+        .iter()
+        .find_map(|a| match a {
+            RouteAttribute::Destination(RouteAddress::Inet6(v6)) => Some(*v6),
+            _ => None,
+        })
+        .unwrap_or(Ipv6Addr::UNSPECIFIED)
+}
 
-    Some(FibEntry4 {
-        network,
-        prefix_len,
-        metric,
+fn source_v6(msg: &RouteMessage) -> Ipv6Addr {
+    msg.attributes
+        .iter()
+        .find_map(|a| match a {
+            RouteAttribute::Source(RouteAddress::Inet6(v6)) => Some(*v6),
+            _ => None,
+        })
+        .unwrap_or(Ipv6Addr::UNSPECIFIED)
+}
+
+fn prefsrc_v4(msg: &RouteMessage) -> Option<Ipv4Addr> {
+    msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::PrefSource(RouteAddress::Inet(v4)) => Some(*v4),
+        _ => None,
     })
 }
 
-/// Parse an IPv6 unicast route. Returns `None` for BGP-protocol routes.
-fn parse_v6(msg: &RouteMessage, table: u32) -> Option<FibEntry6> {
-    if msg.header.kind != RouteType::Unicast {
-        return None;
-    }
-    if !in_table(msg, table) {
-        return None;
-    }
-    if is_bgp_route(msg) {
-        return None;
-    }
-
-    let prefix_len = msg.header.destination_prefix_length;
-
-    let network = msg
-        .attributes
-        .iter()
-        .find_map(|a| {
-            if let RouteAttribute::Destination(RouteAddress::Inet6(v6)) = a {
-                Some(*v6)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(Ipv6Addr::UNSPECIFIED);
-
-    let metric = metric_of(msg);
-
-    Some(FibEntry6 {
-        network,
-        prefix_len,
-        metric,
+fn nexthop_object(msg: &RouteMessage) -> Option<u32> {
+    msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Other(nla) if nla.kind() == RTA_NH_ID && nla.value_len() == 4 => {
+            let mut value = [0u8; 4];
+            nla.emit_value(&mut value);
+            // nla_put_u32 writes host byte order.
+            Some(u32::from_ne_bytes(value))
+        }
+        _ => None,
     })
+}
+
+fn multipath(msg: &RouteMessage) -> Option<&[RouteNextHop]> {
+    msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::MultiPath(legs) => Some(legs.as_slice()),
+        _ => None,
+    })
+}
+
+/// A gateway (`RTA_GATEWAY`, or `RTA_VIA` for a cross-family gateway) and an
+/// output interface, taken from a route's or a multipath leg's attributes.
+fn path(attributes: &[RouteAttribute], oif: Option<u32>) -> NextHopPath {
+    let gateway = attributes.iter().find_map(|a| match a {
+        RouteAttribute::Gateway(RouteAddress::Inet(v4))
+        | RouteAttribute::Via(RouteVia::Inet(v4)) => Some(IpAddr::V4(*v4)),
+        RouteAttribute::Gateway(RouteAddress::Inet6(v6))
+        | RouteAttribute::Via(RouteVia::Inet6(v6)) => Some(IpAddr::V6(*v6)),
+        _ => None,
+    });
+    let oif = oif.or_else(|| {
+        attributes.iter().find_map(|a| match a {
+            RouteAttribute::Oif(i) => Some(*i),
+            _ => None,
+        })
+    });
+    NextHopPath {
+        gateway,
+        oif: oif.and_then(NonZeroU32::new),
+    }
+}
+
+/// Decodes an IPv4 route into its kernel identity.
+///
+/// Returns `None` for a table of 0 or a destination the kernel would itself
+/// reject (`fib_valid_key_len`); neither occurs in a kernel-generated message.
+fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
+    let slot = RouteSlotV4 {
+        table: TableId::new(route_table(msg))?,
+        dst: Ipv4Prefix::new(destination_v4(msg), msg.header.destination_prefix_length).ok()?,
+        tos: msg.header.tos,
+        priority: metric_of(msg),
+    };
+    let next_hop = if let Some(id) = nexthop_object(msg) {
+        NextHopV4::Object(id)
+    } else if let Some(legs) = multipath(msg) {
+        // One IPv4 alias, several legs: added and deleted as a unit.
+        NextHopV4::Multipath(
+            legs.iter()
+                .map(|leg| MultipathLeg {
+                    path: path(&leg.attributes, Some(leg.interface_index)),
+                    hops: leg.hops,
+                })
+                .collect(),
+        )
+    } else {
+        NextHopV4::Path(path(&msg.attributes, None))
+    };
+    Some(KernelRouteV4 {
+        slot,
+        kind: u8::from(msg.header.kind),
+        protocol: u8::from(msg.header.protocol),
+        scope: u8::from(msg.header.scope),
+        prefsrc: prefsrc_v4(msg),
+        next_hop,
+    })
+}
+
+/// Decodes an IPv6 route message into one route per ECMP sibling.
+///
+/// The kernel stores each IPv6 ECMP sibling as its own `fib6_info` but reports
+/// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`), in
+/// notifications and in dumps alike (`fib6_dump_node` dumps a set once). It
+/// deletes siblings one at a time, or all at once with one `RTA_MULTIPATH`
+/// message. Splitting the message makes these line up. A route using a
+/// nexthop object is never split.
+///
+/// Every returned route carries the header's type and protocol, but only the
+/// first one is the route the header describes; see [`apply_new`] for how the
+/// others are treated.
+///
+/// Returns an empty `Vec` for a table of 0 or a non-canonical prefix.
+fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
+    let Some(table) = TableId::new(route_table(msg)) else {
+        return Vec::new();
+    };
+    let Ok(dst) = Ipv6Prefix::new(destination_v6(msg), msg.header.destination_prefix_length) else {
+        return Vec::new();
+    };
+    let Ok(src) = Ipv6Prefix::new(source_v6(msg), msg.header.source_prefix_length) else {
+        return Vec::new();
+    };
+    let slot = RouteSlotV6 {
+        table,
+        dst,
+        src,
+        priority: metric_of(msg),
+    };
+    let protocol = u8::from(msg.header.protocol);
+    let kind = u8::from(msg.header.kind);
+    let route = |next_hop| KernelRouteV6 {
+        slot,
+        kind,
+        protocol,
+        protocol_inferred: false,
+        next_hop,
+    };
+    if let Some(id) = nexthop_object(msg) {
+        vec![route(NextHopV6::Object(id))]
+    } else if let Some(legs) = multipath(msg) {
+        legs.iter()
+            .map(|leg| {
+                route(NextHopV6::Path(path(
+                    &leg.attributes,
+                    Some(leg.interface_index),
+                )))
+            })
+            .collect()
+    } else {
+        vec![route(NextHopV6::Path(path(&msg.attributes, None)))]
+    }
 }
 
 fn metric_of(msg: &RouteMessage) -> u32 {
+    // IPv4 omits RTA_PRIORITY when the priority is 0 (fib_dump_info).
     msg.attributes
         .iter()
         .find_map(|a| {
@@ -436,98 +546,118 @@ fn metric_of(msg: &RouteMessage) -> u32 {
 
 // ── Snapshot mutation ─────────────────────────────────────────────────────────
 
-/// Applies a `RTM_NEWROUTE` event to the snapshot.
+/// Adds a route from the initial dump. Dumps list routes in kernel order, so
+/// each route goes to the end of its slot.
 ///
-/// Returns `true` if the snapshot changed (an entry was added or updated),
-/// `false` if the route was filtered (BGP protocol, wrong table, non-unicast)
-/// or was an exact duplicate of an existing entry.
-fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
+/// An IPv6 dump message describes its first leg only. `fib6_dump_node` never
+/// dumps the other siblings separately, so their protocol is inferred from
+/// the first (see the `route` module docs) until a message reports it.
+fn apply_dumped(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
+    if !in_table(msg, table) {
+        return false;
+    }
     match msg.header.address_family {
-        AddressFamily::Inet => {
-            let Some(entry) = parse_v4(msg, table) else {
-                return false;
-            };
-            if let Some(slot) = snap
-                .v4
-                .iter_mut()
-                .find(|e| e.network == entry.network && e.prefix_len == entry.prefix_len)
-            {
-                if *slot == entry {
-                    return false; // no-op duplicate
-                }
-                *slot = entry;
-            } else {
-                snap.v4.push(entry);
-            }
-            true
-        }
+        AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.insert(r, Position::Back)),
         AddressFamily::Inet6 => {
-            let Some(entry) = parse_v6(msg, table) else {
+            let mut legs = decode_v6(msg).into_iter();
+            let Some(first) = legs.next() else {
                 return false;
             };
-            if let Some(slot) = snap
-                .v6
-                .iter_mut()
-                .find(|e| e.network == entry.network && e.prefix_len == entry.prefix_len)
-            {
-                if *slot == entry {
-                    return false;
-                }
-                *slot = entry;
-            } else {
-                snap.v6.push(entry);
+            let mut changed = snap.v6.upsert(first, Position::Back);
+            for leg in legs {
+                changed |= snap.v6.insert(protocol_inferred(leg), Position::Back);
             }
-            true
+            changed
         }
         _ => false,
     }
 }
 
-/// Applies a `RTM_DELROUTE` event to the snapshot.
+/// Applies a `RTM_NEWROUTE` notification whose netlink header carried `flags`.
 ///
-/// Returns `true` if an entry was actually removed, `false` if the route was
-/// filtered (BGP protocol, wrong table) or was already absent.
+/// Returns `true` if the tracked routes changed. Every route is mirrored, so
+/// that replacements displace the right one, but BGP and non-unicast routes
+/// never count as a change.
+///
+/// - `NLM_F_REPLACE`: the kernel replaced an existing route in place and sent
+///   no `RTM_DELROUTE` for it (`fib_table_insert`, `fib6_add_rt2node`).
+/// - IPv4 without `NLM_F_REPLACE`: inserted at the end of its slot with
+///   `NLM_F_APPEND`, otherwise at the front (`fib_table_insert`).
+/// - IPv6 without `NLM_F_REPLACE`: always at the end of its slot
+///   (`fib6_add_rt2node`).
+///
+/// For IPv6 the header describes the first `RTA_MULTIPATH` leg. Without
+/// `NLM_F_APPEND`, every leg not yet mirrored comes from the same request
+/// (`ip6_route_multipath_add` reports its first new route), so it shares the
+/// header's protocol. With `NLM_F_APPEND`, `ip6_route_mpath_notify` reports
+/// the set's *first* sibling instead, which may be an older route of another
+/// protocol, so new legs get that protocol as an inference. Legs already
+/// mirrored keep what is known about them.
+///
+/// A route that is already mirrored is not added again, so replaying an event
+/// that the initial dump already reflected is harmless.
+fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32) -> bool {
+    if !in_table(msg, table) {
+        return false;
+    }
+    let replace = flags & NLM_F_REPLACE != 0;
+    let append = flags & NLM_F_APPEND != 0;
+    match msg.header.address_family {
+        AddressFamily::Inet => {
+            let Some(route) = decode_v4(msg) else {
+                return false;
+            };
+            if replace {
+                snap.v4.replace(route)
+            } else if append {
+                snap.v4.insert(route, Position::Back)
+            } else {
+                snap.v4.insert(route, Position::Front)
+            }
+        }
+        AddressFamily::Inet6 => {
+            let mut legs = decode_v6(msg).into_iter();
+            let Some(first) = legs.next() else {
+                return false;
+            };
+            let mut changed = if replace {
+                snap.v6.replace(first)
+            } else {
+                snap.v6.upsert(first, Position::Back)
+            };
+            for leg in legs {
+                let leg = if append { protocol_inferred(leg) } else { leg };
+                changed |= snap.v6.insert(leg, Position::Back);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// An IPv6 ECMP leg whose message describes another sibling: its protocol is
+/// not in the message, so the described sibling's protocol (already on the
+/// leg from the header) is marked as an inference.
+fn protocol_inferred(mut leg: KernelRouteV6) -> KernelRouteV6 {
+    leg.protocol_inferred = true;
+    leg
+}
+
+/// Applies a `RTM_DELROUTE` notification.
+///
+/// The kernel reports the identity of the route it removed, so exactly that
+/// route is removed here and other routes for the same prefix remain. This
+/// applies to BGP routes too: a BGP leg can share an ECMP set with a static one.
+/// Returns `true` if the tracked routes changed.
 fn apply_del(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
-    if !in_table(msg, table) || is_bgp_route(msg) {
+    if !in_table(msg, table) {
         return false;
     }
     match msg.header.address_family {
-        AddressFamily::Inet => {
-            let prefix_len = msg.header.destination_prefix_length;
-            let network = msg
-                .attributes
-                .iter()
-                .find_map(|a| {
-                    if let RouteAttribute::Destination(RouteAddress::Inet(v4)) = a {
-                        Some(*v4)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(Ipv4Addr::UNSPECIFIED);
-            let before = snap.v4.len();
-            snap.v4
-                .retain(|e| !(e.network == network && e.prefix_len == prefix_len));
-            snap.v4.len() < before
-        }
-        AddressFamily::Inet6 => {
-            let prefix_len = msg.header.destination_prefix_length;
-            let network = msg
-                .attributes
-                .iter()
-                .find_map(|a| {
-                    if let RouteAttribute::Destination(RouteAddress::Inet6(v6)) = a {
-                        Some(*v6)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(Ipv6Addr::UNSPECIFIED);
-            let before = snap.v6.len();
-            snap.v6
-                .retain(|e| !(e.network == network && e.prefix_len == prefix_len));
-            snap.v6.len() < before
-        }
+        AddressFamily::Inet => decode_v4(msg).is_some_and(|r| snap.v4.remove(&r)),
+        AddressFamily::Inet6 => decode_v6(msg)
+            .iter()
+            .fold(false, |changed, r| snap.v6.remove(r) | changed),
         _ => false,
     }
 }
@@ -970,111 +1100,876 @@ mod tests {
         );
     }
 
-    // ── parse_v4 — BGP exclusion ──────────────────────────────────────────────
+    // ── Fixtures for the identity tests ──────────────────────────────────────
+    //
+    // Notification flags as the kernel sets them on the RTM_NEWROUTE it
+    // multicasts (fib_table_insert / fib6_add_rt2node):
+    // - a new route in an empty slot: NLM_F_EXCL | NLM_F_CREATE;
+    // - `ip route append` into an occupied IPv4 slot: NLM_F_CREATE | NLM_F_APPEND;
+    // - `ip route replace` of an existing route: NLM_F_REPLACE.
+    const CREATE: u16 = netlink_packet_core::NLM_F_EXCL | netlink_packet_core::NLM_F_CREATE;
+    const APPEND: u16 = netlink_packet_core::NLM_F_CREATE | NLM_F_APPEND;
+    const REPLACE: u16 = NLM_F_REPLACE;
+
+    fn with_gateway(mut msg: RouteMessage, gateway: &str) -> RouteMessage {
+        let addr = match gateway.parse::<IpAddr>().unwrap() {
+            IpAddr::V4(v4) => RouteAddress::Inet(v4),
+            IpAddr::V6(v6) => RouteAddress::Inet6(v6),
+        };
+        msg.attributes.push(RouteAttribute::Gateway(addr));
+        msg
+    }
+
+    fn with_oif(mut msg: RouteMessage, oif: u32) -> RouteMessage {
+        msg.attributes.push(RouteAttribute::Oif(oif));
+        msg
+    }
+
+    /// An IPv6 message for an ECMP sibling set, as `rt6_fill_node` encodes it.
+    fn ecmp_v6_msg(
+        network: &str,
+        prefix_len: u8,
+        metric: u32,
+        legs: &[(&str, u32)],
+    ) -> RouteMessage {
+        let mut msg = igp_v6_msg(network, prefix_len, metric, 254);
+        let legs = legs
+            .iter()
+            .map(|&(gw, oif)| {
+                let mut leg = RouteNextHop::default();
+                leg.interface_index = oif;
+                leg.attributes
+                    .push(RouteAttribute::Gateway(RouteAddress::Inet6(
+                        gw.parse().unwrap(),
+                    )));
+                leg
+            })
+            .collect();
+        msg.attributes.push(RouteAttribute::MultiPath(legs));
+        msg
+    }
+
+    fn metric_v4(snap: &FibSnapshot, addr: &str) -> Option<u32> {
+        snap.igp_metric_v4(addr.parse().unwrap())
+    }
+
+    fn metric_v6(snap: &FibSnapshot, addr: &str) -> Option<u32> {
+        snap.igp_metric_v6(addr.parse().unwrap())
+    }
+
+    // ── Tracking policy ──────────────────────────────────────────────────────
 
     #[test]
-    fn parse_v4_rejects_bgp_route() {
+    fn bgp_and_non_unicast_routes_are_not_tracked() {
         assert!(
-            parse_v4(&bgp_v4_msg("10.0.0.0", 8, 254), 254).is_none(),
-            "BGP routes must not enter FibSnapshot"
+            !decode_v4(&bgp_v4_msg("10.0.0.0", 8, 254))
+                .unwrap()
+                .is_tracked()
         );
-    }
-
-    #[test]
-    fn parse_v4_accepts_igp_route() {
-        let entry =
-            parse_v4(&igp_v4_msg("10.0.0.0", 8, 100, 254), 254).expect("IGP route must be parsed");
-        assert_eq!(entry.network, "10.0.0.0".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(entry.prefix_len, 8);
-        assert_eq!(entry.metric, 100);
-    }
-
-    // ── parse_v6 — BGP exclusion ──────────────────────────────────────────────
-
-    #[test]
-    fn parse_v6_rejects_bgp_route() {
+        assert!(!decode_v6(&bgp_v6_msg("2001:db8::", 32, 254))[0].is_tracked());
+        let mut blackhole = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        blackhole.header.kind = RouteType::BlackHole;
+        assert!(!decode_v4(&blackhole).unwrap().is_tracked());
         assert!(
-            parse_v6(&bgp_v6_msg("2001:db8::", 32, 254), 254).is_none(),
-            "BGP routes must not enter FibSnapshot"
+            decode_v4(&igp_v4_msg("10.0.0.0", 8, 100, 254))
+                .unwrap()
+                .is_tracked()
         );
-    }
-
-    #[test]
-    fn parse_v6_accepts_igp_route() {
-        let entry = parse_v6(&igp_v6_msg("2001:db8::", 32, 50, 254), 254)
-            .expect("IGP route must be parsed");
-        assert_eq!(entry.network, "2001:db8::".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(entry.prefix_len, 32);
-        assert_eq!(entry.metric, 50);
-    }
-
-    // ── apply_new ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn apply_new_igp_route_returns_true_and_updates_snapshot() {
-        let mut snap = FibSnapshot::new();
-        assert!(apply_new(
-            &mut snap,
-            &igp_v4_msg("192.168.0.0", 24, 10, 254),
-            254
-        ));
-        assert_eq!(snap.v4.len(), 1);
     }
 
     #[test]
     fn apply_new_bgp_route_returns_false_and_leaves_snapshot_empty() {
         let mut snap = FibSnapshot::new();
-        assert!(
-            !apply_new(&mut snap, &bgp_v4_msg("10.0.0.0", 8, 254), 254),
-            "BGP route must not change snapshot or signal change"
-        );
-        assert!(snap.v4.is_empty());
+        assert!(!apply_new(
+            &mut snap,
+            &bgp_v4_msg("10.0.0.0", 8, 254),
+            CREATE,
+            254
+        ));
+        assert!(!apply_new(
+            &mut snap,
+            &bgp_v6_msg("2001:db8::", 32, 254),
+            CREATE,
+            254
+        ));
+        // Mirrored for slot bookkeeping, but never used or reported.
+        assert_eq!(snap.routes_v4().count() + snap.routes_v6().count(), 0);
+        assert_eq!(snap.igp_metric_v4("10.1.1.1".parse().unwrap()), None);
+        assert_eq!(snap.igp_metric_v6("2001:db8::1".parse().unwrap()), None);
     }
 
     #[test]
-    fn apply_new_duplicate_igp_route_returns_false() {
+    fn apply_new_rejects_route_in_wrong_table() {
         let mut snap = FibSnapshot::new();
-        let msg = igp_v4_msg("192.168.0.0", 24, 10, 254);
-        apply_new(&mut snap, &msg, 254);
+        assert!(!apply_new(
+            &mut snap,
+            &igp_v4_msg("10.0.0.0", 8, 100, 200),
+            CREATE,
+            254
+        ));
+        assert!(!apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 100, 200),
+            CREATE,
+            254
+        ));
+        assert!(snap.v4.is_empty() && snap.v6.is_empty());
+    }
+
+    #[test]
+    fn apply_del_bgp_route_returns_false() {
+        let mut snap = FibSnapshot::new();
+        apply_new(&mut snap, &igp_v4_msg("10.0.0.0", 8, 20, 254), CREATE, 254);
+        let mut del = igp_v4_msg("10.0.0.0", 8, 20, 254);
+        del.header.protocol = RouteProtocol::Bgp;
         assert!(
-            !apply_new(&mut snap, &msg, 254),
-            "identical re-insert must not fire change notification"
+            !apply_del(&mut snap, &del, 254),
+            "BGP DelRoute must not signal change"
         );
         assert_eq!(snap.v4.len(), 1);
     }
 
+    // ── Decoding ─────────────────────────────────────────────────────────────
+
     #[test]
-    fn apply_new_metric_change_returns_true() {
-        let mut snap = FibSnapshot::new();
-        apply_new(&mut snap, &igp_v4_msg("192.168.0.0", 24, 10, 254), 254);
-        assert!(
-            apply_new(&mut snap, &igp_v4_msg("192.168.0.0", 24, 20, 254), 254),
-            "metric change on existing prefix must fire change notification"
+    fn decode_v4_reads_every_identity_field() {
+        let mut msg = with_oif(
+            with_gateway(igp_v4_msg("10.1.0.0", 16, 30, 254), "192.0.2.1"),
+            7,
         );
-        assert_eq!(snap.v4[0].metric, 20);
+        msg.header.tos = 0x10;
+        msg.attributes
+            .push(RouteAttribute::PrefSource(RouteAddress::Inet(
+                "192.0.2.9".parse().unwrap(),
+            )));
+        let r = decode_v4(&msg).unwrap();
+        assert_eq!(r.kind, u8::from(RouteType::Unicast));
+        assert_eq!(r.slot.table, TableId::MAIN);
+        assert_eq!(r.slot.dst.to_string(), "10.1.0.0/16");
+        assert_eq!(r.slot.tos, 0x10);
+        assert_eq!(r.slot.priority, 30);
+        assert_eq!(r.protocol, u8::from(RouteProtocol::Ospf));
+        assert_eq!(r.prefsrc, Some("192.0.2.9".parse().unwrap()));
+        assert_eq!(
+            r.next_hop,
+            NextHopV4::Path(NextHopPath {
+                gateway: Some("192.0.2.1".parse().unwrap()),
+                oif: NonZeroU32::new(7),
+            })
+        );
     }
 
-    // ── apply_del ─────────────────────────────────────────────────────────────
+    #[test]
+    fn decode_v4_default_route_without_destination_is_zero_prefix() {
+        // fib_dump_info omits RTA_DST when the prefix length is 0.
+        let mut msg = RouteMessage::default();
+        msg.header.address_family = AddressFamily::Inet;
+        msg.header.kind = RouteType::Unicast;
+        msg.header.table = 254;
+        let r = decode_v4(&msg).unwrap();
+        assert_eq!(r.slot.dst, Ipv4Prefix::DEFAULT);
+        assert_eq!(r.slot.priority, 0, "absent RTA_PRIORITY means priority 0");
+    }
 
     #[test]
-    fn apply_del_igp_route_returns_true_when_present() {
+    fn decode_rejects_unspecified_table_and_host_bits() {
+        let mut msg = igp_v4_msg("10.0.0.0", 8, 1, 254);
+        msg.header.table = 0;
+        assert!(
+            decode_v4(&msg).is_none(),
+            "RT_TABLE_UNSPEC is not a real table"
+        );
+        // fib_valid_key_len: "Invalid prefix for given prefix length".
+        assert!(decode_v4(&igp_v4_msg("10.0.0.1", 8, 1, 254)).is_none());
+        assert_eq!(
+            decode_v6(&igp_v6_msg("2001:db8::1", 32, 1, 254)),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn route_table_uses_rta_table_attribute_when_present() {
+        let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        // Table IDs > 255 are stored in RTA_TABLE, not the header byte.
+        msg.attributes.push(RouteAttribute::Table(300));
+        assert_eq!(route_table(&msg), 300);
+        assert_eq!(decode_v4(&msg).unwrap().slot.table.get(), 300);
+    }
+
+    #[test]
+    fn route_table_falls_back_to_header_when_no_attribute() {
+        let msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
+        assert_eq!(route_table(&msg), 254);
+    }
+
+    #[test]
+    fn in_table_zero_matches_any_table() {
+        let msg = igp_v4_msg("10.0.0.0", 8, 100, 200);
+        assert!(
+            in_table(&msg, 0),
+            "table 0 must match routes from any table"
+        );
+    }
+
+    #[test]
+    fn decode_reads_nexthop_object_id() {
+        // RTA_NH_ID is a host-order u32 (nla_put_u32 in rt6_fill_node /
+        // fib_dump_info).
+        let nh = RouteAttribute::Other(netlink_packet_core::DefaultNla::new(
+            RTA_NH_ID,
+            42u32.to_ne_bytes().to_vec(),
+        ));
+        let mut v4 = igp_v4_msg("10.0.0.0", 8, 1, 254);
+        v4.attributes.push(nh.clone());
+        assert_eq!(decode_v4(&v4).unwrap().next_hop, NextHopV4::Object(42));
+
+        // Even if compat mode adds RTA_MULTIPATH, a nexthop-object route is one
+        // route and is not split.
+        let mut v6 = ecmp_v6_msg("2001:db8::", 32, 1, &[("fe80::1", 2), ("fe80::2", 3)]);
+        v6.attributes.push(nh);
+        let routes = decode_v6(&v6);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].next_hop, NextHopV6::Object(42));
+    }
+
+    #[test]
+    fn decode_v4_keeps_multipath_legs_together() {
+        // An IPv4 multipath route is one fib_alias; it must stay one route.
+        let mut msg = igp_v4_msg("10.0.0.0", 8, 1, 254);
+        let legs = ["192.0.2.1", "192.0.2.2"]
+            .iter()
+            .zip([2u32, 3])
+            .map(|(gw, oif)| {
+                let mut leg = RouteNextHop::default();
+                leg.interface_index = oif;
+                leg.hops = 1;
+                leg.attributes
+                    .push(RouteAttribute::Gateway(RouteAddress::Inet(
+                        gw.parse().unwrap(),
+                    )));
+                leg
+            })
+            .collect();
+        msg.attributes.push(RouteAttribute::MultiPath(legs));
+        let NextHopV4::Multipath(legs) = decode_v4(&msg).unwrap().next_hop else {
+            panic!("expected multipath");
+        };
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[1].path.oif, NonZeroU32::new(3));
+        assert_eq!(legs[1].hops, 1);
+    }
+
+    #[test]
+    fn decode_v6_splits_ecmp_siblings_and_reads_source_prefix() {
+        let msg = ecmp_v6_msg("2001:db8::", 32, 5, &[("fe80::1", 2), ("fe80::2", 3)]);
+        let routes = decode_v6(&msg);
+        assert_eq!(routes.len(), 2);
+        assert!(
+            routes
+                .iter()
+                .all(|r| r.slot.priority == 5 && r.qualifies_for_ecmp())
+        );
+
+        let mut sourced = igp_v6_msg("2001:db8::", 32, 5, 254);
+        sourced.header.source_prefix_length = 48;
+        sourced
+            .attributes
+            .push(RouteAttribute::Source(RouteAddress::Inet6(
+                "2001:db8:1::".parse().unwrap(),
+            )));
+        assert_eq!(
+            decode_v6(&sourced)[0].slot.src.to_string(),
+            "2001:db8:1::/48"
+        );
+    }
+
+    // ── Issue #56 acceptance: same prefix, metrics 10 and 100 ────────────────
+    //
+    // fib_table_insert groups IPv4 aliases by "[prefix,dscp,priority]" and
+    // fib6_add_rt2node groups IPv6 routes by metric, so two routes for one
+    // prefix with different priorities are two kernel routes. The lookup takes
+    // the lowest priority (fib_table_lookup walks aliases in ascending
+    // priority; fib6 nodes are sorted by metric). fib_table_delete and
+    // fib6_del remove exactly one route and report it in RTM_DELROUTE.
+
+    fn same_prefix_lifecycle(
+        primary: &RouteMessage,
+        backup: &RouteMessage,
+        metric: impl Fn(&FibSnapshot) -> Option<u32>,
+    ) {
+        for (first, second) in [(primary, backup), (backup, primary)] {
+            let mut snap = FibSnapshot::new();
+            assert!(apply_new(&mut snap, first, CREATE, 254));
+            assert!(
+                apply_new(&mut snap, second, CREATE, 254),
+                "a second priority for the same prefix is a new route"
+            );
+            assert_eq!(
+                metric(&snap),
+                Some(10),
+                "lowest priority wins in either order"
+            );
+
+            let mut backup_gone = snap.clone();
+            assert!(apply_del(&mut backup_gone, backup, 254));
+            assert_eq!(
+                metric(&backup_gone),
+                Some(10),
+                "deleting the backup keeps the primary"
+            );
+
+            let mut primary_gone = snap.clone();
+            assert!(apply_del(&mut primary_gone, primary, 254));
+            assert_eq!(
+                metric(&primary_gone),
+                Some(100),
+                "deleting the primary falls back"
+            );
+
+            assert!(apply_del(&mut primary_gone, backup, 254));
+            assert_eq!(metric(&primary_gone), None);
+        }
+    }
+
+    #[test]
+    fn ipv4_same_prefix_different_metrics_are_distinct_routes() {
+        same_prefix_lifecycle(
+            &igp_v4_msg("198.51.100.0", 24, 10, 254),
+            &igp_v4_msg("198.51.100.0", 24, 100, 254),
+            |s| metric_v4(s, "198.51.100.7"),
+        );
+    }
+
+    #[test]
+    fn ipv6_same_prefix_different_metrics_are_distinct_routes() {
+        same_prefix_lifecycle(
+            &igp_v6_msg("2001:db8:1::", 64, 10, 254),
+            &igp_v6_msg("2001:db8:1::", 64, 100, 254),
+            |s| metric_v6(s, "2001:db8:1::7"),
+        );
+    }
+
+    #[test]
+    fn initial_dump_matches_incremental_state_in_any_order() {
+        let msgs = [
+            igp_v4_msg("198.51.100.0", 24, 100, 254),
+            igp_v4_msg("198.51.100.0", 24, 10, 254),
+            igp_v6_msg("2001:db8:1::", 64, 100, 254),
+            igp_v6_msg("2001:db8:1::", 64, 10, 254),
+        ];
+        let mut incremental = FibSnapshot::new();
+        for m in &msgs {
+            apply_new(&mut incremental, m, CREATE, 254);
+        }
+        for order in [[0, 1, 2, 3], [1, 0, 3, 2]] {
+            let mut dumped = FibSnapshot::new();
+            for i in order {
+                apply_dumped(&mut dumped, &msgs[i], 254);
+            }
+            assert_eq!(metric_v4(&dumped, "198.51.100.7"), Some(10));
+            assert_eq!(metric_v6(&dumped, "2001:db8:1::7"), Some(10));
+            assert_eq!(dumped.v4.len(), incremental.v4.len());
+            assert_eq!(dumped.v6.len(), incremental.v6.len());
+            // Events that arrived during the dump are replayed afterwards; the
+            // replay must not change anything.
+            for m in &msgs {
+                assert!(!apply_new(&mut dumped, m, CREATE, 254));
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_notification_is_not_a_change() {
         let mut snap = FibSnapshot::new();
-        apply_new(&mut snap, &igp_v4_msg("192.168.0.0", 24, 10, 254), 254);
-        assert!(apply_del(
+        let msg = igp_v4_msg("192.168.0.0", 24, 10, 254);
+        assert!(apply_new(&mut snap, &msg, CREATE, 254));
+        assert!(!apply_new(&mut snap, &msg, CREATE, 254));
+        let msg6 = igp_v6_msg("2001:db8::", 32, 50, 254);
+        assert!(apply_new(&mut snap, &msg6, CREATE, 254));
+        assert!(!apply_new(&mut snap, &msg6, CREATE, 254));
+        assert_eq!((snap.v4.len(), snap.v6.len()), (1, 1));
+    }
+
+    #[test]
+    fn delete_of_absent_route_is_not_a_change() {
+        let mut snap = FibSnapshot::new();
+        apply_new(
             &mut snap,
-            &igp_v4_msg("192.168.0.0", 24, 0, 254),
+            &igp_v4_msg("192.168.0.0", 24, 10, 254),
+            CREATE,
+            254,
+        );
+        // Same prefix, different priority: a different route, so nothing goes.
+        assert!(!apply_del(
+            &mut snap,
+            &igp_v4_msg("192.168.0.0", 24, 20, 254),
             254
         ));
-        assert!(snap.v4.is_empty());
+        assert!(!apply_del(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 0, 254),
+            254
+        ));
+        assert_eq!(snap.v4.len(), 1);
+    }
+
+    // ── Other identity selectors ─────────────────────────────────────────────
+
+    #[test]
+    fn same_prefix_in_two_tables_are_distinct_when_tracking_all_tables() {
+        let mut snap = FibSnapshot::new();
+        let main = igp_v4_msg("10.0.0.0", 8, 10, 254);
+        let other = igp_v4_msg("10.0.0.0", 8, 10, 100);
+        assert!(apply_new(&mut snap, &main, CREATE, 0));
+        assert!(apply_new(&mut snap, &other, CREATE, 0));
+        assert_eq!(snap.v4.len(), 2);
+        assert!(apply_del(&mut snap, &main, 0));
+        assert_eq!(
+            metric_v4(&snap, "10.1.1.1"),
+            Some(10),
+            "table 100's route remains"
+        );
     }
 
     #[test]
-    fn apply_del_igp_route_returns_false_when_absent() {
+    fn tos_route_neither_overwrites_nor_serves_best_effort_lookups() {
+        // fib_table_lookup: `if (fa->fa_dscp && !fib_dscp_masked_match(...))
+        // continue;` — a DSCP-specific alias does not match other traffic.
         let mut snap = FibSnapshot::new();
+        let plain = igp_v4_msg("10.0.0.0", 8, 50, 254);
+        let mut tos = igp_v4_msg("10.0.0.0", 8, 5, 254);
+        tos.header.tos = 0x10;
+        apply_new(&mut snap, &plain, CREATE, 254);
+        assert!(apply_new(&mut snap, &tos, CREATE, 254));
+        assert_eq!(metric_v4(&snap, "10.1.1.1"), Some(50));
+        assert!(apply_del(&mut snap, &tos, 254));
+        assert_eq!(metric_v4(&snap, "10.1.1.1"), Some(50));
+        assert!(apply_del(&mut snap, &plain, 254));
         assert!(
-            !apply_del(&mut snap, &igp_v4_msg("192.168.0.0", 24, 0, 254), 254),
-            "delete of absent route must not signal change"
+            !apply_new(&mut FibSnapshot::new(), &tos, CREATE, 1),
+            "wrong table"
         );
+        apply_new(&mut snap, &tos, CREATE, 254);
+        assert_eq!(
+            metric_v4(&snap, "10.1.1.1"),
+            None,
+            "only a TOS route: no best-effort route"
+        );
+    }
+
+    #[test]
+    fn appended_ipv4_aliases_in_one_slot_are_deleted_individually() {
+        // `ip route append`: same [prefix, dscp, priority], different next hop.
+        let mut snap = FibSnapshot::new();
+        let a = with_gateway(igp_v4_msg("10.0.0.0", 8, 10, 254), "192.0.2.1");
+        let b = with_gateway(igp_v4_msg("10.0.0.0", 8, 10, 254), "192.0.2.2");
+        assert!(apply_new(&mut snap, &a, CREATE, 254));
+        assert!(apply_new(&mut snap, &b, APPEND, 254));
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(
+            metric_v4(&snap, "10.1.1.1"),
+            Some(10),
+            "b is still installed"
+        );
+    }
+
+    // ── NLM_F_REPLACE ────────────────────────────────────────────────────────
+
+    #[test]
+    fn ipv4_replace_swaps_the_slots_first_alias_without_a_delete() {
+        let mut snap = FibSnapshot::new();
+        let old = with_gateway(igp_v4_msg("10.0.0.0", 8, 10, 254), "192.0.2.1");
+        let new = with_gateway(igp_v4_msg("10.0.0.0", 8, 10, 254), "192.0.2.2");
+        apply_new(&mut snap, &old, CREATE, 254);
+        assert!(apply_new(&mut snap, &new, REPLACE, 254));
+        assert_eq!(snap.v4.len(), 1);
+        assert!(!apply_del(&mut snap, &old, 254), "the old alias is gone");
+        assert!(apply_del(&mut snap, &new, 254));
+    }
+
+    #[test]
+    fn bgp_replacing_an_igp_route_removes_it_from_the_snapshot() {
+        // FibWriter installs with NLM_F_REPLACE. With the same prefix and
+        // priority as an IGP route, the kernel replaces the IGP alias; the
+        // only notification is RTM_NEWROUTE for the BGP route.
+        let mut snap = FibSnapshot::new();
+        apply_new(&mut snap, &igp_v4_msg("10.0.0.0", 8, 20, 254), CREATE, 254);
+        apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 20, 254),
+            CREATE,
+            254,
+        );
+        assert!(apply_new(
+            &mut snap,
+            &bgp_v4_msg("10.0.0.0", 8, 254),
+            REPLACE,
+            254
+        ));
+        assert!(apply_new(
+            &mut snap,
+            &bgp_v6_msg("2001:db8::", 32, 254),
+            REPLACE,
+            254
+        ));
+        assert_eq!(snap.routes_v4().count() + snap.routes_v6().count(), 0);
+    }
+
+    // ── PR #122 review: untracked routes in the same slot / ECMP set ─────────
+
+    #[test]
+    fn replacing_a_leading_bgp_alias_keeps_the_static_alias_behind_it() {
+        // Kernel slot order [BGP via .1, static dev]. fib_table_insert with
+        // NLM_F_REPLACE swaps `fa_first` — the BGP alias — and leaves the
+        // static alias in place.
+        let bgp1 = with_oif(
+            with_gateway(bgp_v4_msg("198.18.1.0", 24, 254), "192.0.2.1"),
+            2,
+        );
+        let bgp2 = with_oif(
+            with_gateway(bgp_v4_msg("198.18.1.0", 24, 254), "192.0.2.2"),
+            2,
+        );
+        let mut static_route = with_oif(igp_v4_msg("198.18.1.0", 24, 20, 254), 2);
+        static_route.header.protocol = RouteProtocol::Static;
+
+        // Through the initial dump (kernel order) ...
+        let mut dumped = FibSnapshot::new();
+        apply_dumped(&mut dumped, &bgp1, 254);
+        apply_dumped(&mut dumped, &static_route, 254);
+        // ... and incrementally: static first, then BGP prepended
+        // (NLM_F_CREATE without NLM_F_APPEND goes to the front).
+        let mut incremental = FibSnapshot::new();
+        apply_new(&mut incremental, &static_route, CREATE, 254);
+        assert!(!apply_new(
+            &mut incremental,
+            &bgp1,
+            netlink_packet_core::NLM_F_CREATE,
+            254
+        ));
+
+        for snap in [&mut dumped, &mut incremental] {
+            assert_eq!(metric_v4(snap, "198.18.1.7"), Some(20));
+            assert!(
+                !apply_new(snap, &bgp2, REPLACE, 254),
+                "only the BGP alias was replaced"
+            );
+            assert_eq!(
+                metric_v4(snap, "198.18.1.7"),
+                Some(20),
+                "static alias survives"
+            );
+            assert!(!apply_del(snap, &bgp1, 254), "the old BGP alias is gone");
+            assert!(
+                !apply_del(snap, &bgp2, 254),
+                "untracked: no change signalled"
+            );
+            assert!(apply_del(snap, &static_route, 254));
+            assert_eq!(metric_v4(snap, "198.18.1.7"), None);
+        }
+    }
+
+    /// A one-leg IPv6 message (`RTM_DELROUTE` of one sibling, or a single add).
+    fn v6_leg(prefix: &str, gw: &str, protocol: RouteProtocol) -> RouteMessage {
+        let mut msg = with_oif(with_gateway(igp_v6_msg(prefix, 64, 10, 254), gw), 2);
+        msg.header.protocol = protocol;
+        msg
+    }
+
+    /// The single dump message for an ECMP set: `fib6_dump_node` dumps the set
+    /// once, headed by its first sibling, then skips the other siblings.
+    fn v6_set_dump(prefix: &str, first: RouteProtocol, legs: &[&str]) -> RouteMessage {
+        let legs: Vec<_> = legs.iter().map(|gw| (*gw, 2)).collect();
+        let mut msg = ecmp_v6_msg(prefix, 64, 10, &legs);
+        msg.header.protocol = first;
+        msg
+    }
+
+    #[test]
+    fn dumped_static_ecmp_set_keeps_the_surviving_sibling() {
+        // PR #122 review round 2: both siblings are static, but the dump
+        // describes only the first. Deleting it must leave the second usable.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:200::",
+                RouteProtocol::Static,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(snap.routes_v6().count(), 2);
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:200::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:200::1"), Some(10));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:200::", "fe80::2", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:200::1"), None);
+    }
+
+    #[test]
+    fn dumped_all_bgp_ecmp_set_is_not_igp_reachability() {
+        // PR #122 review round 3: two BGP siblings and nothing else. Live
+        // events report each BGP route, so the running snapshot has no path;
+        // a restart's dump must agree.
+        let mut live = FibSnapshot::new();
+        apply_new(
+            &mut live,
+            &v6_leg("2001:db8:203::", "fe80::1", RouteProtocol::Bgp),
+            APPEND,
+            254,
+        );
+        let second = v6_set_dump(
+            "2001:db8:203::",
+            RouteProtocol::Bgp,
+            &["fe80::2", "fe80::1"],
+        );
+        apply_new(&mut live, &second, APPEND, 254);
+        assert_eq!(metric_v6(&live, "2001:db8:203::1"), None);
+
+        let mut dumped = FibSnapshot::new();
+        apply_dumped(
+            &mut dumped,
+            &v6_set_dump(
+                "2001:db8:203::",
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(
+            metric_v6(&dumped, "2001:db8:203::1"),
+            None,
+            "dump agrees with live"
+        );
+        assert_eq!(dumped.v6.len(), 2, "both siblings mirrored");
+    }
+
+    #[test]
+    fn dumped_mixed_ecmp_set_headed_by_bgp_follows_the_documented_inference() {
+        // The dump message for a BGP-first static+BGP set is the same as for
+        // an all-BGP set, so the static sibling is inferred to be BGP. That is
+        // the documented cost of keeping all-BGP sets out (see the `route`
+        // module docs). A later message reporting the static route fixes it.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:202::",
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), None);
+        let reported = v6_leg("2001:db8:202::", "fe80::2", RouteProtocol::Static);
+        assert!(apply_new(&mut snap, &reported, REPLACE, 254));
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), Some(10));
+        assert!(apply_del(&mut snap, &reported, 254));
+        assert!(!apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:202::", "fe80::1", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn dumped_mixed_ecmp_set_headed_by_static_clears_after_both_deletes() {
+        // Review round 1: the BGP sibling's protocol is not in the dump, so it
+        // is inferred to be static (the documented mixed-set limit) and counts
+        // until deleted; its delete must be applied.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:99::",
+                RouteProtocol::Static,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), Some(10));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::2", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), None);
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn incremental_mixed_ecmp_set_knows_each_siblings_protocol() {
+        // Single-route appends: each RTM_NEWROUTE is headed by the route it
+        // adds (fib6_add_rt2node → inet6_rt_notify(rt)), so protocols are known.
+        let mut snap = FibSnapshot::new();
+        apply_new(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            APPEND,
+            254,
+        );
+        let mut bgp_added =
+            v6_set_dump("2001:db8:99::", RouteProtocol::Bgp, &["fe80::2", "fe80::1"]);
+        bgp_added.header.protocol = RouteProtocol::Bgp;
+        assert!(!apply_new(&mut snap, &bgp_added, APPEND, 254));
+        assert_eq!(
+            snap.routes_v6().count(),
+            1,
+            "only the static sibling is tracked"
+        );
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8:99::1"),
+            None,
+            "the remaining sibling is BGP"
+        );
+        assert!(!apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::2", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn multipath_append_legs_infer_the_described_siblings_protocol() {
+        // ip6_route_mpath_notify reports the set's *first* sibling for an
+        // NLM_F_APPEND multipath add, so the header says nothing about the
+        // appended legs.
+        let mut snap = FibSnapshot::new();
+        let a = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::1"),
+            2,
+        );
+        apply_new(&mut snap, &a, CREATE, 254);
+        let appended = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 2)]);
+        assert!(apply_new(&mut snap, &appended, APPEND, 254));
+        let inferred: Vec<_> = snap.routes_v6().map(|r| r.protocol_inferred).collect();
+        assert!(inferred.contains(&true) && inferred.contains(&false));
+        assert!(
+            snap.routes_v6()
+                .all(|r| r.protocol == u8::from(RouteProtocol::Ospf))
+        );
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8::1"),
+            Some(10),
+            "appended leg still a path"
+        );
+    }
+
+    #[test]
+    fn multipath_create_legs_share_the_header_protocol() {
+        // Without NLM_F_APPEND, ip6_route_multipath_add reports its first new
+        // route, and every leg not yet seen comes from the same request.
+        let mut snap = FibSnapshot::new();
+        let set = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 3)]);
+        assert!(apply_new(&mut snap, &set, CREATE, 254));
+        assert_eq!(snap.routes_v6().count(), 2);
+        let a = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::1"),
+            2,
+        );
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(metric_v6(&snap, "2001:db8::1"), Some(10));
+    }
+
+    #[test]
+    fn ipv6_ecmp_sibling_add_and_delete_track_each_sibling() {
+        // Appending sibling B to A: one RTM_NEWROUTE listing [B, A]. Deleting
+        // B alone: RTM_DELROUTE for B only (fib6_del_route clears the sibling
+        // count before inet6_rt_notify).
+        let mut snap = FibSnapshot::new();
+        let a = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::1"),
+            2,
+        );
+        let b = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::2"),
+            3,
+        );
+        let both = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::2", 3), ("fe80::1", 2)]);
+        assert!(apply_new(&mut snap, &a, CREATE, 254));
+        assert!(apply_new(&mut snap, &both, APPEND, 254));
+        assert_eq!(snap.v6.len(), 2);
+        assert!(apply_del(&mut snap, &b, 254));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8::1"),
+            Some(10),
+            "sibling A survives"
+        );
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(metric_v6(&snap, "2001:db8::1"), None);
+    }
+
+    #[test]
+    fn ipv6_delete_all_siblings_in_one_message() {
+        // __ip6_del_rt_siblings with fc_delete_all_nh sends one RTM_DELROUTE
+        // listing every sibling.
+        let mut snap = FibSnapshot::new();
+        let both = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 3)]);
+        apply_new(&mut snap, &both, CREATE, 254);
+        assert!(apply_del(&mut snap, &both, 254));
+        assert!(snap.v6.is_empty());
+    }
+
+    #[test]
+    fn ipv6_replace_of_ecmp_set_removes_every_sibling() {
+        // fib6_add_rt2node: "Replacing an ECMP route, remove all siblings".
+        let mut snap = FibSnapshot::new();
+        apply_new(
+            &mut snap,
+            &ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 3)]),
+            CREATE,
+            254,
+        );
+        let c = with_oif(
+            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::3"),
+            4,
+        );
+        assert!(apply_new(&mut snap, &c, REPLACE, 254));
+        assert_eq!(snap.v6.len(), 1);
+        assert!(apply_del(&mut snap, &c, 254));
+        assert!(snap.v6.is_empty());
+    }
+
+    #[test]
+    fn ipv6_replace_leaves_other_metrics_alone() {
+        let mut snap = FibSnapshot::new();
+        apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 10, 254),
+            CREATE,
+            254,
+        );
+        apply_new(
+            &mut snap,
+            &igp_v6_msg("2001:db8::", 32, 100, 254),
+            CREATE,
+            254,
+        );
+        let replacement = with_oif(igp_v6_msg("2001:db8::", 32, 100, 254), 9);
+        assert!(apply_new(&mut snap, &replacement, REPLACE, 254));
+        assert_eq!(snap.v6.len(), 2);
+        assert_eq!(metric_v6(&snap, "2001:db8::1"), Some(10));
     }
 
     // ── dump_stale_bgp filter logic ───────────────────────────────────────────
@@ -1111,198 +2006,5 @@ mod tests {
     fn dump_stale_v6_excludes_igp_route() {
         let msg = igp_v6_msg("2001:db8::", 32, 100, 254);
         assert!(!is_bgp_route(&msg));
-    }
-
-    #[test]
-    fn apply_del_bgp_route_returns_false_always() {
-        // Even if a BGP route somehow appeared in the snapshot, its RTM_DELROUTE
-        // event must not trigger a change notification.
-        let mut snap = FibSnapshot::new();
-        snap.v4.push(FibEntry4 {
-            network: "10.0.0.0".parse().unwrap(),
-            prefix_len: 8,
-            metric: 20,
-        });
-        assert!(
-            !apply_del(&mut snap, &bgp_v4_msg("10.0.0.0", 8, 254), 254),
-            "BGP DelRoute must not signal change"
-        );
-        // The smuggled entry is untouched — apply_del was a no-op for BGP.
-        assert_eq!(snap.v4.len(), 1);
-    }
-
-    // ── parse_v4 — non-unicast and wrong-table filtering ─────────────────────
-
-    #[test]
-    fn parse_v4_rejects_non_unicast_route() {
-        let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
-        msg.header.kind = RouteType::BlackHole;
-        assert!(
-            parse_v4(&msg, 254).is_none(),
-            "non-unicast route must be filtered"
-        );
-    }
-
-    #[test]
-    fn parse_v4_rejects_route_in_wrong_table() {
-        assert!(
-            parse_v4(&igp_v4_msg("10.0.0.0", 8, 100, 200), 254).is_none(),
-            "route in table 200 must not appear in table 254 snapshot"
-        );
-    }
-
-    #[test]
-    fn parse_v4_default_route_uses_unspecified_network() {
-        // 0.0.0.0/0 may carry no Destination attribute — parse_v4 must default to UNSPECIFIED.
-        let mut msg = RouteMessage::default();
-        msg.header.address_family = AddressFamily::Inet;
-        msg.header.kind = RouteType::Unicast;
-        msg.header.protocol = RouteProtocol::Ospf;
-        msg.header.destination_prefix_length = 0;
-        msg.header.table = 254;
-        let entry = parse_v4(&msg, 254).expect("default route must be parsed");
-        assert_eq!(entry.network, Ipv4Addr::UNSPECIFIED);
-        assert_eq!(entry.prefix_len, 0);
-    }
-
-    // ── parse_v6 — non-unicast and wrong-table filtering ─────────────────────
-
-    #[test]
-    fn parse_v6_rejects_non_unicast_route() {
-        let mut msg = igp_v6_msg("2001:db8::", 32, 100, 254);
-        msg.header.kind = RouteType::BlackHole;
-        assert!(
-            parse_v6(&msg, 254).is_none(),
-            "non-unicast IPv6 route must be filtered"
-        );
-    }
-
-    #[test]
-    fn parse_v6_rejects_route_in_wrong_table() {
-        assert!(
-            parse_v6(&igp_v6_msg("2001:db8::", 32, 100, 200), 254).is_none(),
-            "IPv6 route in table 200 must not appear in table 254 snapshot"
-        );
-    }
-
-    // ── route_table — RTA_TABLE attribute override ────────────────────────────
-
-    #[test]
-    fn route_table_uses_rta_table_attribute_when_present() {
-        let mut msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
-        // Table IDs > 255 are stored in RTA_TABLE, not the header byte.
-        msg.attributes.push(RouteAttribute::Table(300));
-        assert_eq!(route_table(&msg), 300);
-    }
-
-    #[test]
-    fn route_table_falls_back_to_header_when_no_attribute() {
-        let msg = igp_v4_msg("10.0.0.0", 8, 100, 254);
-        assert_eq!(route_table(&msg), 254);
-    }
-
-    // ── in_table — table 0 matches everything ────────────────────────────────
-
-    #[test]
-    fn in_table_zero_matches_any_table() {
-        let msg = igp_v4_msg("10.0.0.0", 8, 100, 200);
-        assert!(
-            in_table(&msg, 0),
-            "table 0 must match routes from any table"
-        );
-    }
-
-    // ── apply_new — IPv6 path ─────────────────────────────────────────────────
-
-    #[test]
-    fn apply_new_ipv6_route_updates_snapshot() {
-        let mut snap = FibSnapshot::new();
-        assert!(apply_new(
-            &mut snap,
-            &igp_v6_msg("2001:db8::", 32, 50, 254),
-            254
-        ));
-        assert_eq!(snap.v6.len(), 1);
-        assert_eq!(
-            snap.v6[0].network,
-            "2001:db8::".parse::<Ipv6Addr>().unwrap()
-        );
-        assert_eq!(snap.v6[0].prefix_len, 32);
-        assert_eq!(snap.v6[0].metric, 50);
-    }
-
-    #[test]
-    fn apply_new_ipv6_duplicate_returns_false() {
-        let mut snap = FibSnapshot::new();
-        let msg = igp_v6_msg("2001:db8::", 32, 50, 254);
-        apply_new(&mut snap, &msg, 254);
-        assert!(
-            !apply_new(&mut snap, &msg, 254),
-            "identical IPv6 re-insert must not fire change"
-        );
-        assert_eq!(snap.v6.len(), 1);
-    }
-
-    #[test]
-    fn apply_new_ipv6_metric_change_returns_true() {
-        let mut snap = FibSnapshot::new();
-        apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 10, 254), 254);
-        assert!(apply_new(
-            &mut snap,
-            &igp_v6_msg("2001:db8::", 32, 20, 254),
-            254
-        ));
-        assert_eq!(snap.v6[0].metric, 20);
-    }
-
-    #[test]
-    fn apply_new_ipv6_bgp_route_returns_false() {
-        let mut snap = FibSnapshot::new();
-        assert!(!apply_new(
-            &mut snap,
-            &bgp_v6_msg("2001:db8::", 32, 254),
-            254
-        ));
-        assert!(snap.v6.is_empty());
-    }
-
-    // ── apply_del — IPv6 path ─────────────────────────────────────────────────
-
-    #[test]
-    fn apply_del_ipv6_route_returns_true_when_present() {
-        let mut snap = FibSnapshot::new();
-        apply_new(&mut snap, &igp_v6_msg("2001:db8::", 32, 50, 254), 254);
-        assert!(apply_del(
-            &mut snap,
-            &igp_v6_msg("2001:db8::", 32, 0, 254),
-            254
-        ));
-        assert!(snap.v6.is_empty());
-    }
-
-    #[test]
-    fn apply_del_ipv6_route_returns_false_when_absent() {
-        let mut snap = FibSnapshot::new();
-        assert!(!apply_del(
-            &mut snap,
-            &igp_v6_msg("2001:db8::", 32, 0, 254),
-            254
-        ));
-    }
-
-    #[test]
-    fn apply_del_ipv6_bgp_route_returns_false() {
-        let mut snap = FibSnapshot::new();
-        snap.v6.push(FibEntry6 {
-            network: "2001:db8::".parse().unwrap(),
-            prefix_len: 32,
-            metric: 50,
-        });
-        assert!(!apply_del(
-            &mut snap,
-            &bgp_v6_msg("2001:db8::", 32, 254),
-            254
-        ));
-        assert_eq!(snap.v6.len(), 1);
     }
 }

@@ -39,6 +39,14 @@ jobs:
       # nextest doesn't support doctests, so those run as a separate step.
       - run: cargo nextest run --workspace --exclude pathvector-e2e
       - run: cargo test --workspace --exclude pathvector-e2e --doc
+      # Live-kernel FIB tests (issue #56). They add and delete real routes, so
+      # they run as root inside a throwaway network namespace, never in the
+      # runner's own. Only the test binary runs under sudo, not cargo.
+      - name: Kernel FIB tests (network namespace)
+        run: |
+          bin=$(cargo test -p pathvector-sys --test kernel_fib_netns --no-run --message-format=json \
+            | jq -r 'select(.target.name == "kernel_fib_netns" and .executable != null) | .executable')
+          sudo unshare --net -- "$bin" --ignored
 
   # ── Lint ────────────────────────────────────────────────────────────────────
   lint:
