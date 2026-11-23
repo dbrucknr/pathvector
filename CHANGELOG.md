@@ -4,6 +4,36 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #80: a rejected replacement withdraws the old candidate)
+
+`handle_update` stored a replacement advertisement in Adj-RIB-In before running
+import policy, and on `Reject`/`Next` only counted the rejection. The peer's
+previously accepted route stayed in the Loc-RIB, selected, installed in the FIB
+and advertised, although RFC 4271 §9 says the replacement "SHALL replace the
+older route in the Adj-RIB-In, thus implicitly withdrawing the older route from
+service" and §9.1.2 only considers "routes that are eligible". Both address
+families, and therefore ROV-Invalid (RFC 6811) and OTC-leak (RFC 9234 §5)
+replacements too, were affected.
+
+Import is now one generic path, `pathvectord/src/daemon/import.rs`:
+`ImportDecision::{Accepted(Route), Rejected}` (`#[must_use]`) is the Phase 1
+result, and its only consumer, `apply`, inserts an accepted route or withdraws
+the peer's candidate. `import_announcement` serves both `handle_update`
+branches; `reapply_import_policy` is now generic and replaces the v4/v6 copies,
+so arrival and re-evaluation apply identical decisions. Per accepted route the
+cost is unchanged; a rejected route costs one extra Loc-RIB lookup.
+
+Regression tests: `pathvectord::daemon::import_reject_tests` (FIB, peers,
+Adj-RIB-In and candidate set for sole-best, takeover, no-churn, rejected →
+accepted, ROV and OTC cases, both families) and the model property test
+`prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer`.
+
+Still open: replacements dropped before import policy (AS_PATH loop, AS 0,
+semantically invalid NEXT_HOP) leave the older route in place; see
+`pathvectord/RFC.md` §9 / §9.1.1 and issue #111.
+
+---
+
 ## 2026-11-23 (issue #67: withdraw when an UPDATE removes the last feasible path)
 
 `LocRib::insert` returned `BestPathChange::Unchanged` whenever no best route

@@ -823,6 +823,17 @@ pub(super) struct UpdateResult {
     pub(super) blackhole_withdrawn_v6: Vec<Nlri<Ipv6Addr>>,
 }
 
+/// Applies one UPDATE from `peer` to its Adj-RIBs-In and the Loc-RIBs, for
+/// IPv4 and IPv6 unicast, and returns the resulting best-path changes.
+///
+/// Withdrawals and RFC 7606 treat-as-withdraw remove the peer's route.
+/// Every announcement that survives the error and loop checks goes through
+/// [`import_announcement`]: it replaces the peer's older route in Adj-RIB-In
+/// (RFC 4271 §9), and import policy decides whether it becomes the peer's
+/// Loc-RIB candidate or withdraws the older one (§9.1.1, issue #80).
+///
+/// Pure with respect to I/O: FIB programming and outbound propagation are
+/// the caller's job, driven by the returned [`UpdateResult`].
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn handle_update(
     peer: PeerId,
