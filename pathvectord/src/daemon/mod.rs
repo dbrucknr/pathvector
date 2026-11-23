@@ -47,6 +47,8 @@ mod fib;
 mod gr;
 mod import;
 #[cfg(test)]
+mod import_reject_tests;
+#[cfg(test)]
 mod last_feasible_tests;
 mod origination;
 mod peer;
