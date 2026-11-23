@@ -16,22 +16,33 @@ TCP MD5 "must be added to all outgoing segments and validated on all incoming se
 **New in `pathvector-session`: `transport::listener`.**
 
 - `ListenerKeys` is the table of inbound keys and their state on the listening sockets
-  (`set_peer`, `remove_peer`, `admission`, `configured`), over the `TcpMd5Port` from #58.
-- `BgpListener::bind` creates the socket (`IPV6_V6ONLY` for IPv6, `SO_REUSEADDR`),
-  installs its family's keys, and only then calls `listen()`. Later `set_peer` /
-  `remove_peer` calls change the live socket; nothing is rebound. Linux updates an
-  existing key in place (`__tcp_md5_do_add`) and accepts a key on a listening socket at
-  any time.
-- `BgpListener::accept` returns only connections the table admits. Linux copies the
-  listener's key into each connection when its handshake completes
-  (`tcp_v4_syn_recv_sock`, `tcp_md5_key_copy`), so a connection that completed before a
-  key was added or changed has no key. After such a change, every connection from that
-  peer is closed until the listener has cleared its accept queue twice, at least 100 ms
-  apart. Clearing stops at an empty queue or after `backlog + 1` connections (the most
-  Linux queues, first in first out), so a connection flood cannot hold it off; the second
-  pass catches a connection created before the change but appended to the queue just
-  after the first (`tcp_v4_syn_recv_sock` copies the key, then
-  `inet_csk_reqsk_queue_add` queues the connection).
+  (`set_peer`, `remove_peer`, `admission`, `is_current`, `configured`), over the
+  `TcpMd5Port` from #58.
+- `BgpListener::bind` creates the socket (`IPV6_V6ONLY` for IPv6, `SO_REUSEADDR`, never
+  `SO_REUSEPORT`), installs its family's keys, and only then calls `listen()`. Later
+  `set_peer` / `remove_peer` calls change the live socket at once (Linux updates an
+  existing key in place, `__tcp_md5_do_add`).
+- **Key changes replace the socket.** Linux copies the listener's key into each
+  connection when its handshake completes (`tcp_v4_syn_recv_sock`, `tcp_md5_key_copy`)
+  and appends it to the accept queue a moment later (`inet_csk_reqsk_queue_add`), so a
+  connection created before a key was added or changed has no key, and no amount of
+  waiting proves that every such connection has reached the queue. After a key is
+  installed while listening, `BgpListener` takes up to `backlog + 1` queued connections
+  off the socket (rejecting the changed peer's), shuts it down, and binds a new socket at
+  the same address with every key installed before `listen()`. `shutdown(SHUT_RD)` on a
+  listener runs `tcp_disconnect` → `inet_csk_listen_stop`, which discards the queue; a
+  late append checks `sk_state != TCP_LISTEN` under the queue lock and discards the
+  connection; a half-open handshake on the closed socket is re-looked-up and checked
+  against the new socket's keys. Only installed adds and rotations trigger this, not
+  removals or refused keys. This replaces an earlier draft of this PR that waited 100 ms
+  between two clearings of the queue, which the PR review showed could not be a barrier.
+- **Accepted connections carry a stamp.** `BgpListener::accept` returns an `Inbound` with
+  an `AuthStamp`; `ListenerKeys::is_current` is false once the peer's key has been set
+  since. The listener re-checks connections it buffered while replacing the socket, and
+  pathvectord re-checks after looking up the session (`route_inbound`), so a connection
+  accepted unkeyed just before `AddPeer` never reaches the new session.
+- Whether a socket replacement is needed is a per-family counter, so screening a
+  connection costs O(1) in the number of configured keys.
 - A required key the host cannot enforce, or any `setsockopt` failure, rejects the peer's
   inbound connections (the kernel would not have checked them) and is reported to the
   caller. `best-effort` admits them unauthenticated with a warning.
@@ -39,10 +50,13 @@ TCP MD5 "must be added to all outgoing segments and validated on all incoming se
 **`pathvectord`.** Static peers' keys are recorded by `build_daemon` and installed by each
 listener before it listens. `AddPeer` installs the key before the peer is added to
 `incoming_senders`; `RemovePeer` removes the peer from `incoming_senders`, then removes the
-key. Failures are logged at error level as `refusing inbound connections from <peer>`.
+key. Inbound connections are routed only if still current after the session lookup, and
+an accept error (for example, a failed socket replacement) backs off 100 ms. Failures are
+logged at error level as `refusing inbound connections from <peer>`.
 `bind_listener` moved into `BgpListener::bind`. TODO.md's "re-bind the listener for
-dynamic MD5 peers" item is closed: its premise (keys cannot be added without rebinding)
-was wrong.
+dynamic MD5 peers" item is closed: keys can be added to a listening socket at any time;
+the socket is now replaced after a runtime key change for a different reason (the
+barrier above).
 
 **Behaviour change.** On a host that enforces TCP MD5, a peer with `md5_password` must now
 sign its inbound connections too; a peer that dials in without the key times out. On a
@@ -50,9 +64,11 @@ host that cannot enforce it, the peer's inbound connections are closed unless
 `tcp_md5_enforcement = "best-effort"`.
 
 **Proof.** Fake-port unit tests for install-before-listen, per-family keys, add / rotate /
-remove, the pre-change-connection race, and the refusal paths, each run on every
-platform; mutating the listener to admit everything, or the daemon to skip the key on
-`AddPeer`, fails them. `pathvector-session/tests/listener_md5_loopback.rs` and
+remove, socket replacement (the replacement's keys go on before `listen()`), stale
+buffered and routed connections (the three review regressions), the unsettled counter,
+and the refusal paths, each run on every platform. Mutating the listener to admit
+everything, to settle without replacing the socket, to skip the buffered or routed
+re-check, or to miscount, or the daemon to skip the key on `AddPeer`, fails them. `pathvector-session/tests/listener_md5_loopback.rs` and
 pathvectord's `daemon::listener_md5_tests` open real loopback connections and observe the
 client's handshake and whether the connection reaches the session, for static, added,
 rotated and removed keys. They fail rather than skip under `CI` on Linux, and on hosts

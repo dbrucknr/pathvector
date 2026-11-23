@@ -892,11 +892,15 @@ separately.
 
 - **Static peers:** the keys go on the listening socket before it starts listening, so no
   handshake can complete without them.
-- **`AddPeer`:** the key goes on the running listener (no rebind) before inbound
-  connections from the peer are routed to its session. Connections from that address
-  that completed their handshake before the key was installed carry no key, so for about
-  100 ms the listener closes every connection from the peer, including any already
-  queued; the peer's next attempt gets through.
+- **`AddPeer`:** the key goes on the running listener before inbound connections from
+  the peer are routed to its session. Connections from that address that completed (or
+  were completing) their handshake before the key was installed carry no key, so the
+  listener then replaces its socket: it closes the peer's queued connections, shuts the
+  old socket down, and binds a new one at the same address with every key installed
+  before it listens. During that (well under a millisecond) new handshakes get no answer
+  and are retried; connections from other peers already queued are kept. A connection
+  accepted from the peer just before `AddPeer` is closed instead of being routed to the
+  new session.
 - **`RemovePeer`:** the peer stops being routed, then its key is removed from the
   listener.
 - **Rotation:** `RemovePeer`, wait for the removal to finish, then `AddPeer` with the new
