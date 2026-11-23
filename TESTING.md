@@ -236,8 +236,11 @@ The netlink adapter's tests (`linux.rs`, Linux only) cover decoding (route type 
 routes not), `NLM_F_REPLACE` / `NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
 `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
 and 100 in both orders, for both families, incrementally and through the initial dump.
-They also cover a static and a BGP route in one IPv6 ECMP set, and a BGP alias
-prepended ahead of a static alias and then replaced. For #57 they compare the oracle's
+They also cover a static and a BGP route in one IPv6 ECMP set, an all-static ECMP set
+learned from the initial dump (which reports a set only once), an all-BGP ECMP set
+that must give no IGP path both live and after a dump, a check that the kernel dumps a
+BGP-first mixed set with the same bytes as an all-BGP set (the reason for the inference
+policy), and a BGP alias prepended ahead of a static alias and then replaced. For #57 they compare the oracle's
 verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
 `ip route get` sends) for each negative type beneath a covering route, its deletion,
 `ip route replace <type>` over a unicast route, an initial dump with mixed metrics and a

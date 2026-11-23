@@ -479,9 +479,11 @@ fn decode_v4(msg: &RouteMessage) -> Option<KernelRouteV4> {
 /// Decodes an IPv6 route message into one route per ECMP sibling.
 ///
 /// The kernel stores each IPv6 ECMP sibling as its own `fib6_info` but reports
-/// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`). It
-/// also deletes and dumps siblings one at a time. Splitting the message makes
-/// all of these line up. A route using a nexthop object is never split.
+/// a sibling set as one message with `RTA_MULTIPATH` (`rt6_fill_node`), in
+/// notifications and in dumps alike (`fib6_dump_node` dumps a set once). It
+/// deletes siblings one at a time, or all at once with one `RTA_MULTIPATH`
+/// message. Splitting the message makes these line up. A route using a
+/// nexthop object is never split.
 ///
 /// Every returned route carries the header's type and protocol, but only the
 /// first one is the route the header describes; see [`apply_new`] for how the
@@ -506,13 +508,18 @@ fn decode_v6(msg: &RouteMessage) -> Vec<KernelRouteV6> {
     };
     let protocol = u8::from(msg.header.protocol);
     let kind = u8::from(msg.header.kind);
-    // Like type and protocol, RTA_PREF describes the route the header is
-    // about; the kernel reports a sibling's own preference in its own message.
+    // RTA_PREF, like type and protocol, belongs to the route the header
+    // describes, and an unreported leg takes it from that sibling the same
+    // way its protocol is inferred. Legs created by the same request share it
+    // (ip6_route_multipath_add builds every leg from one fib6_config); for a
+    // leg of another origin it is a best guess, which only matters when the
+    // set competes with another route of its metric.
     let preference = preference_v6(msg);
     let route = |next_hop| KernelRouteV6 {
         slot,
         kind,
         protocol,
+        protocol_inferred: false,
         preference,
         next_hop,
     };
@@ -563,8 +570,9 @@ fn metric_of(msg: &RouteMessage) -> u32 {
 /// Adds a route from the initial dump. Dumps list routes in kernel order, so
 /// each route goes to the end of its slot.
 ///
-/// An IPv6 dump message describes its first leg only; other legs are added as
-/// untracked until their own dump message describes them.
+/// An IPv6 dump message describes its first leg only. `fib6_dump_node` never
+/// dumps the other siblings separately, so their protocol is inferred from
+/// the first (see the `route` module docs) until a message reports it.
 fn apply_dumped(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool {
     if !in_table(msg, table) {
         return false;
@@ -578,7 +586,7 @@ fn apply_dumped(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool 
             };
             let mut changed = snap.v6.upsert(first, Position::Back);
             for leg in legs {
-                changed |= snap.v6.insert_unknown_origin(&leg);
+                changed |= snap.v6.insert(protocol_inferred(leg), Position::Back);
             }
             changed
         }
@@ -604,7 +612,8 @@ fn apply_dumped(snap: &mut FibSnapshot, msg: &RouteMessage, table: u32) -> bool 
 /// (`ip6_route_multipath_add` reports its first new route), so it shares the
 /// header's protocol. With `NLM_F_APPEND`, `ip6_route_mpath_notify` reports
 /// the set's *first* sibling instead, which may be an older route of another
-/// protocol, so new legs are added as untracked.
+/// protocol, so new legs get that protocol as an inference. Legs already
+/// mirrored keep what is known about them.
 ///
 /// A route that is already mirrored is not added again, so replaying an event
 /// that the initial dump already reflected is harmless.
@@ -638,16 +647,21 @@ fn apply_new(snap: &mut FibSnapshot, msg: &RouteMessage, flags: u16, table: u32)
                 snap.v6.upsert(first, Position::Back)
             };
             for leg in legs {
-                changed |= if append {
-                    snap.v6.insert_unknown_origin(&leg)
-                } else {
-                    snap.v6.insert(leg, Position::Back)
-                };
+                let leg = if append { protocol_inferred(leg) } else { leg };
+                changed |= snap.v6.insert(leg, Position::Back);
             }
             changed
         }
         _ => false,
     }
+}
+
+/// An IPv6 ECMP leg whose message describes another sibling: its protocol is
+/// not in the message, so the described sibling's protocol (already on the
+/// leg from the header) is marked as an inference.
+fn protocol_inferred(mut leg: KernelRouteV6) -> KernelRouteV6 {
+    leg.protocol_inferred = true;
+    leg
 }
 
 /// Applies a `RTM_DELROUTE` notification.
@@ -1737,52 +1751,188 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mixed_protocol_ecmp_dump_then_deleting_both_leaves_nothing() {
-        // rt6_fill_node takes rtm_protocol from the route the message
-        // describes and lists its siblings' next hops without their protocol.
-        // A static and a BGP sibling are each dumped with the other as a leg.
-        let mut static_hdr =
-            ecmp_v6_msg("2001:db8:99::", 64, 10, &[("fe80::1", 2), ("fe80::2", 2)]);
-        static_hdr.header.protocol = RouteProtocol::Static;
-        let mut bgp_hdr = ecmp_v6_msg("2001:db8:99::", 64, 10, &[("fe80::2", 2), ("fe80::1", 2)]);
-        bgp_hdr.header.protocol = RouteProtocol::Bgp;
-        let mut del_static = with_oif(
-            with_gateway(igp_v6_msg("2001:db8:99::", 64, 10, 254), "fe80::1"),
-            2,
-        );
-        del_static.header.protocol = RouteProtocol::Static;
-        let mut del_bgp = with_oif(
-            with_gateway(igp_v6_msg("2001:db8:99::", 64, 10, 254), "fe80::2"),
-            2,
-        );
-        del_bgp.header.protocol = RouteProtocol::Bgp;
+    /// A one-leg IPv6 message (`RTM_DELROUTE` of one sibling, or a single add).
+    fn v6_leg(prefix: &str, gw: &str, protocol: RouteProtocol) -> RouteMessage {
+        let mut msg = with_oif(with_gateway(igp_v6_msg(prefix, 64, 10, 254), gw), 2);
+        msg.header.protocol = protocol;
+        msg
+    }
 
-        for order in [[&static_hdr, &bgp_hdr], [&bgp_hdr, &static_hdr]] {
-            let mut snap = FibSnapshot::new();
-            for m in order {
-                apply_dumped(&mut snap, m, 254);
-            }
-            assert_eq!(
-                snap.routes_v6().count(),
-                1,
-                "only the static sibling is tracked"
-            );
-            assert_eq!(metric_v6(&snap, "2001:db8:99::1"), Some(10));
-
-            assert!(apply_del(&mut snap, &del_static, 254));
-            assert_eq!(
-                metric_v6(&snap, "2001:db8:99::1"),
-                None,
-                "the remaining sibling is BGP"
-            );
-            assert!(!apply_del(&mut snap, &del_bgp, 254));
-            assert_eq!(snap.v6.len(), 0, "the BGP sibling's delete was applied");
-        }
+    /// The single dump message for an ECMP set: `fib6_dump_node` dumps the set
+    /// once, headed by its first sibling, then skips the other siblings.
+    fn v6_set_dump(prefix: &str, first: RouteProtocol, legs: &[&str]) -> RouteMessage {
+        let legs: Vec<_> = legs.iter().map(|gw| (*gw, 2)).collect();
+        let mut msg = ecmp_v6_msg(prefix, 64, 10, &legs);
+        msg.header.protocol = first;
+        msg
     }
 
     #[test]
-    fn multipath_append_legs_are_untracked_until_described() {
+    fn dumped_static_ecmp_set_keeps_the_surviving_sibling() {
+        // PR #122 review round 2: both siblings are static, but the dump
+        // describes only the first. Deleting it must leave the second usable.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:200::",
+                RouteProtocol::Static,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(snap.routes_v6().count(), 2);
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:200::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:200::1"), Some(10));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:200::", "fe80::2", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:200::1"), None);
+    }
+
+    #[test]
+    fn dumped_all_bgp_ecmp_set_is_not_igp_reachability() {
+        // PR #122 review round 3: two BGP siblings and nothing else. Live
+        // events report each BGP route, so the running snapshot has no path;
+        // a restart's dump must agree.
+        let mut live = FibSnapshot::new();
+        apply_new(
+            &mut live,
+            &v6_leg("2001:db8:203::", "fe80::1", RouteProtocol::Bgp),
+            APPEND,
+            254,
+        );
+        let second = v6_set_dump(
+            "2001:db8:203::",
+            RouteProtocol::Bgp,
+            &["fe80::2", "fe80::1"],
+        );
+        apply_new(&mut live, &second, APPEND, 254);
+        assert_eq!(metric_v6(&live, "2001:db8:203::1"), None);
+
+        let mut dumped = FibSnapshot::new();
+        apply_dumped(
+            &mut dumped,
+            &v6_set_dump(
+                "2001:db8:203::",
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(
+            metric_v6(&dumped, "2001:db8:203::1"),
+            None,
+            "dump agrees with live"
+        );
+        assert_eq!(dumped.v6.len(), 2, "both siblings mirrored");
+    }
+
+    #[test]
+    fn dumped_mixed_ecmp_set_headed_by_bgp_follows_the_documented_inference() {
+        // The dump message for a BGP-first static+BGP set is the same as for
+        // an all-BGP set, so the static sibling is inferred to be BGP. That is
+        // the documented cost of keeping all-BGP sets out (see the `route`
+        // module docs). A later message reporting the static route fixes it.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:202::",
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), None);
+        let reported = v6_leg("2001:db8:202::", "fe80::2", RouteProtocol::Static);
+        assert!(apply_new(&mut snap, &reported, REPLACE, 254));
+        assert_eq!(metric_v6(&snap, "2001:db8:202::1"), Some(10));
+        assert!(apply_del(&mut snap, &reported, 254));
+        assert!(!apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:202::", "fe80::1", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn dumped_mixed_ecmp_set_headed_by_static_clears_after_both_deletes() {
+        // Review round 1: the BGP sibling's protocol is not in the dump, so it
+        // is inferred to be static (the documented mixed-set limit) and counts
+        // until deleted; its delete must be applied.
+        let mut snap = FibSnapshot::new();
+        apply_dumped(
+            &mut snap,
+            &v6_set_dump(
+                "2001:db8:99::",
+                RouteProtocol::Static,
+                &["fe80::1", "fe80::2"],
+            ),
+            254,
+        );
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), Some(10));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::2", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(metric_v6(&snap, "2001:db8:99::1"), None);
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn incremental_mixed_ecmp_set_knows_each_siblings_protocol() {
+        // Single-route appends: each RTM_NEWROUTE is headed by the route it
+        // adds (fib6_add_rt2node → inet6_rt_notify(rt)), so protocols are known.
+        let mut snap = FibSnapshot::new();
+        apply_new(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            APPEND,
+            254,
+        );
+        let mut bgp_added =
+            v6_set_dump("2001:db8:99::", RouteProtocol::Bgp, &["fe80::2", "fe80::1"]);
+        bgp_added.header.protocol = RouteProtocol::Bgp;
+        assert!(!apply_new(&mut snap, &bgp_added, APPEND, 254));
+        assert_eq!(
+            snap.routes_v6().count(),
+            1,
+            "only the static sibling is tracked"
+        );
+        assert!(apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::1", RouteProtocol::Static),
+            254
+        ));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8:99::1"),
+            None,
+            "the remaining sibling is BGP"
+        );
+        assert!(!apply_del(
+            &mut snap,
+            &v6_leg("2001:db8:99::", "fe80::2", RouteProtocol::Bgp),
+            254
+        ));
+        assert_eq!(snap.v6.len(), 0);
+    }
+
+    #[test]
+    fn multipath_append_legs_infer_the_described_siblings_protocol() {
         // ip6_route_mpath_notify reports the set's *first* sibling for an
         // NLM_F_APPEND multipath add, so the header says nothing about the
         // appended legs.
@@ -1793,17 +1943,19 @@ mod tests {
         );
         apply_new(&mut snap, &a, CREATE, 254);
         let appended = ecmp_v6_msg("2001:db8::", 32, 10, &[("fe80::1", 2), ("fe80::2", 2)]);
-        assert!(!apply_new(&mut snap, &appended, APPEND, 254));
-        assert_eq!(snap.v6.len(), 2);
-        assert_eq!(snap.routes_v6().count(), 1);
-
-        // A later message describing the new leg (e.g. a dump) classifies it.
-        let b = with_oif(
-            with_gateway(igp_v6_msg("2001:db8::", 32, 10, 254), "fe80::2"),
-            2,
+        assert!(apply_new(&mut snap, &appended, APPEND, 254));
+        let inferred: Vec<_> = snap.routes_v6().map(|r| r.protocol_inferred).collect();
+        assert!(inferred.contains(&true) && inferred.contains(&false));
+        assert!(
+            snap.routes_v6()
+                .all(|r| r.protocol == u8::from(RouteProtocol::Ospf))
         );
-        assert!(apply_dumped(&mut snap, &b, 254));
-        assert_eq!(snap.routes_v6().count(), 2);
+        assert!(apply_del(&mut snap, &a, 254));
+        assert_eq!(
+            metric_v6(&snap, "2001:db8::1"),
+            Some(10),
+            "appended leg still a path"
+        );
     }
 
     #[test]

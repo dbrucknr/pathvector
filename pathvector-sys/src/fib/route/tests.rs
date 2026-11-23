@@ -83,6 +83,7 @@ fn v6(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV6 {
         },
         kind: RTN_UNICAST,
         protocol: RTPROT_STATIC,
+        protocol_inferred: false,
         preference: RoutePreference::Medium,
         next_hop: NextHopV6::Path(via(gateway)),
     }
@@ -742,22 +743,45 @@ fn untracked_routes_are_mirrored_but_never_used_or_signalled() {
 }
 
 #[test]
-fn upsert_reclassifies_a_route_in_place() {
-    // An IPv6 leg first seen inside another route's message is untracked;
-    // the message that describes it settles its protocol.
+fn inferred_protocol_is_used_until_a_message_reports_it() {
+    // An IPv6 ECMP leg seen only inside another sibling's message has no
+    // reported protocol (fib6_dump_node never dumps it on its own); it takes
+    // the described sibling's protocol as an inference.
     let a = v6("2001:db8::/32", 10, Some("fe80::1"));
-    let b = v6("2001:db8::/32", 10, Some("fe80::2"));
+    let inferred_static = KernelRouteV6 {
+        protocol_inferred: true,
+        ..v6("2001:db8::/32", 10, Some("fe80::2"))
+    };
+    let inferred_bgp = KernelRouteV6 {
+        protocol_inferred: true,
+        ..bgp6("2001:db8::/32", 10, Some("fe80::2"))
+    };
+    assert!(inferred_static.is_tracked() && !inferred_bgp.is_tracked());
+
     let mut m = Mirror6::default();
     m.insert(a.clone(), Position::Back);
-    assert!(!m.insert_unknown_origin(&b));
+    assert!(
+        !m.insert(inferred_bgp, Position::Back),
+        "an inferred BGP leg is not a path"
+    );
     assert_eq!(m.iter().count(), 1);
+    // A message reporting it as static settles it, in place.
+    let b = v6("2001:db8::/32", 10, Some("fe80::2"));
     assert!(m.upsert(b.clone(), Position::Back));
     assert!(order6(&m, &[&a, &b]), "keeps its position");
-    assert!(!m.upsert(b.clone(), Position::Back), "nothing new");
-    // And the other way: a leg later described as BGP stops being used.
+    assert!(!m.upsert(b, Position::Back), "nothing new");
+    // An inference never overwrites a reported protocol.
+    assert!(!m.insert(
+        KernelRouteV6 {
+            protocol_inferred: true,
+            ..bgp6("2001:db8::/32", 10, Some("fe80::2"))
+        },
+        Position::Back
+    ));
+    assert_eq!(m.iter().count(), 2);
+    // Reported as BGP: no longer a path.
     assert!(m.upsert(bgp6("2001:db8::/32", 10, Some("fe80::2")), Position::Back));
     assert_eq!(m.iter().count(), 1);
-    assert!(!m.insert_unknown_origin(&a), "already present");
 }
 
 // ── IPv4 NLM_F_REPLACE ────────────────────────────────────────────────────────
@@ -1203,6 +1227,7 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> + Clone {
         prop::sample::select(vec![1u32, 10]),
         prop::sample::select(vec![None, None, None, Some("2001:db8:ffff::/48")]),
         prop::sample::select(vec![RTPROT_STATIC, RTPROT_STATIC, RTPROT_BGP, RTPROT_RA]),
+        any::<bool>(),
         prop::sample::select(vec![
             None,
             Some("fe80::1"),
@@ -1217,23 +1242,28 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> + Clone {
             RoutePreference::High,
         ]),
     )
-        .prop_map(|(prefix, priority, src, protocol, gw, kind, preference)| {
-            let mut r = v6(prefix, priority, gw);
-            if let Some(src) = src {
-                r.slot.src = p6(src);
-            }
-            r.protocol = protocol;
-            r.kind = kind;
-            if RouteKind::from_rtm_type(kind).is_some_and(|k| k != RouteKind::Unicast) {
-                // Negative routes sit on the loopback device with no gateway
-                // (fib6_nh_init) and are always medium (ip6_route_info_create
-                // overwrites their fib6_flags).
-                r.next_hop = NextHopV6::Path(via(None));
-            } else {
-                r.preference = preference;
-            }
-            r
-        })
+        .prop_map(
+            |(prefix, priority, src, protocol, inferred, gw, kind, preference)| {
+                let mut r = v6(prefix, priority, gw);
+                if let Some(src) = src {
+                    r.slot.src = p6(src);
+                }
+                r.protocol = protocol;
+                r.protocol_inferred = inferred;
+                r.kind = kind;
+                if RouteKind::from_rtm_type(kind).is_some_and(|k| k != RouteKind::Unicast) {
+                    // Negative routes sit on the loopback device with no gateway
+                    // (fib6_nh_init) and are always medium (ip6_route_info_create
+                    // overwrites their fib6_flags).
+                    r.next_hop = NextHopV6::Path(via(None));
+                    // Never an ECMP leg, so its protocol is always reported.
+                    r.protocol_inferred = false;
+                } else {
+                    r.preference = preference;
+                }
+                r
+            },
+        )
 }
 
 fn probes_v4() -> Vec<Ipv4Addr> {

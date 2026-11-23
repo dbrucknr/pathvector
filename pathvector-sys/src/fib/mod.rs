@@ -534,6 +534,7 @@ mod tests {
             },
             kind: RTN_UNICAST,
             protocol: 3,
+            protocol_inferred: false,
             preference: RoutePreference::Medium,
             next_hop: NextHopV6::Path(NextHopPath {
                 gateway: None,

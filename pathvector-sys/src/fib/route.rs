@@ -72,13 +72,32 @@
 //! message represents and lists it first in `RTA_MULTIPATH`, followed by its
 //! siblings. A leg carries only its interface, weight, flags and gateway, so
 //! the siblings' own protocols are not in the message, and Linux allows one
-//! ECMP set to mix, say, static and BGP routes. The adapter therefore treats
-//! the first leg as described by the header. Another leg it has not seen takes
-//! the header's type and protocol only if the message comes from the request
-//! that created it (a create or replace without `NLM_F_APPEND`, where
-//! `ip6_route_multipath_add` reports the first new route). Otherwise, such as
-//! in a dump or an append, the leg is mirrored as untracked until a message
-//! describing it arrives. Each sibling's own dump message does that.
+//! ECMP set to mix, say, static and BGP routes. Dumps never fill the gap:
+//! `fib6_dump_node` emits a sibling set once and then jumps past its siblings
+//! ("no need to dump the sibling routes again").
+//!
+//! So a dump message for an all-BGP set and one for a BGP-first static+BGP set
+//! are the same bytes: no decoder can tell them apart, and some policy must
+//! decide what an unreported sibling is. The policy here:
+//!
+//! - The first leg is the route the header describes.
+//! - Another leg not yet mirrored takes the header's protocol. Without
+//!   `NLM_F_APPEND` (a create or replace), that is exact:
+//!   `ip6_route_multipath_add` reports its own first new route, so every new
+//!   leg comes from that request. In a dump or an `NLM_F_APPEND`, the protocol
+//!   is *inferred* ([`KernelRouteV6::protocol_inferred`]). An ECMP set is
+//!   almost always installed by one daemon, so this is exact for every
+//!   single-protocol set, BGP and IGP alike, and keeps a dump and incremental
+//!   events in agreement for them.
+//! - A message that later reports the leg's protocol replaces the inference.
+//!   An inference never overwrites a known protocol.
+//!
+//! Only an ECMP set that mixes protocols and is learned from a dump (or an
+//! append) can be misclassified: its unreported siblings take the first
+//! sibling's protocol, in either direction. Treating every unreported sibling
+//! as IGP instead would make each all-BGP ECMP set count as IGP reachability
+//! after a restart; treating it as BGP would lose the second path of every
+//! all-static set. Both are worse in the common case.
 //!
 //! # Negative routes
 //!
@@ -671,6 +690,10 @@ pub struct KernelRouteV6 {
     pub kind: u8,
     /// `rtm_protocol`.
     pub protocol: u8,
+    /// `true` when no message has reported this route's protocol and it was
+    /// taken from the sibling the message described (see the module docs on
+    /// IPv6 multipath messages).
+    pub protocol_inferred: bool,
     /// `RTA_PREF`. Ranks routes of one metric group during lookup. Medium for
     /// every negative route (see [`RoutePreference`]).
     pub preference: RoutePreference,
@@ -698,8 +721,9 @@ impl KernelRouteV6 {
         RouteKind::from_rtm_type(self.kind)
     }
 
-    /// Whether the snapshot uses this route for reachability (unicast or
-    /// negative, not BGP).
+    /// Whether the snapshot uses this route for reachability: unicast or
+    /// negative, and not installed by BGP. An inferred protocol is used like
+    /// a reported one.
     #[must_use]
     pub const fn is_tracked(&self) -> bool {
         tracked_kind(self.kind, self.protocol).is_some()
@@ -862,16 +886,6 @@ impl<R: MirroredRoute> Entry<R> {
                 identity: route.identity(),
                 ecmp: route.ecmp(),
             }
-        }
-    }
-
-    /// An entry for a route whose type and protocol are unknown (an IPv6
-    /// sibling leg the message does not describe). It is never used for
-    /// lookups until a message describing it arrives.
-    fn unknown_origin(route: &R) -> Self {
-        Self::Untracked {
-            identity: route.identity(),
-            ecmp: route.ecmp(),
         }
     }
 
@@ -1089,15 +1103,6 @@ impl<R: MirroredRoute> RouteMirror<R> {
         group[i] = Entry::new(route);
         self.settle(slot);
         self.tracked_in(&slot) != before
-    }
-
-    /// Adds a route whose type and protocol the message does not give (see
-    /// [`Entry::unknown_origin`]) unless it is already mirrored.
-    pub fn insert_unknown_origin(&mut self, route: &R) -> bool {
-        if !self.contains(route) {
-            self.insert_entry(*route.slot(), Entry::unknown_origin(route), Position::Back);
-        }
-        false
     }
 
     /// Removes exactly the kernel route `route`; other routes of the slot stay.
