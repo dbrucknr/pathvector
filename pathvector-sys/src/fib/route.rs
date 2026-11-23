@@ -92,12 +92,22 @@
 //! - A message that later reports the leg's protocol replaces the inference.
 //!   An inference never overwrites a known protocol.
 //!
+//! - When a delete leaves a slot holding a route whose protocol is inferred,
+//!   the adapter reads the set back from the kernel and applies it with
+//!   [`RouteMirror::redescribe`]. A dump now describes a different sibling
+//!   (the deleted one is gone), and describes a lone remaining route fully.
+//!
 //! Only an ECMP set that mixes protocols and is learned from a dump (or an
 //! append) can be misclassified: its unreported siblings take the first
 //! sibling's protocol, in either direction. Treating every unreported sibling
 //! as IGP instead would make each all-BGP ECMP set count as IGP reachability
 //! after a restart; treating it as BGP would lose the second path of every
-//! all-static set. Both are worse in the common case.
+//! all-static set. Both are worse in the common case. The re-read bounds how
+//! long a misclassification lasts: for a two-route set it ends at the first
+//! delete of either route. A dump cannot end it earlier, since it always
+//! describes the same sibling. (`RTM_GETROUTE` with `RTM_F_FIB_MATCH` describes
+//! whichever sibling the multipath hash picks, and only for the slot that wins
+//! a full policy lookup, so it cannot target a given slot or sibling.)
 //!
 //! # Negative routes
 //!
@@ -756,6 +766,10 @@ pub(crate) trait MirroredRoute: Clone + PartialEq {
     /// for IPv4, which has no such ranking.
     fn preference(&self) -> RoutePreference;
 
+    /// Whether this route's protocol was inferred rather than reported
+    /// (always `false` for IPv4, whose messages describe every route).
+    fn protocol_inferred(&self) -> bool;
+
     /// Whether this route is an IPv6 ECMP sibling candidate (always `false`
     /// for IPv4, where a multipath route is a single alias).
     fn ecmp(&self) -> bool;
@@ -806,6 +820,10 @@ impl MirroredRoute for KernelRouteV4 {
         RoutePreference::Medium
     }
 
+    fn protocol_inferred(&self) -> bool {
+        false
+    }
+
     fn ecmp(&self) -> bool {
         false
     }
@@ -847,6 +865,10 @@ impl MirroredRoute for KernelRouteV6 {
         self.preference
     }
 
+    fn protocol_inferred(&self) -> bool {
+        self.protocol_inferred
+    }
+
     fn ecmp(&self) -> bool {
         self.qualifies_for_ecmp()
     }
@@ -867,11 +889,21 @@ impl MirroredRoute for KernelRouteV6 {
 /// One mirrored route. Routes lookups never use are kept only as an identity
 /// hash, so a full BGP table installed in the kernel costs little memory. A
 /// tracked route keeps its typed kind, so a lookup can classify it without a
-/// fallible conversion.
+/// fallible conversion. An untracked route whose protocol is only inferred is
+/// kept whole, because a later re-read of its slot may show that it is
+/// tracked after all.
 #[derive(Debug, Clone, PartialEq)]
 enum Entry<R> {
-    Tracked { kind: RouteKind, route: Box<R> },
-    Untracked { identity: u64, ecmp: bool },
+    Tracked {
+        kind: RouteKind,
+        route: Box<R>,
+    },
+    /// Untracked under an inferred protocol.
+    Unconfirmed(Box<R>),
+    Untracked {
+        identity: u64,
+        ecmp: bool,
+    },
 }
 
 impl<R: MirroredRoute> Entry<R> {
@@ -881,6 +913,8 @@ impl<R: MirroredRoute> Entry<R> {
                 kind,
                 route: Box::new(route),
             }
+        } else if route.protocol_inferred() {
+            Self::Unconfirmed(Box::new(route))
         } else {
             Self::Untracked {
                 identity: route.identity(),
@@ -891,7 +925,7 @@ impl<R: MirroredRoute> Entry<R> {
 
     fn is(&self, route: &R) -> bool {
         match self {
-            Self::Tracked { route: r, .. } => r.same_identity(route),
+            Self::Tracked { route: r, .. } | Self::Unconfirmed(r) => r.same_identity(route),
             Self::Untracked { identity, .. } => *identity == route.identity(),
         }
     }
@@ -902,11 +936,12 @@ impl<R: MirroredRoute> Entry<R> {
 
     fn ecmp(&self) -> bool {
         match self {
-            Self::Tracked { route, .. } => route.ecmp(),
+            Self::Tracked { route: r, .. } | Self::Unconfirmed(r) => r.ecmp(),
             Self::Untracked { ecmp, .. } => *ecmp,
         }
     }
 
+    /// The route, if lookups may use it.
     fn route(&self) -> Option<&R> {
         self.tracked().map(|(route, _)| route)
     }
@@ -914,7 +949,17 @@ impl<R: MirroredRoute> Entry<R> {
     fn tracked(&self) -> Option<(&R, RouteKind)> {
         match self {
             Self::Tracked { kind, route } => Some((route, *kind)),
-            Self::Untracked { .. } => None,
+            Self::Unconfirmed(_) | Self::Untracked { .. } => None,
+        }
+    }
+
+    /// The route, if its protocol is only inferred.
+    fn inferred(&self) -> Option<&R> {
+        match self {
+            Self::Tracked { route: r, .. } | Self::Unconfirmed(r) if r.protocol_inferred() => {
+                Some(r)
+            }
+            _ => None,
         }
     }
 }
@@ -981,6 +1026,7 @@ impl<R: MirroredRoute> RouteMirror<R> {
             g.iter()
                 .map(|e| match e {
                     Entry::Tracked { route, .. } => (route.identity(), true),
+                    Entry::Unconfirmed(r) => (r.identity(), false),
                     Entry::Untracked { identity, .. } => (*identity, false),
                 })
                 .collect()
@@ -1041,6 +1087,12 @@ impl<R: MirroredRoute> RouteMirror<R> {
             Some((route, RouteKind::Reject(kind))) => FibLookup::Reject { route, kind },
             Some((route, RouteKind::Throw)) => FibLookup::Throw(route),
         }
+    }
+
+    /// The first route of `slot`, in kernel order, whose protocol is only
+    /// inferred, tracked or not.
+    pub fn first_inferred(&self, slot: &R::Slot) -> Option<&R> {
+        self.slots.get(slot)?.iter().find_map(Entry::inferred)
     }
 
     /// The tracked routes of `slot`, in kernel order. Slots are tiny, so
@@ -1181,6 +1233,63 @@ impl RouteMirror<KernelRouteV6> {
             });
         }
         group[victim] = Entry::new(new);
+        self.settle(slot);
+        self.tracked_in(&slot) != before
+    }
+
+    /// Applies a fresh kernel description of one sibling set, read back from
+    /// the kernel after its routes changed.
+    ///
+    /// `set` is decoded from one kernel message: the first route is the one
+    /// the message describes, with its reported protocol; the others are its
+    /// siblings and carry that protocol as an inference (they are marked so
+    /// here, whatever their flag says).
+    /// The kernel was read after the events applied so far, so only routes
+    /// already mirrored are touched: one that is missing was added after
+    /// those events, and its own notification is still to come.
+    ///
+    /// - The described route is updated in place.
+    /// - A sibling whose protocol is itself inferred takes the new inference.
+    ///   Its old one came from a sibling that a fresh dump no longer
+    ///   describes, and this keeps the result equal to what a restart's dump
+    ///   would give.
+    /// - A sibling whose protocol was reported keeps it.
+    ///
+    /// Returns `true` if the tracked routes changed.
+    pub fn redescribe(&mut self, set: impl IntoIterator<Item = KernelRouteV6>) -> bool {
+        let mut set = set.into_iter();
+        let Some(described) = set.next() else {
+            return false;
+        };
+        let slot = described.slot;
+        let before = self.tracked_in(&slot);
+        let Some(group) = self.slots.get_mut(&slot) else {
+            return false;
+        };
+        let described = std::iter::once((
+            KernelRouteV6 {
+                protocol_inferred: false,
+                ..described
+            },
+            false,
+        ));
+        let siblings = set.map(|r| {
+            let r = KernelRouteV6 {
+                protocol_inferred: true,
+                ..r
+            };
+            (r, true)
+        });
+        for (route, only_if_inferred) in described.chain(siblings) {
+            if route.slot != slot {
+                continue;
+            }
+            if let Some(entry) = group.iter_mut().find(|e| e.is(&route))
+                && (!only_if_inferred || entry.inferred().is_some())
+            {
+                *entry = Entry::new(route);
+            }
+        }
         self.settle(slot);
         self.tracked_in(&slot) != before
     }
