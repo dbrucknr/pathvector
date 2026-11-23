@@ -3,6 +3,7 @@
 //! snapshot supervisor's port (`supervisor.rs`).
 
 use std::{
+    future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
@@ -262,27 +263,34 @@ impl RouteFeed for NetlinkFeed {
         }
     }
 
-    async fn dump(
+    fn dump(
         &mut self,
         family: Family,
-        into: &mut FibSnapshot,
-    ) -> Result<DumpReport, DumpError> {
+    ) -> impl Future<Output = Result<DumpReport, DumpError>> + Send + 'static {
         let request = match family {
             Family::V4 => RouteMessageBuilder::<Ipv4Addr>::new().build(),
             Family::V6 => RouteMessageBuilder::<Ipv6Addr>::new().build(),
         };
         let mut request = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(request));
         request.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
-        // `request` fails only when the connection task has finished.
-        let replies = self
-            .handle
-            .request(request)
-            .map_err(|_| DumpError::ConnectionLost)?;
-        read_dump(replies, into, self.table).await
+        // The request is queued now; `request` fails only when the
+        // connection task has finished.
+        let replies = self.handle.request(request);
+        let table = self.table;
+        async move {
+            let replies = replies.map_err(|_| DumpError::ConnectionLost)?;
+            let mut routes = FibSnapshot::new();
+            let interrupted = read_dump(replies, &mut routes, table).await?;
+            Ok(DumpReport {
+                routes,
+                interrupted,
+            })
+        }
     }
 }
 
-/// Reads one dump's replies into `into`.
+/// Reads one dump's replies into `into`; returns whether the dump was
+/// interrupted (`NLM_F_DUMP_INTR`).
 ///
 /// The dump is complete only when `NLMSG_DONE` arrives: netlink-proto closes
 /// a request's reply stream both after `NLMSG_DONE` and when the connection
@@ -295,11 +303,11 @@ pub(super) async fn read_dump(
     replies: impl Stream<Item = NetlinkMessage<RouteNetlinkMessage>>,
     into: &mut FibSnapshot,
     table: u32,
-) -> Result<DumpReport, DumpError> {
+) -> Result<bool, DumpError> {
     let mut replies = std::pin::pin!(replies);
-    let mut report = DumpReport::default();
+    let mut interrupted = false;
     while let Some(msg) = replies.next().await {
-        report.interrupted |= msg.header.flags & NLM_F_DUMP_INTR != 0;
+        interrupted |= msg.header.flags & NLM_F_DUMP_INTR != 0;
         match msg.payload {
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
                 apply_dumped(into, &route, table);
@@ -307,7 +315,7 @@ pub(super) async fn read_dump(
             NetlinkPayload::Done(done) if done.code < 0 => {
                 return Err(DumpError::Failed(io::Error::from_raw_os_error(-done.code)));
             }
-            NetlinkPayload::Done(_) => return Ok(report),
+            NetlinkPayload::Done(_) => return Ok(interrupted),
             NetlinkPayload::Error(e) if e.code.is_some() => {
                 return Err(DumpError::Failed(e.to_io()));
             }
@@ -2121,7 +2129,7 @@ mod tests {
 
     fn dump_of(
         msgs: Vec<NetlinkMessage<RouteNetlinkMessage>>,
-    ) -> (Result<DumpReport, DumpError>, FibSnapshot) {
+    ) -> (Result<bool, DumpError>, FibSnapshot) {
         let mut snap = FibSnapshot::new();
         let result = block_on(read_dump(stream::iter(msgs), &mut snap, 254));
         (result, snap)
@@ -2149,7 +2157,7 @@ mod tests {
         let mut msgs = routes();
         msgs.push(done(0, 0));
         let (result, snap) = dump_of(msgs);
-        assert_eq!(result.unwrap(), DumpReport { interrupted: false });
+        assert!(!result.unwrap(), "not interrupted");
         assert_eq!((snap.routes_v4().count(), snap.routes_v6().count()), (1, 1));
     }
 
@@ -2158,10 +2166,10 @@ mod tests {
         let mut flagged = reply(igp_v4_msg("10.0.0.0", 8, 10, 254));
         flagged.header.flags |= NLM_F_DUMP_INTR;
         let (result, _) = dump_of(vec![flagged, done(0, 0)]);
-        assert!(result.unwrap().interrupted);
+        assert!(result.unwrap());
 
         let (result, _) = dump_of(vec![done(0, NLM_F_DUMP_INTR)]);
-        assert!(result.unwrap().interrupted);
+        assert!(result.unwrap());
     }
 
     #[test]

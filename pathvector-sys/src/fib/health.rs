@@ -102,6 +102,8 @@ pub enum DegradedCause {
     /// `NLM_F_DUMP_INTR`, or the routing table of that family changed while
     /// it was being dumped.
     DumpInconsistent,
+    /// A route dump did not finish within its [`DumpTimeout`].
+    DumpStalled,
 }
 
 impl DegradedCause {
@@ -120,6 +122,7 @@ impl fmt::Display for DegradedCause {
             Self::ConnectFailed(e) => write!(f, "opening a netlink socket failed: {e}"),
             Self::DumpFailed(e) => write!(f, "route dump failed: {e}"),
             Self::DumpInconsistent => f.write_str("route table changed during the dump"),
+            Self::DumpStalled => f.write_str("route dump did not finish in time"),
         }
     }
 }
@@ -276,6 +279,41 @@ impl Default for ResyncBackoff {
     }
 }
 
+/// The longest one family's route dump may take before the supervisor gives
+/// up on it and replaces the connection.
+///
+/// A dump can stop without an error reaching the reader: when `netlink_dump`
+/// cannot queue its next chunk it leaves the dump running and only retries
+/// once another message has been read from the socket. The deadline bounds
+/// that case and any other stall. It covers the whole dump of one family,
+/// BGP-installed routes included, so set it well above what a dump of the
+/// largest expected kernel table takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DumpTimeout(Duration);
+
+impl DumpTimeout {
+    /// 60 s.
+    pub const DEFAULT: Self = Self(Duration::from_secs(60));
+
+    /// A deadline of `limit`, or `None` if it is zero.
+    #[must_use]
+    pub fn new(limit: Duration) -> Option<Self> {
+        (!limit.is_zero()).then_some(Self(limit))
+    }
+
+    /// The deadline.
+    #[must_use]
+    pub fn get(&self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for DumpTimeout {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Why [`ResyncBackoff::new`] rejected its arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResyncBackoffError {
@@ -350,5 +388,16 @@ mod tests {
         assert!(!DegradedCause::ConnectFailed(failure).is_loss());
         assert!(!DegradedCause::DumpFailed(failure).is_loss());
         assert!(!DegradedCause::DumpInconsistent.is_loss());
+        assert!(!DegradedCause::DumpStalled.is_loss());
+    }
+
+    #[test]
+    fn dump_timeout_rejects_zero() {
+        assert_eq!(DumpTimeout::new(Duration::ZERO), None);
+        assert_eq!(
+            DumpTimeout::new(Duration::from_secs(1)).map(|t| t.get()),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(DumpTimeout::default().get(), Duration::from_secs(60));
     }
 }

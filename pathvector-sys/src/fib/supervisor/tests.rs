@@ -23,6 +23,7 @@
 
 use std::{
     collections::VecDeque,
+    future::Future,
     io,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -39,7 +40,7 @@ use super::*;
 use crate::fib::{
     FibSnapshot, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, NextHopPath, NextHopV4,
     NextHopV6, RouteKind, RouteSlotV4, RouteSlotV6, TableId,
-    health::{DegradedCause, FibStatus, ResyncBackoff, SnapshotHealth},
+    health::{DegradedCause, DumpTimeout, FibStatus, ResyncBackoff, SnapshotHealth},
 };
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -154,6 +155,9 @@ enum DumpAct {
     OverrunDuring(Change),
     /// Waits for the sender before answering.
     Gate(oneshot::Receiver<()>),
+    /// Never answers: `netlink_dump` could not queue its next chunk and
+    /// nothing else is read that would make `netlink_recvmsg` retry it.
+    Stall,
 }
 
 struct FeedSlot {
@@ -163,6 +167,8 @@ struct FeedSlot {
     /// `NETLINK_S_CONGESTED`: every notification is dropped until the reader
     /// empties the queue.
     congested: bool,
+    /// `cb_running`: a dump was requested and has not ended.
+    dump_running: bool,
 }
 
 #[derive(Default)]
@@ -309,6 +315,7 @@ impl RouteSource for FakeSource {
             tx: Some(tx),
             dropping: 0,
             congested: false,
+            dump_running: false,
         });
         Ok(FakeFeed {
             id: k.feeds.len() - 1,
@@ -347,65 +354,77 @@ impl RouteFeed for FakeFeed {
         received
     }
 
-    async fn dump(
+    fn dump(
         &mut self,
         family: Family,
-        into: &mut FibSnapshot,
-    ) -> Result<DumpReport, DumpError> {
-        let act = {
-            let mut k = self.kernel.lock();
+    ) -> impl Future<Output = Result<DumpReport, DumpError>> + Send + 'static {
+        let kernel = self.kernel.clone();
+        let id = self.id;
+        let (act, busy) = {
+            let mut k = kernel.lock();
             k.dump_times.push(Instant::now());
-            k.dump_script.pop_front().unwrap_or(DumpAct::Normal)
+            // `__netlink_dump_start`: one dump per socket at a time.
+            let busy = std::mem::replace(&mut k.feeds[id].dump_running, true);
+            (k.dump_script.pop_front().unwrap_or(DumpAct::Normal), busy)
         };
-        let act = match act {
-            DumpAct::Gate(rx) => {
-                let _ = rx.await;
-                DumpAct::Normal
+        async move {
+            if busy {
+                return Err(DumpError::Failed(io::Error::from_raw_os_error(EBUSY)));
             }
-            other => other,
-        };
-        let mut k = self.kernel.lock();
-        if k.feeds[self.id].tx.is_none() {
-            return Err(DumpError::ConnectionLost);
-        }
-        let mut report = DumpReport::default();
-        match act {
-            DumpAct::Normal | DumpAct::Gate(_) => k.copy(family, into, None),
-            DumpAct::Fail(errno) => {
-                return Err(DumpError::Failed(io::Error::from_raw_os_error(errno)));
-            }
-            DumpAct::Truncate => {
-                let routes = k.routes(family);
-                for r in &routes[..routes.len() / 2] {
-                    Change::Add(r.clone()).apply(into);
+            let act = match act {
+                DumpAct::Gate(rx) => {
+                    let _ = rx.await;
+                    DumpAct::Normal
                 }
-                k.feeds[self.id].tx = None;
+                DumpAct::Stall => std::future::pending().await,
+                other => other,
+            };
+            let mut k = kernel.lock();
+            // Only a dump that ends (NLMSG_DONE, an error) frees the socket.
+            k.feeds[id].dump_running = false;
+            if k.feeds[id].tx.is_none() {
                 return Err(DumpError::ConnectionLost);
             }
-            DumpAct::FlagInterrupted => {
-                k.copy(family, into, None);
-                report.interrupted = true;
+            let mut report = DumpReport::default();
+            let into = &mut report.routes;
+            match act {
+                DumpAct::Normal | DumpAct::Gate(_) | DumpAct::Stall => k.copy(family, into, None),
+                DumpAct::Fail(errno) => {
+                    return Err(DumpError::Failed(io::Error::from_raw_os_error(errno)));
+                }
+                DumpAct::Truncate => {
+                    let routes = k.routes(family);
+                    for r in &routes[..routes.len() / 2] {
+                        Change::Add(r.clone()).apply(into);
+                    }
+                    k.feeds[id].tx = None;
+                    return Err(DumpError::ConnectionLost);
+                }
+                DumpAct::FlagInterrupted => {
+                    k.copy(family, into, None);
+                    report.interrupted = true;
+                }
+                DumpAct::ChangeDuring(c) => {
+                    k.change(&c);
+                    k.copy(family, into, None);
+                }
+                DumpAct::SkipDuring(c) => {
+                    // Only a change to the tree being walked restarts the walk.
+                    let skip = if k.change(&c) && c.family() == family {
+                        k.routes(family).into_iter().find(|r| r != c.route())
+                    } else {
+                        None
+                    };
+                    k.copy(family, into, skip.as_ref());
+                }
+                DumpAct::OverrunDuring(c) => {
+                    k.feeds[id].dropping += 1;
+                    k.change(&c);
+                    k.copy(family, into, None);
+                }
             }
-            DumpAct::ChangeDuring(c) => {
-                k.change(&c);
-                k.copy(family, into, None);
-            }
-            DumpAct::SkipDuring(c) => {
-                // Only a change to the tree being walked restarts the walk.
-                let skip = if k.change(&c) && c.family() == family {
-                    k.routes(family).into_iter().find(|r| r != c.route())
-                } else {
-                    None
-                };
-                k.copy(family, into, skip.as_ref());
-            }
-            DumpAct::OverrunDuring(c) => {
-                k.feeds[self.id].dropping += 1;
-                k.change(&c);
-                k.copy(family, into, None);
-            }
+            Ok(report)
         }
-        Ok(report)
     }
 }
 
@@ -413,6 +432,15 @@ impl RouteFeed for FakeFeed {
 
 fn backoff() -> ResyncBackoff {
     ResyncBackoff::new(Duration::from_millis(10), Duration::from_secs(1)).unwrap()
+}
+
+const DUMP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn pacing() -> Pacing {
+    Pacing {
+        backoff: backoff(),
+        dump_timeout: DumpTimeout::new(DUMP_TIMEOUT).unwrap(),
+    }
 }
 
 struct Harness {
@@ -427,7 +455,7 @@ impl Harness {
     fn start(kernel: &FakeKernel) -> Self {
         let (shared, changes, status) = Shared::new();
         let snapshot = shared.snapshot.clone();
-        let task = tokio::spawn(supervise(FakeSource(kernel.clone()), shared, backoff()));
+        let task = tokio::spawn(supervise(FakeSource(kernel.clone()), shared, pacing()));
         Self {
             kernel: kernel.clone(),
             snapshot,
@@ -700,7 +728,7 @@ async fn the_first_connect_failure_is_returned_to_the_caller() {
     let kernel = FakeKernel::default();
     kernel.fail_connects(&[ENOMEM]);
     let (shared, _changes, status) = Shared::new();
-    let err = supervise(FakeSource(kernel.clone()), shared, backoff()).await;
+    let err = supervise(FakeSource(kernel.clone()), shared, pacing()).await;
     assert_eq!(err.raw_os_error(), Some(ENOMEM));
     assert!(matches!(
         status.borrow().health().degraded_cause(),
@@ -824,6 +852,76 @@ async fn an_overrun_during_a_dump_abandons_the_attempt() {
     assert!(h.agrees());
 }
 
+// ── Dumps that never finish (PR #125 review) ─────────────────────────────────
+//
+// `netlink_dump` returns -ENOBUFS when it cannot allocate or charge its next
+// chunk and leaves `cb_running` set; `netlink_recvmsg` reports that through
+// `sk_err` (an overrun for netlink-proto) and retries the dump only after it
+// has received a queued message. A new dump on that socket gets `EBUSY`
+// (`__netlink_dump_start`).
+
+#[tokio::test(start_paused = true)]
+async fn an_overrun_while_a_dump_is_pending_abandons_it_and_reconnects() {
+    let routes = universe();
+    let kernel = FakeKernel::with(&routes[..2]);
+    let (_gate, gated) = oneshot::channel::<()>(); // never released
+    kernel.script(DumpAct::Gate(gated));
+    let mut h = Harness::start(&kernel);
+    h.quiesce(Duration::from_millis(1)).await;
+    assert_eq!(h.health(), SnapshotHealth::Starting, "the dump is pending");
+
+    kernel.lose_next(1);
+    kernel.add(&routes[3]); // dropped: the overrun arrives while the dump waits
+    let status = h.wait_degraded(DegradedCause::NotificationsLost).await;
+    assert_eq!((status.losses(), status.resyncs()), (1, 0));
+    let status = h.wait_ready().await;
+    assert!(h.agrees());
+    assert_eq!(status.resyncs(), 1);
+    assert_eq!(kernel.connects(), 2, "the busy socket is replaced");
+    assert_eq!(
+        kernel.dumps(),
+        1 + 2,
+        "no dump is attempted on the busy socket"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dump_that_never_finishes_hits_its_deadline_and_reconnects() {
+    let kernel = FakeKernel::with(&universe());
+    kernel.script(DumpAct::Stall);
+    let started = Instant::now();
+    let mut h = Harness::start(&kernel);
+    h.wait_degraded(DegradedCause::DumpStalled).await;
+    assert_eq!(started.elapsed(), DUMP_TIMEOUT, "exactly the deadline");
+    assert_eq!(h.status().resyncs(), 0);
+    h.wait_ready().await;
+    assert!(h.agrees());
+    assert_eq!(kernel.connects(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn notifications_read_during_a_dump_are_applied_and_replayed() {
+    let routes = universe();
+    let kernel = FakeKernel::with(&routes[..1]);
+    let mut h = Harness::ready(&kernel).await;
+    let (gate, gated) = oneshot::channel();
+
+    kernel.lose_next(1);
+    kernel.add(&routes[1]); // dropped: starts a resync
+    kernel.script(DumpAct::Gate(gated));
+    h.wait_degraded(DegradedCause::NotificationsLost).await;
+    h.quiesce(Duration::from_secs(1)).await; // the IPv4 dump is now pending
+    kernel.add(&routes[4]); // an IPv6 change while the IPv4 dump runs
+    h.quiesce(Duration::from_millis(1)).await;
+    assert!(
+        reachable(&h.snapshot(), "2001:db8::1"),
+        "applied to the live snapshot at once"
+    );
+    gate.send(()).unwrap();
+    h.wait_ready().await;
+    assert!(h.agrees());
+}
+
 // ── Pacing ────────────────────────────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -879,6 +977,7 @@ enum Fault {
     ChangeDuring(usize),
     SkipDuring(usize),
     OverrunDuring(usize),
+    Stall,
 }
 
 fn toggle(kernel: &FakeKernel, i: usize) -> Change {
@@ -903,6 +1002,7 @@ fn op() -> impl Strategy<Value = Op> {
         (0..n).prop_map(Fault::ChangeDuring),
         (0..n).prop_map(Fault::SkipDuring),
         (0..n).prop_map(Fault::OverrunDuring),
+        Just(Fault::Stall),
     ];
     prop_oneof![
         6 => (0..n).prop_map(Op::Toggle),
@@ -949,6 +1049,7 @@ async fn run_model(initial: Vec<usize>, ops: Vec<Op>) {
                 Fault::ChangeDuring(i) => DumpAct::ChangeDuring(toggle(&kernel, *i)),
                 Fault::SkipDuring(i) => DumpAct::SkipDuring(toggle(&kernel, *i)),
                 Fault::OverrunDuring(i) => DumpAct::OverrunDuring(toggle(&kernel, *i)),
+                Fault::Stall => DumpAct::Stall,
             }),
             Op::Wait(ms) => h.quiesce(Duration::from_millis(*ms)).await,
         }

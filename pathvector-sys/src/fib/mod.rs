@@ -101,7 +101,8 @@ use tokio::sync::watch;
 
 mod health;
 pub use health::{
-    DegradedCause, FibStatus, IoFailure, ResyncBackoff, ResyncBackoffError, SnapshotHealth,
+    DegradedCause, DumpTimeout, FibStatus, IoFailure, ResyncBackoff, ResyncBackoffError,
+    SnapshotHealth,
 };
 
 // Generic over the kernel port; on other platforms only the tests instantiate
@@ -443,6 +444,7 @@ pub struct KernelFib {
     pub(crate) status_rx: watch::Receiver<FibStatus>,
     pub(crate) table: u32,
     pub(crate) backoff: ResyncBackoff,
+    pub(crate) dump_timeout: DumpTimeout,
     pub(crate) receive_buffer: Option<NonZeroU32>,
 }
 
@@ -467,6 +469,7 @@ impl KernelFib {
         KernelFibBuilder {
             table,
             backoff: ResyncBackoff::DEFAULT,
+            dump_timeout: DumpTimeout::DEFAULT,
             receive_buffer: None,
         }
     }
@@ -524,11 +527,21 @@ impl KernelFib {
         #[cfg(target_os = "linux")]
         {
             let source = linux::NetlinkSource::new(self.table, self.receive_buffer);
-            Err(supervisor::supervise(source, self.shared, self.backoff).await)
+            let pacing = supervisor::Pacing {
+                backoff: self.backoff,
+                dump_timeout: self.dump_timeout,
+            };
+            Err(supervisor::supervise(source, self.shared, pacing).await)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (self.shared, self.table, self.backoff, self.receive_buffer);
+            let _ = (
+                self.shared,
+                self.table,
+                self.backoff,
+                self.dump_timeout,
+                self.receive_buffer,
+            );
             Ok(())
         }
     }
@@ -568,6 +581,7 @@ impl KernelFib {
 pub struct KernelFibBuilder {
     table: u32,
     backoff: ResyncBackoff,
+    dump_timeout: DumpTimeout,
     receive_buffer: Option<NonZeroU32>,
 }
 
@@ -576,6 +590,13 @@ impl KernelFibBuilder {
     /// Defaults to [`ResyncBackoff::DEFAULT`].
     pub fn resync_backoff(mut self, backoff: ResyncBackoff) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// The longest one family's route dump may take before the connection is
+    /// replaced. Defaults to [`DumpTimeout::DEFAULT`].
+    pub fn dump_timeout(mut self, timeout: DumpTimeout) -> Self {
+        self.dump_timeout = timeout;
         self
     }
 
@@ -602,6 +623,7 @@ impl KernelFibBuilder {
                 status_rx,
                 table: self.table,
                 backoff: self.backoff,
+                dump_timeout: self.dump_timeout,
                 receive_buffer: self.receive_buffer,
             },
             change_rx,

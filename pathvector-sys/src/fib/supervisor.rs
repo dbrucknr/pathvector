@@ -49,6 +49,17 @@
 //!   notification arrives while it runs, and it is repeated.
 //!   (`iproute2`'s `rtnl_dump_filter_l` only prints "Dump was interrupted and
 //!   may be inconsistent."; a daemon has to do better.)
+//! - **A dump that stops.** `netlink_dump` returns `-ENOBUFS` when it cannot
+//!   allocate or charge the next chunk, leaving the dump running
+//!   (`cb_running` stays set); `netlink_recvmsg` reports that through
+//!   `sk_err`, which `netlink-proto` turns into the same overrun message, and
+//!   retries the dump only after it has *received* a queued message. On a
+//!   socket with nothing else queued the dump never resumes. So the
+//!   supervisor reads notifications while a dump runs, treats an overrun
+//!   then as fatal for the dump, and also gives each dump a deadline
+//!   ([`DumpTimeout`]). An abandoned dump is still running in the kernel, and
+//!   `__netlink_dump_start` answers a new dump on that socket with `EBUSY`,
+//!   so abandoning one always replaces the connection.
 //!
 //! # Recovery
 //!
@@ -58,9 +69,9 @@
 //! 1. Notifications already received are applied to the live snapshot. They
 //!    were read before the dump requests are sent, so the dumps will reflect
 //!    them too.
-//! 2. Each family is dumped into a fresh snapshot, IPv4 then IPv6.
-//!    Notifications that arrive during a family's dump are applied to the
-//!    fresh snapshot once that dump completes (replaying a change the dump
+//! 2. Each family is dumped into a fresh snapshot, IPv4 then IPv6, while
+//!    notifications keep being read. Those that arrive during a family's dump
+//!    are applied to the fresh snapshot once that dump completes (replaying a change the dump
 //!    already shows is harmless: see `apply_new`). Notifications for a family
 //!    not dumped yet are left out of the fresh snapshot, since its dump will
 //!    show them. Every notification is also applied to the live snapshot, in
@@ -72,6 +83,8 @@
 //!    last through the rest of the dump. The next attempt starts after a
 //!    delay during which the queue is read to the end, which ends the
 //!    episode, so that attempt's dumps are covered by fresh notifications.
+//!    If the overrun (or the deadline) catches a dump still running, the
+//!    connection is replaced as well.
 //! 4. Otherwise the fresh snapshot replaces the old one in a single move under
 //!    the write lock; the old one is freed after the lock is released, so
 //!    lookups are never blocked for longer than that move.
@@ -81,10 +94,11 @@
 //!    still installed: it is newer than the one it replaces, and every
 //!    notification since its dump has been applied.
 //!
-//! An overrun keeps the same connection: `netlink-proto` notes that after
-//! `ENOBUFS` "contents of the socket's internal buffer is still valid". A
-//! connection loss or a failed dump drops the connection (its task is
-//! aborted with it) and opens a new one.
+//! An overrun with no dump running keeps the same connection:
+//! `netlink-proto` notes that after `ENOBUFS` "contents of the socket's
+//! internal buffer is still valid". A connection loss, a failed dump or an
+//! abandoned dump drops the connection (its task is aborted with it) and opens
+//! a new one.
 //!
 //! Between attempts the supervisor keeps applying the notifications it does
 //! receive, so a degraded snapshot drifts no further than necessary, and
@@ -105,7 +119,7 @@ use tokio::{
 
 use super::{
     FibSnapshot,
-    health::{DegradedCause, FibStatus, IoFailure, ResyncBackoff, SnapshotHealth},
+    health::{DegradedCause, DumpTimeout, FibStatus, IoFailure, ResyncBackoff, SnapshotHealth},
 };
 
 // ── Port ──────────────────────────────────────────────────────────────────────
@@ -147,9 +161,11 @@ pub(crate) enum Received<U> {
     Closed,
 }
 
-/// How a complete dump went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A complete dump of one family.
+#[derive(Debug, Default)]
 pub(crate) struct DumpReport {
+    /// The family's routes, in kernel order (the other family is empty).
+    pub(crate) routes: FibSnapshot,
     /// The kernel set `NLM_F_DUMP_INTR` on one of the dump's messages.
     pub(crate) interrupted: bool,
 }
@@ -177,13 +193,15 @@ pub(crate) trait RouteFeed: Send {
     /// A notification that has already been received, without waiting.
     fn try_next(&mut self) -> Received<Self::Update>;
 
-    /// Dumps every route of `family` into `into`, in kernel order. Succeeds
-    /// only if the kernel ended the dump with `NLMSG_DONE`.
+    /// Requests a dump of every route of `family`. The returned future does
+    /// not borrow the feed, so notifications can be read while it runs, and
+    /// succeeds only if the kernel ends the dump with `NLMSG_DONE`. Dropping
+    /// it before then leaves the dump running in the kernel; the feed must
+    /// not be asked for another dump afterwards.
     fn dump(
         &mut self,
         family: Family,
-        into: &mut FibSnapshot,
-    ) -> impl Future<Output = Result<DumpReport, DumpError>> + Send;
+    ) -> impl Future<Output = Result<DumpReport, DumpError>> + Send + 'static;
 }
 
 /// Opens connections subscribed to IPv4 and IPv6 route notifications.
@@ -337,16 +355,23 @@ impl Retry {
 
 // ── Supervisor ────────────────────────────────────────────────────────────────
 
+/// Timing for [`supervise`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pacing {
+    pub(crate) backoff: ResyncBackoff,
+    pub(crate) dump_timeout: DumpTimeout,
+}
+
 /// Runs until dropped, keeping `shared` in step with the kernel.
 ///
 /// Returns only if the very first [`RouteSource::connect`] fails: that means
 /// this process cannot use netlink at all (for example a sandbox that forbids
 /// the socket), which retrying will not fix. Every later failure is retried
-/// with `backoff` delays and reported through the status.
+/// with backoff delays and reported through the status.
 pub(crate) async fn supervise<S: RouteSource>(
     mut source: S,
     shared: Shared,
-    backoff: ResyncBackoff,
+    pacing: Pacing,
 ) -> io::Error {
     let mut feed = match source.connect() {
         Ok(feed) => feed,
@@ -355,9 +380,9 @@ pub(crate) async fn supervise<S: RouteSource>(
             return e;
         }
     };
-    let mut retry = Retry::new(backoff);
+    let mut retry = Retry::new(pacing.backoff);
     loop {
-        run_connection(feed, &shared, &mut retry).await;
+        run_connection(feed, &shared, &mut retry, pacing.dump_timeout).await;
         feed = reconnect(&mut source, &shared, &mut retry).await;
     }
 }
@@ -376,15 +401,20 @@ async fn reconnect<S: RouteSource>(source: &mut S, shared: &Shared, retry: &mut 
 /// Resynchronizes and then follows notifications on one connection, until
 /// the connection is lost or must be replaced. Dropping `feed` on return
 /// closes the connection.
-async fn run_connection<F: RouteFeed>(mut feed: F, shared: &Shared, retry: &mut Retry) {
+async fn run_connection<F: RouteFeed>(
+    mut feed: F,
+    shared: &Shared,
+    retry: &mut Retry,
+    dump_timeout: DumpTimeout,
+) {
     loop {
         shared.begin_attempt();
-        match resync(&mut feed, shared).await {
-            Ok(None) => {
+        match resync(&mut feed, shared, dump_timeout).await {
+            Attempt::Ready => {
                 shared.ready();
                 retry.ready();
             }
-            Ok(Some(cause)) => {
+            Attempt::Retry(cause) => {
                 shared.degrade(cause);
                 if settle(&mut feed, shared, retry.next_delay()).await.is_err() {
                     shared.degrade(DegradedCause::ConnectionLost);
@@ -392,12 +422,8 @@ async fn run_connection<F: RouteFeed>(mut feed: F, shared: &Shared, retry: &mut 
                 }
                 continue;
             }
-            Err(DumpError::Failed(e)) => {
-                shared.degrade(DegradedCause::DumpFailed(IoFailure::from(&e)));
-                return;
-            }
-            Err(DumpError::ConnectionLost) => {
-                shared.degrade(DegradedCause::ConnectionLost);
+            Attempt::Reconnect(cause) => {
+                shared.degrade(cause);
                 return;
             }
         }
@@ -446,26 +472,40 @@ async fn settle<F: RouteFeed>(
     }
 }
 
+/// How a resynchronization attempt ended.
+#[derive(Debug)]
+enum Attempt {
+    /// A consistent fresh snapshot was installed.
+    Ready,
+    /// Try again on the same connection: an overrun abandoned the attempt
+    /// after its dumps had finished (nothing installed), or the installed
+    /// snapshot may miss routes.
+    Retry(DegradedCause),
+    /// The connection must be replaced: it ended, a dump failed, or a dump
+    /// was abandoned while still running in the kernel (nothing installed).
+    Reconnect(DegradedCause),
+}
+
+impl From<DumpError> for Attempt {
+    fn from(e: DumpError) -> Self {
+        Self::Reconnect(match e {
+            DumpError::Failed(e) => DegradedCause::DumpFailed(IoFailure::from(&e)),
+            DumpError::ConnectionLost => DegradedCause::ConnectionLost,
+        })
+    }
+}
+
 /// Dumps both families into a fresh snapshot and installs it.
-///
-/// Returns `Ok(None)` if the fresh snapshot was installed and the dumps were
-/// consistent, `Ok(Some(DumpInconsistent))` if it was installed but may miss
-/// routes, `Ok(Some(NotificationsLost))` if an overrun abandoned the attempt,
-/// and `Err` if a dump did not complete. Nothing is installed in the last two
-/// cases.
-async fn resync<F: RouteFeed>(
-    feed: &mut F,
-    shared: &Shared,
-) -> Result<Option<DegradedCause>, DumpError> {
+async fn resync<F: RouteFeed>(feed: &mut F, shared: &Shared, dump_timeout: DumpTimeout) -> Attempt {
     // Step 1: everything received so far predates the dump requests.
     loop {
         match feed.try_next() {
             Received::Notification(Notification::Route(update)) => shared.apply(&update),
             Received::Notification(Notification::Overrun) => {
-                return Ok(Some(DegradedCause::NotificationsLost));
+                return Attempt::Retry(DegradedCause::NotificationsLost);
             }
             Received::Empty => break,
-            Received::Closed => return Err(DumpError::ConnectionLost),
+            Received::Closed => return Attempt::Reconnect(DegradedCause::ConnectionLost),
         }
     }
 
@@ -473,26 +513,65 @@ async fn resync<F: RouteFeed>(
     let mut consistent = true;
     // Step 2: IPv4, then IPv6.
     for family in [Family::V4, Family::V6] {
-        let report = feed.dump(family, &mut fresh).await?;
+        // Notifications that arrive while the dump runs, in order.
+        let mut during = Vec::new();
+        let dump = feed.dump(family);
+        let deadline = time::sleep(dump_timeout.get());
+        tokio::pin!(dump, deadline);
+        let report = loop {
+            tokio::select! {
+                // Notifications first: an overrun read in the same wake-up as
+                // NLMSG_DONE was queued before it (sock_error is checked
+                // before the queue), so it must win.
+                biased;
+                notification = feed.next() => match notification {
+                    Some(Notification::Route(update)) => {
+                        shared.apply(&update);
+                        during.push(update);
+                    }
+                    // Step 3: the dump may also have stopped for good.
+                    Some(Notification::Overrun) => {
+                        return Attempt::Reconnect(DegradedCause::NotificationsLost);
+                    }
+                    None => return Attempt::Reconnect(DegradedCause::ConnectionLost),
+                },
+                result = &mut dump => match result {
+                    Ok(report) => break report,
+                    Err(e) => return e.into(),
+                },
+                () = &mut deadline => return Attempt::Reconnect(DegradedCause::DumpStalled),
+            }
+        };
         consistent &= !report.interrupted;
+        match family {
+            Family::V4 => fresh.v4 = report.routes.v4,
+            Family::V6 => fresh.v6 = report.routes.v6,
+        }
+
         // With IPv4 dumped first, an IPv4 notification is always newer than
         // the IPv4 dump, while an IPv6 one is newer than the IPv6 dump only
         // once that dump is done.
         let dumped = |f: Family| f == Family::V4 || family == Family::V6;
+        let mut replay = |update: &F::Update, consistent: &mut bool| {
+            let f = update.family();
+            *consistent &= f != family;
+            if dumped(f) {
+                update.apply(&mut fresh);
+            }
+        };
+        for update in &during {
+            replay(update, &mut consistent);
+        }
         loop {
             match feed.try_next() {
                 Received::Empty => break,
-                Received::Closed => return Err(DumpError::ConnectionLost),
-                // Step 3.
+                Received::Closed => return Attempt::Reconnect(DegradedCause::ConnectionLost),
+                // Step 3, with the dump already finished.
                 Received::Notification(Notification::Overrun) => {
-                    return Ok(Some(DegradedCause::NotificationsLost));
+                    return Attempt::Retry(DegradedCause::NotificationsLost);
                 }
                 Received::Notification(Notification::Route(update)) => {
-                    let f = update.family();
-                    consistent &= f != family;
-                    if dumped(f) {
-                        update.apply(&mut fresh);
-                    }
+                    replay(&update, &mut consistent);
                     shared.apply(&update);
                 }
             }
@@ -501,7 +580,11 @@ async fn resync<F: RouteFeed>(
 
     // Steps 4 and 5.
     shared.install(fresh);
-    Ok((!consistent).then_some(DegradedCause::DumpInconsistent))
+    if consistent {
+        Attempt::Ready
+    } else {
+        Attempt::Retry(DegradedCause::DumpInconsistent)
+    }
 }
 
 #[cfg(test)]
