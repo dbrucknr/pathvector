@@ -227,7 +227,9 @@ next chunk it returns `-ENOBUFS`, leaves the dump running, and `netlink_recvmsg`
 it only after it has received another queued message. The supervisor therefore reads
 notifications while a dump runs, gives each dump a deadline, and replaces the socket when
 it abandons a running dump (a new dump on that socket would get `EBUSY` from
-`__netlink_dump_start`).
+`__netlink_dump_start`). A busy notification channel cannot hold either back: the dump
+and the deadline are checked before every notification, and the supervisor yields to the
+runtime as it works through a long queue.
 
 After a detection the snapshot becomes `Degraded`, the supervisor waits (`ResyncBackoff`:
 100 ms doubling to 10 s by default, applying the notifications it still receives), dumps

@@ -114,6 +114,7 @@ use std::{
 
 use tokio::{
     sync::watch,
+    task::coop,
     time::{self, Instant},
 };
 
@@ -431,7 +432,10 @@ async fn run_connection<F: RouteFeed>(
         // The snapshot mirrors the kernel; keep it that way.
         loop {
             match feed.next().await {
-                Some(Notification::Route(update)) => shared.apply(&update),
+                Some(Notification::Route(update)) => {
+                    shared.apply(&update);
+                    coop::consume_budget().await;
+                }
                 Some(Notification::Overrun) => {
                     shared.degrade(DegradedCause::NotificationsLost);
                     if settle(&mut feed, shared, retry.next_delay()).await.is_err() {
@@ -469,6 +473,7 @@ async fn settle<F: RouteFeed>(
                 None => return Err(Closed),
             },
         }
+        coop::consume_budget().await;
     }
 }
 
@@ -495,10 +500,17 @@ impl From<DumpError> for Attempt {
     }
 }
 
+/// The most notifications one drain of already-received notifications reads.
+/// A connection task on another thread can keep refilling the channel, so an
+/// unbounded drain might never end.
+const DRAIN_LIMIT: usize = 65_536;
+
 /// Dumps both families into a fresh snapshot and installs it.
 async fn resync<F: RouteFeed>(feed: &mut F, shared: &Shared, dump_timeout: DumpTimeout) -> Attempt {
-    // Step 1: everything received so far predates the dump requests.
-    loop {
+    // Step 1: everything received so far predates the dump requests. Past
+    // the cap the rest is read during the IPv4 dump, where an IPv4 change
+    // counts against consistency: conservative, never wrong.
+    for _ in 0..DRAIN_LIMIT {
         match feed.try_next() {
             Received::Notification(Notification::Route(update)) => shared.apply(&update),
             Received::Notification(Notification::Overrun) => {
@@ -516,14 +528,28 @@ async fn resync<F: RouteFeed>(feed: &mut F, shared: &Shared, dump_timeout: DumpT
         // Notifications that arrive while the dump runs, in order.
         let mut during = Vec::new();
         let dump = feed.dump(family);
-        let deadline = time::sleep(dump_timeout.get());
+        let deadline_at = Instant::now() + dump_timeout.get();
+        let deadline = time::sleep_until(deadline_at);
         tokio::pin!(dump, deadline);
         let report = loop {
+            // Checked against the clock too: a timer is only marked as fired
+            // when the runtime services its time driver, which a busy loop
+            // can postpone.
+            if Instant::now() >= deadline_at {
+                return Attempt::Reconnect(DegradedCause::DumpStalled);
+            }
             tokio::select! {
-                // Notifications first: an overrun read in the same wake-up as
-                // NLMSG_DONE was queued before it (sock_error is checked
-                // before the queue), so it must win.
+                // The dump and the deadline are polled before every
+                // notification, so a queue that never empties cannot hold
+                // them back (tokio's select "Fairness" docs). An overrun
+                // queued before NLMSG_DONE is still seen before anything is
+                // installed: the drain below reads it.
                 biased;
+                result = &mut dump => match result {
+                    Ok(report) => break report,
+                    Err(e) => return e.into(),
+                },
+                () = &mut deadline => return Attempt::Reconnect(DegradedCause::DumpStalled),
                 notification = feed.next() => match notification {
                     Some(Notification::Route(update)) => {
                         shared.apply(&update);
@@ -535,12 +561,12 @@ async fn resync<F: RouteFeed>(feed: &mut F, shared: &Shared, dump_timeout: DumpT
                     }
                     None => return Attempt::Reconnect(DegradedCause::ConnectionLost),
                 },
-                result = &mut dump => match result {
-                    Ok(report) => break report,
-                    Err(e) => return e.into(),
-                },
-                () = &mut deadline => return Attempt::Reconnect(DegradedCause::DumpStalled),
             }
+            // The feed's channel does not take part in tokio's cooperative
+            // budget; without this a busy channel never yields the thread,
+            // and on a current-thread runtime the deadline's timer never
+            // fires.
+            coop::consume_budget().await;
         };
         consistent &= !report.interrupted;
         match family {
@@ -562,7 +588,16 @@ async fn resync<F: RouteFeed>(feed: &mut F, shared: &Shared, dump_timeout: DumpT
         for update in &during {
             replay(update, &mut consistent);
         }
+        // A capped drain cannot tell what is left from what arrived during
+        // the dump, so stopping at the cap counts as inconsistent; the rest
+        // is applied after the install, in order.
+        let mut drained = 0;
         loop {
+            if drained == DRAIN_LIMIT {
+                consistent = false;
+                break;
+            }
+            drained += 1;
             match feed.try_next() {
                 Received::Empty => break,
                 Received::Closed => return Attempt::Reconnect(DegradedCause::ConnectionLost),

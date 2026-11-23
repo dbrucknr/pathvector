@@ -159,6 +159,9 @@ enum DumpAct {
     /// Never answers: `netlink_dump` could not queue its next chunk and
     /// nothing else is read that would make `netlink_recvmsg` retry it.
     Stall,
+    /// These no-op notifications become ready while the dump runs, readable
+    /// by `try_next` too.
+    FloodDuring(Vec<Change>),
 }
 
 struct FeedSlot {
@@ -180,6 +183,15 @@ struct Kernel {
     connect_failures: VecDeque<i32>,
     dump_script: VecDeque<DumpAct>,
     connect_times: Vec<Instant>,
+    /// Notifications that are always ready to read, ahead of the real ones,
+    /// like a channel a connection task on another thread keeps refilling.
+    flood: VecDeque<Change>,
+    /// Whether `try_next` also serves the flood (otherwise only `next`).
+    flood_in_try_next: bool,
+    /// Blocking work per flooded notification read by `next`.
+    flood_cost: Duration,
+    /// Flooded notifications still unread when the IPv6 dump was requested.
+    flood_left_at_v6_dump: Option<usize>,
     dump_times: Vec<Instant>,
 }
 
@@ -287,6 +299,23 @@ impl FakeKernel {
         self.lock().dump_script.push_back(act);
     }
 
+    /// Makes `n` copies of `change` (which must change nothing) always ready
+    /// to read, each costing `cost` of blocking work when `next` reads it.
+    fn flood(&self, n: usize, change: &Change, cost: Duration) {
+        let mut k = self.lock();
+        k.flood = std::iter::repeat_n(change.clone(), n).collect();
+        k.flood_cost = cost;
+    }
+
+    fn take_flood(&self, by_try_next: bool) -> Option<(Change, Duration)> {
+        let mut k = self.lock();
+        if by_try_next && !k.flood_in_try_next {
+            return None;
+        }
+        let cost = k.flood_cost;
+        k.flood.pop_front().map(|c| (c, cost))
+    }
+
     fn truth(&self) -> FibSnapshot {
         self.lock().truth.clone()
     }
@@ -336,6 +365,11 @@ impl RouteFeed for FakeFeed {
     type Update = Change;
 
     async fn next(&mut self) -> Option<Notification<Change>> {
+        // Ready at once, without yielding, like a non-empty channel.
+        if let Some((change, cost)) = self.kernel.take_flood(false) {
+            std::thread::sleep(cost);
+            return Some(Notification::Route(change));
+        }
         let n = self.rx.recv().await;
         if self.rx.is_empty() {
             self.kernel.lock().read_to_end(self.id);
@@ -344,6 +378,9 @@ impl RouteFeed for FakeFeed {
     }
 
     fn try_next(&mut self) -> Received<Change> {
+        if let Some((change, _)) = self.kernel.take_flood(true) {
+            return Received::Notification(Notification::Route(change));
+        }
         let received = match self.rx.try_recv() {
             Ok(n) => Received::Notification(n),
             Err(mpsc::error::TryRecvError::Empty) => Received::Empty,
@@ -364,6 +401,9 @@ impl RouteFeed for FakeFeed {
         let (act, busy) = {
             let mut k = kernel.lock();
             k.dump_times.push(Instant::now());
+            if family == Family::V6 && k.flood_left_at_v6_dump.is_none() {
+                k.flood_left_at_v6_dump = Some(k.flood.len());
+            }
             // `__netlink_dump_start`: one dump per socket at a time.
             let busy = std::mem::replace(&mut k.feeds[id].dump_running, true);
             (k.dump_script.pop_front().unwrap_or(DumpAct::Normal), busy)
@@ -390,6 +430,11 @@ impl RouteFeed for FakeFeed {
             let into = &mut report.routes;
             match act {
                 DumpAct::Normal | DumpAct::Gate(_) | DumpAct::Stall => k.copy(family, into, None),
+                DumpAct::FloodDuring(changes) => {
+                    k.flood = changes.into();
+                    k.flood_in_try_next = true;
+                    k.copy(family, into, None);
+                }
                 DumpAct::Fail(errno) => {
                     return Err(DumpError::Failed(io::Error::from_raw_os_error(errno)));
                 }
@@ -919,6 +964,113 @@ async fn notifications_read_during_a_dump_are_applied_and_replayed() {
         "applied to the live snapshot at once"
     );
     gate.send(()).unwrap();
+    h.wait_ready().await;
+    assert!(h.agrees());
+}
+
+// ── A busy notification channel (PR #125 re-review) ──────────────────────────
+//
+// tokio's `select!` with `biased;` polls branches in order, so a branch that
+// is always ready starves the ones after it ("Fairness" in the tokio docs).
+// The dump and its deadline must not depend on the notification queue
+// running dry.
+
+/// An IPv6 notification that changes nothing (the route is absent).
+fn no_op_v6() -> Change {
+    Change::Del(v6("fd99::", 64, 1))
+}
+
+/// An IPv4 notification that changes nothing.
+fn no_op_v4() -> Change {
+    Change::Del(v4("10.99.0.0", 16, 1))
+}
+
+/// Real time: the flood never yields, so paused time could not move. Each
+/// notification blocks for 1 ms; 1000 of them outlast a 50 ms deadline
+/// twenty times over. Checked only before the flood would have run out.
+#[tokio::test]
+async fn a_busy_channel_cannot_hold_back_the_dump_deadline() {
+    let kernel = FakeKernel::with(&universe());
+    kernel.script(DumpAct::Stall);
+    kernel.flood(1_000, &no_op_v6(), Duration::from_millis(1));
+    let (shared, _changes, mut status) = Shared::new();
+    let pacing = Pacing {
+        backoff: backoff(),
+        dump_timeout: DumpTimeout::new(Duration::from_millis(50)).unwrap(),
+    };
+    let started = std::time::Instant::now();
+    let task = tokio::spawn(supervise(FakeSource(kernel.clone()), shared, pacing));
+    status
+        .wait_for(|s| s.health().degraded_cause() == Some(DegradedCause::DumpStalled))
+        .await
+        .unwrap();
+    let waited = started.elapsed();
+    task.abort();
+    assert!(
+        waited < Duration::from_millis(500),
+        "the 50 ms deadline fired after {waited:?}"
+    );
+    assert!(
+        kernel.lock().flood.len() > 400,
+        "the flood was not drained first"
+    );
+}
+
+/// The channel is outside tokio's cooperative budget, so the supervisor
+/// must yield on its own while draining a busy one, or every other task on
+/// its thread waits for the queue to run dry.
+#[tokio::test]
+async fn a_busy_channel_does_not_monopolize_the_thread() {
+    let kernel = FakeKernel::with(&universe());
+    let (_gate, gated) = oneshot::channel::<()>(); // the dump stays pending
+    kernel.script(DumpAct::Gate(gated));
+    kernel.flood(1_000, &no_op_v6(), Duration::ZERO);
+    let (shared, _changes, _status) = Shared::new();
+    let task = tokio::spawn(supervise(FakeSource(kernel.clone()), shared, pacing()));
+    // Runs as soon as the supervisor yields after requesting its dump.
+    let observer = {
+        let kernel = kernel.clone();
+        tokio::spawn(async move {
+            while kernel.dumps() == 0 {
+                tokio::task::yield_now().await;
+            }
+            kernel.lock().flood.len()
+        })
+    };
+    let left = observer.await.unwrap();
+    task.abort();
+    assert!(left > 0, "another task ran only once the flood was drained");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_channel_cannot_hold_back_a_finished_dump() {
+    let kernel = FakeKernel::with(&universe());
+    // Always ready through `next`: only a dump polled ahead of the channel
+    // is taken before these run out.
+    kernel.flood(5_000, &no_op_v6(), Duration::ZERO);
+    let mut h = Harness::start(&kernel);
+    h.wait_ready().await;
+    assert!(h.agrees());
+    assert_eq!(
+        kernel.lock().flood_left_at_v6_dump,
+        Some(5_000),
+        "the finished IPv4 dump was taken before any queued notification"
+    );
+}
+
+/// IPv4 changes that raced the IPv4 dump, queued behind more IPv6 ones than
+/// one drain reads: if a capped drain counted as complete they would be read
+/// during the IPv6 dump, look newer than the IPv4 dump, and never mark it
+/// inconsistent.
+#[tokio::test(start_paused = true)]
+async fn a_drain_that_hits_its_cap_is_not_trusted() {
+    let kernel = FakeKernel::with(&universe());
+    let mut queued = vec![no_op_v6(); DRAIN_LIMIT];
+    queued.extend(std::iter::repeat_n(no_op_v4(), 10));
+    kernel.script(DumpAct::FloodDuring(queued));
+    let mut h = Harness::start(&kernel);
+    let status = h.wait_degraded(DegradedCause::DumpInconsistent).await;
+    assert_eq!(status.resyncs(), 1, "installed, but not trusted");
     h.wait_ready().await;
     assert!(h.agrees());
 }
