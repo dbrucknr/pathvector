@@ -242,6 +242,71 @@ Known limits:
   fails), neighbour reachability, or the early return `__find_rr_leaf` takes for a route
   through a blackhole nexthop object.
 
+### Reading the kernel FIB: lost notifications and recovery
+
+netlink(7): "Netlink is not a reliable protocol." When a listener's receive buffer is
+full "the message will be dropped and the kernel and the user-space process will no
+longer have the same view of kernel state. It is up to the application to detect when
+this happens (via the `ENOBUFS` error returned by recvmsg(2)) and resynchronize."
+Subscribing before the first dump only closes the startup race; it does nothing about
+later losses.
+
+`KernelFib::spawn` therefore runs a supervisor over one `NETLINK_ROUTE` socket that is
+subscribed to IPv4 and IPv6 route notifications and also carries the dumps:
+
+| Detected | How it surfaces | Cause reported |
+|---|---|---|
+| Notifications dropped | `recvmsg` fails with `ENOBUFS`; `netlink-proto` 0.12 turns it into an `NLMSG_OVERRUN` message | `NotificationsLost` |
+| Connection ended | any other socket error or an undecodable datagram ends `netlink-proto`'s connection task and the notification stream | `ConnectionLost` |
+| Dump cut short | the reply stream ends without `NLMSG_DONE` (`NLMSG_DONE` forwarding is switched on for this) | `ConnectionLost` |
+| Dump failed | `NLMSG_ERROR`, or a negative error in `NLMSG_DONE` | `DumpFailed(errno)` |
+| Dump may have missed routes | `NLM_F_DUMP_INTR`, or a notification for the same family arriving during that family's dump | `DumpInconsistent` |
+| Dump stopped | an overrun while the dump runs, or no `NLMSG_DONE` within `DumpTimeout` (60 s by default) | `NotificationsLost` / `DumpStalled` |
+| New socket refused | `socket` / `bind` / `setsockopt` failed | `ConnectFailed(errno)` |
+
+The last detection rule matters because the kernel's route dumpers never set
+`NLM_F_DUMP_INTR` (only dumpers that call `nl_dump_check_consistent` do), yet
+`fib6_dump_table` restarts from the root after a tree change and skips as many routes as
+it had already sent, which can drop an unchanged route. Every such change is also
+notified on the subscribed socket, so it is visible.
+
+A dump can also stop without ending: when `netlink_dump` cannot allocate or charge its
+next chunk it returns `-ENOBUFS`, leaves the dump running, and `netlink_recvmsg` retries
+it only after it has received another queued message. The supervisor therefore reads
+notifications while a dump runs, gives each dump a deadline, and replaces the socket when
+it abandons a running dump (a new dump on that socket would get `EBUSY` from
+`__netlink_dump_start`). A busy notification channel cannot hold either back: the dump
+and the deadline are checked before every notification, and the supervisor yields to the
+runtime as it works through a long queue.
+
+After a detection the snapshot becomes `Degraded`, the supervisor waits (`ResyncBackoff`:
+100 ms doubling to 10 s by default, applying the notifications it still receives), dumps
+IPv4 then IPv6 into a fresh snapshot, and swaps it in with one move under the write lock.
+An overrun during an attempt abandons it: the kernel drops every notification while the
+socket is congested but reports `ENOBUFS` only once (`netlink_overrun`,
+`netlink_broadcast_deliver`, `netlink_rcv_wake`). A lost connection is reopened with the
+same delays; an overrun keeps the socket.
+
+`KernelFib::status()` / `KernelOracle::status()` publish a `FibStatus`: the
+`SnapshotHealth` (`Starting`, `Ready { since }`, `Degraded { since, cause, attempts }`)
+plus counters of losses and completed resyncs. **Lookups never refuse:** while degraded
+they answer from the last snapshot (stale but flagged), because declaring every next hop
+unreachable would make BGP withdraw everything on a transient overrun. `spawn` returns
+only if the very first socket cannot be opened. `KernelFib::builder` sets the backoff,
+the per-dump deadline (`dump_timeout`) and the socket's `SO_RCVBUF` (`receive_buffer`).
+`pathvectord` logs the status it finds when its logger starts, every change of cause,
+recovery, and a reminder when a single-cause outage reaches 4, 8, 16, … retries.
+
+Known limits:
+
+- Changes the kernel never notifies are not detected. In particular, when a link goes
+  down `fib_table_flush` removes the IPv4 routes through it and sends `RTM_DELROUTE` only
+  if their preferred source address was removed.
+- There is no periodic verification dump, so a divergence that is never signalled lasts
+  until the next detected loss.
+- `KernelFib::stale_bgp_routes` still uses `rtnetlink`'s dump, which cannot tell a
+  complete dump from one cut short by a closed connection.
+
 ---
 
 ## Unsafe code audit
