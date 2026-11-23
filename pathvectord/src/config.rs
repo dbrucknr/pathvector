@@ -4,6 +4,7 @@ use std::{
 };
 
 use pathvector_policy::DefaultAction;
+use pathvector_session::transport::tcp_md5::{Md5Enforcement, TcpMd5Key, TcpMd5KeyError};
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon configuration.
@@ -254,6 +255,26 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub rpki: Option<RpkiConfig>,
+    /// What to do when a peer has `md5_password` but this host cannot
+    /// enforce TCP MD5 (kernel built without `CONFIG_TCP_MD5SIG`, a non-Linux
+    /// build, or an IPv6 peer).
+    ///
+    /// - `"required"` (default): the session does not connect, and the
+    ///   connect error is logged. RFC 5925 §8: an endpoint configured to
+    ///   require TCP MD5 must sign all outgoing segments and validate all
+    ///   incoming ones.
+    /// - `"best-effort"`: the session connects **without authentication** and
+    ///   a warning is logged on every connection attempt. Meant for
+    ///   development hosts such as Docker Desktop, whose kernel lacks TCP MD5.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as            = 65001
+    /// bgp_id              = "10.0.0.1"
+    /// tcp_md5_enforcement = "best-effort"   # development only
+    /// ```
+    #[serde(default)]
+    pub tcp_md5_enforcement: TcpMd5EnforcementConfig,
 }
 
 /// RTR server connection settings for RPKI Route Origin Validation.
@@ -451,9 +472,19 @@ pub struct PeerConfig {
     pub export_default: Option<ExportDefault>,
     /// RFC 2385 TCP MD5 authentication key shared with this peer.
     ///
-    /// When set, the kernel signs and verifies every TCP segment for this BGP
-    /// session using HMAC-MD5. The peer must be configured with the same key.
-    /// Maximum 80 bytes (Linux kernel limit). Omit to disable MD5 (default).
+    /// When set, the kernel signs every TCP segment pathvectord sends to this
+    /// peer and drops segments from it that are unsigned or wrongly signed.
+    /// The peer must be configured with the same key. Must be 1 to 80 bytes:
+    /// an empty or longer value is a config error (Linux would read an empty
+    /// key as "delete the key", and rejects keys over 80 bytes). Omit to
+    /// disable MD5 (default).
+    ///
+    /// If the host cannot enforce the key (a kernel without
+    /// `CONFIG_TCP_MD5SIG`, a non-Linux build, or an IPv6 peer), the session
+    /// does not connect unless `[daemon] tcp_md5_enforcement = "best-effort"`.
+    ///
+    /// Currently applied to outbound connections only; inbound listener keys
+    /// are tracked in issue #66.
     ///
     /// ```toml
     /// [[peers]]
@@ -462,7 +493,7 @@ pub struct PeerConfig {
     /// md5_password = "secret"
     /// ```
     #[serde(default)]
-    pub md5_password: Option<String>,
+    pub md5_password: Option<Md5Password>,
     /// Whether this peer is a Route Reflector client (RFC 4456).
     ///
     /// When `true`, the daemon acts as a Route Reflector for this peer:
@@ -624,6 +655,77 @@ fn default_bgp_port() -> u16 {
     179
 }
 
+// ── TCP MD5 ───────────────────────────────────────────────────────────────────
+
+/// A peer's TCP MD5 password, validated when it is parsed.
+///
+/// Holds the text as written (so the dynamic-peer sidecar can store it again)
+/// and the [`TcpMd5Key`] built from it. Construction fails for an empty value
+/// or one longer than 80 bytes; see [`TcpMd5Key`]. `Debug` hides the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Md5Password {
+    text: String,
+    key: TcpMd5Key,
+}
+
+impl Md5Password {
+    /// The validated key.
+    pub fn key(&self) -> &TcpMd5Key {
+        &self.key
+    }
+}
+
+impl TryFrom<String> for Md5Password {
+    type Error = TcpMd5KeyError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        let key = TcpMd5Key::try_from(text.as_str())?;
+        Ok(Self { text, key })
+    }
+}
+
+impl std::str::FromStr for Md5Password {
+    type Err = TcpMd5KeyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_owned())
+    }
+}
+
+impl From<Md5Password> for String {
+    fn from(p: Md5Password) -> Self {
+        p.text
+    }
+}
+
+impl std::fmt::Debug for Md5Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Md5Password(<redacted>)")
+    }
+}
+
+/// `[daemon] tcp_md5_enforcement`: `"required"` (default) or `"best-effort"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TcpMd5EnforcementConfig {
+    /// Refuse to connect when a configured key cannot be enforced.
+    #[default]
+    Required,
+    /// Connect unauthenticated, with a warning, when a configured key cannot
+    /// be enforced.
+    BestEffort,
+}
+
+impl From<TcpMd5EnforcementConfig> for Md5Enforcement {
+    fn from(c: TcpMd5EnforcementConfig) -> Self {
+        match c {
+            TcpMd5EnforcementConfig::Required => Self::Required,
+            TcpMd5EnforcementConfig::BestEffort => Self::BestEffort,
+        }
+    }
+}
+
 // ── Dynamic peer persistence ──────────────────────────────────────────────────
 
 /// Internal sidecar file format — a flat list of peer configs.
@@ -685,7 +787,13 @@ impl DynamicPeerStore {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 toml::from_str::<SidecarFile>(&text)
-                    .unwrap_or_default()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "ignoring unparseable dynamic peer sidecar: {e}"
+                        );
+                        SidecarFile::default()
+                    })
                     .peers
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
@@ -814,7 +922,7 @@ mod sidecar_tests {
             import_default: Some(ImportDefault::Accept),
             import_default_v6: Some(ImportDefault::Reject),
             export_default: Some(ExportDefault::Accept),
-            md5_password: Some("s3cr3t".into()),
+            md5_password: Some("s3cr3t".parse().unwrap()),
             is_rr_client: true,
             next_hop_self: false,
             hold_time: Some(60),
@@ -834,7 +942,7 @@ mod sidecar_tests {
         assert!(matches!(got.import_default, Some(ImportDefault::Accept)));
         assert!(matches!(got.import_default_v6, Some(ImportDefault::Reject)));
         assert!(matches!(got.export_default, Some(ExportDefault::Accept)));
-        assert_eq!(got.md5_password.as_deref(), Some("s3cr3t"));
+        assert_eq!(got.md5_password, Some("s3cr3t".parse().unwrap()));
         assert!(got.is_rr_client);
         assert_eq!(got.hold_time, Some(60));
         assert_eq!(got.shutdown_message.as_deref(), Some("planned maintenance"));
@@ -1097,7 +1205,85 @@ remote_as = 65002
 md5_password = "s3cr3t"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.peers[0].md5_password.as_deref(), Some("s3cr3t"));
+        assert_eq!(cfg.peers[0].md5_password, Some("s3cr3t".parse().unwrap()));
+    }
+
+    fn peer_with_md5(value: &str) -> String {
+        format!(
+            r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+md5_password = "{value}"
+"#
+        )
+    }
+
+    /// Linux `tcp_v4_parse_md5_keys` reads a zero key length as "delete the
+    /// key" (`tcp_md5_do_del`), so `md5_password = ""` would silently mean
+    /// "no authentication". It must be a config error instead.
+    #[test]
+    fn test_md5_password_empty_is_rejected() {
+        let err = toml::from_str::<Config>(&peer_with_md5(""))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    /// `TCP_MD5SIG_MAXKEYLEN` is 80 (`include/uapi/linux/tcp.h`); the kernel
+    /// returns `EINVAL` for longer keys, so reject them when parsing.
+    #[test]
+    fn test_md5_password_over_80_bytes_is_rejected() {
+        let err = toml::from_str::<Config>(&peer_with_md5(&"x".repeat(81)))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("too long"), "{err}");
+        let ok: Config = toml::from_str(&peer_with_md5(&"x".repeat(80))).unwrap();
+        assert!(ok.peers[0].md5_password.is_some());
+    }
+
+    #[test]
+    fn test_md5_password_debug_is_redacted() {
+        let p: Md5Password = "hunter2".parse().unwrap();
+        assert_eq!(format!("{p:?}"), "Md5Password(<redacted>)");
+    }
+
+    /// Fail closed by default: without an explicit setting, a key the host
+    /// cannot enforce stops the session.
+    #[test]
+    fn test_tcp_md5_enforcement_defaults_to_required() {
+        let cfg: Config = toml::from_str(&peer_with_md5("k")).unwrap();
+        assert_eq!(
+            cfg.daemon.tcp_md5_enforcement,
+            TcpMd5EnforcementConfig::Required
+        );
+        assert_eq!(
+            Md5Enforcement::from(cfg.daemon.tcp_md5_enforcement),
+            Md5Enforcement::Required
+        );
+    }
+
+    #[test]
+    fn test_tcp_md5_enforcement_values() {
+        let parse = |v: &str| {
+            toml::from_str::<Config>(&format!(
+                "[daemon]\nlocal_as = 65001\nbgp_id = \"10.0.0.1\"\ntcp_md5_enforcement = \"{v}\"\n"
+            ))
+            .map(|c| c.daemon.tcp_md5_enforcement)
+        };
+        assert_eq!(
+            parse("required").unwrap(),
+            TcpMd5EnforcementConfig::Required
+        );
+        assert_eq!(
+            parse("best-effort").unwrap(),
+            TcpMd5EnforcementConfig::BestEffort
+        );
+        assert!(parse("off").is_err(), "unknown values must not parse");
     }
 
     #[test]

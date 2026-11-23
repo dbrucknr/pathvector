@@ -44,7 +44,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         confederation_member: false,
         public_as: 65001,
         peer_addr,
-        md5_password: None,
+        tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
@@ -240,7 +240,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         confederation_member: false,
         public_as: 65001,
         peer_addr,
-        md5_password: None,
+        tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }

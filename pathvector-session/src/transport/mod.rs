@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod prop_tests;
+pub mod tcp_md5;
 
 use std::future::Future;
 use std::io;
@@ -297,11 +298,14 @@ pub struct SessionConfig {
     pub public_as: u32,
     /// Address (IP + port) of the remote BGP peer.
     pub peer_addr: SocketAddr,
-    /// RFC 2385 TCP MD5 authentication key for this peer. When set, the kernel
-    /// signs every TCP segment with HMAC-MD5 keyed by this value. The peer must
-    /// be configured with the same key or the session will not establish. Max 80
-    /// bytes (Linux kernel limit). `None` disables MD5 authentication.
-    pub md5_password: Option<String>,
+    /// RFC 2385 TCP MD5 authentication for this peer. When set, the outbound
+    /// socket gets the key before `connect()`, so the kernel signs every
+    /// segment and drops unsigned or wrongly signed ones. The peer must use
+    /// the same key or the session will not establish. If the host cannot
+    /// enforce the key, the connection is refused unless the policy is
+    /// [`Md5Enforcement::BestEffort`](tcp_md5::Md5Enforcement::BestEffort).
+    /// `None` disables TCP MD5.
+    pub tcp_md5: Option<tcp_md5::TcpMd5Auth>,
 }
 
 /// Commands sent to a running session via [`SessionHandle`].
@@ -444,15 +448,6 @@ impl SessionHandle for SpawnedSessionHandle {
             .await;
     }
 }
-
-// ── TCP MD5SIG helpers (RFC 2385) ─────────────────────────────────────────────
-
-/// Set the `TCP_MD5SIG` socket option on `fd` for the given peer IP address.
-///
-/// Re-exported from [`pathvector_sys`], where all unsafe OS-level code lives.
-/// This crate and all other pathvector crates call this safe function without
-/// writing any `unsafe` themselves.
-pub use pathvector_sys::apply_tcp_md5sig;
 
 /// Spawn a BGP session task and return a handle to control it.
 ///
@@ -1310,9 +1305,9 @@ impl<T: BgpTransport> Session<T> {
                         self.pending_input = Some(FsmInput::TcpConnected);
                     } else if self.connect_factory.is_some() {
                         let addr = self.config.peer_addr;
-                        let password = self.config.md5_password.clone();
+                        let md5_auth = self.config.tcp_md5.clone();
                         self.connect_task = Some(tokio::spawn(async move {
-                            tcp_connect(addr, password.as_deref()).await
+                            tcp_connect(&tcp_md5::KernelTcpMd5, addr, md5_auth.as_ref()).await
                         }));
                     } else {
                         // Injected-transport mode with no transport remaining — signal
@@ -1637,16 +1632,22 @@ pub(crate) fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
 
 // ── TCP connect helper ────────────────────────────────────────────────────────
 
-/// Connect to `addr`, optionally setting `TCP_MD5SIG` before the handshake.
+/// Connect to `addr`, installing the TCP MD5 key first when `tcp_md5` is set.
 ///
-/// When `password` is `None` this is equivalent to `TcpStream::connect(addr)`.
-/// When `password` is `Some(key)`, a raw socket is created first, the MD5 key
-/// is installed via [`apply_tcp_md5sig`], and then the socket is connected.
-async fn tcp_connect(addr: SocketAddr, password: Option<&str>) -> io::Result<TcpStream> {
-    use std::os::unix::io::AsRawFd;
+/// With `tcp_md5 = None` this is `TcpStream::connect(addr)`. Otherwise the key
+/// goes on the socket through `port` before the SYN is sent, and
+/// [`tcp_md5::protect_socket`] applies the enforcement policy: under
+/// [`Md5Enforcement::Required`](tcp_md5::Md5Enforcement::Required) a key the
+/// host cannot enforce fails the connect before any packet leaves.
+async fn tcp_connect<P: tcp_md5::TcpMd5Port + ?Sized>(
+    port: &P,
+    addr: SocketAddr,
+    tcp_md5: Option<&tcp_md5::TcpMd5Auth>,
+) -> io::Result<TcpStream> {
+    use std::os::fd::AsFd;
     use tokio::net::TcpSocket;
 
-    let Some(key) = password else {
+    let Some(auth) = tcp_md5 else {
         return TcpStream::connect(addr).await;
     };
 
@@ -1655,14 +1656,7 @@ async fn tcp_connect(addr: SocketAddr, password: Option<&str>) -> io::Result<Tcp
     } else {
         TcpSocket::new_v6()?
     };
-
-    apply_tcp_md5sig(socket.as_raw_fd(), addr.ip(), key).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("TCP MD5SIG setup failed for {}: {e}", addr.ip()),
-        )
-    })?;
-
+    let _protection = tcp_md5::protect_socket(port, socket.as_fd(), addr.ip(), auth)?;
     socket.connect(addr).await
 }
 
@@ -1806,7 +1800,7 @@ mod tests {
             public_as: 65001,
             // peer_addr is unused when a transport is injected via spawn_with.
             peer_addr: "127.0.0.1:0".parse().unwrap(),
-            md5_password: None,
+            tcp_md5: None,
             connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
         }
     }
@@ -4274,5 +4268,84 @@ mod tests {
             matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after stop(), got {event:?}"
         );
+    }
+
+    // ── tcp_connect + TCP MD5 policy (issue #58) ─────────────────────────────
+
+    mod tcp_md5_connect {
+        use std::io;
+        use std::time::Duration;
+
+        use tokio::net::TcpListener;
+
+        use super::super::tcp_connect;
+        use super::super::tcp_md5::tests::{FakePort, enforced, kernel_unsupported};
+        use super::super::tcp_md5::{Md5Enforcement, TcpMd5Auth};
+
+        fn auth(enforcement: Md5Enforcement) -> TcpMd5Auth {
+            TcpMd5Auth::new("k".parse().unwrap(), enforcement)
+        }
+
+        async fn accepted(l: &TcpListener) -> bool {
+            tokio::time::timeout(Duration::from_millis(200), l.accept())
+                .await
+                .is_ok()
+        }
+
+        /// RFC 5925 §8 / RFC 2385 §2.0: with MD5 required and the host
+        /// unable to enforce it, the connect fails before any SYN is sent,
+        /// so the peer never sees an unauthenticated connection attempt.
+        #[tokio::test]
+        async fn required_but_unenforceable_never_connects() {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let port = FakePort::new(kernel_unsupported);
+
+            let err = tcp_connect(&port, addr, Some(&auth(Md5Enforcement::Required)))
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+            assert_eq!(*port.installs.lock().unwrap(), vec![addr.ip()]);
+            assert!(!accepted(&l).await, "no connection may reach the peer");
+        }
+
+        /// The explicit `BestEffort` opt-in connects without enforcement.
+        #[tokio::test]
+        async fn best_effort_connects_when_unenforceable() {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let port = FakePort::new(kernel_unsupported);
+
+            tcp_connect(&port, addr, Some(&auth(Md5Enforcement::BestEffort)))
+                .await
+                .expect("best-effort connects");
+            assert!(accepted(&l).await);
+        }
+
+        /// The key is installed on the socket before `connect()`.
+        #[tokio::test]
+        async fn key_is_installed_before_connecting() {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let port = FakePort::new(enforced);
+
+            tcp_connect(&port, addr, Some(&auth(Md5Enforcement::Required)))
+                .await
+                .expect("connects");
+            assert_eq!(*port.installs.lock().unwrap(), vec![addr.ip()]);
+            assert!(accepted(&l).await);
+        }
+
+        /// No key configured: the port is never consulted.
+        #[tokio::test]
+        async fn no_key_does_not_touch_the_port() {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let port = FakePort::new(kernel_unsupported);
+
+            tcp_connect(&port, addr, None).await.expect("connects");
+            assert!(port.installs.lock().unwrap().is_empty());
+        }
     }
 }
