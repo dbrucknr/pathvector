@@ -229,26 +229,34 @@ pub(super) async fn run(
     // an existing route without sending RTM_DELROUTE for it, and NLM_F_APPEND
     // says where in its slot an IPv4 route was inserted.
     //
-    // Events already queued are applied together before any re-read, so a
-    // burst of deletes costs one dump per table and device.
+    // Once a delete calls for a re-read, events already queued (up to
+    // `REREAD_BATCH`) are applied before it, so a burst of deletes costs one
+    // dump per table and device. Each change is still signalled at once.
     while let Some(event) = events.next().await {
-        let mut changed = false;
         let mut reread = HashSet::new();
         let mut next = Some(event);
+        let mut applied = 0;
         while let Some((msg, _addr)) = next {
-            changed |= apply_event(&snapshot, msg, table, &mut reread);
-            next = events.next().now_or_never().flatten();
+            if apply_event(&snapshot, msg, table, &mut reread) {
+                let _ = change_tx.send(());
+            }
+            applied += 1;
+            next = if reread.is_empty() || applied >= REREAD_BATCH {
+                None
+            } else {
+                events.next().now_or_never().flatten()
+            };
         }
-        if !reread.is_empty() {
-            changed |= reread_sets(&reread_handle, &snapshot, reread).await;
-        }
-        if changed {
+        if !reread.is_empty() && reread_sets(&reread_handle, &snapshot, reread).await {
             let _ = change_tx.send(());
         }
     }
 
     Ok(())
 }
+
+/// The most queued events applied before a pending re-read runs.
+const REREAD_BATCH: usize = 1024;
 
 /// Applies one multicast route event. An IPv6 delete that leaves a route with
 /// an inferred protocol in its slot adds the slot to `reread`.

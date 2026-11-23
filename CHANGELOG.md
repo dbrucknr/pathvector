@@ -19,8 +19,9 @@ described in full, and the remaining inferred siblings take the new head's proto
 The dump runs on a second netlink connection with `NETLINK_GET_STRICT_CHK`, filtered by
 table and device, because no request can select one prefix (`ip_valid_fib_dump_req`
 rejects a nonzero `rtm_dst_len`; `RTM_F_FIB_MATCH` describes the sibling the multipath
-hash picks). Queued events are applied first, so a burst of deletes costs one dump per
-table and device, and the snapshot lock is not held across the dump. Untracked routes
+hash picks). Events already queued (up to 1024) are applied before the dump, so a burst
+of deletes costs one dump per table and device; each change is still signalled at once,
+and the snapshot lock is not held across the dump. Untracked routes
 with an inferred protocol are now kept whole instead of as a hash.
 
 Live tests: a BGP-first mixed set regains its static path after the BGP delete, and a

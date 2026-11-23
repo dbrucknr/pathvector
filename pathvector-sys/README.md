@@ -171,9 +171,9 @@ give). No request can target one prefix: a strict-checked dump rejects a nonzero
 (`ip_valid_fib_dump_req`), and `RTM_GETROUTE` with `RTM_F_FIB_MATCH` answers a policy
 lookup with whichever sibling the multipath hash picks. So the dump is filtered by table
 and by the device of the inferred head (Linux 4.20+, `NETLINK_GET_STRICT_CHK`; older
-kernels dump everything and the set is picked out here). Queued events are applied first,
-so a burst of deletes costs one dump per table and device, and the snapshot lock is not
-held during the dump. An untracked route with an inferred protocol is kept whole rather
+kernels dump everything and the set is picked out here). Events already queued (up to
+1024) are applied before the dump, so a burst of deletes costs one dump per table and
+device, and the snapshot lock is not held during the dump. An untracked route with an inferred protocol is kept whole rather
 than as a hash so that it can be found and settled.
 
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
