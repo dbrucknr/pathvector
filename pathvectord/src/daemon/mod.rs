@@ -45,6 +45,8 @@ mod capabilities;
 mod deferral;
 mod fib;
 mod gr;
+#[cfg(test)]
+mod last_feasible_tests;
 mod origination;
 mod peer;
 mod policy;
