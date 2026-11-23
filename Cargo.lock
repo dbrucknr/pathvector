@@ -1873,6 +1873,7 @@ dependencies = [
  "pathvector-sys",
  "pathvector-types",
  "proptest",
+ "socket2",
  "tokio",
  "tokio-util",
  "tracing",
