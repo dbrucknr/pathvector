@@ -67,13 +67,20 @@
 //! message represents and lists it first in `RTA_MULTIPATH`, followed by its
 //! siblings. A leg carries only its interface, weight, flags and gateway, so
 //! the siblings' own protocols are not in the message, and Linux allows one
-//! ECMP set to mix, say, static and BGP routes. The adapter therefore treats
-//! the first leg as described by the header. Another leg it has not seen takes
-//! the header's type and protocol only if the message comes from the request
-//! that created it (a create or replace without `NLM_F_APPEND`, where
-//! `ip6_route_multipath_add` reports the first new route). Otherwise, such as
-//! in a dump or an append, the leg is mirrored as untracked until a message
-//! describing it arrives. Each sibling's own dump message does that.
+//! ECMP set to mix, say, static and BGP routes. Dumps never fill the gap:
+//! `fib6_dump_node` emits a sibling set once and then jumps past its siblings
+//! ("no need to dump the sibling routes again").
+//!
+//! The adapter therefore treats the first leg as described by the header.
+//! Another leg it has not seen takes the header's protocol only if the
+//! message comes from the request that created it (a create or replace
+//! without `NLM_F_APPEND`, where `ip6_route_multipath_add` reports the first
+//! new route). Otherwise, as in a dump or an append, its protocol is recorded
+//! as unknown ([`KernelRouteV6::protocol`] is `None`) and it is **tracked**:
+//! the kernel forwards over every sibling, and a set made only of IGP or
+//! static routes is the common case, so dropping such legs would report
+//! surviving paths as unreachable. A later message that describes the leg
+//! settles its protocol.
 //!
 //! [`FibSnapshot`]: super::FibSnapshot
 
@@ -431,8 +438,9 @@ pub struct KernelRouteV6 {
     pub slot: RouteSlotV6,
     /// `rtm_type`.
     pub kind: u8,
-    /// `rtm_protocol`.
-    pub protocol: u8,
+    /// `rtm_protocol`, or `None` when no message has described this route: an
+    /// ECMP sibling seen only as a leg of another sibling's message.
+    pub protocol: Option<u8>,
     /// Next hop.
     pub next_hop: NextHopV6,
 }
@@ -446,15 +454,19 @@ impl KernelRouteV6 {
     /// `RTPROT_RA`, which stands in for it here.
     #[must_use]
     pub fn qualifies_for_ecmp(&self) -> bool {
-        self.protocol != RTPROT_RA
+        self.protocol != Some(RTPROT_RA)
             && matches!(self.next_hop, NextHopV6::Path(p) if p.gateway.is_some())
     }
 
-    /// Whether the snapshot uses this route for reachability (unicast, not
-    /// BGP).
+    /// Whether the snapshot uses this route for reachability: unicast, and not
+    /// known to be BGP. A route of unknown protocol counts (see the module
+    /// docs on IPv6 multipath messages).
     #[must_use]
     pub const fn is_tracked(&self) -> bool {
-        is_igp_unicast(self.kind, self.protocol)
+        match self.protocol {
+            Some(protocol) => is_igp_unicast(self.kind, protocol),
+            None => self.kind == RTN_UNICAST,
+        }
     }
 }
 
@@ -597,16 +609,6 @@ impl<R: MirroredRoute> Entry<R> {
                 identity: route.identity(),
                 ecmp: route.ecmp(),
             }
-        }
-    }
-
-    /// An entry for a route whose type and protocol are unknown (an IPv6
-    /// sibling leg the message does not describe). It is never used for
-    /// lookups until a message describing it arrives.
-    fn unknown_origin(route: &R) -> Self {
-        Self::Untracked {
-            identity: route.identity(),
-            ecmp: route.ecmp(),
         }
     }
 
@@ -793,15 +795,6 @@ impl<R: MirroredRoute> RouteMirror<R> {
         group[i] = Entry::new(route);
         self.settle(slot);
         self.tracked_in(&slot) != before
-    }
-
-    /// Adds a route whose type and protocol the message does not give (see
-    /// [`Entry::unknown_origin`]) unless it is already mirrored.
-    pub fn insert_unknown_origin(&mut self, route: &R) -> bool {
-        if !self.contains(route) {
-            self.insert_entry(*route.slot(), Entry::unknown_origin(route), Position::Back);
-        }
-        false
     }
 
     /// Removes exactly the kernel route `route`; other routes of the slot stay.
