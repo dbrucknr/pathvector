@@ -24,6 +24,7 @@ tracing          = "0.1"
 criterion = { workspace = true }
 proptest  = { workspace = true }
 tokio     = { version = "1", features = ["net", "io-util", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = "0.3"
 
 [[bench]]
 name    = "codec"

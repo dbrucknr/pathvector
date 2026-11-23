@@ -86,9 +86,12 @@ pub enum Md5Protection {
 /// # Errors
 ///
 /// - [`io::ErrorKind::Unsupported`] if the key cannot be enforced and the
-///   policy is [`Md5Enforcement::Required`]. The inner error is the
-///   [`TcpMd5Error`].
+///   policy is [`Md5Enforcement::Required`]. The inner error is
+///   [`Md5NotEnforceable`].
 /// - Any other `setsockopt` failure, whatever the policy.
+///
+/// Both errors are also logged at `error` level with the peer and reason,
+/// because the session loop reports a failed connect only as `TcpFailed`.
 pub fn protect_socket<P: TcpMd5Port + ?Sized>(
     port: &P,
     socket: BorrowedFd<'_>,
@@ -106,14 +109,20 @@ pub fn protect_socket<P: TcpMd5Port + ?Sized>(
             );
             Ok(Md5Protection::Unenforced(why))
         }
-        Err(TcpMd5Error::Unsupported(reason)) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            Md5NotEnforceable { peer, reason },
-        )),
-        Err(TcpMd5Error::Os(e)) => Err(io::Error::new(
-            e.kind(),
-            format!("TCP MD5 key setup failed for {peer}: {e}"),
-        )),
+        Err(TcpMd5Error::Unsupported(reason)) => {
+            let refusal = Md5NotEnforceable { peer, reason };
+            // Logged here because the session loop folds every connect error
+            // into `TcpFailed`; this is the only place that knows why.
+            tracing::error!(%peer, reason = reason.label(), "{refusal}");
+            Err(io::Error::new(io::ErrorKind::Unsupported, refusal))
+        }
+        Err(TcpMd5Error::Os(e)) => {
+            tracing::error!(%peer, error = %e, "TCP MD5 key setup failed");
+            Err(io::Error::new(
+                e.kind(),
+                format!("TCP MD5 key setup failed for {peer}: {e}"),
+            ))
+        }
     }
 }
 

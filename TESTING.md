@@ -645,6 +645,9 @@ UAPI exactly.
 | Live kernel (CI) | Re-install replaces the key; removal stops enforcement; second removal → `NotFound` | `reinstalling_replaces_the_key`, `removing_the_key_stops_enforcement` |
 | Session policy | `Required` (default) + unenforceable → error, no SYN sent | `required_key_that_cannot_be_enforced_is_an_error`, `required_but_unenforceable_never_connects` |
 | Session policy | `BestEffort` → `Unenforced(reason)` + warning; never hides `Os` errors | `best_effort_reports_unenforced_with_reason`, `best_effort_connects_when_unenforceable`, `best_effort_does_not_hide_os_errors` |
+| Session policy | A spawned session whose required key is unenforceable logs peer and reason | `required_md5_failure_is_logged_by_running_session` |
+| Config / sidecar | Parse errors never print a password (syntax error, over-length, bare value) | `test_config_errors_do_not_reveal_md5_password`, `unparseable_sidecar_log_does_not_reveal_passwords`, `rejected_sidecar_password_is_not_logged` |
+| Config / sidecar | One invalid sidecar entry keeps the others and is preserved on write; an unparseable file is never overwritten | `invalid_entry_does_not_drop_valid_peers`, `unparseable_sidecar_is_never_overwritten` |
 | Daemon wiring | Key and policy reach static and dynamic sessions | `build_daemon_md5_password_reaches_session_config`, `build_daemon_best_effort_md5_reaches_session_config`, `add_peer_wires_md5_key_and_enforcement_into_session_config` |
 | E2E interop (CI) | Matching keys → Established against GoBGP; mismatch never establishes | `md5_matching_key_session_establishes`, `md5_key_mismatch_session_never_establishes` |
 

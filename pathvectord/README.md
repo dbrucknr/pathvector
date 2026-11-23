@@ -878,6 +878,13 @@ With `"best-effort"`, pathvectord logs a warning at startup for every peer with
 - **macOS native:** no TCP MD5 support in pathvectord; same as above.
 - **IPv6 peers:** not yet implemented; same as above.
 
+**Dynamic-peer sidecar:** an entry in `dynamic_peers.toml` with an invalid
+`md5_password` (empty or over 80 bytes, which older versions accepted) is logged and
+skipped at startup but kept in the file so you can fix it; other peers still load. If the
+file is not valid TOML at all, no dynamic peers load and pathvectord will not overwrite it
+until it is fixed or removed. Config errors report the line number without quoting it, so
+passwords never reach the logs.
+
 **Inbound connections:** keys are currently installed only on the outbound socket
 pathvectord uses to dial the peer. The BGP listener does not install keys yet, for static
 or dynamic peers (issue #66), so do not rely on TCP MD5 to protect connections the peer

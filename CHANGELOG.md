@@ -52,6 +52,17 @@ connections to show that matching keys connect while unsigned, wrong-key and
 unexpectedly signed SYNs are dropped, that re-installing rotates the key, and that
 removal stops enforcement. Those live tests fail rather than skip when `CI` is set.
 
+**Review fixes (PR #124).** `toml::de::Error`'s `Display` quotes the offending source
+line, so sidecar and startup config errors could print an `md5_password`; they now go
+through `config::describe_toml_error` (message + line number only), and `Md5Password`'s
+deserializer never echoes a non-string value. The dynamic-peer sidecar is parsed entry by
+entry: an entry that fails validation (an empty or over-80-byte password accepted by older
+versions) is logged, skipped, and written back unchanged, instead of turning the whole
+file into an empty list that the next `AddPeer` would overwrite; a file that cannot be
+read or parsed at all is never overwritten. A session that refuses to connect because a
+required key cannot be enforced now logs the peer and reason at `error` level (the
+session loop only reports `TcpFailed`), proven through a spawned session.
+
 Not in scope: inbound listener keys (#66), exact UAPI struct layout (#60), IPv6 MD5.
 
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
