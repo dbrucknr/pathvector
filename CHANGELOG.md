@@ -4,6 +4,26 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #56: FIB snapshot keeps every route for a prefix)
+
+`pathvector-sys`'s `FibSnapshot` identified kernel routes by prefix alone. Adding a
+metric-100 route after a metric-10 route for the same prefix overwrote the snapshot
+entry with metric 100; deleting either route removed the prefix even though the other
+was still in the kernel; and a dump that listed both could select metric 100. Confirmed
+on a live kernel in a network namespace: after `add metric 10`, `add metric 100`, the
+old snapshot reported 100, and after deleting the 100 route it reported the prefix as
+unreachable.
+
+The snapshot now mirrors routes under the identity Linux uses (`fib_table_insert` /
+`fib6_add_rt2node`): table, prefix, IPv4 TOS or IPv6 source prefix, priority, and next
+hop, with IPv6 ECMP siblings stored separately. `RTM_DELROUTE` removes exactly the named
+route; `NLM_F_REPLACE` notifications displace the replaced route; lookups take the
+longest prefix and then the lowest priority. New validated types: `Ipv4Prefix`,
+`Ipv6Prefix`, `TableId`, `KernelRouteV4`, `KernelRouteV6`. The public `FibEntry4` /
+`FibEntry6` types are removed (nothing outside the crate used them). Proof: domain unit
+and property tests against an independent reference model, netlink adapter tests, and
+live-kernel tests run in a network namespace in CI.
+
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 
 Round-2 review response (below) replaced `restart_time_zero_peer_blocks_release_until_its_own_eor_arrives`'s

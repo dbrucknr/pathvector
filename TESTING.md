@@ -214,6 +214,41 @@ any syscall, keeping them cross-platform (they pass on macOS and Linux alike).
 | Keys longer than 80 bytes always produce `InvalidInput` | RFC 2385 key length limit; must be enforced before the kernel call |
 | Any IPv6 address always returns `Unsupported` | IPv6 peer MD5 is not yet implemented; must not silently succeed |
 
+#### Kernel FIB route identity (issue #56)
+
+The FIB snapshot mirrors kernel routes under their full Linux identity, not just
+their prefix. The domain tests in `pathvector-sys/src/fib/route/tests.rs` run on every
+platform and compare the mirror against a reference model written directly from the
+kernel's lookup rule (`net/ipv4/fib_trie.c`, `net/ipv6/ip6_fib.c`):
+
+| Invariant | Why it matters |
+|---|---|
+| Any add/delete sequence leaves exactly the set of routes the kernel holds, and every lookup equals the reference (longest prefix, then lowest priority) | A backup route overwriting the primary, or one delete removing every route for a prefix, gives wrong IGP metrics and spurious unreachability |
+| Lookups do not depend on load (dump) order | Dump and incremental state must agree |
+| Adding then deleting a route restores every lookup | Deletes remove only the named route |
+| Routes of one slot stay contiguous through inserts, replaces and deletes | `NLM_F_REPLACE` targets "the first route of the slot" |
+| `Ipv4Prefix`/`Ipv6Prefix` accept exactly the canonical prefixes | Same rule as the kernel's `fib_valid_key_len` |
+
+The netlink adapter's tests (`linux.rs`, Linux only) cover decoding, `NLM_F_REPLACE` /
+`NLM_F_APPEND` handling and IPv6 ECMP sibling messages. Live-kernel tests in
+`pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes with metrics 10
+and 100 in both orders, for both families, incrementally and through the initial dump.
+They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
+namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
+
+```bash
+cargo test -p pathvector-sys --test kernel_fib_netns --no-run   # prints the binary path
+sudo unshare --net -- <binary> --ignored
+```
+
+or from macOS via Docker:
+
+```bash
+docker run --rm --network none --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 -v "$PWD":/src -w /src rust:1.88 \
+  cargo test -p pathvector-sys --test kernel_fib_netns -- --ignored
+```
+
 ---
 
 ## Fuzz testing

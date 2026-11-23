@@ -101,6 +101,43 @@ netlink communication. Routes are installed with:
 distinguish pathvectord-installed routes from other BGP implementations and from static
 or IGP routes when running tools like `ip route show proto bgp`.
 
+### Reading the kernel FIB: route identity
+
+`KernelFib` keeps a `FibSnapshot` of the kernel's IGP routes (everything except
+`RTPROT_BGP` and non-unicast routes) and answers next-hop reachability and IGP-metric
+queries from it.
+
+A prefix does not identify a kernel route. Linux keeps several routes for one prefix,
+and the snapshot stores each under the identity the kernel itself uses:
+
+| Family | Slot (the kernel's grouping) | Route within the slot |
+|---|---|---|
+| IPv4 | table, prefix, TOS, priority (`fib_table_insert`: "[prefix,dscp,priority]") | protocol, scope, preferred source, next hop(s) |
+| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route) |
+
+Prefixes are validated newtypes (`Ipv4Prefix`, `Ipv6Prefix`: length within range, no
+host bits) and table IDs cannot be zero (`TableId`), so a route identity can only hold
+values the kernel can report. `RTM_DELROUTE` removes exactly the route it names.
+`RTM_NEWROUTE` with `NLM_F_REPLACE` displaces the route the kernel replaced, which never
+gets an `RTM_DELROUTE` of its own.
+
+A lookup takes the longest matching prefix and, among its routes, the lowest priority,
+as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
+kept but not selected, because a best-effort lookup from an unspecified source cannot
+use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes and
+`route_to_v4` / `route_to_v6` return the route a lookup selects.
+
+Known limits:
+
+- Routes the snapshot does not track (BGP-installed and non-unicast routes) are not
+  mirrored, so if one sits ahead of a tracked route in the same IPv4 slot, an
+  `NLM_F_REPLACE` may displace the wrong one in the mirror.
+- IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.
+- With table `0` (all tables) the tables are compared as one; policy routing rules are
+  not modelled.
+- IPv6 ECMP eligibility uses `RTPROT_RA` as a stand-in for the kernel's `RTF_ADDRCONF`
+  flag, which netlink does not expose.
+
 ---
 
 ## Unsafe code audit
