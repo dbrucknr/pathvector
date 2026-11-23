@@ -1089,10 +1089,15 @@ impl<R: MirroredRoute> RouteMirror<R> {
         }
     }
 
-    /// The first route of `slot`, in kernel order, whose protocol is only
-    /// inferred, tracked or not.
-    pub fn first_inferred(&self, slot: &R::Slot) -> Option<&R> {
-        self.slots.get(slot)?.iter().find_map(Entry::inferred)
+    /// The first ECMP route of `slot`, if its protocol is only inferred.
+    ///
+    /// A slot holds at most one sibling set (`fib6_add_rt2node` joins each
+    /// new ECMP route of a metric to the first ECMP route of that metric), and
+    /// a dump describes the set through its first sibling in kernel order
+    /// (`fib6_dump_node`). So this is the route a re-read would describe, and
+    /// re-reading teaches nothing unless it returns `Some`.
+    pub fn inferred_set_head(&self, slot: &R::Slot) -> Option<&R> {
+        self.slots.get(slot)?.iter().find(|e| e.ecmp())?.inferred()
     }
 
     /// The tracked routes of `slot`, in kernel order. Slots are tiny, so

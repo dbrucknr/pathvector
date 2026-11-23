@@ -282,8 +282,9 @@ fn apply_event(
 //
 // A delete changes what the kernel describes: once the first sibling is gone
 // the next one heads the set, and a lone remaining route is described in
-// full. So after a delete that leaves an inferred route in its slot, the set
-// is read back and applied with `RouteMirror::redescribe`.
+// full. So after a delete that leaves a set headed by a route with an
+// inferred protocol, the set is read back and applied with
+// `RouteMirror::redescribe`.
 //
 // No request can target one prefix:
 // - A strict-checked dump rejects a prefix (`ip_valid_fib_dump_req`:
@@ -301,27 +302,30 @@ fn apply_event(
 // and the wanted sets are picked out by slot.
 
 /// The slot to re-read after an IPv6 `RTM_DELROUTE` has been applied: the
-/// deleted route's slot, if a route whose protocol is inferred remains there.
+/// deleted route's slot, if its sibling set is now headed by a route whose
+/// protocol is inferred. That is the route a dump now describes; with a known
+/// head, a dump would only repeat what is known.
 fn slot_to_reread(snap: &FibSnapshot, msg: &RouteMessage, table: u32) -> Option<RouteSlotV6> {
     if !in_table(msg, table) || msg.header.address_family != AddressFamily::Inet6 {
         return None;
     }
     let slot = decode_v6(msg).first()?.slot;
-    snap.v6.first_inferred(&slot).map(|_| slot)
+    snap.v6.inferred_set_head(&slot).map(|_| slot)
 }
 
 /// A re-read dump: one routing table, optionally only routes using a device.
 type DumpFilter = (TableId, Option<NonZeroU32>);
 
-/// Groups the slots that still hold an inferred route by the dump that will
-/// re-read them. Slots settled by later events in the same burst are dropped.
+/// Groups the slots whose set is still headed by an inferred route by the
+/// dump that will re-read them. Slots settled by later events in the same
+/// burst are dropped.
 fn reread_groups(
     snap: &FibSnapshot,
     slots: HashSet<RouteSlotV6>,
 ) -> HashMap<DumpFilter, HashSet<RouteSlotV6>> {
     let mut groups: HashMap<DumpFilter, HashSet<RouteSlotV6>> = HashMap::new();
     for slot in slots {
-        let Some(route) = snap.v6.first_inferred(&slot) else {
+        let Some(route) = snap.v6.inferred_set_head(&slot) else {
             continue;
         };
         let oif = match route.next_hop {
@@ -2227,6 +2231,27 @@ mod tests {
         assert!(delete_event(&mut other, &set).is_empty());
         assert!(other.v6.is_empty());
 
+        // Deleting a sibling other than the head: a dump still describes the
+        // known head, so a re-read would repeat it.
+        let mut three = FibSnapshot::new();
+        apply_dumped(
+            &mut three,
+            &v6_set_dump(
+                prefix,
+                RouteProtocol::Bgp,
+                &["fe80::1", "fe80::2", "fe80::3"],
+            ),
+            254,
+        );
+        assert!(
+            delete_event(&mut three, &v6_leg(prefix, "fe80::3", RouteProtocol::Bgp)).is_empty()
+        );
+        assert_eq!(
+            delete_event(&mut three, &v6_leg(prefix, "fe80::1", RouteProtocol::Bgp)).len(),
+            1,
+            "deleting the head does"
+        );
+
         // IPv4, and routes in a table we do not track, never are.
         let mut snap = FibSnapshot::new();
         let v4 = igp_v4_msg("10.0.0.0", 8, 10, 254);
@@ -2244,8 +2269,10 @@ mod tests {
 
     #[test]
     fn reread_groups_by_table_and_device_and_skips_settled_slots() {
+        // Dumped BGP-first pairs whose head has since been deleted, so the
+        // inferred second route heads each set.
         let mut snap = FibSnapshot::new();
-        let mut on_oif = |prefix: &str, oif: u32, table: u32| {
+        let mut headless = |prefix: &str, oif: u32, table: u32| {
             let mut msg = v6_set_dump(prefix, RouteProtocol::Bgp, &["fe80::1", "fe80::2"]);
             if let Some(RouteAttribute::MultiPath(legs)) = msg
                 .attributes
@@ -2258,18 +2285,18 @@ mod tests {
             }
             msg.attributes.push(RouteAttribute::Table(table));
             apply_dumped(&mut snap, &msg, 0);
-            slot_of(&msg)
+            let legs = decode_v6(&msg);
+            snap.v6.remove(&legs[0]);
+            legs[1].clone()
         };
-        let a = on_oif("2001:db8:1::", 2, 254);
-        let b = on_oif("2001:db8:2::", 2, 254);
-        let c = on_oif("2001:db8:3::", 3, 254);
-        let d = on_oif("2001:db8:4::", 2, 300);
-        let settled = on_oif("2001:db8:5::", 2, 254);
-        let reported = KernelRouteV6 {
-            protocol_inferred: false,
-            ..snap.v6.first_inferred(&settled).unwrap().clone()
-        };
-        snap.v6.upsert(reported, Position::Back);
+        let a = headless("2001:db8:1::", 2, 254).slot;
+        let b = headless("2001:db8:2::", 2, 254).slot;
+        let c = headless("2001:db8:3::", 3, 254).slot;
+        let d = headless("2001:db8:4::", 2, 300).slot;
+        // A later event in the same burst reported this one's protocol.
+        let settled = headless("2001:db8:5::", 2, 254);
+        snap.v6.upsert(settled.clone(), Position::Back);
+        let settled = settled.slot;
 
         let groups = reread_groups(&snap, HashSet::from([a, b, c, d, settled]));
         let main = TableId::MAIN;
