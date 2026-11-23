@@ -22,7 +22,15 @@ the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `
 `NoRoute`). Only `Forward` counts as reachable or yields an IGP metric. A `throw` is
 reported as no route in the mirrored table, since policy rules are not modelled. New
 public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
-`RejectKind`; `route_to_v4` / `route_to_v6` now return only forwarding routes. Proof:
+`RejectKind`, `RoutePreference`; `route_to_v4` / `route_to_v6` now return only
+forwarding routes.
+
+Review follow-up (Codex on PR #123, both reproduced on a live kernel): IPv6 selection
+now ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`)
+before list order, so a high-preference unicast route is no longer hidden by an earlier
+blackhole; and `is_v6_reachable` applies its link-local fallback only when no route
+covers the address, so a negative route over link-local space is honoured. IPv6
+`RTM_NEWROUTE` handling decodes each message once instead of twice. Proof:
 domain and property tests (the reference model now includes route types), netlink
 adapter tests, and live-kernel tests that compare every verdict with the kernel's own
 lookup.

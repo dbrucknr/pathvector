@@ -225,6 +225,7 @@ kernel's lookup rule (`net/ipv4/fib_trie.c`, `net/ipv6/ip6_fib.c`):
 |---|---|
 | Any add/delete sequence leaves exactly the set of routes the kernel holds, and every lookup equals the reference (longest prefix, then lowest priority) | A backup route overwriting the primary, or one delete removing every route for a prefix, gives wrong IGP metrics and spurious unreachability |
 | The route type plays no part in selection; the selected route's type alone decides the outcome, and only a unicast route is reachable | A negative route beneath a covering route must not fall through to it (`fib_table_lookup` returns the selected alias's `fib_props` error) |
+| IPv6: within the lowest metric of the longest prefix, the highest router preference wins, then list order (generated routes carry preferences; negatives are medium) | `rt6_score_route` / `find_match`; ignoring it let an earlier blackhole hide a high-preference unicast route |
 | Lookups do not depend on load (dump) order | Dump and incremental state must agree |
 | Adding then deleting a route restores every lookup | Deletes remove only the named route |
 | Routes of one slot stay contiguous through inserts, replaces and deletes | `NLM_F_REPLACE` targets "the first route of the slot" |
@@ -243,7 +244,10 @@ tests in `pathvector-sys/tests/kernel_fib_netns.rs` add and delete real routes:
   longer unicast route inside a throw prefix (#57). Every probe compares the oracle's
   verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
   `ip route get` sends): the expected errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and
-  `ENETUNREACH`.
+  `ENETUNREACH`;
+- IPv6 router preference deciding between negative and unicast routes of one metric
+  (including that the kernel drops `RTA_PREF` on negative routes), and negative routes
+  over link-local space, which must override the link-local fallback (PR #123 review).
 
 The tests run in parallel in one namespace, so each uses its own prefixes and interfaces
 (prefixed `pvtest`) and none adds a real default route. They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
