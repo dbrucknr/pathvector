@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pathvector_session::transport::listener::{
-    Admission, BgpListener, KeyRefusal, ListenerKeys, ListenerProtection, Rejection,
+    Admission, BgpListener, Inbound, KeyRefusal, ListenerKeys, ListenerProtection, Rejection,
 };
 use pathvector_session::transport::tcp_md5::{
     KernelTcpMd5, TcpMd5Auth, TcpMd5Error, TcpMd5Key, TcpMd5Port,
@@ -80,7 +80,7 @@ fn host_supports_md5(test: &str) -> bool {
 
 fn bind(keys: &Arc<ListenerKeys>) -> (BgpListener, SocketAddr) {
     let l = BgpListener::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(keys)).expect("bind");
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
     (l, addr)
 }
 
@@ -102,7 +102,7 @@ async fn connect(addr: SocketAddr, md5: Option<&TcpMd5Key>) -> Option<TcpStream>
 }
 
 /// The next connection the listener hands over within a short wait.
-async fn try_accept(l: &mut BgpListener) -> Option<(TcpStream, SocketAddr)> {
+async fn try_accept(l: &mut BgpListener) -> Option<Inbound> {
     tokio::time::timeout(Duration::from_millis(300), l.accept())
         .await
         .ok()
@@ -112,8 +112,9 @@ async fn try_accept(l: &mut BgpListener) -> Option<(TcpStream, SocketAddr)> {
 /// Accepts `client`'s connection and exchanges a few bytes each way, so
 /// every data segment is signed and verified too.
 async fn accept_and_talk(l: &mut BgpListener, mut client: TcpStream) {
-    let (mut server, from) = try_accept(l).await.expect("connection must be handed over");
-    assert_eq!(from, client.local_addr().unwrap());
+    let inbound = try_accept(l).await.expect("connection must be handed over");
+    assert_eq!(inbound.peer(), client.local_addr().unwrap());
+    let mut server = inbound.into_stream();
     client.write_all(b"OPEN").await.unwrap();
     let mut buf = [0u8; 4];
     server.read_exact(&mut buf).await.unwrap();
@@ -161,7 +162,7 @@ async fn static_key_admits_only_the_matching_key() {
 }
 
 /// A key added while the listener is running (a dynamically added peer)
-/// takes effect without rebinding: before it, an unsigned client gets in;
+/// takes effect while the listener runs: before it, an unsigned client gets in;
 /// after it, only the matching key does.
 #[tokio::test]
 async fn dynamically_added_key_is_enforced() {
@@ -177,8 +178,8 @@ async fn dynamically_added_key_is_enforced() {
         keys.set_peer(LOOPBACK, required("added-key")),
         Ok(ListenerProtection::Enforced)
     );
-    // Let the listener settle the change: it rejects the peer for about
-    // 100 ms after a key change (see `transport::listener`).
+    // Let the listener replace its socket after the key change (see
+    // `transport::listener`); until then it rejects the peer.
     assert!(try_accept(&mut l).await.is_none());
     assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
 
@@ -203,13 +204,13 @@ async fn rotated_key_replaces_the_old_one() {
     let _ = keys.set_peer(LOOPBACK, required("old-key"));
     let (mut l, addr) = bind(&keys);
     let mut established = connect(addr, Some(&key("old-key"))).await.expect("old key");
-    let (mut server, _) = try_accept(&mut l).await.expect("accepted");
+    let mut server = try_accept(&mut l).await.expect("accepted").into_stream();
 
     assert_eq!(
         keys.set_peer(LOOPBACK, required("new-key")),
         Ok(ListenerProtection::Enforced)
     );
-    // Settle the change (about 100 ms, see `transport::listener`).
+    // Let the listener replace its socket after the key change.
     assert!(try_accept(&mut l).await.is_none());
     assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
 

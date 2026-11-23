@@ -37,25 +37,56 @@
 //!   keeps that copy. Changing or removing the listener's key later has no
 //!   effect on connections that already exist.
 //!
-//! # Connections that completed before a key change
+//! # Key changes on a listening socket
 //!
 //! Since the key is copied when the handshake completes, a connection that
-//! completed before the listener had the key carries no key, even if the
-//! application accepts it afterwards. Keys installed by [`BgpListener::bind`]
-//! go on the socket before `listen()`, so for them no such connection can
-//! exist. A key added or changed later, with [`ListenerKeys::set_peer`],
-//! could be preceded by connections already waiting in the accept queue.
-//! Until [`BgpListener`] has cleared its accept queue after the change, it
-//! rejects every connection from that peer (the key is "unsettled").
+//! completed before the listener had the key carries no key, even if it is
+//! accepted afterwards. Keys installed by [`BgpListener::bind`] go on the
+//! socket before `listen()`, so for them no such connection can exist.
 //!
-//! "Cleared" means: after the change, the listener took connections off the
-//! queue until it was empty (or until it had taken as many as the queue can
-//! hold, since Linux's queue is first-in first-out: `inet_csk_reqsk_queue_add`
-//! appends, `reqsk_queue_remove` takes the head), and did so again at least
-//! 100 ms later, to catch a connection created before the change but queued
-//! just after the first pass. The cost is that a correctly signed connection
-//! from that peer arriving in that window is also rejected, and the peer
-//! retries.
+//! A key added or changed later with [`ListenerKeys::set_peer`] goes on the
+//! live socket at once, so new handshakes are checked against it. But
+//! connections created before the change may already be queued, or may still
+//! be on their way to the queue: the kernel copies the key into a new
+//! connection (`tcp_v4_syn_recv_sock`) a moment before appending it to the
+//! accept queue (`inet_csk_reqsk_queue_add`), and no amount of waiting proves
+//! that every such append has happened. So after such a change [`BgpListener`]
+//! **replaces its socket**:
+//!
+//! 1. It takes the queued connections off the old socket, rejecting those from
+//!    the changed peer and keeping the others.
+//! 2. It shuts the old socket down. `shutdown(SHUT_RD)` on a listening socket
+//!    runs `tcp_disconnect` (`inet_shutdown`, `case TCP_LISTEN`), which sets
+//!    `TCP_CLOSE` and then `inet_csk_listen_stop` discards every queued
+//!    connection. A late `inet_csk_reqsk_queue_add` checks
+//!    `sk->sk_state != TCP_LISTEN` under the queue lock and discards the
+//!    connection, and a half-open handshake on a non-listening socket is
+//!    dropped and looked up again (`tcp_v4_rcv`, `TCP_NEW_SYN_RECV`). The
+//!    socket is never set listening again. Connections are not moved to
+//!    another socket: `reuseport_migrate_sock` does that only for an
+//!    `SO_REUSEPORT` group, which this socket never joins.
+//! 3. It binds a new socket to the same address and installs every key
+//!    before `listen()`, like [`BgpListener::bind`].
+//!
+//! Every connection from the new socket was created by a socket that had the
+//! peer's current key from the start. Until the replacement is done,
+//! connections from the changed peer are rejected; while it happens (well
+//! under a millisecond on loopback), new handshakes get no answer and the
+//! peer retries. Only a key that was actually installed after `listen()`
+//! causes a replacement: added or rotated keys, not removals and not keys
+//! that could not be installed.
+//!
+//! # Connections accepted around a key change
+//!
+//! Each connection [`BgpListener::accept`] returns carries an [`AuthStamp`]:
+//! the state of the key table when the connection was screened. If the
+//! peer's key is set again afterwards, [`ListenerKeys::is_current`] says the
+//! connection predates it. The listener checks this before handing over a
+//! connection it buffered, and the caller should check it again at the point
+//! where it commits to using the connection: if the code that adds a peer
+//! sets its key first and only then makes the peer reachable, a connection
+//! that passes both the reachability check and `is_current` was screened
+//! after the key was set.
 //!
 //! # When the key cannot be enforced
 //!
@@ -79,15 +110,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Shutdown, SocketAddr};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
-use tokio::time::Instant;
 
 use super::tcp_md5::{
     KernelTcpMd5, Md5Enforcement, TcpMd5Auth, TcpMd5Error, TcpMd5Port, TcpMd5Unsupported,
@@ -100,17 +129,9 @@ const LISTEN_BACKLOG: i32 = 1024;
 /// `net.core.somaxconn` (`__sys_listen_socket`) and stops creating
 /// connections once the queue holds more than the backlog
 /// (`sk_acceptq_is_full`: `sk_ack_backlog > sk_max_ack_backlog`, checked in
-/// `tcp_v4_syn_recv_sock`), so it never holds more than this many.
+/// `tcp_v4_syn_recv_sock`). Taking at most this many before replacing the
+/// socket keeps a connection flood from holding the replacement off.
 const MAX_QUEUED: usize = LISTEN_BACKLOG.unsigned_abs() as usize + 1;
-
-/// How long a key change waits for a second look at the accept queue before
-/// it counts as settled. In Linux, a new connection's key is copied from the
-/// listener (`tcp_v4_syn_recv_sock`) a moment before the connection is
-/// appended to the accept queue (`inet_csk_reqsk_queue_add`), in the same
-/// packet's processing. A connection created just before the key was
-/// installed can therefore reach the queue just after it was seen empty; the
-/// second look, this long after the first, takes it off the queue too.
-const SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 /// An IP address family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,18 +299,59 @@ impl fmt::Display for Rejection {
     }
 }
 
+/// The state of a [`ListenerKeys`] table when a connection was screened.
+/// See [`ListenerKeys::is_current`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthStamp(u64);
+
+/// A connection [`BgpListener::accept`] admitted.
+#[derive(Debug)]
+pub struct Inbound {
+    stream: TcpStream,
+    peer: SocketAddr,
+    stamp: AuthStamp,
+}
+
+impl Inbound {
+    /// The remote address.
+    #[must_use]
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// When the connection was screened. Check it with
+    /// [`ListenerKeys::is_current`] or [`BgpListener::is_current`] before
+    /// using the connection.
+    #[must_use]
+    pub fn stamp(&self) -> AuthStamp {
+        self.stamp
+    }
+
+    /// The connection.
+    #[must_use]
+    pub fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+}
+
 /// A peer's key state on the listening socket of its address family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyState {
     /// No listening socket for the family.
     Deferred,
-    /// The key is on the socket. `settled` is false until the accept queue
-    /// has been seen empty after install number `epoch`.
-    Installed { epoch: u64, settled: bool },
+    /// The key is on the socket. `settled` is false if it was installed after
+    /// the socket started listening; the socket must then be replaced.
+    Installed { settled: bool },
     /// Best-effort and not enforceable.
     Unenforced(TcpMd5Unsupported),
     /// Not installed; connections are rejected.
     Refused(KeyRefusal),
+}
+
+impl KeyState {
+    const fn is_unsettled(self) -> bool {
+        matches!(self, Self::Installed { settled: false })
+    }
 }
 
 #[derive(Debug)]
@@ -300,6 +362,8 @@ struct PeerEntry {
     /// the same as `state` being `Installed`, but a failed key change
     /// leaves the previous key in place.
     on_socket: bool,
+    /// The table's change counter when this peer's key was last set.
+    changed: u64,
 }
 
 #[derive(Debug)]
@@ -315,8 +379,24 @@ struct Inner {
     peers: HashMap<IpAddr, PeerEntry>,
     /// Indexed by [`AddressFamily::index`].
     slots: [Option<Slot>; 2],
-    /// Incremented by every key installed after `listen()`.
-    epoch: u64,
+    /// Number of unsettled keys per family, indexed like `slots`.
+    unsettled: [usize; 2],
+    /// Incremented by every [`ListenerKeys::set_peer`] that changes a peer.
+    changes: u64,
+}
+
+impl Inner {
+    /// Updates `family`'s unsettled count for a peer whose state changed
+    /// from `before` to `after` (`None`: no entry).
+    fn track(&mut self, family: AddressFamily, before: Option<KeyState>, after: Option<KeyState>) {
+        let count = &mut self.unsettled[family.index()];
+        if before.is_some_and(KeyState::is_unsettled) {
+            *count -= 1;
+        }
+        if after.is_some_and(KeyState::is_unsettled) {
+            *count += 1;
+        }
+    }
 }
 
 /// The TCP MD5 keys configured for inbound connections, and their state on
@@ -370,10 +450,16 @@ impl<P> ListenerKeys<P> {
     /// What a listener does with a connection from `peer`.
     #[must_use]
     pub fn admission(&self, peer: IpAddr) -> Admission {
-        match self.lock().peers.get(&peer).map(|e| e.state) {
+        self.screen(peer).0
+    }
+
+    /// [`admission`](Self::admission) and the stamp it was read at.
+    fn screen(&self, peer: IpAddr) -> (Admission, AuthStamp) {
+        let inner = self.lock();
+        let admission = match inner.peers.get(&peer).map(|e| e.state) {
             None => Admission::Unkeyed,
-            Some(KeyState::Installed { settled: true, .. }) => Admission::Authenticated,
-            Some(KeyState::Installed { settled: false, .. }) => {
+            Some(KeyState::Installed { settled: true }) => Admission::Authenticated,
+            Some(KeyState::Installed { settled: false }) => {
                 Admission::Rejected(Rejection::KeyChangePending)
             }
             Some(KeyState::Unenforced(why)) => Admission::Unauthenticated(why),
@@ -381,38 +467,25 @@ impl<P> ListenerKeys<P> {
                 Admission::Rejected(Rejection::KeyNotInstalled(refusal))
             }
             Some(KeyState::Deferred) => Admission::Rejected(Rejection::NoListener),
-        }
+        };
+        (admission, AuthStamp(inner.changes))
     }
 
-    /// Whether any key of `family` is waiting for its accept queue to drain.
+    /// Whether a connection from `peer` screened at `stamp` is still valid:
+    /// `false` if `peer`'s key has been set since (added, rotated, or failed
+    /// to install), so that the connection predates the current key.
+    #[must_use]
+    pub fn is_current(&self, peer: IpAddr, stamp: AuthStamp) -> bool {
+        self.lock()
+            .peers
+            .get(&peer)
+            .is_none_or(|e| e.changed <= stamp.0)
+    }
+
+    /// Whether any key of `family` was installed after its socket started
+    /// listening, so that the socket must be replaced. Constant time.
     fn has_unsettled(&self, family: AddressFamily) -> bool {
-        self.lock().peers.iter().any(|(ip, e)| {
-            AddressFamily::of(*ip) == family
-                && matches!(e.state, KeyState::Installed { settled: false, .. })
-        })
-    }
-
-    fn epoch(&self) -> u64 {
-        self.lock().epoch
-    }
-
-    /// Marks every key of `family` installed at or before `epoch` as
-    /// settled. Call only after the family's accept queue was seen empty
-    /// after reading `epoch`.
-    fn settle(&self, family: AddressFamily, epoch: u64) {
-        for (ip, e) in &mut self.lock().peers {
-            if AddressFamily::of(*ip) != family {
-                continue;
-            }
-            if let KeyState::Installed {
-                epoch: installed,
-                settled,
-            } = &mut e.state
-                && *installed <= epoch
-            {
-                *settled = true;
-            }
-        }
+        self.lock().unsettled[family.index()] > 0
     }
 
     /// Forgets `family`'s socket. Its keys go back to
@@ -420,6 +493,7 @@ impl<P> ListenerKeys<P> {
     fn detach(&self, family: AddressFamily) {
         let mut inner = self.lock();
         inner.slots[family.index()] = None;
+        inner.unsettled[family.index()] = 0;
         for (ip, e) in &mut inner.peers {
             if AddressFamily::of(*ip) == family {
                 e.state = KeyState::Deferred;
@@ -442,12 +516,13 @@ impl<P: TcpMd5Port> ListenerKeys<P> {
     /// key for it (key rotation).
     ///
     /// If a listening socket for the peer's address family is bound, the key
-    /// is installed on it now. Linux replaces an existing key for the same
-    /// address in place (`__tcp_md5_do_add`: "Pre-existing entry - just
-    /// update that one"); connections accepted earlier keep the key they
-    /// were accepted with. Connections from `peer` that completed before
-    /// this call are rejected (see the [module documentation](self)).
-    /// Setting the key the peer already has changes nothing.
+    /// is installed on it now, and the [`BgpListener`] then replaces the
+    /// socket (see the [module documentation](self)). Linux replaces an
+    /// existing key for the same address in place (`__tcp_md5_do_add`:
+    /// "Pre-existing entry - just update that one"); connections accepted
+    /// earlier keep the key they were accepted with, and stop being
+    /// [current](Self::is_current). Setting the key the peer already has
+    /// changes nothing.
     ///
     /// # Errors
     ///
@@ -465,50 +540,46 @@ impl<P: TcpMd5Port> ListenerKeys<P> {
         let mut inner = self.lock();
         let inner = &mut *inner;
 
-        if let Some(e) = inner.peers.get(&peer)
+        let previous = inner.peers.get(&peer);
+        if let Some(e) = previous
             && e.auth == auth
             && matches!(e.state, KeyState::Installed { .. })
         {
             return Ok(ListenerProtection::Enforced);
         }
+        let before = previous.map(|e| e.state);
+        let previously_on_socket = previous.is_some_and(|e| e.on_socket);
+        inner.changes += 1;
+        let changed = inner.changes;
 
-        let previously_on_socket = inner.peers.get(&peer).is_some_and(|e| e.on_socket);
-        let Some(slot) = &inner.slots[family.index()] else {
-            inner.peers.insert(
-                peer,
-                PeerEntry {
-                    auth,
-                    state: KeyState::Deferred,
-                    on_socket: false,
-                },
-            );
-            return Ok(ListenerProtection::Deferred);
+        let (state, on_socket, outcome) = match &inner.slots[family.index()] {
+            None => (KeyState::Deferred, false, Ok(ListenerProtection::Deferred)),
+            Some(slot) => match install(&self.port, slot, peer, &auth) {
+                Ok(Installed::Enforced) => {
+                    slot.notify.notify_one();
+                    (
+                        KeyState::Installed { settled: false },
+                        true,
+                        Ok(ListenerProtection::Enforced),
+                    )
+                }
+                Ok(Installed::Unenforced(why)) => (
+                    KeyState::Unenforced(why),
+                    false,
+                    Ok(ListenerProtection::Unenforced(why)),
+                ),
+                // A failed replacement leaves the previous key, if any, in place.
+                Err(e) => (KeyState::Refused(e.refusal), previously_on_socket, Err(e)),
+            },
         };
-
-        let (state, on_socket, outcome) = match install(&self.port, slot, peer, &auth) {
-            Ok(Installed::Enforced) => {
-                inner.epoch += 1;
-                slot.notify.notify_one();
-                let state = KeyState::Installed {
-                    epoch: inner.epoch,
-                    settled: false,
-                };
-                (state, true, Ok(ListenerProtection::Enforced))
-            }
-            Ok(Installed::Unenforced(why)) => (
-                KeyState::Unenforced(why),
-                false,
-                Ok(ListenerProtection::Unenforced(why)),
-            ),
-            // A failed replacement leaves the previous key, if any, in place.
-            Err(e) => (KeyState::Refused(e.refusal), previously_on_socket, Err(e)),
-        };
+        inner.track(family, before, Some(state));
         inner.peers.insert(
             peer,
             PeerEntry {
                 auth,
                 state,
                 on_socket,
+                changed,
             },
         );
         outcome
@@ -527,12 +598,14 @@ impl<P: TcpMd5Port> ListenerKeys<P> {
     /// kernel keeps dropping the peer's unsigned segments, which fails
     /// closed.
     pub fn remove_peer(&self, peer: IpAddr) -> Result<bool, TcpMd5Error> {
+        let family = AddressFamily::of(peer);
         let mut inner = self.lock();
         let Some(entry) = inner.peers.remove(&peer) else {
             return Ok(false);
         };
+        inner.track(family, Some(entry.state), None);
         if entry.on_socket
-            && let Some(slot) = &inner.slots[AddressFamily::of(peer).index()]
+            && let Some(slot) = &inner.slots[family.index()]
         {
             self.port.remove(slot.fd.as_fd(), peer)?;
         }
@@ -565,10 +638,7 @@ impl<P: TcpMd5Port> ListenerKeys<P> {
             }
             match install(&self.port, &slot, *ip, &e.auth) {
                 Ok(Installed::Enforced) => {
-                    e.state = KeyState::Installed {
-                        epoch: inner.epoch,
-                        settled: true,
-                    };
+                    e.state = KeyState::Installed { settled: true };
                     e.on_socket = true;
                 }
                 Ok(Installed::Unenforced(why)) => {
@@ -582,6 +652,7 @@ impl<P: TcpMd5Port> ListenerKeys<P> {
                 }
             }
         }
+        inner.unsettled[family.index()] = 0;
         inner.slots[family.index()] = Some(slot);
         Ok(failures)
     }
@@ -627,31 +698,28 @@ fn install<P: TcpMd5Port>(
 /// [`ListenerKeys`] table.
 ///
 /// [`bind`](Self::bind) installs the table's keys before the socket starts
-/// listening, and later changes to the table reach the socket without
-/// rebinding it. [`accept`](Self::accept) only returns connections the table
-/// admits; it closes the others.
+/// listening. Later changes to the table reach the socket at once, and a key
+/// installed while listening makes the listener replace its socket (see the
+/// [module documentation](crate::transport::listener)).
+/// [`accept`](Self::accept) only returns connections the table admits; it
+/// closes the others.
 pub struct BgpListener<P: TcpMd5Port = KernelTcpMd5> {
-    listener: TcpListener,
+    /// `None` only if replacing the socket failed; the next
+    /// [`accept`](Self::accept) tries again.
+    listener: Option<TcpListener>,
+    /// The bound address (with the actual port), for replacements.
+    addr: SocketAddr,
     family: AddressFamily,
     keys: Arc<ListenerKeys<P>>,
     notify: Arc<Notify>,
-    /// Admitted connections taken off the queue while draining it.
-    ready: VecDeque<(TcpStream, SocketAddr)>,
-    /// The first time the queue was cleared after key change `epoch`; the
-    /// change settles on a later clearing [`SETTLE_DELAY`] after it.
-    settling: Option<Settling>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Settling {
-    epoch: u64,
-    cleared_at: Instant,
+    /// Admitted connections taken off the old socket while replacing it.
+    ready: VecDeque<Inbound>,
 }
 
 impl<P: TcpMd5Port> fmt::Debug for BgpListener<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BgpListener")
-            .field("listener", &self.listener)
+            .field("addr", &self.addr)
             .field("family", &self.family)
             .finish_non_exhaustive()
     }
@@ -663,7 +731,8 @@ impl<P: TcpMd5Port> BgpListener<P> {
     ///
     /// An IPv6 socket is set to `IPV6_V6ONLY`, so it never receives IPv4
     /// connections, which need the IPv4 socket's keys. `SO_REUSEADDR` is
-    /// set. Keys that cannot be installed are logged at error level, and
+    /// set; `SO_REUSEPORT` is not, so connections are never moved to another
+    /// socket. Keys that cannot be installed are logged at error level, and
     /// their peers' connections are rejected; they do not make the bind
     /// fail.
     ///
@@ -672,50 +741,30 @@ impl<P: TcpMd5Port> BgpListener<P> {
     /// Any socket, bind or listen error, or [`io::ErrorKind::AlreadyExists`]
     /// if `keys` already has a listener for this address family.
     pub fn bind(addr: SocketAddr, keys: Arc<ListenerKeys<P>>) -> io::Result<Self> {
-        let family = AddressFamily::of(addr.ip());
-        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        if family == AddressFamily::V6 {
-            socket.set_only_v6(true)?;
-        }
-        socket.set_reuse_address(true)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&addr.into())?;
-
         let notify = Arc::new(Notify::new());
-        let failures = keys.attach(family, socket.try_clone()?.into(), Arc::clone(&notify))?;
-        for e in &failures {
-            tracing::error!(peer = %e.peer(), listen = %addr, "{e}");
-        }
-
-        // The keys are on the socket before it listens, so no handshake can
-        // complete without them.
-        let listener = socket
-            .listen(LISTEN_BACKLOG)
-            .and_then(|()| TcpListener::from_std(socket.into()));
-        let listener = match listener {
-            Ok(l) => l,
-            Err(e) => {
-                keys.detach(family);
-                return Err(e);
-            }
-        };
+        let listener = bind_socket(addr, &keys, &notify)?;
+        let addr = listener.local_addr()?;
         Ok(Self {
-            listener,
-            family,
+            listener: Some(listener),
+            addr,
+            family: AddressFamily::of(addr.ip()),
             keys,
             notify,
             ready: VecDeque::new(),
-            settling: None,
         })
     }
 
     /// The local address the socket is bound to.
-    ///
-    /// # Errors
-    ///
-    /// As for [`TcpListener::local_addr`].
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Whether `inbound` is still valid: [`ListenerKeys::is_current`] for
+    /// its peer and stamp.
+    #[must_use]
+    pub fn is_current(&self, inbound: &Inbound) -> bool {
+        self.keys.is_current(inbound.peer.ip(), inbound.stamp)
     }
 
     /// The next connection that the key table admits.
@@ -727,118 +776,122 @@ impl<P: TcpMd5Port> BgpListener<P> {
     ///
     /// # Errors
     ///
-    /// An error from `accept()` on the listening socket.
-    pub async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+    /// An error from `accept()`, or from binding the replacement socket.
+    /// After a failed replacement the next call tries again.
+    pub async fn accept(&mut self) -> io::Result<Inbound> {
         loop {
-            if let Some(conn) = self.ready.pop_front() {
-                return Ok(conn);
+            let mut replace_error = None;
+            if self.listener.is_none() || self.keys.has_unsettled(self.family) {
+                replace_error = self.replace_socket().err();
             }
-            if self.keys.has_unsettled(self.family) {
-                self.drain();
-                if let Some(conn) = self.ready.pop_front() {
-                    return Ok(conn);
+            while let Some(inbound) = self.ready.pop_front() {
+                if self.is_current(&inbound) {
+                    return Ok(inbound);
                 }
-            } else {
-                // Nothing left to settle (for example, the peer was removed).
-                self.settling = None;
+                tracing::warn!(
+                    peer = %inbound.peer,
+                    "rejecting inbound BGP connection: its TCP MD5 key changed after it was accepted"
+                );
             }
-            let recheck = self.settling.map(|s| s.cleared_at + SETTLE_DELAY);
+            // Connections already taken off the old socket are served first,
+            // even if its replacement could not be bound.
+            if let Some(e) = replace_error {
+                return Err(e);
+            }
+            let Some(listener) = &self.listener else {
+                continue;
+            };
             tokio::select! {
                 biased;
                 () = self.notify.notified() => {}
-                () = sleep_until(recheck) => {}
-                accepted = self.listener.accept() => {
+                accepted = listener.accept() => {
                     let (stream, addr) = accepted?;
-                    if self.admit(addr) {
-                        return Ok((stream, addr));
+                    if let Some(stamp) = self.admit(addr) {
+                        return Ok(Inbound { stream, peer: addr, stamp });
                     }
                 }
             }
         }
     }
 
-    /// Clears the accept queue and advances the settling of key changes.
+    /// Replaces the listening socket after a key was installed on it while
+    /// it was listening (see the [module documentation](crate::transport::listener)).
     ///
-    /// Key changes up to `epoch` (read before clearing) are settled when the
-    /// queue has been cleared twice, [`SETTLE_DELAY`] apart, both times after
-    /// `epoch` was read. Every connection taken off the queue meanwhile was
-    /// screened while those keys were unsettled, so connections from their
-    /// peers were rejected.
-    fn drain(&mut self) {
-        let epoch = self.keys.epoch();
-        if !self.clear_queue() {
-            return;
-        }
-        let now = Instant::now();
-        match self.settling {
-            None => {
-                self.settling = Some(Settling {
-                    epoch,
-                    cleared_at: now,
-                });
+    /// # Errors
+    ///
+    /// Binding or listening on the new socket failed. The old socket is gone
+    /// either way; `self.listener` stays `None` until a later call succeeds.
+    fn replace_socket(&mut self) -> io::Result<()> {
+        if let Some(old) = self.listener.take() {
+            self.take_queued(&old);
+            // The barrier: after this the old socket is not listening, its
+            // queue is discarded, and any connection still on its way to the
+            // queue is discarded too.
+            if let Err(e) = socket2::SockRef::from(&old).shutdown(Shutdown::Read) {
+                tracing::debug!(error = %e, "shutdown of replaced BGP listening socket");
             }
-            Some(s) if now >= s.cleared_at + SETTLE_DELAY => {
-                self.keys.settle(self.family, s.epoch);
-                // Changes made since `s` was recorded start their own wait.
-                self.settling = (epoch > s.epoch).then_some(Settling {
-                    epoch,
-                    cleared_at: now,
-                });
-            }
-            Some(_) => {}
+            drop(old);
         }
+        // Drops the table's duplicate descriptor, so the old socket closes.
+        self.keys.detach(self.family);
+        let new = bind_socket(self.addr, &self.keys, &self.notify)?;
+        tracing::debug!(addr = %self.addr, "replaced BGP listening socket after a TCP MD5 key change");
+        self.listener = Some(new);
+        Ok(())
     }
 
-    /// Takes connections off the accept queue, screening each, until it is
-    /// empty or [`MAX_QUEUED`] have been taken (by then, every connection
-    /// that was queued when this began has been taken). Returns `false` if
-    /// an accept error stopped it first.
-    fn clear_queue(&mut self) -> bool {
-        let socket = socket2::SockRef::from(&self.listener);
-        let mut taken = 0;
-        while taken < MAX_QUEUED {
+    /// Takes up to [`MAX_QUEUED`] connections off `old`'s queue, keeping the
+    /// admitted ones in `ready`. Connections from a peer whose key changed
+    /// are rejected, since they may predate the change.
+    fn take_queued(&mut self, old: &TcpListener) {
+        let socket = socket2::SockRef::from(old);
+        for _ in 0..MAX_QUEUED {
             match socket.accept() {
                 Ok((conn, addr)) => {
-                    taken += 1;
                     let Some(addr) = addr.as_socket() else {
                         continue;
                     };
-                    if !self.admit(addr) {
+                    let Some(stamp) = self.admit(addr) else {
                         continue;
-                    }
+                    };
                     let stream = std::net::TcpStream::from(conn);
                     match stream
                         .set_nonblocking(true)
                         .and_then(|()| TcpStream::from_std(stream))
                     {
-                        Ok(stream) => self.ready.push_back((stream, addr)),
+                        Ok(stream) => self.ready.push_back(Inbound {
+                            stream,
+                            peer: addr,
+                            stamp,
+                        }),
                         Err(e) => tracing::warn!(peer = %addr, error = %e,
                             "dropping inbound BGP connection"),
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
-                // The queued connection was reset before we took it.
-                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => taken += 1,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => {
-                    // Not cleared, so nothing settles; the next `accept`
-                    // call tries again.
-                    tracing::warn!(error = %e, "BGP listener accept error while draining");
-                    return false;
+                    tracing::warn!(error = %e, "BGP listener accept error before replacing the socket");
+                    return;
                 }
             }
         }
-        true
     }
 
-    /// Whether a connection from `addr` may be used. Logs rejections.
-    fn admit(&self, addr: SocketAddr) -> bool {
+    /// The stamp of a connection from `addr` that may be used, or `None`.
+    /// Logs rejections.
+    fn admit(&self, addr: SocketAddr) -> Option<AuthStamp> {
         if AddressFamily::of(addr.ip()) != self.family {
             tracing::warn!(peer = %addr, "rejecting inbound connection: wrong address family");
-            return false;
+            return None;
         }
-        match self.keys.admission(addr.ip()) {
-            Admission::Unkeyed | Admission::Authenticated => true,
+        let (admission, stamp) = self.keys.screen(addr.ip());
+        match admission {
+            Admission::Unkeyed | Admission::Authenticated => Some(stamp),
             Admission::Unauthenticated(why) => {
                 tracing::warn!(
                     peer = %addr,
@@ -846,21 +899,13 @@ impl<P: TcpMd5Port> BgpListener<P> {
                     "accepting inbound BGP connection WITHOUT TCP MD5 authentication \
                      (tcp_md5_enforcement is best-effort)"
                 );
-                true
+                Some(stamp)
             }
             Admission::Rejected(why) => {
                 tracing::warn!(peer = %addr, "rejecting inbound BGP connection: {why}");
-                false
+                None
             }
         }
-    }
-}
-
-/// Resolves at `deadline`, or never if `None`.
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -868,6 +913,38 @@ impl<P: TcpMd5Port> Drop for BgpListener<P> {
     fn drop(&mut self) {
         self.keys.detach(self.family);
     }
+}
+
+/// Creates a socket bound to `addr`, attaches it to `keys` (installing their
+/// keys for its family), and only then starts listening.
+fn bind_socket<P: TcpMd5Port>(
+    addr: SocketAddr,
+    keys: &ListenerKeys<P>,
+    notify: &Arc<Notify>,
+) -> io::Result<TcpListener> {
+    let family = AddressFamily::of(addr.ip());
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if family == AddressFamily::V6 {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+
+    let failures = keys.attach(family, socket.try_clone()?.into(), Arc::clone(notify))?;
+    for e in &failures {
+        tracing::error!(peer = %e.peer(), listen = %addr, "{e}");
+    }
+
+    // The keys are on the socket before it listens, so no handshake can
+    // complete without them.
+    let listener = socket
+        .listen(LISTEN_BACKLOG)
+        .and_then(|()| TcpListener::from_std(socket.into()));
+    if listener.is_err() {
+        keys.detach(family);
+    }
+    listener
 }
 
 #[cfg(test)]

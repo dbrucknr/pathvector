@@ -149,7 +149,7 @@ fn bind(keys: &Arc<ListenerKeys<FakePort>>) -> BgpListener<FakePort> {
 }
 
 /// The next admitted connection, or `None` within a short wait.
-async fn try_accept(l: &mut BgpListener<FakePort>) -> Option<(TcpStream, SocketAddr)> {
+async fn try_accept(l: &mut BgpListener<FakePort>) -> Option<Inbound> {
     tokio::time::timeout(Duration::from_millis(200), l.accept())
         .await
         .ok()
@@ -227,12 +227,12 @@ async fn unknown_peer_is_unkeyed_and_admitted() {
     let keys = keys(Outcome::Ok);
     let _ = keys.set_peer(OTHER_V4, required("k"));
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
 
     assert_eq!(keys.admission(LOOPBACK), Admission::Unkeyed);
     let client = TcpStream::connect(addr).await.unwrap();
-    let (_, from) = try_accept(&mut l).await.expect("unkeyed peer admitted");
-    assert_eq!(from, client.local_addr().unwrap());
+    let inbound = try_accept(&mut l).await.expect("unkeyed peer admitted");
+    assert_eq!(inbound.peer(), client.local_addr().unwrap());
 }
 
 #[tokio::test]
@@ -278,7 +278,7 @@ async fn required_key_that_cannot_be_enforced_rejects_the_peer() {
     let keys = keys(Outcome::Unsupported);
     let _ = keys.set_peer(LOOPBACK, required("k"));
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
 
     let refusal = KeyRefusal::NotEnforceable(TcpMd5Unsupported::Platform);
     assert_eq!(
@@ -297,7 +297,7 @@ async fn required_key_that_cannot_be_enforced_rejects_the_peer() {
 async fn set_peer_reports_a_required_key_it_cannot_enforce() {
     let keys = keys(Outcome::Unsupported);
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
 
     let err = keys.set_peer(LOOPBACK, required("k")).unwrap_err();
     assert_eq!(err.peer(), LOOPBACK);
@@ -316,7 +316,7 @@ async fn set_peer_reports_a_required_key_it_cannot_enforce() {
 async fn best_effort_key_that_cannot_be_enforced_admits_unauthenticated() {
     let keys = keys(Outcome::Unsupported);
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
 
     assert_eq!(
         keys.set_peer(LOOPBACK, best_effort("k")),
@@ -357,7 +357,7 @@ async fn refused_key_does_not_affect_other_peers() {
     let keys = keys(Outcome::Unsupported);
     let _ = keys.set_peer(OTHER_V4, required("k"));
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
 
     let _client = TcpStream::connect(addr).await.unwrap();
     assert!(try_accept(&mut l).await.is_some());
@@ -365,17 +365,33 @@ async fn refused_key_does_not_affect_other_peers() {
 
 // ── keys changed while listening ─────────────────────────────────────────────
 
+/// Unsettled keys per family, checked against a full scan of the table.
+fn unsettled(keys: &ListenerKeys<FakePort>, family: AddressFamily) -> usize {
+    let inner = keys.lock();
+    let scanned = inner
+        .peers
+        .iter()
+        .filter(|(ip, e)| AddressFamily::of(**ip) == family && e.state.is_unsettled())
+        .count();
+    assert_eq!(
+        inner.unsettled[family.index()],
+        scanned,
+        "count out of sync"
+    );
+    scanned
+}
+
 /// The race this module closes. Linux copies the listener's key into a
 /// connection when its handshake completes (`tcp_v4_syn_recv_sock`, "Copy
 /// over the MD5 key from the original socket"), so a connection that
 /// completed before the key was installed carries no key, even if it is
 /// accepted afterwards. It must be rejected; a connection made after the
-/// queue has been drained is admitted.
+/// socket was replaced is admitted.
 #[tokio::test]
 async fn connection_queued_before_a_new_key_is_rejected() {
     let keys = keys(Outcome::Ok);
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
 
     // Handshake completes with no key; the connection waits in the queue.
     let early = queued_connection(addr).await;
@@ -403,20 +419,61 @@ async fn connection_queued_before_a_new_key_is_rejected() {
     );
     assert!(closed_by_server(early).await, "and must be closed");
     assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
+    assert_eq!(l.local_addr(), addr, "replacement keeps the address");
 
     let late = TcpStream::connect(addr).await.unwrap();
-    let (_, from) = try_accept(&mut l).await.expect("post-key connection");
-    assert_eq!(from, late.local_addr().unwrap());
+    let inbound = try_accept(&mut l).await.expect("post-key connection");
+    assert_eq!(inbound.peer(), late.local_addr().unwrap());
 }
 
-/// Rotation: the new key replaces the old one on the socket, and
-/// connections queued under the old key are discarded the same way.
+/// A key installed while listening makes the listener replace its socket:
+/// the new socket at the same address gets every key before `listen()`, so
+/// no connection it produces can predate the key. Waiting cannot prove that
+/// about the old socket (a connection whose key was copied before the
+/// change can be appended to the queue after any check), so the old socket
+/// is shut down instead (`inet_shutdown` → `tcp_disconnect` →
+/// `inet_csk_listen_stop`).
 #[tokio::test]
-async fn rotation_installs_the_new_key_and_settles_again() {
+async fn key_change_replaces_the_socket_with_keys_installed_before_listen() {
+    let keys = probing_keys();
+    let mut l = bind(&keys);
+    let addr = l.local_addr();
+
+    let _ = keys.set_peer(LOOPBACK, required("k"));
+    assert!(try_accept(&mut l).await.is_none());
+
+    assert_eq!(
+        calls(&keys),
+        vec![
+            Call::Install {
+                peer: LOOPBACK,
+                key: key("k"),
+                listening: Some(true)
+            },
+            Call::Install {
+                peer: LOOPBACK,
+                key: key("k"),
+                listening: Some(false)
+            },
+        ],
+        "installed on the live socket, then on the replacement before listen()"
+    );
+    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
+    assert_eq!(unsettled(&keys, AddressFamily::V4), 0);
+
+    let client = TcpStream::connect(addr).await.unwrap();
+    let inbound = try_accept(&mut l).await.expect("replacement listens");
+    assert_eq!(inbound.peer(), client.local_addr().unwrap());
+}
+
+/// Rotation: the new key replaces the old one on the socket, connections
+/// queued under the old key are discarded, and the socket is replaced.
+#[tokio::test]
+async fn rotation_installs_the_new_key_and_replaces_the_socket() {
     let keys = keys(Outcome::Ok);
     let _ = keys.set_peer(LOOPBACK, required("old"));
     let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
+    let addr = l.local_addr();
     let queued = queued_connection(addr).await;
 
     assert_eq!(
@@ -434,6 +491,11 @@ async fn rotation_installs_the_new_key_and_settles_again() {
     );
     assert!(try_accept(&mut l).await.is_none());
     assert!(closed_by_server(queued).await);
+    assert_eq!(
+        calls(&keys).len(),
+        3,
+        "old, new live, new on the replacement"
+    );
     assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
 }
 
@@ -452,84 +514,100 @@ async fn setting_the_same_key_again_is_a_no_op() {
     assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
 }
 
-/// A drain settles only the keys installed before it began; a key
-/// installed during it stays pending until the next drain.
+/// The per-family count behind the constant-time `has_unsettled` check
+/// stays equal to a scan of the table through every transition: install
+/// while listening, removal, a failed rotation, and socket replacement.
 #[tokio::test]
-async fn settling_covers_only_keys_installed_before_the_drain() {
+async fn unsettled_count_follows_every_transition() {
     let keys = keys(Outcome::Ok);
-    let _l = bind(&keys);
+    let mut l = bind(&keys);
+    let _ = keys.set_peer(PEER_V6, required("v6")); // deferred: no IPv6 socket
+
     let _ = keys.set_peer(LOOPBACK, required("a"));
-    let epoch = keys.epoch();
     let _ = keys.set_peer(OTHER_V4, required("b"));
-
-    keys.settle(AddressFamily::V4, epoch);
-
-    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
-    assert_eq!(
-        keys.admission(OTHER_V4),
-        Admission::Rejected(Rejection::KeyChangePending)
-    );
+    assert_eq!(unsettled(&keys, AddressFamily::V4), 2);
     assert!(keys.has_unsettled(AddressFamily::V4));
     assert!(!keys.has_unsettled(AddressFamily::V6));
-}
-
-/// One clearing of the queue is not enough: a connection whose key lookup
-/// happened before the install can be appended to the queue just after it
-/// was seen empty (`tcp_v4_syn_recv_sock`, then `inet_csk_reqsk_queue_add`).
-/// The key settles only on a second clearing at least `SETTLE_DELAY` later.
-#[tokio::test]
-async fn a_key_change_settles_only_on_a_second_clearing_after_the_delay() {
-    let keys = keys(Outcome::Ok);
-    let mut l = bind(&keys);
-    let _ = keys.set_peer(LOOPBACK, required("k"));
-
-    l.drain();
-    assert_eq!(
-        keys.admission(LOOPBACK),
-        Admission::Rejected(Rejection::KeyChangePending),
-        "first clearing only starts the wait"
-    );
-    l.drain();
-    assert_eq!(
-        keys.admission(LOOPBACK),
-        Admission::Rejected(Rejection::KeyChangePending),
-        "a second clearing too soon does not settle"
-    );
-
-    tokio::time::sleep(SETTLE_DELAY + Duration::from_millis(20)).await;
-    l.drain();
-    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
-    assert!(l.settling.is_none());
-}
-
-/// A connection that reaches the queue between the first and second
-/// clearing (the late append above) is rejected by the second.
-#[tokio::test]
-async fn connection_queued_between_the_two_clearings_is_rejected() {
-    let keys = keys(Outcome::Ok);
-    let mut l = bind(&keys);
-    let addr = l.local_addr().unwrap();
-    let _ = keys.set_peer(LOOPBACK, required("k"));
-    l.drain();
-
-    let late = queued_connection(addr).await;
-    assert!(try_accept(&mut l).await.is_none());
-    assert!(closed_by_server(late).await);
-}
-
-/// Removing a peer whose key change is still settling ends the wait, so the
-/// listener does not keep waking up for it.
-#[tokio::test]
-async fn removing_a_settling_peer_ends_the_wait() {
-    let keys = keys(Outcome::Ok);
-    let mut l = bind(&keys);
-    let _ = keys.set_peer(LOOPBACK, required("k"));
-    l.drain();
-    assert!(l.settling.is_some());
 
     assert!(keys.remove_peer(LOOPBACK).unwrap());
+    assert_eq!(unsettled(&keys, AddressFamily::V4), 1);
+
+    *keys.port.install.lock().unwrap() = Outcome::NoMemory;
+    assert!(keys.set_peer(OTHER_V4, required("b2")).is_err());
+    assert_eq!(unsettled(&keys, AddressFamily::V4), 0);
+
+    *keys.port.install.lock().unwrap() = Outcome::Ok;
+    let _ = keys.set_peer(OTHER_V4, required("b3"));
+    assert_eq!(unsettled(&keys, AddressFamily::V4), 1);
+    assert!(try_accept(&mut l).await.is_none(), "replaces the socket");
+    assert_eq!(unsettled(&keys, AddressFamily::V4), 0);
+    assert_eq!(unsettled(&keys, AddressFamily::V6), 0);
+}
+
+// ── connections accepted around a key change ─────────────────────────────────
+
+/// Codex review of PR #127: a connection taken off the old socket while
+/// replacing it for peer A's key, from peer B that had no key yet, was
+/// buffered and later returned even after B got a required key. It predates
+/// B's key, so it must be discarded, also once B's key is fully in force.
+#[tokio::test]
+async fn buffered_connection_is_dropped_when_its_peer_gains_a_key() {
+    let keys = keys(Outcome::Ok);
+    let mut l = bind(&keys);
+    let client = queued_connection(l.local_addr()).await;
+
+    let _ = keys.set_peer(OTHER_V4, required("a"));
+    l.replace_socket().unwrap();
+    assert_eq!(
+        l.ready.len(),
+        1,
+        "the unkeyed loopback connection is buffered"
+    );
+
+    let _ = keys.set_peer(LOOPBACK, required("b"));
+    assert!(
+        try_accept(&mut l).await.is_none(),
+        "stale connection dropped"
+    );
+    assert_eq!(keys.admission(LOOPBACK), Admission::Authenticated);
+    assert!(closed_by_server(client).await);
+}
+
+/// Same, when B's required key cannot be installed: B's connections are
+/// refused, including the buffered one.
+#[tokio::test]
+async fn buffered_connection_is_dropped_when_its_peers_key_is_refused() {
+    let keys = keys(Outcome::Ok);
+    let mut l = bind(&keys);
+    let client = queued_connection(l.local_addr()).await;
+
+    let _ = keys.set_peer(OTHER_V4, required("a"));
+    l.replace_socket().unwrap();
+    assert_eq!(l.ready.len(), 1);
+
+    *keys.port.install.lock().unwrap() = Outcome::Unsupported;
+    assert!(keys.set_peer(LOOPBACK, required("b")).is_err());
     assert!(try_accept(&mut l).await.is_none());
-    assert!(l.settling.is_none());
+    assert!(closed_by_server(client).await);
+}
+
+/// A connection handed over before its peer got a key stops being current,
+/// so a caller that checks `is_current` after making the peer reachable
+/// never uses a connection that predates the key.
+#[tokio::test]
+async fn accepted_connection_stops_being_current_when_its_peer_gains_a_key() {
+    let keys = keys(Outcome::Ok);
+    let mut l = bind(&keys);
+    let _client = TcpStream::connect(l.local_addr()).await.unwrap();
+    let inbound = try_accept(&mut l).await.expect("unkeyed peer admitted");
+    assert!(l.is_current(&inbound));
+
+    let _ = keys.set_peer(OTHER_V4, required("other"));
+    assert!(l.is_current(&inbound), "another peer's key does not matter");
+
+    let _ = keys.set_peer(LOOPBACK, required("k"));
+    assert!(!l.is_current(&inbound));
+    assert!(!keys.is_current(LOOPBACK, inbound.stamp()));
 }
 
 // ── removal ──────────────────────────────────────────────────────────────────
