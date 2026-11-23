@@ -54,6 +54,10 @@ mod route;
 #[cfg(test)]
 mod gr_preference_tests;
 
+// Issue #69: RFC 4456 §9 reflected-route tie-breakers through ingestion.
+#[cfg(test)]
+mod rr_tie_break_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use capabilities::{SpawnConfig, build_local_capabilities};
@@ -10009,7 +10013,7 @@ mod tests {
 
     /// Builds a DaemonState acting as an RR for the given clients.
     /// `clients` and `non_clients` are all iBGP peers (same `local_as`).
-    fn make_rr_state(
+    pub(super) fn make_rr_state(
         local_as: u32,
         cluster_id: u32,
         clients: &[Ipv4Addr],
