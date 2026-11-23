@@ -156,11 +156,13 @@ pub trait FibWrite {
 // ── FibSnapshot ──────────────────────────────────────────────────────────────
 
 mod route;
-pub(crate) use route::RouteList;
 pub use route::{
     Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg, NextHopPath, NextHopV4,
-    NextHopV6, PrefixError, RouteSlotV4, RouteSlotV6, TableId,
+    NextHopV6, PrefixError, RTN_UNICAST, RTPROT_BGP, RouteSlotV4, RouteSlotV6, TableId,
 };
+// `Position` is used only by the Linux adapter and the tests.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
+pub(crate) use route::{Position, RouteMirror};
 
 /// Returns `true` if `addr` is a link-local IPv6 address (`fe80::/10`).
 ///
@@ -186,6 +188,13 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
 /// leaves the others in place. See the `route` module docs for the kernel
 /// source this follows.
 ///
+/// Every kernel route in the tracked table(s) is mirrored, including BGP and
+/// non-unicast routes, because an `NLM_F_REPLACE` displaces whichever route is
+/// first in its slot. Only *tracked* routes (unicast, not `RTPROT_BGP`) are
+/// used for lookups, listed by [`routes_v4`](Self::routes_v4) /
+/// [`routes_v6`](Self::routes_v6), or signal a change; the rest are stored as
+/// an identity hash only.
+///
 /// # Lookup
 ///
 /// Reachability queries use longest-prefix match. Among the routes for the
@@ -196,8 +205,8 @@ fn is_link_local_v6(addr: Ipv6Addr) -> bool {
 /// best-effort lookup from an unspecified source cannot match them.
 #[derive(Debug, Default, Clone)]
 pub struct FibSnapshot {
-    pub(crate) v4: RouteList<KernelRouteV4>,
-    pub(crate) v6: RouteList<KernelRouteV6>,
+    pub(crate) v4: RouteMirror<KernelRouteV4>,
+    pub(crate) v6: RouteMirror<KernelRouteV6>,
 }
 
 impl FibSnapshot {
@@ -207,12 +216,14 @@ impl FibSnapshot {
         Self::default()
     }
 
-    /// Every IPv4 route in the snapshot, in kernel order within each slot.
+    /// Every tracked IPv4 route, in kernel order within each slot (slots in no
+    /// particular order).
     pub fn routes_v4(&self) -> impl Iterator<Item = &KernelRouteV4> {
         self.v4.iter()
     }
 
-    /// Every IPv6 route in the snapshot, in kernel order within each slot.
+    /// Every tracked IPv6 route, in kernel order within each slot (slots in no
+    /// particular order).
     pub fn routes_v6(&self) -> impl Iterator<Item = &KernelRouteV6> {
         self.v6.iter()
     }
@@ -468,6 +479,7 @@ mod tests {
                 tos: 0,
                 priority: metric,
             },
+            kind: RTN_UNICAST,
             protocol: 3, // RTPROT_BOOT, what `ip route add` uses
             scope: 0,
             prefsrc: None,
@@ -487,6 +499,7 @@ mod tests {
                 src: Ipv6Prefix::DEFAULT,
                 priority: metric,
             },
+            kind: RTN_UNICAST,
             protocol: 3,
             next_hop: NextHopV6::Path(NextHopPath {
                 gateway: None,
@@ -498,7 +511,8 @@ mod tests {
     fn snap_with_v4(entries: &[(&str, u8, u32)]) -> FibSnapshot {
         let mut snap = FibSnapshot::new();
         for &(network, prefix_len, metric) in entries {
-            snap.v4.insert_back(r4(network, prefix_len, metric));
+            snap.v4
+                .insert(r4(network, prefix_len, metric), Position::Back);
         }
         snap
     }
@@ -506,7 +520,8 @@ mod tests {
     fn snap_with_v6(entries: &[(&str, u8, u32)]) -> FibSnapshot {
         let mut snap = FibSnapshot::new();
         for &(network, prefix_len, metric) in entries {
-            snap.v6.insert_back(r6(network, prefix_len, metric));
+            snap.v6
+                .insert(r6(network, prefix_len, metric), Position::Back);
         }
         snap
     }
@@ -658,7 +673,7 @@ mod tests {
             .write()
             .unwrap()
             .v4
-            .insert_back(r4("10.0.0.0", 8, 42));
+            .insert(r4("10.0.0.0", 8, 42), Position::Back);
 
         assert!(oracle.is_v4_reachable("10.1.2.3".parse().unwrap()));
         assert_eq!(oracle.igp_metric_v4("10.1.2.3".parse().unwrap()), Some(42));
@@ -679,7 +694,7 @@ mod tests {
             .write()
             .unwrap()
             .v6
-            .insert_back(r6("2001:db8::", 32, 7));
+            .insert(r6("2001:db8::", 32, 7), Position::Back);
 
         assert!(oracle.is_v6_reachable("2001:db8::1".parse().unwrap()));
         assert_eq!(
@@ -740,7 +755,7 @@ mod tests {
         // Inject a route directly
         {
             let mut snap = fib.snapshot.write().unwrap();
-            snap.v4.insert_back(r4("10.0.0.0", 8, 10));
+            snap.v4.insert(r4("10.0.0.0", 8, 10), Position::Back);
         }
 
         // Oracle now sees the injected route
@@ -759,7 +774,7 @@ mod tests {
             .write()
             .unwrap()
             .v4
-            .insert_back(r4("192.168.1.0", 24, 20));
+            .insert(r4("192.168.1.0", 24, 20), Position::Back);
         let _ = fib.change_tx.send(());
 
         assert!(rx.has_changed().unwrap());

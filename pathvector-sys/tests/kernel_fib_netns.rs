@@ -29,10 +29,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use netlink_packet_core::{
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+};
 use netlink_packet_route::{
+    RouteNetlinkMessage,
     link::{LinkAttribute, LinkFlags},
-    route::RouteScope,
+    route::{RouteMessage, RouteProtocol, RouteScope},
 };
 use pathvector_sys::{FibSnapshot, KernelFib, RT_TABLE_MAIN};
 use rtnetlink::{Handle, LinkDummy, RouteMessageBuilder};
@@ -304,4 +308,184 @@ async fn initial_dump_keeps_both_priorities() {
     );
     drop(s);
     task.abort();
+}
+
+// ── PR #122 review: untracked routes sharing a slot or ECMP set ──────────────
+
+/// Sends `RTM_NEWROUTE` with exactly `flags` (rtnetlink's builder only offers
+/// EXCL or REPLACE) and panics if the kernel rejects it.
+async fn new_route_with_flags(handle: &Handle, route: RouteMessage, flags: u16) {
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(route));
+    req.header.flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+    let mut responses = handle.clone().request(req).expect("send RTM_NEWROUTE");
+    while let Some(msg) = responses.next().await {
+        if let NetlinkPayload::Error(e) = msg.payload {
+            assert!(e.code.is_none(), "kernel rejected RTM_NEWROUTE: {e:?}");
+        }
+    }
+}
+
+fn v6_via(dst: Ipv6Addr, gw: &str, oif: u32, protocol: RouteProtocol) -> RouteMessage {
+    RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(dst, 64)
+        .gateway(gw.parse().unwrap())
+        .output_interface(oif)
+        .priority(10)
+        .protocol(protocol)
+        .build()
+}
+
+fn v4_route(dst: Ipv4Addr, gw: Option<&str>, oif: u32, protocol: RouteProtocol) -> RouteMessage {
+    let mut b = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(dst, 24)
+        .output_interface(oif)
+        .priority(10)
+        .protocol(protocol);
+    b = match gw {
+        Some(gw) => b.gateway(gw.parse().unwrap()),
+        None => b.scope(RouteScope::Link),
+    };
+    b.build()
+}
+
+async fn del(handle: &Handle, route: RouteMessage) {
+    handle
+        .route()
+        .del(route)
+        .execute()
+        .await
+        .expect("delete route");
+}
+
+/// Adds a marker route and waits for it, so every earlier event has been
+/// applied (the kernel delivers notifications in order).
+async fn barrier_v4(handle: &Handle, snap: &Arc<RwLock<FibSnapshot>>, oif: u32, dst: Ipv4Addr) {
+    add_v4(handle, dst, 24, oif, 1).await;
+    eventually(snap, "marker route", |s| count_v4(s, dst) == 1).await;
+}
+
+async fn barrier_v6(handle: &Handle, snap: &Arc<RwLock<FibSnapshot>>, oif: u32, dst: Ipv6Addr) {
+    add_v6(handle, dst, 64, oif, 1).await;
+    eventually(snap, "marker route", |s| count_v6(s, dst) == 1).await;
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn mixed_protocol_ipv6_ecmp_leaves_nothing_after_both_deletes() {
+    // A static and a BGP route appended into one ECMP set. rt6_fill_node
+    // reports each with the other as an RTA_MULTIPATH leg under its own
+    // protocol, so the BGP leg must not be taken for static.
+    let handle = connect();
+    let oif = dummy(&handle, "pv56d").await;
+    let dump_dst: Ipv6Addr = "2001:db8:99::".parse().unwrap();
+    let live_dst: Ipv6Addr = "2001:db8:9a::".parse().unwrap();
+    let append = NLM_F_CREATE | NLM_F_APPEND;
+
+    // Present before the initial dump.
+    new_route_with_flags(
+        &handle,
+        v6_via(dump_dst, "fe80::1", oif, RouteProtocol::Static),
+        append,
+    )
+    .await;
+    new_route_with_flags(
+        &handle,
+        v6_via(dump_dst, "fe80::2", oif, RouteProtocol::Bgp),
+        append,
+    )
+    .await;
+    let (snap, task) = start_fib().await;
+    // And added while running.
+    new_route_with_flags(
+        &handle,
+        v6_via(live_dst, "fe80::1", oif, RouteProtocol::Static),
+        append,
+    )
+    .await;
+    new_route_with_flags(
+        &handle,
+        v6_via(live_dst, "fe80::2", oif, RouteProtocol::Bgp),
+        append,
+    )
+    .await;
+    barrier_v6(&handle, &snap, oif, "2001:db8:98::".parse().unwrap()).await;
+
+    for (dst, probe) in [(dump_dst, "2001:db8:99::1"), (live_dst, "2001:db8:9a::1")] {
+        let probe: Ipv6Addr = probe.parse().unwrap();
+        {
+            let s = snap.read().unwrap();
+            assert_eq!(count_v6(&s, dst), 1, "only the static sibling is tracked");
+            assert_eq!(s.igp_metric_v6(probe), Some(10));
+        }
+        del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Static)).await;
+        del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Bgp)).await;
+    }
+    barrier_v6(&handle, &snap, oif, "2001:db8:97::".parse().unwrap()).await;
+    let s = snap.read().unwrap();
+    assert_eq!(s.igp_metric_v6("2001:db8:99::1".parse().unwrap()), None);
+    assert_eq!(s.igp_metric_v6("2001:db8:9a::1".parse().unwrap()), None);
+    drop(s);
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn replacing_a_leading_bgp_alias_keeps_the_static_alias() {
+    // Slot order [BGP, static] (BGP prepended with NLM_F_CREATE only). An
+    // NLM_F_REPLACE of BGP replaces `fa_first`, the BGP alias.
+    let handle = connect();
+    let oif = dummy(&handle, "pv56e").await;
+    handle
+        .address()
+        .add(oif, "192.0.2.100".parse().unwrap(), 24)
+        .execute()
+        .await
+        .expect("address for the BGP gateways");
+    let dump_dst: Ipv4Addr = "198.18.1.0".parse().unwrap();
+    let live_dst: Ipv4Addr = "198.18.3.0".parse().unwrap();
+
+    let setup = |dst| {
+        let handle = handle.clone();
+        async move {
+            add_static_then_prepend_bgp(&handle, dst, oif).await;
+        }
+    };
+    setup(dump_dst).await;
+    let (snap, task) = start_fib().await;
+    setup(live_dst).await;
+    barrier_v4(&handle, &snap, oif, "198.18.2.0".parse().unwrap()).await;
+
+    for dst in [dump_dst, live_dst] {
+        let replacement = v4_route(dst, Some("192.0.2.2"), oif, RouteProtocol::Bgp);
+        handle
+            .route()
+            .add(replacement)
+            .replace()
+            .execute()
+            .await
+            .expect("replace the BGP alias");
+    }
+    barrier_v4(&handle, &snap, oif, "198.18.4.0".parse().unwrap()).await;
+
+    // The kernel still has both aliases; the static one must still count.
+    let s = snap.read().unwrap();
+    assert_eq!(s.igp_metric_v4("198.18.1.7".parse().unwrap()), Some(10));
+    assert_eq!(s.igp_metric_v4("198.18.3.7".parse().unwrap()), Some(10));
+    drop(s);
+    task.abort();
+}
+
+async fn add_static_then_prepend_bgp(handle: &Handle, dst: Ipv4Addr, oif: u32) {
+    handle
+        .route()
+        .add(v4_route(dst, None, oif, RouteProtocol::Static))
+        .execute()
+        .await
+        .expect("static alias");
+    new_route_with_flags(
+        handle,
+        v4_route(dst, Some("192.0.2.1"), oif, RouteProtocol::Bgp),
+        NLM_F_CREATE,
+    )
+    .await;
 }
