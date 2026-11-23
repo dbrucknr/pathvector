@@ -312,13 +312,18 @@ The FSM restart behavior is deferred.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| `TCP_MD5SIG` socket option on outbound socket before `connect()` | `transport/mod.rs` `tcp_connect` | ✅ | — |
-| `TCP_MD5SIG` socket option on BGP listener socket per configured peer | `daemon.rs` `run_bgp_listener` | ✅ | — |
-| `md5_password` TOML field wired into `SessionConfig` and propagated | `config.rs`, `daemon.rs` | ✅ | `test_md5_password_explicit` |
+| `TCP_MD5SIG` key installed on outbound socket before `connect()` | `transport/mod.rs` `tcp_connect` | ✅ | `key_is_installed_before_connecting` |
+| Key that cannot be enforced, with `Md5Enforcement::Required` (default): no connection attempt, `ErrorKind::Unsupported` (RFC 5925 §8: required MD5 "must be added to all outgoing segments and validated on all incoming segments"; issue #58) | `transport/tcp_md5.rs` `protect_socket` | ✅ | `required_key_that_cannot_be_enforced_is_an_error`, `required_but_unenforceable_never_connects` |
+| `Md5Enforcement::BestEffort` is an explicit opt-in; connects unauthenticated, logs a warning, returns `Md5Protection::Unenforced(reason)` | `transport/tcp_md5.rs` | ✅ | `best_effort_reports_unenforced_with_reason`, `best_effort_connects_when_unenforceable` |
+| `BestEffort` does not hide real `setsockopt` failures | `transport/tcp_md5.rs` | ✅ | `best_effort_does_not_hide_os_errors` |
+| `TCP_MD5SIG` key on BGP listener socket per configured peer | `pathvectord` `run_bgp_listener` | ❌ | Not applied yet — issue #66 |
+| `md5_password` TOML field validated (1–80 bytes) and wired into `SessionConfig::tcp_md5` | `pathvectord` `config.rs`, `daemon/` | ✅ | `test_md5_password_empty_is_rejected`, `test_md5_password_over_80_bytes_is_rejected`, `build_daemon_md5_password_reaches_session_config` |
 
-**Platform note:** Linux only. `apply_tcp_md5sig` is a no-op with a `warn!` log on
-non-Linux platforms (macOS dev environment). Key rotation and per-AFI MD5 for IPv6
-peers are not yet supported.
+**Platform note:** keys are only enforced on Linux kernels built with
+`CONFIG_TCP_MD5SIG`, for IPv4 peers. Elsewhere `pathvector-sys` reports
+`TcpMd5Error::Unsupported` and the session applies its `Md5Enforcement` policy.
+The kernel-level proof (matching keys connect; unsigned and wrong-key SYNs are
+dropped) is `pathvector-sys/tests/tcp_md5_loopback.rs`.
 
 ---
 

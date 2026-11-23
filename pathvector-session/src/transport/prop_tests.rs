@@ -16,7 +16,7 @@ fn arb_config() -> impl Strategy<Value = SessionConfig> {
             confederation_member: false,
             public_as: local_as,
             peer_addr: "127.0.0.1:0".parse().unwrap(),
-            md5_password: None,
+            tcp_md5: None,
             connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
         },
     )
@@ -59,7 +59,7 @@ proptest! {
                 confederation_member: false,
                 public_as: local_as,
                 peer_addr: "127.0.0.1:0".parse().unwrap(),
-                md5_password: None,
+                tcp_md5: None,
                 connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
             });
             handle.start().await;

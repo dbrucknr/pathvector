@@ -21,6 +21,37 @@ pub(super) struct SpawnConfig {
     /// Member-AS. Threaded into [`SessionConfig::confederation_member`]
     /// resolution at each session spawn via `effective_confederation_member`.
     pub(super) confederation_id: Option<u32>,
+    /// `[daemon] tcp_md5_enforcement`, applied to every dynamically added
+    /// peer that has an `md5_password`.
+    pub(super) md5_enforcement: Md5Enforcement,
+}
+
+/// Map of peer address to its TCP MD5 settings, shared with the BGP listener.
+pub(super) type Md5Keys = Arc<RwLock<HashMap<IpAddr, TcpMd5Auth>>>;
+
+/// The session's TCP MD5 settings for `peer`, or `None` if it has no
+/// `md5_password`.
+pub(super) fn session_tcp_md5(
+    peer: &config::PeerConfig,
+    enforcement: Md5Enforcement,
+) -> Option<TcpMd5Auth> {
+    peer.md5_password
+        .as_ref()
+        .map(|p| TcpMd5Auth::new(p.key().clone(), enforcement))
+}
+
+/// Logs one warning at startup per peer whose MD5 key may go unenforced.
+pub(super) fn warn_if_md5_best_effort(enforcement: Md5Enforcement, peers: &[config::PeerConfig]) {
+    if enforcement != Md5Enforcement::BestEffort {
+        return;
+    }
+    for peer in peers.iter().filter(|p| p.md5_password.is_some()) {
+        tracing::warn!(
+            peer = %peer.address,
+            "tcp_md5_enforcement = \"best-effort\": if this host cannot enforce TCP MD5, \
+             the session will connect WITHOUT authentication"
+        );
+    }
 }
 
 impl SpawnConfig {

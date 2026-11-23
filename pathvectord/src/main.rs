@@ -28,7 +28,12 @@ async fn main() {
     });
 
     let mut cfg: config::Config = toml::from_str(&text).unwrap_or_else(|e| {
-        eprintln!("failed to parse config: {e}");
+        // Not `{e}`: toml's Display quotes the source line, which can hold
+        // an md5_password.
+        eprintln!(
+            "failed to parse config {path}: {}",
+            config::describe_toml_error(&e, Some(&text))
+        );
         std::process::exit(1);
     });
 

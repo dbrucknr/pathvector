@@ -2315,6 +2315,7 @@ What remains as optional future work:
   side is not a mismatch); implemented behavior matches the non-strict default.
   Add if an operator needs to enforce Role negotiation as a hard requirement.
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
+- Metric for unauthenticated MD5 connects — under `tcp_md5_enforcement = "best-effort"` an unenforced connect is logged (`warn!`) and returned as `Md5Protection::Unenforced`, but not counted; a `pathvectord_bgp_tcp_md5_unenforced_total{peer,reason}` counter would make it alertable (issue #58 follow-up)
 
 RFC 8538 (2026-06-24), RFC 4724 Phase 1+2 (2026-06-22), RFC 7313 (2026-06-18), RFC 9003
 (2026-06-18), per-peer hold timer (2026-06-18), outbound ROUTE-REFRESH trigger

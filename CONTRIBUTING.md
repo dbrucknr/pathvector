@@ -133,8 +133,8 @@ compiles and any lint violations become CI failures.
 ### When this bites you
 
 Any time you touch:
-- `pathvector-sys/src/tcp.rs` — the `apply_linux` function and its Linux-only tests
-- `pathvectord/src/daemon.rs` — the BGP listener MD5 key installation block
+- `pathvector-sys/src/tcp/linux.rs` and `pathvector-sys/tests/tcp_md5_loopback.rs` — the Linux `TCP_MD5SIG` adapter and its live tests
+- `pathvector-sys/src/fib/linux.rs` — the netlink FIB backend
 - Any new `#[cfg(target_os = "linux")]` code you add
 
 ### How to catch it before pushing
@@ -168,7 +168,7 @@ These are the ones that have bitten us. All are in pedantic and invisible on mac
 
 | Lint | Trigger | Fix |
 |---|---|---|
-| `doc_markdown` | Function name in doc comment without backticks | `` `apply_tcp_md5sig` `` not `apply_tcp_md5sig` |
+| `doc_markdown` | Function name in doc comment without backticks | `` `install_tcp_md5_key` `` not `install_tcp_md5_key` |
 | `struct_field_names` | All fields share a common prefix (e.g. `tcpm_`) | `#[allow(clippy::struct_field_names)]` with a comment explaining why (kernel ABI) |
 | `cast_possible_truncation` | `i32 as u16`, `usize as u8`, `usize as u32` in FFI | `#[allow(...)]` with a comment proving the value fits, or `try_from().expect()` |
 | `unnested_or_patterns` | `Some(A) \| Some(B)` in `matches!` | `Some(A \| B)` |
