@@ -10,12 +10,31 @@ use crate::{
 
 /// Describes how the best path for a prefix changed after a `LocRib` mutation.
 ///
-/// Returned by [`LocRib::insert`], [`LocRib::withdraw`], and
-/// [`LocRib::withdraw_peer`] so callers can react without re-querying the RIB.
+/// Returned by [`LocRib::insert`], [`LocRib::withdraw`],
+/// [`LocRib::withdraw_peer`], and [`LocRib::recompute_all`] so callers can
+/// react without re-querying the RIB.
 ///
 /// The common consumer is a `FibManager` that installs or removes kernel
 /// routes on best-path changes, and the outbound advertisement pipeline that
 /// sends UPDATE messages to peers.
+///
+/// # Delta contract
+///
+/// The values are a *complete and minimal delta* of the Loc-RIB's best-path
+/// table: a consumer that starts from an empty map and applies every change
+/// it is handed (`Announced` → insert, `Withdrawn` → remove) always holds
+/// exactly [`LocRib::best_routes`].
+///
+/// - **Complete** — every prefix that had a selected route before a mutation
+///   and has none after it yields `Withdrawn`, *whatever* the mutation was:
+///   an explicit withdrawal, a replacement route whose `NEXT_HOP` is
+///   unresolvable (RFC 4271 §9 implicit withdrawal + §9.1.2 "Unresolvable
+///   routes SHALL be removed from the Loc-RIB and the routing table"), a
+///   session going down, or a reachability change.
+/// - **Minimal** — `Withdrawn` is never emitted for a prefix that had no
+///   selected route before the mutation (e.g. one whose candidates were all
+///   unresolvable), so a FIB writer never deletes a route BGP did not
+///   install.
 // `Announced` carries a full `Route<A>` so the FibManager can act on it
 // immediately without a second RIB lookup. `Route<A>` is large (~207 bytes),
 // but these values are consumed immediately at each call site — they are never
@@ -29,16 +48,62 @@ pub enum BestPathChange<A: IpAddress> {
     /// The caller should install/update the route in the FIB and advertise
     /// it to eligible peers.
     Announced(Nlri<A>, Route<A>),
-    /// The best path was removed and no candidates remain for this prefix.
+    /// The prefix had a selected best path and now has none: every remaining
+    /// candidate (if any) is infeasible, or no candidates remain.
     ///
-    /// The caller should withdraw the route from the FIB and send a BGP
-    /// WITHDRAW to all peers that were receiving it.
+    /// RFC 4271 §9.2: "all newly unfeasible routes for which there is no
+    /// replacement route SHALL be advertised to its peers by means of an
+    /// UPDATE message." The caller should withdraw the route from the FIB and
+    /// send a BGP WITHDRAW to all peers that were receiving it.
     Withdrawn(Nlri<A>),
-    /// The best path is unchanged — the insert or withdraw touched a
-    /// non-winning candidate.
+    /// The best path is unchanged — the mutation touched a non-winning
+    /// candidate, or the prefix had no feasible route before or after it.
     ///
     /// No FIB update or BGP advertisement is required.
     Unchanged,
+}
+
+/// How the selected peer for one prefix moved across a single Loc-RIB
+/// mutation.
+///
+/// Built only by [`BestTransition::between`], which matches exhaustively on
+/// `(previous, next)`. Every mutating `LocRib` method derives its
+/// [`BestPathChange`] through this type, so no code path can forget the
+/// `Some → None` (withdraw) case or invent a `None → None` withdrawal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BestTransition {
+    /// No feasible route before or after: nothing was installed or
+    /// advertised, so nothing needs withdrawing.
+    NeverSelected,
+    /// The same peer's unmodified route is still selected.
+    Kept,
+    /// A selected route existed and none does now (RFC 4271 §9.2 "newly
+    /// unfeasible routes for which there is no replacement route").
+    Lost,
+    /// `PeerId`'s route is now selected and differs from what was selected
+    /// before — a new winner, or the same winner with replaced attributes.
+    Selected(PeerId),
+}
+
+impl BestTransition {
+    /// Classifies the move from `previous` to `next` selected peer.
+    ///
+    /// `replaced` is the peer whose candidate route was overwritten by this
+    /// mutation, if any. When it is also the (unchanged) winner, its route
+    /// content changed (RFC 4271 §3.1: "Changing the attribute(s) of a route
+    /// is accomplished by advertising a replacement route"), so the
+    /// transition is `Selected`, not `Kept`.
+    fn between(previous: Option<PeerId>, next: Option<PeerId>, replaced: Option<PeerId>) -> Self {
+        match (previous, next) {
+            (None, None) => Self::NeverSelected,
+            (Some(_), None) => Self::Lost,
+            (None, Some(winner)) => Self::Selected(winner),
+            (Some(before), Some(winner)) if before != winner || replaced == Some(winner) => {
+                Self::Selected(winner)
+            }
+            (Some(_), Some(_)) => Self::Kept,
+        }
+    }
 }
 
 /// The local routing table — best-path selected, post-import-policy.
@@ -152,12 +217,27 @@ impl<A: IpAddress> LocRib<A> {
     /// Inserts a route from `peer` into the candidate set and recomputes the
     /// best route for that prefix.
     ///
-    /// If this peer previously had a route for this prefix, it is replaced.
-    /// Best-path selection runs after every insert, so `best()` always
-    /// reflects the current winner.
+    /// If this peer previously had a route for this prefix, it is replaced —
+    /// RFC 4271 §9: the new route "SHALL replace the older route [...] thus
+    /// implicitly withdrawing the older route from service." Best-path
+    /// selection runs after every insert, so `best()` always reflects the
+    /// current winner.
     ///
-    /// Returns a [`BestPathChange`] describing whether and how the best path
-    /// changed as a result of this insert.
+    /// A route whose `NEXT_HOP` `oracle` reports unresolvable is still stored as
+    /// a candidate (RFC 4271 §9.1.2: such routes "SHOULD be kept in the
+    /// Adj-RIBs-In (in case they become resolvable)") but is excluded from
+    /// selection.
+    ///
+    /// # Returns
+    ///
+    /// - [`BestPathChange::Announced`] when the inserted route, or another
+    ///   candidate, becomes the new best, or when the current winner's route
+    ///   was replaced.
+    /// - [`BestPathChange::Withdrawn`] when the prefix had a best route and
+    ///   the replacement left it with no feasible candidate — e.g. the sole
+    ///   selected route is replaced by one whose `NEXT_HOP` is unresolvable.
+    /// - [`BestPathChange::Unchanged`] otherwise, including when the prefix
+    ///   had no feasible route before the insert and still has none.
     pub fn insert(
         &mut self,
         peer: PeerId,
@@ -165,9 +245,7 @@ impl<A: IpAddress> LocRib<A> {
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
         let nlri = route.nlri;
-
-        // Snapshot old best peer before mutation so we can detect Unchanged.
-        let old_best_peer = self.best.get(nlri.prefix()).copied();
+        let previous = self.best.get(nlri.prefix()).copied();
 
         self.candidates.insert((nlri, peer), route);
         let peers = self.peer_index.entry(nlri).or_default();
@@ -176,44 +254,30 @@ impl<A: IpAddress> LocRib<A> {
         }
         self.recompute_best(nlri, oracle);
 
-        match self.best.get(nlri.prefix()).copied() {
-            None => BestPathChange::Unchanged,
-            Some(new_peer) => {
-                let new_route = &self.candidates[&(nlri, new_peer)];
-                match old_best_peer {
-                    Some(old_peer) if old_peer == new_peer => {
-                        // Same winning peer — unchanged unless its route content changed.
-                        // We only need to check content when the inserting peer is the
-                        // current winner (otherwise its route didn't change this round).
-                        if peer == new_peer {
-                            // The winning peer just updated its route; we don't have the
-                            // old content anymore so conservatively signal Announced.
-                            BestPathChange::Announced(nlri, new_route.clone())
-                        } else {
-                            BestPathChange::Unchanged
-                        }
-                    }
-                    _ => BestPathChange::Announced(nlri, new_route.clone()),
-                }
-            }
-        }
+        let next = self.best.get(nlri.prefix()).copied();
+        self.change_for(nlri, BestTransition::between(previous, next, Some(peer)))
     }
 
     /// Removes a specific prefix from a peer's contribution and recomputes
     /// best-path selection for that prefix.
     ///
-    /// Called when a peer withdraws a specific route. If no candidates remain
-    /// for the prefix, the prefix is removed from the `LocRib` entirely.
+    /// Called when a peer withdraws a specific route (WITHDRAWN ROUTES,
+    /// `MP_UNREACH_NLRI`, or RFC 7606 "treat-as-withdraw"). If no candidates
+    /// remain for the prefix, the prefix is removed from the `LocRib`
+    /// entirely.
     ///
     /// Returns a [`BestPathChange`] describing whether and how the best path
-    /// changed as a result of this withdrawal.
+    /// changed as a result of this withdrawal: `Withdrawn` exactly when the
+    /// prefix had a best route and no feasible candidate remains, `Announced`
+    /// when another candidate takes over, `Unchanged` otherwise (including
+    /// when `peer` had no route for `nlri`).
     pub fn withdraw(
         &mut self,
         peer: &PeerId,
         nlri: &Nlri<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
-        let had_best = self.best.get(nlri.prefix()).is_some();
+        let previous = self.best.get(nlri.prefix()).copied();
 
         if self.candidates.remove(&(*nlri, *peer)).is_none() {
             return BestPathChange::Unchanged;
@@ -225,30 +289,17 @@ impl<A: IpAddress> LocRib<A> {
         } else {
             false
         };
-        if !has_remaining {
+        if has_remaining {
+            self.recompute_best(*nlri, oracle);
+        } else {
             self.peer_index.remove(nlri);
             self.best.remove(nlri.prefix());
-            return if had_best {
-                BestPathChange::Withdrawn(*nlri)
-            } else {
-                BestPathChange::Unchanged
-            };
         }
 
-        let old_best_peer = self.best.get(nlri.prefix()).copied();
-        self.recompute_best(*nlri, oracle);
-
-        match self.best.get(nlri.prefix()).copied() {
-            None => BestPathChange::Withdrawn(*nlri),
-            Some(new_peer) => {
-                if old_best_peer == Some(new_peer) && old_best_peer != Some(*peer) {
-                    // Same winner and it wasn't the peer we just withdrew — no change.
-                    BestPathChange::Unchanged
-                } else {
-                    BestPathChange::Announced(*nlri, self.candidates[&(*nlri, new_peer)].clone())
-                }
-            }
-        }
+        // `peer`'s candidate is gone, so it cannot be the next winner: no
+        // route was replaced in place.
+        let next = self.best.get(nlri.prefix()).copied();
+        self.change_for(*nlri, BestTransition::between(previous, next, None))
     }
 
     /// Removes all routes contributed by `peer` and recomputes best-path
@@ -354,20 +405,30 @@ impl<A: IpAddress> LocRib<A> {
         nlris
             .into_iter()
             .filter_map(|nlri| {
-                let old_peer = self.best.get(nlri.prefix()).copied();
+                let previous = self.best.get(nlri.prefix()).copied();
                 self.recompute_best(nlri, oracle);
-                let new_peer = self.best.get(nlri.prefix()).copied();
-                match (old_peer, new_peer) {
-                    (None, None) => None,
-                    (Some(_), None) => Some(BestPathChange::Withdrawn(nlri)),
-                    (Some(op), Some(np)) if op == np => None,
-                    (_, Some(np)) => Some(BestPathChange::Announced(
-                        nlri,
-                        self.candidates[&(nlri, np)].clone(),
-                    )),
+                let next = self.best.get(nlri.prefix()).copied();
+                match self.change_for(nlri, BestTransition::between(previous, next, None)) {
+                    BestPathChange::Unchanged => None,
+                    change => Some(change),
                 }
             })
             .collect()
+    }
+
+    /// Maps a [`BestTransition`] for `nlri` to the public [`BestPathChange`].
+    ///
+    /// The only place a `Route` is cloned for a change, and only for
+    /// `Selected` — the same single clone the insert/withdraw paths have
+    /// always paid for an announcement.
+    fn change_for(&self, nlri: Nlri<A>, transition: BestTransition) -> BestPathChange<A> {
+        match transition {
+            BestTransition::NeverSelected | BestTransition::Kept => BestPathChange::Unchanged,
+            BestTransition::Lost => BestPathChange::Withdrawn(nlri),
+            BestTransition::Selected(winner) => {
+                BestPathChange::Announced(nlri, self.candidates[&(nlri, winner)].clone())
+            }
+        }
     }
 
     fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
@@ -920,5 +981,399 @@ mod tests {
             "best-path change expected when winner's next-hop goes down and runner-up is reachable"
         );
         assert_eq!(rib.best_peer(&nlri("10.0.0.0/8")), Some(peer(2)));
+    }
+
+    // ── Issue #67: an UPDATE that removes the last feasible path ─────────────
+    //
+    // RFC 4271 §9 (UPDATE Message Handling): "if the NLRI of the new route is
+    // identical to the one the route currently has stored in the Adj-RIB-In,
+    // then the new route SHALL replace the older route in the Adj-RIB-In, thus
+    // implicitly withdrawing the older route from service."
+    //
+    // RFC 4271 §9.1.2: "If the NEXT_HOP attribute of a BGP route depicts an
+    // address that is not resolvable [...] the BGP route MUST be excluded from
+    // the Phase 2 decision function." and "Unresolvable routes SHALL be removed
+    // from the Loc-RIB and the routing table.  However, corresponding
+    // unresolvable routes SHOULD be kept in the Adj-RIBs-In (in case they
+    // become resolvable)."
+    //
+    // RFC 4271 §9.2: "All newly installed routes and all newly unfeasible
+    // routes for which there is no replacement route SHALL be advertised to
+    // its peers by means of an UPDATE message."
+    //
+    // So a replacement whose NEXT_HOP is unresolvable, arriving when it (or
+    // every remaining candidate) is the last feasible route, must surface as
+    // `Withdrawn` — exactly as an explicit WITHDRAWN ROUTES entry would. Every
+    // oracle below is fixed for the whole test: the transition is caused by
+    // the UPDATE, never by a change in reachability.
+
+    /// Oracle with a fixed verdict per next-hop: everything is resolvable
+    /// except the addresses in `unresolvable`.
+    struct FixedOracle(Vec<NextHop>);
+
+    impl FixedOracle {
+        fn rejecting(unresolvable: &[&str]) -> Self {
+            Self(
+                unresolvable
+                    .iter()
+                    .map(|a| match a.parse::<IpAddr>().unwrap() {
+                        IpAddr::V4(v4) => NextHop::V4(v4),
+                        IpAddr::V6(v6) => NextHop::V6(v6),
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl NextHopOracle for FixedOracle {
+        fn is_reachable(&self, nh: &NextHop) -> bool {
+            !self.0.contains(nh)
+        }
+
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+            None
+        }
+    }
+
+    const UNRESOLVABLE_V4: &str = "198.51.100.99";
+    const UNRESOLVABLE_V6: &str = "2001:db8:ffff::99";
+
+    fn route_lp_nh(prefix: &str, lp: u32, nh: &str) -> Route<Ipv4Addr> {
+        RouteBuilder::new(nlri(prefix), Origin::Igp, AsPath::new())
+            .local_pref(LocalPref::new(lp))
+            .next_hop(NextHop::V4(nh.parse().unwrap()))
+            .build()
+    }
+
+    /// RFC 4271 §9 + §9.1.2 + §9.2: replacing the sole selected route with one
+    /// whose `NEXT_HOP` is unresolvable is an implicit withdrawal of the only
+    /// feasible route, so the change must be `Withdrawn` and no best remains.
+    #[test]
+    fn test_insert_replacing_sole_best_with_unresolvable_next_hop_is_withdrawn() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        let first = rib.insert(peer(1), route_with_nh("10.0.0.0/8", "192.0.2.1"), &oracle);
+        assert!(matches!(first, BestPathChange::Announced(p, _) if p == n));
+
+        let change = rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+
+        assert_eq!(change, BestPathChange::Withdrawn(n));
+        assert!(rib.best(&n).is_none());
+        assert_eq!(rib.best_peer(&n), None);
+        assert_eq!(rib.best_routes().count(), 0);
+        assert!(rib.longest_match("10.1.2.3".parse().unwrap()).is_none());
+    }
+
+    /// RFC 4271 §9.1.2: "corresponding unresolvable routes SHOULD be kept in
+    /// the Adj-RIBs-In (in case they become resolvable)". The withdrawn
+    /// replacement must stay a candidate so a later reachability change can
+    /// re-select it.
+    #[test]
+    fn test_insert_unresolvable_replacement_is_kept_as_candidate() {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+        let rejecting = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+
+        rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", "192.0.2.1"),
+            &rejecting,
+        );
+        rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &rejecting,
+        );
+        assert!(rib.best(&n).is_none());
+        assert_eq!(rib.candidates(&n).map(|c| c.len()), Some(1));
+
+        let changes = rib.recompute_all(&AlwaysReachable);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            &changes[0],
+            BestPathChange::Announced(p, r)
+                if *p == n && r.next_hop == Some(NextHop::V4(UNRESOLVABLE_V4.parse().unwrap()))
+        ));
+    }
+
+    /// RFC 4271 §9.1.2 / §9.2, both address families: the same transition on
+    /// an IPv6 Loc-RIB must also yield `Withdrawn`.
+    #[test]
+    fn test_insert_replacing_sole_best_with_unresolvable_next_hop_is_withdrawn_v6() {
+        use std::net::Ipv6Addr;
+
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V6]);
+        let mut rib: LocRib<Ipv6Addr> = LocRib::new();
+        let n: Nlri<Ipv6Addr> = "2001:db8:1::/48".parse().unwrap();
+        let v6_route = |nh: &str| {
+            RouteBuilder::new(n, Origin::Igp, AsPath::new())
+                .next_hop(NextHop::V6(nh.parse().unwrap()))
+                .build()
+        };
+
+        let first = rib.insert(peer(1), v6_route("2001:db8::1"), &oracle);
+        assert!(matches!(first, BestPathChange::Announced(p, _) if p == n));
+
+        let change = rib.insert(peer(1), v6_route(UNRESOLVABLE_V6), &oracle);
+
+        assert_eq!(change, BestPathChange::Withdrawn(n));
+        assert!(rib.best(&n).is_none());
+        assert_eq!(rib.best_routes().count(), 0);
+    }
+
+    /// RFC 4271 §9.2 "newly unfeasible routes for which there is no
+    /// replacement route": with several candidates, a prefix is withdrawn
+    /// only when the replacement removes the *last* feasible one. Here the
+    /// runner-up is already unresolvable, so replacing the winner leaves no
+    /// feasible route.
+    #[test]
+    fn test_insert_last_feasible_of_several_candidates_is_withdrawn() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(
+            peer(1),
+            route_lp_nh("10.0.0.0/8", 200, "192.0.2.1"),
+            &oracle,
+        );
+        // Infeasible from the start: never selected, nothing to announce.
+        let infeasible = rib.insert(
+            peer(2),
+            route_lp_nh("10.0.0.0/8", 300, UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert_eq!(infeasible, BestPathChange::Unchanged);
+        assert_eq!(rib.best_peer(&n), Some(peer(1)));
+
+        let change = rib.insert(
+            peer(1),
+            route_lp_nh("10.0.0.0/8", 200, UNRESOLVABLE_V4),
+            &oracle,
+        );
+
+        assert_eq!(change, BestPathChange::Withdrawn(n));
+        assert!(rib.best(&n).is_none());
+        assert_eq!(rib.candidates(&n).map(|c| c.len()), Some(2));
+    }
+
+    /// Same as above, but every candidate starts feasible and is replaced by
+    /// an infeasible route one UPDATE at a time: the losing candidate going
+    /// infeasible is `Unchanged`; the winner going infeasible afterwards is
+    /// `Withdrawn`.
+    #[test]
+    fn test_insert_all_candidates_become_infeasible_one_by_one() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(
+            peer(1),
+            route_lp_nh("10.0.0.0/8", 200, "192.0.2.1"),
+            &oracle,
+        );
+        rib.insert(
+            peer(2),
+            route_lp_nh("10.0.0.0/8", 100, "192.0.2.2"),
+            &oracle,
+        );
+        assert_eq!(rib.best_peer(&n), Some(peer(1)));
+
+        let loser = rib.insert(
+            peer(2),
+            route_lp_nh("10.0.0.0/8", 100, UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert_eq!(loser, BestPathChange::Unchanged);
+        assert_eq!(rib.best_peer(&n), Some(peer(1)));
+
+        let winner = rib.insert(
+            peer(1),
+            route_lp_nh("10.0.0.0/8", 200, UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert_eq!(winner, BestPathChange::Withdrawn(n));
+        assert!(rib.best(&n).is_none());
+    }
+
+    /// RFC 4271 §9.1.2: "install that route in the Loc-RIB, replacing any
+    /// route to the same destination". When the winner's replacement is
+    /// unresolvable but a feasible alternative exists, the alternative is
+    /// selected and must be announced — not withdrawn.
+    #[test]
+    fn test_insert_unresolvable_replacement_promotes_feasible_alternative() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(
+            peer(1),
+            route_lp_nh("10.0.0.0/8", 200, "192.0.2.1"),
+            &oracle,
+        );
+        let runner_up = route_lp_nh("10.0.0.0/8", 100, "192.0.2.2");
+        rib.insert(peer(2), runner_up.clone(), &oracle);
+
+        let change = rib.insert(
+            peer(1),
+            route_lp_nh("10.0.0.0/8", 200, UNRESOLVABLE_V4),
+            &oracle,
+        );
+
+        assert_eq!(change, BestPathChange::Announced(n, runner_up));
+        assert_eq!(rib.best_peer(&n), Some(peer(2)));
+    }
+
+    /// A winner's replacement that stays resolvable carries changed attributes
+    /// (RFC 4271 §3.1: "Changing the attribute(s) of a route is accomplished
+    /// by advertising a replacement route"), so it must be re-announced with
+    /// the new content.
+    #[test]
+    fn test_insert_feasible_replacement_of_winner_is_announced_with_new_content() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(peer(1), route_with_nh("10.0.0.0/8", "192.0.2.1"), &oracle);
+        let replacement = route_with_nh("10.0.0.0/8", "192.0.2.7");
+
+        let change = rib.insert(peer(1), replacement.clone(), &oracle);
+
+        assert_eq!(change, BestPathChange::Announced(n, replacement));
+    }
+
+    /// An infeasible route for a prefix that has never had a feasible best
+    /// route must not emit a spurious `Withdrawn` — nothing was ever installed
+    /// or advertised, so §9.2 has nothing to withdraw.
+    #[test]
+    fn test_insert_infeasible_into_prefix_without_best_is_unchanged() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        let first = rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert_eq!(first, BestPathChange::Unchanged);
+        let replaced = rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert_eq!(replaced, BestPathChange::Unchanged);
+        let second_peer = rib.insert(
+            peer(2),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert_eq!(second_peer, BestPathChange::Unchanged);
+        assert!(rib.best(&n).is_none());
+    }
+
+    /// RFC 7606 §2 "treat-as-withdraw" removes routes "just as if they had
+    /// been listed in the WITHDRAWN ROUTES field", i.e. via `withdraw`. An
+    /// explicit withdrawal of the only *feasible* candidate, leaving only an
+    /// infeasible one, must also report `Withdrawn`.
+    #[test]
+    fn test_withdraw_last_feasible_leaving_infeasible_candidate_is_withdrawn() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(peer(1), route_with_nh("10.0.0.0/8", "192.0.2.1"), &oracle);
+        rib.insert(
+            peer(2),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+
+        assert_eq!(
+            rib.withdraw(&peer(1), &n, &oracle),
+            BestPathChange::Withdrawn(n)
+        );
+        assert!(rib.best(&n).is_none());
+        // Withdrawing the remaining infeasible candidate is not a second withdrawal.
+        assert_eq!(
+            rib.withdraw(&peer(2), &n, &oracle),
+            BestPathChange::Unchanged
+        );
+        assert!(rib.is_empty());
+    }
+
+    /// Mirror image of issue #67, found by the replay property test: removing
+    /// one of several candidates that are *all* infeasible leaves the prefix
+    /// without a best route, but there was none before either. Emitting
+    /// `Withdrawn` here would make the FIB writer delete a kernel route BGP
+    /// never installed (possibly a static or connected route for the same
+    /// prefix). RFC 4271 §9.2 only requires withdrawing "newly unfeasible
+    /// routes", so the change must be `Unchanged`.
+    #[test]
+    fn test_withdraw_infeasible_candidate_when_no_best_is_unchanged() {
+        let oracle = FixedOracle::rejecting(&[UNRESOLVABLE_V4]);
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let n = nlri("10.0.0.0/8");
+
+        rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+        rib.insert(
+            peer(2),
+            route_with_nh("10.0.0.0/8", UNRESOLVABLE_V4),
+            &oracle,
+        );
+        assert!(rib.best(&n).is_none());
+
+        assert_eq!(
+            rib.withdraw(&peer(1), &n, &oracle),
+            BestPathChange::Unchanged
+        );
+        assert_eq!(
+            rib.withdraw_peer(&peer(2), &oracle),
+            vec![BestPathChange::Unchanged]
+        );
+        assert!(rib.is_empty());
+    }
+
+    /// Exhaustive truth table for [`BestTransition::between`], derived from
+    /// RFC 4271 §9.1.2 (install the selected route, "replacing any route to
+    /// the same destination") and §9.2 ("newly unfeasible routes for which
+    /// there is no replacement route SHALL be advertised").
+    #[test]
+    fn test_best_transition_truth_table() {
+        let (a, b) = (peer(1), peer(2));
+        let cases = [
+            // previous, next, replaced => expected
+            (None, None, None, BestTransition::NeverSelected),
+            (None, None, Some(a), BestTransition::NeverSelected),
+            (Some(a), None, None, BestTransition::Lost),
+            (Some(a), None, Some(a), BestTransition::Lost),
+            (Some(a), None, Some(b), BestTransition::Lost),
+            (None, Some(a), None, BestTransition::Selected(a)),
+            (None, Some(a), Some(a), BestTransition::Selected(a)),
+            (None, Some(a), Some(b), BestTransition::Selected(a)),
+            (Some(a), Some(b), None, BestTransition::Selected(b)),
+            (Some(a), Some(b), Some(a), BestTransition::Selected(b)),
+            (Some(a), Some(b), Some(b), BestTransition::Selected(b)),
+            (Some(a), Some(a), Some(a), BestTransition::Selected(a)),
+            (Some(a), Some(a), None, BestTransition::Kept),
+            (Some(a), Some(a), Some(b), BestTransition::Kept),
+        ];
+        for (previous, next, replaced, expected) in cases {
+            assert_eq!(
+                BestTransition::between(previous, next, replaced),
+                expected,
+                "between({previous:?}, {next:?}, {replaced:?})"
+            );
+        }
     }
 }
