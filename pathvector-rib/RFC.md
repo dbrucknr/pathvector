@@ -93,12 +93,34 @@ bypasses iBGP split-horizon so the daemon's propagation loop can implement corre
 
 ---
 
-## RFC 4724 — Graceful Restart: Stale Route Timer (Deferred)
+## RFC 4724 — Graceful Restart: stale routes in the RIB
 
-**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724 (§4.2 as amended by RFC 8538 §4.1)  
+**Boundary:** this crate owns the stale *marking* and its effect (none) on selection; when a
+stale route is removed (replacement, End-of-RIB, Restart Time / stale timer) is decided by
+`pathvectord` — see its RFC 4724 table.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
+| §4.2 MUST: mark retained routes "as stale routing information" | `src/route.rs` (`Staleness`), `src/adj_rib_in.rs` (`mark_all_stale`) | ✅ | `adj_rib_in::tests::test_mark_all_stale_marks_every_route_and_keeps_attributes` |
+| §4.2 MUST NOT "differentiate between stale and other routing information during forwarding"; RFC 9494 §1 "in conventional GR, route preference is not affected" — a `GrStale` route competes on its attributes | `src/best_path.rs` (`prefer` does not read staleness) | ✅ | `best_path::tests::conventional_gr_*`, `best_path::prop_tests::{prop_conventional_gr_staleness_never_changes_the_winner, prop_prefer_ignores_conventional_gr_staleness, prop_prefer_is_a_strict_total_order}` |
+| §4.2 MUST: "replace the stale routes by the routing updates received from the peer" | `src/adj_rib_in.rs` (`insert`) | ✅ | `adj_rib_in::tests::test_reannouncement_replaces_stale_route_with_fresh_one` |
+| Staleness is local state, never advertised (no duplicate UPDATE on marking; RFC 9494 §1) | `src/outbound.rs` | ✅ | `outbound::tests::test_prepare_outbound_never_carries_staleness` |
+
+**Corrected 2026-11-23 (issue #68):** `prefer` used to rank any fresh route above any stale
+one before `LOCAL_PREF`, and `stale_loses_to_non_stale_before_all_other_criteria` asserted
+that while citing RFC 4724 §4.2 — which says the opposite.
+
+### RFC 9494 — Long-Lived Graceful Restart (not implemented)
+
+LLGR is the mechanism that depreferences retained routes ("A least preferred route MUST be
+treated as less preferred than any other route that is not also least preferred", §4.4), and
+§4.3 applies it only for a speaker that "has advertised the Long-Lived Graceful Restart
+Capability". pathvectord never advertises it, so a received `LLGR_STALE` community has no
+selection effect here (policy may still match on it, §3.2). `Staleness` is `#[non_exhaustive]`
+so an LLGR variant can be added alongside its negotiation, timer and propagation rules.
+
+---|---|---|---|
 | Mark routes stale when peer session resets during graceful restart | — | ❌ | — |
 | Remove stale routes when restart-time expires | — | ❌ | — |
 
