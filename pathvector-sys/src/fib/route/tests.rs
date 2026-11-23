@@ -4,7 +4,10 @@
 //! - `net/ipv4/fib_trie.c`: `fib_valid_key_len`, `fib_table_insert`,
 //!   `fib_table_delete`, `fib_table_lookup`.
 //! - `net/ipv6/ip6_fib.c`: `fib6_add_rt2node`, `fib6_del_route`.
-//! - `include/net/ip6_route.h`: `rt6_qualify_for_ecmp`.
+//! - `include/net/ip6_route.h`: `rt6_qualify_for_ecmp`, `rt6_duplicate_nexthop`.
+//! - `net/ipv4/fib_semantics.c`: `fib_props`; `net/ipv6/route.c`: `fib6_prop`,
+//!   `rt6_score_route`, `find_match`, `ip6_route_info_create`; `ip-route(8)`
+//!   "Route types".
 //!
 //! The expected values are worked out from those functions, not from this
 //! module's implementation. The property tests compare the mirror with a
@@ -23,8 +26,19 @@ use super::*;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
+const RTN_LOCAL: u8 = 2;
 const RTN_BLACKHOLE: u8 = 6;
+const RTN_UNREACHABLE: u8 = 7;
+const RTN_PROHIBIT: u8 = 8;
+const RTN_THROW: u8 = 9;
 const RTPROT_STATIC: u8 = 4;
+
+const NEGATIVE_KINDS: [RouteKind; 4] = [
+    RouteKind::Reject(RejectKind::Blackhole),
+    RouteKind::Reject(RejectKind::Unreachable),
+    RouteKind::Reject(RejectKind::Prohibit),
+    RouteKind::Throw,
+];
 
 fn p4(s: &str) -> Ipv4Prefix {
     let (addr, len) = s.split_once('/').unwrap();
@@ -70,6 +84,7 @@ fn v6(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV6 {
         kind: RTN_UNICAST,
         protocol: RTPROT_STATIC,
         protocol_inferred: false,
+        preference: RoutePreference::Medium,
         next_hop: NextHopV6::Path(via(gateway)),
     }
 }
@@ -85,6 +100,28 @@ fn bgp6(prefix: &str, priority: u32, gateway: Option<&str>) -> KernelRouteV6 {
     KernelRouteV6 {
         protocol: RTPROT_BGP,
         ..v6(prefix, priority, gateway)
+    }
+}
+
+/// A negative IPv4 route as the kernel reports it: no gateway, no device
+/// (`fib_create_info` refuses both for these types).
+fn neg4(prefix: &str, priority: u32, kind: RouteKind) -> KernelRouteV4 {
+    KernelRouteV4 {
+        kind: kind.rtm_type(),
+        next_hop: NextHopV4::Path(NextHopPath {
+            gateway: None,
+            oif: None,
+        }),
+        ..v4(prefix, priority, None)
+    }
+}
+
+/// A negative IPv6 route as the kernel reports it: on the loopback device
+/// (ifindex 1), no gateway (`fib6_nh_init`), medium preference.
+fn neg6(prefix: &str, priority: u32, kind: RouteKind) -> KernelRouteV6 {
+    KernelRouteV6 {
+        kind: kind.rtm_type(),
+        ..v6(prefix, priority, None)
     }
 }
 
@@ -173,16 +210,347 @@ fn table_zero_is_not_a_table() {
 }
 
 #[test]
-fn tracking_rule_is_unicast_and_not_bgp() {
+fn tracking_rule_is_unicast_or_negative_and_not_bgp() {
     assert!(v4("10.0.0.0/8", 1, None).is_tracked());
     assert!(!bgp4("10.0.0.0/8", 1, None).is_tracked());
-    let blackhole = KernelRouteV4 {
-        kind: RTN_BLACKHOLE,
-        ..v4("10.0.0.0/8", 1, None)
-    };
-    assert!(!blackhole.is_tracked());
     assert!(v6("2001:db8::/32", 1, None).is_tracked());
     assert!(!bgp6("2001:db8::/32", 1, None).is_tracked());
+    // Issue #57: a negative route decides reachability for what it covers.
+    for kind in NEGATIVE_KINDS {
+        assert!(neg4("10.0.0.0/8", 1, kind).is_tracked(), "{kind:?}");
+        assert!(neg6("2001:db8::/32", 1, kind).is_tracked(), "{kind:?}");
+        assert_eq!(neg4("10.0.0.0/8", 1, kind).route_kind(), Some(kind));
+        // FibWriter's own RFC 7999 blackholes stay excluded like every other
+        // BGP route.
+        let bgp = KernelRouteV4 {
+            protocol: RTPROT_BGP,
+            ..neg4("10.0.0.0/8", 1, kind)
+        };
+        assert!(!bgp.is_tracked(), "BGP {kind:?}");
+    }
+    // local, broadcast, anycast, multicast, nat, xresolve, unspec: mirrored
+    // for slot order only.
+    for kind in [0, RTN_LOCAL, 3, 4, 5, 10, 11] {
+        let r = KernelRouteV4 {
+            kind,
+            ..v4("10.0.0.0/8", 1, None)
+        };
+        assert!(!r.is_tracked(), "{kind}");
+        assert_eq!(r.route_kind(), None);
+    }
+}
+
+// ── Issue #57: negative routes ────────────────────────────────────────────────
+
+#[test]
+fn route_kind_round_trips_the_rtnetlink_constants() {
+    // <linux/rtnetlink.h>: RTN_UNICAST 1, RTN_LOCAL 2, RTN_BROADCAST 3,
+    // RTN_ANYCAST 4, RTN_MULTICAST 5, RTN_BLACKHOLE 6, RTN_UNREACHABLE 7,
+    // RTN_PROHIBIT 8, RTN_THROW 9, RTN_NAT 10, RTN_XRESOLVE 11.
+    let mirrored = [
+        (1, RouteKind::Unicast),
+        (6, RouteKind::Reject(RejectKind::Blackhole)),
+        (7, RouteKind::Reject(RejectKind::Unreachable)),
+        (8, RouteKind::Reject(RejectKind::Prohibit)),
+        (9, RouteKind::Throw),
+    ];
+    for (rtm_type, kind) in mirrored {
+        assert_eq!(RouteKind::from_rtm_type(rtm_type), Some(kind));
+        assert_eq!(kind.rtm_type(), rtm_type);
+    }
+    for unmirrored in [0, 2, 3, 4, 5, 10, 11, 12, 255] {
+        assert_eq!(RouteKind::from_rtm_type(unmirrored), None, "{unmirrored}");
+    }
+}
+
+#[test]
+fn ipv4_negative_route_beneath_a_covering_route_ends_the_lookup() {
+    // fib_table_lookup: `err = fib_props[fa->fa_type].error; if (unlikely(err
+    // < 0)) { out_reject: ... return err; }` — no backtracking to the default.
+    for kind in NEGATIVE_KINDS {
+        let default = v4("0.0.0.0/0", 0, Some("192.0.2.1"));
+        let neg = neg4("10.1.0.0/16", 1024, kind);
+        let mut list = RouteMirror::default();
+        list.insert(default.clone(), Position::Back);
+        list.insert(neg.clone(), Position::Back);
+
+        assert_eq!(
+            list.lookup(a4("10.1.2.3")),
+            Some(&neg),
+            "{kind:?} is selected"
+        );
+        let outcome = list.resolve(a4("10.1.2.3"));
+        assert!(!outcome.is_reachable(), "{kind:?}");
+        assert_eq!(outcome.forwarding(), None, "{kind:?}");
+        assert_eq!(outcome.selected(), Some(&neg), "{kind:?}");
+        match kind {
+            RouteKind::Reject(k) => {
+                assert_eq!(
+                    outcome,
+                    FibLookup::Reject {
+                        route: &neg,
+                        kind: k
+                    }
+                );
+            }
+            RouteKind::Throw => assert_eq!(outcome, FibLookup::Throw(&neg)),
+            RouteKind::Unicast => unreachable!(),
+        }
+        assert_eq!(list.resolve(a4("10.2.0.1")), FibLookup::Forward(&default));
+
+        assert!(list.remove(&neg));
+        assert_eq!(list.resolve(a4("10.1.2.3")), FibLookup::Forward(&default));
+    }
+}
+
+#[test]
+fn ipv6_negative_route_beneath_a_covering_route_ends_the_lookup() {
+    // fib6_table_lookup backtracks only when rt6_select yields the null entry;
+    // a reject route is selected like any other and its fib6_prop error ends
+    // the lookup (ip6_rt_init_dst_reject).
+    for kind in NEGATIVE_KINDS {
+        let default = v6("::/0", 1024, Some("fe80::1"));
+        let neg = neg6("2001:db8:1::/48", 1024, kind);
+        let mut list = RouteMirror::default();
+        list.insert(default.clone(), Position::Back);
+        list.insert(neg.clone(), Position::Back);
+
+        let outcome = list.resolve(a6("2001:db8:1::3"));
+        assert!(!outcome.is_reachable(), "{kind:?}");
+        assert_eq!(outcome.selected(), Some(&neg), "{kind:?}");
+        assert_eq!(
+            list.resolve(a6("2001:db8:2::1")),
+            FibLookup::Forward(&default)
+        );
+
+        assert!(list.remove(&neg));
+        assert_eq!(
+            list.resolve(a6("2001:db8:1::3")),
+            FibLookup::Forward(&default)
+        );
+    }
+}
+
+#[test]
+fn empty_list_resolves_to_no_route() {
+    let list = Mirror4::default();
+    let outcome = list.resolve(a4("10.0.0.1"));
+    assert_eq!(outcome, FibLookup::NoRoute);
+    assert_eq!(outcome.selected(), None);
+    assert!(!outcome.is_reachable());
+}
+
+#[test]
+fn negative_and_unicast_in_one_ipv4_slot_follow_kernel_order() {
+    // fib_table_insert: aliases of one [prefix, dscp, priority] slot coexist
+    // when their type differs (the duplicate test requires `fa->fa_type ==
+    // cfg->fc_type`); `ip route append` puts the new one last, `prepend`
+    // first. fib_table_lookup takes the first alias of the slot.
+    for kind in NEGATIVE_KINDS {
+        let uni = v4("10.0.0.0/8", 10, None);
+        let neg = neg4("10.0.0.0/8", 10, kind);
+
+        let mut appended = RouteMirror::default();
+        appended.insert(uni.clone(), Position::Back);
+        assert!(
+            appended.insert(neg.clone(), Position::Back),
+            "different type, new alias"
+        );
+        assert_eq!(appended.resolve(a4("10.1.1.1")), FibLookup::Forward(&uni));
+
+        let mut prepended = RouteMirror::default();
+        prepended.insert(uni.clone(), Position::Back);
+        assert!(prepended.insert(neg.clone(), Position::Front));
+        assert!(
+            !prepended.resolve(a4("10.1.1.1")).is_reachable(),
+            "{kind:?}"
+        );
+        // Deleting the negative alias leaves the unicast one.
+        assert!(prepended.remove(&neg));
+        assert_eq!(prepended.resolve(a4("10.1.1.1")), FibLookup::Forward(&uni));
+    }
+}
+
+#[test]
+fn ipv4_type_is_part_of_the_alias_identity() {
+    // "a perfect match which uses the same scope, type, and nexthop
+    // information" — a blackhole and an unreachable alias are two routes.
+    let bh = neg4("10.0.0.0/8", 10, RouteKind::Reject(RejectKind::Blackhole));
+    let un = neg4("10.0.0.0/8", 10, RouteKind::Reject(RejectKind::Unreachable));
+    let mut list = RouteMirror::default();
+    assert!(list.insert(bh.clone(), Position::Back));
+    assert!(list.insert(un.clone(), Position::Back));
+    assert!(list.remove(&bh));
+    assert_eq!(
+        list.resolve(a4("10.1.1.1")),
+        FibLookup::Reject {
+            route: &un,
+            kind: RejectKind::Unreachable
+        }
+    );
+}
+
+#[test]
+fn ipv6_negative_routes_of_one_metric_are_one_route() {
+    // fib6_nh_init puts every reject route on the loopback device with no
+    // gateway, and rt6_duplicate_nexthop compares only device, gateway and
+    // encap, so a second negative route of the same metric is a duplicate
+    // (-EEXIST) whatever its type.
+    let bh = neg6(
+        "2001:db8::/32",
+        10,
+        RouteKind::Reject(RejectKind::Blackhole),
+    );
+    let un = neg6(
+        "2001:db8::/32",
+        10,
+        RouteKind::Reject(RejectKind::Unreachable),
+    );
+    let mut list = RouteMirror::default();
+    assert!(list.insert(bh.clone(), Position::Back));
+    assert!(!list.insert(un.clone(), Position::Back));
+    assert!(
+        !bh.qualifies_for_ecmp(),
+        "no gateway: never an ECMP sibling"
+    );
+    assert!(list.remove(&un));
+    assert!(list.is_empty());
+}
+
+#[test]
+fn route_preference_is_normalised_like_rtm_to_fib6_config() {
+    // <linux/icmpv6.h>: LOW 0x3, MEDIUM 0x0, HIGH 0x1, INVALID 0x2.
+    // rtm_to_fib6_config: "if (pref != ICMPV6_ROUTER_PREF_LOW && pref !=
+    // ICMPV6_ROUTER_PREF_HIGH) pref = ICMPV6_ROUTER_PREF_MEDIUM;"
+    assert_eq!(RoutePreference::from_rta_pref(3), RoutePreference::Low);
+    assert_eq!(RoutePreference::from_rta_pref(1), RoutePreference::High);
+    for other in [0, 2, 4, 255] {
+        assert_eq!(
+            RoutePreference::from_rta_pref(other),
+            RoutePreference::Medium
+        );
+    }
+    assert_eq!(RoutePreference::default(), RoutePreference::Medium);
+}
+
+#[test]
+fn ipv6_preference_ranks_routes_within_a_metric_group() {
+    // rt6_score_route: `m |= IPV6_DECODE_PREF(IPV6_EXTRACT_PREF(fib6_flags))
+    // << 2`; find_match keeps a route only `if (m > *mpri)`. So within the
+    // lowest-metric group the highest preference wins, and among equal
+    // preferences the first in list order. Negative routes are always medium
+    // (ip6_route_info_create overwrites their fib6_flags).
+    let bh = RouteKind::Reject(RejectKind::Blackhole);
+    let pref = |mut r: KernelRouteV6, p| {
+        r.preference = p;
+        r
+    };
+    let neg = neg6("2001:db8:1::/64", 100, bh);
+
+    // A later high-preference unicast route beats an earlier negative one.
+    let high_uni = pref(
+        v6("2001:db8:1::/64", 100, Some("fe80::1")),
+        RoutePreference::High,
+    );
+    let mut list = RouteMirror::default();
+    list.insert(neg.clone(), Position::Back);
+    list.insert(high_uni.clone(), Position::Back);
+    assert_eq!(
+        list.resolve(a6("2001:db8:1::1")),
+        FibLookup::Forward(&high_uni)
+    );
+
+    // An earlier low-preference unicast route loses to a later negative one.
+    let low_uni = pref(
+        v6("2001:db8:1::/64", 100, Some("fe80::1")),
+        RoutePreference::Low,
+    );
+    let mut list = RouteMirror::default();
+    list.insert(low_uni, Position::Back);
+    list.insert(neg.clone(), Position::Back);
+    assert!(!list.resolve(a6("2001:db8:1::1")).is_reachable());
+
+    // Equal (medium) preference: list order.
+    let uni = v6("2001:db8:1::/64", 100, Some("fe80::1"));
+    let mut list = RouteMirror::default();
+    list.insert(uni.clone(), Position::Back);
+    list.insert(neg.clone(), Position::Back);
+    assert_eq!(list.resolve(a6("2001:db8:1::1")), FibLookup::Forward(&uni));
+
+    // Preference never crosses metric groups or prefix lengths.
+    let mut list = RouteMirror::default();
+    list.insert(high_uni.clone(), Position::Back);
+    list.insert(neg6("2001:db8:1::/64", 10, bh), Position::Back);
+    assert!(!list.resolve(a6("2001:db8:1::1")).is_reachable());
+    let mut list = RouteMirror::default();
+    list.insert(
+        pref(
+            v6("2001:db8::/32", 100, Some("fe80::1")),
+            RoutePreference::High,
+        ),
+        Position::Back,
+    );
+    list.insert(neg, Position::Back);
+    assert!(!list.resolve(a6("2001:db8:1::1")).is_reachable());
+}
+
+#[test]
+fn ipv6_preference_is_not_part_of_the_identity() {
+    // rt6_duplicate_nexthop compares device, gateway and encap only.
+    let a = v6("2001:db8::/32", 10, Some("fe80::1"));
+    let mut b = a.clone();
+    b.preference = RoutePreference::High;
+    let mut list = RouteMirror::default();
+    list.insert(a, Position::Back);
+    assert!(list.contains(&b));
+    assert!(!list.insert(b.clone(), Position::Back));
+    assert!(list.remove(&b));
+}
+
+#[test]
+fn tos_and_source_specific_negative_routes_do_not_affect_best_effort_lookups() {
+    // fib_table_lookup checks the DSCP before the type, so a TOS-specific
+    // blackhole only drops traffic with that TOS.
+    let mut tos = neg4("10.1.0.0/16", 0, RouteKind::Reject(RejectKind::Blackhole));
+    tos.slot.tos = 0x10;
+    let mut list = RouteMirror::default();
+    list.insert(v4("10.0.0.0/8", 50, None), Position::Back);
+    list.insert(tos, Position::Back);
+    assert_eq!(metric4(&list, "10.1.1.1"), Some(50));
+    assert!(list.resolve(a4("10.1.1.1")).is_reachable());
+
+    let mut sourced = neg6("2001:db8:1::/48", 0, RouteKind::Throw);
+    sourced.slot.src = p6("2001:db8:ffff::/48");
+    let mut list6 = RouteMirror::default();
+    list6.insert(v6("2001:db8::/32", 50, None), Position::Back);
+    list6.insert(sourced, Position::Back);
+    assert!(list6.resolve(a6("2001:db8:1::1")).is_reachable());
+}
+
+#[test]
+fn replacing_a_unicast_route_with_a_negative_one_makes_it_unreachable() {
+    // `ip route replace blackhole ...` sends one RTM_NEWROUTE with
+    // NLM_F_REPLACE; the unicast alias it displaced gets no RTM_DELROUTE.
+    for kind in NEGATIVE_KINDS {
+        let uni = v4("10.0.0.0/8", 10, Some("192.0.2.1"));
+        let neg = neg4("10.0.0.0/8", 10, kind);
+        let mut list = RouteMirror::default();
+        list.insert(v4("0.0.0.0/0", 0, Some("192.0.2.9")), Position::Back);
+        list.insert(uni.clone(), Position::Back);
+        assert!(list.replace(neg.clone()));
+        assert!(!list.contains(&uni));
+        assert!(!list.resolve(a4("10.1.1.1")).is_reachable(), "{kind:?}");
+        // And back again.
+        assert!(list.replace(uni.clone()));
+        assert_eq!(list.resolve(a4("10.1.1.1")), FibLookup::Forward(&uni));
+
+        let uni6 = v6("2001:db8::/32", 10, Some("fe80::1"));
+        let neg6 = neg6("2001:db8::/32", 10, kind);
+        let mut list6 = RouteMirror::default();
+        list6.insert(uni6.clone(), Position::Back);
+        assert!(list6.replace(neg6.clone()));
+        assert!(!list6.resolve(a6("2001:db8::1")).is_reachable(), "{kind:?}");
+    }
 }
 
 // ── Issue #56 acceptance at the domain level ─────────────────────────────────
@@ -555,50 +923,125 @@ fn ipv6_replace_edge_cases() {
 
 // ── Property tests ────────────────────────────────────────────────────────────
 
-/// Reference lookup written straight from the kernel rule, independently of
-/// `RouteMirror::lookup`: try prefix lengths from longest to shortest; the
-/// first length that has a usable covering route decides, and among those the
-/// lowest priority wins.
-fn reference_lookup_v4<'a>(
-    routes: impl Iterator<Item = &'a KernelRouteV4>,
-    addr: Ipv4Addr,
-) -> Option<(u8, u32)> {
-    let routes: Vec<_> = routes
-        .filter(|r| r.kind == RTN_UNICAST && r.protocol != RTPROT_BGP && r.slot.tos == 0)
-        .collect();
-    let bits = u32::from(addr);
-    (0..=32u8).rev().find_map(|len| {
-        let top = |x: u32| if len == 0 { 0 } else { x >> (32 - len) };
-        routes
-            .iter()
-            .filter(|r| {
-                r.slot.dst.prefix_len() == len && top(u32::from(r.slot.dst.addr())) == top(bits)
-            })
-            .map(|r| r.slot.priority)
-            .min()
-            .map(|p| (len, p))
-    })
+/// The tracking rule written out independently of the implementation: these
+/// `rtm_type`s (unicast and the four negative types), not `RTPROT_BGP`.
+fn ref_tracked(kind: u8, protocol: u8) -> bool {
+    matches!(
+        kind,
+        RTN_UNICAST | RTN_BLACKHOLE | RTN_UNREACHABLE | RTN_PROHIBIT | RTN_THROW
+    ) && protocol != RTPROT_BGP
 }
 
-fn reference_lookup_v6<'a>(
-    routes: impl Iterator<Item = &'a KernelRouteV6>,
+/// `IPV6_DECODE_PREF` ("1:low,2:med,3:high"), written out independently of
+/// `RoutePreference`'s ordering.
+fn decode_pref(p: RoutePreference) -> u8 {
+    match p {
+        RoutePreference::Low => 1,
+        RoutePreference::Medium => 2,
+        RoutePreference::High => 3,
+    }
+}
+
+/// Reference lookup over the kernel model's slot lists, written straight from
+/// the kernel rule and independently of `RouteMirror::lookup`: among slots
+/// that cover `addr`, can match best-effort traffic and hold a tracked route,
+/// the longest prefix, then the lowest priority, then the lowest table ID;
+/// within that slot, the tracked routes in kernel order, and the first with
+/// the highest preference score. The route type plays no part in selection.
+fn reference_select<S, R: Clone>(
+    slots: &HashMap<S, Vec<R>>,
+    covers: impl Fn(&S) -> bool,
+    rank: impl Fn(&S) -> (u8, u32, u32),
+    tracked: impl Fn(&R) -> bool,
+    pref: impl Fn(&R) -> u8,
+) -> Option<R> {
+    let (_, routes) = slots
+        .iter()
+        .filter(|(s, rs)| covers(s) && rs.iter().any(&tracked))
+        .min_by_key(|(s, _)| {
+            let (len, priority, table) = rank(s);
+            (u8::MAX - len, priority, table)
+        })?;
+    let best = routes.iter().filter(|r| tracked(r)).map(&pref).max()?;
+    routes
+        .iter()
+        .find(|r| tracked(r) && pref(r) == best)
+        .cloned()
+}
+
+fn reference_lookup_v4(
+    slots: &HashMap<RouteSlotV4, Vec<KernelRouteV4>>,
+    addr: Ipv4Addr,
+) -> Option<KernelRouteV4> {
+    let bits = u32::from(addr);
+    reference_select(
+        slots,
+        |s| {
+            let len = s.dst.prefix_len();
+            let top = |x: u32| if len == 0 { 0 } else { x >> (32 - len) };
+            s.tos == 0 && top(u32::from(s.dst.addr())) == top(bits)
+        },
+        |s| (s.dst.prefix_len(), s.priority, s.table.get()),
+        |r| ref_tracked(r.kind, r.protocol),
+        |_| 2,
+    )
+}
+
+fn reference_lookup_v6(
+    slots: &HashMap<RouteSlotV6, Vec<KernelRouteV6>>,
     addr: Ipv6Addr,
-) -> Option<(u8, u32)> {
-    let routes: Vec<_> = routes
-        .filter(|r| r.kind == RTN_UNICAST && r.protocol != RTPROT_BGP && r.slot.src.is_default())
-        .collect();
+) -> Option<KernelRouteV6> {
     let bits = u128::from(addr);
-    (0..=128u8).rev().find_map(|len| {
-        let top = |x: u128| if len == 0 { 0 } else { x >> (128 - len) };
-        routes
-            .iter()
-            .filter(|r| {
-                r.slot.dst.prefix_len() == len && top(u128::from(r.slot.dst.addr())) == top(bits)
-            })
-            .map(|r| r.slot.priority)
-            .min()
-            .map(|p| (len, p))
-    })
+    reference_select(
+        slots,
+        |s| {
+            let len = s.dst.prefix_len();
+            let top = |x: u128| if len == 0 { 0 } else { x >> (128 - len) };
+            s.src.is_default() && top(u128::from(s.dst.addr())) == top(bits)
+        },
+        |s| (s.dst.prefix_len(), s.priority, s.table.get()),
+        |r| ref_tracked(r.kind, r.protocol),
+        |r| decode_pref(r.preference),
+    )
+}
+
+/// The mirror's outcome must name the reference route, and its variant must
+/// follow from that route's `rtm_type` alone (ip-route(8): only unicast
+/// forwards; blackhole, unreachable and prohibit reject; throw ends the
+/// table lookup).
+fn check_outcome<R: PartialEq + std::fmt::Debug>(
+    got: FibLookup<'_, R>,
+    expected: Option<&R>,
+    kind_of: impl Fn(&R) -> u8,
+) -> Result<(), TestCaseError> {
+    let Some(e) = expected else {
+        prop_assert_eq!(got, FibLookup::NoRoute);
+        return Ok(());
+    };
+    let want = match kind_of(e) {
+        RTN_UNICAST => FibLookup::Forward(e),
+        RTN_BLACKHOLE => FibLookup::Reject {
+            route: e,
+            kind: RejectKind::Blackhole,
+        },
+        RTN_UNREACHABLE => FibLookup::Reject {
+            route: e,
+            kind: RejectKind::Unreachable,
+        },
+        RTN_PROHIBIT => FibLookup::Reject {
+            route: e,
+            kind: RejectKind::Prohibit,
+        },
+        RTN_THROW => FibLookup::Throw(e),
+        other => {
+            return Err(TestCaseError::fail(format!(
+                "untracked kind {other} selected"
+            )));
+        }
+    };
+    prop_assert_eq!(got, want);
+    prop_assert_eq!(got.is_reachable(), kind_of(e) == RTN_UNICAST);
+    Ok(())
 }
 
 /// The kernel's IPv4 slot lists, written from `fib_table_insert` /
@@ -721,6 +1164,21 @@ impl KernelV6 {
     }
 }
 
+/// Route types: mostly unicast, every negative type, and `local` (mirrored but
+/// never tracked).
+fn arb_rtm_type() -> impl Strategy<Value = u8> + Clone {
+    prop::sample::select(vec![
+        RTN_UNICAST,
+        RTN_UNICAST,
+        RTN_UNICAST,
+        RTN_BLACKHOLE,
+        RTN_UNREACHABLE,
+        RTN_PROHIBIT,
+        RTN_THROW,
+        RTN_LOCAL,
+    ])
+}
+
 /// A small universe so that sequences collide on prefix, priority, table, TOS,
 /// type, protocol and next hop often.
 fn arb_v4() -> impl Strategy<Value = KernelRouteV4> + Clone {
@@ -737,7 +1195,7 @@ fn arb_v4() -> impl Strategy<Value = KernelRouteV4> + Clone {
         prop::sample::select(vec![254u32, 254, 100]),
         prop::sample::select(vec![0u8, 0, 0, 0x10]),
         prop::sample::select(vec![RTPROT_STATIC, RTPROT_STATIC, RTPROT_BGP]),
-        prop::sample::select(vec![RTN_UNICAST, RTN_UNICAST, RTN_UNICAST, RTN_BLACKHOLE]),
+        arb_rtm_type(),
         prop::sample::select(vec![None, Some("192.0.2.1"), Some("192.0.2.2")]),
     )
         .prop_map(|(prefix, priority, table, tos, protocol, kind, gw)| {
@@ -746,6 +1204,13 @@ fn arb_v4() -> impl Strategy<Value = KernelRouteV4> + Clone {
             r.slot.tos = tos;
             r.protocol = protocol;
             r.kind = kind;
+            if RouteKind::from_rtm_type(kind).is_some_and(|k| k != RouteKind::Unicast) {
+                // Negative routes have no gateway or device (fib_create_info).
+                r.next_hop = NextHopV4::Path(NextHopPath {
+                    gateway: None,
+                    oif: None,
+                });
+            }
             r
         })
 }
@@ -769,16 +1234,36 @@ fn arb_v6() -> impl Strategy<Value = KernelRouteV6> + Clone {
             Some("fe80::2"),
             Some("fe80::3"),
         ]),
+        arb_rtm_type(),
+        prop::sample::select(vec![
+            RoutePreference::Medium,
+            RoutePreference::Medium,
+            RoutePreference::Low,
+            RoutePreference::High,
+        ]),
     )
-        .prop_map(|(prefix, priority, src, protocol, inferred, gw)| {
-            let mut r = v6(prefix, priority, gw);
-            if let Some(src) = src {
-                r.slot.src = p6(src);
-            }
-            r.protocol = protocol;
-            r.protocol_inferred = inferred;
-            r
-        })
+        .prop_map(
+            |(prefix, priority, src, protocol, inferred, gw, kind, preference)| {
+                let mut r = v6(prefix, priority, gw);
+                if let Some(src) = src {
+                    r.slot.src = p6(src);
+                }
+                r.protocol = protocol;
+                r.protocol_inferred = inferred;
+                r.kind = kind;
+                if RouteKind::from_rtm_type(kind).is_some_and(|k| k != RouteKind::Unicast) {
+                    // Negative routes sit on the loopback device with no gateway
+                    // (fib6_nh_init) and are always medium (ip6_route_info_create
+                    // overwrites their fib6_flags).
+                    r.next_hop = NextHopV6::Path(via(None));
+                    // Never an ECMP leg, so its protocol is always reported.
+                    r.protocol_inferred = false;
+                } else {
+                    r.preference = preference;
+                }
+                r
+            },
+        )
 }
 
 fn probes_v4() -> Vec<Ipv4Addr> {
@@ -883,8 +1368,9 @@ proptest! {
             let tracked: HashSet<_> = mirror.iter().cloned().collect();
             prop_assert_eq!(tracked, after.values().flatten().cloned().collect::<HashSet<_>>());
             for addr in probes_v4() {
-                let got = mirror.lookup(addr).map(|r| (r.slot.dst.prefix_len(), r.slot.priority));
-                prop_assert_eq!(got, reference_lookup_v4(kernel.slots.values().flatten(), addr));
+                let expected = reference_lookup_v4(&kernel.slots, addr);
+                check_outcome(mirror.resolve(addr), expected.as_ref(), |r| r.kind)?;
+                prop_assert_eq!(mirror.lookup(addr), expected.as_ref());
             }
         }
     }
@@ -918,8 +1404,9 @@ proptest! {
             let tracked: HashSet<_> = mirror.iter().cloned().collect();
             prop_assert_eq!(tracked, after.values().flatten().cloned().collect::<HashSet<_>>());
             for addr in probes_v6() {
-                let got = mirror.lookup(addr).map(|r| (r.slot.dst.prefix_len(), r.slot.priority));
-                prop_assert_eq!(got, reference_lookup_v6(kernel.slots.values().flatten(), addr));
+                let expected = reference_lookup_v6(&kernel.slots, addr);
+                check_outcome(mirror.resolve(addr), expected.as_ref(), |r| r.kind)?;
+                prop_assert_eq!(mirror.lookup(addr), expected.as_ref());
             }
         }
     }

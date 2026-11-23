@@ -104,8 +104,8 @@ or IGP routes when running tools like `ip route show proto bgp`.
 ### Reading the kernel FIB: route identity
 
 `KernelFib` keeps a `FibSnapshot` of the kernel routing table and answers next-hop
-reachability and IGP-metric queries from its *tracked* routes: unicast routes not
-installed by BGP (`RTPROT_BGP`).
+reachability and IGP-metric queries from its *tracked* routes: unicast, blackhole,
+unreachable, prohibit and throw routes not installed by BGP (`RTPROT_BGP`).
 
 A prefix does not identify a kernel route. Linux keeps several routes for one prefix,
 and the snapshot stores each under the identity the kernel itself uses:
@@ -113,7 +113,7 @@ and the snapshot stores each under the identity the kernel itself uses:
 | Family | Slot (the kernel's grouping) | Route within the slot |
 |---|---|---|
 | IPv4 | table, prefix, TOS, priority (`fib_table_insert`: "[prefix,dscp,priority]") | type, protocol, scope, preferred source, next hop(s) |
-| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route) |
+| IPv6 | table, prefix, source prefix, metric (`fib6_add_rt2node`) | next hop (each ECMP sibling is its own route); type, protocol and preference are recorded but, as in `rt6_duplicate_nexthop`, not compared |
 
 Prefixes are validated newtypes (`Ipv4Prefix`, `Ipv6Prefix`: length within range, no
 host bits) and table IDs cannot be zero (`TableId`), so a route identity can only hold
@@ -145,10 +145,55 @@ each all-BGP ECMP set count as IGP reachability after a restart, and counting no
 the second path of every all-static set.
 
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
-as the kernel does. IPv4 routes with a non-zero TOS and IPv6 source-specific routes are
-kept but not selected, because a best-effort lookup from an unspecified source cannot
-use them. `FibSnapshot::routes_v4` / `routes_v6` list the stored routes and
-`route_to_v4` / `route_to_v6` return the route a lookup selects.
+as the kernel does. For IPv6, routes of that priority are then ranked by router
+preference (`RTA_PREF`; `rt6_score_route` adds `IPV6_DECODE_PREF(pref) << 2`, and
+`find_match` keeps only a strictly better score), and only then by list order. Negative
+IPv6 routes are always medium preference: `ip6_route_info_create` overwrites a reject
+route's flags with `RTF_REJECT | RTF_NONEXTHOP`, dropping `RTF_PREF`. IPv4 routes with a
+non-zero TOS and IPv6 source-specific routes are kept but not selected, because a
+best-effort lookup from an unspecified source cannot use them.
+`FibSnapshot::routes_v4` / `routes_v6` list the tracked routes.
+
+### Reading the kernel FIB: negative routes
+
+The route is selected **before** its type is looked at, so a negative route beneath a
+covering unicast route makes the destinations it covers unreachable. `ip-route(8)`:
+blackhole, unreachable and prohibit destinations "are unreachable"; a selected throw
+route ends the lookup in the table "pretending that no route was found". In the kernel,
+`fib_table_lookup` returns the selected alias's `fib_props` error without backtracking to
+a shorter prefix, and `fib6_table_lookup` only backtracks when a node yields no route.
+
+`FibSnapshot::lookup_v4` / `lookup_v6` return a `FibLookup`:
+
+| Selected route | `FibLookup` | Reachable | Kernel error for local senders |
+|---|---|---|---|
+| unicast | `Forward(route)` | yes | none |
+| blackhole | `Reject { kind: Blackhole, .. }` | no | `EINVAL` |
+| unreachable | `Reject { kind: Unreachable, .. }` | no | `EHOSTUNREACH` |
+| prohibit | `Reject { kind: Prohibit, .. }` | no | `EACCES` |
+| throw | `Throw(route)` | no (see below) | `ENETUNREACH` with the default rules |
+| none | `NoRoute` | no | `ENETUNREACH` |
+
+`is_v4_reachable` / `is_v6_reachable`, `igp_metric_v4` / `igp_metric_v6` and
+`route_to_v4` / `route_to_v6` only ever use a `Forward` result, so a negative route can
+never supply an IGP metric.
+
+`is_v6_reachable` treats a link-local address (`fe80::/10`) as on-link **only when no
+route covers it**, because the oracle has no output interface to find the per-interface
+`fe80::/64` route with. A negative route over link-local space is honoured, as the
+kernel honours it (`RTM_GETROUTE` for an address beneath a `prohibit` route answers
+`EACCES`).
+
+**Throw.** A throw route ends the lookup in its table with `-EAGAIN`, which is also what
+a table returns when nothing matches; the kernel then tries the next policy rule. With
+the default rules (local, main, default for IPv4; local, main for IPv6) a throw in `main`
+leaves only the normally empty `default` table, so the lookup fails. The snapshot mirrors
+one table and does not model rules, so it reports a throw as "no route in the mirrored
+table": not reachable. If you use policy rules that send thrown traffic to another
+table, the oracle does not follow them.
+
+`FibWriter`'s own RFC 7999 blackholes carry `RTPROT_BGP` and stay untracked, like every
+BGP route (see "BGP route exclusion" in the `fib` module docs).
 
 Known limits:
 
@@ -169,6 +214,16 @@ Known limits:
   not modelled.
 - IPv6 ECMP eligibility uses `RTPROT_RA` as a stand-in for the kernel's `RTF_ADDRCONF`
   flag, which netlink does not expose.
+- A route through a nexthop object (`RTA_NH_ID`) is classified by the type the kernel
+  reports. The kernel reports a route through a blackhole nexthop as `blackhole`, but
+  changing the nexthop object later sends no route notification.
+- An IPv6 unicast route via the loopback device is turned into a reject route by the
+  kernel (`fib6_is_reject`) but still reported as unicast, so the oracle treats it as
+  reachable.
+- IPv6 selection within a metric group follows preference and list order, but not the
+  kernel's round-robin pointer (`fn->rr_ptr`, moved only when a gateway's neighbour
+  fails), neighbour reachability, or the early return `__find_rr_leaf` takes for a route
+  through a blackhole nexthop object.
 
 ---
 

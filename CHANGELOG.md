@@ -4,6 +4,38 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #57: negative kernel routes decide reachability)
+
+`pathvector-sys`'s FIB snapshot ignored every non-unicast route for reachability, so with a unicast
+default route and a more-specific `blackhole`, `unreachable`, `prohibit` or `throw`
+route the oracle fell back to the default and reported the destination reachable, and
+BGP could pick a next hop the kernel deliberately cannot forward to. Confirmed on a live
+kernel: beneath a blackhole the old snapshot said reachable while `RTM_GETROUTE` (what
+`ip route get` sends) failed with `EINVAL`.
+
+Linux selects the route first and only then looks at its type: `fib_table_lookup`
+returns the selected alias's `fib_props` error without backtracking to a shorter prefix,
+and `fib6_table_lookup` backtracks only when a node yields no route. The snapshot now
+tracks the four negative types (non-BGP; `KernelRouteV4` / `KernelRouteV6::route_kind`
+gives the typed `RouteKind`; the type is part of the IPv4 alias identity, not the IPv6
+one, as in the kernel), and resolves lookups to a typed `FibLookup` (`Forward`, `Reject`, `Throw`,
+`NoRoute`). Only `Forward` counts as reachable or yields an IGP metric. A `throw` is
+reported as no route in the mirrored table, since policy rules are not modelled. New
+public API: `FibSnapshot::lookup_v4` / `lookup_v6`, `FibLookup`, `RouteKind`,
+`RejectKind`, `RoutePreference`; `route_to_v4` / `route_to_v6` now return only
+forwarding routes.
+
+Review follow-up (Codex on PR #123, both reproduced on a live kernel): IPv6 selection
+ranks routes of one metric by router preference (`RTA_PREF`, `rt6_score_route`) before
+list order, so a high-preference unicast route is not hidden by an earlier blackhole;
+and `is_v6_reachable` applies its link-local fallback only when no route covers the
+address, so a negative route over link-local space is honoured. Built on #122's
+full-table mirror: negative routes were already mirrored there, as untracked hashes;
+they are now tracked, and a tracked entry keeps its typed `RouteKind`. Proof:
+domain and property tests (the reference model now includes route types), netlink
+adapter tests, and live-kernel tests that compare every verdict with the kernel's own
+lookup.
+
 ## 2026-11-23 (PR #122 review round 3: unreported IPv6 siblings inherit the protocol)
 
 Round 2 counted every IPv6 ECMP sibling whose protocol the kernel did not report as an
