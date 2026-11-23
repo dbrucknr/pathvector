@@ -2361,18 +2361,12 @@ Not yet started. Key work items:
 ### Dynamic peer management — known gaps (2026-06-18)
 
 Six gaps identified during a correctness audit of the `AddPeer`/`RemovePeer` feature.
-Items 1, 2, 4, 5, 6 resolved 2026-06-18 — see CHANGELOG.md. Item 3 remains open.
+Items 1, 2, 4, 5, 6 resolved 2026-06-18, item 3 on 2026-11-23 — see CHANGELOG.md.
 
-**3. MD5 password on dynamically-added peers doesn't work for inbound connections**
-
-The BGP listener socket is bound once at startup; TCP MD5SIG keys cannot be added to
-an existing listening socket on Linux without rebinding. Dynamically-added peers with
-`md5_password` only work for outbound connections (pathvectord dials them). If the
-remote peer tries to initiate toward us, the listener rejects the TCP handshake because
-no key is installed for that source address.
-
-Fix (full): re-bind the listener socket when a new MD5 peer is added — requires moving
-the listener into a task that can be restarted. Documented in `pathvectord/README.md`.
+**3. ~~MD5 password on dynamically-added peers doesn't work for inbound connections~~**
+Resolved 2026-11-23 (issue #66), see CHANGELOG.md. The premise was wrong: Linux accepts
+`TCP_MD5SIG` on a listening socket at any time, so no rebind is needed. The real gap was
+wider: the listener installed no keys at all, for static peers either.
 
 ### watch_routes broadcast channel — guaranteed delivery
 

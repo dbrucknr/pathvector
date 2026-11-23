@@ -4,6 +4,82 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #66: TCP MD5 keys on the BGP listener)
+
+`run_bgp_listener` received the TCP MD5 key map as `_md5_passwords` and never used it, and
+its comment claimed the listener used "the keys that were active at bind time". No key was
+ever installed on the listening socket, for static or dynamic peers, so a configured
+`md5_password` protected only the connections pathvectord dialled. An unsigned connection
+from the peer's address was accepted and handed to the session. RFC 5925 §8: required
+TCP MD5 "must be added to all outgoing segments and validated on all incoming segments".
+
+**New in `pathvector-session`: `transport::listener`.**
+
+- `ListenerKeys` is the table of inbound keys and their state on the listening sockets
+  (`set_peer`, `remove_peer`, `admission`, `is_current`, `configured`), over the
+  `TcpMd5Port` from #58.
+- `BgpListener::bind` creates the socket (`IPV6_V6ONLY` for IPv6, `SO_REUSEADDR`, never
+  `SO_REUSEPORT`), installs its family's keys, and only then calls `listen()`. Later
+  `set_peer` / `remove_peer` calls change the live socket at once (Linux updates an
+  existing key in place, `__tcp_md5_do_add`).
+- **Key changes replace the socket.** Linux copies the listener's key into each
+  connection when its handshake completes (`tcp_v4_syn_recv_sock`, `tcp_md5_key_copy`)
+  and appends it to the accept queue a moment later (`inet_csk_reqsk_queue_add`), so a
+  connection created before a key was added or changed has no key, and no amount of
+  waiting proves that every such connection has reached the queue. After a key is
+  installed while listening, `BgpListener` takes up to `backlog + 1` queued connections
+  off the socket (rejecting the changed peer's), shuts it down, and binds a new socket at
+  the same address with every key installed before `listen()`. `shutdown(SHUT_RD)` on a
+  listener runs `tcp_disconnect` → `inet_csk_listen_stop`, which discards the queue; a
+  late append checks `sk_state != TCP_LISTEN` under the queue lock and discards the
+  connection; a half-open handshake on the closed socket is re-looked-up and checked
+  against the new socket's keys. Only installed adds and rotations trigger this, not
+  removals or refused keys. This replaces an earlier draft of this PR that waited 100 ms
+  between two clearings of the queue, which the PR review showed could not be a barrier.
+- **Accepted connections carry a stamp.** `BgpListener::accept` returns an `Inbound` with
+  an `AuthStamp`; `ListenerKeys::is_current` is false once the peer's key has been set
+  since. The listener re-checks connections it buffered while replacing the socket, and
+  pathvectord re-checks after looking up the session (`route_inbound`), so a connection
+  accepted unkeyed just before `AddPeer` never reaches the new session.
+- Whether a socket replacement is needed is a per-family counter, so screening a
+  connection costs O(1) in the number of configured keys.
+- A required key the host cannot enforce, or any `setsockopt` failure, rejects the peer's
+  inbound connections (the kernel would not have checked them) and is reported to the
+  caller. `best-effort` admits them unauthenticated with a warning.
+
+**`pathvectord`.** Static peers' keys are recorded by `build_daemon` and installed by each
+listener before it listens. `AddPeer` installs the key before the peer is added to
+`incoming_senders`; `RemovePeer` removes the peer from `incoming_senders`, then removes the
+key. Inbound connections are routed only if still current after the session lookup, and
+an accept error (for example, a failed socket replacement) backs off 100 ms. Failures are
+logged at error level as `refusing inbound connections from <peer>`.
+`bind_listener` moved into `BgpListener::bind`. TODO.md's "re-bind the listener for
+dynamic MD5 peers" item is closed: keys can be added to a listening socket at any time;
+the socket is now replaced after a runtime key change for a different reason (the
+barrier above).
+
+**Behaviour change.** On a host that enforces TCP MD5, a peer with `md5_password` must now
+sign its inbound connections too; a peer that dials in without the key times out. On a
+host that cannot enforce it, the peer's inbound connections are closed unless
+`tcp_md5_enforcement = "best-effort"`.
+
+**Proof.** Fake-port unit tests for install-before-listen, per-family keys, add / rotate /
+remove, socket replacement (the replacement's keys go on before `listen()`), stale
+buffered and routed connections (the three review regressions), the unsettled counter,
+and the refusal paths, each run on every platform. Mutating the listener to admit
+everything, to settle without replacing the socket, to skip the buffered or routed
+re-check, or to miscount, or the daemon to skip the key on `AddPeer`, fails them. `pathvector-session/tests/listener_md5_loopback.rs` and
+pathvectord's `daemon::listener_md5_tests` open real loopback connections and observe the
+client's handshake and whether the connection reaches the session, for static, added,
+rotated and removed keys. They fail rather than skip under `CI` on Linux, and on hosts
+without TCP MD5 they check the fail-closed path live instead. Three CI-only e2e tests in
+`pathvector-e2e/tests/auth.rs` have GoBGP dial pathvectord while pathvectord's own dial
+goes to a dead port, so only the listener can bring the session up: matching key
+establishes; unsigned (the #66 bug: it used to establish) and wrong key never do.
+
+Also corrected TESTING.md's second "Platform behaviour" table, left over from before #58,
+which said `ENOPROTOOPT` was treated as success.
+
 ## 2026-11-23 (issue #59: the FIB snapshot recovers from netlink loss)
 
 `pathvector-sys`'s `KernelFib` ignored `NLMSG_OVERRUN` (how `netlink-proto` reports

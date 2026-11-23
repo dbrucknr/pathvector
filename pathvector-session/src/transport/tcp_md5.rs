@@ -13,6 +13,9 @@
 //!   connection goes ahead **unauthenticated**, a warning is logged on every
 //!   attempt, and [`protect_socket`] returns [`Md5Protection::Unenforced`]
 //!   with the reason. Real failures (for example `ENOBUFS`) still fail.
+//!
+//! This covers connections the session dials. Keys for connections the peer
+//! initiates live on the listening socket: see [`super::listener`].
 
 use std::io;
 use std::net::IpAddr;
