@@ -4,6 +4,66 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (issue #66: TCP MD5 keys on the BGP listener)
+
+`run_bgp_listener` received the TCP MD5 key map as `_md5_passwords` and never used it, and
+its comment claimed the listener used "the keys that were active at bind time". No key was
+ever installed on the listening socket, for static or dynamic peers, so a configured
+`md5_password` protected only the connections pathvectord dialled. An unsigned connection
+from the peer's address was accepted and handed to the session. RFC 5925 §8: required
+TCP MD5 "must be added to all outgoing segments and validated on all incoming segments".
+
+**New in `pathvector-session`: `transport::listener`.**
+
+- `ListenerKeys` is the table of inbound keys and their state on the listening sockets
+  (`set_peer`, `remove_peer`, `admission`, `configured`), over the `TcpMd5Port` from #58.
+- `BgpListener::bind` creates the socket (`IPV6_V6ONLY` for IPv6, `SO_REUSEADDR`),
+  installs its family's keys, and only then calls `listen()`. Later `set_peer` /
+  `remove_peer` calls change the live socket; nothing is rebound. Linux updates an
+  existing key in place (`__tcp_md5_do_add`) and accepts a key on a listening socket at
+  any time.
+- `BgpListener::accept` returns only connections the table admits. Linux copies the
+  listener's key into each connection when its handshake completes
+  (`tcp_v4_syn_recv_sock`, `tcp_md5_key_copy`), so a connection that completed before a
+  key was added or changed has no key. After such a change, every connection from that
+  peer is closed until the listener has cleared its accept queue twice, at least 100 ms
+  apart. Clearing stops at an empty queue or after `backlog + 1` connections (the most
+  Linux queues, first in first out), so a connection flood cannot hold it off; the second
+  pass catches a connection created before the change but appended to the queue just
+  after the first (`tcp_v4_syn_recv_sock` copies the key, then
+  `inet_csk_reqsk_queue_add` queues the connection).
+- A required key the host cannot enforce, or any `setsockopt` failure, rejects the peer's
+  inbound connections (the kernel would not have checked them) and is reported to the
+  caller. `best-effort` admits them unauthenticated with a warning.
+
+**`pathvectord`.** Static peers' keys are recorded by `build_daemon` and installed by each
+listener before it listens. `AddPeer` installs the key before the peer is added to
+`incoming_senders`; `RemovePeer` removes the peer from `incoming_senders`, then removes the
+key. Failures are logged at error level as `refusing inbound connections from <peer>`.
+`bind_listener` moved into `BgpListener::bind`. TODO.md's "re-bind the listener for
+dynamic MD5 peers" item is closed: its premise (keys cannot be added without rebinding)
+was wrong.
+
+**Behaviour change.** On a host that enforces TCP MD5, a peer with `md5_password` must now
+sign its inbound connections too; a peer that dials in without the key times out. On a
+host that cannot enforce it, the peer's inbound connections are closed unless
+`tcp_md5_enforcement = "best-effort"`.
+
+**Proof.** Fake-port unit tests for install-before-listen, per-family keys, add / rotate /
+remove, the pre-change-connection race, and the refusal paths, each run on every
+platform; mutating the listener to admit everything, or the daemon to skip the key on
+`AddPeer`, fails them. `pathvector-session/tests/listener_md5_loopback.rs` and
+pathvectord's `daemon::listener_md5_tests` open real loopback connections and observe the
+client's handshake and whether the connection reaches the session, for static, added,
+rotated and removed keys. They fail rather than skip under `CI` on Linux, and on hosts
+without TCP MD5 they check the fail-closed path live instead. Three CI-only e2e tests in
+`pathvector-e2e/tests/auth.rs` have GoBGP dial pathvectord while pathvectord's own dial
+goes to a dead port, so only the listener can bring the session up: matching key
+establishes; unsigned (the #66 bug: it used to establish) and wrong key never do.
+
+Also corrected TESTING.md's second "Platform behaviour" table, left over from before #58,
+which said `ENOPROTOOPT` was treated as success.
+
 ## 2026-11-23 (issue #58: TCP MD5 never reports an unenforced key as enabled)
 
 `pathvector-sys::apply_tcp_md5sig` returned `Ok(())` when the kernel rejected

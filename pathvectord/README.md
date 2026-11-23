@@ -100,7 +100,7 @@ remote_as = 65001
 | `metrics_port` | `u16` | — | TCP port for the Prometheus `/metrics` scrape endpoint. Omit to disable. Conventional value: `9179` |
 | `graceful_restart_time` | `u16` | `0` | Seconds peers should hold our routes after an unclean session loss (RFC 4724 §3). `0` disables forwarding-state advertisement — peers withdraw our routes immediately. See [Graceful Restart](#graceful-restart-rfc-4724) |
 | `restarting` | `bool` | `false` | Set to `true` when restarting pathvectord mid-session to signal the RFC 4724 Restart State (R) bit, so peers stop their stale-route timers as soon as the session re-establishes. Remove after restart. Ignored when `graceful_restart_time = 0` |
-| `tcp_md5_enforcement` | `"required"` \| `"best-effort"` | `"required"` | What to do when a peer has `md5_password` but this host cannot enforce TCP MD5 (kernel without `CONFIG_TCP_MD5SIG`, non-Linux, IPv6 peer). `"required"` refuses to connect; `"best-effort"` connects **unauthenticated** and logs a warning. See [TCP MD5 authentication](#tcp-md5-authentication-rfc-2385) |
+| `tcp_md5_enforcement` | `"required"` \| `"best-effort"` | `"required"` | What to do when a peer has `md5_password` but this host cannot enforce TCP MD5 (kernel without `CONFIG_TCP_MD5SIG`, non-Linux, IPv6 peer). `"required"` refuses to connect and closes the peer's inbound connections; `"best-effort"` connects and accepts **unauthenticated** and logs a warning. See [TCP MD5 authentication](#tcp-md5-authentication-rfc-2385) |
 
 ### `[[peers]]` fields
 
@@ -885,10 +885,32 @@ file is not valid TOML at all, no dynamic peers load and pathvectord will not ov
 until it is fixed or removed. Config errors report the line number without quoting it, so
 passwords never reach the logs.
 
-**Inbound connections:** keys are currently installed only on the outbound socket
-pathvectord uses to dial the peer. The BGP listener does not install keys yet, for static
-or dynamic peers (issue #66), so do not rely on TCP MD5 to protect connections the peer
-initiates.
+**Inbound connections.** Each peer's key is also installed on the BGP listening socket
+for its address family, so a connection the peer initiates is protected too. A key on the
+socket used to dial the peer does not protect the listener; the two are configured
+separately.
+
+- **Static peers:** the keys go on the listening socket before it starts listening, so no
+  handshake can complete without them.
+- **`AddPeer`:** the key goes on the running listener (no rebind) before inbound
+  connections from the peer are routed to its session. Connections from that address
+  that completed their handshake before the key was installed carry no key, so for about
+  100 ms the listener closes every connection from the peer, including any already
+  queued; the peer's next attempt gets through.
+- **`RemovePeer`:** the peer stops being routed, then its key is removed from the
+  listener.
+- **Rotation:** `RemovePeer`, wait for the removal to finish, then `AddPeer` with the new
+  key. An established session keeps the key it was accepted with until it ends (Linux
+  copies the listener's key into each accepted connection).
+
+On Linux the kernel drops an unsigned or wrongly signed SYN from a keyed peer address
+without replying, so the peer's connection attempt times out (RFC 2385 §2.0, §4.1). When
+the key cannot be installed on the listener (the cases above, or a `setsockopt` error such
+as `ENOMEM` when `net.core.optmem_max` is exhausted by many keys), pathvectord logs
+`refusing inbound connections from <peer>: ...` at error level and closes every inbound
+connection from that peer without reading it. With `tcp_md5_enforcement = "best-effort"`
+an unenforceable key admits the peer's inbound connections unauthenticated, with a
+warning on each.
 
 ---
 
@@ -974,6 +996,8 @@ INFO removing stale BGP routes v4=42 v6=0
 | `unknown service pathvector.v1.PeerService` | CLI is hitting GoBGP's gRPC (port 50051) | Pass `--address http://127.0.0.1:50052` |
 | MD5 session stuck in Active (Linux) | Key mismatch — kernel drops SYN | Verify both sides use the same `md5_password` / `auth-password` |
 | MD5 peer never connects; log says `TCP MD5 is required but cannot be enforced` | Kernel without `CONFIG_TCP_MD5SIG` (e.g. Docker Desktop), macOS, or IPv6 peer | Run on native Linux, or set `[daemon] tcp_md5_enforcement = "best-effort"` for development |
+| Log says `refusing inbound connections from <peer>` | The peer's key could not be installed on the BGP listener (same causes, or a `setsockopt` error); its inbound connections are closed | Fix the cause in the message; outbound connections are governed separately |
+| `rejecting inbound BGP connection: TCP MD5 key changed` right after `AddPeer` | Connections queued before the key was installed are discarded | None needed; the peer's next attempt is authenticated |
 
 ---
 
