@@ -899,6 +899,13 @@ impl<A: IpAddress> MraiTracker<A> {
         self.last_sent.entry(peer).or_default().insert(nlri, at);
     }
 
+    /// Forgets every last-sent stamp, so the next announcement of any
+    /// destination to any peer is outside its interval.
+    #[cfg(test)]
+    pub(crate) fn clear_last_sent(&mut self) {
+        self.last_sent.clear();
+    }
+
     /// Moves every last-sent stamp for `peer` to `at` — lets tests expire the
     /// interval without sleeping.
     #[cfg(test)]

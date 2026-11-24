@@ -82,10 +82,20 @@ RFC 4271 §9.1. The steps implemented in this crate:
 | 5 | `ORIGIN` | lower (IGP=0 best, then EGP=1, then INCOMPLETE=2) |
 | 6 | `MED` | lower (missing → treated as 0) |
 | 9 | Route age | oldest eBGP route (only when both candidates are eBGP) |
-| 10 | Peer IP address | lower (final tie-breaker) |
+| 10 | BGP Identifier | lower (skipped if either side is unknown) |
+| 11 | Peer IP address | lower (final tie-breaker) |
 
 Steps 1 (next-hop reachability) and 8 (IGP metric to next-hop) require IGP/FIB
 integration and are deferred. See `TODO.md` for details.
+
+**Graceful Restart.** A route retained while a peer restarts is marked
+`Staleness::GrStale`, but staleness is not a decision step: RFC 4724 §4.2
+forbids differentiating stale routes "during forwarding", and RFC 9494 §1
+states that "in conventional GR, route preference is not affected". A stale
+route keeps winning on its `LOCAL_PREF` (and every later step) until the peer
+replaces it, its End-of-RIB sweeps it, or the Restart Time expires. Staleness
+is never advertised. Long-Lived GR (RFC 9494), which *does* make retained
+routes least preferred, is not implemented.
 
 ---
 
@@ -95,6 +105,7 @@ integration and are deferred. See `TODO.md` for details.
 |---|---|
 | [`Route<A>`] | A concrete BGP route stored in the RIB; implements [`BgpRoute`](pathvector_policy::BgpRoute) |
 | [`RouteBuilder<A>`] | Builder for constructing [`Route<A>`] values |
+| [`Staleness`] | `Fresh` or `GrStale` (RFC 4724 §4.2); documents why staleness does not affect selection |
 | [`PeerId`] | A BGP peer identified by its IP address |
 | [`AdjRibIn<A>`] | Per-peer inbound routing table (pre-policy) |
 | [`LocRib<A>`] | Local routing table with best-path selection |

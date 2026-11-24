@@ -657,8 +657,9 @@ impl DaemonState {
                  stale routes retained for up to {gr_restart_time} s"
             );
 
-            // RFC 4724 §4.2 SHOULD: mark retained routes as stale so fresh
-            // routes from other peers immediately win best-path selection.
+            // RFC 4724 §4.2 MUST: mark retained routes as stale. Staleness
+            // does not change their preference (RFC 9494 §1) — it scopes the
+            // End-of-RIB sweep and the Restart Time deadline.
             self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6);
 
             if notify {

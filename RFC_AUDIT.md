@@ -472,6 +472,19 @@ per-family retention, EOR-triggered pruning, GR-deadline-expiry flush,
 stale-route de-preference in best-path, and clean-vs-unclean termination
 handling) genuinely matches the RFC text on a fresh read.
 
+> **Correction (2026-11-23, issue #68):** the "stale-route de-preference in
+> best-path" item above was not RFC behavior and should not have been
+> confirmed. RFC 4724 §4.2 says the router "MUST NOT differentiate between
+> stale and other routing information during forwarding" (RFC 8538 §4.1
+> keeps the sentence), and RFC 9494 §1 says "in conventional GR, route
+> preference is not affected" — depreferencing is Long-Lived GR behavior.
+> The comparator ranked any fresh route above any stale one before
+> `LOCAL_PREF`, and the test proving it cited §4.2. Fixed: staleness is now a
+> `Staleness` enum that `prefer` does not read, and is reset on the
+> advertised copy (marking had also been re-sending identical UPDATEs). This
+> is the CLAUDE.md failure mode exactly — a test name citing an RFC for
+> behavior the RFC does not require.
+
 | Clause | Confidence | Notes | What would close this out |
 |---|---|---|---|
 | On (undetected) TCP termination + new incoming connection from a GR-capable peer: MUST treat as termination of the old session, close old, keep new, **no NOTIFICATION sent** | See the §5 finding below — this is the FSM-level mechanism for this clause, and it's missing | — | See §5 below |
