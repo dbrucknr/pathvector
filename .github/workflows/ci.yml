@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger, mainly to run the heavy jobs (e2e, fuzz, coverage) on a
+  # PR branch before merging: `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
+
+# A new push to a PR cancels that PR's in-flight run. Runs on main (push or
+# workflow_dispatch) are never cancelled, so every merge gets a full run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -122,6 +131,9 @@ jobs:
   # the final compile step is invalidated when source changes.
   e2e:
     name: End-to-end (Docker)
+    # Heavy job: skipped on pull_request, runs on push to main and on
+    # workflow_dispatch. Test/Lint/MSRV/Docs still gate PRs.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -291,6 +303,9 @@ jobs:
   # ── Fuzz ────────────────────────────────────────────────────────────────────
   fuzz:
     name: Fuzz (smoke)
+    # Heavy job: skipped on pull_request, runs on push to main and on
+    # workflow_dispatch. Test/Lint/MSRV/Docs still gate PRs.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -335,6 +350,9 @@ jobs:
           if-no-files-found: ignore
 
   coverage:
+    # Heavy job: skipped on pull_request, runs on push to main and on
+    # workflow_dispatch. Test/Lint/MSRV/Docs still gate PRs.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
