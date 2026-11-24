@@ -673,6 +673,16 @@ individually re-derived this pass — worth a follow-up if time allows,
 though the highest-risk, highest-blast-radius clauses (missing-mandatory,
 duplicate-attribute handling, attribute-flags) have already been covered.
 
+**Addendum 2026-11-23 (issue #69): §7.9 ORIGINATOR_ID and §7.10 CLUSTER_LIST.**
+Both say "if [...] received from an external neighbor, it SHALL be discarded
+using the approach of 'attribute discard'". Confirmed gap, now fixed:
+`handle_update` stored both from any peer. This became exploitable once RFC
+4456 §9 made them best-path tie-breakers, because an eBGP peer could forge an
+ORIGINATOR_ID to win step (f). They are now kept only from `Internal` peers.
+Tests: `pathvectord` `rr_tie_break_tests::{ebgp,confed_member}_originator_id_and_cluster_list_are_discarded`.
+The "internal neighbor, length not a multiple of 4 → treat-as-withdraw" half
+is a codec concern and was not re-derived here.
+
 All 4 new/independent gaps filed in `TODO.md` (#19). The missing-mandatory-
 attribute finding is flagged as the audit's single highest-priority item
 given how easily it's triggered in ordinary operation.
