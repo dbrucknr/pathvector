@@ -763,3 +763,426 @@ fn assert_matches_serial_query(pdu: Option<&Pdu>) {
         "expected a Serial Query, got {pdu:?}"
     );
 }
+
+// ── #88: data, serial state and notifications stay consistent ────────────
+
+fn v6(prefix: &str, len: u8, asn: u32) -> Pdu {
+    Pdu::Ipv6Prefix {
+        flags: PrefixFlags { announce: true },
+        prefix_len: len,
+        max_len: len,
+        prefix: prefix.parse().unwrap(),
+        asn,
+    }
+}
+
+fn withdraw(pdu: Pdu) -> Pdu {
+    match pdu {
+        Pdu::Ipv4Prefix {
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+            ..
+        } => Pdu::Ipv4Prefix {
+            flags: PrefixFlags { announce: false },
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+        },
+        Pdu::Ipv6Prefix {
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+            ..
+        } => Pdu::Ipv6Prefix {
+            flags: PrefixFlags { announce: false },
+            prefix_len,
+            max_len,
+            prefix,
+            asn,
+        },
+        other => panic!("not a prefix PDU: {other:?}"),
+    }
+}
+
+fn a6() -> std::net::Ipv6Addr {
+    "2001:db8::1".parse().unwrap()
+}
+
+fn b6() -> std::net::Ipv6Addr {
+    "2001:db9::1".parse().unwrap()
+}
+
+/// Session 1, serial 1, holding A (v4 `192.0.2.0/24` AS65001) and A6 (v6
+/// `2001:db8::/32` AS65001).
+async fn initial_dual_family_sync(s: &mut TcpStream, tap: &Tap) {
+    assert_eq!(tap.read(s).await, Some(Pdu::ResetQuery));
+    send(s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+    send(s, RtrVersion::V1, v4("192.0.2.0", 24, 65001)).await;
+    send(s, RtrVersion::V1, v6("2001:db8::", 32, 65001)).await;
+    send(s, RtrVersion::V1, eod(1, 1)).await;
+}
+
+/// The changes the failing transfers below announce: withdraw A and A6,
+/// announce B (`198.51.100.0/24` AS65020) and B6 (`2001:db9::/32` AS65020).
+async fn send_partial_changes(s: &mut TcpStream) {
+    send(s, RtrVersion::V1, withdraw(v4("192.0.2.0", 24, 65001))).await;
+    send(s, RtrVersion::V1, v4("198.51.100.0", 24, 65020)).await;
+    send(s, RtrVersion::V1, withdraw(v6("2001:db8::", 32, 65001))).await;
+    send(s, RtrVersion::V1, v6("2001:db9::", 32, 65020)).await;
+}
+
+fn generation(changed: &tokio::sync::watch::Receiver<u64>) -> u64 {
+    *changed.borrow()
+}
+
+/// Gives the client time to process everything the server has written. The
+/// pre-fix bug is "visible within microseconds", so this only ever makes the
+/// assertions that follow *more* likely to catch it, never less.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Failure {
+    /// Connection lost mid-transfer.
+    Eof,
+    /// A PDU of unknown type.
+    MalformedPdu,
+    /// RFC 8210 §5.9 defines Cache Reset only as the reply to a Serial
+    /// Query; mid-transfer it is a protocol violation.
+    CacheResetMidTransfer,
+    /// End of Data whose Protocol Version differs from the Cache Response's
+    /// (RFC 8210 §5.8).
+    EndOfDataAtOtherVersion,
+}
+
+/// Issue #88 reproduction, generalised: announcements *and* withdrawals of
+/// both families are streamed, then the transfer fails before End of Data.
+///
+/// RFC 8210 §4 associates the current serial with a *completed* response, and
+/// the public `subscribe()` contract promises completed-sync notifications.
+/// So until End of Data validates, nothing may be visible: VRPs, serial,
+/// status and notifications must all still describe the previous generation,
+/// and the reconnect must resume from exactly that generation.
+async fn failed_incremental_transfer_publishes_nothing(failure: Failure) {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_dual_family_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 1, 2).await;
+                tap.read(&mut s).await; // Serial Query {1, 1}
+                send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+                send_partial_changes(&mut s).await;
+                match failure {
+                    Failure::Eof => drop(s),
+                    Failure::MalformedPdu => {
+                        use tokio::io::AsyncWriteExt;
+                        s.write_all(&[1, 5, 0, 0, 0, 0, 0, 8]).await.unwrap();
+                        hold_open().await;
+                    }
+                    Failure::CacheResetMidTransfer => {
+                        send(&mut s, RtrVersion::V1, Pdu::CacheReset).await;
+                        hold_open().await;
+                    }
+                    Failure::EndOfDataAtOtherVersion => {
+                        send(
+                            &mut s,
+                            RtrVersion::V0,
+                            Pdu::EndOfData {
+                                session_id: 1,
+                                serial: 2,
+                                intervals: None,
+                            },
+                        )
+                        .await;
+                        hold_open().await;
+                    }
+                }
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    let mut changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    let before = generation(&changed);
+    changed.mark_unchanged();
+    go.open();
+    cache.next_seen("Serial Query").await;
+
+    wait_for("the failed transfer to end the session", || {
+        !handle.status().connected
+    })
+    .await;
+
+    let ctx = format!("after {failure:?}");
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid, "{ctx}");
+    assert_eq!(
+        validate(&handle, b(), 65020),
+        RoaValidity::NotFound,
+        "{ctx}"
+    );
+    assert_eq!(
+        handle.validate_v6(a6(), 32, 65001),
+        RoaValidity::Valid,
+        "{ctx}"
+    );
+    assert_eq!(
+        handle.validate_v6(b6(), 32, 65020),
+        RoaValidity::NotFound,
+        "{ctx}"
+    );
+    assert_eq!(generation(&changed), before, "{ctx}: nothing completed");
+    assert!(!changed.has_changed().unwrap(), "{ctx}");
+    let status = handle.status();
+    assert_eq!(
+        status.serial,
+        Some(1),
+        "{ctx}: serial still names what is installed"
+    );
+    assert_eq!(status.roa_count, 2, "{ctx}");
+
+    // ...and the resume point matches the installed generation.
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!(reconnect.conn, 1, "{ctx}");
+    assert_eq!(
+        reconnect.pdu,
+        Pdu::SerialQuery {
+            session_id: 1,
+            serial: 1
+        },
+        "{ctx}"
+    );
+}
+
+#[tokio::test]
+async fn eof_mid_incremental_transfer_publishes_nothing() {
+    failed_incremental_transfer_publishes_nothing(Failure::Eof).await;
+}
+
+#[tokio::test]
+async fn malformed_pdu_mid_incremental_transfer_publishes_nothing() {
+    failed_incremental_transfer_publishes_nothing(Failure::MalformedPdu).await;
+}
+
+#[tokio::test]
+async fn cache_reset_mid_incremental_transfer_publishes_nothing() {
+    failed_incremental_transfer_publishes_nothing(Failure::CacheResetMidTransfer).await;
+}
+
+/// Also #90: "Ensure mismatched data is not committed or combined with
+/// old-session VRPs."
+#[tokio::test]
+async fn end_of_data_at_other_version_publishes_nothing() {
+    failed_incremental_transfer_publishes_nothing(Failure::EndOfDataAtOtherVersion).await;
+}
+
+/// A *full* load that dies part-way (here: after Cache Reset made the router
+/// ask for one) must not have discarded the previous generation (RFC 8210
+/// §12 treats the no-data window as transient; this crate's design is that
+/// stale-but-recent VRPs beat none) nor exposed the half-loaded one. The
+/// resume state, however, was legitimately dropped by the Cache Reset, so the
+/// status serial is `None` and the reconnect starts with a Reset Query.
+#[tokio::test]
+async fn interrupted_full_load_keeps_previous_vrps_and_publishes_nothing() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_dual_family_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 1, 2).await;
+                tap.read(&mut s).await; // Serial Query
+                send(&mut s, RtrVersion::V1, Pdu::CacheReset).await;
+                tap.read(&mut s).await; // Reset Query
+                send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 2 }).await;
+                send(&mut s, RtrVersion::V1, v4("198.51.100.0", 24, 65020)).await;
+                send(&mut s, RtrVersion::V1, v6("2001:db9::", 32, 65020)).await;
+                drop(s);
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    let mut changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    let before = generation(&changed);
+    changed.mark_unchanged();
+    go.open();
+    cache.next_seen("Serial Query").await;
+    cache.next_seen("Reset Query after Cache Reset").await;
+    wait_for("the interrupted load to end the session", || {
+        !handle.status().connected
+    })
+    .await;
+
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+    assert_eq!(handle.validate_v6(a6(), 32, 65001), RoaValidity::Valid);
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::NotFound);
+    assert_eq!(handle.validate_v6(b6(), 32, 65020), RoaValidity::NotFound);
+    assert_eq!(generation(&changed), before);
+    assert_eq!(handle.status().serial, None);
+    assert_eq!(handle.status().roa_count, 2);
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!((reconnect.conn, reconnect.pdu), (1, Pdu::ResetQuery));
+}
+
+/// Nothing a transfer carries is visible before its End of Data; at End of
+/// Data the whole change set — announcements and withdrawals, both families,
+/// VRPs, serial, status — appears together, with exactly one notification.
+/// Run for both an incremental update and a full reload.
+async fn transfer_is_published_atomically_at_end_of_data(full_reload: bool) {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let finish = Gate::new();
+    let finish_s = finish.clone();
+    let mut cache = MockCache::spawn(move |_conn, mut s, tap| {
+        let go = go_s.clone();
+        let finish = finish_s.clone();
+        async move {
+            initial_dual_family_sync(&mut s, &tap).await;
+            go.wait().await;
+            notify(&mut s, RtrVersion::V1, 1, 2).await;
+            tap.read(&mut s).await; // Serial Query
+            if full_reload {
+                send(&mut s, RtrVersion::V1, Pdu::CacheReset).await;
+                tap.read(&mut s).await; // Reset Query
+                send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 2 }).await;
+                send(&mut s, RtrVersion::V1, v4("198.51.100.0", 24, 65020)).await;
+                send(&mut s, RtrVersion::V1, v6("2001:db9::", 32, 65020)).await;
+            } else {
+                send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+                send_partial_changes(&mut s).await;
+            }
+            finish.wait().await;
+            send(
+                &mut s,
+                RtrVersion::V1,
+                eod(if full_reload { 2 } else { 1 }, 9),
+            )
+            .await;
+            hold_open().await;
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    let changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    let before = generation(&changed);
+    go.open();
+    cache.next_seen("Serial Query").await;
+    if full_reload {
+        cache.next_seen("Reset Query").await;
+    }
+    settle().await;
+
+    // Mid-transfer: the previous generation, whole.
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+    assert_eq!(handle.validate_v6(a6(), 32, 65001), RoaValidity::Valid);
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::NotFound);
+    assert_eq!(handle.validate_v6(b6(), 32, 65020), RoaValidity::NotFound);
+    assert_eq!(generation(&changed), before);
+
+    finish.open();
+    wait_for("End of Data", || handle.status().serial == Some(9)).await;
+
+    // After End of Data: the new generation, whole, announced once.
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
+    assert_eq!(handle.validate_v6(a6(), 32, 65001), RoaValidity::NotFound);
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::Valid);
+    assert_eq!(handle.validate_v6(b6(), 32, 65020), RoaValidity::Valid);
+    assert_eq!(handle.status().roa_count, 2);
+    assert_eq!(
+        generation(&changed),
+        before + 1,
+        "exactly one notification for the completed transfer"
+    );
+}
+
+#[tokio::test]
+async fn incremental_transfer_is_published_atomically_at_end_of_data() {
+    transfer_is_published_atomically_at_end_of_data(false).await;
+}
+
+#[tokio::test]
+async fn full_reload_is_published_atomically_at_end_of_data() {
+    transfer_is_published_atomically_at_end_of_data(true).await;
+}
+
+/// RFC 8210 §5.1 session mismatch detected at End of Data, after a
+/// half-applied transfer: everything learned from the cache is flushed —
+/// both the old generation *and* the rejected transfer's data, which must
+/// not survive "combined with old-session VRPs" — subscribers hear about it
+/// once, and the status is coherent (no serial, no records).
+#[tokio::test]
+async fn end_of_data_session_mismatch_flushes_old_and_staged_data_with_one_notification() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_dual_family_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 1, 2).await;
+                tap.read(&mut s).await; // Serial Query
+                send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+                send_partial_changes(&mut s).await;
+                send(&mut s, RtrVersion::V1, eod(99, 2)).await;
+                tap.read(&mut s).await; // Error Report
+                hold_open().await;
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    let changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    let before = generation(&changed);
+    go.open();
+    cache.next_seen("Serial Query").await;
+    let report = cache.next_seen("Error Report").await;
+    assert_eq!(error_report(&report).0, CORRUPT_DATA);
+    wait_for("flush", || handle.status().roa_count == 0).await;
+
+    for (addr, asn) in [(a(), 65001), (b(), 65020)] {
+        assert_eq!(validate(&handle, addr, asn), RoaValidity::NotFound);
+    }
+    assert_eq!(handle.validate_v6(a6(), 32, 65001), RoaValidity::NotFound);
+    assert_eq!(handle.validate_v6(b6(), 32, 65020), RoaValidity::NotFound);
+    assert_eq!(handle.status().serial, None);
+    assert_eq!(
+        generation(&changed),
+        before + 1,
+        "one notification for the flush"
+    );
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!(reconnect.pdu, Pdu::ResetQuery);
+}

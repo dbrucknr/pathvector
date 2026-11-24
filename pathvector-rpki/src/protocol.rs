@@ -254,9 +254,6 @@ pub(crate) enum Step {
     /// §8.3 Cache Reset in reply to a Serial Query: the incremental update
     /// cannot be served. The resume state is unusable; issue a Reset Query.
     ResetRequired,
-    /// Cache Reset *after* a Cache Response, i.e. mid-transfer. RFC 8210
-    /// §5.9 defines it only as the reply to a Serial Query.
-    MidTransferReset,
     /// §8.4 / §12 Error Code 2: nothing to serve yet. Non-fatal; retry with a
     /// Reset Query after the retry interval.
     NoDataAvailable { text: String },
@@ -418,7 +415,6 @@ impl Exchange {
                     Err(Violation::session_mismatch(session, *session_id))
                 }
             }
-            Pdu::CacheReset => Ok(Step::MidTransferReset),
             Pdu::EndOfData {
                 session_id,
                 serial,
@@ -433,8 +429,11 @@ impl Exchange {
                     intervals: *intervals,
                 })
             }
+            // RFC 8210 §5.9 defines Cache Reset only as the reply to a Serial
+            // Query, i.e. *instead of* a Cache Response; after one has been
+            // accepted it is as unexpected as any other query-direction PDU.
             other => Err(Violation::unexpected_pdu(
-                "Prefix, Router Key, Cache Reset, or End of Data",
+                "Prefix, Router Key, Serial Notify, or End of Data",
                 other,
             )),
         }
@@ -895,6 +894,16 @@ mod tests {
         assert_eq!(ex.on_pdu(V1, &notify(1)).unwrap(), Step::Ignore);
         let v = violation(ex.on_pdu(V1, &notify(3)));
         assert_eq!(v.consequence, Consequence::Flush);
+    }
+
+    /// RFC 8210 §5.9: Cache Reset answers a Serial Query; it is not a valid
+    /// way to abort a transfer already begun with a Cache Response.
+    #[test]
+    fn cache_reset_mid_transfer_is_a_violation() {
+        let mut ex = in_transfer(V1);
+        let v = violation(ex.on_pdu(V1, &Pdu::CacheReset));
+        assert!(matches!(v.error, RtrError::UnexpectedPdu { .. }));
+        assert_eq!(v.consequence, Consequence::Drop);
     }
 
     #[test]

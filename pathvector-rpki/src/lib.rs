@@ -9,6 +9,7 @@
 //! that is the external validator's job. It only speaks the RTR protocol to consume the
 //! validator's output.
 
+mod cache;
 mod client;
 mod error;
 mod pdu;
@@ -18,7 +19,8 @@ mod table;
 #[cfg(test)]
 mod regression_tests;
 
-pub use client::{RtrClient, RtrConfig, RtrHandle, RtrStatus};
+pub use cache::RtrStatus;
+pub use client::{RtrClient, RtrConfig, RtrHandle};
 pub use error::{PduError, RtrError};
 pub use pdu::RtrVersion;
 pub use table::{RoaTable, RoaValidity};

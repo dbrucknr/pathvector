@@ -30,7 +30,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use ipnetx::{interfaces::IpAddress, prefix::IpPrefix};
 use routemap::RouteMap;
 
-use crate::pdu::{Pdu, PrefixFlags};
+use crate::pdu::Pdu;
 
 /// RFC 6811 §2 origin validation state for a `(prefix, origin AS)` pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +143,86 @@ impl<A: IpAddress> FamilyTable<A> {
     }
 }
 
+/// One decoded VRP change: announce or withdraw one `(prefix, max_len, asn)`.
+///
+/// This is what a Prefix PDU becomes once it has been checked as
+/// representable. Staged transfers hold these instead of raw PDUs, so a
+/// staged delta can only ever contain prefix changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VrpOp {
+    announce: bool,
+    vrp: Vrp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vrp {
+    V4(IpPrefix<Ipv4Addr>, RoaEntry),
+    V6(IpPrefix<Ipv6Addr>, RoaEntry),
+}
+
+impl VrpOp {
+    /// Decodes the change a Prefix PDU describes. `None` for any other PDU,
+    /// and for a prefix length the address family cannot represent (such a
+    /// record is skipped, exactly as before — whether it should instead be
+    /// reported as corrupt data is the separate prefix-bounds validation
+    /// issue, #91).
+    pub(crate) fn from_pdu(pdu: &Pdu) -> Option<Self> {
+        match *pdu {
+            Pdu::Ipv4Prefix {
+                flags,
+                prefix_len,
+                max_len,
+                prefix,
+                asn,
+            } => Some(Self {
+                announce: flags.announce,
+                vrp: Vrp::V4(
+                    IpPrefix::new(prefix, prefix_len).ok()?,
+                    RoaEntry { max_len, asn },
+                ),
+            }),
+            Pdu::Ipv6Prefix {
+                flags,
+                prefix_len,
+                max_len,
+                prefix,
+                asn,
+            } => Some(Self {
+                announce: flags.announce,
+                vrp: Vrp::V6(
+                    IpPrefix::new(prefix, prefix_len).ok()?,
+                    RoaEntry { max_len, asn },
+                ),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A complete VRP set built off to the side — no locks, invisible to
+/// validation until [`RoaTable::install`] swaps it in. Used to stage a full
+/// (Reset Query) load.
+pub(crate) struct Snapshot {
+    v4: FamilyTable<Ipv4Addr>,
+    v6: FamilyTable<Ipv6Addr>,
+}
+
+impl Snapshot {
+    pub(crate) fn new() -> Self {
+        Self {
+            v4: FamilyTable::new(),
+            v6: FamilyTable::new(),
+        }
+    }
+
+    pub(crate) fn apply(&mut self, op: VrpOp) {
+        match op.vrp {
+            Vrp::V4(p, e) => apply_flagged(&mut self.v4, p, e, op.announce),
+            Vrp::V6(p, e) => apply_flagged(&mut self.v6, p, e, op.announce),
+        }
+    }
+}
+
 /// Combined IPv4 + IPv6 ROA cache. Uses interior mutability so an
 /// [`crate::RtrHandle`] can hand out cheap `Arc` clones while the RTR client
 /// task applies incremental diffs from the wire.
@@ -203,6 +283,7 @@ impl RoaTable {
     /// any other `Pdu` variant (the client only calls this for
     /// `Pdu::Ipv4Prefix`/`Pdu::Ipv6Prefix`, but taking the whole enum keeps
     /// the call site in `client.rs` a single match-free line).
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn apply_prefix_pdu(&self, pdu: &Pdu) {
         match *pdu {
             Pdu::Ipv4Prefix {
@@ -217,7 +298,7 @@ impl RoaTable {
                 };
                 let entry = RoaEntry { max_len, asn };
                 let mut table = self.v4.write().unwrap();
-                apply_flagged(&mut table, p, entry, flags);
+                apply_flagged(&mut table, p, entry, flags.announce);
             }
             Pdu::Ipv6Prefix {
                 flags,
@@ -231,9 +312,35 @@ impl RoaTable {
                 };
                 let entry = RoaEntry { max_len, asn };
                 let mut table = self.v6.write().unwrap();
-                apply_flagged(&mut table, p, entry, flags);
+                apply_flagged(&mut table, p, entry, flags.announce);
             }
             _ => {}
+        }
+    }
+
+    /// Replaces the whole VRP set with `snapshot` in O(1): both family locks
+    /// are taken (always v4 then v6) and the trees swapped, so a validation
+    /// sees either the old set or the new one — never a mixture, and never a
+    /// partially loaded one.
+    pub(crate) fn install(&self, snapshot: Snapshot) {
+        let mut v4 = self.v4.write().unwrap();
+        let mut v6 = self.v6.write().unwrap();
+        *v4 = snapshot.v4;
+        *v6 = snapshot.v6;
+    }
+
+    /// Applies a staged change set in order under both family locks, so a
+    /// concurrent validation sees either none of it or all of it. The lock
+    /// hold is O(`ops.len()`); a typical RPKI serial-to-serial delta is a
+    /// few hundred to a few thousand VRPs.
+    pub(crate) fn apply_delta(&self, ops: &[VrpOp]) {
+        let mut v4 = self.v4.write().unwrap();
+        let mut v6 = self.v6.write().unwrap();
+        for op in ops {
+            match op.vrp {
+                Vrp::V4(p, e) => apply_flagged(&mut v4, p, e, op.announce),
+                Vrp::V6(p, e) => apply_flagged(&mut v6, p, e, op.announce),
+            }
         }
     }
 
@@ -249,9 +356,9 @@ fn apply_flagged<A: IpAddress>(
     table: &mut FamilyTable<A>,
     prefix: IpPrefix<A>,
     entry: RoaEntry,
-    flags: PrefixFlags,
+    announce: bool,
 ) {
-    if flags.announce {
+    if announce {
         table.insert(prefix, entry);
     } else {
         table.remove(prefix, entry);
@@ -261,6 +368,7 @@ fn apply_flagged<A: IpAddress>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdu::PrefixFlags;
 
     fn p4(s: &str) -> IpPrefix<Ipv4Addr> {
         s.parse().unwrap()
@@ -594,6 +702,65 @@ mod tests {
         });
         table.clear();
         assert!(table.is_empty());
+    }
+
+    /// Cost of staging vs applying records directly (issue #88's performance
+    /// question). Not a pass/fail test — run with
+    /// `cargo test --release -p pathvector-rpki -- --ignored --nocapture staging_cost`.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn staging_cost_report() {
+        use std::time::Instant;
+
+        fn pdus(n: u32, base: u32) -> Vec<Pdu> {
+            (0..n)
+                .map(|i| Pdu::Ipv4Prefix {
+                    flags: PrefixFlags { announce: true },
+                    prefix_len: 24,
+                    max_len: 24,
+                    prefix: Ipv4Addr::from((base + i) << 8),
+                    asn: 64_512 + (i % 1000),
+                })
+                .collect()
+        }
+        let full = pdus(500_000, 0x0A_0000);
+        let delta = pdus(20_000, 0x2A_0000);
+
+        // Before: every Prefix PDU applied to the live table as it arrived.
+        let live = RoaTable::new();
+        let t = Instant::now();
+        for p in &full {
+            live.apply_prefix_pdu(p);
+        }
+        println!(
+            "direct apply   500k VRPs (old behaviour): {:?}",
+            t.elapsed()
+        );
+
+        // After: build a private snapshot, then swap it in.
+        let staged_target = RoaTable::new();
+        let t = Instant::now();
+        let mut snap = Snapshot::new();
+        for p in &full {
+            snap.apply(VrpOp::from_pdu(p).unwrap());
+        }
+        let build = t.elapsed();
+        let t = Instant::now();
+        staged_target.install(snap);
+        println!(
+            "stage+install  500k VRPs: build {build:?}, install (both locks held) {:?}",
+            t.elapsed()
+        );
+
+        // Incremental: 20k-op delta applied under both locks.
+        let ops: Vec<VrpOp> = delta.iter().map(|p| VrpOp::from_pdu(p).unwrap()).collect();
+        let t = Instant::now();
+        staged_target.apply_delta(&ops);
+        println!(
+            "apply_delta    20k ops on a 500k table (both locks held): {:?}",
+            t.elapsed()
+        );
+        println!("VrpOp size: {} bytes", std::mem::size_of::<VrpOp>());
     }
 
     #[test]

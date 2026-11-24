@@ -10,8 +10,8 @@
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
-    sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant, SystemTime},
+    sync::Arc,
+    time::Duration,
 };
 
 use tokio::{
@@ -21,11 +21,14 @@ use tokio::{
 };
 use tracing::warn;
 
+#[cfg(any(test, feature = "test-util"))]
+use crate::cache::table_from;
 use crate::{
+    cache::{RtrStatus, Shared, Staged},
     error::{PduError, RtrError},
     pdu::{self, EndOfDataIntervals, Pdu, RtrVersion},
     protocol::{self, Consequence, Exchange, Negotiation, Query, Resume, Step, Violation},
-    table::{RoaTable, RoaValidity},
+    table::RoaValidity,
 };
 
 /// Upper bound on a single PDU's declared length. The largest legitimate
@@ -77,58 +80,6 @@ impl Default for RtrConfig {
     }
 }
 
-/// A point-in-time snapshot of RTR session health, for operator visibility
-/// (gRPC/CLI in Phase 1).
-#[derive(Debug, Clone)]
-pub struct RtrStatus {
-    pub connected: bool,
-    pub version: Option<RtrVersion>,
-    pub serial: Option<u32>,
-    pub roa_count: usize,
-    pub last_update: Option<Instant>,
-    /// Same instant as `last_update`, in wall-clock form — `Instant` is
-    /// monotonic and can't be converted to a Unix timestamp for operator-
-    /// facing display (e.g. correlating with validator logs).
-    pub wall_clock_update: Option<SystemTime>,
-    pub last_error: Option<String>,
-}
-
-impl RtrStatus {
-    fn disconnected() -> Self {
-        Self {
-            connected: false,
-            version: None,
-            serial: None,
-            roa_count: 0,
-            last_update: None,
-            wall_clock_update: None,
-            last_error: None,
-        }
-    }
-
-    /// `true` if the cache has never synced, or hasn't synced within
-    /// `expire`. Informational only in this phase — nothing clears the cache
-    /// automatically on staleness (see crate-level docs: stale-but-recent ROA
-    /// data is preferable to no data for a blackhole operator's ROV decisions).
-    #[must_use]
-    pub fn is_stale(&self, expire: Duration) -> bool {
-        self.last_update.is_none_or(|t| t.elapsed() > expire)
-    }
-}
-
-struct Shared {
-    table: RoaTable,
-    /// What the client remembers about the cache for an incremental
-    /// (Serial Query) resume — see [`Resume`]. `None` means the next query
-    /// must be a Reset Query.
-    resume: Mutex<Option<Resume>>,
-    status: RwLock<RtrStatus>,
-    /// Fires whenever the ROA table changes (a completed sync, full or
-    /// incremental). The value itself is an unused generation counter — only
-    /// the change notification matters. See [`RtrHandle::subscribe`].
-    changed: watch::Sender<u64>,
-}
-
 /// A cheap-clone (`Arc`-backed) handle to a running RTR client. Safe to hold
 /// from any number of callers (gRPC handlers, and in a later phase, policy
 /// conditions) — `validate_*`/`status` never block on network I/O.
@@ -138,12 +89,12 @@ pub struct RtrHandle(Arc<Shared>);
 impl RtrHandle {
     #[must_use]
     pub fn validate_v4(&self, prefix: Ipv4Addr, prefix_len: u8, origin_asn: u32) -> RoaValidity {
-        self.0.table.validate_v4(prefix, prefix_len, origin_asn)
+        self.0.table().validate_v4(prefix, prefix_len, origin_asn)
     }
 
     #[must_use]
     pub fn validate_v6(&self, prefix: Ipv6Addr, prefix_len: u8, origin_asn: u32) -> RoaValidity {
-        self.0.table.validate_v6(prefix, prefix_len, origin_asn)
+        self.0.table().validate_v6(prefix, prefix_len, origin_asn)
     }
 
     /// # Panics
@@ -152,7 +103,7 @@ impl RtrHandle {
     /// panicked while holding it) — not an expected runtime condition.
     #[must_use]
     pub fn status(&self) -> RtrStatus {
-        self.0.status.read().unwrap().clone()
+        self.0.status()
     }
 
     /// Returns a receiver that fires whenever the ROA table changes — a
@@ -163,7 +114,7 @@ impl RtrHandle {
     /// the cache reflects it, without waiting for a session reset.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.0.changed.subscribe()
+        self.0.subscribe()
     }
 }
 
@@ -177,12 +128,7 @@ impl RtrClient {
     /// block on connection setup.
     #[must_use]
     pub fn spawn(config: RtrConfig) -> (RtrHandle, tokio::task::JoinHandle<()>) {
-        let shared = Arc::new(Shared {
-            table: RoaTable::new(),
-            resume: Mutex::new(None),
-            status: RwLock::new(RtrStatus::disconnected()),
-            changed: watch::channel(0).0,
-        });
+        let shared = Arc::new(Shared::new());
         let handle = RtrHandle(Arc::clone(&shared));
         let join = tokio::spawn(run_session_loop(config, shared));
         (handle, join)
@@ -199,34 +145,7 @@ pub fn for_testing(
     v4: impl IntoIterator<Item = (Ipv4Addr, u8, u8, u32)>,
     v6: impl IntoIterator<Item = (Ipv6Addr, u8, u8, u32)>,
 ) -> RtrHandle {
-    let table = RoaTable::new();
-    for (prefix, prefix_len, max_len, asn) in v4 {
-        table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
-            flags: pdu::PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
-    }
-    for (prefix, prefix_len, max_len, asn) in v6 {
-        table.apply_prefix_pdu(&Pdu::Ipv6Prefix {
-            flags: pdu::PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
-    }
-    let mut status = RtrStatus::disconnected();
-    status.connected = true;
-    status.roa_count = table.len();
-    RtrHandle(Arc::new(Shared {
-        table,
-        resume: Mutex::new(None),
-        status: RwLock::new(status),
-        changed: watch::channel(0).0,
-    }))
+    RtrHandle(Arc::new(Shared::with_table(table_from(v4, v6))))
 }
 
 impl RtrHandle {
@@ -241,15 +160,13 @@ impl RtrHandle {
     /// panicked while holding it) — not an expected runtime condition.
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_roa_v4(&self, prefix: Ipv4Addr, prefix_len: u8, max_len: u8, asn: u32) {
-        self.0.table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
+        self.0.insert_for_testing(&Pdu::Ipv4Prefix {
             flags: pdu::PrefixFlags { announce: true },
             prefix_len,
             max_len,
             prefix,
             asn,
         });
-        self.0.status.write().unwrap().roa_count = self.0.table.len();
-        self.0.changed.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// IPv6 counterpart of [`RtrHandle::insert_roa_v4`].
@@ -260,54 +177,13 @@ impl RtrHandle {
     /// panicked while holding it) — not an expected runtime condition.
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_roa_v6(&self, prefix: Ipv6Addr, prefix_len: u8, max_len: u8, asn: u32) {
-        self.0.table.apply_prefix_pdu(&Pdu::Ipv6Prefix {
+        self.0.insert_for_testing(&Pdu::Ipv6Prefix {
             flags: pdu::PrefixFlags { announce: true },
             prefix_len,
             max_len,
             prefix,
             asn,
         });
-        self.0.status.write().unwrap().roa_count = self.0.table.len();
-        self.0.changed.send_modify(|g| *g = g.wrapping_add(1));
-    }
-}
-
-impl Shared {
-    fn resume(&self) -> Option<Resume> {
-        *self.resume.lock().unwrap()
-    }
-
-    /// Records a completed transfer's `(version, session, serial)` as the
-    /// point future Serial Queries resume from.
-    fn set_resume(&self, resume: Resume) {
-        *self.resume.lock().unwrap() = Some(resume);
-    }
-
-    /// RFC 8210 §5.1: "the router MUST flush all data learned from that
-    /// cache." Clears every VRP and the resume state, and — because
-    /// validation results just changed — notifies subscribers so policy is
-    /// re-evaluated against the (now empty) cache.
-    fn flush(&self) {
-        let had_data = !self.table.is_empty();
-        self.table.clear();
-        self.forget_resume();
-        {
-            let mut status = self.status.write().unwrap();
-            status.roa_count = 0;
-            status.version = None;
-        }
-        if had_data {
-            self.changed.send_modify(|g| *g = g.wrapping_add(1));
-        }
-    }
-
-    /// Drops the incremental resume state — the cache said (Cache Reset,
-    /// session error, version change) that the remembered serial cannot be
-    /// used. The installed VRPs are *not* touched: whether they are kept or
-    /// flushed is a separate decision at each call site.
-    fn forget_resume(&self) {
-        *self.resume.lock().unwrap() = None;
-        self.status.write().unwrap().serial = None;
     }
 }
 
@@ -337,7 +213,7 @@ async fn run_session_loop(config: RtrConfig, shared: Arc<Shared>) {
                         error = %e,
                         "RTR session error"
                     );
-                    set_disconnected(&shared, e.to_string());
+                    shared.set_disconnected(e.to_string());
                     // RFC 8210 §6: "a protocol version mismatch overrides"
                     // the Retry Interval — the cache just told us which
                     // version it speaks, so reconnect at once.
@@ -353,17 +229,11 @@ async fn run_session_loop(config: RtrConfig, shared: Arc<Shared>) {
                     error = %e,
                     "RTR connect failed"
                 );
-                set_disconnected(&shared, e.to_string());
+                shared.set_disconnected(e.to_string());
             }
         }
         tokio::time::sleep(config.retry_interval).await;
     }
-}
-
-fn set_disconnected(shared: &Arc<Shared>, error: String) {
-    let mut status = shared.status.write().unwrap();
-    status.connected = false;
-    status.last_error = Some(error);
 }
 
 /// One TCP connection's lifecycle: repeated sync-then-idle cycles until an
@@ -394,17 +264,6 @@ async fn run_one_connection(
         if let Some(iv) = intervals {
             refresh = Duration::from_secs(u64::from(iv.refresh));
             retry = Duration::from_secs(u64::from(iv.retry));
-        }
-
-        {
-            let mut status = shared.status.write().unwrap();
-            status.connected = true;
-            status.version = Some(negotiation.version());
-            status.serial = shared.resume().map(|r| r.serial.get());
-            status.roa_count = shared.table.len();
-            status.last_update = Some(Instant::now());
-            status.wall_clock_update = Some(SystemTime::now());
-            status.last_error = None;
         }
 
         // Idle until the refresh timer fires or the server sends an
@@ -444,13 +303,17 @@ async fn sync(
 ) -> Result<Option<EndOfDataIntervals>, RtrError> {
     // Forces the *next* query to be a `ResetQuery` regardless of remembered
     // serial/session state. Set by Cache Reset and by Error Code 2.
-    // Deliberately does not clear `shared.table` itself — see the
-    // `Accepted` arm for why the clear is deferred until the replacement
-    // load actually starts.
+    // Deliberately does not touch the installed VRPs: they stay valid until
+    // the replacement load *commits* (see `cache.rs`).
     let mut force_reset = false;
     'exchange: loop {
         let query = Query::choose(shared.resume(), force_reset);
         let mut exchange = Exchange::new(query, *negotiation);
+        // Records of this transfer accumulate here, invisible to validation,
+        // status and subscribers, until a validated End of Data commits them
+        // (see `cache.rs`). If the exchange ends any other way the staged
+        // records are dropped with it.
+        let mut staged = Staged::for_query(query);
         write_pdu(stream, negotiation.version(), &query.pdu()).await?;
 
         loop {
@@ -491,38 +354,24 @@ async fn sync(
                             "RTR server answered at a lower protocol version than requested; downgrading"
                         );
                     }
-                    if matches!(query, Query::Reset) {
-                        // The cache just accepted our Reset Query and is
-                        // about to send the replacement full load — safe to
-                        // drop the stale table now, right before the new one
-                        // is applied. Clearing any earlier (e.g. as soon as
-                        // Error Code 2 or Cache Reset arrived) would discard
-                        // the last successfully validated data for the
-                        // entire, possibly long, retry window — exactly the
-                        // condition RFC 8210 §12 describes as transient, and
-                        // exactly what this crate's own
-                        // stale-but-recent-is-better-than-no-data design (see
-                        // `RtrStatus::is_stale`'s doc comment) exists to
-                        // avoid.
-                        shared.table.clear();
-                    }
                 }
-                Step::Prefix => shared.table.apply_prefix_pdu(&frame.pdu),
+                Step::Prefix => staged.push(&frame.pdu),
                 Step::Ignore => {}
                 Step::Complete {
                     session,
                     serial,
                     intervals,
                 } => {
-                    shared.set_resume(Resume {
-                        version: negotiation.version(),
-                        session,
-                        serial,
-                    });
-                    // Fires on every completed sync, full or incremental —
-                    // the single, correct point to notify subscribers (see
-                    // `RtrHandle::subscribe`) that the table just changed.
-                    shared.changed.send_modify(|g| *g = g.wrapping_add(1));
+                    // Data, serial, status and the subscriber notification
+                    // are published together, here and only here.
+                    shared.commit(
+                        staged,
+                        Resume {
+                            version: negotiation.version(),
+                            session,
+                            serial,
+                        },
+                    );
                     return Ok(intervals);
                 }
                 // RFC 8210 §8.3: "When a router receives this, the router
@@ -543,20 +392,14 @@ async fn sync(
                     force_reset = true;
                     continue 'exchange;
                 }
-                Step::MidTransferReset => {
-                    shared.table.clear();
-                    shared.forget_resume();
-                    force_reset = true;
-                    continue 'exchange;
-                }
                 Step::DowngradeToV0 { text } => {
                     warn!(text = %text, "RTR server rejected protocol v1, falling back to v0");
                     *negotiation = Negotiation::Proposed(RtrVersion::V0);
                     *version_hint = RtrVersion::V0;
                     // v0 and v1 session state (serial, session ID) are not
-                    // interchangeable — force a full resync under the new
-                    // version.
-                    shared.table.clear();
+                    // interchangeable (RFC 8210 §5.1) — force a full resync
+                    // under the new version. The installed VRPs stay until
+                    // that load commits.
                     shared.forget_resume();
                     continue 'exchange;
                 }
@@ -575,13 +418,7 @@ async fn sync(
                         "RTR cache reports no data available yet; forcing a Reset \
                          Query retry on the same connection"
                     );
-                    {
-                        // Transport is still live — only the last sync
-                        // attempt failed — so `connected` is deliberately
-                        // left as-is.
-                        let mut status = shared.status.write().unwrap();
-                        status.last_error = Some(text);
-                    }
+                    shared.set_last_error(text);
                     force_reset = true;
                     tokio::time::sleep(retry_interval).await;
                     continue 'exchange;
@@ -945,92 +782,6 @@ mod tests {
 
         handle.insert_roa_v6("2001:db8::".parse().unwrap(), 32, 32, 65001);
         assert!(changed.has_changed().unwrap());
-    }
-
-    /// RFC 8210 §5.7: a `CacheReset` PDU received mid-diff (in place of a
-    /// Prefix PDU or `EndOfData`) means the server can't serve this sync
-    /// after all and the client must restart with a fresh Reset Query on
-    /// the *same* TCP connection — not treat it as a fatal error requiring
-    /// a reconnect. `apply_diff_stream`'s `DiffOutcome::ResyncNeeded` path
-    /// implements this; this test isolates it (previously only reachable
-    /// indirectly through other tests).
-    #[tokio::test]
-    async fn cache_reset_mid_stream_triggers_full_resync_on_same_connection() {
-        let (config, _server) = spawn_mock_server(|mut stream| async move {
-            // First attempt: normal Reset Query, accepted, then the server
-            // gives up mid-diff instead of sending prefixes + End of Data.
-            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
-            write_one(
-                &mut stream,
-                RtrVersion::V1,
-                &Pdu::CacheResponse { session_id: 1 },
-            )
-            .await;
-            write_one(&mut stream, RtrVersion::V1, &Pdu::CacheReset).await;
-
-            // Second attempt: same TCP connection. The table was cleared, so
-            // the client has no serial to resume from and must send another
-            // Reset Query (not a Serial Query) — this time the server
-            // completes the sync normally.
-            assert_eq!(read_one(&mut stream).await, Pdu::ResetQuery);
-            write_one(
-                &mut stream,
-                RtrVersion::V1,
-                &Pdu::CacheResponse { session_id: 2 },
-            )
-            .await;
-            write_one(
-                &mut stream,
-                RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "198.51.100.0".parse().unwrap(),
-                    asn: 65020,
-                },
-            )
-            .await;
-            write_one(
-                &mut stream,
-                RtrVersion::V1,
-                &Pdu::EndOfData {
-                    session_id: 2,
-                    serial: 1,
-                    intervals: Some(EndOfDataIntervals {
-                        refresh: 3600,
-                        retry: 600,
-                        expire: 7200,
-                    }),
-                },
-            )
-            .await;
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        })
-        .await;
-
-        let (handle, _join) = RtrClient::spawn(config);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if handle.status().connected {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect(
-            "client did not complete the post-CacheReset resync within 5s \
-             (did it treat CacheReset as fatal instead of resyncing?)",
-        );
-
-        // Confirm the *second* session's data actually made it in — proving
-        // the resync completed, not just that the connection stayed open.
-        assert_eq!(
-            handle.validate_v4("198.51.100.1".parse().unwrap(), 24, 65020),
-            RoaValidity::Valid
-        );
-        assert_eq!(handle.status().serial, Some(1));
     }
 
     /// An unsolicited `SerialNotify` received during the idle phase must
