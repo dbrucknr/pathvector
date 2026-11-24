@@ -67,7 +67,7 @@ extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 
   With the polling client the new daemon behaves like one with no client (same lock-hold bucket,
   RSS flat at the table size instead of +436 MiB). `converge`: `list_peers` p50 230 ms → 425 µs,
   max 1.22 s → 454 ms; lock holds and convergence time (5.6–6.2 s) unchanged. The control peer's
-  keepalive stayed on cadence (≤ 3.45 s silence, hold 9 s) in all 8 windows. In the `cow`
+  keepalive stayed on cadence (≤ 3.45 s silence, hold 9 s) in all 12 windows. In the `cow`
   "churn + concurrent `watch_routes` snapshots" window `list_peers` p99 is still 0.9 s (old: 1.3 s)
   and RSS 2.1 GiB (old: 3.3 GiB with the client): `watch_routes` itself materialises the table and
   is out of scope here. Each cell is a single run on a loaded laptop; treat differences of a bucket
