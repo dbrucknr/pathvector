@@ -139,6 +139,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
