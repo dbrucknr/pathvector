@@ -34,6 +34,11 @@ recovered in place; it does not authorize processing an UPDATE before Establishe
   normalised to it) with per-state handling as above. A recovered UPDATE in Established is now an
   ordinary Event 27 UPDATE, which also fixes a latent bug: recovered UPDATEs did **not** restart
   the HoldTimer, so a peer sending only RFC 7606-recovered UPDATEs would have been timed out.
+- Review follow-up (Codex, PR #143): RFC 6608 §4 requires the FSM Error NOTIFICATION's Data
+  to be "a 1-octet, unsigned integer that indicates the type of the unexpected message" in
+  OpenSent, OpenConfirm *and* Established; every such NOTIFICATION was sent with empty Data. All
+  four sites now carry the type octet (2 for an UPDATE, malformed or not; 1 OPEN, 4 KEEPALIVE,
+  5 ROUTE-REFRESH) via the new `BgpMessage::type_code`.
 - Connect/Active now treat a received UPDATE (valid or not) per §8.2.2 (drop to Idle) instead of
   silently ignoring it.
 - The transport still classifies a session-reset recovery as `TerminationReason::OperatorStop`
@@ -42,7 +47,7 @@ recovered in place; it does not authorize processing an UPDATE before Establishe
 Regression tests (each confirmed failing before the fix): the full state × outcome matrix with
 exact outputs and normal-UPDATE parity in `src/fsm/update_error_tests.rs`; real loopback-TCP /
 real-`BgpCodec` tests in `tests/malformed_update_fsm.rs` — raw payload bytes in OpenSent and
-OpenConfirm (exact NOTIFICATION off the wire, connection closed, no session event), Established
+OpenConfirm (exact NOTIFICATION incl. the RFC 6608 type octet off the wire, connection closed, no session event), Established
 discard/withdraw/reset (exact NOTIFICATION Data, `Terminated(OperatorStop)`, reconnect on a new
 connection) and HoldTimer restart. Not done: a Docker/pathvectord scenario (the e2e images are
 shared tags; building them from this branch would replace other work's images) — the daemon-side

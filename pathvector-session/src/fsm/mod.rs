@@ -474,13 +474,10 @@ impl Fsm {
             // local system: sends the NOTIFICATION with the Error Code
             // Finite State Machine Error" — RFC 7606 recovery never applies
             // before Established.
-            FsmInput::MessageReceived(_) | FsmInput::MalformedUpdate(_) => {
+            unexpected @ (FsmInput::MessageReceived(_) | FsmInput::MalformedUpdate(_)) => {
                 self.state = State::Idle;
                 vec![
-                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
-                        error: NotificationError::FsmErrorOpenSent,
-                        data: vec![],
-                    })),
+                    fsm_error(NotificationError::FsmErrorOpenSent, &unexpected),
                     FsmOutput::StopHoldTimer,
                     FsmOutput::CloseTcpConnection,
                 ]
@@ -584,13 +581,10 @@ impl Fsm {
             // OpenConfirm, "In response to any other event (Events 9, 12-13,
             // 20, 27-28), the local system: sends a NOTIFICATION with a code
             // of Finite State Machine Error".
-            FsmInput::MessageReceived(_) | FsmInput::MalformedUpdate(_) => {
+            unexpected @ (FsmInput::MessageReceived(_) | FsmInput::MalformedUpdate(_)) => {
                 self.state = State::Idle;
                 vec![
-                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
-                        error: NotificationError::FsmErrorOpenConfirm,
-                        data: vec![],
-                    })),
+                    fsm_error(NotificationError::FsmErrorOpenConfirm, unexpected),
                     FsmOutput::StopHoldTimer,
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
@@ -666,7 +660,7 @@ impl Fsm {
             // ROUTE-REFRESH: honoured only when both sides negotiated RFC 2918.
             // Full re-advertisement (FsmOutput::RouteRefreshRequested) is deferred;
             // for now we accept it silently when negotiated and reject it when not.
-            FsmInput::MessageReceived(BgpMessage::RouteRefresh(_)) => {
+            unexpected @ FsmInput::MessageReceived(BgpMessage::RouteRefresh(_)) => {
                 let negotiated = self
                     .peer_open
                     .as_ref()
@@ -677,10 +671,7 @@ impl Fsm {
                 } else {
                     self.state = State::Idle;
                     vec![
-                        FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
-                            error: NotificationError::FsmErrorEstablished,
-                            data: vec![],
-                        })),
+                        fsm_error(NotificationError::FsmErrorEstablished, &unexpected),
                         FsmOutput::StopHoldTimer,
                         FsmOutput::StopKeepaliveTimer,
                         FsmOutput::CloseTcpConnection,
@@ -689,13 +680,10 @@ impl Fsm {
                 }
             }
             // Any other unexpected message type in Established (RFC 4271 §6.5 subcode 3).
-            FsmInput::MessageReceived(_) => {
+            unexpected @ FsmInput::MessageReceived(_) => {
                 self.state = State::Idle;
                 vec![
-                    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
-                        error: NotificationError::FsmErrorEstablished,
-                        data: vec![],
-                    })),
+                    fsm_error(NotificationError::FsmErrorEstablished, &unexpected),
                     FsmOutput::StopHoldTimer,
                     FsmOutput::StopKeepaliveTimer,
                     FsmOutput::CloseTcpConnection,
@@ -1011,6 +999,23 @@ fn resolve_as(open: &OpenMessage) -> u32 {
             }
         })
         .unwrap_or_else(|| u32::from(open.my_as))
+}
+
+/// A Finite State Machine Error NOTIFICATION for an unexpected message.
+///
+/// RFC 6608 §4: "The Data field is a 1-octet, unsigned integer that indicates
+/// the type of the unexpected message." — for `OpenSent`, `OpenConfirm` and
+/// `Established` alike. A malformed UPDATE is an UPDATE (type 2).
+fn fsm_error(error: NotificationError, unexpected: &FsmInput) -> FsmOutput {
+    let type_code = match unexpected {
+        FsmInput::MessageReceived(m) => m.type_code(),
+        FsmInput::MalformedUpdate(_) => 2,
+        other => unreachable!("not a received message: {other:?}"),
+    };
+    FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+        error,
+        data: vec![type_code],
+    }))
 }
 
 fn hold_duration(hold_time: u16) -> Duration {

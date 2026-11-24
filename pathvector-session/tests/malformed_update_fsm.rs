@@ -232,7 +232,8 @@ async fn open_sent_update_of_every_recovery_outcome_is_an_fsm_error_with_no_rout
             n,
             NotificationMessage {
                 error: NotificationError::FsmErrorOpenSent,
-                data: vec![]
+                // RFC 6608 §4: one octet, the type of the unexpected message.
+                data: vec![2]
             },
             "{payload:?}: OpenSent must answer with Finite State Machine Error subcode 1"
         );
@@ -275,7 +276,7 @@ async fn open_confirm_update_of_every_recovery_outcome_is_an_fsm_error_with_no_r
             n,
             NotificationMessage {
                 error: NotificationError::FsmErrorOpenConfirm,
-                data: vec![]
+                data: vec![2]
             },
             "{payload:?}: OpenConfirm must answer with Finite State Machine Error subcode 2"
         );

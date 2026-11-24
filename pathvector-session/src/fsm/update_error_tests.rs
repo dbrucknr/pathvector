@@ -196,10 +196,13 @@ fn no_route_update(out: &[FsmOutput]) -> bool {
     !out.iter().any(|o| matches!(o, FsmOutput::RouteUpdate(_)))
 }
 
+/// RFC 6608 §4: the FSM Error NOTIFICATION's Data is "a 1-octet, unsigned
+/// integer that indicates the type of the unexpected message" — 2 for UPDATE,
+/// whatever the RFC 7606 recovery outcome (a malformed UPDATE is an UPDATE).
 fn fsm_error_notification(error: NotificationError) -> FsmOutput {
     FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
         error,
-        data: vec![],
+        data: vec![2],
     }))
 }
 
@@ -265,7 +268,8 @@ fn rfc4271_8_2_2_connect_and_active_drop_to_idle_on_update_and_every_malformed_o
 /// 11-13, 20, 25-28), the local system: sends the NOTIFICATION with the
 /// Error Code Finite State Machine Error, ... drops the TCP connection, ...
 /// changes its state to Idle." RFC 6608 §3 supplies subcode 1 ("Receive
-/// Unexpected Message in OpenSent State"). This applies identically to a
+/// Unexpected Message in OpenSent State") and §4 the Data: the one-octet type
+/// of the unexpected message, here 2 (UPDATE). This applies identically to a
 /// valid UPDATE (Event 27) and to every RFC 7606 recovery outcome — including
 /// a session-reset error, whose own Update-error NOTIFICATION is *not* the
 /// one RFC 4271 requires here (Event 28 in OpenSent is an FSM error).
@@ -483,5 +487,63 @@ fn rfc4271_8_2_2_malformed_update_matches_normal_update_before_established() {
             assert_eq!(got, want, "{state:?} / {label}");
             assert_eq!(fsm.state(), baseline.state(), "{state:?} / {label}");
         }
+    }
+}
+
+/// RFC 6608 §4, all three states: the FSM Error NOTIFICATION's Data is the
+/// one-octet type of the *unexpected* message, so it follows the message
+/// received (1 OPEN, 3 NOTIFICATION is not "unexpected" in these states and
+/// is excluded; 4 KEEPALIVE, 5 ROUTE-REFRESH), not a fixed value.
+#[test]
+fn rfc6608_4_fsm_error_data_is_the_unexpected_message_type() {
+    let open = || peer_open();
+    let rr = || {
+        BgpMessage::RouteRefresh(crate::message::RouteRefreshMessage::new(
+            pathvector_types::AfiSafi::IPV4_UNICAST,
+        ))
+    };
+    // (state, message, expected type octet, expected error)
+    let cases = [
+        (
+            State::OpenSent,
+            rr(),
+            5,
+            NotificationError::FsmErrorOpenSent,
+        ),
+        (
+            State::OpenConfirm,
+            open(),
+            1,
+            NotificationError::FsmErrorOpenConfirm,
+        ),
+        (
+            State::OpenConfirm,
+            rr(),
+            5,
+            NotificationError::FsmErrorOpenConfirm,
+        ),
+        (
+            State::Established,
+            open(),
+            1,
+            NotificationError::FsmErrorEstablished,
+        ),
+        // RouteRefresh without the capability negotiated (this config
+        // advertises none) is unexpected in Established.
+        (
+            State::Established,
+            rr(),
+            5,
+            NotificationError::FsmErrorEstablished,
+        ),
+    ];
+    for (state, msg, type_code, error) in cases {
+        let mut fsm = fsm_in(state);
+        let out = fsm.process(FsmInput::MessageReceived(msg.clone()));
+        let want = FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
+            error,
+            data: vec![type_code],
+        }));
+        assert!(out.contains(&want), "{state:?} / {msg:?}: {out:?}");
     }
 }

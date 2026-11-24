@@ -309,6 +309,25 @@ impl BgpMessage {
         }
     }
 
+    /// The BGP message Type octet this message carries on the wire (RFC 4271
+    /// §4.1: 1 OPEN, 2 UPDATE, 3 NOTIFICATION, 4 KEEPALIVE; RFC 2918: 5
+    /// ROUTE-REFRESH). A [`BgpMessage::MalformedUpdate`] was received as an
+    /// UPDATE, so it reports 2.
+    ///
+    /// This is the value RFC 6608 §4 requires in the Data field of a Finite
+    /// State Machine Error NOTIFICATION identifying the unexpected message.
+    #[must_use]
+    pub fn type_code(&self) -> u8 {
+        match self {
+            Self::Open(_) => MsgType::Open,
+            Self::Update(_) | Self::MalformedUpdate(_) => MsgType::Update,
+            Self::Notification(_) => MsgType::Notification,
+            Self::Keepalive => MsgType::Keepalive,
+            Self::RouteRefresh(_) => MsgType::RouteRefresh,
+        }
+        .as_u8()
+    }
+
     /// Encode this message to wire format, including the 19-byte header,
     /// using four-octet AS numbers ([`AsnWidth::Four`]).
     ///
