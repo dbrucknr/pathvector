@@ -56,6 +56,10 @@ mod peer;
 mod policy;
 mod route;
 
+// Issue #68: conventional-GR stale routes keep their ordinary preference.
+#[cfg(test)]
+mod gr_preference_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use capabilities::{
@@ -17354,12 +17358,16 @@ mod test_gr_phase2 {
         );
     }
 
-    /// When a second established peer has an update_sender, stale-route
-    /// repropagation after stale marking must reach it via `flush_updates`.
-    /// This exercises `repropagate_after_stale_mark_v4` and the inner loop
-    /// that calls `propagate_prefix` + `flush_updates` for each peer.
+    /// `repropagate_after_stale_mark_v4` runs its per-peer loop over an
+    /// established observer, and — because a conventional-GR stale route
+    /// keeps its selection and staleness is never advertised — sends it
+    /// nothing. RFC 4724 §4.2: the routes are retained, not withdrawn; RFC
+    /// 9494 §1: conventional GR resolves the trade-off "in favor of not
+    /// advertising". (This test previously asserted that an UPDATE *was*
+    /// sent; what was sent was an identical duplicate of the route already
+    /// advertised — issue #68.)
     #[test]
-    fn stale_mark_repropagates_withdrawals_to_established_observer() {
+    fn stale_mark_sends_no_update_to_established_observer() {
         const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
         const OBS_AS: u32 = 65005;
 
@@ -17382,13 +17390,16 @@ mod test_gr_phase2 {
         let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
-        // Unclean disconnect — stale marking should propagate to OBS_IP.
+        // Unclean disconnect — the route is retained and marked stale.
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        // The observer must have received an UPDATE (withdrawal of the now-stale prefix).
         assert!(
-            obs_rx.try_recv().is_ok(),
-            "observer must receive an UPDATE after stale-route repropagation"
+            state.rib.loc_rib.best(&nlri("198.51.100.0/24")).is_some(),
+            "the route is retained"
+        );
+        assert!(
+            obs_rx.try_recv().is_err(),
+            "no UPDATE may be sent to the observer when a route is only marked stale"
         );
     }
 
@@ -17666,11 +17677,16 @@ mod test_gr_phase2 {
         );
     }
 
-    /// RFC 4724 §4.2 SHOULD — on unclean termination routes must be marked
-    /// stale in LocRib so a fresh route from a second peer immediately wins
-    /// best-path selection.
+    /// RFC 4724 §4.2 MUST — on unclean termination the retained routes are
+    /// marked stale in LocRib, and (RFC 9494 §1) "in conventional GR, route
+    /// preference is not affected": with equal attributes the retained route
+    /// keeps winning on the ordinary tie-breakers instead of losing to a fresh
+    /// route from a second peer. Previously named
+    /// `stale_marking_lets_fresh_peer_win_immediately`, which asserted the
+    /// opposite (issue #68); `daemon::gr_preference_tests` covers the
+    /// LOCAL_PREF case.
     #[test]
-    fn stale_marking_lets_fresh_peer_win_immediately() {
+    fn stale_marking_keeps_equally_preferred_route_selected() {
         const PEER2_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
         const PEER2_AS: u32 = 65003;
 
@@ -17688,36 +17704,33 @@ mod test_gr_phase2 {
             None,
         );
 
-        // Both peers announce the same prefix; PEER_IP wins (lower IP address tie-breaker).
+        // Both peers announce the same prefix with the same attributes;
+        // PEER_IP wins on the ordinary tie-breakers (older eBGP route, lower
+        // peer address).
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
-        // Same attributes as PEER_IP — tie-breaker (lower peer IP) decides winner.
         state.on_route_update(IpAddr::V4(PEER2_IP), announce(&["10.0.0.0/8"]));
 
         let winner_before = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
-        assert!(
-            winner_before.is_some(),
-            "must have a best path before termination"
+        assert_eq!(
+            winner_before.map(PeerId::ip),
+            Some(std::net::IpAddr::V4(PEER_IP)),
+            "precondition: PEER_IP wins the tie before termination"
         );
 
-        // PEER_IP disconnects uncleanly — its route is marked stale.
+        // PEER_IP disconnects uncleanly — its route is retained and marked stale.
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        // PEER2's fresh route must now be the best path.
         let best_after = state.rib.loc_rib.best(&nlri("10.0.0.0/8"));
-        assert!(
-            best_after.is_some(),
-            "route must still be present (held stale)"
+        assert_eq!(
+            best_after.map(|r| r.staleness),
+            Some(pathvector_rib::Staleness::GrStale),
+            "the retained route is marked stale"
         );
-        assert!(
-            !best_after.unwrap().stale,
-            "winning route must be the non-stale route from PEER2"
-        );
-
         let winner_after = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
         assert_eq!(
             winner_after.map(PeerId::ip),
-            Some(std::net::IpAddr::V4(PEER2_IP)),
-            "PEER2 must be the winning peer after PEER_IP's routes are marked stale"
+            Some(std::net::IpAddr::V4(PEER_IP)),
+            "staleness must not move the selection to PEER2"
         );
     }
 
@@ -17788,20 +17801,20 @@ mod test_gr_phase2 {
             .is_ok()
         {}
 
-        // Unclean termination of PEER_IP — COMPETING_IP's route must now win and
-        // repropagate_after_stale_mark_v6 must iterate over observer.
+        // Unclean termination of PEER_IP — repropagate_after_stale_mark_v6
+        // must iterate over the observer. Staleness does not change the
+        // selection (RFC 9494 §1), so nothing needs re-advertising; the key
+        // invariant is that the loop runs and a best route remains.
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.flush_pending();
 
-        // Observer should receive an UPDATE (re-announce from COMPETING_IP winning).
-        // The exact content depends on best-path: the key invariant is the loop ran.
         assert!(
             state
                 .rib
                 .loc_rib_v6
                 .best(&nlri_v6("2001:db8::/32"))
                 .is_some(),
-            "a best v6 route must still exist from COMPETING_IP"
+            "a best v6 route must still exist"
         );
     }
 
@@ -18225,6 +18238,15 @@ mod test_gr_phase2 {
         state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
         while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
+        // With accept-all import and no transformations, stale marking alone
+        // sends nothing (RFC 9494 §1), so the send path is only reachable
+        // when Adj-RIB-Out is out of step with Loc-RIB. Force that by
+        // forgetting what was advertised.
+        state
+            .adj_ribs_out_v6
+            .get_mut(&IpAddr::V4(OBS_IP))
+            .unwrap()
+            .withdraw(&nlri_v6("2001:db8::/32"));
         drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
@@ -18698,6 +18720,15 @@ mod test_gr_phase2 {
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
+        // With accept-all import and no transformations, stale marking alone
+        // sends nothing (RFC 9494 §1), so the send path is only reachable
+        // when Adj-RIB-Out is out of step with Loc-RIB. Force that by
+        // forgetting what was advertised.
+        state
+            .adj_ribs_out
+            .get_mut(&IpAddr::V4(OBS_IP))
+            .unwrap()
+            .withdraw(&nlri("10.0.0.0/8"));
         // Drop the observer's receiver so the next send fails.
         drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 

@@ -4,6 +4,66 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (pathvector-rib, pathvectord: conventional Graceful Restart keeps ordinary route preference — issue #68)
+
+### [pathvector-rib] Stale routes are no longer depreferenced
+
+`best_path::prefer` ranked any fresh route above any Graceful-Restart-stale
+route before every other criterion, so a peer restart could move selection
+(and forwarding) from a LOCAL_PREF-300 route to a LOCAL_PREF-100 one for the
+whole restart window. The test that proved it,
+`stale_loses_to_non_stale_before_all_other_criteria`, cited RFC 4724 §4.2 —
+which requires the opposite: the router "MUST NOT differentiate between stale
+and other routing information during forwarding" (kept verbatim by RFC 8538
+§4.1). RFC 9494 §1 is explicit: "in conventional GR, route preference is not
+affected"; only Long-Lived GR depreferences retained routes (§4.4), and only
+for a speaker that advertised the LLGR Capability (§4.3).
+
+- **Breaking (workspace-internal):** `Route::stale: bool` is replaced by
+  `Route::staleness: Staleness` (`Fresh` | `GrStale`, `#[non_exhaustive]`,
+  re-exported from the crate root). Its rustdoc carries the selection
+  semantics and RFC basis, and states that LLGR is not implemented — an LLGR
+  variant would be added separately rather than overloading `GrStale`.
+- `prefer` no longer reads staleness. A stale route competes on its
+  attributes until the peer replaces it, End-of-RIB sweeps it, or the
+  Restart Time expires (all unchanged).
+- `prepare_outbound` / `prepare_outbound_v6` reset staleness on the
+  advertised copy. Staleness took part in `Route`'s `PartialEq`, so marking a
+  selected route stale made the outbound copy differ from `AdjRibOut` and
+  re-sent an identical UPDATE for every retained prefix to every peer —
+  the churn RFC 9494 §1 says conventional GR avoids.
+
+### Tests
+
+- `pathvector-rib`: `conventional_gr_stale_route_keeps_its_higher_local_pref_preference`
+  (the issue's acceptance case), `..._with_lower_local_pref_still_loses`,
+  `..._wins_on_every_later_decision_step`, `conventional_gr_staleness_is_not_a_tie_breaker`
+  (§9.1.2.2 (f) and (g)); proptests `prop_conventional_gr_staleness_never_changes_the_winner`,
+  `prop_prefer_ignores_conventional_gr_staleness`, and
+  `prop_prefer_is_a_strict_total_order` (irreflexive, asymmetric, total,
+  transitive over every triple of 3–6 candidates, staleness mixed in);
+  `test_prepare_outbound_never_carries_staleness`; `AdjRibIn` mark/replace tests.
+- `pathvectord`: new `daemon/gr_preference_tests.rs` — iBGP LOCAL_PREF-300
+  route retained over a fresh LOCAL_PREF-100 one (Loc-RIB and FIB), no UPDATE
+  on stale marking (with and without an alternative, IPv4 and IPv6), fallback
+  to the fresh route on Restart Time expiry, replacement on re-announcement
+  and End-of-RIB sweep. All failed before the fix.
+- Rewritten because they asserted the old behavior:
+  `stale_marking_lets_fresh_peer_win_immediately` →
+  `stale_marking_keeps_equally_preferred_route_selected`;
+  `stale_mark_repropagates_withdrawals_to_established_observer` →
+  `stale_mark_sends_no_update_to_established_observer`. The two
+  repropagation stall-path tests now force an Adj-RIB-Out desync, since stale
+  marking alone no longer sends anything.
+
+Found while writing the ordering proptest, **not** fixed here (unrelated to
+staleness): step (f) is skipped when only one side's BGP Identifier is known,
+which is not transitive — with ids `a=1`, `b=None`, `c=2` on peers `.3`,
+`.2`, `.1`, `c ≻ b ≻ a ≻ c`. The proptest keeps each candidate set
+all-known or all-unknown and documents why.
+
+---
+
 ## 2026-11-23 (issue #67: withdraw when an UPDATE removes the last feasible path)
 
 `LocRib::insert` returned `BestPathChange::Unchanged` whenever no best route

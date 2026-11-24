@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc fcb4b4d18e49e6de9c62bacc2d08c6f5d56e0fe30328bc97becf230ad2b079eb # shrinks to med_a = Some(525), med_b = None
+cc b25855dae43a82b9f6c1ed705d4ca3f88345a95a70bdae7844a7c261cfb3e49d # shrinks to specs = [Candidate { local_pref: None, neighbor_as: 1, path_len: 1, origin: Igp, med: None, peer_type: Internal, received_at: 0, bgp_id: 1, staleness: Fresh }, Candidate { local_pref: None, neighbor_as: 1, path_len: 1, origin: Igp, med: None, peer_type: External, received_at: 0, bgp_id: 1, staleness: GrStale }], known_bgp_ids = false
