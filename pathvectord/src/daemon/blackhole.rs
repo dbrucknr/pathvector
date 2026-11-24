@@ -79,7 +79,7 @@ impl<A: IpAddress> AuthorizedBlackhole<A> {
 /// # ROV exception
 ///
 /// RFC 7999 §3.3: "An operator MUST ensure that origin validation techniques
-/// (such as the one described in [RFC6811]) do not inadvertently block
+/// (such as the one described in RFC 6811) do not inadvertently block
 /// legitimate announcements carrying the BLACKHOLE community." A legitimate
 /// host blackhole (`/32`, `/128`) is routinely longer than any ROA
 /// `maxLength`, so ordinary ROV would mark it Invalid. The exception is
