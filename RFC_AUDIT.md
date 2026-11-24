@@ -736,6 +736,23 @@ verifiable given the larger gap. No new `TODO.md` item — the existing
 deferred entry in `pathvector-session/RFC.md` already accurately describes
 this.
 
+**Update 2026-11-24 (issue #95) — gap closed, and a larger one found in the
+same audit's blind spot.** The audit above checked the *daemon's* handling of
+`AS4_PATH` and rated the encode side "Confirmed correct" because
+`AsPath::downgrade_for_two_byte_peer` substitutes AS_TRANS. It never looked at
+the *wire codec*, which wrote every `AS_PATH` ASN as four octets and read
+them as four octets regardless of the negotiated capability — so the
+substitution changed numbers, not widths, and a genuine two-octet UPDATE
+(`02 01 fd ea`) was rejected as a truncated AS_PATH and withdrawn. The
+receive-side reconstruction (§4.2.3), confed-in-AS4_PATH discard and
+malformed-`AS4_PATH` rules are now implemented in `pathvector-session`
+(`reconcile_as4_attributes`) with `AsPath::reconstruct_with_as4_path`; the
+NEW-NEW "MUST be discarded" clause is now an explicit discard (and is
+reported for logging) rather than an accident of the daemon ignoring the
+attribute. See `pathvector-session/RFC.md` for the clause-by-clause table.
+Lesson consistent with `CLAUDE.md`: an "implemented" row verified at one
+layer says nothing about the layer beneath it.
+
 ---
 
 # RFC 6396 — MRT Routing Information Export Format

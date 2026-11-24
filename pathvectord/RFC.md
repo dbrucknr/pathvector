@@ -118,8 +118,10 @@ last-sent stamp, so a re-announcement right after a withdrawal goes out immediat
 AS_TRANS (23456) and appending the original path as AS4_PATH (type 17, flags 0xC0 =
 optional+transitive) so downstream 4-byte-capable routers can reconstruct the full path.  
 **Boundary:** `Asn::TRANS` constant and `AsPath::downgrade_for_two_byte_peer()` live in
-`pathvector-types`. Inbound AS4_PATH merging (receiving from 2-byte peers) is owned by
-`pathvector-session`.  
+`pathvector-types`. The wire form (two-octet `AS_PATH`/`AGGREGATOR`, AS_TRANS, and a
+generated `AS4_PATH`/`AS4_AGGREGATOR` if the daemon did not attach one) and inbound AS4_PATH
+merging (receiving from 2-byte peers) are owned by `pathvector-session`, which the daemon
+reaches through the negotiated `AsnWidth`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc6793#section-4
 
 | Requirement | File | Status | Verified by |
@@ -129,6 +131,8 @@ optional+transitive) so downstream 4-byte-capable routers can reconstruct the fu
 | No AS_TRANS / AS4_PATH for 4-byte-capable peers | `src/outbound.rs` | ✅ | `four_byte_asn_to_four_byte_peer_no_trans_no_as4_path` |
 | No AS4_PATH when all ASNs fit in 2 bytes (no substitution occurred) | `src/outbound.rs` | ✅ | `two_byte_asns_to_two_byte_peer_no_trans_no_as4_path` |
 | AS4_PATH appears as last attribute (2-byte speakers can skip unknown optional attributes) | `src/outbound.rs` | ✅ | `as4_path_is_last_attribute_for_two_byte_peer` |
+| No AS4_PATH when the only four-byte ASN is in a confed segment (§4.2.2 "MUST NOT send" — nothing non-mappable left after stripping confed) | `src/outbound.rs` `push_as4_side_channel` | ✅ | `no_as4_path_when_the_only_four_byte_asn_is_in_a_confed_segment` |
+| AS4_AGGREGATOR for a non-mappable aggregating AS toward a 2-byte peer; never for a mappable AS or a 4-byte peer | `src/outbound.rs` `push_as4_side_channel` | ✅ | `as4_aggregator_only_for_non_mappable_aggregator_toward_two_byte_peer` |
 | E2e verification against real 2-byte-only peer (GoBGP `--as2` mode) | — | ❌ | — |
 
 **Deferred:** E2e test against GoBGP in 2-byte-only mode to verify wire format on a live session.

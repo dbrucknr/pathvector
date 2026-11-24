@@ -50,6 +50,60 @@ accepts every connection, paused clock for expiry) all fail on the previous `mai
 pass now, plus 36 socket-free unit tests of the state machine and timers and 4 of config validation. Not changed (separate
 issues): #89, #91, #92, #93, #94.
 
+## 2026-11-24 (RFC 6793: AS_PATH and AGGREGATOR used four-octet ASNs on every session)
+
+**Bug (issue #95).** `pathvector-session` read and wrote every ASN in `AS_PATH` as four
+octets, whatever the peer negotiated; `AGGREGATOR` was width-aware on decode only. A valid
+UPDATE from a peer without the four-octet AS capability — `AS_PATH` value `02 01 fd ea`,
+AS_SEQUENCE of AS 65002 — was rejected as a truncated segment and its NLRI withdrawn, and
+some longer legacy paths whose bytes happened to tile as four-octet ASNs were silently
+misparsed into garbage ASNs. On the send side an OLD peer received four-octet `AS_PATH` and an
+8-byte `AGGREGATOR`. The daemon's AS_TRANS substitution (`downgrade_for_two_byte_peer`) only
+changed the ASN values, never the widths, and `AS4_PATH`/`AS4_AGGREGATOR` from an OLD peer
+were never read into the path (the RFC 6793 §4.2.3 gap tracked since 2026-07-16).
+
+**Fix.** A new `AsnWidth { Two, Four }` (`AsnWidth::negotiate(local, peer)`: four-octet only
+if the capability was advertised to *and* received from the peer) replaces the bare
+`four_byte_asn: bool`. The transport derives it once at `SessionEstablished` and hands it to
+*both* the reading and the writing `BgpCodec` (the writer previously never learned the
+negotiated capabilities). The codec then implements RFC 6793 in full:
+
+- receive, two-octet peer: two-octet `AS_PATH`/`AGGREGATOR`; `AS4_PATH` merged into `AS_PATH`
+  by the new `AsPath::reconstruct_with_as4_path` (§4.2.3: N<M ignores `AS4_PATH`; otherwise
+  prepend the N−M leading hops, keeping leading/adjacent confed segments);
+  `AS4_AGGREGATOR` replaces an `AS_TRANS` `AGGREGATOR`, and a non-`AS_TRANS` `AGGREGATOR`
+  makes `AS4_AGGREGATOR` and `AS4_PATH` ignored; confed segments in `AS4_PATH` are discarded
+  and reported; malformed `AS4_PATH` is attribute-discard (§6);
+- receive, four-octet peer: `AS4_PATH`/`AS4_AGGREGATOR` are discarded and reported (§4.1, §6);
+- send, two-octet peer: two-octet `AS_PATH`/`AGGREGATOR`, `AS_TRANS` for non-mappable ASNs,
+  and `AS4_PATH` (confed excluded; omitted when every ASN is mappable) / `AS4_AGGREGATOR`
+  generated when the caller has not attached them (§4.2.2);
+- send, four-octet peer: `AS4_*` are never written (§4.1);
+- RFC 7606 §7.2: a zero-length `AS_PATH` segment is now treat-as-withdraw (it was accepted);
+  segments over 255 ASNs are split on encode instead of wrapping the one-octet count.
+
+`pathvectord` now also builds the `AS4_AGGREGATOR` for a non-mappable aggregator and omits
+`AS4_PATH` when the only four-byte ASN sits in a confed segment (§4.2.2 "MUST NOT send"),
+so UPDATE packing sees the true attribute sizes. `BgpCodec::set_four_byte_asn(bool)` and
+`BgpTransport::set_four_byte_asn` became `set_asn_width(AsnWidth)`;
+`BgpMessage::decode_with_limit_and_caps` is public and takes an `AsnWidth`;
+`BgpMessage::encode_with(AsnWidth)` is new (`encode()` = four-octet, as before).
+
+**Proof.** 35 wire-level tests in `message/asn_width_tests.rs` use hand-derived RFC bytes (the
+issue's exact `02 01 fd ea`, a misparse-prone multi-segment path, AS_TRANS + `AS4_PATH`
+merge, every §4.2.3/§6 branch, exact encode bytes, the 255 limit) plus five new proptest
+properties; three loopback-TCP tests in `tests/transport.rs` drive a raw-socket legacy peer
+through the whole OPEN → negotiation → codec chain in both directions. Mutating the codec to
+ignore the width fails 21 of the original 34 of them; removing the transport's `set_asn_width` call
+fails both legacy-peer TCP tests. `session_message` fuzz target now decodes at both widths.
+Not covered: a live run against a real two-octet-only speaker (still tracked in `TODO.md`).
+Related and untouched: #96 (extended-message/AS-width setup reads possibly stale
+`Session.config` capabilities — `AsnWidth::negotiate` is now the single place to fix it for
+the AS width), #97 (outbound size/length overflow — the segment split here removes only the
+`AS_PATH` count wrap).
+
+---
+
 ## 2026-11-23 (IPv6 ECMP: re-read a set after a delete leaves an inferred head)
 
 Follow-up to PR #122. A dump describes an IPv6 ECMP set only through its first sibling,

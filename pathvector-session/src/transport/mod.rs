@@ -25,7 +25,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use crate::framing::{BgpCodec, FramingError};
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
 use crate::message::{
-    AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CodecError,
+    AsnWidth, AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CodecError,
     MalformedUpdate, MpUnreachNlri, MsgHeaderError, NotificationError, NotificationMessage,
     OpenMessage, OpenMsgError, PathAttribute, UpdateMessage, UpdateMsgError,
 };
@@ -173,10 +173,10 @@ pub trait BgpTransport: Send + 'static {
     /// Raise (or lower) the message size limit after Extended Message capability
     /// (RFC 8654) is negotiated. Default implementation is a no-op.
     fn set_extended_message(&mut self, _enabled: bool) {}
-    /// Record whether RFC 6793's 4-octet AS number capability was negotiated
-    /// bilaterally with the peer, governing AGGREGATOR's expected length
-    /// (RFC 7606 §7.7). Default implementation is a no-op.
-    fn set_four_byte_asn(&mut self, _negotiated: bool) {}
+    /// Set the width of AS numbers on this session (RFC 6793 §4), for both
+    /// decoding received and encoding sent UPDATEs. Default implementation
+    /// is a no-op.
+    fn set_asn_width(&mut self, _width: AsnWidth) {}
 }
 
 // ── Production transport impl ─────────────────────────────────────────────────
@@ -210,8 +210,11 @@ impl BgpTransport for FramedBgpTransport {
         self.reader.decoder_mut().set_extended_message(enabled);
     }
 
-    fn set_four_byte_asn(&mut self, negotiated: bool) {
-        self.reader.decoder_mut().set_four_byte_asn(negotiated);
+    fn set_asn_width(&mut self, width: AsnWidth) {
+        self.reader.decoder_mut().set_asn_width(width);
+        // The writer's codec is a separate instance: without this the
+        // outbound side would keep encoding four-octet ASNs to an OLD peer.
+        self.writer.encoder_mut().set_asn_width(width);
     }
 }
 
@@ -1355,22 +1358,15 @@ impl<T: BgpTransport> Session<T> {
                             .config
                             .capabilities
                             .contains(&Capability::ExtendedMessage);
-                    // RFC 7606 §7.7 / RFC 6793: AGGREGATOR's expected length
-                    // depends on whether the 4-octet AS number capability was
-                    // negotiated bilaterally — advertised to *and* received
-                    // from the peer, not just one direction.
-                    let four_byte_asn = info
-                        .peer_capabilities
-                        .iter()
-                        .any(|c| matches!(c, Capability::FourByteAsn(_)))
-                        && self
-                            .config
-                            .capabilities
-                            .iter()
-                            .any(|c| matches!(c, Capability::FourByteAsn(_)));
+                    // RFC 6793 §4: the AS-number width of AS_PATH / AGGREGATOR
+                    // is a bilateral decision — advertised to *and* received
+                    // from the peer. Decided here, once; the codec only
+                    // ever receives the result.
+                    let asn_width =
+                        AsnWidth::negotiate(&self.config.capabilities, &info.peer_capabilities);
                     if let Some(t) = &mut self.transport {
                         t.set_extended_message(extended);
-                        t.set_four_byte_asn(four_byte_asn);
+                        t.set_asn_width(asn_width);
                     }
                     info.local_addr = self.local_addr;
                     let _ = self.event_tx.send(SessionEvent::Established(info)).await;
