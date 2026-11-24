@@ -255,7 +255,7 @@ impl<A: IpAddress> LocRib<A> {
         if !peers.contains(&peer) {
             peers.push(peer);
         }
-        self.recompute_best(nlri, oracle);
+        self.recompute_best(nlri, previous, oracle);
 
         let next = self.best.get(nlri.prefix());
         self.change_for(nlri, BestTransition::between(previous, next, Some(peer)))
@@ -293,10 +293,10 @@ impl<A: IpAddress> LocRib<A> {
             false
         };
         if has_remaining {
-            self.recompute_best(*nlri, oracle);
+            self.recompute_best(*nlri, previous, oracle);
         } else {
             self.peer_index.remove(nlri);
-            self.best.set(nlri.prefix(), None);
+            self.best.set(nlri.prefix(), previous, None);
         }
 
         // `peer`'s candidate is gone, so it cannot be the next winner: no
@@ -431,7 +431,7 @@ impl<A: IpAddress> LocRib<A> {
             .into_iter()
             .filter_map(|nlri| {
                 let previous = self.best.get(nlri.prefix());
-                self.recompute_best(nlri, oracle);
+                self.recompute_best(nlri, previous, oracle);
                 let next = self.best.get(nlri.prefix());
                 match self.change_for(nlri, BestTransition::between(previous, next, None)) {
                     BestPathChange::Unchanged => None,
@@ -456,7 +456,13 @@ impl<A: IpAddress> LocRib<A> {
         }
     }
 
-    fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
+    /// `previous` is the prefix's winner as the caller just read it.
+    fn recompute_best(
+        &mut self,
+        nlri: Nlri<A>,
+        previous: Option<PeerId>,
+        oracle: &dyn NextHopOracle,
+    ) {
         // Use peer_index for O(k) lookup instead of scanning the full flat map.
         // Clone routes into a temp AHashMap — k is typically 1–8, negligible cost.
         let peer_map: AHashMap<PeerId, Route<A>> = self
@@ -468,9 +474,9 @@ impl<A: IpAddress> LocRib<A> {
             .collect();
 
         if let Some((peer, _)) = select_best_with_oracle(&peer_map, oracle) {
-            self.best.set(nlri.prefix(), Some(peer));
+            self.best.set(nlri.prefix(), previous, Some(peer));
         } else {
-            self.best.set(nlri.prefix(), None);
+            self.best.set(nlri.prefix(), previous, None);
         }
     }
 }
@@ -691,7 +697,7 @@ mod tests {
             .get_mut(&n)
             .unwrap()
             .retain(|p| *p != peer(1));
-        rib.recompute_best(n, &AlwaysReachable);
+        rib.recompute_best(n, rib.best_peer(&n), &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());
     }
@@ -701,7 +707,7 @@ mod tests {
         // Calls recompute_best directly with a prefix that is not in candidates.
         // Covers the implicit else-fallthrough of `if let Some(peer_map)`.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.recompute_best(nlri("10.0.0.0/8"), &AlwaysReachable);
+        rib.recompute_best(nlri("10.0.0.0/8"), None, &AlwaysReachable);
         assert!(rib.is_empty());
     }
 

@@ -45,8 +45,19 @@ impl<A: IpAddress> BestTable<A> {
 
     /// Makes `winner` the winner of `prefix` (`None` clears it), keeping the
     /// per-peer counts in step. The single mutation point of the table.
-    pub(crate) fn set(&mut self, prefix: IpPrefix<A>, winner: Option<PeerId>) {
-        let previous = self.get(prefix);
+    ///
+    /// The caller passes the winner it has just read as `previous` (every
+    /// `LocRib` mutation already does, to classify the transition), which
+    /// saves a second walk of the prefix tree on the insert hot path.
+    /// `previous` must equal [`get`](Self::get) for `prefix`; debug builds
+    /// assert it.
+    pub(crate) fn set(
+        &mut self,
+        prefix: IpPrefix<A>,
+        previous: Option<PeerId>,
+        winner: Option<PeerId>,
+    ) {
+        debug_assert_eq!(previous, self.get(prefix), "stale `previous` winner");
         if previous == winner {
             return;
         }
