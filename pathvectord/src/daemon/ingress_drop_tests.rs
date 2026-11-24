@@ -855,7 +855,8 @@ fn run(
 // ── Graceful Restart must not resurrect ineligible routes ────────────────────
 
 /// A, B and C established; A advertises Graceful Restart for IPv4 and IPv6
-/// unicast, so an unclean drop retains its routes (RFC 4724 §4.2).
+/// unicast, so an unclean drop retains its routes (RFC 4724 §4.2), and our
+/// session address toward A is `OWN_V4`.
 fn established_gr() -> (DaemonState, Receivers) {
     use pathvector_session::message::{Capability, GracefulRestartFamily};
     let (mut state, mut receivers) = crate::daemon::tests::make_state(
@@ -894,7 +895,7 @@ fn established_gr() -> (DaemonState, Receivers) {
         AS_A,
         90,
         &a_caps,
-        None,
+        Some(IpAddr::V4(OWN_V4)),
     );
     for (ip, asn) in [(PEER_B, super::last_feasible_tests::AS_B), (PEER_C, AS_C)] {
         state.on_established(IpAddr::V4(ip), ip, PeerType::External, asn, 90, &mp, None);
@@ -998,6 +999,95 @@ fn graceful_restart_does_not_resurrect_policy_rejected_routes() {
 
     assert!(state.rib.loc_rib.best(&n4()).is_none());
     assert!(state.rib.loc_rib_v6.best(&n6()).is_none());
+}
+
+/// Soft reconfiguration during the GR window (a ROA-cache change, a new import
+/// default) re-judges the retained routes. Teardown forgets the live session's
+/// local address, but RFC 4271 §6.3 (a) still forbids installing a route whose
+/// NEXT_HOP is our own address, so it must stay rejected (Codex review of #139).
+#[test]
+fn own_next_hop_stays_rejected_through_soft_reconfiguration_in_the_gr_window() {
+    let (mut state, mut receivers) = established_gr();
+
+    state.on_route_update(IpAddr::V4(PEER_A), v4(&[AS_A], RESOLVABLE_V4));
+    state.on_route_update(IpAddr::V4(PEER_A), Fault::OwnNextHop.update_v4());
+    drain(&mut state, &mut receivers);
+    assert!(state.rib.loc_rib.best(&n4()).is_none());
+
+    state.on_terminated(
+        IpAddr::V4(PEER_A),
+        pathvector_session::transport::TerminationReason::Unclean,
+        true,
+    );
+    assert!(state.gr.deadlines.contains_key(&IpAddr::V4(PEER_A)));
+    assert!(
+        !state.rib.local_addrs.contains_key(&IpAddr::V4(PEER_A)),
+        "precondition: teardown forgot the live session's local address"
+    );
+    assert!(state.rib.loc_rib.best(&n4()).is_none());
+
+    state.reevaluate_all_import_policies();
+
+    assert!(
+        state.rib.loc_rib.best(&n4()).is_none(),
+        "RFC 4271 §6.3 (a): re-evaluation installed a route whose NEXT_HOP is our own address"
+    );
+}
+
+/// RFC 4760 §3: an UPDATE "that carries no NLRI, other than the one encoded in
+/// the MP_REACH_NLRI attribute, SHOULD NOT carry the NEXT_HOP attribute. If
+/// such a message contains the NEXT_HOP attribute, the BGP speaker that
+/// receives the message SHOULD ignore this attribute." An unused classic
+/// NEXT_HOP of 0.0.0.0 must therefore not withdraw the valid MP_REACH routes
+/// (Codex review of #139). Once the classic NLRI field uses it, it applies
+/// (`invalid_next_hop_attribute_withdraws_every_nlri_of_the_update`).
+#[test]
+fn unused_classic_next_hop_is_ignored_when_mp_reach_is_the_only_nlri() {
+    let (mut state, mut receivers) = established();
+    let alt_v6: Ipv6Addr = "2001:db8::44".parse().unwrap();
+
+    state.on_route_update(IpAddr::V4(PEER_A), v6(&[AS_A], RESOLVABLE_V6));
+    state.on_route_update(
+        IpAddr::V4(PEER_A),
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                path(&[AS_A]),
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    next_hop: NextHop::V4(RESOLVABLE_V4),
+                    prefixes: vec![Prefix::V4(n4())],
+                }),
+            ],
+            announced: vec![],
+        },
+    );
+    drain(&mut state, &mut receivers);
+
+    let mut replacement = v6(&[AS_A], alt_v6);
+    replacement
+        .attributes
+        .push(PathAttribute::NextHop(Ipv4Addr::UNSPECIFIED));
+    replacement
+        .attributes
+        .push(PathAttribute::MpReachNlri(MpReachNlri {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            next_hop: NextHop::V4(RESOLVABLE_V4_ALT),
+            prefixes: vec![Prefix::V4(n4())],
+        }));
+    state.on_route_update(IpAddr::V4(PEER_A), replacement);
+
+    assert_eq!(
+        state.rib.loc_rib_v6.best(&n6()).and_then(|r| r.next_hop),
+        Some(NextHop::V6(alt_v6)),
+        "RFC 4760 §3: the unused NEXT_HOP is ignored; the IPv6 route is replaced"
+    );
+    assert_eq!(
+        state.rib.loc_rib.best(&n4()).and_then(|r| r.next_hop),
+        Some(NextHop::V4(RESOLVABLE_V4_ALT)),
+        "RFC 4760 §3: the MP_REACH IPv4 route is replaced too"
+    );
 }
 
 // ── BLACKHOLE tags are never retained on a dropped route ─────────────────────

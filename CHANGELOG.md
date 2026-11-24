@@ -43,7 +43,11 @@ IPv4/IPv6 lists was worse: the NLRI were cleared without being counted or logged
   built before teardown forgets the local address); a syntactically invalid NEXT_HOP
   *attribute* withdraws every NLRI of the UPDATE (RFC 7606 §2); a dropped BLACKHOLE-tagged
   announcement is not retained, so its tag cannot later be mistaken for an installed null
-  route.
+  route. Second review round: the gate falls back to `GracefulRestartState::retained_local_v4`
+  (our last IPv4 address toward the peer), so own-NEXT_HOP routes stay rejected when a ROA or
+  default-policy change re-evaluates the retained routes after teardown cleared `local_addrs`;
+  and the whole-UPDATE NEXT_HOP check applies only when the classic NLRI field uses the
+  attribute (RFC 4760 §3: MP-only UPDATEs ignore a stray NEXT_HOP).
 
 Regression tests: `daemon/ingress_drop_tests.rs` — through `DaemonState::on_route_update`,
 sole best replaced, takeover, no earlier route, mixed UPDATEs, re-evaluation, BLACKHOLE,

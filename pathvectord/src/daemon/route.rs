@@ -1468,9 +1468,14 @@ pub(super) fn handle_update(
     // UPDATE message, so *every* route it announces is withdrawn, whichever
     // NLRI field or MP_REACH_NLRI carries it (issue #138). An MP_REACH_NLRI
     // next hop is not the NEXT_HOP attribute and is judged per attribute below.
+    // RFC 4760 §3: an UPDATE "that carries no NLRI, other than the one encoded in
+    // the MP_REACH_NLRI attribute, SHOULD NOT carry the NEXT_HOP attribute. If
+    // such a message contains the NEXT_HOP attribute, the BGP speaker that
+    // receives the message SHOULD ignore this attribute." So the attribute is
+    // only checked when the classic NLRI field actually uses it.
     if let Some(nh) = next_hop
+        && !msg.announced.is_empty()
         && gate.check_next_hop(&nh) == Some(IngressDrop::NextHopSyntax)
-        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
     {
         tracing::warn!(
             peer = %peer,

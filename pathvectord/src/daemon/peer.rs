@@ -309,6 +309,9 @@ impl DaemonState {
                 rib.local_addrs.insert(peer_ip, addr);
             }
         }
+        if let Some(IpAddr::V4(addr)) = local_addr {
+            self.gr.retained_local_v4.insert(peer_ip, addr);
+        }
 
         // Record negotiated message size limit for NLRI batching.
         let max_len = if peer_capabilities.contains(&Capability::ExtendedMessage)
@@ -593,8 +596,9 @@ impl DaemonState {
             && gr_restart_time > 0
             && (reason == TerminationReason::Unclean || notification_gr_eligible);
 
-        // The pre-policy checks need our address toward this peer, which the
-        // block below forgets; GR re-judges the retained routes after it.
+        // Built before the block below forgets the live session's address
+        // (`ingress_gate` falls back to `gr.retained_local_v4`, so later soft
+        // reconfiguration judges the retained routes the same way).
         let gate = self.ingress_gate(peer_ip);
 
         // Remove live session state from snapshot.

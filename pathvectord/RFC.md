@@ -103,6 +103,12 @@ Notes:
   test `invalid_next_hop_attribute_withdraws_every_nlri_of_the_update`). An invalid
   *MP_REACH_NLRI* next hop is not the NEXT_HOP attribute, so it stays scoped to that
   attribute's own NLRI (`invalid_mp_reach_next_hop_withdraws_only_its_own_nlri_v4_good_v6_bad`).
+  RFC 4760 §3 carves out the MP-only case: an UPDATE "that carries no NLRI, other than the
+  one encoded in the MP_REACH_NLRI attribute, SHOULD NOT carry the NEXT_HOP attribute. If
+  such a message contains the NEXT_HOP attribute, the BGP speaker that receives the message
+  SHOULD ignore this attribute." RFC 7606 does not remove it, so the attribute is checked
+  only when the classic NLRI field uses it
+  (`unused_classic_next_hop_is_ignored_when_mp_reach_is_the_only_nlri`).
   Our own address as NEXT_HOP is semantic (§6.3 (a)), so it is per-route `Ineligible`.
 - If both an `Ineligible` and a `TreatAsWithdraw` reason apply, treat-as-withdraw wins
   (`IngressDrop::most_severe`).
@@ -111,7 +117,10 @@ Notes:
   `reapply_import_policy`, and Graceful Restart stale marking (`mark_stale_and_repropagate`
   re-judges each retained route with `ImportDecision::evaluate_gated`; RFC 4724 §4.2
   retains routes, it does not make an ineligible one eligible). The gate is built before
-  teardown forgets the local address, so own-NEXT_HOP routes stay rejected. It counts toward
+  teardown forgets the local address, and `GracefulRestartState::retained_local_v4` keeps our
+  last address toward the peer for the life of the retained routes, so own-NEXT_HOP routes stay
+  rejected through later soft reconfiguration too
+  (`own_next_hop_stays_rejected_through_soft_reconfiguration_in_the_gr_window`). It counts toward
   max-prefix like a policy-rejected route.
 - A BLACKHOLE-tagged (RFC 7999) announcement that is dropped is **not** retained: no null
   route is installed for it, and a stored tag would later read as "this peer owns a kernel

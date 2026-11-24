@@ -49,10 +49,15 @@ impl DaemonState {
         IngressGate::new(
             self.rib.local_as,
             self.rib.confederation_id,
-            self.rib.local_addrs.get(&peer_ip).and_then(|a| match a {
-                IpAddr::V4(v4) => Some(*v4),
-                IpAddr::V6(_) => None,
-            }),
+            self.rib
+                .local_addrs
+                .get(&peer_ip)
+                .and_then(|a| match a {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                })
+                // The live session is gone but its routes may be retained (GR).
+                .or_else(|| self.gr.retained_local_v4.get(&peer_ip).copied()),
             self.rib.local_ipv6,
         )
     }
