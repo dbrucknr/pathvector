@@ -67,6 +67,13 @@ mod peer;
 mod policy;
 mod route;
 
+// Issues #81 and #82: BLACKHOLE authorization and import eligibility through
+// Graceful Restart.
+#[cfg(test)]
+mod blackhole_tests;
+#[cfg(test)]
+mod issue_81_82_tests;
+
 // Issue #68: conventional-GR stale routes keep their ordinary preference.
 #[cfg(test)]
 mod gr_preference_tests;

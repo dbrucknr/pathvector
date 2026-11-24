@@ -127,7 +127,7 @@ impl DaemonState {
                 if let Some(effects) = self.reimport_peer_v4(peer_ip, gate) {
                     self.program_fib_v4(effects);
                 }
-                self.repropagate_after_stale_mark_v4(peer_ip, &affected);
+                self.repropagate_peer_prefixes_v4(peer_ip, &affected);
                 self.emit_route_events(&affected);
             }
         }
@@ -146,15 +146,19 @@ impl DaemonState {
                 if let Some(effects) = self.reimport_peer_v6(peer_ip, gate) {
                     self.program_fib_v6(effects);
                 }
-                self.repropagate_after_stale_mark_v6(peer_ip, &affected);
+                self.repropagate_peer_prefixes_v6(peer_ip, &affected);
             }
         }
     }
 
-    /// Propagates v4 best-path changes caused by stale marking to other peers.
-    /// `affected` is the peer's own prefixes — the only ones re-import can
-    /// change.
-    fn repropagate_after_stale_mark_v4(&mut self, peer_ip: IpAddr, affected: &[Nlri<Ipv4Addr>]) {
+    /// Propagates the IPv4 best-path changes a peer's own prefixes caused
+    /// (stale re-import, or a flushed family) to the other peers. `affected`
+    /// is the peer's own prefixes — the only ones that can have changed.
+    pub(super) fn repropagate_peer_prefixes_v4(
+        &mut self,
+        peer_ip: IpAddr,
+        affected: &[Nlri<Ipv4Addr>],
+    ) {
         let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
@@ -229,8 +233,12 @@ impl DaemonState {
         }
     }
 
-    /// Propagates v6 best-path changes caused by stale marking to other peers.
-    fn repropagate_after_stale_mark_v6(&mut self, peer_ip: IpAddr, affected: &[Nlri<Ipv6Addr>]) {
+    /// IPv6 counterpart of [`repropagate_peer_prefixes_v4`](Self::repropagate_peer_prefixes_v4).
+    pub(super) fn repropagate_peer_prefixes_v6(
+        &mut self,
+        peer_ip: IpAddr,
+        affected: &[Nlri<Ipv6Addr>],
+    ) {
         let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types

@@ -496,27 +496,56 @@ impl DaemonState {
         );
     }
 
-    /// Releases every blackhole `peer_ip` holds in the IPv4 book and programs
-    /// the resulting null-route withdrawals (a session ended, or a family left
-    /// Graceful Restart). RFC 7999 null routes bypass the Loc-RIB, so
-    /// `rib_withdraw_peer_v4` never sees them; the book is the record of what
-    /// the peer owns, so nothing is inferred from stored route attributes and
-    /// a prefix another peer still holds keeps its null route.
-    pub(super) fn release_peer_blackholes_v4(&mut self, peer_ip: IpAddr) {
-        let changes = self.blackholes.v4.release_peer(PeerId::from(peer_ip));
-        self.program_fib_v4(RibEffects {
-            best: Vec::new(),
-            blackhole: changes,
-        });
+    /// Removes everything `peer_ip` contributed to the IPv4 tables — the
+    /// Adj-RIB-In, its Loc-RIB candidates and its blackhole claims — programs
+    /// the FIB, and propagates the changes to the other peers. Used for an
+    /// address family a Graceful Restart peer did not advertise.
+    pub(super) fn flush_family_v4(&mut self, peer_ip: IpAddr) {
+        let nlris: Vec<Nlri<Ipv4Addr>> = self
+            .adj_ribs_in
+            .get_mut(&peer_ip)
+            .map(|ari| {
+                let held = ari.routes().map(|(n, _)| *n).collect();
+                ari.clear();
+                held
+            })
+            .unwrap_or_default();
+        let oracle = Arc::clone(&self.oracle_v4);
+        let effects = retire_routes(
+            PeerId::from(peer_ip),
+            nlris.iter().copied(),
+            None,
+            &mut Arc::make_mut(&mut self.rib).loc_rib,
+            &mut self.blackholes.v4,
+            &*oracle,
+        );
+        self.program_fib_v4(effects);
+        self.repropagate_peer_prefixes_v4(peer_ip, &nlris);
+        self.emit_route_events(&nlris);
     }
 
-    /// IPv6 counterpart of [`release_peer_blackholes_v4`](Self::release_peer_blackholes_v4).
-    pub(super) fn release_peer_blackholes_v6(&mut self, peer_ip: IpAddr) {
-        let changes = self.blackholes.v6.release_peer(PeerId::from(peer_ip));
-        self.program_fib_v6(RibEffects {
-            best: Vec::new(),
-            blackhole: changes,
-        });
+    /// IPv6 counterpart of [`flush_family_v4`](Self::flush_family_v4).
+    pub(super) fn flush_family_v6(&mut self, peer_ip: IpAddr) {
+        let nlris: Vec<Nlri<Ipv6Addr>> = self
+            .adj_ribs_in_v6
+            .get_mut(&peer_ip)
+            .map(|ari| {
+                let held = ari.routes().map(|(n, _)| *n).collect();
+                ari.clear();
+                held
+            })
+            .unwrap_or_default();
+        let oracle = Arc::clone(&self.oracle_v6);
+        let effects = retire_routes(
+            PeerId::from(peer_ip),
+            nlris.iter().copied(),
+            None,
+            &mut Arc::make_mut(&mut self.rib).loc_rib_v6,
+            &mut self.blackholes.v6,
+            &*oracle,
+        );
+        self.program_fib_v6(effects);
+        self.repropagate_peer_prefixes_v6(peer_ip, &nlris);
     }
 
     ///
@@ -617,20 +646,17 @@ impl DaemonState {
             let gr_v6 =
                 families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
 
-            // Flush routes for families NOT covered by the peer's GR capability.
-            // Release the peer's blackholes — they bypass LocRib and are
-            // invisible to rib_withdraw_peer_v4/v6 (RFC 7999).
+            // Flush routes for families NOT covered by the peer's GR capability
+            // (RFC 4724 §4.2 retains routes only "for all the address families
+            // that were previously received in the Graceful Restart
+            // Capability"): out of the Adj-RIB-In, the Loc-RIB, the FIB and —
+            // for RFC 7999 blackholes, which have no Loc-RIB entry — the
+            // null-route book, then withdrawn from the other peers.
             if !gr_v4 {
-                self.release_peer_blackholes_v4(peer_ip);
-                if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
-                    ari.clear();
-                }
+                self.flush_family_v4(peer_ip);
             }
             if !gr_v6 {
-                self.release_peer_blackholes_v6(peer_ip);
-                if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
-                    ari.clear();
-                }
+                self.flush_family_v6(peer_ip);
             }
 
             // GR helper path — retain covered routes; arm deadline timer.
