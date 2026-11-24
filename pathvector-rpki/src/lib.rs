@@ -15,13 +15,14 @@ mod error;
 mod pdu;
 mod protocol;
 mod table;
+mod timers;
 
 #[cfg(test)]
 mod regression_tests;
 
 pub use cache::RtrStatus;
 pub use client::{RtrClient, RtrConfig, RtrHandle};
-pub use error::{PduError, RtrError};
+pub use error::{PduError, RtrConfigError, RtrError};
 pub use pdu::RtrVersion;
 pub use table::{RoaTable, RoaValidity};
 

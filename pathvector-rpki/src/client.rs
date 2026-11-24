@@ -25,10 +25,11 @@ use tracing::warn;
 use crate::cache::table_from;
 use crate::{
     cache::{RtrStatus, Shared, Staged},
-    error::{PduError, RtrError},
-    pdu::{self, EndOfDataIntervals, Pdu, RtrVersion},
+    error::{PduError, RtrConfigError, RtrError},
+    pdu::{self, Pdu, RtrVersion},
     protocol::{self, Consequence, Exchange, Negotiation, Query, Resume, Step, Violation},
     table::RoaValidity,
+    timers::Timers,
 };
 
 /// Upper bound on a single PDU's declared length. The largest legitimate
@@ -41,13 +42,27 @@ use crate::{
 const MAX_PDU_LEN: u32 = 64 * 1024;
 
 /// Configuration for an RTR session.
+///
+/// The three intervals are *defaults*: they apply to the first sync, to every
+/// RFC 6810 (v0) session (whose End of Data carries no intervals), and until
+/// a v1 cache advertises its own in End of Data, which then take precedence
+/// (clamped to the RFC 8210 §6 ranges, see below). [`RtrConfig::validate`]
+/// checks them against those ranges; `RtrClient::spawn` does not reject a
+/// configuration that fails it (it has no error channel), so callers that
+/// accept operator input should call it first.
+///
+/// | Field | RFC 8210 §6 range | Recommended |
+/// |---|---|---|
+/// | `refresh_interval` | 1 s ..= 86 400 s | 3 600 s |
+/// | `retry_interval` | 1 s ..= 7 200 s | 600 s |
+/// | `expire_interval` | 600 s ..= 172 800 s | 7 200 s |
 #[derive(Debug, Clone)]
 pub struct RtrConfig {
     pub host: String,
     pub port: u16,
-    /// RFC 8210 §6 default: how long to wait between successful syncs before
-    /// polling again. Overridden by the server's `EndOfData` intervals once a
-    /// v1 session is established.
+    /// RFC 8210 §6 Refresh Interval: how long to wait between successful syncs
+    /// before polling again. Overridden by the server's `EndOfData` interval
+    /// on a v1 session.
     pub refresh_interval: Duration,
     /// How long to wait after a connection failure before reconnecting.
     /// Also reused as the pause before retrying a query on the *same*
@@ -55,12 +70,60 @@ pub struct RtrConfig {
     /// response — the one non-fatal error code, where a fresh connection
     /// isn't warranted.
     pub retry_interval: Duration,
-    /// How long cached data may go unrefreshed before it's considered stale.
-    /// Not enforced automatically in this phase — see [`RtrStatus::is_stale`].
+    /// RFC 8210 §6 Expire Interval: how long, from receipt of End of Data, the
+    /// data may be retained without another *completed* sync. **Enforced**:
+    /// when it elapses every VRP and the resume state are discarded, so all
+    /// validation results become `NotFound` (ROV fails open), `status()`
+    /// reports `expired`, and subscribers are notified. Overridden by the
+    /// server's `EndOfData` interval on a v1 session; applies as-is to v0.
     pub expire_interval: Duration,
     /// Protocol version to attempt first. Falls back to `V0` automatically on
     /// an `ErrorReport` indicating unsupported version.
     pub initial_version: RtrVersion,
+}
+
+impl RtrConfig {
+    /// Checks the timer defaults against the ranges RFC 8210 §6 allows a cache
+    /// to advertise, and the requirement that Expire exceed Refresh and Retry.
+    ///
+    /// # Errors
+    ///
+    /// The first violated constraint.
+    pub fn validate(&self) -> Result<(), RtrConfigError> {
+        use crate::timers::{EXPIRE_SECS, REFRESH_SECS, RETRY_SECS};
+
+        fn check(
+            field: &'static str,
+            value: Duration,
+            range: &std::ops::RangeInclusive<u32>,
+        ) -> Result<(), RtrConfigError> {
+            let (min, max) = (
+                Duration::from_secs(u64::from(*range.start())),
+                Duration::from_secs(u64::from(*range.end())),
+            );
+            if (min..=max).contains(&value) {
+                Ok(())
+            } else {
+                Err(RtrConfigError::OutOfRange {
+                    field,
+                    value,
+                    min,
+                    max,
+                })
+            }
+        }
+        check("refresh_interval", self.refresh_interval, &REFRESH_SECS)?;
+        check("retry_interval", self.retry_interval, &RETRY_SECS)?;
+        check("expire_interval", self.expire_interval, &EXPIRE_SECS)?;
+        if self.expire_interval <= self.refresh_interval.max(self.retry_interval) {
+            return Err(RtrConfigError::ExpireNotAfterPollIntervals {
+                expire: self.expire_interval,
+                refresh: self.refresh_interval,
+                retry: self.retry_interval,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for RtrConfig {
@@ -130,7 +193,7 @@ impl RtrClient {
     pub fn spawn(config: RtrConfig) -> (RtrHandle, tokio::task::JoinHandle<()>) {
         let shared = Arc::new(Shared::new());
         let handle = RtrHandle(Arc::clone(&shared));
-        let join = tokio::spawn(run_session_loop(config, shared));
+        let join = tokio::spawn(run(config, shared));
         (handle, join)
     }
 }
@@ -184,6 +247,16 @@ impl RtrHandle {
             prefix,
             asn,
         });
+    }
+}
+
+/// The client task: the reconnecting session loop, and — as an independent
+/// sibling future in the same task, so both stop together when the task is
+/// aborted — the expiry watcher. Neither ever completes.
+async fn run(config: RtrConfig, shared: Arc<Shared>) {
+    tokio::select! {
+        () = run_session_loop(config, Arc::clone(&shared)) => {}
+        () = shared.watch_expiry() => {}
     }
 }
 
@@ -245,14 +318,19 @@ async fn run_one_connection(
     shared: &Arc<Shared>,
     version_hint: &mut RtrVersion,
 ) -> Result<(), RtrError> {
-    let mut refresh = config.refresh_interval;
-    // RFC 8210 §6: "The router SHOULD NOT retry sooner than [the cache's
-    // advertised Retry Interval]." Starts at `config.retry_interval` (used
-    // for the very first sync, before any cache has told us otherwise) and
-    // is updated below once a v1 session actually supplies one. `expire` is
-    // read directly from `RtrConfig`/`RtrStatus::is_stale` by callers that
-    // need it; nothing here needs to hold onto it beyond this point.
-    let mut retry = config.retry_interval;
+    // RFC 8210 §6 timers. Start as configured (used for the very first sync,
+    // before any cache has told us otherwise, and for every v0 session —
+    // RFC 6810 End of Data carries no intervals); each completed v1 sync
+    // replaces them with the cache's own (clamped) values. "The router SHOULD
+    // NOT retry sooner than [the cache's advertised Retry Interval]." The
+    // Expire Interval is consumed at commit time (see `sync`), where it
+    // starts the data's expiry countdown.
+    let defaults = Timers::new(
+        config.refresh_interval,
+        config.retry_interval,
+        config.expire_interval,
+    );
+    let mut timers = defaults;
     // §7: every connection starts a fresh negotiation. A remembered session
     // is resumed at the version it was learned at; otherwise start from the
     // last version known to work with this cache.
@@ -260,17 +338,21 @@ async fn run_one_connection(
         Negotiation::Proposed(shared.resume().map_or(*version_hint, |r| r.version));
 
     loop {
-        let intervals = sync(stream, shared, &mut negotiation, version_hint, retry).await?;
-        if let Some(iv) = intervals {
-            refresh = Duration::from_secs(u64::from(iv.refresh));
-            retry = Duration::from_secs(u64::from(iv.retry));
-        }
+        timers = sync(
+            stream,
+            shared,
+            &mut negotiation,
+            version_hint,
+            defaults,
+            timers,
+        )
+        .await?;
 
         // Idle until the refresh timer fires or the server sends an
         // unsolicited Serial Notify — either way, loop back to the top and
         // re-sync via Serial Query.
         tokio::select! {
-            () = tokio::time::sleep(refresh) => {}
+            () = tokio::time::sleep(timers.refresh) => {}
             frame = read_frame(stream) => {
                 let frame = frame?;
                 if let Err(violation) = protocol::on_idle(
@@ -287,7 +369,8 @@ async fn run_one_connection(
 }
 
 /// Runs query/response/transfer exchanges until one completes, returning the
-/// cache-advertised intervals (v1) of the completed End of Data.
+/// timers in force after that End of Data (the cache's, for v1; `defaults`
+/// for v0).
 ///
 /// Handles, without dropping the connection: one round of v1→v0 fallback
 /// (RFC 8210 §7), Cache Reset (§8.3 — forget the resume state and issue a
@@ -299,21 +382,26 @@ async fn sync(
     shared: &Arc<Shared>,
     negotiation: &mut Negotiation,
     version_hint: &mut RtrVersion,
-    retry_interval: Duration,
-) -> Result<Option<EndOfDataIntervals>, RtrError> {
+    defaults: Timers,
+    timers: Timers,
+) -> Result<Timers, RtrError> {
     // Forces the *next* query to be a `ResetQuery` regardless of remembered
     // serial/session state. Set by Cache Reset and by Error Code 2.
     // Deliberately does not touch the installed VRPs: they stay valid until
     // the replacement load *commits* (see `cache.rs`).
     let mut force_reset = false;
     'exchange: loop {
-        let query = Query::choose(shared.resume(), force_reset);
+        // Resume state and the epoch of the generation it describes, read
+        // together: a delta staged for this query is only valid against that
+        // generation.
+        let (resume, epoch) = shared.basis();
+        let query = Query::choose(resume, force_reset);
         let mut exchange = Exchange::new(query, *negotiation);
         // Records of this transfer accumulate here, invisible to validation,
         // status and subscribers, until a validated End of Data commits them
         // (see `cache.rs`). If the exchange ends any other way the staged
         // records are dropped with it.
-        let mut staged = Staged::for_query(query);
+        let mut staged = Staged::for_query(query, epoch);
         write_pdu(stream, negotiation.version(), &query.pdu()).await?;
 
         loop {
@@ -362,17 +450,24 @@ async fn sync(
                     serial,
                     intervals,
                 } => {
-                    // Data, serial, status and the subscriber notification
-                    // are published together, here and only here.
-                    shared.commit(
-                        staged,
-                        Resume {
-                            version: negotiation.version(),
-                            session,
-                            serial,
-                        },
+                    let resume = Resume {
+                        version: negotiation.version(),
+                        session,
+                        serial,
+                    };
+                    if let Some(effective) = publish(shared, staged, resume, defaults, intervals) {
+                        return Ok(effective);
+                    }
+                    // The generation this delta was relative to was
+                    // invalidated (the cache expired) while it was in flight.
+                    // Applying it to what is left would publish a fragment as
+                    // if it were the cache: ask for the full set instead.
+                    warn!(
+                        "RTR incremental update completed after the cache was invalidated; \
+                         discarding it and issuing a Reset Query"
                     );
-                    return Ok(intervals);
+                    force_reset = true;
+                    continue 'exchange;
                 }
                 // RFC 8210 §8.3: "When a router receives this, the router
                 // SHOULD attempt to connect to any more-preferred caches in
@@ -420,12 +515,46 @@ async fn sync(
                     );
                     shared.set_last_error(text);
                     force_reset = true;
-                    tokio::time::sleep(retry_interval).await;
+                    tokio::time::sleep(timers.retry).await;
                     continue 'exchange;
                 }
             }
         }
     }
+}
+
+/// Commits a completed transfer, applying the End of Data's timing
+/// parameters. Returns the timers now in force, or `None` if the staged delta
+/// had gone stale (nothing was applied).
+fn publish(
+    shared: &Shared,
+    staged: Staged,
+    resume: Resume,
+    defaults: Timers,
+    intervals: Option<pdu::EndOfDataIntervals>,
+) -> Option<Timers> {
+    let effective = defaults.after_end_of_data(intervals);
+    for c in &effective.clamped {
+        warn!(
+            interval = c.name,
+            advertised = c.advertised,
+            used = c.used,
+            "RTR cache advertised an interval outside its RFC 8210 §6 range; clamped"
+        );
+    }
+    if effective.expire_not_after_poll_intervals {
+        warn!(
+            expire = effective.timers.expire.as_secs(),
+            "RTR cache's Expire Interval is not larger than its Refresh/Retry Interval \
+             (RFC 8210 §6 requires it to be); honouring it as advertised"
+        );
+    }
+    // Data, serial, status, expiry deadline and the subscriber notification
+    // are published together, here and only here.
+    shared
+        .commit(staged, resume, effective.timers.expire)
+        .ok()
+        .map(|()| effective.timers)
 }
 
 /// Upper bound on the offending-PDU copy placed in an outgoing Error Report
@@ -544,7 +673,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        pdu::PrefixFlags,
+        pdu::{EndOfDataIntervals, PrefixFlags},
         protocol::{ERROR_CODE_NO_DATA_AVAILABLE, ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION},
     };
 
@@ -1488,5 +1617,57 @@ mod tests {
         .expect("client did not report an error within 5s — did it hang trying to allocate?");
 
         assert!(!handle.status().connected);
+    }
+
+    // ── RtrConfig::validate (RFC 8210 §6 ranges) ─────────────────────────
+
+    fn config_with(refresh: u64, retry: u64, expire: u64) -> RtrConfig {
+        RtrConfig {
+            refresh_interval: Duration::from_secs(refresh),
+            retry_interval: Duration::from_secs(retry),
+            expire_interval: Duration::from_secs(expire),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        assert_eq!(RtrConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn range_boundaries_validate() {
+        assert_eq!(config_with(1, 1, 600).validate(), Ok(()));
+        assert_eq!(config_with(86_400, 7_200, 172_800).validate(), Ok(()));
+    }
+
+    #[test]
+    fn out_of_range_timers_are_rejected_by_field() {
+        for (cfg, field) in [
+            (config_with(0, 600, 7200), "refresh_interval"),
+            (config_with(86_401, 600, 172_800), "refresh_interval"),
+            (config_with(3600, 0, 7200), "retry_interval"),
+            (config_with(3600, 7_201, 172_800), "retry_interval"),
+            (config_with(300, 60, 599), "expire_interval"),
+            (config_with(3600, 600, 172_801), "expire_interval"),
+        ] {
+            match cfg.validate() {
+                Err(RtrConfigError::OutOfRange { field: f, .. }) => assert_eq!(f, field),
+                other => panic!("{cfg:?}: expected OutOfRange({field}), got {other:?}"),
+            }
+        }
+    }
+
+    /// §6: "Caches MUST set Expire Interval to a value larger than either
+    /// Refresh Interval or Retry Interval."
+    #[test]
+    fn expire_must_exceed_refresh_and_retry() {
+        for cfg in [config_with(3600, 600, 3600), config_with(600, 700, 700)] {
+            assert!(matches!(
+                cfg.validate(),
+                Err(RtrConfigError::ExpireNotAfterPollIntervals { .. })
+            ));
+        }
+        assert_eq!(config_with(3600, 600, 3601).validate(), Ok(()));
     }
 }

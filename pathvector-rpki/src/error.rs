@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::pdu::RtrVersion;
 
 /// Errors produced by the RTR PDU codec.
@@ -42,6 +44,61 @@ impl std::error::Error for PduError {
         }
     }
 }
+
+/// An [`RtrConfig`](crate::RtrConfig) timer is outside what RFC 8210 §6
+/// permits a cache to advertise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RtrConfigError {
+    /// `field` is outside `min..=max`.
+    OutOfRange {
+        field: &'static str,
+        value: Duration,
+        min: Duration,
+        max: Duration,
+    },
+    /// RFC 8210 §6: "Caches MUST set Expire Interval to a value larger than
+    /// either Refresh Interval or Retry Interval." The configured defaults
+    /// (used for the first sync and for every v0 session) should honour the
+    /// same relationship.
+    ExpireNotAfterPollIntervals {
+        expire: Duration,
+        refresh: Duration,
+        retry: Duration,
+    },
+}
+
+impl std::fmt::Display for RtrConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+            } => write!(
+                f,
+                "RTR {field} of {}s is outside the RFC 8210 §6 range {}s..={}s",
+                value.as_secs(),
+                min.as_secs(),
+                max.as_secs()
+            ),
+            Self::ExpireNotAfterPollIntervals {
+                expire,
+                refresh,
+                retry,
+            } => write!(
+                f,
+                "RTR expire_interval ({}s) must be larger than both refresh_interval ({}s) \
+                 and retry_interval ({}s) (RFC 8210 §6)",
+                expire.as_secs(),
+                refresh.as_secs(),
+                retry.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RtrConfigError {}
 
 /// Errors produced by an RTR client session.
 #[derive(Debug)]

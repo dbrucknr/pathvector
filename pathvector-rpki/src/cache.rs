@@ -42,7 +42,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant as MonotonicInstant};
 
 use crate::{
     pdu::{Pdu, RtrVersion},
@@ -71,6 +71,15 @@ pub struct RtrStatus {
     /// facing display (e.g. correlating with validator logs).
     pub wall_clock_update: Option<SystemTime>,
     pub last_error: Option<String>,
+    /// When the installed generation must be discarded if no further sync
+    /// completes: the last End of Data's receipt time plus the effective
+    /// Expire Interval (RFC 8210 §6). `None` when there is no installed
+    /// generation. Only a *completed* sync moves this; connecting, bytes and
+    /// notifications do not.
+    pub expires_at: Option<Instant>,
+    /// `true` from the moment the installed generation expired (and was
+    /// flushed) until the next completed sync.
+    pub expired: bool,
 }
 
 impl RtrStatus {
@@ -83,13 +92,19 @@ impl RtrStatus {
             last_update: None,
             wall_clock_update: None,
             last_error: None,
+            expires_at: None,
+            expired: false,
         }
     }
 
     /// `true` if the cache has never synced, or hasn't synced within
-    /// `expire`. Informational only in this phase — nothing clears the cache
-    /// automatically on staleness (see crate-level docs: stale-but-recent ROA
-    /// data is preferable to no data for a blackhole operator's ROV decisions).
+    /// `expire`.
+    ///
+    /// This is a caller-chosen *freshness check*, not the protocol's expiry:
+    /// the client enforces RFC 8210 §6 itself, using the Expire Interval the
+    /// cache advertised (or the configured one for v0), and discards the data
+    /// when it elapses (see [`RtrStatus::expires_at`] / [`RtrStatus::expired`]).
+    /// Use `is_stale` for a softer, earlier warning threshold.
     #[must_use]
     pub fn is_stale(&self, expire: Duration) -> bool {
         self.last_update.is_none_or(|t| t.elapsed() > expire)
@@ -100,16 +115,31 @@ impl RtrStatus {
 pub(crate) enum Staged {
     /// Reset Query: the complete new set, replacing everything on commit.
     Full(Snapshot),
-    /// Serial Query: changes to apply, in order, to the installed set.
-    Delta(Vec<VrpOp>),
+    /// Serial Query: changes to apply, in order, to the installed set —
+    /// valid only against the generation identified by `base`.
+    Delta { base: Epoch, ops: Vec<VrpOp> },
 }
+
+/// Identifies the installed generation a delta is relative to. It advances
+/// whenever the installed data is invalidated (flush, expiry, resume state
+/// dropped), so a delta staged before such an event can be recognised as
+/// stale at commit instead of being applied to a different table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Epoch(u64);
+
+/// A delta was staged against a generation that has since been invalidated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stale;
 
 impl Staged {
     /// The staging area appropriate for the answer to `query`.
-    pub(crate) fn for_query(query: Query) -> Self {
+    pub(crate) fn for_query(query: Query, base: Epoch) -> Self {
         match query {
             Query::Reset => Self::Full(Snapshot::new()),
-            Query::Serial(_) => Self::Delta(Vec::new()),
+            Query::Serial(_) => Self::Delta {
+                base,
+                ops: Vec::new(),
+            },
         }
     }
 
@@ -118,7 +148,7 @@ impl Staged {
         if let Some(op) = VrpOp::from_pdu(pdu) {
             match self {
                 Self::Full(snapshot) => snapshot.apply(op),
-                Self::Delta(ops) => ops.push(op),
+                Self::Delta { ops, .. } => ops.push(op),
             }
         }
     }
@@ -130,6 +160,12 @@ struct Core {
     /// (Serial Query) resume. `None` means the next query must be a Reset
     /// Query. Always consistent with `status.serial`.
     resume: Option<Resume>,
+    /// See [`Epoch`].
+    epoch: Epoch,
+    /// Monotonic instant at which the installed generation must be
+    /// discarded unless another sync completes first. `None` iff there is no
+    /// installed generation to expire. Mirrors `status.expires_at`.
+    expiry: Option<MonotonicInstant>,
 }
 
 /// State shared between the session task and every [`crate::RtrHandle`].
@@ -143,6 +179,10 @@ pub(crate) struct Shared {
     /// unused generation counter — only the change notification matters. See
     /// [`crate::RtrHandle::subscribe`].
     changed: watch::Sender<u64>,
+    /// Mirrors `Core::expiry` (always updated under the `core` write lock) so
+    /// the expiry watcher can sleep until the current deadline and be woken
+    /// the moment it moves.
+    deadline: watch::Sender<Option<MonotonicInstant>>,
 }
 
 impl Shared {
@@ -152,8 +192,11 @@ impl Shared {
             core: RwLock::new(Core {
                 status: RtrStatus::disconnected(),
                 resume: None,
+                epoch: Epoch(0),
+                expiry: None,
             }),
             changed: watch::channel(0).0,
+            deadline: watch::channel(None).0,
         }
     }
 
@@ -168,8 +211,11 @@ impl Shared {
             core: RwLock::new(Core {
                 status,
                 resume: None,
+                epoch: Epoch(0),
+                expiry: None,
             }),
             changed: watch::channel(0).0,
+            deadline: watch::channel(None).0,
         }
     }
 
@@ -189,34 +235,68 @@ impl Shared {
         self.core.read().unwrap().resume
     }
 
+    /// What the next query is based on: the resume state and the epoch of the
+    /// generation it describes, read together so they cannot disagree.
+    pub(crate) fn basis(&self) -> (Option<Resume>, Epoch) {
+        let core = self.core.read().unwrap();
+        (core.resume, core.epoch)
+    }
+
     fn notify(&self) {
         self.changed.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// Publishes a completed transfer: VRPs, resume state and status change
-    /// together under one lock, and subscribers are notified afterwards —
-    /// every completed sync, even one that changed nothing, because
-    /// `subscribe()` promises completed-sync notifications.
-    pub(crate) fn commit(&self, staged: Staged, resume: Resume) {
+    /// Publishes a completed transfer: VRPs, resume state, status and expiry
+    /// deadline change together under one lock, and subscribers are notified
+    /// afterwards — every completed sync, even one that changed nothing,
+    /// because `subscribe()` promises completed-sync notifications.
+    ///
+    /// `expire` is the effective Expire Interval; the new deadline is `now +
+    /// expire` (RFC 8210 §6: "Countdown for this timer starts upon receipt
+    /// of the containing End Of Data PDU"). This is the *only* way the
+    /// deadline moves forward.
+    ///
+    /// # Errors
+    ///
+    /// [`Stale`] if `staged` is a delta against a generation that was
+    /// invalidated while the transfer was in flight (e.g. the cache expired);
+    /// nothing is applied.
+    pub(crate) fn commit(
+        &self,
+        staged: Staged,
+        resume: Resume,
+        expire: Duration,
+    ) -> Result<(), Stale> {
         {
             let mut core = self.core.write().unwrap();
             match staged {
                 Staged::Full(snapshot) => self.table.install(snapshot),
-                Staged::Delta(ops) => self.table.apply_delta(&ops),
+                Staged::Delta { base, ops } => {
+                    if base != core.epoch {
+                        return Err(Stale);
+                    }
+                    self.table.apply_delta(&ops);
+                }
             }
             core.resume = Some(resume);
-            let now = SystemTime::now();
+            let now = MonotonicInstant::now();
+            let deadline = now + expire;
+            core.expiry = Some(deadline);
+            self.deadline.send_replace(Some(deadline));
             core.status = RtrStatus {
                 connected: true,
                 version: Some(resume.version),
                 serial: Some(resume.serial.get()),
                 roa_count: self.table.len(),
-                last_update: Some(Instant::now()),
-                wall_clock_update: Some(now),
+                last_update: Some(now.into_std()),
+                wall_clock_update: Some(SystemTime::now()),
                 last_error: None,
+                expires_at: Some(deadline.into_std()),
+                expired: false,
             };
         }
         self.notify();
+        Ok(())
     }
 
     /// RFC 8210 §5.1: "the router MUST flush all data learned from that
@@ -226,16 +306,90 @@ impl Shared {
     pub(crate) fn flush(&self) {
         let had_data = {
             let mut core = self.core.write().unwrap();
-            let had_data = !self.table.is_empty();
-            self.table.clear();
-            core.resume = None;
-            core.status.serial = None;
-            core.status.roa_count = 0;
-            core.status.version = None;
+            self.invalidate(&mut core)
+        };
+        if had_data {
+            self.notify();
+        }
+    }
+
+    /// Discards every VRP and all resume state, under the caller's `core`
+    /// lock. Returns whether there was any data (i.e. whether validation
+    /// results changed).
+    fn invalidate(&self, core: &mut Core) -> bool {
+        let had_data = !self.table.is_empty();
+        self.table.clear();
+        core.resume = None;
+        core.epoch = Epoch(core.epoch.0.wrapping_add(1));
+        core.expiry = None;
+        self.deadline.send_replace(None);
+        core.status.serial = None;
+        core.status.roa_count = 0;
+        core.status.version = None;
+        core.status.expires_at = None;
+        had_data
+    }
+
+    /// RFC 8210 §6: "The router MUST NOT retain the data past the time
+    /// indicated by [the Expire Interval]." Called by the expiry watcher when
+    /// `deadline` passes. Discards every VRP and all resume state (so the
+    /// next query is a Reset Query), marks the status expired and — because
+    /// every validation result just became `NotFound` — notifies subscribers.
+    ///
+    /// Returns `false` without effect if `deadline` is no longer the current
+    /// one (a sync completed, or the data was flushed, in the meantime).
+    pub(crate) fn expire(&self, deadline: MonotonicInstant) -> bool {
+        let had_data = {
+            let mut core = self.core.write().unwrap();
+            if core.expiry != Some(deadline) {
+                return false;
+            }
+            let had_data = self.invalidate(&mut core);
+            core.status.expired = true;
+            core.status.last_error = Some(
+                "cache data expired: no sync completed within the cache's Expire Interval \
+                 (RFC 8210 §6); all VRPs discarded"
+                    .to_string(),
+            );
             had_data
         };
         if had_data {
             self.notify();
+        }
+        true
+    }
+
+    /// Sleeps until the current deadline, expires the cache when it passes,
+    /// and follows the deadline as completed syncs move it. Runs for the life
+    /// of the client, *independently* of the session loop: it is not
+    /// interrupted by, and does not wait for, connects, back-off sleeps,
+    /// pending queries or partial reads. Never returns.
+    pub(crate) async fn watch_expiry(&self) {
+        let mut rx = self.deadline.subscribe();
+        loop {
+            let current = *rx.borrow_and_update();
+            match current {
+                None => {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                Some(at) => {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(at) => {
+                            // If a sync renewed the deadline at the last
+                            // moment this is a no-op and `rx` already holds
+                            // the new value.
+                            self.expire(at);
+                        }
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -247,6 +401,7 @@ impl Shared {
     pub(crate) fn forget_resume(&self) {
         let mut core = self.core.write().unwrap();
         core.resume = None;
+        core.epoch = Epoch(core.epoch.0.wrapping_add(1));
         core.status.serial = None;
     }
 
