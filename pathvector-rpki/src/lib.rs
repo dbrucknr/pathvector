@@ -12,7 +12,11 @@
 mod client;
 mod error;
 mod pdu;
+mod protocol;
 mod table;
+
+#[cfg(test)]
+mod regression_tests;
 
 pub use client::{RtrClient, RtrConfig, RtrHandle, RtrStatus};
 pub use error::{PduError, RtrError};

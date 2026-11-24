@@ -149,8 +149,6 @@ impl<A: IpAddress> FamilyTable<A> {
 pub struct RoaTable {
     v4: std::sync::RwLock<FamilyTable<Ipv4Addr>>,
     v6: std::sync::RwLock<FamilyTable<Ipv6Addr>>,
-    serial: std::sync::atomic::AtomicU32,
-    has_serial: std::sync::atomic::AtomicBool,
 }
 
 impl RoaTable {
@@ -158,8 +156,6 @@ impl RoaTable {
         Self {
             v4: std::sync::RwLock::new(FamilyTable::new()),
             v6: std::sync::RwLock::new(FamilyTable::new()),
-            serial: std::sync::atomic::AtomicU32::new(0),
-            has_serial: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -246,25 +242,6 @@ impl RoaTable {
     pub(crate) fn clear(&self) {
         self.v4.write().unwrap().clear();
         self.v6.write().unwrap().clear();
-        self.has_serial
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_serial(&self, serial: u32) {
-        self.serial
-            .store(serial, std::sync::atomic::Ordering::Relaxed);
-        self.has_serial
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// `None` until the first successful sync (distinguishes "never synced"
-    /// from a legitimate serial value of `0`).
-    pub(crate) fn serial(&self) -> Option<u32> {
-        if self.has_serial.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(self.serial.load(std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        }
     }
 }
 
@@ -606,17 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn roa_table_serial_starts_none_and_tracks_set_value() {
-        let table = RoaTable::new();
-        assert_eq!(table.serial(), None);
-        table.set_serial(0);
-        assert_eq!(table.serial(), Some(0)); // 0 is a valid serial, distinct from "never synced"
-        table.set_serial(42);
-        assert_eq!(table.serial(), Some(42));
-    }
-
-    #[test]
-    fn roa_table_clear_resets_serial_and_data() {
+    fn roa_table_clear_removes_data() {
         let table = RoaTable::new();
         table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
             flags: PrefixFlags { announce: true },
@@ -625,9 +592,7 @@ mod tests {
             prefix: "192.0.2.0".parse().unwrap(),
             asn: 65001,
         });
-        table.set_serial(10);
         table.clear();
-        assert_eq!(table.serial(), None);
         assert!(table.is_empty());
     }
 
