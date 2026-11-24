@@ -4,6 +4,82 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-24 (pathvectord: list_peers / get_peer no longer scan the Loc-RIB — issue #106)
+
+`build_peer_state` counted `prefixes_accepted` by walking every best route once per
+configured peer, and the peer handlers did it on a cloned `Arc<RibSnapshot>`. So each
+`list_peers` call was O(table × peers), and while a reader held the clone the event loop's next
+`Arc::make_mut` deep-copied both Loc-RIBs under the write lock. On the 1.13 M-prefix table of
+the PR #114 harness that was `list_peers` p50 ~230 ms, write-lock holds up to 500 ms and an
+extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 Hz.
+
+- `pathvector-rib`: new private `BestTable` owns the best-path winner map **and** a per-peer win
+  count. Its single mutator updates both, so the counts cannot drift; `LocRib::best_win_count(peer)`
+  is O(1). `LocRib::best_win_counts_consistent()` is the O(table) audit used by tests.
+- `pathvectord`: new read port `daemon/peer_stats.rs` (`RibSnapshot::peer_rib_stats` →
+  `PeerRibStats`, with a saturating `PrefixCount` newtype for the `u32` wire fields). `list_peers`,
+  `get_peer` and `watch_peers` (initial state and each `Changed` refresh) read it under the
+  `DaemonState` read guard and take **no** `Arc<RibSnapshot>` clone, so they cannot force a
+  copy-on-write. `watch_peers` now subscribes and reads its initial state under one guard.
+- Behavior change: `prefixes_accepted` now counts IPv4 **and** IPv6 wins. It read only the IPv4
+  Loc-RIB, so an IPv6-only peer showed 0 beside a non-zero `prefixes_received`.
+- Proof: `prop_loc_rib_win_counts_equal_full_recount` (random insert/withdraw/peer-down/
+  reachability sequences, checked after every step) and
+  `prop_accepted_count_matches_full_recount_through_daemon_paths` (through import policy,
+  withdrawals, session teardown and re-establishment); `test_list_peers_cost_is_independent_of_loc_rib_size`
+  (8 peers × 120 k prefixes; fails at ~545 ms on the old scan, passes in microseconds); the
+  winner-follows tests in `grpc.rs`. Both counting tests were confirmed to fail with the decrement
+  removed / the scan restored.
+- Benchmark `peer_win_count` (Apple M2 Max, release, jemalloc, one peer of four, per call):
+
+  | Loc-RIB prefixes | old scan | `best_win_count` | `LocRib::clone` (the forced CoW copy) |
+  |---|---|---|---|
+  | 100 | 4.0 µs | 3.7 ns | 3.8 µs |
+  | 1 k | 45 µs | 3.0 ns | 49 µs |
+  | 10 k | 397 µs | 2.9 ns | 499 µs |
+  | 100 k | 5.4 ms | 2.9 ns | 10.7 ms |
+  | 1 M | 100 ms | 3.7 ns | 127 ms |
+
+  `list_peers` paid the scan column once per peer; a management read can no longer cause the
+  right-hand column.
+- Insert cost (new steady-state bench `loc_rib_insert_steady`: RIB built once with exactly n distinct
+  /24s, asserted `rib.len() == n`, then a long loop, so no cold-start artifact; 3 alternating
+  before/after runs; before = `19d82fc`). A winner-changing insert on one hot prefix costs
+  533–552 ns before and 549–579 ns after (+~25–30 ns, about 5 %, the two per-peer count updates)
+  at 10k / 100k / 500k. Across every prefix of the table ("scattered", cache-cold) the runs overlap:
+  10k 731–778 ns before vs 705–788 ns after, 100k 1.30–1.42 µs vs 1.36–1.43 µs, 500k 1.59–1.71 µs
+  vs 1.57–1.67 µs. A route's whole UPDATE path (policy, Adj-RIB-In, propagation) is many
+  microseconds, so this is on the order of 1 % of it (an estimate, not a measurement). The older
+  `loc_rib_insert` bench is not a reliable comparison: it rebuilds the RIB per criterion sample
+  (cold first touches at 500k), and its `nlri_for` keeps only 16 bits of the index, so its 100k
+  and 500k RIBs hold 65,536 distinct prefixes, not 100k/500k (left unchanged here).
+- Full-table harness comparison (PR #114's `loadtest`, real `latest-bview.gz`: 1,133,510 IPv4
+  prefixes, one loader on 127.0.0.1 + control peer on the LAN address, release builds, Apple M2 Max,
+  `--scenarios converge,cow`, one run per cell). "old" = #114 head, "new" = #114 head + this change.
+  The "management client polling at 10 Hz" rows are the issue's scenario (default probe); the
+  "none" rows use `--probe-interval-ms 0`.
+
+  | `cow`, churn only (2000 prefixes, 12 s) | `list_peers` p50 | longest write-lock hold | peak RSS |
+  |---|---|---|---|
+  | old, 10 Hz client | 236 ms | ≤ 500 ms | 1651 MiB |
+  | old, no client | n/a | ≤ 10 ms | 1215 MiB |
+  | **new, 10 Hz client** | **526 µs** (max 11.5 ms) | **≤ 10 ms** | **1215 MiB** |
+  | new, no client | n/a | ≤ 10 ms | 1215 MiB |
+
+  With the polling client the new daemon behaves like one with no client (same lock-hold bucket,
+  RSS flat at the table size instead of +436 MiB). `converge`: `list_peers` p50 230 ms → 425 µs,
+  max 1.22 s → 454 ms; lock holds and convergence time (5.6–6.2 s) unchanged. The control peer's
+  keepalive stayed on cadence (≤ 3.45 s silence, hold 9 s) in all 12 windows. In the `cow`
+  "churn + concurrent `watch_routes` snapshots" window `list_peers` p99 is still 0.9 s (old: 1.3 s)
+  and RSS 2.1 GiB (old: 3.3 GiB with the client): `watch_routes` itself materialises the table and
+  is out of scope here. Each cell is a single run on a loaded laptop; treat differences of a bucket
+  as noise. Raw output is in the PR comment thread.
+- Not changed: the other `snapshot()` callers (`list_routes`, `watch_routes`, ...) legitimately
+  walk the table and still clone the `Arc`; moving them off the write-lock path is a separate
+  change.
+
+---
+
 ## 2026-11-24 (pathvectord: authorize BLACKHOLE and re-import retained routes through one pipeline — issues #81, #82)
 
 Both issues share one root cause: the daemon had no single import classification path.

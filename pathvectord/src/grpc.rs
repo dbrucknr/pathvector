@@ -260,8 +260,6 @@ fn role_to_str(role: pathvector_types::Role) -> &'static str {
 /// Returns `None` if `addr` is not in `peer_remote_as` (i.e. not configured).
 fn build_peer_state(snap: &RibSnapshot, addr: IpAddr) -> Option<PeerState> {
     let remote_as = *snap.peer_remote_as.get(&addr)?;
-    let peer_id = PeerId::from(addr);
-
     let (session_state, peer_type, hold_time, uptime_seconds) =
         if let Some(&pt) = snap.peer_types.get(&addr) {
             let uptime = snap
@@ -284,25 +282,8 @@ fn build_peer_state(snap: &RibSnapshot, addr: IpAddr) -> Option<PeerState> {
             )
         };
 
-    let prefixes_received = snap
-        .prefixes_received
-        .get(&addr)
-        .copied()
-        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
-
-    // Count best-path wins: routes in the Loc-RIB whose winner is this peer.
-    let prefixes_accepted = snap
-        .loc_rib
-        .best_routes()
-        .filter(|(nlri, _)| snap.loc_rib.best_peer(nlri) == Some(peer_id))
-        .count();
-    let prefixes_accepted = u32::try_from(prefixes_accepted).unwrap_or(u32::MAX);
-
-    let prefixes_advertised = snap
-        .prefixes_advertised
-        .get(&addr)
-        .copied()
-        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    // O(1) counters — never a Loc-RIB scan (issue #106).
+    let stats = snap.peer_rib_stats(addr);
 
     Some(PeerState {
         address: addr.to_string(),
@@ -312,9 +293,9 @@ fn build_peer_state(snap: &RibSnapshot, addr: IpAddr) -> Option<PeerState> {
         peer_type,
         hold_time,
         uptime_seconds,
-        prefixes_received,
-        prefixes_accepted,
-        prefixes_advertised,
+        prefixes_received: stats.received.get(),
+        prefixes_accepted: stats.accepted.get(),
+        prefixes_advertised: stats.advertised.get(),
         eor_ipv4_received: snap.eor_received.contains(&addr),
         eor_ipv6_received: snap.eor_received_v6.contains(&addr),
         peer_gr_restart_time: snap
@@ -330,6 +311,22 @@ fn build_peer_state(snap: &RibSnapshot, addr: IpAddr) -> Option<PeerState> {
             .get(&addr)
             .map_or_else(String::new, |&r| role_to_str(r).to_string()),
     })
+}
+
+/// Every configured peer's state, sorted by address for stable CLI output.
+///
+/// Pure and O(peers): safe to call under the `DaemonState` read guard, which
+/// is how the peer handlers use it so they never hold an `Arc<RibSnapshot>`
+/// clone (issue #106).
+fn peer_states(snap: &RibSnapshot) -> Vec<PeerState> {
+    let mut peers: Vec<PeerState> = snap
+        .peer_remote_as
+        .keys()
+        .copied()
+        .filter_map(|addr| build_peer_state(snap, addr))
+        .collect();
+    peers.sort_by_key(|p| p.address.clone());
+    peers
 }
 
 type PeerEventStream =
@@ -372,15 +369,10 @@ impl PeerService for PeerServiceImpl {
         &self,
         _request: Request<ListPeersRequest>,
     ) -> Result<Response<ListPeersResponse>, Status> {
-        let snap = self.state.read().await.snapshot();
-        let mut peers: Vec<PeerState> = snap
-            .peer_remote_as
-            .keys()
-            .copied()
-            .filter_map(|addr| build_peer_state(&snap, addr))
-            .collect();
-        // Stable ordering by address for predictable CLI output.
-        peers.sort_by_key(|p| p.address.clone());
+        // Read under the guard, no `Arc<RibSnapshot>` clone: the work is
+        // O(peers), and a held clone would make the event loop's next
+        // `Arc::make_mut` deep-copy the RIB (issue #106).
+        let peers = peer_states(&self.state.read().await.rib);
         Ok(Response::new(ListPeersResponse { peers }))
     }
 
@@ -394,8 +386,7 @@ impl PeerService for PeerServiceImpl {
             .parse()
             .map_err(|_| Status::invalid_argument("address must be a valid IP address"))?;
 
-        let snap = self.state.read().await.snapshot();
-        build_peer_state(&snap, addr)
+        build_peer_state(&self.state.read().await.rib, addr)
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("peer {addr} is not configured")))
     }
@@ -404,22 +395,21 @@ impl PeerService for PeerServiceImpl {
         &self,
         _request: Request<WatchPeersRequest>,
     ) -> Result<Response<Self::WatchPeersStream>, Status> {
-        // Subscribe BEFORE snapshot to avoid a race between snapshot and first delta.
-        let rx = self.state.read().await.peer_tx.subscribe();
-
-        // Snapshot: clone Arc once, release lock, iterate without holding it.
-        let snap = self.state.read().await.snapshot();
-        let mut events: Vec<PeerEvent> = snap
-            .peer_remote_as
-            .keys()
-            .copied()
-            .filter_map(|addr| build_peer_state(&snap, addr))
-            .map(|ps| PeerEvent {
-                r#type: PeerEventType::Current as i32,
-                peer: Some(ps),
-            })
-            .collect();
-        events.sort_by_key(|e| e.peer.as_ref().map_or(String::new(), |p| p.address.clone()));
+        // Subscribe and read the initial state under ONE read guard: no delta
+        // can land between the two, and no `Arc<RibSnapshot>` clone is held
+        // (issue #106).
+        let (rx, mut events) = {
+            let state = self.state.read().await;
+            let rx = state.peer_tx.subscribe();
+            let events: Vec<PeerEvent> = peer_states(&state.rib)
+                .into_iter()
+                .map(|ps| PeerEvent {
+                    r#type: PeerEventType::Current as i32,
+                    peer: Some(ps),
+                })
+                .collect();
+            (rx, events)
+        };
         events.push(PeerEvent {
             r#type: PeerEventType::EndInitial as i32,
             peer: None,
@@ -447,20 +437,13 @@ impl PeerService for PeerServiceImpl {
                         // not detected here — the daemon broadcasts an explicit
                         // Removed event (with peer: Some) for those.
                         let Some(state) = state_weak.upgrade() else { break };
-                        let snap = state.read().await.snapshot();
-                        let mut changed: Vec<PeerEvent> = snap
-                            .peer_remote_as
-                            .keys()
-                            .copied()
-                            .filter_map(|addr| build_peer_state(&snap, addr))
+                        let changed: Vec<PeerEvent> = peer_states(&state.read().await.rib)
+                            .into_iter()
                             .map(|ps| PeerEvent {
                                 r#type: PeerEventType::Changed as i32,
                                 peer: Some(ps),
                             })
                             .collect();
-                        changed.sort_by_key(|e| {
-                            e.peer.as_ref().map_or(String::new(), |p| p.address.clone())
-                        });
                         for e in changed {
                             yield Ok(e);
                         }
@@ -1594,6 +1577,191 @@ mod tests {
         let ps = build_peer_state(&s.rib, IpAddr::V4(addr)).unwrap();
         assert_eq!(ps.configured_role, "customer");
         assert_eq!(ps.negotiated_role, "provider");
+    }
+
+    // ── prefixes_accepted is the incremental best-path win count (#106) ───────
+
+    /// `prefixes_accepted` is "Loc-RIB prefixes whose winner is this peer".
+    /// Two peers announce the same prefix with different AS_PATH lengths
+    /// (RFC 4271 §9.1.2.2 (a)-(c): shorter path wins), so the count must follow
+    /// the winner, not the announcer, as routes come, go and sessions drop.
+    #[test]
+    fn test_prefixes_accepted_follows_winner_through_withdraw_and_teardown() {
+        use pathvector_session::message::{PathAttribute, UpdateMessage};
+
+        let a1: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let a2: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let mut s = make_state(65001, &[(a1, 65002), (a2, 65003)]);
+        for (a, asn) in [(a1, 65002), (a2, 65003)] {
+            s.on_established(IpAddr::V4(a), a, PeerType::External, asn, 90, &[], None);
+        }
+        let announce = |s: &mut DaemonState, a: Ipv4Addr, path: Vec<u32>, prefix: &str| {
+            s.on_route_update(
+                IpAddr::V4(a),
+                pathvector_session::message::UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![
+                        PathAttribute::Origin(Origin::Igp),
+                        PathAttribute::AsPath(AsPath::from_sequence(
+                            path.into_iter().map(Asn::new).collect(),
+                        )),
+                        PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 100)),
+                    ],
+                    announced: vec![nlri(prefix)],
+                },
+            );
+        };
+        let accepted = |s: &DaemonState, a: Ipv4Addr| {
+            build_peer_state(&s.rib, IpAddr::V4(a))
+                .unwrap()
+                .prefixes_accepted
+        };
+
+        // peer 1 (longer path) announces both prefixes; peer 2 (shorter path)
+        // takes over one of them.
+        announce(&mut s, a1, vec![65002, 64000], "10.1.0.0/16");
+        announce(&mut s, a1, vec![65002, 64000], "10.2.0.0/16");
+        assert_eq!((accepted(&s, a1), accepted(&s, a2)), (2, 0));
+        announce(&mut s, a2, vec![65003], "10.1.0.0/16");
+        assert_eq!((accepted(&s, a1), accepted(&s, a2)), (1, 1));
+        // Received counts every announced prefix; accepted only wins.
+        let ps1 = build_peer_state(&s.rib, IpAddr::V4(a1)).unwrap();
+        assert_eq!(ps1.prefixes_received, 2);
+        assert_eq!(ps1.prefixes_accepted, 1);
+
+        // The winner withdraws: peer 1 is promoted back.
+        s.on_route_update(
+            IpAddr::V4(a2),
+            UpdateMessage {
+                withdrawn: vec![nlri("10.1.0.0/16")],
+                attributes: vec![],
+                announced: vec![],
+            },
+        );
+        assert_eq!((accepted(&s, a1), accepted(&s, a2)), (2, 0));
+
+        // Session teardown flushes the peer's routes from the Loc-RIB.
+        s.on_terminated(IpAddr::V4(a1), TerminationReason::OperatorStop, false);
+        assert_eq!((accepted(&s, a1), accepted(&s, a2)), (0, 0));
+    }
+
+    /// An IPv6-only peer's accepted count is its IPv6 wins. (It used to read
+    /// only the IPv4 Loc-RIB and so always showed 0 beside a non-zero
+    /// `prefixes_received`.)
+    #[test]
+    fn test_prefixes_accepted_counts_ipv6_best_paths() {
+        use pathvector_session::message::{MpReachNlri, PathAttribute, Prefix, UpdateMessage};
+        use pathvector_types::AfiSafi;
+
+        let a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let mut s = make_state(65001, &[(a, 65002)]);
+        Arc::make_mut(&mut s.rib).local_ipv6 = Some("2001:db8::1".parse().unwrap());
+        s.on_established(
+            IpAddr::V4(a),
+            a,
+            PeerType::External,
+            65002,
+            90,
+            &[pathvector_session::message::Capability::MultiProtocol(
+                AfiSafi::IPV6_UNICAST,
+            )],
+            None,
+        );
+        s.on_route_update(
+            IpAddr::V4(a),
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::MpReachNlri(MpReachNlri {
+                        afi_safi: AfiSafi::IPV6_UNICAST,
+                        next_hop: pathvector_types::NextHop::V6("2001:db8::2".parse().unwrap()),
+                        prefixes: vec![Prefix::V6(nlri6("2001:db8:1::/48"))],
+                    }),
+                ],
+                announced: vec![],
+            },
+        );
+        let ps = build_peer_state(&s.rib, IpAddr::V4(a)).unwrap();
+        assert_eq!(ps.prefixes_received, 1);
+        assert_eq!(ps.prefixes_accepted, 1);
+    }
+
+    /// Regression for #106: `list_peers` / `get_peer` / `watch_peers` must not
+    /// scan the Loc-RIB per peer. With 8 peers over a 120k-prefix Loc-RIB the
+    /// old implementation did ~1M `best_peer` lookups per call (hundreds of
+    /// ms in a debug build); the counters make it O(peers). The 100 ms budget
+    /// is ~3 orders of magnitude above the new cost and well below the old.
+    #[tokio::test]
+    async fn test_list_peers_cost_is_independent_of_loc_rib_size() {
+        use std::time::{Duration, Instant};
+
+        const PEERS: u8 = 8;
+        const PER_PEER: usize = 15_000;
+        let addrs: Vec<(Ipv4Addr, u32)> = (0..PEERS)
+            .map(|i| (Ipv4Addr::new(10, 0, 0, 2 + i), 65002 + u32::from(i)))
+            .collect();
+        let mut s = make_state(65001, &addrs);
+        for (n, &(a, asn)) in addrs.iter().enumerate() {
+            for i in 0..PER_PEER {
+                let idx = n * PER_PEER + i;
+                let prefix = format!(
+                    "{}.{}.{}.0/24",
+                    11 + idx / 65_536,
+                    (idx / 256) % 256,
+                    idx % 256
+                );
+                let route = RouteBuilder::new(
+                    nlri(&prefix),
+                    Origin::Igp,
+                    AsPath::from_sequence(vec![Asn::new(asn)]),
+                )
+                .next_hop(pathvector_types::NextHop::V4(a))
+                .peer_type(PeerType::External)
+                .build();
+                s.rib_insert_v4(PeerId::from(IpAddr::V4(a)), route);
+            }
+        }
+        assert_eq!(s.rib.loc_rib.len(), usize::from(PEERS) * PER_PEER);
+        let svc = PeerServiceImpl {
+            state: Arc::new(RwLock::new(s)),
+            cmd_tx: noop_cmd_tx(),
+            stop_senders: noop_stop_senders(),
+        };
+
+        let t = Instant::now();
+        let resp = svc
+            .list_peers(Request::new(ListPeersRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let list_elapsed = t.elapsed();
+        assert_eq!(resp.peers.len(), usize::from(PEERS));
+        assert!(
+            resp.peers.iter().all(|p| p.prefixes_accepted == 15_000),
+            "each peer wins exactly its own prefixes"
+        );
+
+        let t = Instant::now();
+        let one = svc
+            .get_peer(Request::new(GetPeerRequest {
+                address: addrs[0].0.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let get_elapsed = t.elapsed();
+        assert_eq!(one.prefixes_accepted, 15_000);
+
+        assert!(
+            list_elapsed < Duration::from_millis(100),
+            "list_peers took {list_elapsed:?} — it is scanning the Loc-RIB again"
+        );
+        assert!(
+            get_elapsed < Duration::from_millis(100),
+            "get_peer took {get_elapsed:?} — it is scanning the Loc-RIB again"
+        );
     }
 
     // ── route_to_proto ────────────────────────────────────────────────────────

@@ -533,7 +533,7 @@ for the full breakdown.
 | `hold_time` | Negotiated hold timer in seconds; `0` when idle |
 | `uptime_seconds` | Seconds since last Established; `0` when idle |
 | `prefixes_received` | Routes in Adj-RIB-In (all received, pre-policy) |
-| `prefixes_accepted` | Routes whose best-path winner is this peer |
+| `prefixes_accepted` | Routes (IPv4 + IPv6) whose best-path winner is this peer. Maintained incrementally by the Loc-RIB, so `ListPeers` / `GetPeer` / `WatchPeers` cost O(peers) regardless of table size |
 | `prefixes_advertised` | Routes currently being sent to this peer (Adj-RIB-Out size) |
 
 ### Route fields

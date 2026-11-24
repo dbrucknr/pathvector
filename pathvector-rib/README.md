@@ -38,6 +38,13 @@ is left with no feasible candidate — whether by an explicit withdrawal or by a
 replacement route with an unresolvable `NEXT_HOP` — always yields `Withdrawn`,
 and a prefix that never had a best route never does.
 
+`LocRib::best_win_count(peer)` answers "how many prefixes does this peer
+currently win?" in O(1). The winner map and the per-peer counts live in one
+private type whose single mutator updates both, so the counts cannot drift from
+the table; a property test checks them against a full recount after every step
+of arbitrary insert / withdraw / peer-down / reachability sequences. Management
+reads use it instead of scanning the table once per peer.
+
 ### Adj-RIB-Out — the outbound view
 
 One table per peer. Contains the routes that will be (or have been) advertised
@@ -159,6 +166,8 @@ cargo bench -p pathvector-rib -- --baseline before
 | `select_best` | 2 / 10 / 100 candidates | RFC 4271 §9.1 10-step comparison loop across competing routes for one prefix |
 | `select_best_reflected_tie` | 2 / 10 / 100 candidates | Candidates tied through step (e), so every comparison reaches the RFC 4456 §9 tie-breakers and (g) |
 | `loc_rib_insert` | 10k / 100k / 500k prefixes | `LocRib::insert` + best-path recompute; simulates a RIB of increasing size up to ~½ a full internet table |
+| `loc_rib_insert_steady` | 10k / 100k / 500k prefixes | Steady-state `LocRib::insert` on a RIB built once: `hot` (one prefix, winner flips) and `scattered` (stride over the whole table, cache-cold). Use this, not `loc_rib_insert`, to compare insert cost at 500k |
+| `peer_win_count` | 100 / 1k / 10k / 100k / 1M prefixes | Per-peer win count: the old `best_routes()` scan vs `best_win_count`, plus the `LocRib::clone` that copy-on-write performs |
 | `outbound_pipeline` | 1 / 10 / 50 peers | `prepare_outbound` + `AdjRibOut::insert` per peer; simulates the Update-Send Process for one prefix change |
 
 All benchmarks are deterministic (no random input) and sized for M2 Max hardware.

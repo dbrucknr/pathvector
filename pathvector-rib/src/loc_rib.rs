@@ -1,11 +1,11 @@
 use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
-use routemap::RouteMap;
 use smallvec::SmallVec;
 
 use crate::{
-    best_path::select_best_with_oracle, oracle::NextHopOracle, peer::PeerId, route::Route,
+    best_path::select_best_with_oracle, best_table::BestTable, oracle::NextHopOracle, peer::PeerId,
+    route::Route,
 };
 
 /// Describes how the best path for a prefix changed after a `LocRib` mutation.
@@ -200,7 +200,10 @@ pub struct LocRib<A: IpAddress> {
     /// Winning peer per prefix.  Stores only the `PeerId` — the actual Route
     /// is always available via `candidates[(prefix, peer)]`.  This avoids
     /// keeping a second full clone of every best route in memory.
-    best: RouteMap<A, PeerId>,
+    ///
+    /// Also counts, per peer, how many prefixes it wins ([`BestTable`]), so
+    /// [`LocRib::best_win_count`] is O(1).
+    best: BestTable<A>,
 }
 
 impl<A: IpAddress> LocRib<A> {
@@ -210,7 +213,7 @@ impl<A: IpAddress> LocRib<A> {
         Self {
             candidates: AHashMap::new(),
             peer_index: AHashMap::new(),
-            best: RouteMap::new(),
+            best: BestTable::new(),
         }
     }
 
@@ -245,16 +248,16 @@ impl<A: IpAddress> LocRib<A> {
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
         let nlri = route.nlri;
-        let previous = self.best.get(nlri.prefix()).copied();
+        let previous = self.best.get(nlri.prefix());
 
         self.candidates.insert((nlri, peer), route);
         let peers = self.peer_index.entry(nlri).or_default();
         if !peers.contains(&peer) {
             peers.push(peer);
         }
-        self.recompute_best(nlri, oracle);
+        self.recompute_best(nlri, previous, oracle);
 
-        let next = self.best.get(nlri.prefix()).copied();
+        let next = self.best.get(nlri.prefix());
         self.change_for(nlri, BestTransition::between(previous, next, Some(peer)))
     }
 
@@ -277,7 +280,7 @@ impl<A: IpAddress> LocRib<A> {
         nlri: &Nlri<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
-        let previous = self.best.get(nlri.prefix()).copied();
+        let previous = self.best.get(nlri.prefix());
 
         if self.candidates.remove(&(*nlri, *peer)).is_none() {
             return BestPathChange::Unchanged;
@@ -290,15 +293,15 @@ impl<A: IpAddress> LocRib<A> {
             false
         };
         if has_remaining {
-            self.recompute_best(*nlri, oracle);
+            self.recompute_best(*nlri, previous, oracle);
         } else {
             self.peer_index.remove(nlri);
-            self.best.remove(nlri.prefix());
+            self.best.set(nlri.prefix(), previous, None);
         }
 
         // `peer`'s candidate is gone, so it cannot be the next winner: no
         // route was replaced in place.
-        let next = self.best.get(nlri.prefix()).copied();
+        let next = self.best.get(nlri.prefix());
         self.change_for(*nlri, BestTransition::between(previous, next, None))
     }
 
@@ -331,14 +334,36 @@ impl<A: IpAddress> LocRib<A> {
     /// Returns the current best route for `nlri`, if any.
     #[must_use]
     pub fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        let peer = *self.best.get(nlri.prefix())?;
+        let peer = self.best.get(nlri.prefix())?;
         self.candidates.get(&(*nlri, peer))
     }
 
     /// Returns the peer whose route is currently best for `nlri`.
     #[must_use]
     pub fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        self.best.get(nlri.prefix()).copied()
+        self.best.get(nlri.prefix())
+    }
+
+    /// Returns how many prefixes currently have `peer` as their best-path
+    /// winner.
+    ///
+    /// O(1): the count is maintained at the single point where the winner of
+    /// a prefix changes, so it is always equal to
+    /// `best_routes().filter(|(n, _)| best_peer(n) == Some(peer)).count()`
+    /// without scanning the table. Management reads (`list_peers`,
+    /// `get_peer`) use this instead of walking a full table per peer.
+    #[must_use]
+    pub fn best_win_count(&self, peer: &PeerId) -> usize {
+        self.best.win_count(*peer)
+    }
+
+    /// Audits the incremental win counts against a full recount.
+    ///
+    /// O(table). For tests and debug assertions only; the counts cannot
+    /// drift through the public API, and this is how that is verified.
+    #[must_use]
+    pub fn best_win_counts_consistent(&self) -> bool {
+        self.best.counts_consistent()
     }
 
     /// Iterates over all `(prefix, best_route)` pairs.
@@ -405,9 +430,9 @@ impl<A: IpAddress> LocRib<A> {
         nlris
             .into_iter()
             .filter_map(|nlri| {
-                let previous = self.best.get(nlri.prefix()).copied();
-                self.recompute_best(nlri, oracle);
-                let next = self.best.get(nlri.prefix()).copied();
+                let previous = self.best.get(nlri.prefix());
+                self.recompute_best(nlri, previous, oracle);
+                let next = self.best.get(nlri.prefix());
                 match self.change_for(nlri, BestTransition::between(previous, next, None)) {
                     BestPathChange::Unchanged => None,
                     change => Some(change),
@@ -431,7 +456,13 @@ impl<A: IpAddress> LocRib<A> {
         }
     }
 
-    fn recompute_best(&mut self, nlri: Nlri<A>, oracle: &dyn NextHopOracle) {
+    /// `previous` is the prefix's winner as the caller just read it.
+    fn recompute_best(
+        &mut self,
+        nlri: Nlri<A>,
+        previous: Option<PeerId>,
+        oracle: &dyn NextHopOracle,
+    ) {
         // Use peer_index for O(k) lookup instead of scanning the full flat map.
         // Clone routes into a temp AHashMap — k is typically 1–8, negligible cost.
         let peer_map: AHashMap<PeerId, Route<A>> = self
@@ -443,9 +474,9 @@ impl<A: IpAddress> LocRib<A> {
             .collect();
 
         if let Some((peer, _)) = select_best_with_oracle(&peer_map, oracle) {
-            self.best.insert(nlri.prefix(), peer);
+            self.best.set(nlri.prefix(), previous, Some(peer));
         } else {
-            self.best.remove(nlri.prefix());
+            self.best.set(nlri.prefix(), previous, None);
         }
     }
 }
@@ -666,7 +697,7 @@ mod tests {
             .get_mut(&n)
             .unwrap()
             .retain(|p| *p != peer(1));
-        rib.recompute_best(n, &AlwaysReachable);
+        rib.recompute_best(n, rib.best_peer(&n), &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());
     }
@@ -676,7 +707,7 @@ mod tests {
         // Calls recompute_best directly with a prefix that is not in candidates.
         // Covers the implicit else-fallthrough of `if let Some(peer_map)`.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.recompute_best(nlri("10.0.0.0/8"), &AlwaysReachable);
+        rib.recompute_best(nlri("10.0.0.0/8"), None, &AlwaysReachable);
         assert!(rib.is_empty());
     }
 
@@ -1348,6 +1379,92 @@ mod tests {
     /// RFC 4271 §9.1.2 (install the selected route, "replacing any route to
     /// the same destination") and §9.2 ("newly unfeasible routes for which
     /// there is no replacement route SHALL be advertised").
+    struct NothingReachable;
+    impl NextHopOracle for NothingReachable {
+        fn is_reachable(&self, _: &NextHop) -> bool {
+            false
+        }
+        fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+            None
+        }
+    }
+
+    // ── best_win_count (issue #106) ──────────────────────────────────────────
+
+    #[test]
+    fn test_best_win_count_empty_rib_is_zero() {
+        let rib: LocRib<Ipv4Addr> = LocRib::new();
+        assert_eq!(rib.best_win_count(&peer(1)), 0);
+        assert!(rib.best_win_counts_consistent());
+    }
+
+    #[test]
+    fn test_best_win_count_tracks_winner_changes() {
+        let mut rib = LocRib::new();
+        // peer 1 wins both prefixes at first.
+        rib.insert(peer(1), route_with_lp("10.0.0.0/8", 100), &AlwaysReachable);
+        rib.insert(peer(1), route_with_lp("11.0.0.0/8", 100), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(1)), 2);
+        assert_eq!(rib.best_win_count(&peer(2)), 0);
+
+        // peer 2 takes over one prefix: the count moves, the total does not.
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 200), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(1)), 1);
+        assert_eq!(rib.best_win_count(&peer(2)), 1);
+
+        // A losing candidate changes nothing.
+        rib.insert(peer(3), route_with_lp("10.0.0.0/8", 50), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(3)), 0);
+
+        // The winner replacing its own route keeps a single count.
+        rib.insert(peer(2), route_with_lp("10.0.0.0/8", 300), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(2)), 1);
+
+        // Withdrawing the winner promotes the next candidate (peer 1).
+        rib.withdraw(&peer(2), &nlri("10.0.0.0/8"), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(1)), 2);
+        assert_eq!(rib.best_win_count(&peer(2)), 0);
+        assert!(rib.best_win_counts_consistent());
+    }
+
+    #[test]
+    fn test_best_win_count_teardown_zeroes_the_peer() {
+        let mut rib = LocRib::new();
+        for p in ["10.0.0.0/8", "11.0.0.0/8", "12.0.0.0/8"] {
+            rib.insert(peer(1), route_with_lp(p, 200), &AlwaysReachable);
+            rib.insert(peer(2), route_with_lp(p, 100), &AlwaysReachable);
+        }
+        assert_eq!(rib.best_win_count(&peer(1)), 3);
+        rib.withdraw_peer(&peer(1), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(1)), 0);
+        assert_eq!(rib.best_win_count(&peer(2)), 3);
+        rib.withdraw_peer(&peer(2), &AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(2)), 0);
+        assert!(rib.is_empty());
+        assert!(rib.best_win_counts_consistent());
+    }
+
+    #[test]
+    fn test_best_win_count_unresolvable_winner_is_not_counted() {
+        // RFC 4271 §9.1.2: a route with an unresolvable NEXT_HOP is excluded
+        // from selection, so it must not count as a best-path win.
+        let mut rib = LocRib::new();
+        rib.insert(
+            peer(1),
+            route_with_nh("10.0.0.0/8", "192.0.2.1"),
+            &AlwaysReachable,
+        );
+        assert_eq!(rib.best_win_count(&peer(1)), 1);
+
+        rib.recompute_all(&NothingReachable);
+        assert_eq!(rib.best_win_count(&peer(1)), 0, "no selected route");
+        assert_eq!(rib.len(), 1, "the candidate is retained");
+
+        rib.recompute_all(&AlwaysReachable);
+        assert_eq!(rib.best_win_count(&peer(1)), 1);
+        assert!(rib.best_win_counts_consistent());
+    }
+
     #[test]
     fn test_best_transition_truth_table() {
         let (a, b) = (peer(1), peer(2));

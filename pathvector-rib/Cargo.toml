@@ -33,7 +33,15 @@ name    = "loc_rib_insert"
 harness = false
 
 [[bench]]
+name    = "loc_rib_insert_steady"
+harness = false
+
+[[bench]]
 name    = "outbound_pipeline"
+harness = false
+
+[[bench]]
+name    = "peer_win_count"
 harness = false
 
 [lints]
