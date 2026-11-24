@@ -114,28 +114,32 @@ impl<A: IpAddress> AdjRibIn<A> {
         self.routes.is_empty()
     }
 
-    /// Marks all held routes [`Staleness::GrStale`] (RFC 4724 §4.2) and
-    /// returns clones for `LocRib` re-insertion.
+    /// Marks all held routes [`Staleness::GrStale`] (RFC 4724 §4.2) in place and
+    /// returns how many were marked.
     ///
     /// Called when a Graceful-Restart-capable peer's session ends while GR
     /// is in effect: the Receiving Speaker "MUST retain the routes received
     /// from the peer [...] and MUST mark them as stale routing information".
-    /// Re-inserting the returned routes keeps the `LocRib` copies' staleness
-    /// in step with this table; it does **not** change their preference — a
-    /// conventional-GR stale route competes on its attributes as before
-    /// (RFC 9494 §1: "in conventional GR, route preference is not
-    /// affected"). Stale routes leave by replacement (an ordinary
-    /// [`insert`](Self::insert) of the re-announced route), by the
-    /// End-of-RIB sweep, or by Restart Time expiry — all driven by the
-    /// caller.
-    pub fn mark_all_stale(&mut self) -> Vec<Route<A>> {
-        self.routes
-            .values_mut()
-            .map(|r| {
-                r.staleness = Staleness::GrStale;
-                r.clone()
-            })
-            .collect()
+    ///
+    /// Nothing is returned for re-insertion into the Loc-RIB on purpose. This
+    /// table holds routes *before* import policy, including ones policy
+    /// rejected, so handing them out as ready-made candidates is how a
+    /// rejected route (or one whose `LOCAL_PREF`/OTC policy had rewritten) used
+    /// to bypass eligibility during GR. The caller re-classifies the marked
+    /// routes through its import pipeline instead, which yields the post-policy
+    /// candidates carrying the new staleness.
+    ///
+    /// Staleness does **not** change a route's preference — a conventional-GR
+    /// stale route competes on its attributes as before (RFC 9494 §1: "in
+    /// conventional GR, route preference is not affected"). Stale routes leave
+    /// by replacement (an ordinary [`insert`](Self::insert) of the re-announced
+    /// route), by the End-of-RIB sweep, or by Restart Time expiry — all driven
+    /// by the caller.
+    pub fn mark_all_stale(&mut self) -> usize {
+        for r in self.routes.values_mut() {
+            r.staleness = Staleness::GrStale;
+        }
+        self.routes.len()
     }
 
     /// Removes all routes from this table.
@@ -270,7 +274,7 @@ mod tests {
 
     /// RFC 4724 §4.2: the Receiving Speaker "MUST retain the routes [...] and
     /// MUST mark them as stale" — every held route becomes `GrStale` with
-    /// its attributes untouched, and the returned copies match the table.
+    /// its attributes untouched, and the count reports how many were marked.
     #[test]
     fn test_mark_all_stale_marks_every_route_and_keeps_attributes() {
         let mut rib: AdjRibIn<Ipv4Addr> = AdjRibIn::new(peer());
@@ -280,15 +284,8 @@ mod tests {
         rib.insert(preferred.clone());
         rib.insert(route("172.16.0.0/12"));
 
-        let mut marked = rib.mark_all_stale();
-        marked.sort_by_key(|r| r.nlri.to_string());
-
-        assert_eq!(marked.len(), 2);
+        assert_eq!(rib.mark_all_stale(), 2);
         assert!(rib.routes().all(|(_, r)| r.staleness == Staleness::GrStale));
-        for r in &marked {
-            assert_eq!(r.staleness, Staleness::GrStale);
-            assert_eq!(rib.get(&r.nlri), Some(r), "returned copy matches the table");
-        }
         let mut expected = preferred;
         expected.staleness = Staleness::GrStale;
         assert_eq!(rib.get(&nlri("10.0.0.0/8")), Some(&expected));

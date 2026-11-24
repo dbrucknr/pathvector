@@ -80,6 +80,118 @@ extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 
 
 ---
 
+## 2026-11-24 (pathvectord: authorize BLACKHOLE and re-import retained routes through one pipeline — issues #81, #82)
+
+Both issues share one root cause: the daemon had no single import classification path.
+`handle_update` looked for the BLACKHOLE community before import policy and programmed a
+kernel null route for any peer, whatever its import default; `reapply_import_policy` and
+Graceful Restart stale marking then treated the stored raw route as an ordinary unicast
+candidate. RFC 7999 §3.3 allows honoring BLACKHOLE only if "the announced prefix is covered
+by an equal or shorter prefix that the neighboring network is authorized to advertise" and
+"the receiving party agreed to honor the BLACKHOLE community on the particular BGP
+session", and requires that origin validation not "inadvertently block legitimate
+announcements carrying the BLACKHOLE community".
+
+- **New config: `blackhole_authorized_prefixes`** (per peer, list of IPv4/IPv6 prefixes).
+  Setting it is the agreement; the list is the authorized scope; omitted = **denied**
+  (RFC 7999 §4). Validated at parse time (`BlackholeScope`): non-empty, canonical prefixes.
+  **Behavior change:** a BLACKHOLE-tagged announcement from a peer with no setting is now
+  ignored (no null route, never unicast). Existing deployments that rely on BLACKHOLE must add
+  the setting. Peers added over gRPC have no agreement.
+- **One pipeline.** `ImportPipeline::classify_gated` (`daemon/import.rs`) turns a received
+  route into `Accepted` / `Blackhole(AuthorizedBlackhole)` / `Rejected` / `BlackholeDenied`;
+  UPDATE arrival, `set_import_default`, RPKI ROA-change re-evaluation and Graceful Restart
+  stale marking all use it, and `ImportDecision::apply` reconciles the Loc-RIB and the
+  blackhole book identically. `AuthorizedBlackhole` can only be minted by
+  `BlackholeAgreement::authorize` (`daemon/blackhole.rs`) and is the only thing
+  `BlackholeBook::claim` takes. Authorized requests are judged by the agreement *instead of* the
+  import policy, so ROV and `import_default = "reject"` cannot block them; an RFC 9234 leak is
+  still ineligible. A denied request is stored but never imported as unicast.
+- **Null-route ownership is recorded, not inferred.** `BlackholeBook` replaces the
+  `holds_blackhole` community scan: a null route is installed by the first peer to claim a
+  prefix and withdrawn by the last to release it, so a denied/dropped request can never delete
+  another peer's route and two peers share one. `program_effects` (`daemon/fib.rs`) is the one
+  place best-path and null-route changes become FIB port calls: a unicast change for a
+  blackholed prefix is not programmed over the null route, and the Loc-RIB best route is
+  restored when the blackhole goes.
+- **Graceful Restart (#82).** Stale marking marks the Adj-RIB-In in place
+  (`AdjRibIn::mark_all_stale` now returns the count, not raw clones) and re-imports through the
+  pipeline: rejected routes stay out, LOCAL_PREF / communities / next hop / ingress OTC survive,
+  authorized blackholes stay blackholes, and EOR / expiry sweeps release null routes. The
+  originally reported rejected-route and LOCAL_PREF repros had already been fixed on main by
+  #139/#140; they remain as pinned regression tests. Only the peer's own prefixes are
+  re-propagated, in address order.
+- **Also fixed:** an address family a GR peer did not advertise was cleared from the Adj-RIB-In
+  at unclean termination but its Loc-RIB entries, FIB routes and advertisements lingered until
+  the restart timer (`flush_family_v4/v6`).
+- **Performance** (`gr_stale_marking_cost`, 60 000 IPv4 routes × 2 candidates, release build,
+  Apple M2 Max): stale marking ~110 ms (~1.9 µs/route) vs ~130–145 ms before — one fewer
+  `Route` clone per route, a single `Arc::make_mut`, and propagation limited to the peer's
+  prefixes in address order (hash-order propagation was ~25 % slower).
+- **Tests:** `issue_81_82_tests.rs` (the reported defects through the real entry points; the
+  three BLACKHOLE ones fail on the pre-fix tree), `blackhole_tests.rs` (authorization, ROV
+  exception, leak, revocation, multi-peer, GR lifecycle, config → agreement, model property
+  tests: never unicast, book == authorized stored requests, fresh import == arrival, idempotent),
+  unit tests for `BlackholeScope`, `BlackholeAgreement`, `BlackholeBook`. e2e: BLACKHOLE tests
+  in `pathvector-e2e/tests/fib.rs` now configure the agreement and gain denied / out-of-scope /
+  IPv4 `/32` / IPv6 `/128` cases (Docker + Linux kernel; compiled, not run on macOS).
+- Docs: `pathvectord/RFC.md` (RFC 7999, RFC 4724), `RFC_AUDIT.md`, `pathvectord/README.md`.
+
+---
+
+## 2026-11-24 (pathvector-session: malformed-UPDATE recovery goes through the FSM — issue #98)
+
+`handle_primary_message` handed a `BgpMessage::MalformedUpdate` straight to
+`handle_malformed_update`, which applied RFC 7606 recovery itself and sent
+`SessionEvent::RouteUpdate` on the event channel without ever asking the FSM. So a recoverable
+malformed UPDATE (attribute discard, treat-as-withdraw) crossed the route-event boundary in
+`OpenSent`/`OpenConfirm` — states where RFC 4271 §8.2.2 processes no UPDATE at all — and a
+session-reset outcome in those states fed `ProtocolErrorNotificationToSend` to an FSM that only
+handled it in `Established`, so no NOTIFICATION was sent and the connection stayed open. Real-wire
+reproduction (before the fix): an UPDATE with a malformed `AGGREGATOR` in place of the peer's
+OPEN made the session emit a `RouteUpdate` and send nothing.
+
+RFC basis (read from the primary text; RFC 4271 §8.2.2, RFC 7606 §2/§3/§5.2, RFC 6608 §3):
+Events 27 (`UpdateMsg`) and 28 (`UpdateMsgErr`) are *state-dependent*. Idle ignores them;
+Connect/Active stop the ConnectRetryTimer, drop TCP and go Idle; OpenSent/OpenConfirm send a
+Finite State Machine Error NOTIFICATION (RFC 6608 subcodes 1/2) and go Idle; Established processes
+a valid UPDATE (Event 27: restart the HoldTimer) or, for an UPDATE error, sends an Update-error
+NOTIFICATION and goes Idle (Event 28). RFC 7606 only changes *which* errors are Event 28 versus
+recovered in place; it does not authorize processing an UPDATE before Established.
+
+- New `fsm::UpdateRecovery` (`src/fsm/recovery.rs`): the pure RFC 7606 decision (session reset /
+  treat-as-withdraw / attribute discard, incl. §3(h) precedence and §5.2 Missing-NLRI escalation).
+  `make_treat_as_withdraw` and `is_nlri_less_with_attributes` moved here from the transport,
+  with their tests. The type is opaque and only the FSM can consume it, so recovery cannot take
+  effect outside the state machine: the transport has no path from a `MalformedUpdate` to
+  `event_tx` any more (`handle_malformed_update` is gone).
+- New `FsmInput::MalformedUpdate(UpdateRecovery)` (`MessageReceived(MalformedUpdate)` is
+  normalised to it) with per-state handling as above. A recovered UPDATE in Established is now an
+  ordinary Event 27 UPDATE, which also fixes a latent bug: recovered UPDATEs did **not** restart
+  the HoldTimer, so a peer sending only RFC 7606-recovered UPDATEs would have been timed out.
+- Review follow-up (Codex, PR #143): RFC 6608 §4 requires the FSM Error NOTIFICATION's Data
+  to be "a 1-octet, unsigned integer that indicates the type of the unexpected message" in
+  OpenSent, OpenConfirm *and* Established; every such NOTIFICATION was sent with empty Data. All
+  four sites now carry the type octet (2 for an UPDATE, malformed or not; 1 OPEN, 4 KEEPALIVE,
+  5 ROUTE-REFRESH) via the new `BgpMessage::type_code`.
+- Connect/Active now treat a received UPDATE (valid or not) per §8.2.2 (drop to Idle) instead of
+  silently ignoring it.
+- The transport still classifies a session-reset recovery as `TerminationReason::OperatorStop`
+  (locally detected: immediate flush, reconnect scheduled), unchanged.
+
+Regression tests (each confirmed failing before the fix): the full state × outcome matrix with
+exact outputs and normal-UPDATE parity in `src/fsm/update_error_tests.rs`; real loopback-TCP /
+real-`BgpCodec` tests in `tests/malformed_update_fsm.rs` — raw payload bytes in OpenSent and
+OpenConfirm (exact NOTIFICATION incl. the RFC 6608 type octet off the wire, connection closed, no session event), Established
+discard/withdraw/reset (exact NOTIFICATION Data, `Terminated(OperatorStop)`, reconnect on a new
+connection) and HoldTimer restart. Not done: a Docker/pathvectord scenario (the e2e images are
+shared tags; building them from this branch would replace other work's images) — the daemon-side
+defenses behind the session boundary are unchanged and not re-exercised end to end. Pre-existing,
+unchanged and noted for follow-up: an FSM-error teardown before Established leaves the peer in
+Idle with no ConnectRetryTimer (same as any other OpenSent/OpenConfirm protocol error).
+
+---
+
 ## 2026-11-24 (pathvectord: withdraw the older route when a replacement is dropped before import policy — issue #138)
 
 Same bug shape as #80 (PR #131), for announcements that never reach import policy.

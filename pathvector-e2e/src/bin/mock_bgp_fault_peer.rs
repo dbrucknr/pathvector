@@ -303,7 +303,7 @@ async fn malformed_update_origin(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -430,7 +430,7 @@ async fn attribute_flags_conflict_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -561,7 +561,7 @@ async fn malformed_otc_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -680,7 +680,7 @@ async fn missing_origin_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -797,7 +797,10 @@ async fn duplicate_mp_reach_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![Capability::MultiProtocol(AfiSafi::IPV4_UNICAST)],
+        capabilities: vec![
+            Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+            Capability::FourByteAsn(u32::from(FAULT_PEER_AS)),
+        ],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -915,7 +918,7 @@ async fn ebgp_local_pref_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1151,7 +1154,7 @@ async fn rfc5065_confed_segment_with_nlri_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1256,7 +1259,7 @@ async fn rfc5065_confed_segment_no_nlri_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1357,7 +1360,7 @@ async fn rfc5065_confed_member_wrong_first_segment_with_nlri_update(stream: TcpS
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1458,7 +1461,7 @@ async fn rfc5065_confed_member_wrong_first_segment_no_nlri_update(stream: TcpStr
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1567,7 +1570,7 @@ async fn confederation_id_loop_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1645,7 +1648,7 @@ async fn replacement_update(
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;
@@ -1740,7 +1743,7 @@ async fn unrecognized_well_known_attribute_update(stream: TcpStream) {
         my_as: FAULT_PEER_AS,
         hold_time: 9,
         bgp_id: FAULT_PEER_BGP_ID,
-        capabilities: vec![],
+        capabilities: vec![Capability::FourByteAsn(u32::from(FAULT_PEER_AS))],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;

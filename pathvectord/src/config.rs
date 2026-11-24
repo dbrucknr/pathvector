@@ -649,6 +649,46 @@ pub struct PeerConfig {
     /// ```
     #[serde(default)]
     pub confederation_member: bool,
+    /// RFC 7999 BLACKHOLE: the prefixes this peer is authorized to blackhole
+    /// on this session. **Setting it is the agreement to honor BLACKHOLE here.**
+    ///
+    /// RFC 7999 §3.3: "BGP speakers in a bilateral peering relationship using
+    /// the BLACKHOLE community MUST only accept and honor BGP announcements
+    /// carrying the BLACKHOLE community under the two following conditions:
+    /// the announced prefix is covered by an equal or shorter prefix that the
+    /// neighboring network is authorized to advertise; the receiving party
+    /// agreed to honor the BLACKHOLE community on the particular BGP session."
+    ///
+    /// **Omitted (the default): denied.** RFC 7999 §4: without an explicit
+    /// directive "network elements SHOULD NOT discard traffic destined towards
+    /// IP prefixes that are tagged with the BLACKHOLE community." A
+    /// BLACKHOLE-tagged announcement on a denied session is ignored — no null
+    /// route, no Loc-RIB entry, nothing exported — whatever the import
+    /// defaults say.
+    ///
+    /// When set, a BLACKHOLE-tagged announcement whose prefix is covered by one
+    /// of these (equal or shorter; `/32` and `/128` host routes inside an
+    /// authorized `/24` or `/48` are covered) programs a kernel null route. It
+    /// is honored **instead of** the session's import policy, so origin
+    /// validation (RFC 6811) and `import_default = "reject"` cannot block it
+    /// (RFC 7999 §3.3: "An operator MUST ensure that origin validation
+    /// techniques … do not inadvertently block legitimate announcements
+    /// carrying the BLACKHOLE community"). An RFC 9234 route leak is still
+    /// rejected. Authorized blackholes are never added to the Loc-RIB and so
+    /// are never advertised to other peers (RFC 7999 §3.2).
+    ///
+    /// Must be a non-empty list of IPv4/IPv6 prefixes in canonical (no host
+    /// bits) CIDR form. Dynamic peers added over gRPC have no blackhole
+    /// agreement.
+    ///
+    /// ```toml
+    /// [[peers]]
+    /// address                       = "198.51.100.1"
+    /// remote_as                     = 64496
+    /// blackhole_authorized_prefixes = ["192.0.2.0/24", "2001:db8:100::/40"]
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blackhole_authorized_prefixes: Option<crate::blackhole::BlackholeScope>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -978,6 +1018,7 @@ mod sidecar_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
@@ -1239,6 +1280,10 @@ mod sidecar_tests {
             max_prefixes_restart: Some(300),
             role: Some(PeerRole::Provider),
             confederation_member: true,
+            blackhole_authorized_prefixes: Some(
+                crate::blackhole::BlackholeScope::new(["192.0.2.0/24", "2001:db8:100::/40"])
+                    .unwrap(),
+            ),
         };
         store.upsert(full_peer.clone()).await;
 
@@ -1271,6 +1316,10 @@ mod sidecar_tests {
         assert!(
             got.confederation_member,
             "confederation_member must round-trip"
+        );
+        assert_eq!(
+            got.blackhole_authorized_prefixes, full_peer.blackhole_authorized_prefixes,
+            "blackhole_authorized_prefixes must round-trip"
         );
     }
 
@@ -1682,5 +1731,70 @@ import_default_v6 = "reject"
             DefaultAction::from(ExportDefault::Reject),
             DefaultAction::Reject
         ));
+    }
+
+    // ── blackhole_authorized_prefixes (RFC 7999 §3.3) ────────────────────────
+
+    fn peer_with_blackhole(line: &str) -> String {
+        format!(
+            r#"
+[daemon]
+local_as = 65002
+bgp_id   = "10.0.0.2"
+
+[[peers]]
+address   = "10.0.0.1"
+remote_as = 65001
+{line}
+"#
+        )
+    }
+
+    /// RFC 7999 §4: no directive, no discard. Omitting the setting is the
+    /// denied default.
+    #[test]
+    fn blackhole_agreement_defaults_to_denied() {
+        let cfg: Config = toml::from_str(&peer_with_blackhole("")).unwrap();
+        assert!(cfg.peers[0].blackhole_authorized_prefixes.is_none());
+    }
+
+    #[test]
+    fn blackhole_authorized_prefixes_parse_both_families() {
+        let cfg: Config = toml::from_str(&peer_with_blackhole(
+            r#"blackhole_authorized_prefixes = ["192.0.2.0/24", "2001:db8:100::/40"]"#,
+        ))
+        .unwrap();
+        let scope = cfg.peers[0].blackhole_authorized_prefixes.as_ref().unwrap();
+        assert!(
+            scope.covers(
+                &"192.0.2.9/32"
+                    .parse::<pathvector_types::Nlri<std::net::Ipv4Addr>>()
+                    .unwrap()
+            )
+        );
+        assert!(
+            scope.covers(
+                &"2001:db8:100::1/128"
+                    .parse::<pathvector_types::Nlri<std::net::Ipv6Addr>>()
+                    .unwrap()
+            )
+        );
+    }
+
+    /// Invalid agreements are config errors, never silently-empty scopes: an
+    /// empty list, a host-bits prefix, and non-prefix text.
+    #[test]
+    fn invalid_blackhole_scopes_are_config_errors() {
+        for bad in [
+            "blackhole_authorized_prefixes = []",
+            r#"blackhole_authorized_prefixes = ["192.0.2.5/24"]"#,
+            r#"blackhole_authorized_prefixes = ["not-a-prefix"]"#,
+            r#"blackhole_authorized_prefixes = "192.0.2.0/24""#,
+        ] {
+            assert!(
+                toml::from_str::<Config>(&peer_with_blackhole(bad)).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 }

@@ -70,7 +70,10 @@ async fn handle_connection(stream: tokio::net::TcpStream) {
         my_as: MOCK_AS,
         hold_time: 9,
         bgp_id: MOCK_BGP_ID,
-        capabilities: vec![Capability::MultiProtocol(AfiSafi::IPV4_UNICAST)],
+        capabilities: vec![
+            Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+            Capability::FourByteAsn(u32::from(MOCK_AS)),
+        ],
     };
     if framed.send(BgpMessage::Open(our_open)).await.is_err() {
         return;

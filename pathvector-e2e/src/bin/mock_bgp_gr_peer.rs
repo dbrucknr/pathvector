@@ -136,6 +136,7 @@ async fn do_handshake(stream: TcpStream, restart_time: u16) -> Framed<TcpStream,
         bgp_id: MOCK_BGP_ID,
         capabilities: vec![
             Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+            Capability::FourByteAsn(u32::from(MOCK_AS)),
             gr_capability(restart_time),
         ],
     };

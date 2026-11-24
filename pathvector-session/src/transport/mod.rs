@@ -23,11 +23,10 @@ use tokio::time::Instant;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::framing::{BgpCodec, FramingError};
-use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo};
+use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo, UpdateRecovery};
 use crate::message::{
-    AsnWidth, AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CodecError,
-    MalformedUpdate, MpUnreachNlri, MsgHeaderError, NotificationError, NotificationMessage,
-    OpenMessage, OpenMsgError, PathAttribute, UpdateMessage, UpdateMsgError,
+    AsnWidth, BgpMessage, Capability, CodecError, MsgHeaderError, NotificationError,
+    NotificationMessage, OpenMessage, OpenMsgError, UpdateMessage,
 };
 
 /// How long to wait for a staged, not-yet-validated second (collision
@@ -704,6 +703,14 @@ impl<T: BgpTransport> Session<T> {
                     FsmInput::ManualStop
                     | FsmInput::NotificationToSend(_)
                     | FsmInput::ProtocolErrorNotificationToSend(_) => {
+                        TerminationReason::OperatorStop
+                    }
+                    // RFC 7606 session-reset recovery of a malformed UPDATE
+                    // is the same kind of locally *detected* protocol error
+                    // (RFC 4271 §8.2.2 Event 28): clean reason, immediate
+                    // flush. A recovered (treat-as-withdraw / discard)
+                    // UPDATE does not terminate the session at all.
+                    FsmInput::MalformedUpdate(r) if r.is_session_reset() => {
                         TerminationReason::OperatorStop
                     }
                     _ => TerminationReason::Unclean,
@@ -1392,7 +1399,23 @@ impl<T: BgpTransport> Session<T> {
         msg: Option<Result<BgpMessage, FramingError>>,
     ) -> Option<FsmInput> {
         match msg {
-            Some(Ok(BgpMessage::MalformedUpdate(m))) => self.handle_malformed_update(m).await,
+            // A malformed UPDATE is *not* acted on here. The transport only
+            // classifies it (pure, no I/O) and hands the result to the FSM,
+            // which applies RFC 4271 §8.2.2's per-state rules first and only
+            // then — in Established — lets the RFC 7606 recovery take effect.
+            // There is deliberately no path from here to `event_tx`.
+            Some(Ok(BgpMessage::MalformedUpdate(m))) => {
+                for e in &m.errors {
+                    tracing::warn!(
+                        peer = %self.config.peer_addr,
+                        type_code = e.type_code,
+                        detail = e.detail,
+                        policy = ?e.policy,
+                        "RFC 7606: malformed path attribute"
+                    );
+                }
+                Some(FsmInput::MalformedUpdate(UpdateRecovery::classify(m)))
+            }
             Some(Ok(m)) => Some(FsmInput::MessageReceived(m)),
             Some(Err(e)) => {
                 tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
@@ -1409,104 +1432,6 @@ impl<T: BgpTransport> Session<T> {
                 Some(FsmInput::TcpFailed)
             }
         }
-    }
-
-    /// Apply RFC 7606 error policy for a malformed UPDATE.
-    ///
-    /// - `SessionReset` (RFC 7606 §3(g): a duplicated `MP_REACH_NLRI` or
-    ///   `MP_UNREACH_NLRI`; or RFC 4271 §6.3, not amended by RFC 7606: an
-    ///   unrecognized well-known attribute): tear down the session with the
-    ///   specific NOTIFICATION the triggering error carries. Per §3(h) this
-    ///   is the strongest of the four error-handling approaches and takes
-    ///   priority over `treat_as_withdraw` when both are set in the same
-    ///   UPDATE. Returns `Some(FsmInput)` for
-    ///   the caller to return from the event loop in this case — specifically
-    ///   `ProtocolErrorNotificationToSend` (RFC 4271 §8.2.2 Event 28), not a
-    ///   manually-sent NOTIFICATION plus `TcpFailed` and not the plain
-    ///   `NotificationToSend`: this is a locally *detected* protocol error on
-    ///   an ongoing, still-configured peer, so it must (a) record
-    ///   `TerminationReason::OperatorStop` (immediate route flush, not
-    ///   `Unclean`'s GR-retention path — we know exactly why the session
-    ///   ended) and (b) still schedule an automatic reconnect, unlike a
-    ///   genuine administrative/operator-initiated teardown.
-    /// - `TreatAsWithdraw`: synthesise a withdrawal UPDATE for all NLRIs that
-    ///   were announced in this message, then forward it as a `RouteUpdate`.
-    ///   Session stays up; returns `None`.
-    /// - `AttributeDiscard` (all remaining errors): forward the cleaned
-    ///   UPDATE (bad attributes already removed by the decoder). Session
-    ///   stays up; returns `None`.
-    async fn handle_malformed_update(&mut self, m: MalformedUpdate) -> Option<FsmInput> {
-        for e in &m.errors {
-            tracing::warn!(
-                peer = %self.config.peer_addr,
-                type_code = e.type_code,
-                detail = e.detail,
-                policy = ?e.policy,
-                "RFC 7606: malformed path attribute"
-            );
-        }
-
-        if m.session_reset {
-            // Use the specific NotificationError/data the triggering error
-            // carries (e.g. Unrecognized Well-known Attribute with the
-            // offending attribute in `data`), falling back to Malformed
-            // Attribute List with no data only if none is found — which
-            // shouldn't happen given `session_reset` is itself derived from
-            // the presence of a `SessionReset`-policy error.
-            let notif = m
-                .errors
-                .iter()
-                .find_map(|e| match &e.policy {
-                    AttributeErrorPolicy::SessionReset { error, data } => {
-                        Some(NotificationMessage {
-                            error: error.clone(),
-                            data: data.clone(),
-                        })
-                    }
-                    _ => None,
-                })
-                .unwrap_or(NotificationMessage {
-                    error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
-                    data: vec![],
-                });
-            return Some(FsmInput::ProtocolErrorNotificationToSend(notif));
-        }
-
-        // RFC 7606 §5.2 "Missing NLRI": if `m.update` carries no reachable
-        // NLRI at all (no traditional NLRI, no MP_REACH_NLRI with any
-        // prefixes) but does carry a path attribute other than
-        // MP_UNREACH_NLRI — whether that attribute survived decoding
-        // (`m.update.attributes`) or didn't, because it was itself
-        // malformed (`m.errors`; the decoder removes a bad attribute from
-        // `m.update.attributes` before `MalformedUpdate` is built) — we
-        // cannot be confident the NLRI have been successfully parsed
-        // (§3(j)). `m.treat_as_withdraw` here means at least one detected
-        // error's policy is stronger than "attribute discard" — exactly
-        // §5.2's trigger — so this must escalate to session reset instead
-        // of the ordinary treat-as-withdraw transform below. This check
-        // MUST run here, before `make_treat_as_withdraw` strips the
-        // surviving attributes it depends on, and MUST also consult
-        // `m.errors` — an UPDATE whose only attribute was itself the
-        // malformed one (e.g. a lone bad NEXT_HOP, no NLRI at all) has an
-        // already-empty `m.update.attributes`, indistinguishable from a
-        // legitimate empty End-of-RIB unless the stripped attribute is
-        // accounted for too.
-        if m.treat_as_withdraw && is_nlri_less_with_attributes(&m.update, &m.errors) {
-            let notif = NotificationMessage {
-                error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
-                data: vec![],
-            };
-            return Some(FsmInput::ProtocolErrorNotificationToSend(notif));
-        }
-
-        let update = if m.treat_as_withdraw {
-            make_treat_as_withdraw(m.update)
-        } else {
-            m.update
-        };
-
-        let _ = self.event_tx.send(SessionEvent::RouteUpdate(update)).await;
-        None
     }
 
     fn drop_connection(&mut self) {
@@ -1556,75 +1481,6 @@ fn header_error_notification(e: &FramingError) -> Option<NotificationMessage> {
         _ => return None,
     };
     Some(NotificationMessage { error, data })
-}
-
-/// RFC 4760 §5: the `MP_UNREACH_NLRI` path attribute type code.
-const ATTR_MP_UNREACH_NLRI: u8 = 15;
-
-/// RFC 7606 §5.2 "Missing NLRI": `true` when `update` carries no reachable
-/// NLRI at all (no traditional NLRI, no `MP_REACH_NLRI` with any prefixes)
-/// but the message — counting both `update.attributes` (attributes that
-/// survived decoding) and `errors` (attributes that didn't, because they
-/// were themselves malformed) — carries an attribute other than
-/// `MP_UNREACH_NLRI`.
-///
-/// `errors` matters because the decoder removes a malformed attribute from
-/// `update.attributes` before `MalformedUpdate` is ever built: an UPDATE
-/// whose *only* attribute was a malformed `NEXT_HOP` has an empty
-/// `update.attributes` — indistinguishable from a legitimate empty
-/// End-of-RIB — unless that stripped attribute is also accounted for here.
-///
-/// The two legitimate NLRI-less encodings — a fully empty legacy
-/// End-of-RIB and an `MP_UNREACH_NLRI`-only End-of-RIB/withdrawal (RFC 4724
-/// §2, whether or not `MP_UNREACH_NLRI` itself is also malformed) — have no
-/// attribute (survived or errored) other than `MP_UNREACH_NLRI`, so this is
-/// `false` for both.
-fn is_nlri_less_with_attributes(update: &UpdateMessage, errors: &[AttributeDecodeError]) -> bool {
-    let has_reachable_nlri = !update.announced.is_empty()
-        || update
-            .attributes
-            .iter()
-            .any(|a| matches!(a, PathAttribute::MpReachNlri(mp) if !mp.prefixes.is_empty()));
-    if has_reachable_nlri {
-        return false;
-    }
-    update
-        .attributes
-        .iter()
-        .any(|a| !matches!(a, PathAttribute::MpUnreachNlri(_)))
-        || errors.iter().any(|e| e.type_code != ATTR_MP_UNREACH_NLRI)
-}
-
-/// Convert an UPDATE with treat-as-withdraw errors into a withdrawal-only UPDATE.
-///
-/// All announced IPv4 NLRIs are moved into `withdrawn`. Any `MP_REACH_NLRI`
-/// attributes are converted to `MP_UNREACH_NLRI` so that non-IPv4 prefixes are
-/// also withdrawn. All other attributes are dropped.
-pub(crate) fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
-    let mut withdrawn = update.withdrawn;
-    withdrawn.extend(update.announced);
-
-    // Convert any decoded MP_REACH_NLRI → MP_UNREACH_NLRI.
-    let mp_unreaches: Vec<PathAttribute> = update
-        .attributes
-        .into_iter()
-        .filter_map(|attr| {
-            if let PathAttribute::MpReachNlri(mp) = attr {
-                Some(PathAttribute::MpUnreachNlri(MpUnreachNlri {
-                    afi_safi: mp.afi_safi,
-                    prefixes: mp.prefixes,
-                }))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    UpdateMessage {
-        withdrawn,
-        attributes: mp_unreaches,
-        announced: vec![],
-    }
 }
 
 // ── TCP connect helper ────────────────────────────────────────────────────────
@@ -3995,217 +3851,6 @@ mod tests {
             result.is_err(),
             "a mismatched-identity candidate must not produce any session \
              event on the live Established peer, got {result:?}"
-        );
-    }
-
-    // ── make_treat_as_withdraw unit tests ─────────────────────────────────────
-
-    #[test]
-    fn test_make_treat_as_withdraw_moves_announced_to_withdrawn() {
-        use pathvector_types::Nlri;
-
-        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
-        let update = UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![],
-            announced: vec![nlri],
-        };
-        let result = super::make_treat_as_withdraw(update);
-        assert_eq!(result.withdrawn, vec![nlri]);
-        assert!(result.announced.is_empty());
-        assert!(result.attributes.is_empty());
-    }
-
-    #[test]
-    fn test_make_treat_as_withdraw_strips_non_mp_reach_attributes() {
-        use pathvector_types::Origin;
-
-        let update = UpdateMessage {
-            withdrawn: vec![],
-            // LOCAL_PREF and ORIGIN are not MpReachNlri — they must be stripped.
-            attributes: vec![
-                PathAttribute::LocalPref(100),
-                PathAttribute::Origin(Origin::Igp),
-            ],
-            announced: vec![],
-        };
-        let result = super::make_treat_as_withdraw(update);
-        assert!(
-            result.attributes.is_empty(),
-            "non-MpReach attrs must be stripped"
-        );
-        assert!(result.withdrawn.is_empty());
-        assert!(result.announced.is_empty());
-    }
-
-    #[test]
-    fn test_make_treat_as_withdraw_mixed_attrs_keeps_only_mp_unreach() {
-        use std::net::Ipv6Addr;
-
-        use crate::message::{MpReachNlri, Prefix};
-        use pathvector_types::{AfiSafi, NextHop, Nlri, Origin};
-
-        let prefix: Nlri<Ipv6Addr> = "2001:db8::/32".parse().unwrap();
-        let update = UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![
-                PathAttribute::LocalPref(200),
-                PathAttribute::MpReachNlri(MpReachNlri {
-                    afi_safi: AfiSafi::IPV6_UNICAST,
-                    next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
-                    prefixes: vec![Prefix::V6(prefix)],
-                }),
-                PathAttribute::Origin(Origin::Egp),
-            ],
-            announced: vec![],
-        };
-        let result = super::make_treat_as_withdraw(update);
-        // Only the converted MpUnreachNlri should remain.
-        assert_eq!(result.attributes.len(), 1);
-        assert!(
-            matches!(&result.attributes[0], PathAttribute::MpUnreachNlri(m) if m.afi_safi == AfiSafi::IPV6_UNICAST),
-            "expected MpUnreachNlri after conversion"
-        );
-        assert!(result.announced.is_empty());
-    }
-
-    #[test]
-    fn test_make_treat_as_withdraw_empty_update_is_noop() {
-        let update = UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![],
-            announced: vec![],
-        };
-        let result = super::make_treat_as_withdraw(update);
-        assert!(result.withdrawn.is_empty());
-        assert!(result.attributes.is_empty());
-        assert!(result.announced.is_empty());
-    }
-
-    /// Pins down `is_nlri_less_with_attributes`'s cases directly, without
-    /// going through a full session. In particular, the `errors` parameter
-    /// must count attributes that were malformed and therefore already
-    /// stripped from `update.attributes` by the decoder — an UPDATE whose
-    /// only attribute was a malformed `NEXT_HOP` (never surviving into
-    /// `update.attributes`) must still be `true`, and the same holds even
-    /// when a valid `MP_UNREACH_NLRI` also happens to be present.
-    #[test]
-    fn test_is_nlri_less_with_attributes() {
-        use crate::message::MpUnreachNlri;
-        use pathvector_types::{AfiSafi, Origin};
-
-        assert!(
-            !super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![],
-                    announced: vec![],
-                },
-                &[]
-            ),
-            "a fully empty legacy EoR must not be NLRI-less-with-attributes"
-        );
-
-        assert!(
-            !super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
-                        afi_safi: AfiSafi::IPV4_UNICAST,
-                        prefixes: vec![],
-                    })],
-                    announced: vec![],
-                },
-                &[]
-            ),
-            "an MP_UNREACH_NLRI-only EoR must not be NLRI-less-with-attributes"
-        );
-
-        assert!(
-            super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![PathAttribute::Origin(Origin::Igp)],
-                    announced: vec![],
-                },
-                &[]
-            ),
-            "ORIGIN present with no reachable NLRI at all must be \
-             NLRI-less-with-attributes"
-        );
-
-        let prefix: Nlri<StdIpv4Addr> = Nlri::new(StdIpv4Addr::new(10, 0, 0, 0), 8).unwrap();
-        assert!(
-            !super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![PathAttribute::Origin(Origin::Igp)],
-                    announced: vec![prefix],
-                },
-                &[]
-            ),
-            "a message with reachable NLRI must not be NLRI-less-with-attributes"
-        );
-
-        // [Codex] The decoder strips a malformed attribute before
-        // `MalformedUpdate` is built — an UPDATE whose *only* attribute was
-        // a malformed NEXT_HOP has empty `update.attributes`, but the
-        // stripped attribute must still count via `errors`.
-        let next_hop_error = AttributeDecodeError {
-            type_code: 3, // NEXT_HOP
-            policy: AttributeErrorPolicy::TreatAsWithdraw,
-            detail: "invalid NEXT_HOP length",
-        };
-        assert!(
-            super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![],
-                    announced: vec![],
-                },
-                std::slice::from_ref(&next_hop_error)
-            ),
-            "a malformed NEXT_HOP as the *only* attribute (already stripped \
-             from `update.attributes`) must still be NLRI-less-with-attributes"
-        );
-
-        // [Codex] The same bypass exists when a valid MP_UNREACH_NLRI is
-        // *also* present alongside the malformed NEXT_HOP.
-        assert!(
-            super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![PathAttribute::MpUnreachNlri(MpUnreachNlri {
-                        afi_safi: AfiSafi::IPV4_UNICAST,
-                        prefixes: vec![],
-                    })],
-                    announced: vec![],
-                },
-                std::slice::from_ref(&next_hop_error)
-            ),
-            "a malformed NEXT_HOP alongside a valid MP_UNREACH_NLRI must \
-             still be NLRI-less-with-attributes"
-        );
-
-        // A malformed MP_UNREACH_NLRI itself (its own type code, 15) is not
-        // "an attribute other than MP_UNREACH_NLRI" — the message never
-        // clears §5.2's own gating condition in the first place.
-        let mp_unreach_error = AttributeDecodeError {
-            type_code: 15, // MP_UNREACH_NLRI
-            policy: AttributeErrorPolicy::TreatAsWithdraw,
-            detail: "malformed MP_UNREACH_NLRI",
-        };
-        assert!(
-            !super::is_nlri_less_with_attributes(
-                &UpdateMessage {
-                    withdrawn: vec![],
-                    attributes: vec![],
-                    announced: vec![],
-                },
-                std::slice::from_ref(&mp_unreach_error)
-            ),
-            "a malformed MP_UNREACH_NLRI as the only error must not be \
-             NLRI-less-with-attributes"
         );
     }
 
