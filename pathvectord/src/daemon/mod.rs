@@ -83,7 +83,9 @@ use capabilities::{
 use deferral::SelectionDeferral;
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
-use import::{ImportTally, import_announcement, import_ineligible, reapply_import_policy};
+use import::{
+    ImportDecision, ImportTally, import_announcement, import_ineligible, reapply_import_policy,
+};
 use ingress::{Disposition, IngressDrop, IngressGate};
 use peer::{run_bgp_listener, run_command_processor};
 use route::MraiTracker;

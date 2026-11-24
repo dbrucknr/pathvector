@@ -56,7 +56,8 @@ use super::DaemonState;
 use super::ingress::IngressGate;
 use super::last_feasible_tests::{
     AS_A, AS_C, LOCAL_AS, PEER_A, PEER_B, PEER_C, RESOLVABLE_V4, RESOLVABLE_V4_ALT, RESOLVABLE_V6,
-    announces_v4, announces_v6, drain, established, n4, n6, sent_to, withdraws_v4, withdraws_v6,
+    Receivers, announces_v4, announces_v6, drain, established, n4, n6, sent_to, withdraws_v4,
+    withdraws_v6,
 };
 use super::route::handle_update;
 use crate::daemon::tests::with_recording_fib;
@@ -506,91 +507,89 @@ fn n6b() -> Nlri<Ipv6Addr> {
     "2001:db8:2::/48".parse().unwrap()
 }
 
-/// One UPDATE carries a traditional IPv4 NLRI (`n4()`, NEXT_HOP unspecified:
-/// RFC 7606 treat-as-withdraw) and an MP_REACH_NLRI IPv4 NLRI (`n4b()`, valid
-/// next hop). A had earlier routes for both. Only `n4()` is withdrawn; `n4b()`
-/// is replaced and its new next hop installed.
+/// One UPDATE carries a classic IPv4 NLRI (`n4()`), a valid MP_REACH_NLRI IPv4
+/// NLRI (`n4b()`) and a valid MP_REACH_NLRI IPv6 NLRI (`n6()`), with a NEXT_HOP
+/// attribute of 0.0.0.0. RFC 4271 §6.3 makes that "syntactically incorrect";
+/// RFC 7606 §3(e) turns the reset into treat-as-withdraw, and §2 defines
+/// treat-as-withdraw for the UPDATE: every route it contains is withdrawn.
+/// A had earlier routes for all three; none may survive (Codex review of #139).
 #[test]
-fn mixed_update_withdraws_only_the_nlri_with_a_bad_next_hop_v4() {
+fn invalid_next_hop_attribute_withdraws_every_nlri_of_the_update() {
     let (mut state, mut receivers) = established();
     let fib = with_recording_fib(&mut state);
-    let old_nh = Ipv4Addr::new(192, 0, 2, 7);
+    let mp_v4 = |nh: Ipv4Addr| {
+        PathAttribute::MpReachNlri(MpReachNlri {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            next_hop: NextHop::V4(nh),
+            prefixes: vec![Prefix::V4(n4b())],
+        })
+    };
+    let mp_v6 = |nh: Ipv6Addr| {
+        PathAttribute::MpReachNlri(MpReachNlri {
+            afi_safi: AfiSafi::IPV6_UNICAST,
+            next_hop: NextHop::V6(nh),
+            prefixes: vec![Prefix::V6(n6())],
+        })
+    };
+    let update = |classic_nh: Ipv4Addr| UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            path(&[AS_A]),
+            PathAttribute::NextHop(classic_nh),
+            mp_v4(RESOLVABLE_V4_ALT),
+            mp_v6(RESOLVABLE_V6),
+        ],
+        announced: vec![n4()],
+    };
 
-    state.on_route_update(IpAddr::V4(PEER_A), v4(&[AS_A], RESOLVABLE_V4));
-    state.on_route_update(
-        IpAddr::V4(PEER_A),
-        UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![
-                PathAttribute::Origin(Origin::Igp),
-                path(&[AS_A]),
-                PathAttribute::MpReachNlri(MpReachNlri {
-                    afi_safi: AfiSafi::IPV4_UNICAST,
-                    next_hop: NextHop::V4(old_nh),
-                    prefixes: vec![Prefix::V4(n4b())],
-                }),
-            ],
-            announced: vec![],
-        },
-    );
+    state.on_route_update(IpAddr::V4(PEER_A), update(RESOLVABLE_V4));
     assert!(state.rib.loc_rib.best(&n4()).is_some());
     assert!(state.rib.loc_rib.best(&n4b()).is_some());
+    assert!(state.rib.loc_rib_v6.best(&n6()).is_some());
     drain(&mut state, &mut receivers);
     fib.v4.lock().unwrap().clear();
+    fib.v6.lock().unwrap().clear();
 
-    let new_nh = Ipv4Addr::new(192, 0, 2, 8);
-    state.on_route_update(
-        IpAddr::V4(PEER_A),
-        UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![
-                PathAttribute::Origin(Origin::Igp),
-                path(&[AS_A]),
-                PathAttribute::NextHop(Ipv4Addr::UNSPECIFIED),
-                PathAttribute::MpReachNlri(MpReachNlri {
-                    afi_safi: AfiSafi::IPV4_UNICAST,
-                    next_hop: NextHop::V4(new_nh),
-                    prefixes: vec![Prefix::V4(n4b())],
-                }),
-            ],
-            announced: vec![n4()],
-        },
-    );
+    let notification = state.on_route_update(IpAddr::V4(PEER_A), update(Ipv4Addr::UNSPECIFIED));
 
+    assert!(notification.is_none(), "RFC 7606: the session stays up");
+    assert!(state.rib.loc_rib.best(&n4()).is_none());
     assert!(
-        state.rib.loc_rib.best(&n4()).is_none(),
-        "RFC 7606 §3(e): the bad-NEXT_HOP NLRI is withdrawn"
+        state.rib.loc_rib.best(&n4b()).is_none(),
+        "RFC 7606 §2: the MP_REACH IPv4 NLRI of the same UPDATE is withdrawn too"
     );
-    assert!(state.adj_ribs_in[&IpAddr::V4(PEER_A)].get(&n4()).is_none());
-    let kept = state.rib.loc_rib.best(&n4b()).expect("n4b must survive");
-    assert_eq!(
-        kept.next_hop,
-        Some(NextHop::V4(new_nh)),
-        "RFC 4271 §9: the valid NLRI is replaced by its new advertisement"
+    assert!(
+        state.rib.loc_rib_v6.best(&n6()).is_none(),
+        "RFC 7606 §2: the MP_REACH IPv6 NLRI of the same UPDATE is withdrawn too"
+    );
+    let a = &state.adj_ribs_in[&IpAddr::V4(PEER_A)];
+    assert!(a.get(&n4()).is_none() && a.get(&n4b()).is_none());
+    assert!(
+        state.adj_ribs_in_v6[&IpAddr::V4(PEER_A)]
+            .get(&n6())
+            .is_none()
     );
     let changes = fib.v4_changes();
     assert!(
         changes.contains(&BestPathChange::Withdrawn(n4())),
-        "got {changes:?}"
+        "{changes:?}"
     );
     assert!(
-        changes
-            .iter()
-            .any(|c| matches!(c, BestPathChange::Announced(n, r)
-                if *n == n4b() && r.next_hop == Some(NextHop::V4(new_nh)))),
-        "got {changes:?}"
+        changes.contains(&BestPathChange::Withdrawn(n4b())),
+        "{changes:?}"
     );
-    assert!(
-        !changes.contains(&BestPathChange::Withdrawn(n4b())),
-        "got {changes:?}"
+    assert_eq!(
+        fib.v6.lock().unwrap().clone(),
+        vec![BestPathChange::Withdrawn(n6())]
     );
 }
 
-/// One UPDATE carries a valid IPv4 NLRI and an IPv6 MP_REACH_NLRI with an
-/// unspecified next hop. A had routes for both families. Only the IPv6 route
-/// is withdrawn; the IPv4 route is replaced normally.
+/// An invalid *MP_REACH_NLRI* next hop is not the NEXT_HOP attribute, so it
+/// stays scoped to that attribute's own NLRI: a valid classic NLRI in the same
+/// UPDATE is replaced normally.
 #[test]
-fn mixed_update_withdraws_only_the_bad_family_v4_good_v6_bad() {
+fn invalid_mp_reach_next_hop_withdraws_only_its_own_nlri_v4_good_v6_bad() {
     let (mut state, mut receivers) = established();
     let fib = with_recording_fib(&mut state);
 
@@ -851,6 +850,214 @@ fn run(
         Some(OWN_V4),
         Some(OWN_V6),
     )
+}
+
+// ── Graceful Restart must not resurrect ineligible routes ────────────────────
+
+/// A, B and C established; A advertises Graceful Restart for IPv4 and IPv6
+/// unicast, so an unclean drop retains its routes (RFC 4724 §4.2).
+fn established_gr() -> (DaemonState, Receivers) {
+    use pathvector_session::message::{Capability, GracefulRestartFamily};
+    let (mut state, mut receivers) = crate::daemon::tests::make_state(
+        LOCAL_AS,
+        &[
+            (IpAddr::V4(PEER_A), AS_A),
+            (IpAddr::V4(PEER_B), super::last_feasible_tests::AS_B),
+            (IpAddr::V4(PEER_C), AS_C),
+        ],
+    );
+    state.set_oracles(
+        super::last_feasible_tests::FixedOracle,
+        super::last_feasible_tests::FixedOracle,
+    );
+    Arc::make_mut(&mut state.rib).local_ipv6 = Some(OWN_V6);
+    let mp = [
+        Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+        Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
+    ];
+    let mut a_caps = mp.to_vec();
+    a_caps.push(Capability::GracefulRestart {
+        restart_flags: 0,
+        restart_time: 120,
+        families: [AfiSafi::IPV4_UNICAST, AfiSafi::IPV6_UNICAST]
+            .into_iter()
+            .map(|afi_safi| GracefulRestartFamily {
+                afi_safi,
+                forwarding_preserved: true,
+            })
+            .collect(),
+    });
+    state.on_established(
+        IpAddr::V4(PEER_A),
+        PEER_A,
+        PeerType::External,
+        AS_A,
+        90,
+        &a_caps,
+        None,
+    );
+    for (ip, asn) in [(PEER_B, super::last_feasible_tests::AS_B), (PEER_C, AS_C)] {
+        state.on_established(IpAddr::V4(ip), ip, PeerType::External, asn, 90, &mp, None);
+    }
+    drain(&mut state, &mut receivers);
+    (state, receivers)
+}
+
+/// RFC 4724 §4.2 retains and marks stale the routes received from the peer; it
+/// does not make an ineligible one eligible. A's AS-looped or own-NEXT_HOP
+/// replacement sits in the Adj-RIB-In (ineligible, RFC 4271 §9.1.2 / §6.3 (a));
+/// when A drops uncleanly, stale marking must not install it, even though
+/// teardown has by then forgotten the local address (Codex review of #139).
+#[test]
+fn graceful_restart_does_not_resurrect_ineligible_routes() {
+    for fault in [Fault::AsLoop, Fault::ConfedLoop, Fault::OwnNextHop] {
+        let (mut state, mut receivers) = established_gr();
+        fault.prepare(&mut state);
+        let fib = with_recording_fib(&mut state);
+
+        state.on_route_update(IpAddr::V4(PEER_A), v4(&[AS_A], RESOLVABLE_V4));
+        state.on_route_update(IpAddr::V4(PEER_A), v6(&[AS_A], RESOLVABLE_V6));
+        state.on_route_update(IpAddr::V4(PEER_A), fault.update_v4());
+        state.on_route_update(IpAddr::V4(PEER_A), fault.update_v6());
+        drain(&mut state, &mut receivers);
+        assert!(state.rib.loc_rib.best(&n4()).is_none(), "{fault:?}");
+        assert!(state.rib.loc_rib_v6.best(&n6()).is_none(), "{fault:?}");
+        fib.v4.lock().unwrap().clear();
+        fib.v6.lock().unwrap().clear();
+
+        state.on_terminated(
+            IpAddr::V4(PEER_A),
+            pathvector_session::transport::TerminationReason::Unclean,
+            true,
+        );
+
+        assert!(
+            state.gr.deadlines.contains_key(&IpAddr::V4(PEER_A)),
+            "{fault:?}: precondition: the drop entered the GR window"
+        );
+        assert!(
+            state.rib.loc_rib.best(&n4()).is_none(),
+            "{fault:?}: stale marking installed an ineligible IPv4 route"
+        );
+        assert!(
+            state.rib.loc_rib_v6.best(&n6()).is_none(),
+            "{fault:?}: stale marking installed an ineligible IPv6 route"
+        );
+        assert!(
+            fib.v4_changes()
+                .iter()
+                .all(|c| !matches!(c, BestPathChange::Announced(..))),
+            "{fault:?}"
+        );
+        assert!(
+            fib.v6
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| !matches!(c, BestPathChange::Announced(..))),
+            "{fault:?}"
+        );
+    }
+}
+
+/// Counterpart: an *eligible* route is still retained and stays selected.
+#[test]
+fn graceful_restart_still_retains_eligible_routes() {
+    let (mut state, _receivers) = established_gr();
+    Fault::OwnNextHop.prepare(&mut state);
+
+    state.on_route_update(IpAddr::V4(PEER_A), v4(&[AS_A], RESOLVABLE_V4));
+    state.on_route_update(IpAddr::V4(PEER_A), v6(&[AS_A], RESOLVABLE_V6));
+    state.on_terminated(
+        IpAddr::V4(PEER_A),
+        pathvector_session::transport::TerminationReason::Unclean,
+        true,
+    );
+
+    assert_eq!(state.rib.loc_rib.best_peer(&n4()), Some(pid(PEER_A)));
+    assert_eq!(state.rib.loc_rib_v6.best_peer(&n6()), Some(pid(PEER_A)));
+}
+
+/// The same re-judging applies to a route that import policy rejected (it is
+/// kept in the Adj-RIB-In for soft reconfiguration): stale marking goes through
+/// `ImportDecision`, not around it.
+#[test]
+fn graceful_restart_does_not_resurrect_policy_rejected_routes() {
+    let (mut state, mut receivers) = established_gr();
+    state.on_route_update(IpAddr::V4(PEER_A), v4(&[AS_A], RESOLVABLE_V4));
+    state.on_route_update(IpAddr::V4(PEER_A), v6(&[AS_A], RESOLVABLE_V6));
+    state.set_import_default(IpAddr::V4(PEER_A), DefaultAction::Reject);
+    drain(&mut state, &mut receivers);
+    assert!(state.rib.loc_rib.best(&n4()).is_none());
+
+    state.on_terminated(
+        IpAddr::V4(PEER_A),
+        pathvector_session::transport::TerminationReason::Unclean,
+        true,
+    );
+
+    assert!(state.rib.loc_rib.best(&n4()).is_none());
+    assert!(state.rib.loc_rib_v6.best(&n6()).is_none());
+}
+
+// ── BLACKHOLE tags are never retained on a dropped route ─────────────────────
+
+/// An ineligible announcement installs no kernel null route, so it must not be
+/// kept with its BLACKHOLE tag: `holds_blackhole` and teardown read that tag as
+/// "this peer owns a null route". Otherwise A's later withdrawal of a looped
+/// BLACKHOLE route would schedule deletion of C's active null route (Codex
+/// review of #139).
+#[test]
+fn dropped_blackhole_announcement_is_not_retained_and_withdrawal_removes_no_null_route() {
+    let policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Accept);
+    let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(DefaultAction::Accept);
+    for fault in [Fault::AsLoop, Fault::OwnNextHop] {
+        let mut adj = AdjRibIn::new(pid(PEER_A));
+        let mut adj_v6 = AdjRibIn::new(pid(PEER_A));
+        let mut loc: LocRib<Ipv4Addr> = LocRib::new();
+        let mut loc_v6: LocRib<Ipv6Addr> = LocRib::new();
+
+        let mut tagged = fault.update_v4();
+        tagged
+            .attributes
+            .push(PathAttribute::Communities(vec![Community::BLACKHOLE]));
+        let first = run(
+            &mut adj,
+            &mut adj_v6,
+            &mut loc,
+            &mut loc_v6,
+            &policy,
+            &policy_v6,
+            tagged,
+        );
+        assert!(
+            first.blackhole_announced_v4.is_empty(),
+            "{fault:?}: no null route for an ineligible announcement"
+        );
+        assert!(
+            adj.get(&n4()).is_none(),
+            "{fault:?}: BLACKHOLE tag retained"
+        );
+
+        let withdraw = UpdateMessage {
+            withdrawn: vec![n4()],
+            attributes: vec![],
+            announced: vec![],
+        };
+        let second = run(
+            &mut adj,
+            &mut adj_v6,
+            &mut loc,
+            &mut loc_v6,
+            &policy,
+            &policy_v6,
+            withdraw,
+        );
+        assert!(
+            second.blackhole_withdrawn_v4.is_empty(),
+            "{fault:?}: withdrawing a never-installed route must not delete a null route"
+        );
+    }
 }
 
 // ── Model property test ──────────────────────────────────────────────────────

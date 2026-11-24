@@ -923,12 +923,39 @@ impl<A: IpAddress> MraiTracker<A> {
 /// (RFC 7999). Whatever supersedes or removes it must report the null route
 /// for removal.
 fn holds_blackhole<A: IpAddress>(adj_rib_in: &AdjRibIn<A>, nlri: &Nlri<A>) -> bool {
-    adj_rib_in.get(nlri).is_some_and(|r| {
-        r.rare_or_default()
-            .communities
-            .iter()
-            .any(|c| c.is_blackhole())
-    })
+    adj_rib_in.get(nlri).is_some_and(is_blackhole_route)
+}
+
+/// `true` when `route` carries the RFC 7999 BLACKHOLE community.
+fn is_blackhole_route<A: IpAddress>(route: &Route<A>) -> bool {
+    route
+        .rare_or_default()
+        .communities
+        .iter()
+        .any(|c| c.is_blackhole())
+}
+
+/// [`withdraw_route`] for every NLRI in `nlris`, appending each best-path
+/// change to `fib_changes`.
+fn withdraw_all<A: IpAddress>(
+    peer: PeerId,
+    nlris: impl IntoIterator<Item = Nlri<A>>,
+    adj_rib_in: &mut AdjRibIn<A>,
+    loc_rib: &mut LocRib<A>,
+    oracle: &dyn NextHopOracle,
+    blackhole_withdrawn: &mut Vec<Nlri<A>>,
+    fib_changes: &mut Vec<BestPathChange<A>>,
+) {
+    for nlri in nlris {
+        fib_changes.push(withdraw_route(
+            peer,
+            &nlri,
+            adj_rib_in,
+            loc_rib,
+            oracle,
+            blackhole_withdrawn,
+        ));
+    }
 }
 
 /// Removes `peer`'s route for `nlri` from the Adj-RIB-In and the Loc-RIB, as an
@@ -1433,6 +1460,46 @@ pub(super) fn handle_update(
         }
     }
 
+    // ── Syntactically invalid NEXT_HOP attribute: whole-UPDATE withdraw ──────
+    // RFC 4271 §6.3: "Syntactic correctness means that the NEXT_HOP attribute
+    // represents a valid IP host address." RFC 7606 §3(e): "'Treat-as-withdraw'
+    // MUST be used for the cases that specify a session reset and involve any
+    // of the attributes ORIGIN, AS_PATH, NEXT_HOP, ..."; §2 defines it for the
+    // UPDATE message, so *every* route it announces is withdrawn, whichever
+    // NLRI field or MP_REACH_NLRI carries it (issue #138). An MP_REACH_NLRI
+    // next hop is not the NEXT_HOP attribute and is judged per attribute below.
+    if let Some(nh) = next_hop
+        && gate.check_next_hop(&nh) == Some(IngressDrop::NextHopSyntax)
+        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
+    {
+        tracing::warn!(
+            peer = %peer,
+            next_hop = ?nh,
+            "{} — treat-as-withdraw of every announced NLRI (RFC 7606 §3(e))",
+            IngressDrop::NextHopSyntax.describe()
+        );
+        withdraw_all(
+            peer,
+            msg.announced
+                .drain(..)
+                .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri)),
+            adj_rib_in,
+            loc_rib,
+            oracle_v4,
+            &mut blackhole_withdrawn_v4,
+            &mut fib_changes,
+        );
+        withdraw_all(
+            peer,
+            mp_v6_announced.drain(..).map(|(nlri, _)| nlri),
+            adj_rib_in_v6,
+            loc_rib_v6,
+            oracle_v6,
+            &mut blackhole_withdrawn_v6,
+            &mut fib_changes_v6,
+        );
+    }
+
     // ── MP_UNREACH_NLRI withdrawals (RFC 4760) ────────────────────────────
     let mp_withdrawn_count = mp_v4_withdrawn.len();
     for nlri in &mp_v4_withdrawn {
@@ -1552,10 +1619,24 @@ pub(super) fn handle_update(
         // (RFC 4271 §9, §9.1.2). It never programs a blackhole, but must
         // retire one the peer announced earlier.
         if drop.is_some() {
-            if holds_blackhole(adj_rib_in, &nlri) {
-                blackhole_withdrawn_v4.push(nlri);
+            if is_blackhole_route(&raw) {
+                // No null route is installed for it, so it is not retained: a
+                // stored BLACKHOLE tag would later read as "this peer owns a
+                // kernel null route" and could delete another peer's.
+                fib_changes.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in,
+                    loc_rib,
+                    oracle_v4,
+                    &mut blackhole_withdrawn_v4,
+                ));
+            } else {
+                if holds_blackhole(adj_rib_in, &nlri) {
+                    blackhole_withdrawn_v4.push(nlri);
+                }
+                fib_changes.push(import_ineligible(peer, raw, adj_rib_in, loc_rib, oracle_v4));
             }
-            fib_changes.push(import_ineligible(peer, raw, adj_rib_in, loc_rib, oracle_v4));
             continue;
         }
 
@@ -1685,16 +1766,27 @@ pub(super) fn handle_update(
         // Same as IPv4: an ineligible announcement replaces the older route
         // and leaves the peer with no candidate.
         if drop.is_some() {
-            if holds_blackhole(adj_rib_in_v6, &nlri) {
-                blackhole_withdrawn_v6.push(nlri);
+            if is_blackhole_route(&raw) {
+                fib_changes_v6.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in_v6,
+                    loc_rib_v6,
+                    oracle_v6,
+                    &mut blackhole_withdrawn_v6,
+                ));
+            } else {
+                if holds_blackhole(adj_rib_in_v6, &nlri) {
+                    blackhole_withdrawn_v6.push(nlri);
+                }
+                fib_changes_v6.push(import_ineligible(
+                    peer,
+                    raw,
+                    adj_rib_in_v6,
+                    loc_rib_v6,
+                    oracle_v6,
+                ));
             }
-            fib_changes_v6.push(import_ineligible(
-                peer,
-                raw,
-                adj_rib_in_v6,
-                loc_rib_v6,
-                oracle_v6,
-            ));
             continue;
         }
 

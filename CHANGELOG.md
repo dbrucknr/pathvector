@@ -36,14 +36,23 @@ IPv4/IPv6 lists was worse: the NLRI were cleared without being counted or logged
   unchecked).
 - Behavior change: an AS-looped announcement is now stored in Adj-RIB-In (it was silently
   not stored). It counts toward max-prefix like a policy-rejected route.
+- Review follow-ups (Codex, PR #139): Graceful Restart stale marking
+  (`mark_stale_and_repropagate`) re-judges each retained route with the gate and import
+  policy instead of inserting raw Adj-RIB-In routes into the Loc-RIB, so a looped,
+  own-NEXT_HOP or policy-rejected route is not resurrected when the peer drops (the gate is
+  built before teardown forgets the local address); a syntactically invalid NEXT_HOP
+  *attribute* withdraws every NLRI of the UPDATE (RFC 7606 §2); a dropped BLACKHOLE-tagged
+  announcement is not retained, so its tag cannot later be mistaken for an installed null
+  route.
 
 Regression tests: `daemon/ingress_drop_tests.rs` — through `DaemonState::on_route_update`,
 sole best replaced, takeover, no earlier route, mixed UPDATEs, re-evaluation, BLACKHOLE,
 IPv4 and IPv6, every drop reason — plus a model property test; unit tests in
 `daemon/ingress.rs`; e2e `as_loop_replacement_withdraws_the_older_route_session_stays_up`
 and `invalid_next_hop_replacement_withdraws_the_older_route_session_stays_up`. See
-`pathvectord/RFC.md`. Still open: the session-side AS 0 checks (#111), and a *non-dropped*
-replacement does not retire an older BLACKHOLE route.
+`pathvectord/RFC.md`. Still open: the session-side AS 0 checks (#111), a *non-dropped*
+replacement does not retire an older BLACKHOLE route, and raw BLACKHOLE routes can still
+reach selection through GR stale marking and re-evaluation (#82).
 
 ---
 

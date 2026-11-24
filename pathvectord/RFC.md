@@ -96,18 +96,28 @@ Decisions, and why:
 
 Notes:
 
-- Each NLRI is judged against the next hop that applies to *it*: the NEXT_HOP attribute
-  for the classic NLRI field, the MP_REACH_NLRI next hop for its own prefixes. One UPDATE
-  can therefore withdraw some NLRI and replace others. RFC 7606 §2 speaks of "all
-  contained routes" for a malformed attribute; a well-formed attribute with an invalid
-  *value* is a route-level check (§5.1.3), so the verdict is route-level too.
+- A syntactically invalid **NEXT_HOP attribute** is treat-as-withdraw for the *whole
+  UPDATE*: RFC 7606 §3(e) selects the approach and §2 defines it over the UPDATE
+  ("all contained routes"), so every NLRI it announces — classic NLRI field, MP_REACH
+  IPv4 and MP_REACH IPv6 — is withdrawn (`handle_update`, before the announcement loops;
+  test `invalid_next_hop_attribute_withdraws_every_nlri_of_the_update`). An invalid
+  *MP_REACH_NLRI* next hop is not the NEXT_HOP attribute, so it stays scoped to that
+  attribute's own NLRI (`invalid_mp_reach_next_hop_withdraws_only_its_own_nlri_v4_good_v6_bad`).
+  Our own address as NEXT_HOP is semantic (§6.3 (a)), so it is per-route `Ineligible`.
 - If both an `Ineligible` and a `TreatAsWithdraw` reason apply, treat-as-withdraw wins
   (`IngressDrop::most_severe`).
-- An `Ineligible` route stays in the Adj-RIB-In for soft reconfiguration, so
-  `reapply_import_policy` asks the same `IngressGate` first; a ROA or default-policy change
-  cannot install a looped route. It counts toward max-prefix like a policy-rejected route.
-- An older BLACKHOLE route (RFC 7999) superseded by a dropped announcement is reported in
-  `blackhole_withdrawn_*` so its kernel null route is removed.
+- An `Ineligible` route stays in the Adj-RIB-In for soft reconfiguration, so every path
+  that turns Adj-RIB-In routes into candidates asks the same `IngressGate` first:
+  `reapply_import_policy`, and Graceful Restart stale marking (`mark_stale_and_repropagate`
+  re-judges each retained route with `ImportDecision::evaluate_gated`; RFC 4724 §4.2
+  retains routes, it does not make an ineligible one eligible). The gate is built before
+  teardown forgets the local address, so own-NEXT_HOP routes stay rejected. It counts toward
+  max-prefix like a policy-rejected route.
+- A BLACKHOLE-tagged (RFC 7999) announcement that is dropped is **not** retained: no null
+  route is installed for it, and a stored tag would later read as "this peer owns a kernel
+  null route" (`holds_blackhole`, peer teardown) and could delete another peer's. It is
+  handled like treat-as-withdraw instead. An older BLACKHOLE route superseded by a dropped
+  announcement is reported in `blackhole_withdrawn_*` so its null route is removed.
 - Still open, outside this issue: an *accepted* (or policy-rejected) replacement that is
   not BLACKHOLE-tagged does not retire an older BLACKHOLE route either.
 - The session-side half of RFC 7607 (OPEN, AGGREGATOR, AS4 attributes) remains issue #111.
@@ -118,8 +128,10 @@ Notes:
 | …another peer's route takes over, peers never see a withdrawal | `src/daemon/route.rs` | ✅ | `dropped_replacement_promotes_other_peers_route_v4`/`_v6` |
 | No earlier route from the peer: no FIB change, nothing sent, other peers' routes untouched | `src/daemon/route.rs` | ✅ | `dropped_announcement_without_earlier_route_is_a_no_op_v4`/`_v6` |
 | Adj-RIB-In: removed for treat-as-withdraw, holds the replacement for ineligible routes | `src/daemon/route.rs` | ✅ | `assert_adj_rib_in_v4`/`_v6` in every test above |
-| Several NLRI in one UPDATE: only the dropped ones are withdrawn | `src/daemon/route.rs` | ✅ | `mixed_update_withdraws_only_the_nlri_with_a_bad_next_hop_v4`, `mixed_update_withdraws_only_the_bad_family_v4_good_v6_bad`, `loop_update_with_several_nlri_withdraws_only_prefixes_with_an_earlier_route`, `loop_update_with_several_v6_nlri_withdraws_only_prefixes_with_an_earlier_route` |
+| Several NLRI in one UPDATE: an invalid NEXT_HOP attribute withdraws all of them; loops and MP_REACH next hops affect only their own NLRI | `src/daemon/route.rs` | ✅ | `invalid_next_hop_attribute_withdraws_every_nlri_of_the_update`, `invalid_mp_reach_next_hop_withdraws_only_its_own_nlri_v4_good_v6_bad`, `loop_update_with_several_nlri_withdraws_only_prefixes_with_an_earlier_route`, `loop_update_with_several_v6_nlri_withdraws_only_prefixes_with_an_earlier_route` |
 | Re-evaluation does not resurrect an ineligible replacement | `src/daemon/import.rs` | ✅ | `reevaluation_keeps_an_ineligible_replacement_out_of_the_loc_rib` |
+| Graceful Restart stale marking does not resurrect ineligible (or policy-rejected) routes, including own-NEXT_HOP after the local address is forgotten; eligible routes are still retained | `src/daemon/gr.rs` | ✅ | `graceful_restart_does_not_resurrect_ineligible_routes`, `graceful_restart_does_not_resurrect_policy_rejected_routes`, `graceful_restart_still_retains_eligible_routes` |
+| A dropped BLACKHOLE announcement is not retained; its withdrawal removes no other peer's null route | `src/daemon/route.rs` | ✅ | `dropped_blackhole_announcement_is_not_retained_and_withdrawal_removes_no_null_route` |
 | An eligible route after a dropped one is installed | `src/daemon/route.rs` | ✅ | `eligible_replacement_of_a_dropped_route_is_installed` |
 | A superseded BLACKHOLE route's null route is withdrawn | `src/daemon/route.rs` | ✅ | `dropped_replacement_of_a_blackhole_route_withdraws_the_null_route` |
 | Model: after any per-peer sequence of accepted / ineligible / treat-as-withdraw announcements and withdrawals, candidates == latest accepted advertisement, Adj-RIB-In as the table above says, re-evaluation agrees | `src/daemon/ingress_drop_tests.rs` | ✅ | `prop_dropped_announcements_leave_the_peer_with_no_candidate` |

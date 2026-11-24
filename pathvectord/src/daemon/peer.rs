@@ -593,6 +593,10 @@ impl DaemonState {
             && gr_restart_time > 0
             && (reason == TerminationReason::Unclean || notification_gr_eligible);
 
+        // The pre-policy checks need our address toward this peer, which the
+        // block below forgets; GR re-judges the retained routes after it.
+        let gate = self.ingress_gate(peer_ip);
+
         // Remove live session state from snapshot.
         {
             let rib = self.rib_mut();
@@ -660,7 +664,7 @@ impl DaemonState {
             // RFC 4724 §4.2 MUST: mark retained routes as stale. Staleness
             // does not change their preference (RFC 9494 §1) — it scopes the
             // End-of-RIB sweep and the Restart Time deadline.
-            self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6);
+            self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6, &gate);
 
             if notify {
                 let _ = self.peer_tx.send(proto::PeerEvent {
