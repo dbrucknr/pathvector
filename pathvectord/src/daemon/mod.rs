@@ -50,6 +50,11 @@ mod gr;
 mod import;
 #[cfg(test)]
 mod import_reject_tests;
+mod ingress;
+// Issue #138: announcements dropped before import policy still withdraw the
+// peer's older route.
+#[cfg(test)]
+mod ingress_drop_tests;
 #[cfg(test)]
 mod last_feasible_tests;
 #[cfg(test)]
@@ -78,7 +83,8 @@ use capabilities::{
 use deferral::SelectionDeferral;
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
-use import::{ImportTally, import_announcement, reapply_import_policy};
+use import::{ImportTally, import_announcement, import_ineligible, reapply_import_policy};
+use ingress::{Disposition, IngressDrop, IngressGate};
 use peer::{run_bgp_listener, run_command_processor};
 use route::MraiTracker;
 #[cfg(test)]
@@ -1795,6 +1801,12 @@ mod tests {
         RouteBuilder::new(nlri_v6(prefix), Origin::Igp, AsPath::new())
             .peer_type(PeerType::External)
             .build()
+    }
+
+    /// Gate for tests that exercise policy only: no confederation, no local
+    /// addresses, and a local AS that no test route carries.
+    fn test_gate() -> IngressGate {
+        IngressGate::new(64999, None, None, None)
     }
 
     fn accept_all() -> Policy<Route<Ipv4Addr>> {
@@ -4899,7 +4911,14 @@ mod tests {
         ari.insert(route_v4("198.51.100.0/24"));
         let mut rib = LocRib::new();
         let snap = capture(|| {
-            let _ = reapply_import_policy(peer(), &ari, &mut rib, &reject_all(), &AlwaysReachable);
+            let _ = reapply_import_policy(
+                peer(),
+                &ari,
+                &mut rib,
+                &reject_all(),
+                &test_gate(),
+                &AlwaysReachable,
+            );
         });
         assert_eq!(
             import_reject_counter(&snap, "10.0.0.1"),
@@ -4914,8 +4933,14 @@ mod tests {
         ari.insert(route_v6("2001:db8::/32"));
         let mut rib: LocRib<Ipv6Addr> = LocRib::new();
         let snap = capture(|| {
-            let _ =
-                reapply_import_policy(peer(), &ari, &mut rib, &reject_all_v6(), &AlwaysReachable);
+            let _ = reapply_import_policy(
+                peer(),
+                &ari,
+                &mut rib,
+                &reject_all_v6(),
+                &test_gate(),
+                &AlwaysReachable,
+            );
         });
         assert_eq!(
             import_reject_counter(&snap, "10.0.0.1"),
@@ -6499,7 +6524,14 @@ mod tests {
         );
         assert!(rib.is_empty());
 
-        reapply_import_policy(peer(), &ari, &mut rib, &accept_all(), &AlwaysReachable);
+        reapply_import_policy(
+            peer(),
+            &ari,
+            &mut rib,
+            &accept_all(),
+            &test_gate(),
+            &AlwaysReachable,
+        );
         assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
     }
 
@@ -6524,7 +6556,14 @@ mod tests {
         );
         assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
 
-        reapply_import_policy(peer(), &ari, &mut rib, &reject_all(), &AlwaysReachable);
+        reapply_import_policy(
+            peer(),
+            &ari,
+            &mut rib,
+            &reject_all(),
+            &test_gate(),
+            &AlwaysReachable,
+        );
         assert!(rib.best(&nlri("10.0.0.0/8")).is_none());
     }
 
@@ -6557,7 +6596,14 @@ mod tests {
                 .then(Accept),
         ));
 
-        reapply_import_policy(peer(), &ari, &mut rib, &new_policy, &AlwaysReachable);
+        reapply_import_policy(
+            peer(),
+            &ari,
+            &mut rib,
+            &new_policy,
+            &test_gate(),
+            &AlwaysReachable,
+        );
         assert_eq!(
             rib.best(&nlri("10.0.0.0/8")).unwrap().local_pref,
             Some(LP::new(300))
@@ -6607,7 +6653,14 @@ mod tests {
         let mut new_policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Accept);
         new_policy.add_term(Term::new(CommunityCondition::new(blocked), Reject));
 
-        reapply_import_policy(peer(), &ari, &mut rib, &new_policy, &AlwaysReachable);
+        reapply_import_policy(
+            peer(),
+            &ari,
+            &mut rib,
+            &new_policy,
+            &test_gate(),
+            &AlwaysReachable,
+        );
         assert!(
             rib.best(&nlri("10.0.0.0/8")).is_none(),
             "blocked route must be withdrawn"
@@ -6662,6 +6715,7 @@ mod tests {
             &ari_v6,
             &mut rib_v6,
             &accept_all_v6(),
+            &test_gate(),
             &AlwaysReachable,
         );
         assert!(
@@ -6712,6 +6766,7 @@ mod tests {
             &ari_v6,
             &mut rib_v6,
             &reject_all_v6(),
+            &test_gate(),
             &AlwaysReachable,
         );
         assert!(
@@ -6942,10 +6997,16 @@ mod tests {
             rib.is_empty(),
             "route with local AS in AS_PATH must be dropped (RFC 4271 §9.1.2)"
         );
-        // AdjRibIn is also empty — silently ignore means do not store.
+        // RFC 4271 §9: an announcement replaces the peer's older route in the
+        // Adj-RIB-In, and §9.1.2 only "excludes" a looped route from the
+        // Phase 2 decision function, so it is stored there as ineligible
+        // (issue #138). Before that fix this asserted "silently ignored
+        // means do not store", which let a looped replacement leave the
+        // peer's *older* route selected; no RFC clause says an ineligible
+        // route is not stored.
         assert!(
-            ari.is_empty(),
-            "silently ignored route must not be stored in AdjRibIn"
+            ari.get(&nlri("10.0.0.0/8")).is_some(),
+            "the ineligible announcement is kept in the Adj-RIB-In (RFC 4271 §9)"
         );
     }
 

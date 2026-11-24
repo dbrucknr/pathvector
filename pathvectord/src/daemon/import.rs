@@ -20,6 +20,8 @@ use super::*;
 
 use pathvector_types::IpAddress;
 
+use super::ingress::IngressGate;
+
 /// The result of RFC 4271 §9.1.1 Phase 1 for one received route: is it
 /// eligible for the Decision Process, and in what (post-policy) form?
 ///
@@ -60,6 +62,27 @@ impl<A: IpAddress> ImportDecision<A> {
         match policy.evaluate(&mut route) {
             Decision::Accept => Self::Accepted(route),
             Decision::Reject | Decision::Next => Self::Rejected,
+        }
+    }
+
+    /// Like [`evaluate`](Self::evaluate), but a route that fails the
+    /// [`IngressGate`] is rejected without running policy: RFC 4271 §9.1.2
+    /// excludes an AS-looped route from Phase 2, and §6.3 says a route whose
+    /// NEXT_HOP is our own address "SHOULD be ignored", so neither can be made
+    /// eligible by policy.
+    ///
+    /// This is how a route read back from the Adj-RIB-In (soft
+    /// reconfiguration) gets the verdict it got on arrival, so an ineligible
+    /// replacement stored there can never be installed by a re-evaluation.
+    pub(crate) fn evaluate_gated(
+        gate: &IngressGate,
+        policy: &Policy<Route<A>>,
+        raw: &Route<A>,
+    ) -> Self {
+        if gate.check_route(raw).is_some() {
+            Self::Rejected
+        } else {
+            Self::evaluate(policy, raw)
         }
     }
 
@@ -147,25 +170,48 @@ pub(super) fn import_announcement<A: IpAddress>(
     decision.apply(peer, &nlri, loc_rib, oracle)
 }
 
-/// Re-evaluates every route in `peer`'s Adj-RIB-In against `policy` and
-/// reconciles `loc_rib` with the result (soft reconfiguration). Used for a
-/// changed import default and for an RPKI ROA-cache change, for either
-/// address family.
+/// Imports one announcement `raw` that failed the [`IngressGate`] with an
+/// [`Ineligible`](super::ingress::Disposition::Ineligible) verdict (an AS loop
+/// or our own address as NEXT_HOP; issue #138).
 ///
-/// Applies exactly the decisions [`import_announcement`] would have, so a
-/// prefix ends up in the same Loc-RIB state however it got there.
+/// RFC 4271 §9: `raw` replaces the peer's older route in the Adj-RIB-In, and
+/// §9.1.2 excludes it from Phase 2, so the peer is left with no Loc-RIB
+/// candidate — the same reconciliation as an import-policy rejection
+/// ([`ImportDecision::Rejected`]), minus the policy run and the policy
+/// counters (the route was never offered to policy).
+pub(super) fn import_ineligible<A: IpAddress>(
+    peer: PeerId,
+    raw: Route<A>,
+    adj_rib_in: &mut AdjRibIn<A>,
+    loc_rib: &mut LocRib<A>,
+    oracle: &dyn NextHopOracle,
+) -> BestPathChange<A> {
+    let nlri = raw.nlri;
+    adj_rib_in.insert(raw);
+    ImportDecision::Rejected.apply(peer, &nlri, loc_rib, oracle)
+}
+
+/// Re-evaluates every route in `peer`'s Adj-RIB-In against `gate` and
+/// `policy` and reconciles `loc_rib` with the result (soft reconfiguration).
+/// Used for a changed import default and for an RPKI ROA-cache change, for
+/// either address family.
+///
+/// Applies exactly the decisions arrival would have (the gate for ineligible
+/// routes, then [`import_announcement`]'s policy), so a prefix ends up in the
+/// same Loc-RIB state however it got there.
 pub(crate) fn reapply_import_policy<A: IpAddress>(
     peer: PeerId,
     adj_rib_in: &AdjRibIn<A>,
     loc_rib: &mut LocRib<A>,
     policy: &Policy<Route<A>>,
+    gate: &IngressGate,
     oracle: &dyn NextHopOracle,
 ) -> Vec<BestPathChange<A>> {
     let mut tally = ImportTally::default();
     let fib_changes: Vec<BestPathChange<A>> = adj_rib_in
         .routes()
         .map(|(nlri, raw)| {
-            let decision = ImportDecision::evaluate(policy, raw);
+            let decision = ImportDecision::evaluate_gated(gate, policy, raw);
             tally.record(&decision);
             decision.apply(peer, nlri, loc_rib, oracle)
         })
