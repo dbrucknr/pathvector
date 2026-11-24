@@ -309,6 +309,9 @@ impl DaemonState {
                 rib.local_addrs.insert(peer_ip, addr);
             }
         }
+        if let Some(IpAddr::V4(addr)) = local_addr {
+            self.gr.retained_local_v4.insert(peer_ip, addr);
+        }
 
         // Record negotiated message size limit for NLRI batching.
         let max_len = if peer_capabilities.contains(&Capability::ExtendedMessage)
@@ -593,6 +596,11 @@ impl DaemonState {
             && gr_restart_time > 0
             && (reason == TerminationReason::Unclean || notification_gr_eligible);
 
+        // Built before the block below forgets the live session's address
+        // (`ingress_gate` falls back to `gr.retained_local_v4`, so later soft
+        // reconfiguration judges the retained routes the same way).
+        let gate = self.ingress_gate(peer_ip);
+
         // Remove live session state from snapshot.
         {
             let rib = self.rib_mut();
@@ -660,7 +668,7 @@ impl DaemonState {
             // RFC 4724 §4.2 MUST: mark retained routes as stale. Staleness
             // does not change their preference (RFC 9494 §1) — it scopes the
             // End-of-RIB sweep and the Restart Time deadline.
-            self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6);
+            self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6, &gate);
 
             if notify {
                 let _ = self.peer_tx.send(proto::PeerEvent {

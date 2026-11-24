@@ -21,7 +21,11 @@ and decides which routes to install in the local routing table.
    (raw, pre-policy), replacing that peer's older advertisement. If import policy accepts
    it, it becomes the peer's candidate in Loc-RIB (the decision table); if policy rejects
    it, the peer's older candidate is withdrawn, because the new advertisement implicitly
-   withdraws the old one (RFC 4271 §9). Best-path selection then picks a winner, which
+   withdraws the old one (RFC 4271 §9). The same holds for an announcement dropped before
+   policy: an AS_PATH loop or our own address as NEXT_HOP leaves the peer with no candidate
+   (the ineligible route is kept in Adj-RIB-In), and AS 0 or a syntactically invalid
+   NEXT_HOP is treated as a withdrawal (RFC 7606), removing the older route outright.
+   Best-path selection then picks a winner, which
    goes to Adj-RIB-Out for each peer that export policy allows it to reach.
 
 3. **gRPC API** — a management interface (not BGP) where you inspect peers, query

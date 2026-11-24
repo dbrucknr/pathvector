@@ -32,6 +32,17 @@ pub(crate) struct GracefulRestartState {
     /// `CEASE/HardReset` is treated as Unclean — the GR window opens rather than
     /// flushing routes immediately.
     pub(crate) notification_capable_peers: HashSet<IpAddr>,
+    /// The IPv4 address this daemon used toward each peer in its most recent
+    /// session.
+    ///
+    /// `RibSnapshot::local_addrs` forgets it when the session ends, but
+    /// Adj-RIB-In routes outlive the session during the GR window and are
+    /// re-judged by every soft reconfiguration. RFC 4271 §6.3 (a): a NEXT_HOP
+    /// that "MUST NOT be the IP address of the receiving speaker" has to stay
+    /// rejected for as long as the route is retained, so the ingress gate falls
+    /// back to this address once the live session is gone (issue #138).
+    /// Overwritten on re-establishment; cleared only on `remove_peer`.
+    pub(crate) retained_local_v4: HashMap<IpAddr, Ipv4Addr>,
 }
 
 impl GracefulRestartState {
@@ -42,6 +53,7 @@ impl GracefulRestartState {
             stale_nlri_v6: HashMap::new(),
             peer_families: HashMap::new(),
             notification_capable_peers: HashSet::new(),
+            retained_local_v4: HashMap::new(),
         }
     }
 
@@ -52,6 +64,7 @@ impl GracefulRestartState {
         self.stale_nlri_v6.remove(&peer_ip);
         self.peer_families.remove(&peer_ip);
         self.notification_capable_peers.remove(&peer_ip);
+        self.retained_local_v4.remove(&peer_ip);
     }
 
     /// Earliest deadline across all active GR windows, or `None` when empty.
@@ -75,7 +88,22 @@ impl GracefulRestartState {
 }
 
 impl DaemonState {
-    pub(super) fn mark_stale_and_repropagate(&mut self, peer_ip: IpAddr, do_v4: bool, do_v6: bool) {
+    /// Marks `peer_ip`'s retained routes stale and re-installs them as Phase 2
+    /// candidates (RFC 4724 §4.2).
+    ///
+    /// "Retained" does not mean "eligible": each route is re-judged by `gate`
+    /// and the peer's import policy exactly as on arrival
+    /// ([`ImportDecision::evaluate_gated`]), so an AS-looped or
+    /// own-NEXT_HOP route (RFC 4271 §9.1.2, §6.3) or a policy-rejected one
+    /// that sits in the Adj-RIB-In stays out of the Loc-RIB. `gate` is built
+    /// by the caller before session teardown forgets the local address.
+    pub(super) fn mark_stale_and_repropagate(
+        &mut self,
+        peer_ip: IpAddr,
+        do_v4: bool,
+        do_v6: bool,
+        gate: &IngressGate,
+    ) {
         let stale_peer = PeerId::from(peer_ip);
 
         // v4 ─────────────────────────────────────────────────────────────────
@@ -90,9 +118,18 @@ impl DaemonState {
                 let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
                     self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
                 let oracle = Arc::clone(&self.oracle_v4);
-                let fib_changes: Vec<_> = stale_v4
+                let decisions: Vec<_> = match self.import_policies.get(&peer_ip) {
+                    Some(policy) => stale_v4
+                        .iter()
+                        .map(|r| (r.nlri, ImportDecision::evaluate_gated(gate, policy, r)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let fib_changes: Vec<_> = decisions
                     .into_iter()
-                    .map(|route| self.rib_mut().loc_rib.insert(stale_peer, route, &*oracle))
+                    .map(|(nlri, d)| {
+                        d.apply(stale_peer, &nlri, &mut self.rib_mut().loc_rib, &*oracle)
+                    })
                     .collect();
                 if let Some(fm) = &self.fib_manager {
                     for change in fib_changes {
@@ -114,12 +151,17 @@ impl DaemonState {
 
             if !stale_v6.is_empty() {
                 let oracle = Arc::clone(&self.oracle_v6);
-                let fib_changes_v6: Vec<_> = stale_v6
+                let decisions: Vec<_> = match self.import_policies_v6.get(&peer_ip) {
+                    Some(policy) => stale_v6
+                        .iter()
+                        .map(|r| (r.nlri, ImportDecision::evaluate_gated(gate, policy, r)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let fib_changes_v6: Vec<_> = decisions
                     .into_iter()
-                    .map(|route| {
-                        self.rib_mut()
-                            .loc_rib_v6
-                            .insert(stale_peer, route, &*oracle)
+                    .map(|(nlri, d)| {
+                        d.apply(stale_peer, &nlri, &mut self.rib_mut().loc_rib_v6, &*oracle)
                     })
                     .collect();
                 if let Some(fm) = &self.fib_manager {

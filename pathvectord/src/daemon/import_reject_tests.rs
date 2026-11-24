@@ -842,9 +842,10 @@ proptest! {
         let before: Vec<_> = loc_rib.best_routes().map(|(n, r)| (n, r.clone())).collect();
         let before_v6: Vec<_> = loc_rib_v6.best_routes().map(|(n, r)| (n, r.clone())).collect();
         for i in 0..3 {
-            let _ = reapply_import_policy(model_peer(i), &adj[i], &mut loc_rib, &policy, &AlwaysReachable);
+            let gate = super::ingress::IngressGate::new(MODEL_LOCAL_AS, None, None, None);
+            let _ = reapply_import_policy(model_peer(i), &adj[i], &mut loc_rib, &policy, &gate, &AlwaysReachable);
             let _ = reapply_import_policy(
-                model_peer(i), &adj_v6[i], &mut loc_rib_v6, &policy_v6, &AlwaysReachable,
+                model_peer(i), &adj_v6[i], &mut loc_rib_v6, &policy_v6, &gate, &AlwaysReachable,
             );
         }
         for p in 0..3 {
