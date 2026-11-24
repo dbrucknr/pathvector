@@ -835,7 +835,7 @@ fn encode_for_old_peer_then_decode_as_old_peer_recovers_the_true_path() {
     );
 }
 
-/// RFC 6793 §6 calls an AS4_PATH shorter than 6 octets malformed, so an
+/// RFC 6793 §6 calls an `AS4_PATH` shorter than 6 octets malformed, so an
 /// empty one (e.g. a caller that stripped confederation segments from a
 /// path that had only those) must never be written — and it must not
 /// suppress the generation of a real one either.

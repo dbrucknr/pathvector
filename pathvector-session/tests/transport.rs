@@ -1474,7 +1474,7 @@ async fn raw_handshake(listener: TcpListener, capabilities: Vec<Capability>) -> 
     s
 }
 
-/// ORIGIN IGP, `as_path` value as AS_PATH, `extra` attribute TLVs, NEXT_HOP
+/// `ORIGIN` IGP, `as_path` value as `AS_PATH`, `extra` attribute TLVs, `NEXT_HOP`
 /// 192.0.2.1, NLRI 198.51.100.0/24 — as one framed UPDATE.
 fn raw_update(as_path: &[u8], extra: &[u8]) -> Vec<u8> {
     let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02];
@@ -1523,7 +1523,7 @@ async fn next_event(handle: &mut impl SessionHandle) -> SessionEvent {
 }
 
 /// Issue #95, end to end: a legacy (no four-octet capability) peer sends the
-/// issue's exact AS_PATH `02 01 fd ea`. The route must be *announced* with
+/// issue's exact `AS_PATH` `02 01 fd ea`. The route must be *announced* with
 /// AS 65002 — before the fix it was converted to a withdrawal.
 #[tokio::test]
 async fn legacy_peer_two_octet_as_path_is_announced_not_withdrawn() {
@@ -1536,7 +1536,9 @@ async fn legacy_peer_two_octet_as_path_is_announced_not_withdrawn() {
         // AS_TRANS + AS4_PATH carrying the true four-octet origin 131072.
         s.write_all(&raw_update(
             &[0x02, 0x02, 0xfd, 0xea, 0x5b, 0xa0],
-            &[0xC0, 0x11, 0x0a, 0x02, 0x02, 0, 0, 0xfd, 0xea, 0, 0x02, 0, 0],
+            &[
+                0xC0, 0x11, 0x0a, 0x02, 0x02, 0, 0, 0xfd, 0xea, 0, 0x02, 0, 0,
+            ],
         ))
         .await
         .unwrap();
@@ -1551,7 +1553,10 @@ async fn legacy_peer_two_octet_as_path_is_announced_not_withdrawn() {
     ));
 
     let first = expect_route_update(next_event(&mut handle).await);
-    assert!(first.withdrawn.is_empty(), "must not be withdrawn: {first:?}");
+    assert!(
+        first.withdrawn.is_empty(),
+        "must not be withdrawn: {first:?}"
+    );
     assert_eq!(first.announced.len(), 1);
     assert_eq!(as_path_asns(&first), vec![65002]);
 
@@ -1568,9 +1573,9 @@ async fn legacy_peer_two_octet_as_path_is_announced_not_withdrawn() {
     peer.abort();
 }
 
-/// Outbound to an OLD peer: the writer half must encode two-octet AS_PATH,
-/// AS_TRANS, and the generated AS4_PATH. Expected bytes are RFC 6793 §4.2.2
-/// by hand: AS_PATH `02 02 fd e9 5b a0`, AS4_PATH (optional transitive)
+/// Outbound to an OLD peer: the writer half must encode two-octet `AS_PATH`,
+/// `AS_TRANS`, and the generated `AS4_PATH`. Expected bytes are RFC 6793 §4.2.2
+/// by hand: `AS_PATH` `02 02 fd e9 5b a0`, `AS4_PATH` (optional transitive)
 /// `c0 11 0a 02 02 00 00 fd e9 00 02 00 00`.
 #[tokio::test]
 async fn updates_to_a_legacy_peer_are_encoded_with_two_octet_asns() {
@@ -1605,9 +1610,7 @@ async fn updates_to_a_legacy_peer_are_encoded_with_two_octet_asns() {
             ])),
             PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
         ],
-        announced: vec![
-            pathvector_types::Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap(),
-        ],
+        announced: vec![pathvector_types::Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap()],
     };
     handle.update_sender().send(msg).await.unwrap();
 
@@ -1629,7 +1632,7 @@ async fn updates_to_a_legacy_peer_are_encoded_with_two_octet_asns() {
     peer.abort();
 }
 
-/// Four-octet peers: outbound AS_PATH keeps four-octet ASNs, and an AS4_PATH
+/// Four-octet peers: outbound `AS_PATH` keeps four-octet ASNs, and an `AS4_PATH`
 /// received from the peer is discarded (RFC 6793 §4.1) rather than merged or
 /// leaked — a well-formed but policy-violating input.
 #[tokio::test]
@@ -1681,9 +1684,7 @@ async fn four_octet_peer_keeps_four_octet_as_path_and_as4_path_is_discarded() {
             ])),
             PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
         ],
-        announced: vec![
-            pathvector_types::Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap(),
-        ],
+        announced: vec![pathvector_types::Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap()],
     };
     handle.update_sender().send(msg).await.unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx)

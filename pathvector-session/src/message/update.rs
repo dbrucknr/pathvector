@@ -979,7 +979,8 @@ pub fn nlri_v6_encoded_len(nlri: &Nlri<Ipv6Addr>) -> usize {
 /// adds or removes `AS4_PATH` / `AS4_AGGREGATOR`. Because it never drops an
 /// attribute and writes ASNs at the widest width, its length is an upper
 /// bound on the attribute bytes of the wire form for either [`AsnWidth`],
-/// provided the caller has attached any `AS4_AGGREGATOR` the route needs.
+/// provided the caller has attached any `AS4_PATH` / `AS4_AGGREGATOR` a
+/// two-octet peer needs (otherwise the two-octet encoder generates them).
 #[must_use]
 pub fn encode_attributes(attrs: &[PathAttribute]) -> Vec<u8> {
     let mut out = Writer::new();
