@@ -213,18 +213,46 @@ multiprotocol routes (inserting into AdjRibIn, propagating) lives in `pathvector
 ## RFC 6793 — Four-Octet AS Number Capability
 
 **Owns:** FourByteAsn capability (code 65) negotiation; AS_TRANS substitution in the 2-byte
-`my_as` field when the local ASN exceeds 65535.  
-**Boundary:** `Asn` type and `AS_TRANS` constant live in `pathvector-types`.  
+`my_as` field when the local ASN exceeds 65535; the per-session ASN width (`AsnWidth`,
+decided once from the OPEN exchange by `AsnWidth::negotiate`) and everything the wire codec
+does with it — two- vs. four-octet `AS_PATH`/`AGGREGATOR` decode and encode, AS_TRANS +
+generated `AS4_PATH`/`AS4_AGGREGATOR` toward an OLD peer, `AS4_PATH`/`AS4_AGGREGATOR`
+reconstruction (§4.2.3) from an OLD peer, and discard of both from a NEW peer.  
+**Boundary:** `Asn` type, `AS_TRANS` constant and the pure path-merge
+(`AsPath::reconstruct_with_as4_path`) live in `pathvector-types`. Deciding *which routes'*
+ASNs to downgrade (and building the AS4 attributes up front so UPDATE packing sees their
+size) is `pathvectord/src/outbound.rs`; the codec guarantees the wire form regardless.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc6793
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | FourByteAsn capability (code 65) advertised in OPEN | `src/message/` | ✅ | `test_capability_four_byte_asn_in_open`, interop:gobgp |
 | When local ASN > 65535, 2-byte `my_as` field set to AS_TRANS (23456) | `src/message/` | ✅ | `test_open_my_as_uses_as_trans_for_4byte_asn` |
-| Four-byte ASN read from NEW_AS4_PATH when peer did not send FourByteAsn cap | `src/message/` | ⚠️ | `test_new_as4_path_fallback` |
+| §4.1: width is bilateral — four-octet only if the capability is advertised to *and* received from the peer | `src/message/asn_width.rs`, `src/transport/mod.rs` | ✅ | `four_octets_only_when_both_sides_advertise_the_capability`, `legacy_peer_two_octet_as_path_is_announced_not_withdrawn` |
+| §4.1/§4.2: `AS_PATH` decoded with two-octet ASNs from an OLD peer, four-octet from a NEW peer (issue #95) | `src/message/update.rs` `decode_as_path_segments` | ✅ | `issue_95_reproduction_two_octet_as_path_decodes_as_65002`, `multi_segment_legacy_path_is_not_misparsed_as_four_octet`, `all_four_segment_types_decode_at_two_octets`, `maximal_255_asn_segment_decodes_at_both_widths` |
+| §4.2.2: `AS_PATH`/`AGGREGATOR` encoded with two-octet ASNs toward an OLD peer (writer half of the codec honours the width) | `src/framing/mod.rs`, `src/message/update.rs` | ✅ | `two_octet_session_encodes_two_octet_as_path`, `updates_to_a_legacy_peer_are_encoded_with_two_octet_asns` |
+| §4.2.2: non-mappable ASN written as AS_TRANS; `AS4_PATH` generated (four-octet, confed segments excluded) unless every non-confed ASN is mappable | `src/message/update.rs` `append_missing_as4_attributes` | ✅ | `non_mappable_asn_becomes_as_trans_with_as4_path_generated`, `generated_as4_path_excludes_confed_segments`, `no_as4_path_when_every_asn_is_mappable`, `no_as4_path_when_only_confed_segments_are_non_mappable`, `caller_supplied_as4_path_is_not_duplicated` |
+| §4.2.2: non-mappable aggregator → `AGGREGATOR` carries AS_TRANS plus `AS4_AGGREGATOR`; mappable → no `AS4_AGGREGATOR` | `src/message/update.rs` | ✅ | `non_mappable_aggregator_uses_as_trans_and_as4_aggregator`, `mappable_aggregator_is_six_bytes_with_no_as4_aggregator` |
+| §4.1: `AS4_PATH`/`AS4_AGGREGATOR` never written on a four-octet session | `src/message/update.rs` `encode_path_attributes` | ✅ | `as4_attributes_are_never_sent_on_a_four_octet_session` |
+| §4.1/§6: `AS4_PATH`/`AS4_AGGREGATOR` received from a NEW peer are discarded, the UPDATE continues, and the discard is reported for logging | `src/message/update.rs` `reconcile_as4_attributes` | ✅ | `as4_attributes_from_a_four_octet_peer_are_discarded_and_logged`, `four_octet_peer_keeps_four_octet_as_path_and_as4_path_is_discarded` |
+| §4.2.3: reconstruct the true path from `AS_PATH` + `AS4_PATH` (shorter `AS4_PATH` prepended with leading `AS_PATH` hops; longer `AS4_PATH` ignored; leading/adjacent confed segments kept) | `pathvector-types` `AsPath::reconstruct_with_as4_path`, called from `reconcile_as4_attributes` | ✅ | `as4_path_is_merged_into_as_path_from_an_old_peer`, `as4_path_shorter_than_as_path_is_prefixed_with_the_leading_as_path_hops`, `as4_path_longer_than_as_path_is_ignored`, `leading_confed_segment_survives_the_merge`, types `reconstruct_*` |
+| §4.2.3: `AGGREGATOR` vs `AS4_AGGREGATOR` — AS_TRANS ⇒ `AS4_AGGREGATOR` replaces it; otherwise `AS4_AGGREGATOR` *and* `AS4_PATH` are ignored | `src/message/update.rs` | ✅ | `as4_aggregator_replaces_an_as_trans_aggregator`, `non_trans_aggregator_makes_as4_aggregator_and_as4_path_ignored`, `lone_as4_aggregator_is_dropped` |
+| §6: confed segments in a received `AS4_PATH` are discarded (not the attribute), logged, UPDATE continues | `src/message/update.rs` | ✅ | `confed_segments_in_as4_path_are_discarded_and_logged_not_fatal` |
+| §6: malformed `AS4_PATH` (length < 6 or odd, zero-length segment, bad type, overrun) / `AS4_AGGREGATOR` (length ≠ 8) → attribute discard | `src/message/update.rs` | ✅ | `malformed_as4_path_is_attribute_discard_and_as_path_is_untouched`, `test_as4_aggregator_too_short_is_attribute_discard` |
+| RFC 7606 §7.2: zero-length segment, unknown type, overrun, one-octet underrun in `AS_PATH` → treat-as-withdraw at either width | `src/message/update.rs` | ✅ | `rfc7606_*` in `asn_width_tests.rs` |
+| RFC 4271 §4.3: a segment holds ≤ 255 ASNs — longer ones are split on encode, never truncated | `src/message/update.rs` `encode_as_path_segments` | ✅ | `oversized_sequence_splits_into_255_asn_segments_at_both_widths`, `prop_long_sequences_split_at_255_and_roundtrip` |
+| Property: encode for an OLD peer then decode as an OLD peer recovers the true path/aggregator | `src/message/prop_tests.rs` | ✅ | `prop_two_octet_encode_then_decode_recovers_the_true_path_and_aggregator` |
+| Live interop against a genuine two-octet-only speaker (e.g. GoBGP `--as2`) | — | ❌ | — |
 
-**Deferred:** Full NEW_AS4_PATH fallback path (when negotiating with a 2-byte-only peer)
-is partially tested but the segment merging logic per RFC 6793 §4.2.3 is not complete.
+**Known limits (inherent to RFC 6793, not defects):** a non-mappable ASN inside a
+confederation segment cannot survive an OLD speaker (§4.2.2 excludes confed segments from
+`AS4_PATH`; §7 forbids such Member-AS numbers); an `AS_SET` of more than 255 members cannot be
+expressed exactly and is split into several sets on encode; adjacent same-type segments of a
+merged path are only re-coalesced at the AS_PATH/AS4_PATH join.
+
+**Deferred:** A live legacy-peer interop test. The unit, property and loopback-TCP tests
+use hand-derived RFC bytes, but no real two-octet-only implementation has been run against
+this code.
 
 ---
 
@@ -312,13 +340,23 @@ The FSM restart behavior is deferred.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| `TCP_MD5SIG` socket option on outbound socket before `connect()` | `transport/mod.rs` `tcp_connect` | ✅ | — |
-| `TCP_MD5SIG` socket option on BGP listener socket per configured peer | `daemon.rs` `run_bgp_listener` | ✅ | — |
-| `md5_password` TOML field wired into `SessionConfig` and propagated | `config.rs`, `daemon.rs` | ✅ | `test_md5_password_explicit` |
+| `TCP_MD5SIG` key installed on outbound socket before `connect()` | `transport/mod.rs` `tcp_connect` | ✅ | `key_is_installed_before_connecting` |
+| Key that cannot be enforced, with `Md5Enforcement::Required` (default): no connection attempt, `ErrorKind::Unsupported` (RFC 5925 §8: required MD5 "must be added to all outgoing segments and validated on all incoming segments"; issue #58) | `transport/tcp_md5.rs` `protect_socket` | ✅ | `required_key_that_cannot_be_enforced_is_an_error`, `required_but_unenforceable_never_connects` |
+| `Md5Enforcement::BestEffort` is an explicit opt-in; connects unauthenticated, logs a warning, returns `Md5Protection::Unenforced(reason)` | `transport/tcp_md5.rs` | ✅ | `best_effort_reports_unenforced_with_reason`, `best_effort_connects_when_unenforceable` |
+| `BestEffort` does not hide real `setsockopt` failures | `transport/tcp_md5.rs` | ✅ | `best_effort_does_not_hide_os_errors` |
+| `TCP_MD5SIG` key on the BGP listening socket for each configured peer, installed before `listen()` (RFC 5925 §8: required MD5 "validated on all incoming segments"; issue #66) | `transport/listener.rs` `BgpListener::bind`, `pathvectord` `run_bgp_listener` | ✅ | `key_configured_before_bind_is_installed_before_listen`, `static_key_admits_only_the_matching_key` (live, CI), `static_peer_inbound_requires_the_key` |
+| Keys added, rotated and removed on the live listening socket; after an add or rotation the socket is replaced, with every key installed before `listen()` | `transport/listener.rs` `ListenerKeys::{set_peer, remove_peer}`, `pathvectord` `run_command_processor` | ✅ | `dynamically_added_key_is_enforced`, `rotated_key_replaces_the_old_one`, `removed_key_is_no_longer_enforced` (live, CI), `key_change_replaces_the_socket_with_keys_installed_before_listen`, `add_peer_installs_listener_key_before_routing_inbound`, `remove_peer_removes_the_listener_key`, `dynamic_peer_inbound_requires_the_key_until_removed` |
+| A connection that completed before a key change carries no key (Linux copies the key at `tcp_v4_syn_recv_sock`); it is closed, not handed over. Barrier: the old socket is shut down (`tcp_disconnect` → `inet_csk_listen_stop`; a late `inet_csk_reqsk_queue_add` sees `sk_state != TCP_LISTEN`) | `transport/listener.rs` `BgpListener::{accept, replace_socket}` | ✅ | `connection_queued_before_a_new_key_is_rejected`, `rotation_installs_the_new_key_and_replaces_the_socket`, `connection_completed_before_a_dynamic_key_is_rejected` (live, CI) |
+| A connection screened before its peer's key was set (buffered while replacing the socket, or accepted just before `AddPeer`) is never used | `transport/listener.rs` `AuthStamp`, `ListenerKeys::is_current`; `pathvectord` `route_inbound` | ✅ | `buffered_connection_is_dropped_when_its_peer_gains_a_key`, `buffered_connection_is_dropped_when_its_peers_key_is_refused`, `accepted_connection_stops_being_current_when_its_peer_gains_a_key`, `connection_accepted_before_add_peer_is_not_routed_to_the_new_session` |
+| Listener key that cannot be enforced under `Required`, or any `setsockopt` failure: the peer's inbound connections are closed; `BestEffort` admits them unauthenticated with a warning | `transport/listener.rs` | ✅ | `required_key_that_cannot_be_enforced_rejects_the_peer`, `os_error_rejects_even_a_best_effort_peer`, `best_effort_key_that_cannot_be_enforced_admits_unauthenticated`, `required_key_on_a_host_without_md5_rejects_the_peer` (live), `add_peer_with_unenforceable_required_key_refuses_inbound` |
+| `md5_password` TOML field validated (1–80 bytes) and wired into `SessionConfig::tcp_md5` | `pathvectord` `config.rs`, `daemon/` | ✅ | `test_md5_password_empty_is_rejected`, `test_md5_password_over_80_bytes_is_rejected`, `build_daemon_md5_password_reaches_session_config` |
 
-**Platform note:** Linux only. `apply_tcp_md5sig` is a no-op with a `warn!` log on
-non-Linux platforms (macOS dev environment). Key rotation and per-AFI MD5 for IPv6
-peers are not yet supported.
+**Platform note:** keys are only enforced on Linux kernels built with
+`CONFIG_TCP_MD5SIG`, for IPv4 peers. Elsewhere `pathvector-sys` reports
+`TcpMd5Error::Unsupported` and the session applies its `Md5Enforcement` policy.
+The kernel-level proof (matching keys connect; unsigned and wrong-key SYNs are
+dropped) is `pathvector-sys/tests/tcp_md5_loopback.rs` for the raw adapter and
+`pathvector-session/tests/listener_md5_loopback.rs` for `BgpListener`.
 
 ---
 

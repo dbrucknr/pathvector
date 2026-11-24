@@ -14,7 +14,7 @@ use pathvector_session::message::{
     MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage, encode_attributes,
     nlri_encoded_len, nlri_v6_encoded_len,
 };
-use pathvector_types::{AfiSafi, NextHop, Nlri, PeerType, UnknownAttribute};
+use pathvector_types::{AfiSafi, Aggregator, AsPath, NextHop, Nlri, PeerType, UnknownAttribute};
 use tokio::sync::mpsc;
 
 /// BGP UPDATE wire overhead: 19-byte header + 2-byte withdrawn-len + 2-byte
@@ -115,16 +115,59 @@ pub(crate) fn route_to_attributes(
     // 4-byte-capable routers further along the path can reconstruct the full
     // AS path. Only emitted when downgrade actually substituted AS_TRANS above.
     //
-    // RFC 6793 §§3, 4.2.2: AS_CONFED_SEQUENCE/AS_CONFED_SET "are declared
-    // invalid for the AS4_PATH attribute and MUST NOT be included" — strip
-    // them here. The wire AS_PATH (`wire_as_path` above) keeps its
-    // (downgraded) confed segments; only the AS4_PATH side-channel excludes
-    // them, since RFC 5065 confederation relaying can leave confed segments
-    // in a route sent toward a two-byte-only peer.
-    if let Some(as4) = as4_path {
-        attrs.push(PathAttribute::As4Path(as4.strip_confed_segments()));
-    }
+    push_as4_side_channel(
+        &mut attrs,
+        peer_four_byte,
+        as4_path,
+        rare.aggregator.as_ref(),
+    );
     attrs
+}
+
+/// RFC 6793 §4.2.2 side-channel attributes for a two-byte-only peer: the
+/// `AS4_PATH` carrying the true four-octet path and, for a non-mappable
+/// aggregating AS, the `AS4_AGGREGATOR` that accompanies an
+/// `AGGREGATOR` whose AS the wire codec writes as `AS_TRANS`.
+///
+/// - §§3, 4.2.2: `AS_CONFED_SEQUENCE`/`AS_CONFED_SET` "are declared invalid
+///   for the AS4_PATH attribute and MUST NOT be included" — they are
+///   stripped here. The wire `AS_PATH` keeps its (downgraded) confed
+///   segments; only the `AS4_PATH` side-channel excludes them, since RFC 5065
+///   confederation relaying can leave confed segments in a route sent toward
+///   a two-byte-only peer.
+/// - §4.2.2: `AS4_PATH` is sent only when some AS in it is non-mappable
+///   ("In this case, the NEW BGP speaker MUST NOT send the AS4_PATH
+///   attribute"), so a four-byte ASN confined to a confed segment — absent
+///   from the stripped path — produces none.
+/// - `AS4_AGGREGATOR` "MUST NOT be sent" when the AS number is mappable.
+///
+/// pathvector-session's encoder would generate the same attributes itself
+/// when absent; building them here keeps the size estimate used for
+/// UPDATE packing (`encode_attributes`) an upper bound on the wire size.
+fn push_as4_side_channel(
+    attrs: &mut Vec<PathAttribute>,
+    peer_four_byte: bool,
+    as4_path: Option<AsPath>,
+    aggregator: Option<&Aggregator>,
+) {
+    // RFC 6793 §4.1: neither attribute is carried between two NEW speakers.
+    if peer_four_byte {
+        return;
+    }
+    if let Some(as4) = as4_path {
+        let as4 = as4.strip_confed_segments();
+        if as4.has_non_mappable_asn() {
+            attrs.push(PathAttribute::As4Path(as4));
+        }
+    }
+    if let Some(agg) = aggregator
+        && agg.asn.is_four_byte()
+    {
+        attrs.push(PathAttribute::As4Aggregator {
+            asn: agg.asn.as_u32(),
+            bgp_id: agg.ip,
+        });
+    }
 }
 
 /// RFC 4271 §5: converts stored unrecognized transitive optional attributes
@@ -366,6 +409,50 @@ pub(crate) enum PrefixDecisionV6 {
     Announce(Route<Ipv6Addr>),
     Withdraw(Nlri<Ipv6Addr>),
     NoChange,
+}
+
+/// What a per-prefix outbound decision would put on the wire, independent of
+/// address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionKind {
+    Announce,
+    Withdraw,
+    NoChange,
+}
+
+/// Family-agnostic view of [`PrefixDecision`] / [`PrefixDecisionV6`], so the
+/// RFC 4271 §9.2.1.1 MRAI gate in `daemon/route.rs` is written once for both
+/// families.
+pub(crate) trait OutboundDecision {
+    /// The "send nothing" decision for this family.
+    const NO_CHANGE: Self;
+
+    /// Classifies this decision.
+    fn kind(&self) -> DecisionKind;
+}
+
+impl OutboundDecision for PrefixDecision {
+    const NO_CHANGE: Self = Self::NoChange;
+
+    fn kind(&self) -> DecisionKind {
+        match self {
+            Self::Announce(_) => DecisionKind::Announce,
+            Self::Withdraw(_) => DecisionKind::Withdraw,
+            Self::NoChange => DecisionKind::NoChange,
+        }
+    }
+}
+
+impl OutboundDecision for PrefixDecisionV6 {
+    const NO_CHANGE: Self = Self::NoChange;
+
+    fn kind(&self) -> DecisionKind {
+        match self {
+            Self::Announce(_) => DecisionKind::Announce,
+            Self::Withdraw(_) => DecisionKind::Withdraw,
+            Self::NoChange => DecisionKind::NoChange,
+        }
+    }
 }
 
 /// IPv6 equivalent of [`propagate_prefix`]: determines the outbound decision
@@ -689,11 +776,12 @@ pub(crate) fn route_v6_to_attributes(
     // RFC 4271 §5: unrecognized transitive optional attributes — see the
     // v4 `route_to_attributes`'s comment on `unknown_attrs_to_path_attributes`.
     attrs.extend(unknown_attrs_to_path_attributes(&rare.unknown));
-    // RFC 6793 §§3, 4.2.2: strip confed segments from AS4_PATH — see the v4
-    // `route_to_attributes`'s comment above.
-    if let Some(as4) = as4_path {
-        attrs.push(PathAttribute::As4Path(as4.strip_confed_segments()));
-    }
+    push_as4_side_channel(
+        &mut attrs,
+        peer_four_byte,
+        as4_path,
+        rare.aggregator.as_ref(),
+    );
     let next_hop = route.next_hop.unwrap_or(NextHop::V6(Ipv6Addr::UNSPECIFIED));
     let mp_reach = MpReachNlri {
         afi_safi: AfiSafi::IPV6_UNICAST,
@@ -1862,6 +1950,62 @@ mod route_to_attributes_tests {
             matches!(attrs.last(), Some(PathAttribute::As4Path(_))),
             "AS4_PATH must be the last attribute"
         );
+    }
+
+    /// RFC 6793 §4.2.2: "except for the case where all of the AS path
+    /// information is composed of mappable four-octet AS numbers only. In
+    /// this case, the NEW BGP speaker MUST NOT send the AS4_PATH attribute."
+    /// A four-byte ASN that lives only in a confederation segment is absent
+    /// from the (confed-stripped) AS4_PATH, so nothing non-mappable remains
+    /// to preserve and no AS4_PATH may be sent.
+    #[test]
+    fn no_as4_path_when_the_only_four_byte_asn_is_in_a_confed_segment() {
+        use pathvector_types::AsPathSegment;
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSequence(vec![Asn::new(131_072)]),
+            AsPathSegment::Sequence(vec![Asn::new(65001)]),
+        ]);
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, path)
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .build();
+        let attrs = route_to_attributes(&route, PeerType::External, false);
+        assert!(as4_path_asns(&attrs).is_none(), "{attrs:?}");
+    }
+
+    /// RFC 6793 §4.2.2: a non-mappable aggregating AS needs AS4_AGGREGATOR
+    /// ("MUST use"), a mappable one must not get it ("MUST NOT be sent"),
+    /// and a four-octet peer never gets it (§4.1).
+    #[test]
+    fn as4_aggregator_only_for_non_mappable_aggregator_toward_two_byte_peer() {
+        let build = |asn: u32| {
+            RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+                .aggregator(pathvector_types::Aggregator {
+                    asn: Asn::new(asn),
+                    ip: Ipv4Addr::new(10, 0, 0, 9),
+                })
+                .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .build()
+        };
+        let has_as4_agg = |attrs: &[PathAttribute]| {
+            attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::As4Aggregator { .. }))
+        };
+        let wide = route_to_attributes(&build(131_072), PeerType::External, false);
+        assert!(wide.contains(&PathAttribute::As4Aggregator {
+            asn: 131_072,
+            bgp_id: Ipv4Addr::new(10, 0, 0, 9),
+        }));
+        assert!(!has_as4_agg(&route_to_attributes(
+            &build(65001),
+            PeerType::External,
+            false
+        )));
+        assert!(!has_as4_agg(&route_to_attributes(
+            &build(131_072),
+            PeerType::External,
+            true
+        )));
     }
 
     /// RFC 6793 §§3, 4.2.2: AS_CONFED_SEQUENCE/AS_CONFED_SET "are declared

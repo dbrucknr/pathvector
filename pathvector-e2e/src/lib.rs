@@ -1849,6 +1849,168 @@ impl Md5Harness {
     }
 }
 
+// ── Md5InboundHarness ────────────────────────────────────────────────────────
+
+/// Port pathvectord dials in [`Md5InboundHarness`]: `discard`, on which nothing
+/// listens in the GoBGP container, so pathvectord's own connection attempts
+/// never reach a BGP speaker. (With a key installed, the unsigned reset from a
+/// port with no listener is dropped, so the attempt times out instead of being
+/// refused, RFC 2385 §4.1; either way it never connects.)
+pub const MD5_INBOUND_DEAD_PORT: u16 = 9;
+
+/// Writes a GoBGP config that actively dials pathvectord, signing with `key`
+/// when given (`auth-password`), and retries every 2 seconds.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_gobgp_config_md5_dialer(pathvectord_ip: &str, key: Option<&str>) -> NamedTempFile {
+    let auth = key.map_or_else(String::new, |k| format!("auth-password    = \"{k}\""));
+    let mut f = NamedTempFile::new().expect("create temp gobgp md5 dialer config");
+    write!(
+        f,
+        r#"
+[global.config]
+  as        = 65001
+  router-id = "1.0.0.1"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "{pathvectord_ip}"
+    peer-as          = 65002
+    {auth}
+  [neighbors.timers.config]
+    hold-time          = 9
+    keepalive-interval = 3
+    connect-retry      = 2
+  [neighbors.transport.config]
+    passive-mode = false
+
+  [[neighbors.afi-safis]]
+    [neighbors.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
+"#
+    )
+    .expect("write gobgp md5 dialer config");
+    f
+}
+
+/// Writes a pathvectord config with one MD5 peer that pathvectord dials on
+/// [`MD5_INBOUND_DEAD_PORT`], so a session can only come up through
+/// pathvectord's listener.
+///
+/// # Panics
+///
+/// Panics if the temporary file cannot be created or written.
+#[must_use]
+pub fn write_daemon_config_md5_inbound_only(peer: Ipv4Addr, key: &str) -> NamedTempFile {
+    let mut f = NamedTempFile::new().expect("create temp pathvectord md5 inbound config");
+    write!(
+        f,
+        r#"
+[daemon]
+local_as  = 65002
+bgp_id    = "10.0.0.2"
+hold_time = 9
+grpc_port = {PATHVECTORD_GRPC_PORT}
+
+[[peers]]
+address            = "{peer}"
+port               = {MD5_INBOUND_DEAD_PORT}
+remote_as          = 65001
+import_default     = "accept"
+export_default     = "accept"
+md5_password       = "{key}"
+"#
+    )
+    .expect("write pathvectord md5 inbound config");
+    f
+}
+
+/// A TCP MD5 test environment in which only GoBGP initiates: GoBGP dials
+/// pathvectord's BGP listener (signing with `gobgp_key`, if any), and
+/// pathvectord, configured with `pathvectord_key`, dials a port where nothing
+/// listens. A session that reaches `Established` was therefore accepted by
+/// pathvectord's listener (issue #66).
+///
+/// Unlike [`Md5Harness::new`], this does not wait for the session; the test
+/// decides what to expect.
+pub struct Md5InboundHarness {
+    // Containers must drop before the network.
+    _gobgpd: ContainerGuard,
+    _pathvectord: ContainerGuard,
+    _gobgpd_config: NamedTempFile,
+    _pathvectord_config: NamedTempFile,
+    pub client: PathvectorClient,
+    /// The GoBGP container's IP on the shared network.
+    pub gobgp_ip: Ipv4Addr,
+    _network: DockerNetwork,
+}
+
+impl Md5InboundHarness {
+    /// Starts pathvectord, then a GoBGP that dials it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, an image is missing, or a container
+    /// does not become healthy.
+    #[must_use]
+    pub fn new(pathvectord_key: &str, gobgp_key: Option<&str>) -> Self {
+        let test_id = alloc_test_id();
+        let grpc_host_port = alloc_grpc_port();
+        let network_name = format!("pathvector-md5-inbound-test-{test_id}");
+        let subnet = md5_test_subnet(test_id);
+        let gobgp_ip_str = md5_gobgp_ip(test_id);
+        let pathvectord_ip_str = md5_pathvectord_ip(test_id);
+        let gobgp_ip: Ipv4Addr = gobgp_ip_str.parse().unwrap();
+
+        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
+
+        let pathvectord_config = write_daemon_config_md5_inbound_only(gobgp_ip, pathvectord_key);
+        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
+        let gobgpd_config = write_gobgp_config_md5_dialer(&pathvectord_ip_str, gobgp_key);
+        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
+
+        let pathvectord = docker_start(
+            &format!("pathvectord-md5-inbound-{test_id}"),
+            PATHVECTORD_IMAGE,
+            &network_name,
+            Some(&pathvectord_ip_str),
+            true,
+            &pathvectord_config_path,
+            "/etc/pathvectord.toml",
+            Some(grpc_host_port),
+            Some("/etc/pathvectord.toml"),
+        );
+        let client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
+            .expect("connect PathvectorClient for Md5InboundHarness");
+
+        let gobgpd = docker_start(
+            &format!("gobgpd-md5-inbound-{test_id}"),
+            GOBGPD_IMAGE,
+            &network_name,
+            Some(&gobgp_ip_str),
+            true,
+            &gobgpd_config_path,
+            "/etc/gobgp/gobgpd.conf",
+            None,
+            None,
+        );
+        wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
+
+        Self {
+            _gobgpd: gobgpd,
+            _pathvectord: pathvectord,
+            _gobgpd_config: gobgpd_config,
+            _pathvectord_config: pathvectord_config,
+            client,
+            gobgp_ip,
+            _network: network,
+        }
+    }
+}
+
 // ── FibHarness ───────────────────────────────────────────────────────────────
 
 /// Per-test subnet for FIB integration tests. Uses the third octet to avoid

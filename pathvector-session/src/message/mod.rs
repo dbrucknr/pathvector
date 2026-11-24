@@ -1,3 +1,6 @@
+mod asn_width;
+#[cfg(test)]
+mod asn_width_tests;
 mod error;
 mod header;
 mod notification;
@@ -7,6 +10,7 @@ mod prop_tests;
 mod route_refresh;
 mod update;
 
+pub use asn_width::AsnWidth;
 pub use error::CodecError;
 pub use header::{MAX_LEN, MAX_LEN_EXTENDED, MessageType};
 pub use notification::{
@@ -219,28 +223,29 @@ impl BgpMessage {
     /// range or exceeds `max_len`, the type is unknown, or any field within
     /// the body is malformed.
     pub fn decode_with_limit(buf: &[u8], max_len: usize) -> Result<Self, CodecError> {
-        // Defaults to `true` (assume the 4-octet AS number capability is
-        // negotiated) to preserve this method's existing behavior for
-        // callers with no session/capability context (tests, fuzzing,
-        // `pathvector-mrt`). The framing layer's `BgpCodec`, which decodes
-        // messages for a real, capability-negotiated session, calls
+        // Defaults to `AsnWidth::Four` (assume the 4-octet AS number
+        // capability is negotiated) to preserve this method's existing
+        // behavior for callers with no session/capability context (tests,
+        // fuzzing, `pathvector-mrt`). The framing layer's `BgpCodec`, which
+        // decodes messages for a real, capability-negotiated session, calls
         // `decode_with_limit_and_caps` directly instead.
-        Self::decode_with_limit_and_caps(buf, max_len, true)
+        Self::decode_with_limit_and_caps(buf, max_len, AsnWidth::Four)
     }
 
-    /// Like [`Self::decode_with_limit`], but `four_byte_asn` explicitly
-    /// states whether RFC 6793's 4-octet AS number capability was
-    /// negotiated bilaterally with the peer (advertised to *and* received
-    /// from them) — this governs AGGREGATOR's expected length per RFC 7606
-    /// §7.7 (6 bytes vs. 8 bytes).
+    /// Like [`Self::decode_with_limit`], but `asn_width` explicitly states
+    /// how AS numbers are encoded on this session (RFC 6793 §4): it governs
+    /// the width of every ASN in `AS_PATH` and `AGGREGATOR` (RFC 7606 §7.7:
+    /// 6 vs. 8 bytes), and decides how `AS4_PATH` / `AS4_AGGREGATOR` are
+    /// handled — merged into `AS_PATH` / `AGGREGATOR` for a two-octet peer
+    /// (§4.2.3), discarded for a four-octet peer (§4.1).
     ///
     /// # Errors
     ///
     /// Same as [`Self::decode_with_limit`].
-    pub(crate) fn decode_with_limit_and_caps(
+    pub fn decode_with_limit_and_caps(
         buf: &[u8],
         max_len: usize,
-        four_byte_asn: bool,
+        asn_width: AsnWidth,
     ) -> Result<Self, CodecError> {
         let mut cur = Cursor::new(buf);
         let (msg_type, total_len) = decode_header(&mut cur, max_len)?;
@@ -266,7 +271,7 @@ impl BgpMessage {
                 }
                 Ok(Self::Open(open))
             }
-            MsgType::Update => match UpdateMessage::decode(&mut cur, four_byte_asn)? {
+            MsgType::Update => match UpdateMessage::decode(&mut cur, asn_width)? {
                 UpdateDecodeOutcome::Clean(u) => Ok(Self::Update(u)),
                 UpdateDecodeOutcome::Partial {
                     update,
@@ -301,12 +306,32 @@ impl BgpMessage {
         }
     }
 
-    /// Encode this message to wire format, including the 19-byte header.
+    /// Encode this message to wire format, including the 19-byte header,
+    /// using four-octet AS numbers ([`AsnWidth::Four`]).
+    ///
+    /// Equivalent to `self.encode_with(AsnWidth::Four)`. Use
+    /// [`Self::encode_with`] for a session whose peer did not negotiate the
+    /// four-octet AS capability.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_with(AsnWidth::Four)
+    }
+
+    /// Encode this message to wire format for a session whose AS numbers are
+    /// `asn_width` octets wide (RFC 6793).
+    ///
+    /// Only UPDATEs depend on the width. For [`AsnWidth::Two`] the encoder
+    /// performs RFC 6793 §4.2.2: every non-mappable ASN in `AS_PATH` /
+    /// `AGGREGATOR` is written as `AS_TRANS`, and the true values are
+    /// preserved in `AS4_PATH` / `AS4_AGGREGATOR` (generated when the
+    /// caller has not already attached them). For [`AsnWidth::Four`],
+    /// `AS4_PATH` / `AS4_AGGREGATOR` are omitted (§4.1: "MUST NOT be
+    /// carried in an UPDATE message between NEW BGP speakers").
+    #[must_use]
+    pub fn encode_with(&self, asn_width: AsnWidth) -> Vec<u8> {
         match self {
             Self::Open(m) => m.encode(),
-            Self::Update(m) => m.encode(),
+            Self::Update(m) => m.encode_with(asn_width),
             Self::Notification(m) => m.encode(),
             Self::Keepalive => {
                 let mut w = Writer::new();

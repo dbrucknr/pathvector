@@ -344,7 +344,7 @@ a violation), 1 confirmed gap (the (f)/(g) conflation).
 | Clause | Confidence | Notes | What would close this out |
 |---|---|---|---|
 | §9.2.1.1: MinRouteAdvertisementIntervalTimer applies to "advertisement **and/or withdrawal**" of routes to a common destination set — the RFC's literal text does *not* exempt withdrawals | **Confirmed gap — in the documentation's RFC citation, not necessarily in the design decision itself** | `pathvectord/RFC.md` (before this pass) asserted "Withdrawals bypass MRAI (RFC 4271 §9.2.1.1 **explicit exemption**)" — I fetched and read the actual §9.2.1.1 text directly rather than trusting this citation, and it says the opposite: "Two UPDATE messages sent by a BGP speaker to a peer that advertise feasible routes **and/or withdrawal of unfeasible routes** to some common set of destinations MUST be separated by at least MinRouteAdvertisementIntervalTimer." There is no "explicit exemption" language anywhere in this section. The underlying *design decision* (send withdrawals immediately, unthrottled) is defensible on real-world safety grounds — delaying a withdrawal keeps a stale/blackholed route reachable for longer, a real operational cost that arguably outweighs strict adherence here — but the documentation overstated its RFC basis, claiming an explicit textual exemption that doesn't exist. Corrected the citation in `pathvectord/RFC.md` (✅ → ⚠️) as part of this pass; the underlying behavior itself is left as "needs a documented rationale, not a code change" rather than "confirmed gap requiring a fix," since I can't rule out this is intentional, defensible, real-world-informed engineering — just not what the raw RFC text says. | Either (a) find the actual justification (operational-safety reasoning, a related errata, or common-practice citation) and rewrite the doc's claim honestly instead of citing a nonexistent "explicit exemption," or (b) reconsider whether withdrawals should in fact respect MRAI per the literal text — this is a judgment call, not an obvious bug, so it shouldn't be fixed reflexively |
-| MRAI enforcement itself (30s eBGP window, per-NLRI suppression/flush) | Confirmed correct | Already well-tested — `mrai_suppresses_ebgp_announcement_within_window`, `mrai_passes_after_window_elapsed`, `flush_mrai_pending_clears_elapsed_pending` (per `pathvectord/RFC.md`) | Same |
+| MRAI enforcement itself (30s eBGP window, per-NLRI suppression/flush) | ~~Confirmed correct~~ **Confirmed gap, fixed 2026-11-23** | Originally marked well-tested on the strength of `mrai_suppresses_ebgp_announcement_within_window`, `mrai_passes_after_window_elapsed`, `flush_mrai_pending_clears_elapsed_pending`. Those tests only re-computed the elapsed-time comparison or drained an empty pending set, and none checked what reached a peer. In fact a replacement held back by MRAI was committed to the Adj-RIB-Out before the check, so the release at expiry diffed to `NoChange` and the peer kept the stale path forever, violating "the last route selected SHALL be advertised at the end of MinRouteAdvertisementIntervalTimer". The IPv6 path applied no MRAI at all. Fixed with `MraiTracker::gate` (`pathvectord/src/daemon/route.rs`) and proven by `pathvectord/src/daemon/mrai_flush_tests.rs`. See `CHANGELOG.md` 2026-11-23. | Same |
 | iBGP MRAI SHOULD be ≥5s (or SHOULD NOT apply the eBGP procedure to iBGP at all — RFC offers this as an explicit either/or) | Confirmed correct — already tracked as a known, deliberate deferral | `pathvectord/RFC.md` already documents this as deferred (❌), and `RFC_REQUIREMENTS.md`'s §9.1/§9.2 rows are already ⚠️ reflecting it — nothing new to add here, this pass just confirms the existing tracking is accurate | Already tracked |
 
 **§9.2 summary:** 3 clauses reviewed — 1 confirmed gap (documentation
@@ -471,6 +471,19 @@ what's already tracked, and confirms the existing extensive test suite
 per-family retention, EOR-triggered pruning, GR-deadline-expiry flush,
 stale-route de-preference in best-path, and clean-vs-unclean termination
 handling) genuinely matches the RFC text on a fresh read.
+
+> **Correction (2026-11-23, issue #68):** the "stale-route de-preference in
+> best-path" item above was not RFC behavior and should not have been
+> confirmed. RFC 4724 §4.2 says the router "MUST NOT differentiate between
+> stale and other routing information during forwarding" (RFC 8538 §4.1
+> keeps the sentence), and RFC 9494 §1 says "in conventional GR, route
+> preference is not affected" — depreferencing is Long-Lived GR behavior.
+> The comparator ranked any fresh route above any stale one before
+> `LOCAL_PREF`, and the test proving it cited §4.2. Fixed: staleness is now a
+> `Staleness` enum that `prefer` does not read, and is reset on the
+> advertised copy (marking had also been re-sending identical UPDATEs). This
+> is the CLAUDE.md failure mode exactly — a test name citing an RFC for
+> behavior the RFC does not require.
 
 | Clause | Confidence | Notes | What would close this out |
 |---|---|---|---|
@@ -660,6 +673,16 @@ individually re-derived this pass — worth a follow-up if time allows,
 though the highest-risk, highest-blast-radius clauses (missing-mandatory,
 duplicate-attribute handling, attribute-flags) have already been covered.
 
+**Addendum 2026-11-23 (issue #69): §7.9 ORIGINATOR_ID and §7.10 CLUSTER_LIST.**
+Both say "if [...] received from an external neighbor, it SHALL be discarded
+using the approach of 'attribute discard'". Confirmed gap, now fixed:
+`handle_update` stored both from any peer. This became exploitable once RFC
+4456 §9 made them best-path tie-breakers, because an eBGP peer could forge an
+ORIGINATOR_ID to win step (f). They are now kept only from `Internal` peers.
+Tests: `pathvectord` `rr_tie_break_tests::{ebgp,confed_member}_originator_id_and_cluster_list_are_discarded`.
+The "internal neighbor, length not a multiple of 4 → treat-as-withdraw" half
+is a codec concern and was not re-derived here.
+
 All 4 new/independent gaps filed in `TODO.md` (#19). The missing-mandatory-
 attribute finding is flagged as the audit's single highest-priority item
 given how easily it's triggered in ordinary operation.
@@ -712,6 +735,23 @@ independently confirmed rather than assumed, 1 not independently
 verifiable given the larger gap. No new `TODO.md` item — the existing
 deferred entry in `pathvector-session/RFC.md` already accurately describes
 this.
+
+**Update 2026-11-24 (issue #95) — gap closed, and a larger one found in the
+same audit's blind spot.** The audit above checked the *daemon's* handling of
+`AS4_PATH` and rated the encode side "Confirmed correct" because
+`AsPath::downgrade_for_two_byte_peer` substitutes AS_TRANS. It never looked at
+the *wire codec*, which wrote every `AS_PATH` ASN as four octets and read
+them as four octets regardless of the negotiated capability — so the
+substitution changed numbers, not widths, and a genuine two-octet UPDATE
+(`02 01 fd ea`) was rejected as a truncated AS_PATH and withdrawn. The
+receive-side reconstruction (§4.2.3), confed-in-AS4_PATH discard and
+malformed-`AS4_PATH` rules are now implemented in `pathvector-session`
+(`reconcile_as4_attributes`) with `AsPath::reconstruct_with_as4_path`; the
+NEW-NEW "MUST be discarded" clause is now an explicit discard (and is
+reported for logging) rather than an accident of the daemon ignoring the
+attribute. See `pathvector-session/RFC.md` for the clause-by-clause table.
+Lesson consistent with `CLAUDE.md`: an "implemented" row verified at one
+layer says nothing about the layer beneath it.
 
 ---
 
@@ -788,6 +828,23 @@ ASPA). One real gap found regardless.
 
 **RFC 8210/6810 summary:** 5 clauses reviewed — 4 confirmed correct, 1
 confirmed gap. Filed in `TODO.md` (#21).
+
+**Update 2026-11-24 — four rows above were "Confirmed correct" in a way a
+later clause-by-clause review (GitHub issues #86, #87, #88, #90) showed to be
+too generous; each is now fixed and proven by a black-box regression test
+that fails on the previous code:**
+
+| Row above | What the audit missed | Resolution |
+|---|---|---|
+| §8.3 Cache Reset → Reset Query ("Confirmed correct", cited `cache_reset_mid_stream_triggers_full_resync_on_same_connection`) | That test sent Cache Reset *after* a Cache Response to a **Reset** Query and cited "§5.7" (the IPv6 Prefix section). RFC 8210 defines Cache Reset only as the reply to a **Serial** Query (§§5.3, 5.9, 8.3). The real §8.3 case was `UnexpectedPdu`, and a reconnect re-sent the refused Serial Query forever. | #87: handled in the query-response state; resume state forgotten at once; the mid-transfer test is replaced by `cache_reset_in_reply_to_serial_query_triggers_reset_query_on_same_connection` and friends. A Cache Reset anywhere else is now a violation. |
+| "Session ID validation" ("Confirmed correct (cross-referenced)") | Only End of Data was compared, and only against its own Cache Response — never against the remembered session (§5.1/§5.5), never for Serial Notify, never the protocol version (§5.8, §7). | #90: `protocol.rs` enforces version and session on every PDU, sends Error Report 0/8, flushes where §5.1 requires. |
+| "Client-side serial number handling … not applicable" | Correct about wraparound arithmetic, but it overlooked that the *commensurability* test (§5.1: version + session + serial together) is the client's job. | #90: `Resume` bundles the three; there is no serial without a session and version. |
+| (not audited) §4/§5.8 "completed response" and §6 Expire Interval | The audit listed timer handling as present; nothing enforced Expire, and half-applied transfers were visible. | #88 (staged, atomic publication) and #86 (monotonic expiry, independent of the session). |
+
+Still open from the same review, deliberately not touched here: #89
+(cancelled idle read loses partial frames), #91 (prefix/max length bounds), #92
+(duplicate announcement / unknown withdrawal, Error Codes 6/7), #93 (stalled-query
+deadlines, retry timing across reconnects), #94 (coverage-claim documentation).
 
 ---
 

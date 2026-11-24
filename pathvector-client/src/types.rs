@@ -238,6 +238,8 @@ pub struct AddPeerParams {
     /// Export-policy default action.  Same semantics as `import_default`.
     pub export_default: Option<bool>,
     /// RFC 2385 TCP MD5 authentication key.  `None` means no MD5.
+    /// `Some("")` is rejected with `InvalidArgument` before anything is sent;
+    /// the daemon rejects keys longer than 80 bytes.
     pub md5_password: Option<String>,
 }
 

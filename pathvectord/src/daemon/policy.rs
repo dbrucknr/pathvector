@@ -41,6 +41,27 @@ impl DaemonState {
         self.flush_pending();
     }
 
+    /// The pre-policy checks for announcements from `peer_ip` (issue #138):
+    /// our AS, Confederation Identifier and addresses toward that peer.
+    /// `on_route_update` and soft reconfiguration both use it, so arrival and
+    /// re-evaluation reach the same verdict.
+    pub(super) fn ingress_gate(&self, peer_ip: IpAddr) -> IngressGate {
+        IngressGate::new(
+            self.rib.local_as,
+            self.rib.confederation_id,
+            self.rib
+                .local_addrs
+                .get(&peer_ip)
+                .and_then(|a| match a {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                })
+                // The live session is gone but its routes may be retained (GR).
+                .or_else(|| self.gr.retained_local_v4.get(&peer_ip).copied()),
+            self.rib.local_ipv6,
+        )
+    }
+
     /// Re-evaluates one peer's Adj-RIB-In (both address families) against
     /// its current import policy, updates Loc-RIB and the FIB, and
     /// propagates any resulting changes to other peers. Shared by
@@ -60,12 +81,14 @@ impl DaemonState {
         // Clone oracle before the mutable borrow of rib so the borrow checker
         // sees oracle_v4 and rib as independent fields of self.
         let oracle = Arc::clone(&self.oracle_v4);
+        let gate = self.ingress_gate(peer_ip);
         let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
         let fib_changes = reapply_import_policy(
             PeerId::from(peer_ip),
             &self.adj_ribs_in[&peer_ip],
             loc_rib,
             &self.import_policies[&peer_ip],
+            &gate,
             &*oracle,
         );
 
@@ -89,11 +112,12 @@ impl DaemonState {
 
         let oracle_v6 = Arc::clone(&self.oracle_v6);
         let loc_rib_v6 = &mut Arc::make_mut(&mut self.rib).loc_rib_v6;
-        let fib_changes_v6 = reapply_import_policy_v6(
+        let fib_changes_v6 = reapply_import_policy(
             PeerId::from(peer_ip),
             &self.adj_ribs_in_v6[&peer_ip],
             loc_rib_v6,
             &self.import_policies_v6[&peer_ip],
+            &gate,
             &*oracle_v6,
         );
 

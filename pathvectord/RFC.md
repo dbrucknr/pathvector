@@ -9,6 +9,146 @@ the workspace that ties all other crates together.
 
 ---
 
+## RFC 4271 §9 / §9.1.1 — Import (Phase 1) and Implicit Withdrawal
+
+**Owns:** `daemon/import.rs`: `ImportDecision`, `import_announcement` and
+`reapply_import_policy`, the one path (both address families) by which a received
+route goes through import policy into the Loc-RIB, on arrival and on re-evaluation.  
+**Boundary:** Policy evaluation lives in `pathvector-policy`; candidate storage and
+best-path selection (§9.1.2) live in `pathvector-rib`; FIB and outbound side effects stay
+with the caller (`DaemonState::on_route_update`, `reevaluate_import_for_peer`).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9
+
+Clauses implemented (quoted from the RFC text):
+
+- §9: "if the NLRI of the new route is identical to the one the route currently has
+  stored in the Adj-RIB-In, then the new route SHALL replace the older route in the
+  Adj-RIB-In, thus implicitly withdrawing the older route from service."
+- §9.1: Phase 1 returns a preference or "a value denoting that this route is ineligible
+  to be installed in Loc-RIB and will be excluded from the next phase of route selection."
+- §9.1.2: "The Phase 2 process considers all routes that are eligible in the Adj-RIBs-In."
+- RFC 9234 §3/§5: a leaked route "MUST be considered ineligible", with RFC 4271's meaning.
+
+RFC 7606 does not apply: it revises error handling for *malformed* UPDATEs and does not
+mention policy. A policy rejection is a well-formed route found ineligible.
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| A replacement route replaces the peer's older route in Adj-RIB-In (pre-policy), whether or not policy accepts it, so later re-evaluation judges the latest advertisement | `src/daemon/import.rs` `import_announcement` | ✅ | `import_announcement_keeps_rejected_replacement_in_adj_rib_in`, `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6` |
+| A replacement that import policy rejects withdraws the peer's older Loc-RIB candidate; with no other candidate the FIB gets `Withdrawn` and peers get WITHDRAWN ROUTES / `MP_UNREACH_NLRI` (§9.2) | `src/daemon/import.rs` `ImportDecision::apply` | ✅ | `rejected_replacement_of_sole_best_withdraws_from_fib_and_peers_v4`/`_v6` (issue #80) |
+| …and another peer's eligible route takes over: FIB switches next hop, peers get a replacement, never a withdrawal | `src/daemon/import.rs` | ✅ | `rejected_replacement_promotes_other_peers_route_v4`/`_v6` |
+| …and a rejected replacement of a non-selected candidate removes it without FIB or peer churn | `src/daemon/import.rs` | ✅ | `rejected_replacement_of_losing_candidate_causes_no_churn_v4`/`_v6` |
+| An accepted replacement of a rejected route is installed and advertised | `src/daemon/import.rs` | ✅ | `accepted_replacement_of_rejected_route_is_installed_v4`/`_v6` |
+| The same holds for RFC 6811 ROV Invalid and RFC 9234 §5 OTC-leak replacements | `src/daemon/import.rs` | ✅ | `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6`, `otc_leak_replacement_withdraws_old_route_v4`/`_v6` |
+| Model: after any per-peer sequence of accepted/rejected announcements and withdrawals, Loc-RIB candidates == each peer's latest advertisement that passed policy; Adj-RIB-In == latest advertisement; re-evaluation agrees with initial import | `src/daemon/import_reject_tests.rs` | ✅ | `prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer` |
+| Replacements dropped *before* import policy (AS loop, AS 0, invalid NEXT_HOP) also implicitly withdraw the older route | `src/daemon/ingress.rs`, `src/daemon/route.rs` | ✅ | See the next section (issue #138) |
+
+---
+
+## RFC 4271 §9 / §9.1.2 / §6.3 — Announcements Dropped Before Import Policy
+
+**Owns:** `daemon/ingress.rs`: `IngressGate` (pure: AS_PATH and next-hop verdicts),
+`IngressDrop` (the reason) and `Disposition` (what the reason does to the peer's older
+route). `route.rs` applies the verdict (`withdraw_route`, `import_ineligible`);
+`import.rs` re-applies it on soft reconfiguration.  
+**Boundary:** No RIB access in `ingress.rs`. Policy stays in `pathvector-policy`; the
+Adj-RIB-In/Loc-RIB reconciliation is the same `ImportDecision::Rejected` path as the
+import-policy case above (issue #80).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9.1.2
+
+Before issue #138 these announcements were dropped with a bare `continue`, so the older
+route the *same peer* advertised for the same NLRI stayed in the Adj-RIB-In, selected,
+installed in the FIB and advertised, although the peer had replaced it.
+
+Clauses (quoted from the RFC text):
+
+- RFC 4271 §9: "the new route SHALL replace the older route in the Adj-RIB-In, thus
+  implicitly withdrawing the older route from service."
+- RFC 4271 §9.1.2: "If the AS_PATH attribute of a BGP route contains an AS loop, the
+  BGP route should be excluded from the Phase 2 decision function." Excluded, not
+  discarded: the route is *ineligible*, so it replaces the older route (§9) and the peer
+  is left with no candidate.
+- RFC 5065 §4: "A BGP speaker receiving an AS_PATH attribute containing an autonomous
+  system matching its own AS Confederation Identifier SHALL treat the path in the same
+  fashion as if it had received a path containing its own AS number."
+- RFC 4271 §6.3: "Syntactic correctness means that the NEXT_HOP attribute represents a
+  valid IP host address." The error is Invalid NEXT_HOP Attribute (session reset), which
+  RFC 7606 §3(e) replaces: "'Treat-as-withdraw' MUST be used for the cases that specify a
+  session reset and involve any of the attributes ORIGIN, AS_PATH, NEXT_HOP, ...".
+  RFC 7606 §2: the routes are handled "just as if they had been listed in the WITHDRAWN
+  ROUTES field", "thus causing them to be removed from the Adj-RIB-In".
+- RFC 4271 §6.3 (a): the NEXT_HOP "MUST NOT be the IP address of the receiving speaker";
+  if it is, "the error SHOULD be logged, and the route SHOULD be ignored. In this case, a
+  NOTIFICATION message SHOULD NOT be sent, and the connection SHOULD NOT be closed." No
+  session reset is specified, so RFC 7606 §3(e) does not apply; RFC 7606 §7.3 only covers
+  a NEXT_HOP of the wrong length.
+- RFC 7607 §2 prohibits AS 0 in AS_PATH and delegates the handling of such an UPDATE to
+  RFC 7606, i.e. treat-as-withdraw.
+
+Decisions, and why:
+
+| Reason | Disposition | Adj-RIB-In | Loc-RIB | Basis |
+|---|---|---|---|---|
+| AS loop (local AS or Confederation Identifier) | `Ineligible` | holds the replacement | no candidate | §9.1.2 "excluded from the Phase 2 decision function"; §9 replacement |
+| Own address as NEXT_HOP | `Ineligible` | holds the replacement | no candidate | §6.3 (a) "SHOULD be ignored", read as *not used*; the route still supersedes the older one (§9), so keeping the superseded route would contradict §9 |
+| Unspecified, loopback, multicast or broadcast IPv4 NEXT_HOP; unspecified or multicast IPv6 next hop (incl. a multicast link-local) | `TreatAsWithdraw` | removed | no candidate | §6.3 syntax + RFC 7606 §3(e), §2 (RFC 1122 §3.2.1.3 and RFC 4291 §2.5.2 / §2.7 say these are not host addresses) |
+| AS 0 in AS_PATH | `TreatAsWithdraw` | removed | no candidate | RFC 7607 §2 → RFC 7606 |
+
+Notes:
+
+- A syntactically invalid **NEXT_HOP attribute** is treat-as-withdraw for the *whole
+  UPDATE*: RFC 7606 §3(e) selects the approach and §2 defines it over the UPDATE
+  ("all contained routes"), so every NLRI it announces — classic NLRI field, MP_REACH
+  IPv4 and MP_REACH IPv6 — is withdrawn (`handle_update`, before the announcement loops;
+  test `invalid_next_hop_attribute_withdraws_every_nlri_of_the_update`). An invalid
+  *MP_REACH_NLRI* next hop is not the NEXT_HOP attribute, so it stays scoped to that
+  attribute's own NLRI (`invalid_mp_reach_next_hop_withdraws_only_its_own_nlri_v4_good_v6_bad`).
+  RFC 4760 §3 carves out the MP-only case: an UPDATE "that carries no NLRI, other than the
+  one encoded in the MP_REACH_NLRI attribute, SHOULD NOT carry the NEXT_HOP attribute. If
+  such a message contains the NEXT_HOP attribute, the BGP speaker that receives the message
+  SHOULD ignore this attribute." RFC 7606 does not remove it, so the attribute is checked
+  only when the classic NLRI field uses it
+  (`unused_classic_next_hop_is_ignored_when_mp_reach_is_the_only_nlri`).
+  Our own address as NEXT_HOP is semantic (§6.3 (a)), so it is per-route `Ineligible`.
+- If both an `Ineligible` and a `TreatAsWithdraw` reason apply, treat-as-withdraw wins
+  (`IngressDrop::most_severe`).
+- An `Ineligible` route stays in the Adj-RIB-In for soft reconfiguration, so every path
+  that turns Adj-RIB-In routes into candidates asks the same `IngressGate` first:
+  `reapply_import_policy`, and Graceful Restart stale marking (`mark_stale_and_repropagate`
+  re-judges each retained route with `ImportDecision::evaluate_gated`; RFC 4724 §4.2
+  retains routes, it does not make an ineligible one eligible). The gate is built before
+  teardown forgets the local address, and `GracefulRestartState::retained_local_v4` keeps our
+  last address toward the peer for the life of the retained routes, so own-NEXT_HOP routes stay
+  rejected through later soft reconfiguration too
+  (`own_next_hop_stays_rejected_through_soft_reconfiguration_in_the_gr_window`). It counts toward
+  max-prefix like a policy-rejected route.
+- A BLACKHOLE-tagged (RFC 7999) announcement that is dropped is **not** retained: no null
+  route is installed for it, and a stored tag would later read as "this peer owns a kernel
+  null route" (`holds_blackhole`, peer teardown) and could delete another peer's. It is
+  handled like treat-as-withdraw instead. An older BLACKHOLE route superseded by a dropped
+  announcement is reported in `blackhole_withdrawn_*` so its null route is removed.
+- Still open, outside this issue: an *accepted* (or policy-rejected) replacement that is
+  not BLACKHOLE-tagged does not retire an older BLACKHOLE route either.
+- The session-side half of RFC 7607 (OPEN, AGGREGATOR, AS4 attributes) remains issue #111.
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Dropped replacement of the sole best route: FIB `Withdrawn`, peers get WITHDRAWN ROUTES / `MP_UNREACH_NLRI`, no NOTIFICATION (§9, §9.2) | `src/daemon/route.rs` | ✅ | `dropped_replacement_of_sole_best_withdraws_from_fib_and_peers_v4`/`_v6` (AS loop, confederation-ID loop, AS 0, unspecified/loopback/multicast/broadcast NEXT_HOP, own-address NEXT_HOP) |
+| …another peer's route takes over, peers never see a withdrawal | `src/daemon/route.rs` | ✅ | `dropped_replacement_promotes_other_peers_route_v4`/`_v6` |
+| No earlier route from the peer: no FIB change, nothing sent, other peers' routes untouched | `src/daemon/route.rs` | ✅ | `dropped_announcement_without_earlier_route_is_a_no_op_v4`/`_v6` |
+| Adj-RIB-In: removed for treat-as-withdraw, holds the replacement for ineligible routes | `src/daemon/route.rs` | ✅ | `assert_adj_rib_in_v4`/`_v6` in every test above |
+| Several NLRI in one UPDATE: an invalid NEXT_HOP attribute withdraws all of them; loops and MP_REACH next hops affect only their own NLRI | `src/daemon/route.rs` | ✅ | `invalid_next_hop_attribute_withdraws_every_nlri_of_the_update`, `invalid_mp_reach_next_hop_withdraws_only_its_own_nlri_v4_good_v6_bad`, `loop_update_with_several_nlri_withdraws_only_prefixes_with_an_earlier_route`, `loop_update_with_several_v6_nlri_withdraws_only_prefixes_with_an_earlier_route` |
+| Re-evaluation does not resurrect an ineligible replacement | `src/daemon/import.rs` | ✅ | `reevaluation_keeps_an_ineligible_replacement_out_of_the_loc_rib` |
+| Graceful Restart stale marking does not resurrect ineligible (or policy-rejected) routes, including own-NEXT_HOP after the local address is forgotten; eligible routes are still retained | `src/daemon/gr.rs` | ✅ | `graceful_restart_does_not_resurrect_ineligible_routes`, `graceful_restart_does_not_resurrect_policy_rejected_routes`, `graceful_restart_still_retains_eligible_routes` |
+| A dropped BLACKHOLE announcement is not retained; its withdrawal removes no other peer's null route | `src/daemon/route.rs` | ✅ | `dropped_blackhole_announcement_is_not_retained_and_withdrawal_removes_no_null_route` |
+| An eligible route after a dropped one is installed | `src/daemon/route.rs` | ✅ | `eligible_replacement_of_a_dropped_route_is_installed` |
+| A superseded BLACKHOLE route's null route is withdrawn | `src/daemon/route.rs` | ✅ | `dropped_replacement_of_a_blackhole_route_withdraws_the_null_route` |
+| Model: after any per-peer sequence of accepted / ineligible / treat-as-withdraw announcements and withdrawals, candidates == latest accepted advertisement, Adj-RIB-In as the table above says, re-evaluation agrees | `src/daemon/ingress_drop_tests.rs` | ✅ | `prop_dropped_announcements_leave_the_peer_with_no_candidate` |
+| Verdicts and dispositions as pure values | `src/daemon/ingress.rs` | ✅ | `ingress::tests::*` |
+| e2e: real session, AS-loop and 0.0.0.0-NEXT_HOP replacements withdraw the first route, session stays up | `pathvector-e2e` | ✅ | `as_loop_replacement_withdraws_the_older_route_session_stays_up`, `invalid_next_hop_replacement_withdraws_the_older_route_session_stays_up` |
+
+---
+
 ## RFC 4271 §9.2 — Update-Send Process
 
 **Owns:** `propagate_prefix`, `prepare_outbound`, and `flush_updates`: the pipeline that
@@ -39,26 +179,40 @@ of UPDATE messages lives in `pathvector-session`.
 
 ## RFC 4271 §9.2.1.1 — Minimum Route Advertisement Interval (MRAI)
 
-**Owns:** eBGP MRAI enforcement: suppressing repeated announcements of the same NLRI
-within a 30-second window to dampen UPDATE bursts toward eBGP peers. Withdrawals bypass
-MRAI unconditionally.  
-**Boundary:** Wire serialisation lives in `pathvector-session`. AdjRibOut is updated
-before the MRAI gate, so the RIB reflects correct state even while wire transmission is
-deferred.  
+**Owns:** eBGP MRAI enforcement, per destination, for IPv4 and IPv6 unicast: a
+re-announcement of a destination inside the 30-second interval is held back and the
+last route selected is announced when the interval expires. Withdrawals bypass MRAI
+(documented deviation, below).  
+**Boundary:** Wire serialisation lives in `pathvector-session`. The gate
+(`MraiTracker::gate` in `src/daemon/route.rs`) wraps each destination's Adj-RIB-Out
+diff: a held-back announcement is rolled back out of the Adj-RIB-Out, so the
+Adj-RIB-Out always holds what the peer was actually sent, and the release at expiry
+diffs against that.  
+**Amendments checked (2026-11-23):** none of RFC 4271's updating RFCs (4724, 6286,
+6608, 6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687, 9774) touches §9.2.1.1. RFC 4760
+does not exempt MP_REACH_NLRI, and the clause is per destination, so it applies to
+IPv6 unicast as well.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9.2.1.1
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| 30 s MRAI for eBGP peers; repeated announcement within window suppressed | `src/daemon.rs` | ✅ | `mrai_suppresses_ebgp_announcement_within_window` |
-| Announcement allowed after MRAI window elapses | `src/daemon.rs` | ✅ | `mrai_passes_after_window_elapsed` |
-| Suppressed NLRIs tracked in `mrai_pending`; flushed by half-MRAI timer | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending`, `has_mrai_pending_true_when_set_nonempty` |
-| Per-NLRI readiness: only NLRIs whose individual window elapsed are flushed | `src/daemon.rs` | ✅ | `flush_mrai_pending_clears_elapsed_pending` |
-| Withdrawals bypass MRAI | `src/daemon.rs` | ⚠️ | `mrai_withdrawal_bypasses_suppression` — **citation corrected 2026-07-16 by `RFC_AUDIT.md` §9.2.1.1: there is no "explicit exemption" for withdrawals in the actual RFC 4271 §9.2.1.1 text.** It says the opposite — "Two UPDATE messages... that advertise feasible routes **and/or withdrawal of unfeasible routes**... MUST be separated by at least MinRouteAdvertisementIntervalTimer." The behavior itself (send withdrawals immediately, unthrottled) is common, defensible real-world practice — delaying a withdrawal keeps a stale/blackholed route alive longer, a real safety cost — but it is not what the RFC's literal text says, and the previous ✅/"explicit exemption" framing overstated the RFC basis for this design choice. See `RFC_AUDIT.md` §9.2.1.1. |
-| iBGP MRAI (SHOULD ≥5 s per RFC 4271 §9.2.1.1) | — | ❌ | — |
+| 30 s MRAI for eBGP peers; re-announcement of a destination within the interval held back | `src/daemon/route.rs` | ✅ | `suppressed_replacement_is_sent_when_mrai_expires_v4` (`daemon/mrai_flush_tests.rs`), `destination_sent_just_now_is_not_ready` |
+| "the last route selected SHALL be advertised at the end of MinRouteAdvertisementIntervalTimer" — the held-back replacement actually reaches the peer at expiry | `src/daemon/route.rs` | ✅ | `suppressed_replacement_is_sent_when_mrai_expires_v4`, `last_route_selected_during_window_is_the_one_sent_v4` — **fixed 2026-11-23:** the replacement used to be committed to the Adj-RIB-Out before the MRAI check, so the release at expiry diffed to `NoChange` and the peer kept the stale path indefinitely |
+| Selection that reverts to the advertised route within the interval sends nothing extra | `src/daemon/route.rs` | ✅ | `replacement_reverted_within_window_never_sends_intermediate_v4` |
+| Adj-RIB-Out (and `show adj-rib-out` / advertised counters) reflects what was sent, not what is held back | `src/daemon/route.rs` | ✅ | `adj_rib_out_holds_route_actually_sent_while_suppressed_v4` |
+| Same interval for IPv6 unicast (MP_REACH_NLRI) | `src/daemon/route.rs` | ✅ | `suppressed_replacement_is_sent_when_mrai_expires_v6` — **added 2026-11-23**; the IPv6 path previously applied no MRAI at all |
+| Held-back destinations released by the MRAI/2 timer; per-destination readiness | `src/daemon/route.rs` | ✅ | `take_ready_releases_only_elapsed_destinations`, `flush_mrai_pending_clears_elapsed_pending`, `regression_flush_mrai_pending_requires_subsequent_flush_pending` |
+| Withdrawals bypass MRAI; a withdrawal cancels a held-back announcement | `src/daemon/route.rs` | ⚠️ | `withdrawal_within_window_is_sent_immediately_v4`/`_v6`, `suppressed_replacement_then_withdrawal_sends_only_withdrawal_v4`/`_v6` — **deliberate deviation.** RFC 4271 §9.2.1.1 applies the interval to "advertise feasible routes **and/or withdrawal of unfeasible routes**" (see `RFC_AUDIT.md` §9.2.1.1). The behaviour follows RFC 1771 §9.2.3.1, which RFC 4271 replaced: "To avoid long-lived black holes, the procedure does not apply to the explicit withdrawal of unfeasible routes." Holding back a withdrawal keeps a blackholed path alive at the peer, so pathvectord accepts the deviation. |
+| iBGP MRAI (SHOULD be shorter than eBGP, or not applied, per RFC 4271 §9.2.1.1) | `src/daemon/route.rs` | ✅ | `ibgp_peer_is_not_rate_limited_v4` — option (b), "the procedure [...] SHOULD NOT apply to routes sent to internal peers": the gate is skipped for iBGP peers |
 
-**Deferred:** iBGP MRAI. The RFC says SHOULD ≥5 s for iBGP; current implementation applies
-no MRAI to iBGP peers. Low operational impact at typical iBGP topologies; deferred until
-route dampening is implemented (both share the `Clock` trait prerequisite).
+**Not covered:** only `propagate_to_all_peers`/`_v6` (UPDATE processing, policy
+changes, origination, FIB-driven next-hop changes, and the MRAI release itself) pass
+through the gate. Announcements made by the session-termination
+(`on_terminated`), graceful-restart, and selection-deferral release paths call
+`propagate_prefix` directly. They are neither rate-limited nor recorded as starting an
+interval, and neither is the initial table dump. They commit exactly what they send,
+so they cannot strand a peer on a stale path. A withdrawal clears the destination's
+last-sent stamp, so a re-announcement right after a withdrawal goes out immediately.
 
 ---
 
@@ -68,8 +222,10 @@ route dampening is implemented (both share the `Clock` trait prerequisite).
 AS_TRANS (23456) and appending the original path as AS4_PATH (type 17, flags 0xC0 =
 optional+transitive) so downstream 4-byte-capable routers can reconstruct the full path.  
 **Boundary:** `Asn::TRANS` constant and `AsPath::downgrade_for_two_byte_peer()` live in
-`pathvector-types`. Inbound AS4_PATH merging (receiving from 2-byte peers) is owned by
-`pathvector-session`.  
+`pathvector-types`. The wire form (two-octet `AS_PATH`/`AGGREGATOR`, AS_TRANS, and a
+generated `AS4_PATH`/`AS4_AGGREGATOR` if the daemon did not attach one) and inbound AS4_PATH
+merging (receiving from 2-byte peers) are owned by `pathvector-session`, which the daemon
+reaches through the negotiated `AsnWidth`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc6793#section-4
 
 | Requirement | File | Status | Verified by |
@@ -79,6 +235,8 @@ optional+transitive) so downstream 4-byte-capable routers can reconstruct the fu
 | No AS_TRANS / AS4_PATH for 4-byte-capable peers | `src/outbound.rs` | ✅ | `four_byte_asn_to_four_byte_peer_no_trans_no_as4_path` |
 | No AS4_PATH when all ASNs fit in 2 bytes (no substitution occurred) | `src/outbound.rs` | ✅ | `two_byte_asns_to_two_byte_peer_no_trans_no_as4_path` |
 | AS4_PATH appears as last attribute (2-byte speakers can skip unknown optional attributes) | `src/outbound.rs` | ✅ | `as4_path_is_last_attribute_for_two_byte_peer` |
+| No AS4_PATH when the only four-byte ASN is in a confed segment (§4.2.2 "MUST NOT send" — nothing non-mappable left after stripping confed) | `src/outbound.rs` `push_as4_side_channel` | ✅ | `no_as4_path_when_the_only_four_byte_asn_is_in_a_confed_segment` |
+| AS4_AGGREGATOR for a non-mappable aggregating AS toward a 2-byte peer; never for a mappable AS or a 4-byte peer | `src/outbound.rs` `push_as4_side_channel` | ✅ | `as4_aggregator_only_for_non_mappable_aggregator_toward_two_byte_peer` |
 | E2e verification against real 2-byte-only peer (GoBGP `--as2` mode) | — | ❌ | — |
 
 **Deferred:** E2e test against GoBGP in 2-byte-only mode to verify wire format on a live session.
@@ -144,7 +302,9 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
 | §4.2 IPv6 EOR triggers pruning of stale IPv6 NLRIs | `src/daemon.rs` | ✅ | `prune_stale_nlri_v6` + IPv6 EOR branch |
 | §4.2 MUST: GR window expiry without re-establishment flushes all stale routes | `src/daemon.rs` | ✅ | `gr_deadline_expiry_flushes_stale_routes` |
-| §4.2 SHOULD: stale route marking — retained routes de-preferred in best-path so a fresh peer wins immediately | `src/daemon.rs`, `pathvector-rib/src/best_path.rs`, `pathvector-rib/src/adj_rib_in.rs` | ✅ | `stale_marking_lets_fresh_peer_win_immediately`, `stale_loses_to_non_stale_before_all_other_criteria` |
+| §4.2 MUST: retained routes marked stale (`Staleness::GrStale`) — **and stale routes keep their ordinary preference** ("MUST NOT differentiate between stale and other routing information during forwarding"; RFC 9494 §1: "in conventional GR, route preference is not affected") | `src/daemon/gr.rs`, `pathvector-rib/src/adj_rib_in.rs`, `pathvector-rib/src/best_path.rs` | ✅ | `daemon::gr_preference_tests::conventional_gr_keeps_stale_higher_local_pref_route_selected`, `stale_marking_keeps_equally_preferred_route_selected`, `pathvector-rib` `best_path::tests::conventional_gr_*` + `prop_conventional_gr_staleness_never_changes_the_winner`. **Corrected 2026-11-23 (issue #68):** this row previously read "SHOULD: retained routes de-preferred in best-path so a fresh peer wins immediately", backed by tests asserting that a stale LOCAL_PREF-300 route lost to a fresh LOCAL_PREF-100 one. RFC 4724 has no such SHOULD; de-preferencing is RFC 9494 (LLGR) behavior, which is not implemented. |
+| §4.2 + RFC 9494 §1: marking routes stale sends no UPDATE (conventional GR resolves the trade-off "in favor of not advertising"); staleness is never part of the advertised route | `pathvector-rib/src/outbound.rs` (`prepare_outbound{,_v6}` reset staleness) | ✅ | `daemon::gr_preference_tests::{conventional_gr_stale_marking_does_not_readvertise_when_an_alternative_exists, stale_marking_of_sole_route_sends_no_duplicate_update, stale_marking_of_sole_v6_route_sends_no_duplicate_update}`, `stale_mark_sends_no_update_to_established_observer`, `outbound::tests::test_prepare_outbound_never_carries_staleness`. Before issue #68, marking a selected route stale re-sent an identical UPDATE for it to every peer. |
+| §4.2 MUST: re-announcement replaces the stale route; End-of-RIB removes the rest; Restart Time expiry falls back to the fresh alternative | `src/daemon/route.rs`, `src/daemon/gr.rs` | ✅ | `daemon::gr_preference_tests::{reannouncement_replaces_stale_route_and_end_of_rib_removes_the_rest, restart_time_expiry_falls_back_to_the_fresh_alternative}` |
 | e2e: unclean disconnect holds routes; window expiry flushes them | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry` |
 | e2e: clean disconnect (NOTIFICATION) flushes routes immediately, no GR window | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_clean_disconnect_flushes_routes_immediately` |
 | e2e: peer restart with partial RIB — un-refreshed routes pruned on EOR | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` |
@@ -326,6 +486,9 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | Non-client iBGP → clients: reflect with correct RR attributes | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_route_reflected_to_client`, `test_rr_non_client_ibgp_to_client_injects_rr_attrs` |
 | Non-client iBGP → non-client iBGP: blocked (standard split-horizon) | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_to_non_client_ibgp_still_blocked` |
 | ORIGINATOR_ID + CLUSTER_LIST included in outbound UPDATE attributes | `src/outbound.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
+| ORIGINATOR_ID + CLUSTER_LIST stored on ingested routes as received, IPv4 **and IPv6** (the IPv6 path used to drop both, so reflected IPv6 routes left this RR without them) | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ipv6_reflected_routes_store_rr_attributes_and_select_by_originator_id, ipv6_route_reflected_to_another_client_carries_originator_id_and_cluster_list}` |
+| §9 tie-breakers (ORIGINATOR_ID for step (f), then shorter CLUSTER_LIST before peer address) applied to ingested routes | `src/daemon/route.rs` → `pathvector-rib` `best_path` | ✅ | `rr_tie_break_tests::{reflected_routes_are_selected_by_originator_id_not_reflector_id, shorter_cluster_list_is_selected_before_peer_address}` |
+| RFC 7606 §7.9 / §7.10: ORIGINATOR_ID / CLUSTER_LIST "received from an external neighbor ... SHALL be discarded using the approach of 'attribute discard'". Kept only from `Internal` peers. A `ConfedMember` peer is in "a different Autonomous System" (RFC 4271) and RFC 5065 grants no exception for these attributes, which matches the outbound stripping toward `ConfedMember` | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ebgp_originator_id_and_cluster_list_are_discarded, confed_member_originator_id_and_cluster_list_are_discarded}` |
 | adj_ribs_out_v6 uses reflecting mode for all iBGP peers when acting as RR | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_is_reflecting_for_ibgp_peer` |
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in propagation | `src/daemon.rs` | ✅ | `test_rr_v6_split_horizon_blocks_non_client_to_non_client` |

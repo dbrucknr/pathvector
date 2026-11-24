@@ -8,14 +8,28 @@
 //! This crate does not perform RPKI repository sync or certificate validation itself —
 //! that is the external validator's job. It only speaks the RTR protocol to consume the
 //! validator's output.
+//!
+//! Consistency guarantees (RFC 8210 §§4, 5.1, 6, 7): VRPs, serial, status and change
+//! notifications are published together at End of Data; a failed transfer leaves the
+//! previous generation intact; the negotiated protocol version and Session ID are
+//! enforced on every PDU; and the data is discarded when the cache's Expire Interval
+//! elapses without a completed sync (after which every validation is `NotFound`). See
+//! the crate README for the details and the cost of staging.
 
+mod cache;
 mod client;
 mod error;
 mod pdu;
+mod protocol;
 mod table;
+mod timers;
 
-pub use client::{RtrClient, RtrConfig, RtrHandle, RtrStatus};
-pub use error::{PduError, RtrError};
+#[cfg(test)]
+mod regression_tests;
+
+pub use cache::RtrStatus;
+pub use client::{RtrClient, RtrConfig, RtrHandle};
+pub use error::{PduError, RtrConfigError, RtrError};
 pub use pdu::RtrVersion;
 pub use table::{RoaTable, RoaValidity};
 

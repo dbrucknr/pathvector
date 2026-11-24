@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pathvector_session::message::BgpMessage;
+use pathvector_session::message::{AsnWidth, BgpMessage, MAX_LEN};
 
 // BGP header constants.
 const HEADER_LEN: usize = 19;
@@ -22,4 +22,18 @@ fuzz_target!(|data: &[u8]| {
     buf[17] = (len & 0xFF) as u8;
 
     let _ = BgpMessage::decode(&buf);
+
+    // RFC 6793: the same bytes parse differently at each negotiated ASN
+    // width (two-octet AS_PATH/AGGREGATOR, AS4_* merge vs. discard), so
+    // exercise both. Whatever decodes cleanly must re-encode for that width
+    // without panicking, and the re-encoded bytes must decode again.
+    for width in [AsnWidth::Two, AsnWidth::Four] {
+        if let Ok(BgpMessage::Update(u)) =
+            BgpMessage::decode_with_limit_and_caps(&buf, MAX_LEN, width)
+        {
+            let msg = BgpMessage::Update(u);
+            let again = msg.encode_with(width);
+            let _ = BgpMessage::decode_with_limit_and_caps(&again, MAX_LEN, width);
+        }
+    }
 });

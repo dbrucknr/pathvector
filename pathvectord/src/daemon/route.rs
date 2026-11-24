@@ -1,6 +1,8 @@
 // daemon/route.rs — Route processing: import/export, propagation, MRAI, handle_update.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::outbound::{DecisionKind, OutboundDecision};
+use pathvector_types::IpAddress;
 
 impl DaemonState {
     #[allow(clippy::similar_names)]
@@ -452,6 +454,12 @@ impl DaemonState {
             let loc_rib = &self.rib.loc_rib;
             let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
+            // RFC 4271 §9.2.1.1: MRAI is applied to eBGP peers only (option
+            // (b) of the iBGP SHOULD), per destination. The gate wraps the
+            // Adj-RIB-Out diff so a held-back announcement is rolled back out
+            // of the Adj-RIB-Out (see `MraiTracker::gate`).
+            let mut mrai = (peer_type == PeerType::External).then_some(&mut self.mrai);
+            let now = Instant::now();
             let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
@@ -472,56 +480,26 @@ impl DaemonState {
                             return PrefixDecision::NoChange;
                         }
                     }
-                    propagate_prefix(
-                        nlri,
-                        loc_rib,
-                        adj_rib_out,
-                        export_policy,
-                        peer_type,
-                        local_as,
-                        public_as,
-                        local_next_hop,
-                        next_hop_self,
-                        v4_deferred,
-                    )
+                    let propagate = |adj: &mut AdjRibOut<Ipv4Addr>| {
+                        propagate_prefix(
+                            nlri,
+                            loc_rib,
+                            adj,
+                            export_policy,
+                            peer_type,
+                            local_as,
+                            public_as,
+                            local_next_hop,
+                            next_hop_self,
+                            v4_deferred,
+                        )
+                    };
+                    match mrai.as_deref_mut() {
+                        Some(mrai) => mrai.gate(peer_ip, nlri, now, adj_rib_out, propagate),
+                        None => propagate(adj_rib_out),
+                    }
                 })
                 .collect();
-            // RFC 4271 §9.2.1.1: apply MRAI for eBGP peers.
-            // Withdrawals bypass MRAI (must be sent immediately per the RFC).
-            let now = Instant::now();
-            let decisions = if peer_type == PeerType::External {
-                let last_sent = self.mrai_last_sent.entry(peer_ip).or_default();
-                let pending = self.mrai_pending.entry(peer_ip).or_default();
-                decisions
-                    .into_iter()
-                    .map(|d| match d {
-                        PrefixDecision::Announce(ref route) => {
-                            let nlri = route.nlri;
-                            let elapsed = last_sent
-                                .get(&nlri)
-                                .map_or(MRAI, |t| now.saturating_duration_since(*t));
-                            if elapsed >= MRAI {
-                                last_sent.insert(nlri, now);
-                                pending.remove(&nlri);
-                                d
-                            } else {
-                                pending.insert(nlri);
-                                PrefixDecision::NoChange
-                            }
-                        }
-                        // Withdrawals are always sent immediately; also clear any
-                        // pending MRAI entry so we don't re-announce after withdrawal.
-                        PrefixDecision::Withdraw(nlri) => {
-                            pending.remove(&nlri);
-                            last_sent.remove(&nlri);
-                            d
-                        }
-                        PrefixDecision::NoChange => d,
-                    })
-                    .collect()
-            } else {
-                decisions
-            };
             // Accumulate into the coalescing buffer; flush_pending() will drain
             // all peers at once when the event channel goes quiet.
             self.pending_decisions
@@ -540,54 +518,34 @@ impl DaemonState {
         });
     }
 
-    /// Re-propagates NLRIs that were suppressed by MRAI and whose window has now elapsed.
+    /// Re-propagates destinations held back by MRAI whose interval has now
+    /// elapsed, for both address families.
     ///
-    /// Should be called roughly every MRAI interval (30 s) by the event loop.
-    /// For each eBGP peer with pending NLRIs, this re-runs `propagate_to_all_peers`
-    /// for the pending set so routes reach the peer after the suppression window closes.
+    /// Called every MRAI/2 by the event loop, which must call `flush_pending`
+    /// afterwards (propagation only buffers). Because a held-back announcement
+    /// never reached the peer's Adj-RIB-Out (see [`MraiTracker::gate`]), the
+    /// re-propagation diffs the current best route against what the peer
+    /// actually holds and so yields the announcement — RFC 4271 §9.2.1.1: "the
+    /// last route selected SHALL be advertised at the end of
+    /// MinRouteAdvertisementIntervalTimer".
     pub(crate) fn flush_mrai_pending(&mut self) {
         let now = Instant::now();
-        // Per-NLRI readiness check: only flush NLRIs whose individual MRAI window
-        // has elapsed. A bulk "max of all last_sent" check would incorrectly
-        // suppress a pending NLRI if any *other* (non-pending) NLRI was sent
-        // recently enough to make the max appear within the window.
-        let peers_with_pending: Vec<IpAddr> = self
-            .mrai_pending
-            .iter()
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(&p, _)| p)
-            .collect();
-
-        for peer_ip in peers_with_pending {
-            let Some(pending) = self.mrai_pending.get(&peer_ip) else {
-                continue;
-            };
-            let (ready, not_ready): (Vec<Nlri<Ipv4Addr>>, Vec<Nlri<Ipv4Addr>>) =
-                pending.iter().copied().partition(|nlri| {
-                    self.mrai_last_sent
-                        .get(&peer_ip)
-                        .and_then(|m| m.get(nlri))
-                        .is_none_or(|t| now.saturating_duration_since(*t) >= MRAI)
-                });
-
-            if ready.is_empty() {
-                continue;
-            }
-
-            // Replace pending with the still-suppressed NLRIs before propagating,
-            // so propagate_to_all_peers sees an accurate pending set.
-            if let Some(p) = self.mrai_pending.get_mut(&peer_ip) {
-                *p = not_ready.into_iter().collect();
-            }
+        let ready = self.mrai.take_ready(now);
+        if !ready.is_empty() {
             self.propagate_to_all_peers(&ready);
+        }
+        let ready_v6 = self.mrai_v6.take_ready(now);
+        if !ready_v6.is_empty() {
+            self.propagate_to_all_peers_v6(&ready_v6);
         }
     }
 
-    /// Returns `true` if any eBGP peer has NLRIs pending for MRAI flush.
+    /// Returns `true` if any eBGP peer has destinations held back by MRAI, in
+    /// either address family.
     ///
-    /// Used by the event loop to decide whether to schedule a wakeup timer.
+    /// Used by the event loop to decide whether to run `flush_mrai_pending`.
     pub(crate) fn has_mrai_pending(&self) -> bool {
-        self.mrai_pending.values().any(|s| !s.is_empty())
+        self.mrai.has_pending() || self.mrai_v6.has_pending()
     }
 
     /// Emits a `RouteEvent` for each NLRI in `affected` based on the current
@@ -653,6 +611,11 @@ impl DaemonState {
             let loc_rib_v6 = &self.rib.loc_rib_v6;
             let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
+            // RFC 4271 §9.2.1.1 is per destination, not per address family,
+            // and RFC 4760 does not exempt MP_REACH_NLRI: same eBGP gate as
+            // `propagate_to_all_peers`.
+            let mut mrai = (peer_type == PeerType::External).then_some(&mut self.mrai_v6);
+            let now = Instant::now();
             let decisions: Vec<PrefixDecisionV6> = nlris
                 .iter()
                 .map(|&nlri| {
@@ -670,18 +633,24 @@ impl DaemonState {
                             return PrefixDecisionV6::NoChange;
                         }
                     }
-                    propagate_prefix_v6(
-                        nlri,
-                        loc_rib_v6,
-                        adj_rib_out_v6,
-                        export_policy_v6,
-                        peer_type,
-                        local_as,
-                        public_as,
-                        local_ipv6,
-                        next_hop_self,
-                        v6_deferred,
-                    )
+                    let propagate = |adj: &mut AdjRibOut<Ipv6Addr>| {
+                        propagate_prefix_v6(
+                            nlri,
+                            loc_rib_v6,
+                            adj,
+                            export_policy_v6,
+                            peer_type,
+                            local_as,
+                            public_as,
+                            local_ipv6,
+                            next_hop_self,
+                            v6_deferred,
+                        )
+                    };
+                    match mrai.as_deref_mut() {
+                        Some(mrai) => mrai.gate(peer_ip, nlri, now, adj_rib_out_v6, propagate),
+                        None => propagate(adj_rib_out_v6),
+                    }
                 })
                 .collect();
             self.pending_decisions_v6
@@ -779,107 +748,237 @@ impl DaemonState {
     }
 }
 
-pub(crate) fn reapply_import_policy(
-    peer: PeerId,
-    adj_rib_in: &AdjRibIn<Ipv4Addr>,
-    loc_rib: &mut LocRib<Ipv4Addr>,
-    policy: &Policy<Route<Ipv4Addr>>,
-    oracle: &dyn NextHopOracle,
-) -> Vec<BestPathChange<Ipv4Addr>> {
-    let mut fib_changes: Vec<BestPathChange<Ipv4Addr>> = Vec::new();
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-
-    for (nlri, raw_route) in adj_rib_in.routes() {
-        let mut route = raw_route.clone();
-        match policy.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route, oracle));
-                accepted += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle));
-                rejected += 1;
-            }
-        }
-    }
-
-    crate::metrics::on_import_reject(peer.ip(), rejected);
-    tracing::info!(
-        peer = %peer,
-        accepted,
-        rejected,
-        rib_size = loc_rib.len(),
-        "soft reconfig complete"
-    );
-    fib_changes
-}
-
-/// IPv6 counterpart of [`reapply_import_policy`].
+/// RFC 4271 §9.2.1.1 MinRouteAdvertisementIntervalTimer state for one address
+/// family, kept per eBGP peer and per destination.
 ///
-/// Re-evaluates all IPv6 routes stored in `adj_rib_in` against `policy` and
-/// reconciles `loc_rib` with the result.  Called by [`DaemonState::set_import_default`]
-/// so that a policy reload applies to both address families without a session reset.
-pub(crate) fn reapply_import_policy_v6(
-    peer: PeerId,
-    adj_rib_in: &AdjRibIn<Ipv6Addr>,
-    loc_rib: &mut LocRib<Ipv6Addr>,
-    policy: &Policy<Route<Ipv6Addr>>,
-    oracle: &dyn NextHopOracle,
-) -> Vec<BestPathChange<Ipv6Addr>> {
-    let mut fib_changes: Vec<BestPathChange<Ipv6Addr>> = Vec::new();
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
+/// > "Two UPDATE messages sent by a BGP speaker to a peer that advertise
+/// > feasible routes and/or withdrawal of unfeasible routes to some common
+/// > set of destinations MUST be separated by at least
+/// > MinRouteAdvertisementIntervalTimer. [...] If new routes are selected
+/// > multiple times while awaiting the expiration of
+/// > MinRouteAdvertisementIntervalTimer, the last route selected SHALL be
+/// > advertised at the end of MinRouteAdvertisementIntervalTimer."
+///
+/// Withdrawals are deliberately **not** held back (the RFC 1771 §9.2.3.1
+/// behaviour, which RFC 4271 dropped). Delaying a withdrawal keeps a
+/// blackholed path alive at the peer; see `pathvectord/RFC.md` §9.2.1.1.
+pub(crate) struct MraiTracker<A: IpAddress> {
+    /// When each destination was last announced to each peer.
+    last_sent: HashMap<IpAddr, HashMap<Nlri<A>, Instant>>,
+    /// Destinations whose announcement is being held back. A set, so several
+    /// selections inside one interval collapse to one release.
+    pending: HashMap<IpAddr, HashSet<Nlri<A>>>,
+}
 
-    for (nlri, raw_route) in adj_rib_in.routes() {
-        let mut route = raw_route.clone();
-        match policy.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route, oracle));
-                accepted += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle));
-                rejected += 1;
-            }
+impl<A: IpAddress> MraiTracker<A> {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_sent: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
-    crate::metrics::on_import_reject(peer.ip(), rejected);
-    tracing::info!(
-        peer = %peer,
-        accepted,
-        rejected,
-        rib_size = loc_rib.len(),
-        "soft reconfig v6 complete"
-    );
-    fib_changes
+    /// Runs `propagate` (one destination's Adj-RIB-Out diff for `peer`) under
+    /// the MRAI gate.
+    ///
+    /// An announcement inside the interval is held back: the Adj-RIB-Out is
+    /// restored to the route the peer actually has, the destination is marked
+    /// pending, and `NoChange` is returned. Restoring is what makes the later
+    /// release work: [`take_ready`](Self::take_ready) re-propagates the
+    /// destination, and the diff against the restored entry yields the
+    /// announcement. Committing the held-back route instead would make that
+    /// diff `NoChange` and strand the peer on a stale path.
+    ///
+    /// A withdrawal is passed through immediately and cancels any pending
+    /// announcement for the destination.
+    pub(crate) fn gate<D: OutboundDecision>(
+        &mut self,
+        peer: IpAddr,
+        nlri: Nlri<A>,
+        now: Instant,
+        adj_rib_out: &mut AdjRibOut<A>,
+        propagate: impl FnOnce(&mut AdjRibOut<A>) -> D,
+    ) -> D {
+        // Only a destination inside its interval can be held back, so only
+        // it needs a snapshot of what the peer currently holds.
+        let sent = self
+            .in_window(peer, &nlri, now)
+            .then(|| adj_rib_out.get(&nlri).cloned());
+        let decision = propagate(adj_rib_out);
+        match decision.kind() {
+            DecisionKind::Announce => {
+                if let Some(sent) = sent {
+                    match sent {
+                        // eBGP Adj-RIB-Out: `insert` always accepts, and its
+                        // confed-segment strip is idempotent on a stored route.
+                        Some(route) => {
+                            let _ = adj_rib_out.insert(route);
+                        }
+                        None => {
+                            let _ = adj_rib_out.withdraw(&nlri);
+                        }
+                    }
+                    self.pending.entry(peer).or_default().insert(nlri);
+                    D::NO_CHANGE
+                } else {
+                    self.last_sent.entry(peer).or_default().insert(nlri, now);
+                    self.cancel_pending(peer, &nlri);
+                    decision
+                }
+            }
+            DecisionKind::Withdraw => {
+                self.cancel_pending(peer, &nlri);
+                if let Some(m) = self.last_sent.get_mut(&peer) {
+                    m.remove(&nlri);
+                }
+                decision
+            }
+            DecisionKind::NoChange => decision,
+        }
+    }
+
+    /// `true` if `nlri` was announced to `peer` less than [`MRAI`] ago.
+    fn in_window(&self, peer: IpAddr, nlri: &Nlri<A>, now: Instant) -> bool {
+        self.last_sent
+            .get(&peer)
+            .and_then(|m| m.get(nlri))
+            .is_some_and(|t| now.saturating_duration_since(*t) < MRAI)
+    }
+
+    fn cancel_pending(&mut self, peer: IpAddr, nlri: &Nlri<A>) {
+        if let Some(p) = self.pending.get_mut(&peer) {
+            p.remove(nlri);
+        }
+    }
+
+    /// Removes and returns every pending destination whose interval has
+    /// elapsed for its peer, deduplicated across peers.
+    ///
+    /// Readiness is per (peer, destination): a destination announced recently
+    /// stays pending even if other destinations for the same peer are ready.
+    /// A destination still inside its interval for some other peer is safe
+    /// to re-propagate anyway — the gate holds it back again for that peer.
+    pub(crate) fn take_ready(&mut self, now: Instant) -> Vec<Nlri<A>> {
+        let mut ready = HashSet::new();
+        for (peer, pending) in &mut self.pending {
+            let last_sent = self.last_sent.get(peer);
+            pending.retain(|nlri| {
+                let elapsed = last_sent
+                    .and_then(|m| m.get(nlri))
+                    .is_none_or(|t| now.saturating_duration_since(*t) >= MRAI);
+                if elapsed {
+                    ready.insert(*nlri);
+                }
+                !elapsed
+            });
+        }
+        ready.into_iter().collect()
+    }
+
+    /// `true` if any peer has a held-back destination.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.values().any(|s| !s.is_empty())
+    }
+
+    /// Drops all state for `peer` (session down / peer removed).
+    pub(crate) fn remove_peer(&mut self, peer: IpAddr) {
+        self.last_sent.remove(&peer);
+        self.pending.remove(&peer);
+    }
+
+    /// Marks `nlri` as held back for `peer` without going through
+    /// [`gate`](Self::gate).
+    #[cfg(test)]
+    pub(crate) fn defer(&mut self, peer: IpAddr, nlri: Nlri<A>) {
+        self.pending.entry(peer).or_default().insert(nlri);
+    }
+
+    /// Sets the last-sent stamp of `nlri` for `peer`.
+    #[cfg(test)]
+    pub(crate) fn set_last_sent(&mut self, peer: IpAddr, nlri: Nlri<A>, at: Instant) {
+        self.last_sent.entry(peer).or_default().insert(nlri, at);
+    }
+
+    /// Forgets every last-sent stamp, so the next announcement of any
+    /// destination to any peer is outside its interval.
+    #[cfg(test)]
+    pub(crate) fn clear_last_sent(&mut self) {
+        self.last_sent.clear();
+    }
+
+    /// Moves every last-sent stamp for `peer` to `at` — lets tests expire the
+    /// interval without sleeping.
+    #[cfg(test)]
+    pub(crate) fn backdate_peer(&mut self, peer: IpAddr, at: Instant) {
+        if let Some(m) = self.last_sent.get_mut(&peer) {
+            for t in m.values_mut() {
+                *t = at;
+            }
+        }
+    }
 }
 
-// RFC 4271 §5.1.3 / §9.1.2 — NEXT_HOP validation.
-// Returns false for addresses that are forbidden as next-hops: unspecified,
-// loopback, multicast, and broadcast. The "own address" check (receiving
-// router's address) is left to the FIB oracle reachability gate because
-// handle_update has no direct access to the local interface address.
-// `own_addr`: the local interface address toward this peer; if the NEXT_HOP
-// equals our own address the peer would be sending traffic to us, black-holing
-// it. RFC 4271 §5.1.3 requires the NEXT_HOP to be reachable and not the
-// receiving router's own address.
-fn is_valid_next_hop_v4(addr: Ipv4Addr, own_addr: Option<Ipv4Addr>) -> bool {
-    !addr.is_unspecified()
-        && !addr.is_loopback()
-        && !addr.is_multicast()
-        && addr != Ipv4Addr::BROADCAST
-        && own_addr.is_none_or(|own| addr != own)
+/// `true` when `adj_rib_in` holds a BLACKHOLE-tagged route for `nlri`, i.e. one
+/// that was never offered to the Loc-RIB and has a kernel null route instead
+/// (RFC 7999). Whatever supersedes or removes it must report the null route
+/// for removal.
+fn holds_blackhole<A: IpAddress>(adj_rib_in: &AdjRibIn<A>, nlri: &Nlri<A>) -> bool {
+    adj_rib_in.get(nlri).is_some_and(is_blackhole_route)
 }
 
-// RFC 4291 §2.5 / RFC 4271 §5.1.3 for IPv6 next-hops carried in MP_REACH_NLRI.
-// Unspecified (::) and multicast (ff00::/8) are not valid forwarding targets.
-// Link-local (fe80::/10) is valid when paired with an interface (V6WithLinkLocal)
-// and is handled by the FIB oracle; a bare link-local as a global next-hop is
-// accepted here because GoBGP and BIRD both use it legitimately in single-hop sessions.
-fn is_valid_next_hop_v6(addr: Ipv6Addr) -> bool {
-    !addr.is_unspecified() && !addr.is_multicast()
+/// `true` when `route` carries the RFC 7999 BLACKHOLE community.
+fn is_blackhole_route<A: IpAddress>(route: &Route<A>) -> bool {
+    route
+        .rare_or_default()
+        .communities
+        .iter()
+        .any(|c| c.is_blackhole())
+}
+
+/// [`withdraw_route`] for every NLRI in `nlris`, appending each best-path
+/// change to `fib_changes`.
+fn withdraw_all<A: IpAddress>(
+    peer: PeerId,
+    nlris: impl IntoIterator<Item = Nlri<A>>,
+    adj_rib_in: &mut AdjRibIn<A>,
+    loc_rib: &mut LocRib<A>,
+    oracle: &dyn NextHopOracle,
+    blackhole_withdrawn: &mut Vec<Nlri<A>>,
+    fib_changes: &mut Vec<BestPathChange<A>>,
+) {
+    for nlri in nlris {
+        fib_changes.push(withdraw_route(
+            peer,
+            &nlri,
+            adj_rib_in,
+            loc_rib,
+            oracle,
+            blackhole_withdrawn,
+        ));
+    }
+}
+
+/// Removes `peer`'s route for `nlri` from the Adj-RIB-In and the Loc-RIB, as an
+/// explicit withdrawal does (RFC 4271 §4.3), and returns the best-path change.
+///
+/// Shared by WITHDRAWN ROUTES, MP_UNREACH_NLRI and every RFC 7606
+/// treat-as-withdraw ("handled as though all contained routes had been
+/// withdrawn just as if they had been listed in the WITHDRAWN ROUTES field",
+/// §2), so the four ways a route can be withdrawn cannot drift apart. A
+/// BLACKHOLE route being removed is appended to `blackhole_withdrawn`.
+fn withdraw_route<A: IpAddress>(
+    peer: PeerId,
+    nlri: &Nlri<A>,
+    adj_rib_in: &mut AdjRibIn<A>,
+    loc_rib: &mut LocRib<A>,
+    oracle: &dyn NextHopOracle,
+    blackhole_withdrawn: &mut Vec<Nlri<A>>,
+) -> BestPathChange<A> {
+    if holds_blackhole(adj_rib_in, nlri) {
+        blackhole_withdrawn.push(*nlri);
+    }
+    adj_rib_in.withdraw(nlri);
+    loc_rib.withdraw(&peer, nlri, oracle)
 }
 
 // UPDATE processing dispatches across all path attribute types in one pass.
@@ -900,6 +999,17 @@ pub(super) struct UpdateResult {
     pub(super) blackhole_withdrawn_v6: Vec<Nlri<Ipv6Addr>>,
 }
 
+/// Applies one UPDATE from `peer` to its Adj-RIBs-In and the Loc-RIBs, for
+/// IPv4 and IPv6 unicast, and returns the resulting best-path changes.
+///
+/// Withdrawals and RFC 7606 treat-as-withdraw remove the peer's route.
+/// Every announcement that survives the error and loop checks goes through
+/// [`import_announcement`]: it replaces the peer's older route in Adj-RIB-In
+/// (RFC 4271 §9), and import policy decides whether it becomes the peer's
+/// Loc-RIB candidate or withdraws the older one (§9.1.1, issue #80).
+///
+/// Pure with respect to I/O: FIB programming and outbound propagation are
+/// the caller's job, driven by the returned [`UpdateResult`].
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn handle_update(
     peer: PeerId,
@@ -932,16 +1042,14 @@ pub(super) fn handle_update(
     for nlri in &msg.withdrawn {
         // If this NLRI had a blackhole kernel route (bypassed LocRib), record
         // it for withdrawal before clearing from AdjRibIn.
-        if adj_rib_in.get(nlri).is_some_and(|r| {
-            r.rare_or_default()
-                .communities
-                .iter()
-                .any(|c| c.is_blackhole())
-        }) {
-            blackhole_withdrawn_v4.push(*nlri);
-        }
-        adj_rib_in.withdraw(nlri);
-        fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle_v4));
+        fib_changes.push(withdraw_route(
+            peer,
+            nlri,
+            adj_rib_in,
+            loc_rib,
+            oracle_v4,
+            &mut blackhole_withdrawn_v4,
+        ));
     }
 
     // ── Single pass over path attributes ─────────────────────────────────
@@ -999,8 +1107,27 @@ pub(super) fn handle_update(
             PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
             PathAttribute::AtomicAggregate => atomic_aggregate = true,
             PathAttribute::Aggregator(a) => aggregator = Some(*a),
-            PathAttribute::OriginatorId(id) => originator_id = Some(*id),
-            PathAttribute::ClusterList(list) => cluster_list.clone_from(list),
+            // RFC 7606 §7.9 / §7.10 revise RFC 4456's error handling: "if
+            // the ORIGINATOR_ID [CLUSTER_LIST] attribute is received from an
+            // external neighbor, it SHALL be discarded using the approach of
+            // 'attribute discard'". Both feed best-path tie-breaking (RFC
+            // 4456 §9) and are reflected to iBGP peers, so a peer outside
+            // the local AS must not be able to set them.
+            //
+            // A confederation Member-AS peer is an external peer in RFC
+            // 4271's sense ("in a different Autonomous System"), and RFC
+            // 5065 lifts only specific restrictions for it (LOCAL_PREF in
+            // §5.2, path selection in §5.3) — none for these attributes, and
+            // RFC 4456 does not address confederations. They are therefore
+            // kept only from `Internal` peers, which matches the outbound
+            // side: `route_to_attributes` strips them toward `ConfedMember`
+            // peers so cluster IDs stay scoped to one Member-AS.
+            PathAttribute::OriginatorId(id) if peer_type == PeerType::Internal => {
+                originator_id = Some(*id);
+            }
+            PathAttribute::ClusterList(list) if peer_type == PeerType::Internal => {
+                cluster_list.clone_from(list);
+            }
             PathAttribute::OnlyToCustomer(asn) => otc = Some(*asn),
             // RFC 4271 §5: "Paths with unrecognized transitive optional
             // attributes SHOULD be accepted [and] passed... to other BGP
@@ -1114,30 +1241,26 @@ pub(super) fn handle_update(
                 .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
                 .collect();
             for nlri in treat_as_withdraw_v4 {
-                if adj_rib_in.get(&nlri).is_some_and(|r| {
-                    r.rare_or_default()
-                        .communities
-                        .iter()
-                        .any(|c| c.is_blackhole())
-                }) {
-                    blackhole_withdrawn_v4.push(nlri);
-                }
-                adj_rib_in.withdraw(&nlri);
-                fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
+                fib_changes.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in,
+                    loc_rib,
+                    oracle_v4,
+                    &mut blackhole_withdrawn_v4,
+                ));
             }
             let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
                 mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
             for nlri in treat_as_withdraw_v6 {
-                if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
-                    r.rare_or_default()
-                        .communities
-                        .iter()
-                        .any(|c| c.is_blackhole())
-                }) {
-                    blackhole_withdrawn_v6.push(nlri);
-                }
-                adj_rib_in_v6.withdraw(&nlri);
-                fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+                fib_changes_v6.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in_v6,
+                    loc_rib_v6,
+                    oracle_v6,
+                    &mut blackhole_withdrawn_v6,
+                ));
             }
         }
     } else if has_reachable_nlri_on_wire {
@@ -1205,48 +1328,35 @@ pub(super) fn handle_update(
         }
     }
 
-    // ── RFC 7607: AS 0 in AS_PATH ────────────────────────────────────────
-    // AS 0 is reserved and MUST NOT appear in AS_PATH. A route carrying it
-    // is malformed; silently drop announces (withdrawals are still processed).
-    let has_as_zero = as_path.contains(pathvector_types::Asn::new(0));
-    if has_as_zero
+    // ── Pre-policy checks on the AS_PATH (issue #138) ───────────────────────
+    // AS 0 (RFC 7607) and an AS loop (RFC 4271 §9.1.2 / RFC 5065 §4) are
+    // properties of the whole UPDATE, so they are decided once here. They are
+    // *applied* per announced NLRI below, not by discarding the NLRI: an
+    // announcement dropped here still replaces the peer's older route for
+    // the same NLRI (RFC 4271 §9), so that route must leave service. See
+    // `IngressDrop::disposition` for which reasons remove the route from the
+    // Adj-RIB-In (treat-as-withdraw) and which keep the ineligible
+    // replacement there. Withdrawals in this UPDATE are unaffected.
+    let gate = IngressGate::new(local_as, confederation_id, local_v4_addr, local_v6_addr);
+    let as_path_drop = gate.check_as_path(&as_path);
+    if let Some(drop) = as_path_drop
         && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
     {
-        tracing::warn!(
-            peer = %peer,
-            %as_path,
-            "dropping UPDATE: AS_PATH contains reserved AS 0 (RFC 7607)"
-        );
-        mp_v4_announced.clear();
-        mp_v6_announced.clear();
-    }
-
-    // ── RFC 4271 §9.1.2 / RFC 5065 §4: AS_PATH loop detection ────────────
-    // If our own AS appears in the received AS_PATH the route has looped back
-    // to us. RFC 5065 extends this: within a confederation, a route can also
-    // loop back via the Confederation Identifier (e.g. relayed out to a
-    // genuine external peer and back in through a different Member-AS) —
-    // `AsPathSegment::contains` does not discriminate by segment type, so
-    // the `local_as` check already catches "own Member-AS Number inside a
-    // CONFED segment" for free; only the confederation-identifier half is
-    // new here. Silently ignore all announced NLRIs in this UPDATE
-    // (withdrawals are still processed — they are safe and necessary).
-    let has_loop = as_path.contains(pathvector_types::Asn::new(local_as))
-        || confederation_id.is_some_and(|cid| as_path.contains(pathvector_types::Asn::new(cid)));
-    if has_loop
-        && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
-    {
-        tracing::debug!(
-            peer = %peer,
-            local_as,
-            %as_path,
-            "dropping UPDATE: AS_PATH contains local AS or confederation ID (RFC 4271 §9.1.2 / RFC 5065 §4)"
-        );
-        // Still process withdrawals below; clear the announce lists.
-        mp_v4_announced.clear();
-        mp_v6_announced.clear();
-        // The traditional NLRI list is consumed by the iterator below; return
-        // early after processing withdrawals by short-circuiting via a flag.
+        if drop == IngressDrop::AsZero {
+            tracing::warn!(
+                peer = %peer,
+                %as_path,
+                "AS_PATH contains reserved AS 0 (RFC 7607) — treat-as-withdraw (RFC 7606)"
+            );
+        } else {
+            tracing::debug!(
+                peer = %peer,
+                local_as,
+                %as_path,
+                "{} — announcements are ineligible, older routes withdrawn",
+                drop.describe()
+            );
+        }
     }
 
     // ── RFC 5065 §5: malformed AS_PATH (confederation-relationship-aware) ──
@@ -1301,30 +1411,26 @@ pub(super) fn handle_update(
                     .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri))
                     .collect();
                 for nlri in treat_as_withdraw_v4 {
-                    if adj_rib_in.get(&nlri).is_some_and(|r| {
-                        r.rare_or_default()
-                            .communities
-                            .iter()
-                            .any(|c| c.is_blackhole())
-                    }) {
-                        blackhole_withdrawn_v4.push(nlri);
-                    }
-                    adj_rib_in.withdraw(&nlri);
-                    fib_changes.push(loc_rib.withdraw(&peer, &nlri, oracle_v4));
+                    fib_changes.push(withdraw_route(
+                        peer,
+                        &nlri,
+                        adj_rib_in,
+                        loc_rib,
+                        oracle_v4,
+                        &mut blackhole_withdrawn_v4,
+                    ));
                 }
                 let treat_as_withdraw_v6: Vec<Nlri<Ipv6Addr>> =
                     mp_v6_announced.drain(..).map(|(nlri, _)| nlri).collect();
                 for nlri in treat_as_withdraw_v6 {
-                    if adj_rib_in_v6.get(&nlri).is_some_and(|r| {
-                        r.rare_or_default()
-                            .communities
-                            .iter()
-                            .any(|c| c.is_blackhole())
-                    }) {
-                        blackhole_withdrawn_v6.push(nlri);
-                    }
-                    adj_rib_in_v6.withdraw(&nlri);
-                    fib_changes_v6.push(loc_rib_v6.withdraw(&peer, &nlri, oracle_v6));
+                    fib_changes_v6.push(withdraw_route(
+                        peer,
+                        &nlri,
+                        adj_rib_in_v6,
+                        loc_rib_v6,
+                        oracle_v6,
+                        &mut blackhole_withdrawn_v6,
+                    ));
                 }
             } else {
                 // RFC 7606 §5.2: this UPDATE carries path attributes (at
@@ -1354,19 +1460,62 @@ pub(super) fn handle_update(
         }
     }
 
+    // ── Syntactically invalid NEXT_HOP attribute: whole-UPDATE withdraw ──────
+    // RFC 4271 §6.3: "Syntactic correctness means that the NEXT_HOP attribute
+    // represents a valid IP host address." RFC 7606 §3(e): "'Treat-as-withdraw'
+    // MUST be used for the cases that specify a session reset and involve any
+    // of the attributes ORIGIN, AS_PATH, NEXT_HOP, ..."; §2 defines it for the
+    // UPDATE message, so *every* route it announces is withdrawn, whichever
+    // NLRI field or MP_REACH_NLRI carries it (issue #138). An MP_REACH_NLRI
+    // next hop is not the NEXT_HOP attribute and is judged per attribute below.
+    // RFC 4760 §3: an UPDATE "that carries no NLRI, other than the one encoded in
+    // the MP_REACH_NLRI attribute, SHOULD NOT carry the NEXT_HOP attribute. If
+    // such a message contains the NEXT_HOP attribute, the BGP speaker that
+    // receives the message SHOULD ignore this attribute." So the attribute is
+    // only checked when the classic NLRI field actually uses it.
+    if let Some(nh) = next_hop
+        && !msg.announced.is_empty()
+        && gate.check_next_hop(&nh) == Some(IngressDrop::NextHopSyntax)
+    {
+        tracing::warn!(
+            peer = %peer,
+            next_hop = ?nh,
+            "{} — treat-as-withdraw of every announced NLRI (RFC 7606 §3(e))",
+            IngressDrop::NextHopSyntax.describe()
+        );
+        withdraw_all(
+            peer,
+            msg.announced
+                .drain(..)
+                .chain(mp_v4_announced.drain(..).map(|(nlri, _)| nlri)),
+            adj_rib_in,
+            loc_rib,
+            oracle_v4,
+            &mut blackhole_withdrawn_v4,
+            &mut fib_changes,
+        );
+        withdraw_all(
+            peer,
+            mp_v6_announced.drain(..).map(|(nlri, _)| nlri),
+            adj_rib_in_v6,
+            loc_rib_v6,
+            oracle_v6,
+            &mut blackhole_withdrawn_v6,
+            &mut fib_changes_v6,
+        );
+    }
+
     // ── MP_UNREACH_NLRI withdrawals (RFC 4760) ────────────────────────────
     let mp_withdrawn_count = mp_v4_withdrawn.len();
     for nlri in &mp_v4_withdrawn {
-        if adj_rib_in.get(nlri).is_some_and(|r| {
-            r.rare_or_default()
-                .communities
-                .iter()
-                .any(|c| c.is_blackhole())
-        }) {
-            blackhole_withdrawn_v4.push(*nlri);
-        }
-        adj_rib_in.withdraw(nlri);
-        fib_changes.push(loc_rib.withdraw(&peer, nlri, oracle_v4));
+        fib_changes.push(withdraw_route(
+            peer,
+            nlri,
+            adj_rib_in,
+            loc_rib,
+            oracle_v4,
+            &mut blackhole_withdrawn_v4,
+        ));
     }
 
     // ── Announcements: traditional NLRIs + MP_REACH_NLRI V4 prefixes ─────
@@ -1374,19 +1523,17 @@ pub(super) fn handle_update(
     // difference is the next-hop source: traditional NLRIs use the NEXT_HOP
     // path attribute (optional); MP_REACH_NLRI carries next-hop inline
     // (mandatory) and takes precedence when present.
-    let mut accepted = 0usize;
+    // `rejected` counts announcements dropped *before* import policy (an
+    // `IngressDrop` or the RFC 7999 BLACKHOLE special case). `import_v4`
+    // counts import-policy outcomes; only its `rejected` feeds
+    // `pathvectord_bgp_import_policy_rejected_total`. The log line reports
+    // the sum.
     let mut rejected = 0usize;
-    // Tracks *only* routes rejected by an actual `Decision::Reject`/`Next`
-    // from import policy — unlike `rejected` above (used for the existing
-    // log line), this excludes the `skip_announces`/invalid-NEXT_HOP
-    // transport-level drops and the RFC 7999 BLACKHOLE special case, none of
-    // which are policy decisions. Feeds `pathvectord_bgp_import_policy_rejected_total`.
-    let mut policy_rejected = 0usize;
+    let mut import_v4 = ImportTally::default();
 
     // Wrap once; every route in this UPDATE shares the same Arc<AsPath>.
     let shared_as_path = Arc::new(as_path);
 
-    let skip_announces = has_loop || has_as_zero;
     let all_announced = msg
         .announced
         .into_iter()
@@ -1398,18 +1545,29 @@ pub(super) fn handle_update(
         );
 
     for (nlri, nh) in all_announced {
-        if skip_announces {
-            rejected += 1;
-            continue;
-        }
-        // RFC 4271 §5.1.3: validate NEXT_HOP before accepting the route.
-        if let Some(NextHop::V4(addr)) = nh
-            && !is_valid_next_hop_v4(addr, local_v4_addr)
+        // RFC 4271 §5.1.3 / §6.3: validate NEXT_HOP before accepting the
+        // route; the AS_PATH verdict was decided once above.
+        let nh_drop = nh.as_ref().and_then(|nh| gate.check_next_hop(nh));
+        if as_path_drop.is_none()
+            && let (Some(drop), Some(nh)) = (nh_drop, nh)
         {
-            tracing::warn!(peer = %peer, prefix = %nlri, next_hop = %addr,
-                "dropping route: invalid NEXT_HOP (RFC 4271 §5.1.3)");
+            tracing::warn!(peer = %peer, prefix = %nlri, next_hop = ?nh,
+                "dropping route: {}", drop.describe());
+        }
+        let drop = IngressDrop::most_severe(as_path_drop, nh_drop);
+        if let Some(drop) = drop {
             rejected += 1;
-            continue;
+            if drop.disposition() == Disposition::TreatAsWithdraw {
+                fib_changes.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in,
+                    loc_rib,
+                    oracle_v4,
+                    &mut blackhole_withdrawn_v4,
+                ));
+                continue;
+            }
         }
 
         let mut builder =
@@ -1449,11 +1607,42 @@ pub(super) fn handle_update(
             builder = builder.unknown_attribute(attr.clone());
         }
 
-        let mut raw = builder.build();
-        if originator_id.is_some() || !cluster_list.is_empty() {
-            let r = raw.rare_mut();
-            r.originator_id = originator_id;
-            r.cluster_list.clone_from(&cluster_list);
+        // RFC 4456 §9: best-path step (f) and the CLUSTER_LIST step read
+        // these from the stored route, so they are stored exactly as
+        // received (after the RR ingress handling above).
+        if let Some(id) = originator_id {
+            builder = builder.originator_id(id);
+        }
+        if !cluster_list.is_empty() {
+            builder = builder.cluster_list(cluster_list.clone());
+        }
+
+        let raw = builder.build();
+
+        // An ineligible announcement (AS loop, own NEXT_HOP) replaces the
+        // peer's older route in the Adj-RIB-In and is not a Phase 2 input
+        // (RFC 4271 §9, §9.1.2). It never programs a blackhole, but must
+        // retire one the peer announced earlier.
+        if drop.is_some() {
+            if is_blackhole_route(&raw) {
+                // No null route is installed for it, so it is not retained: a
+                // stored BLACKHOLE tag would later read as "this peer owns a
+                // kernel null route" and could delete another peer's.
+                fib_changes.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in,
+                    loc_rib,
+                    oracle_v4,
+                    &mut blackhole_withdrawn_v4,
+                ));
+            } else {
+                if holds_blackhole(adj_rib_in, &nlri) {
+                    blackhole_withdrawn_v4.push(nlri);
+                }
+                fib_changes.push(import_ineligible(peer, raw, adj_rib_in, loc_rib, oracle_v4));
+            }
+            continue;
         }
 
         // RFC 7999: routes tagged with the BLACKHOLE community bypass LocRib
@@ -1476,69 +1665,63 @@ pub(super) fn handle_update(
             continue;
         }
 
-        // Store the pre-policy route for soft reconfiguration.
-        adj_rib_in.insert(raw.clone());
-
-        // Apply import policy to a working copy; only insert if accepted.
-        let mut route = raw;
-        match policy.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes.push(loc_rib.insert(peer, route, oracle_v4));
-                accepted += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                rejected += 1;
-                policy_rejected += 1;
-            }
-        }
+        // RFC 4271 §9 + §9.1.1: replace the peer's Adj-RIB-In route, run
+        // import policy, and reconcile the Loc-RIB with the outcome — a
+        // rejected replacement withdraws the peer's older candidate.
+        fib_changes.push(import_announcement(
+            peer,
+            raw,
+            adj_rib_in,
+            loc_rib,
+            policy,
+            oracle_v4,
+            &mut import_v4,
+        ));
     }
 
     // ── MP_UNREACH_NLRI IPv6 withdrawals (RFC 4760) ──────────────────────────
     let mp_v6_withdrawn_count = mp_v6_withdrawn.len();
     for nlri in &mp_v6_withdrawn {
-        if adj_rib_in_v6.get(nlri).is_some_and(|r| {
-            r.rare_or_default()
-                .communities
-                .iter()
-                .any(|c| c.is_blackhole())
-        }) {
-            blackhole_withdrawn_v6.push(*nlri);
-        }
-        adj_rib_in_v6.withdraw(nlri);
-        fib_changes_v6.push(loc_rib_v6.withdraw(&peer, nlri, oracle_v6));
+        fib_changes_v6.push(withdraw_route(
+            peer,
+            nlri,
+            adj_rib_in_v6,
+            loc_rib_v6,
+            oracle_v6,
+            &mut blackhole_withdrawn_v6,
+        ));
     }
 
     // ── IPv6 announcements from MP_REACH_NLRI ─────────────────────────────
     // Same BLACKHOLE + import-policy gate as IPv4. RFC 8212: eBGP peers with no
     // explicit policy default to Reject via `policy_v6` default action.
-    let mut accepted_v6 = 0usize;
+    // Same split as `rejected` / `import_v4` above.
     let mut rejected_v6 = 0usize;
-    // See `policy_rejected`'s comment above — same v4/v6 asymmetry between
-    // "rejected for any reason" (logging) and "rejected by policy" (metric).
-    let mut policy_rejected_v6 = 0usize;
+    let mut import_v6 = ImportTally::default();
     for (nlri, nh) in mp_v6_announced {
-        // RFC 4271 §5.1.3 / RFC 4291 §2.5 / RFC 2545 §3: validate the IPv6 next-hop.
-        // Own-address check: reject if global next-hop matches our configured IPv6 address.
-        // Link-local addresses are not checked (interface-scoped; commonly used in eBGP).
-        let bad_v6_nh = match nh {
-            NextHop::V6(addr) => {
-                !is_valid_next_hop_v6(addr) || local_v6_addr.is_some_and(|local| local == addr)
-            }
-            NextHop::V6WithLinkLocal { global, link_local } => {
-                !is_valid_next_hop_v6(global)
-                    || local_v6_addr.is_some_and(|local| local == global)
-                    || link_local.is_multicast()
-            }
-            NextHop::V4(_) => false,
-        };
-        if bad_v6_nh {
-            tracing::warn!(
-                peer = %peer,
-                prefix = %nlri,
-                "dropping IPv6 route: invalid NEXT_HOP (RFC 4271 §5.1.3)"
-            );
+        // RFC 4271 §5.1.3 / §6.3, RFC 4291 §2.5 / §2.7, RFC 2545 §3: validate
+        // the IPv6 next hop; the AS_PATH verdict was decided once above.
+        let nh_drop = gate.check_next_hop(&nh);
+        if as_path_drop.is_none()
+            && let Some(drop) = nh_drop
+        {
+            tracing::warn!(peer = %peer, prefix = %nlri, next_hop = ?nh,
+                "dropping IPv6 route: {}", drop.describe());
+        }
+        let drop = IngressDrop::most_severe(as_path_drop, nh_drop);
+        if let Some(drop) = drop {
             rejected_v6 += 1;
-            continue;
+            if drop.disposition() == Disposition::TreatAsWithdraw {
+                fib_changes_v6.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in_v6,
+                    loc_rib_v6,
+                    oracle_v6,
+                    &mut blackhole_withdrawn_v6,
+                ));
+                continue;
+            }
         }
         let mut builder =
             RouteBuilder::with_shared_as_path(nlri, origin, Arc::clone(&shared_as_path))
@@ -1574,8 +1757,43 @@ pub(super) fn handle_update(
         for attr in &unknown {
             builder = builder.unknown_attribute(attr.clone());
         }
+        // Same as the IPv4 path: RFC 4456 §9 selection and RR loop
+        // prevention on re-advertisement both need these on IPv6 routes too.
+        if let Some(id) = originator_id {
+            builder = builder.originator_id(id);
+        }
+        if !cluster_list.is_empty() {
+            builder = builder.cluster_list(cluster_list.clone());
+        }
 
         let raw = builder.build();
+
+        // Same as IPv4: an ineligible announcement replaces the older route
+        // and leaves the peer with no candidate.
+        if drop.is_some() {
+            if is_blackhole_route(&raw) {
+                fib_changes_v6.push(withdraw_route(
+                    peer,
+                    &nlri,
+                    adj_rib_in_v6,
+                    loc_rib_v6,
+                    oracle_v6,
+                    &mut blackhole_withdrawn_v6,
+                ));
+            } else {
+                if holds_blackhole(adj_rib_in_v6, &nlri) {
+                    blackhole_withdrawn_v6.push(nlri);
+                }
+                fib_changes_v6.push(import_ineligible(
+                    peer,
+                    raw,
+                    adj_rib_in_v6,
+                    loc_rib_v6,
+                    oracle_v6,
+                ));
+            }
+            continue;
+        }
 
         if raw
             .rare_or_default()
@@ -1591,32 +1809,29 @@ pub(super) fn handle_update(
             continue;
         }
 
-        adj_rib_in_v6.insert(raw.clone());
-
-        let mut route = raw;
-        match policy_v6.evaluate(&mut route) {
-            Decision::Accept => {
-                fib_changes_v6.push(loc_rib_v6.insert(peer, route, oracle_v6));
-                accepted_v6 += 1;
-            }
-            Decision::Reject | Decision::Next => {
-                rejected_v6 += 1;
-                policy_rejected_v6 += 1;
-            }
-        }
+        // Same import path as IPv4 (RFC 4271 §9 + §9.1.1).
+        fib_changes_v6.push(import_announcement(
+            peer,
+            raw,
+            adj_rib_in_v6,
+            loc_rib_v6,
+            policy_v6,
+            oracle_v6,
+            &mut import_v6,
+        ));
     }
 
-    crate::metrics::on_import_reject(peer.ip(), policy_rejected);
-    crate::metrics::on_import_reject(peer.ip(), policy_rejected_v6);
+    crate::metrics::on_import_reject(peer.ip(), import_v4.rejected);
+    crate::metrics::on_import_reject(peer.ip(), import_v6.rejected);
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
         mp_withdrawn = mp_withdrawn_count,
         mp_v6_withdrawn = mp_v6_withdrawn_count,
-        accepted,
-        rejected,
-        accepted_v6,
-        rejected_v6,
+        accepted = import_v4.accepted,
+        rejected = rejected + import_v4.rejected,
+        accepted_v6 = import_v6.accepted,
+        rejected_v6 = rejected_v6 + import_v6.rejected,
         rib_size = loc_rib.len(),
         rib_v6_size = loc_rib_v6.len(),
         "processed UPDATE"

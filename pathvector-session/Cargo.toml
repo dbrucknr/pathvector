@@ -17,6 +17,7 @@ futures          = { workspace = true }
 metrics          = { workspace = true }
 pathvector-sys   = { workspace = true }
 pathvector-types = { workspace = true }
+socket2          = { workspace = true }
 tokio            = { workspace = true }
 tokio-util       = { workspace = true }
 tracing          = "0.1"
@@ -26,6 +27,7 @@ criterion = { workspace = true }
 metrics-util = "0.19"
 proptest  = { workspace = true }
 tokio     = { version = "1", features = ["net", "io-util", "time", "sync", "rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = "0.3"
 
 [[bench]]
 name    = "codec"
