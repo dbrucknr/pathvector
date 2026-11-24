@@ -6,7 +6,7 @@ use pathvector_types::{Asn, LocalPref, PeerType};
 use crate::{
     oracle::{AlwaysReachable, NextHopOracle},
     peer::PeerId,
-    route::Route,
+    route::{EffectiveRouterId, Route},
 };
 
 /// Selects the best route from a set of candidates using the BGP decision
@@ -24,11 +24,27 @@ use crate::{
 /// | 5 | `ORIGIN` | lower (`IGP=0` best) |
 /// | 6 | `MED` (same neighboring AS only) | lower (missing → `0`) |
 /// | 9 | Route age (eBGP only) | older |
-/// | 10 | BGP Identifier (RFC 4271 §9.1.2.2 (f); skipped if either side unknown) | lower |
+/// | 10 | BGP Identifier (RFC 4271 §9.1.2.2 (f)); `ORIGINATOR_ID` replaces it on reflected routes (RFC 4456 §9); unknown ranks last | lower |
+/// | 10a | `CLUSTER_LIST` length (RFC 4456 §9, inserted between (f) and (g)); absent → 0 | shorter |
 /// | 11 | Peer IP address (RFC 4271 §9.1.2.2 (g), final tie-breaker) | lower |
 ///
 /// Steps 1 and 8 require IGP reachability information not available at the
 /// RIB layer. See `TODO.md`.
+///
+/// # Route reflection
+///
+/// RFC 4456 §9 amends the tie-breakers: "If a route carries the
+/// `ORIGINATOR_ID` attribute, then in Step f) the `ORIGINATOR_ID` SHOULD be
+/// treated as the BGP Identifier of the BGP speaker that has advertised the
+/// route", and "a BGP Speaker SHOULD prefer a route with the shorter
+/// `CLUSTER_LIST` length" before step (g). Both are read from the route
+/// itself ([`Route::effective_router_id`], [`Route::cluster_list_len`]); the
+/// caller only has to store the attributes as received.
+///
+/// An unknown identifier (a route with neither `ORIGINATOR_ID` nor
+/// [`Route::peer_bgp_id`]) ranks after every known one at step (f) rather
+/// than skipping the step, which would not be transitive — see
+/// [`EffectiveRouterId`].
 ///
 /// # Graceful Restart
 ///
@@ -258,20 +274,56 @@ fn prefer<A: IpAddress>(
         }
     }
 
-    // Step 10 (RFC 4271 §9.1.2.2 (f)): lowest BGP Identifier.
-    // Only compared when both routes have a known peer_bgp_id — if either
-    // is None (e.g. the identifier isn't tracked for that route), this step
-    // is skipped and step 11 decides instead, mirroring how step 8's
-    // IGP-metric comparison is skipped when either side's metric is None.
-    if let (Some(id_a), Some(id_b)) = (a.peer_bgp_id, b.peer_bgp_id) {
-        let bgp_id = id_b.cmp(&id_a);
-        if bgp_id != Ordering::Equal {
-            return bgp_id; // reverse: lower BGP Identifier → Greater → preferred
-        }
+    // Step 10 (RFC 4271 §9.1.2.2 (f), amended by RFC 4456 §9): lowest
+    // effective BGP Identifier — ORIGINATOR_ID if carried, else the peer's
+    // BGP Identifier; unknown ranks last — then, the step RFC 4456 §9
+    // inserts "between Steps f) and g)", shortest CLUSTER_LIST.
+    let tie_break = TieBreakKey::of(b).cmp(&TieBreakKey::of(a));
+    if tie_break != Ordering::Equal {
+        return tie_break; // reverse: smaller key → Greater → preferred
     }
 
     // Step 11 (RFC 4271 §9.1.2.2 (g)): lowest peer address (final tie-breaker).
     peer_b.cmp(peer_a) // reverse: lower peer IP → Greater → preferred
+}
+
+/// The route-reflection-aware tie-breakers that precede RFC 4271 §9.1.2.2
+/// (g), in decision order. The derived `Ord` is lexicographic over the
+/// fields in declaration order, so a smaller key is preferred:
+///
+/// 1. `router_id` — step (f), with `ORIGINATOR_ID` substituted for the
+///    advertising peer's BGP Identifier (RFC 4456 §9). See
+///    [`EffectiveRouterId`] for the ordering, including unknown identifiers.
+/// 2. `cluster_list_len` — RFC 4456 §9: "the following rule SHOULD be
+///    inserted between Steps f) and g): a BGP Speaker SHOULD prefer a route
+///    with the shorter `CLUSTER_LIST` length."
+///
+/// Each field is a total order, so the key — and with (g) a total order on
+/// peer addresses, `prefer`'s tie-breaking tail — is transitive.
+///
+/// Only built when every earlier step has tied, so it is off the common
+/// path; building it reads `Route::rare` without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TieBreakKey {
+    router_id: EffectiveRouterId,
+    cluster_list_len: usize,
+}
+
+impl TieBreakKey {
+    /// Equivalent to `(route.effective_router_id(), route.cluster_list_len())`
+    /// (checked by `reflection_tests::prop_tie_break_key_matches_route_accessors`),
+    /// but dereferences the boxed rare attributes once instead of twice.
+    #[inline]
+    fn of<A: IpAddress>(route: &Route<A>) -> Self {
+        let (originator_id, cluster_list_len) = route
+            .rare
+            .as_deref()
+            .map_or((None, 0), |r| (r.originator_id, r.cluster_list.len()));
+        Self {
+            router_id: EffectiveRouterId::for_route(route.peer_bgp_id, originator_id),
+            cluster_list_len,
+        }
+    }
 }
 
 // ── Property tests ────────────────────────────────────────────────────────────
@@ -655,6 +707,11 @@ mod prop_tests {
     // decision steps — are common.
 
     /// Everything `prefer` reads from one candidate, plus its staleness.
+    ///
+    /// `bgp_id: None` is a route whose advertising peer's BGP Identifier is
+    /// unknown; `originator_id`/`cluster_len` are the RFC 4456 attributes
+    /// (`None`/`0` = not carried). The identifier ranges overlap so that
+    /// `ORIGINATOR_ID` substitution (RFC 4456 §9) both ties and reorders.
     #[derive(Debug, Clone)]
     struct Candidate {
         local_pref: Option<u32>,
@@ -664,7 +721,9 @@ mod prop_tests {
         med: Option<u32>,
         peer_type: PeerType,
         received_at: u32,
-        bgp_id: u8,
+        bgp_id: Option<u8>,
+        originator_id: Option<u8>,
+        cluster_len: usize,
         staleness: Staleness,
     }
 
@@ -682,7 +741,11 @@ mod prop_tests {
                 Just(PeerType::Local),
             ],
             0u32..=2,
-            1u8..=3,
+            (
+                prop::option::of(1u8..=3),
+                prop::option::of(1u8..=3),
+                0usize..=2,
+            ),
             prop_oneof![Just(Staleness::Fresh), Just(Staleness::GrStale)],
         )
             .prop_map(
@@ -694,7 +757,7 @@ mod prop_tests {
                     med,
                     peer_type,
                     received_at,
-                    bgp_id,
+                    (bgp_id, originator_id, cluster_len),
                     staleness,
                 )| Candidate {
                     local_pref,
@@ -705,15 +768,14 @@ mod prop_tests {
                     peer_type,
                     received_at,
                     bgp_id,
+                    originator_id,
+                    cluster_len,
                     staleness,
                 },
             )
     }
 
-    /// Builds the route. `known_bgp_ids` applies to every candidate in a
-    /// set at once — see `prop_prefer_is_a_strict_total_order` for why a
-    /// set never mixes known and unknown identifiers.
-    fn build(c: &Candidate, known_bgp_ids: bool) -> Route<Ipv4Addr> {
+    fn build(c: &Candidate) -> Route<Ipv4Addr> {
         let mut asns = vec![Asn::new(65_000 + c.neighbor_as)];
         asns.extend((1..c.path_len).map(|i| Asn::new(64_512 + u32::try_from(i).unwrap())));
         let mut b =
@@ -726,7 +788,12 @@ mod prop_tests {
         }
         let mut route = b.build();
         route.received_at = c.received_at;
-        route.peer_bgp_id = known_bgp_ids.then(|| Ipv4Addr::new(10, 255, 0, c.bgp_id));
+        route.peer_bgp_id = c.bgp_id.map(|d| Ipv4Addr::new(10, 255, 0, d));
+        if c.originator_id.is_some() || c.cluster_len > 0 {
+            let rare = route.rare_mut();
+            rare.originator_id = c.originator_id.map(|d| Ipv4Addr::new(10, 255, 0, d));
+            rare.cluster_list = (1..=u32::try_from(c.cluster_len).unwrap()).collect();
+        }
         route.staleness = c.staleness;
         route
     }
@@ -740,12 +807,11 @@ mod prop_tests {
         #[test]
         fn prop_conventional_gr_staleness_never_changes_the_winner(
             specs in prop::collection::vec(arb_candidate(), 1..=6),
-            known_bgp_ids in any::<bool>(),
         ) {
             let with_staleness: HashMap<_, _> = specs
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (peer(u8::try_from(i + 1).unwrap()), build(c, known_bgp_ids)))
+                .map(|(i, c)| (peer(u8::try_from(i + 1).unwrap()), build(c)))
                 .collect();
             let all_fresh: HashMap<_, _> = with_staleness
                 .iter()
@@ -775,15 +841,17 @@ mod prop_tests {
         /// groups *with* MED, RFC 4271 §9.1.2.2 (c) is not transitive by
         /// design — that is why selection groups by neighboring AS first.
         ///
-        /// Each set has either every BGP Identifier known or none known.
-        /// Step (f) is skipped when only one side's identifier is known,
-        /// which is not transitive for a mixed set (tracked separately;
-        /// it is unrelated to staleness).
+        /// Sets mix known and unknown BGP Identifiers, reflected and direct
+        /// routes, and CLUSTER_LISTs of length 0–2. Before issue #69, step
+        /// (f) was skipped when only one side's identifier was known, which
+        /// is not transitive for such a mix; this property is the proof
+        /// that the RFC 4456 §9 tie-breakers (effective identifier, then
+        /// `CLUSTER_LIST` length, then peer address) keep the order total.
+        /// The selected winner must also be the order's maximum.
         #[test]
         fn prop_prefer_is_a_strict_total_order(
             mut specs in prop::collection::vec(arb_candidate(), 3..=6),
             one_neighbor_group in any::<bool>(),
-            known_bgp_ids in any::<bool>(),
         ) {
             for c in &mut specs {
                 if one_neighbor_group {
@@ -795,7 +863,7 @@ mod prop_tests {
             let cands: Vec<(PeerId, Route<Ipv4Addr>)> = specs
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (peer(u8::try_from(i + 1).unwrap()), build(c, known_bgp_ids)))
+                .map(|(i, c)| (peer(u8::try_from(i + 1).unwrap()), build(c)))
                 .collect();
             let cmp = |i: usize, j: usize| {
                 prefer(&cands[i].0, &cands[i].1, &cands[j].0, &cands[j].1, &AlwaysReachable)
@@ -823,6 +891,14 @@ mod prop_tests {
                     }
                 }
             }
+            if one_neighbor_group {
+                let map: HashMap<_, _> = cands.iter().cloned().collect();
+                let (best, _) = select_best(&map).unwrap();
+                let w = cands.iter().position(|(p, _)| *p == best).unwrap();
+                for j in (0..n).filter(|&j| j != w) {
+                    prop_assert_eq!(cmp(w, j), Ordering::Greater, "winner is the maximum");
+                }
+            }
         }
 
         /// The pairwise form of the invariance property: flipping either
@@ -831,11 +907,10 @@ mod prop_tests {
         fn prop_prefer_ignores_conventional_gr_staleness(
             a in arb_candidate(),
             b in arb_candidate(),
-            known_bgp_ids in any::<bool>(),
         ) {
             let (pa, pb) = (peer(1), peer(2));
-            let ra = build(&a, known_bgp_ids);
-            let rb = build(&b, known_bgp_ids);
+            let ra = build(&a);
+            let rb = build(&b);
             let expected = prefer(&pa, &ra, &pb, &rb, &AlwaysReachable);
             for sa in [Staleness::Fresh, Staleness::GrStale] {
                 for sb in [Staleness::Fresh, Staleness::GrStale] {
@@ -1089,11 +1164,15 @@ mod tests {
     }
 
     #[test]
-    fn test_select_best_falls_back_to_peer_ip_when_bgp_identifier_known_on_only_one_side() {
-        // (f) requires a known BGP Identifier on *both* candidates to
-        // compare; if only one side has it, the comparison is skipped
-        // (mirrors the IGP-metric step's None-on-either-side skip) and (g)
-        // peer-IP decides instead.
+    fn test_select_best_known_bgp_identifier_beats_unknown() {
+        // Corrected for issue #69. This test used to assert that (f) is
+        // *skipped* when only one side's identifier is known, letting (g)
+        // decide. That rule is not transitive (see
+        // `reflection_tests::unknown_identifier_ranks_after_every_known_identifier_transitively`
+        // for the three-route cycle it produces), and RFC 4271 §9.1.2.2 has
+        // no "skip" clause for (f). An unknown identifier now ranks after
+        // every known one, so the route with the known identifier wins even
+        // from the higher peer address.
         let with_id = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
             .peer_type(PeerType::External)
             .peer_bgp_id(Ipv4Addr::new(1, 1, 1, 1))
@@ -1101,17 +1180,16 @@ mod tests {
         let without_id = RouteBuilder::new(nlri(), Origin::Igp, AsPath::new())
             .peer_type(PeerType::External)
             .build();
-        // Give the peer *without* a known BGP Identifier the lower peer IP,
-        // so if (f) were incorrectly applied one-sided it would still have
-        // to fall through to (g) and agree — construct the disagreeing case
-        // instead: the known-ID peer gets the higher peer IP, so a
-        // one-sided (f) bug (e.g. treating missing-as-lowest) would pick a
-        // different winner than the correct skip-to-(g) behavior.
+        let mut with_id = with_id;
+        let mut without_id = without_id;
+        // Same received_at so step 9 (oldest eBGP route) cannot decide.
+        with_id.received_at = 0;
+        without_id.received_at = 0;
         let mut candidates = HashMap::new();
         candidates.insert(peer(1), without_id); // lower peer IP, no known BGP Identifier
         candidates.insert(peer(2), with_id); // higher peer IP, known BGP Identifier
         let (winner, _) = select_best(&candidates).unwrap();
-        assert_eq!(winner, peer(1)); // (f) skipped entirely; (g): lower peer IP wins
+        assert_eq!(winner, peer(2)); // (f): known identifier ranks first
     }
 
     #[test]
@@ -1643,5 +1721,426 @@ mod oracle_tests {
             peer(1),
             "step 10 (lower peer IP) should win when step 8 is skipped"
         );
+    }
+}
+
+// ── RFC 4456 §9: reflected-route tie-breakers ────────────────────────────────
+//
+// RFC 4456 §9 ("Impact on Route Selection") modifies RFC 4271 §9.1.2.2:
+//
+//   "If a route carries the ORIGINATOR_ID attribute, then in Step f) the
+//    ORIGINATOR_ID SHOULD be treated as the BGP Identifier of the BGP
+//    speaker that has advertised the route.
+//
+//    In addition, the following rule SHOULD be inserted between Steps f)
+//    and g): a BGP Speaker SHOULD prefer a route with the shorter
+//    CLUSTER_LIST length.  The CLUSTER_LIST length is zero if a route does
+//    not carry the CLUSTER_LIST attribute."
+//
+// RFC 4271 §9.1.2.2: "The criteria MUST be applied in the order specified."
+// (f) "Remove from consideration all routes other than the route that was
+// advertised by the BGP speaker with the lowest BGP Identifier value."
+// (g) "Prefer the route received from the lowest peer address."
+//
+// Every expectation below is derived from those clauses, not from the
+// implementation. Each candidate is an iBGP route tied with the other through
+// (e) — same LOCAL_PREF, AS_PATH, ORIGIN, MED, and source type, and no IGP
+// metric (`AlwaysReachable`) — so only (f), the inserted CLUSTER_LIST step,
+// and (g) can separate them.
+
+#[cfg(test)]
+mod reflection_tests {
+    use std::cmp::Ordering;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pathvector_types::{AsPath, Asn, LocalPref, Nlri, Origin, PeerType};
+
+    use super::{prefer, select_best};
+    use crate::{PeerId, Route, RouteBuilder, oracle::AlwaysReachable};
+
+    fn peer(last_octet: u8) -> PeerId {
+        PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)))
+    }
+
+    fn id(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        Ipv4Addr::new(a, b, c, d)
+    }
+
+    /// An iBGP route tied with every other route from this helper through
+    /// RFC 4271 §9.1.2.2 (e). `peer_bgp_id` is the advertising neighbor's
+    /// OPEN identifier; `originator_id`/`cluster_list` are the RFC 4456
+    /// attributes the route carries (`None`/empty = not carried).
+    fn ibgp(
+        peer_bgp_id: Option<Ipv4Addr>,
+        originator_id: Option<Ipv4Addr>,
+        cluster_list: &[u32],
+    ) -> Route<Ipv4Addr> {
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let mut route = RouteBuilder::new(
+            nlri,
+            Origin::Igp,
+            AsPath::from_sequence(vec![Asn::new(65100)]),
+        )
+        .local_pref(LocalPref::new(100))
+        .peer_type(PeerType::Internal)
+        .build();
+        route.received_at = 0;
+        route.peer_bgp_id = peer_bgp_id;
+        if originator_id.is_some() || !cluster_list.is_empty() {
+            let rare = route.rare_mut();
+            rare.originator_id = originator_id;
+            rare.cluster_list = cluster_list.to_vec();
+        }
+        route
+    }
+
+    fn winner(candidates: Vec<(PeerId, Route<Ipv4Addr>)>) -> PeerId {
+        let map: HashMap<_, _> = candidates.into_iter().collect();
+        select_best(&map).expect("non-empty").0
+    }
+
+    fn cmp(pa: PeerId, a: &Route<Ipv4Addr>, pb: PeerId, b: &Route<Ipv4Addr>) -> Ordering {
+        prefer(&pa, a, &pb, b, &AlwaysReachable)
+    }
+
+    /// Issue #69 acceptance case 1. Reflector A (BGP Identifier 1.1.1.1)
+    /// carries `ORIGINATOR_ID` 9.9.9.9; reflector B (2.2.2.2) carries
+    /// 3.3.3.3. RFC 4456 §9: step (f) compares the `ORIGINATOR_ID`s, so B's
+    /// 3.3.3.3 beats A's 9.9.9.9 — although A's reflector identifier is
+    /// lower and A sits on the lower peer address ((g) would pick A too).
+    #[test]
+    fn rfc4456_originator_id_replaces_reflector_bgp_identifier_in_step_f() {
+        let a = ibgp(Some(id(1, 1, 1, 1)), Some(id(9, 9, 9, 9)), &[100]);
+        let b = ibgp(Some(id(2, 2, 2, 2)), Some(id(3, 3, 3, 3)), &[200]);
+        assert_eq!(
+            winner(vec![(peer(1), a.clone()), (peer(2), b.clone())]),
+            peer(2),
+            "RFC 4456 §9: ORIGINATOR_ID 3.3.3.3 < 9.9.9.9 decides step (f)"
+        );
+        assert_eq!(cmp(peer(2), &b, peer(1), &a), Ordering::Greater);
+        assert_eq!(cmp(peer(1), &a, peer(2), &b), Ordering::Less);
+    }
+
+    /// Issue #69 acceptance case 2. Both routes were originated by 9.9.9.9 and
+    /// reached us through different reflectors, so their step-(f)
+    /// identifiers tie. RFC 4456 §9 inserts "prefer a route with the shorter
+    /// `CLUSTER_LIST` length" before (g): B's one-entry list beats A's
+    /// two-entry list although A has both the lower reflector identifier and
+    /// the lower peer address.
+    #[test]
+    fn rfc4456_shorter_cluster_list_wins_when_originator_ids_tie() {
+        let a = ibgp(Some(id(1, 1, 1, 1)), Some(id(9, 9, 9, 9)), &[100, 300]);
+        let b = ibgp(Some(id(2, 2, 2, 2)), Some(id(9, 9, 9, 9)), &[200]);
+        assert_eq!(
+            winner(vec![(peer(1), a), (peer(2), b)]),
+            peer(2),
+            "RFC 4456 §9: one-entry CLUSTER_LIST beats two-entry when (f) ties"
+        );
+    }
+
+    /// The `CLUSTER_LIST` step sits *between* (f) and (g): with the identifier
+    /// tied and no `ORIGINATOR_ID` on either side (two sessions to the same
+    /// speaker), the shorter list wins over the lower peer address.
+    #[test]
+    fn rfc4456_cluster_list_length_is_compared_before_peer_address() {
+        let a = ibgp(Some(id(5, 5, 5, 5)), None, &[100, 300]);
+        let b = ibgp(Some(id(5, 5, 5, 5)), None, &[200]);
+        assert_eq!(
+            winner(vec![(peer(1), a), (peer(2), b)]),
+            peer(2),
+            "RFC 4456 §9: CLUSTER_LIST length is decided before (g) peer address"
+        );
+    }
+
+    /// "The `CLUSTER_LIST` length is zero if a route does not carry the
+    /// `CLUSTER_LIST` attribute." A route without the attribute beats one
+    /// with a one-entry list when (f) ties, despite the higher peer address.
+    #[test]
+    fn rfc4456_absent_cluster_list_counts_as_length_zero() {
+        let reflected = ibgp(Some(id(5, 5, 5, 5)), Some(id(5, 5, 5, 5)), &[100]);
+        let direct = ibgp(Some(id(5, 5, 5, 5)), None, &[]);
+        assert_eq!(
+            winner(vec![(peer(1), reflected), (peer(2), direct)]),
+            peer(2),
+            "absent CLUSTER_LIST = length 0 < 1"
+        );
+    }
+
+    /// The `CLUSTER_LIST` rule is inserted *after* (f): a lower effective
+    /// identifier wins even with the longer `CLUSTER_LIST`.
+    #[test]
+    fn rfc4456_step_f_is_decided_before_cluster_list_length() {
+        let a = ibgp(Some(id(8, 8, 8, 8)), Some(id(1, 1, 1, 1)), &[100, 200, 300]);
+        let b = ibgp(Some(id(7, 7, 7, 7)), Some(id(2, 2, 2, 2)), &[400]);
+        assert_eq!(
+            winner(vec![(peer(2), a), (peer(1), b)]),
+            peer(2),
+            "(f): ORIGINATOR_ID 1.1.1.1 wins before the CLUSTER_LIST step"
+        );
+    }
+
+    /// Neither route carries `ORIGINATOR_ID`: RFC 4271 §9.1.2.2 (f) applies
+    /// unchanged and compares the advertising peers' BGP Identifiers.
+    #[test]
+    fn non_reflected_routes_compare_peer_bgp_identifiers() {
+        let a = ibgp(Some(id(9, 9, 9, 9)), None, &[]);
+        let b = ibgp(Some(id(1, 1, 1, 1)), None, &[]);
+        assert_eq!(
+            winner(vec![(peer(1), a), (peer(2), b)]),
+            peer(2),
+            "(f): lower BGP Identifier wins over lower peer address"
+        );
+    }
+
+    /// A route learned directly from its originator (no `ORIGINATOR_ID`) and a
+    /// reflected one are compared on the same footing: the direct route's
+    /// (f) identifier is its peer's BGP Identifier, the reflected route's is
+    /// its `ORIGINATOR_ID`. Here the direct speaker 5.5.5.5 beats the reflected
+    /// route's originator 7.7.7.7 even though the reflector's own identifier
+    /// (1.1.1.1) is lower — the pre-fix comparator picked the reflected route.
+    #[test]
+    fn mixed_direct_and_reflected_compare_peer_id_against_originator_id() {
+        let direct = ibgp(Some(id(5, 5, 5, 5)), None, &[]);
+        let reflected = ibgp(Some(id(1, 1, 1, 1)), Some(id(7, 7, 7, 7)), &[100]);
+        assert_eq!(
+            winner(vec![
+                (peer(2), direct.clone()),
+                (peer(1), reflected.clone())
+            ]),
+            peer(2),
+            "(f): 5.5.5.5 (direct peer) < 7.7.7.7 (ORIGINATOR_ID)"
+        );
+
+        // And the other way round: the reflected route's originator is lower.
+        let direct = ibgp(Some(id(5, 5, 5, 5)), None, &[]);
+        let reflected = ibgp(Some(id(9, 9, 9, 9)), Some(id(3, 3, 3, 3)), &[100]);
+        assert_eq!(
+            winner(vec![(peer(1), direct), (peer(2), reflected)]),
+            peer(2),
+            "(f): 3.3.3.3 (ORIGINATOR_ID) < 5.5.5.5 (direct peer)"
+        );
+    }
+
+    /// RFC 4456 §9 keys the substitution on the route *carrying*
+    /// `ORIGINATOR_ID`, not on the peer's identifier being known: a route
+    /// with `ORIGINATOR_ID` but no recorded peer BGP Identifier still has a
+    /// step-(f) identifier.
+    #[test]
+    fn originator_id_supplies_the_identifier_when_peer_bgp_id_is_unknown() {
+        let reflected = ibgp(None, Some(id(1, 1, 1, 1)), &[100]);
+        let direct = ibgp(Some(id(2, 2, 2, 2)), None, &[]);
+        assert_eq!(
+            winner(vec![(peer(2), reflected), (peer(1), direct)]),
+            peer(2),
+            "(f): ORIGINATOR_ID 1.1.1.1 < 2.2.2.2"
+        );
+    }
+
+    /// The tie-breakers never override an earlier step: a reflected route
+    /// with a better `ORIGINATOR_ID` and shorter `CLUSTER_LIST` still loses on
+    /// `LOCAL_PREF` and on `AS_PATH` length.
+    #[test]
+    fn rfc4456_tie_breakers_never_override_earlier_steps() {
+        let better_ids = ibgp(Some(id(1, 1, 1, 1)), Some(id(1, 1, 1, 1)), &[]);
+        let mut higher_lp = ibgp(Some(id(9, 9, 9, 9)), Some(id(9, 9, 9, 9)), &[1, 2, 3]);
+        higher_lp.local_pref = Some(LocalPref::new(200));
+        assert_eq!(
+            winner(vec![(peer(1), better_ids.clone()), (peer(2), higher_lp)]),
+            peer(2),
+            "LOCAL_PREF decides before any tie-breaker"
+        );
+
+        let mut shorter_path = ibgp(Some(id(9, 9, 9, 9)), Some(id(9, 9, 9, 9)), &[1, 2, 3]);
+        shorter_path.as_path = std::sync::Arc::new(AsPath::new());
+        assert_eq!(
+            winner(vec![(peer(1), better_ids), (peer(2), shorter_path)]),
+            peer(2),
+            "(a) AS_PATH length decides before any tie-breaker"
+        );
+    }
+
+    /// Missing-identifier policy, and the transitivity it buys. RFC 4271
+    /// gives no rule for a route whose step-(f) identifier is unknown (only
+    /// a route from outside a session — e.g. one built without
+    /// `peer_bgp_id` — can lack one). Skipping (f) whenever *either* side
+    /// is unknown is not transitive: with a = 1.1.1.1 on .3, b = unknown on
+    /// .2, c = 1.1.1.2 on .1 it gives a ≻ c by (f), c ≻ b and b ≻ a by (g) —
+    /// a cycle, so `max_by` returns an iteration-order-dependent winner.
+    /// pathvector instead ranks an unknown identifier after every known one
+    /// (a route never wins (f) on missing data), which makes (f) a total
+    /// order: a ≻ c ≻ b.
+    #[test]
+    fn unknown_identifier_ranks_after_every_known_identifier_transitively() {
+        let (pa, a) = (peer(3), ibgp(Some(id(1, 1, 1, 1)), None, &[]));
+        let (pb, b) = (peer(2), ibgp(None, None, &[]));
+        let (pc, c) = (peer(1), ibgp(Some(id(1, 1, 1, 2)), None, &[]));
+
+        assert_eq!(cmp(pa, &a, pc, &c), Ordering::Greater, "a ≻ c: (f)");
+        assert_eq!(
+            cmp(pc, &c, pb, &b),
+            Ordering::Greater,
+            "c ≻ b: known beats unknown"
+        );
+        assert_eq!(
+            cmp(pa, &a, pb, &b),
+            Ordering::Greater,
+            "a ≻ b: known beats unknown"
+        );
+        assert_eq!(
+            winner(vec![(pa, a), (pb, b), (pc, c)]),
+            pa,
+            "the maximum of a total order"
+        );
+    }
+
+    /// Both identifiers unknown: (f) ties, the `CLUSTER_LIST` step and then (g)
+    /// decide.
+    #[test]
+    fn both_identifiers_unknown_fall_through_to_cluster_list_then_peer_address() {
+        let a = ibgp(None, None, &[]);
+        let b = ibgp(None, None, &[]);
+        assert_eq!(winner(vec![(peer(1), a), (peer(2), b)]), peer(1), "(g)");
+
+        let longer = ibgp(None, None, &[]);
+        let mut longer = longer;
+        longer.rare_mut().cluster_list = vec![1];
+        let shorter = ibgp(None, None, &[]);
+        assert_eq!(
+            winner(vec![(peer(1), longer), (peer(2), shorter)]),
+            peer(2),
+            "CLUSTER_LIST step before (g)"
+        );
+    }
+
+    proptest::proptest! {
+        /// Reference model written straight from the RFC text, independent
+        /// of `prefer`. For two routes tied through (e):
+        ///   (f)  identifier = `ORIGINATOR_ID` if carried, else the peer's BGP
+        ///        Identifier (RFC 4456 §9); lower wins; unknown ranks last
+        ///        (pathvector's documented missing-identifier policy);
+        ///   (f') shorter `CLUSTER_LIST`, absent = 0 (RFC 4456 §9);
+        ///   (g)  lower peer address (RFC 4271 §9.1.2.2).
+        /// Identifier values are drawn from a tiny range so every step is
+        /// exercised, including equal identifiers from different sources.
+        #[test]
+        fn prop_reflected_tie_break_matches_rfc_reference(
+            a_peer_id in proptest::option::of(1u8..=3),
+            a_orig in proptest::option::of(1u8..=3),
+            a_len in 0usize..=2,
+            b_peer_id in proptest::option::of(1u8..=3),
+            b_orig in proptest::option::of(1u8..=3),
+            b_len in 0usize..=2,
+            a_has_lower_address in proptest::bool::ANY,
+        ) {
+            let ip = |d: u8| id(10, 255, 0, d);
+            let clusters = |n: usize| (1..=u32::try_from(n).unwrap()).collect::<Vec<_>>();
+            let a = ibgp(a_peer_id.map(ip), a_orig.map(ip), &clusters(a_len));
+            let b = ibgp(b_peer_id.map(ip), b_orig.map(ip), &clusters(b_len));
+            let (pa, pb) = if a_has_lower_address {
+                (peer(1), peer(2))
+            } else {
+                (peer(2), peer(1))
+            };
+
+            // Smaller key = preferred.
+            let key = |peer_id: Option<u8>, orig: Option<u8>, len: usize, p: PeerId| {
+                let effective = orig.or(peer_id);
+                (effective.is_none(), effective, len, p)
+            };
+            let expected = if key(a_peer_id, a_orig, a_len, pa) < key(b_peer_id, b_orig, b_len, pb) {
+                pa
+            } else {
+                pb
+            };
+
+            proptest::prop_assert_eq!(winner(vec![(pa, a.clone()), (pb, b.clone())]), expected);
+            proptest::prop_assert_eq!(
+                cmp(pa, &a, pb, &b),
+                if expected == pa { Ordering::Greater } else { Ordering::Less }
+            );
+        }
+    }
+
+    proptest::proptest! {
+        /// `prefer` restricted to the tie-breakers is a strict total order
+        /// (irreflexive, asymmetric, total over distinct peers, transitive
+        /// over every triple), for 3–6 routes tied through (e) that mix
+        /// known/unknown peer identifiers, reflected/direct routes, and
+        /// `CLUSTER_LIST` lengths. This is the focused form of
+        /// `prop_tests::prop_prefer_is_a_strict_total_order`: with every
+        /// earlier step tied, it finds the pre-fix (f) cycle within the
+        /// default case count.
+        #[test]
+        fn prop_tie_breakers_are_a_strict_total_order(
+            specs in proptest::collection::vec(
+                (
+                    proptest::option::of(1u8..=3),
+                    proptest::option::of(1u8..=3),
+                    0usize..=2,
+                ),
+                3..=6,
+            ),
+        ) {
+            let ip = |d: u8| id(10, 255, 0, d);
+            let cands: Vec<(PeerId, Route<Ipv4Addr>)> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, &(peer_id, orig, len))| {
+                    let clusters: Vec<u32> = (1..=u32::try_from(len).unwrap()).collect();
+                    (
+                        peer(u8::try_from(i + 1).unwrap()),
+                        ibgp(peer_id.map(ip), orig.map(ip), &clusters),
+                    )
+                })
+                .collect();
+            let c = |i: usize, j: usize| cmp(cands[i].0, &cands[i].1, cands[j].0, &cands[j].1);
+            let n = cands.len();
+            for i in 0..n {
+                proptest::prop_assert_eq!(c(i, i), Ordering::Equal);
+                for j in (0..n).filter(|&j| j != i) {
+                    proptest::prop_assert_ne!(c(i, j), Ordering::Equal);
+                    proptest::prop_assert_eq!(c(i, j), c(j, i).reverse());
+                    for k in (0..n).filter(|&k| k != i && k != j) {
+                        if c(i, j) == Ordering::Greater && c(j, k) == Ordering::Greater {
+                            proptest::prop_assert_eq!(c(i, k), Ordering::Greater, "{} > {} > {}", i, j, k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// `TieBreakKey::of` reads the rare attributes directly for speed;
+        /// it must agree with the public accessors that document the rule.
+        #[test]
+        fn prop_tie_break_key_matches_route_accessors(
+            peer_id in proptest::option::of(proptest::num::u32::ANY),
+            orig in proptest::option::of(proptest::num::u32::ANY),
+            len in 0usize..=3,
+            allocate_rare in proptest::bool::ANY,
+        ) {
+            let clusters: Vec<u32> = (1..=u32::try_from(len).unwrap()).collect();
+            let mut route = ibgp(peer_id.map(Ipv4Addr::from), orig.map(Ipv4Addr::from), &clusters);
+            if allocate_rare {
+                let _ = route.rare_mut(); // allocated but possibly all-default
+            }
+            let key = super::TieBreakKey::of(&route);
+            proptest::prop_assert_eq!(key.router_id, route.effective_router_id());
+            proptest::prop_assert_eq!(key.cluster_list_len, route.cluster_list_len());
+        }
+    }
+
+    /// Ties all the way to (g): equal effective identifier and equal
+    /// `CLUSTER_LIST` length — the lower peer address wins, and the
+    /// comparison is antisymmetric.
+    #[test]
+    fn full_tie_through_cluster_list_falls_to_peer_address() {
+        let a = ibgp(Some(id(4, 4, 4, 4)), Some(id(9, 9, 9, 9)), &[1, 2]);
+        let b = ibgp(Some(id(3, 3, 3, 3)), Some(id(9, 9, 9, 9)), &[3, 4]);
+        assert_eq!(cmp(peer(1), &a, peer(2), &b), Ordering::Greater);
+        assert_eq!(cmp(peer(2), &b, peer(1), &a), Ordering::Less);
+        assert_eq!(cmp(peer(1), &a, peer(1), &a), Ordering::Equal);
     }
 }

@@ -82,11 +82,24 @@ RFC 4271 §9.1. The steps implemented in this crate:
 | 5 | `ORIGIN` | lower (IGP=0 best, then EGP=1, then INCOMPLETE=2) |
 | 6 | `MED` | lower (missing → treated as 0) |
 | 9 | Route age | oldest eBGP route (only when both candidates are eBGP) |
-| 10 | BGP Identifier | lower (skipped if either side is unknown) |
+| 10 | BGP Identifier, or `ORIGINATOR_ID` if the route carries one (RFC 4456 §9) | lower (unknown ranks after every known identifier) |
+| 10a | `CLUSTER_LIST` length (RFC 4456 §9; absent counts as 0) | shorter |
 | 11 | Peer IP address | lower (final tie-breaker) |
 
 Steps 1 (next-hop reachability) and 8 (IGP metric to next-hop) require IGP/FIB
 integration and are deferred. See `TODO.md` for details.
+
+**Route reflection.** RFC 4456 §9 amends the tie-breakers. If a route carries
+`ORIGINATOR_ID`, that identifier "SHOULD be treated as the BGP Identifier of the
+BGP speaker that has advertised the route". A route reflector's own identifier
+therefore never decides between two reflected routes. A shorter `CLUSTER_LIST`
+is then preferred before the peer address. The selector reads both from the
+route (`Route::effective_router_id`, `Route::cluster_list_len`), so the caller
+only has to store the attributes as received. `pathvectord` keeps them only
+from iBGP peers (RFC 7606 §7.9/§7.10). A route with neither an
+`ORIGINATOR_ID` nor a known peer BGP Identifier ranks after every route that
+has one. Skipping the step instead would not be transitive across three
+routes.
 
 **Graceful Restart.** A route retained while a peer restarts is marked
 `Staleness::GrStale`, but staleness is not a decision step: RFC 4724 §4.2
@@ -106,6 +119,7 @@ routes least preferred, is not implemented.
 | [`Route<A>`] | A concrete BGP route stored in the RIB; implements [`BgpRoute`](pathvector_policy::BgpRoute) |
 | [`RouteBuilder<A>`] | Builder for constructing [`Route<A>`] values |
 | [`Staleness`] | `Fresh` or `GrStale` (RFC 4724 §4.2); documents why staleness does not affect selection |
+| [`EffectiveRouterId`] | The identifier best-path step (f) compares: `ORIGINATOR_ID` if carried, else the peer's BGP Identifier (RFC 4456 §9); ordered for preference |
 | [`PeerId`] | A BGP peer identified by its IP address |
 | [`AdjRibIn<A>`] | Per-peer inbound routing table (pre-policy) |
 | [`LocRib<A>`] | Local routing table with best-path selection |
@@ -115,7 +129,7 @@ routes least preferred, is not implemented.
 
 ## Benchmarks
 
-Three Criterion benchmark groups measure the control-plane hot paths. Run them with:
+Four Criterion benchmark groups measure the control-plane hot paths. Run them with:
 
 ```bash
 cargo bench -p pathvector-rib
@@ -143,6 +157,7 @@ cargo bench -p pathvector-rib -- --baseline before
 | Group | Sizes | What it measures |
 |---|---|---|
 | `select_best` | 2 / 10 / 100 candidates | RFC 4271 §9.1 10-step comparison loop across competing routes for one prefix |
+| `select_best_reflected_tie` | 2 / 10 / 100 candidates | Candidates tied through step (e), so every comparison reaches the RFC 4456 §9 tie-breakers and (g) |
 | `loc_rib_insert` | 10k / 100k / 500k prefixes | `LocRib::insert` + best-path recompute; simulates a RIB of increasing size up to ~½ a full internet table |
 | `outbound_pipeline` | 1 / 10 / 50 peers | `prepare_outbound` + `AdjRibOut::insert` per peer; simulates the Update-Send Process for one prefix change |
 

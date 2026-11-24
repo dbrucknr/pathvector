@@ -74,6 +74,100 @@ impl Staleness {
     }
 }
 
+/// The identifier best-path step (f) compares for one route: the BGP
+/// Identifier "of the BGP speaker that has advertised the route" (RFC 4271
+/// §9.1.2.2 (f)), with `ORIGINATOR_ID` substituted for reflected routes
+/// (RFC 4456 §9).
+///
+/// Build it with [`for_route`](Self::for_route) (or
+/// [`Route::effective_router_id`]), which is the only place the
+/// substitution rule lives, so a comparator cannot compare the reflector's
+/// identifier where the originator's is required.
+///
+/// # Ordering
+///
+/// `Ord` is preference order — smaller is preferred at step (f):
+///
+/// - Known identifiers compare as 4-octet unsigned integers in network
+///   order, the comparison RFC 4271 §6.8 defines for BGP Identifiers
+///   ("converting them to host byte order and treating them as 4-octet
+///   unsigned integers"). `1.0.0.0` > `0.255.255.255`.
+/// - An unknown identifier sorts **after every known one**. RFC 4271 has no
+///   rule for a missing identifier (every session supplies one in its
+///   OPEN); it only arises for a route built outside a session. Ranking it
+///   last means a route never wins step (f) on missing data, and — unlike
+///   skipping step (f) when either side is unknown, which is not transitive
+///   for three routes — keeps best-path selection a total order.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::Ipv4Addr;
+/// use pathvector_rib::EffectiveRouterId;
+///
+/// let reflector = Some(Ipv4Addr::new(1, 1, 1, 1));
+/// let originator = Some(Ipv4Addr::new(9, 9, 9, 9));
+///
+/// // RFC 4456 §9: a carried `ORIGINATOR_ID` replaces the advertising peer's ID.
+/// let reflected = EffectiveRouterId::for_route(reflector, originator);
+/// assert_eq!(reflected.get(), originator);
+///
+/// // Without `ORIGINATOR_ID` the advertising peer's own BGP Identifier is used.
+/// let direct = EffectiveRouterId::for_route(Some(Ipv4Addr::new(5, 5, 5, 5)), None);
+/// assert!(direct < reflected); // 5.5.5.5 < 9.9.9.9: preferred at step (f)
+///
+/// // Unknown ranks after every known identifier.
+/// let unknown = EffectiveRouterId::for_route(None, None);
+/// assert!(!unknown.is_known());
+/// assert!(reflected < unknown);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EffectiveRouterId(RouterIdRank);
+
+/// Declaration order is the preference order: the derived `Ord` ranks every
+/// `Known` before `Unknown`, and `Known` values by `Ipv4Addr`'s octet-wise
+/// (network-order numeric) `Ord`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum RouterIdRank {
+    Known(Ipv4Addr),
+    Unknown,
+}
+
+impl EffectiveRouterId {
+    /// The step-(f) identifier of a route advertised by a peer whose BGP
+    /// Identifier is `peer_bgp_id` and which carries `originator_id`.
+    ///
+    /// RFC 4456 §9: "If a route carries the `ORIGINATOR_ID` attribute, then in
+    /// Step f) the `ORIGINATOR_ID` SHOULD be treated as the BGP Identifier of
+    /// the BGP speaker that has advertised the route." So `originator_id`
+    /// wins whenever it is present, even if `peer_bgp_id` is unknown.
+    #[must_use]
+    #[inline]
+    pub const fn for_route(peer_bgp_id: Option<Ipv4Addr>, originator_id: Option<Ipv4Addr>) -> Self {
+        match (originator_id, peer_bgp_id) {
+            (Some(id), _) | (None, Some(id)) => Self(RouterIdRank::Known(id)),
+            (None, None) => Self(RouterIdRank::Unknown),
+        }
+    }
+
+    /// The identifier, or `None` if neither source supplied one.
+    #[must_use]
+    #[inline]
+    pub const fn get(self) -> Option<Ipv4Addr> {
+        match self.0 {
+            RouterIdRank::Known(id) => Some(id),
+            RouterIdRank::Unknown => None,
+        }
+    }
+
+    /// Whether an identifier is known.
+    #[must_use]
+    #[inline]
+    pub const fn is_known(self) -> bool {
+        matches!(self.0, RouterIdRank::Known(_))
+    }
+}
+
 /// A concrete BGP route stored in the RIB.
 ///
 /// `Route<A>` is the type that lives in [`AdjRibIn`](crate::AdjRibIn),
@@ -124,6 +218,9 @@ pub struct RareAttrs {
     pub extended_communities: Vec<ExtendedCommunity>,
     /// Ordered list of cluster IDs this route has passed through
     /// (RFC 4456 `CLUSTER_LIST`, type 10). Empty for non-reflected routes.
+    ///
+    /// Best-path selection reads only its length, through
+    /// [`Route::cluster_list_len`] (RFC 4456 §9).
     pub cluster_list: Vec<u32>,
     /// Flag indicating this route is an aggregate with suppressed path info.
     pub atomic_aggregate: bool,
@@ -131,6 +228,9 @@ pub struct RareAttrs {
     pub aggregator: Option<Aggregator>,
     /// BGP Identifier of the router that first introduced this route into the
     /// iBGP mesh via a route reflector (RFC 4456 `ORIGINATOR_ID`, type 9).
+    ///
+    /// When present it replaces [`Route::peer_bgp_id`] at best-path step
+    /// (f) (RFC 4456 §9) — see [`Route::effective_router_id`].
     pub originator_id: Option<Ipv4Addr>,
     /// `ONLY_TO_CUSTOMER` (RFC 9234 §3) — route-leak prevention marker. Once
     /// set (either by the peer we received it from, or by us on ingress
@@ -184,12 +284,14 @@ pub struct Route<A: IpAddress> {
     /// Distinct from the peer's session/transport IP address (`PeerId`,
     /// tracked separately by the caller): a router's BGP Identifier is
     /// commonly a loopback address unrelated to the physical interface used
-    /// for a given peering. Used in best-path step (f) (RFC 4271 §9.1.2.2):
-    /// when routes are tied through every prior criterion, the route from
-    /// the peer with the lowest BGP Identifier wins, evaluated *before* the
-    /// final peer-IP-address tiebreak (step (g)). Set by
-    /// [`RouteBuilder::peer_bgp_id`]; `None` skips step (f) and falls
-    /// through directly to step (g).
+    /// for a given peering.
+    ///
+    /// Best-path step (f) (RFC 4271 §9.1.2.2) does not read this field
+    /// directly: it compares [`Route::effective_router_id`], which is this
+    /// identifier unless the route carries `ORIGINATOR_ID` (RFC 4456 §9).
+    /// Set by [`RouteBuilder::peer_bgp_id`]; with neither present the
+    /// identifier is unknown and ranks after every known one (see
+    /// [`EffectiveRouterId`]).
     pub peer_bgp_id: Option<Ipv4Addr>,
     /// Infrequently-set attributes: communities, cluster list, aggregator, etc.
     ///
@@ -219,6 +321,51 @@ impl<A: IpAddress> Route<A> {
     #[inline]
     pub fn rare_mut(&mut self) -> &mut RareAttrs {
         self.rare.get_or_insert_with(Box::default)
+    }
+
+    /// The `ORIGINATOR_ID` this route carries (RFC 4456 §8), if any.
+    #[must_use]
+    #[inline]
+    pub fn originator_id(&self) -> Option<Ipv4Addr> {
+        self.rare.as_deref().and_then(|r| r.originator_id)
+    }
+
+    /// The number of cluster IDs in this route's `CLUSTER_LIST`.
+    ///
+    /// RFC 4456 §9: "The `CLUSTER_LIST` length is zero if a route does not
+    /// carry the `CLUSTER_LIST` attribute." Shorter is preferred between
+    /// best-path steps (f) and (g).
+    #[must_use]
+    #[inline]
+    pub fn cluster_list_len(&self) -> usize {
+        self.rare.as_deref().map_or(0, |r| r.cluster_list.len())
+    }
+
+    /// The identifier best-path step (f) compares for this route:
+    /// [`originator_id`](Self::originator_id) if carried, else
+    /// [`peer_bgp_id`](Self::peer_bgp_id) (RFC 4456 §9).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::Ipv4Addr;
+    /// use pathvector_rib::RouteBuilder;
+    /// use pathvector_types::{AsPath, Nlri, Origin};
+    ///
+    /// let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+    /// let reflected = RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+    ///     .peer_bgp_id(Ipv4Addr::new(1, 1, 1, 1)) // the route reflector
+    ///     .originator_id(Ipv4Addr::new(9, 9, 9, 9)) // the originating client
+    ///     .cluster_list(vec![1, 2])
+    ///     .build();
+    ///
+    /// assert_eq!(reflected.effective_router_id().get(), Some(Ipv4Addr::new(9, 9, 9, 9)));
+    /// assert_eq!(reflected.cluster_list_len(), 2);
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn effective_router_id(&self) -> EffectiveRouterId {
+        EffectiveRouterId::for_route(self.peer_bgp_id, self.originator_id())
     }
 }
 
@@ -489,6 +636,31 @@ impl<A: IpAddress> RouteBuilder<A> {
         self
     }
 
+    /// Sets the `ORIGINATOR_ID` attribute (RFC 4456 §8).
+    ///
+    /// Replaces the advertising peer's BGP Identifier at best-path step (f)
+    /// (RFC 4456 §9) — see [`Route::effective_router_id`].
+    #[must_use]
+    pub fn originator_id(mut self, id: Ipv4Addr) -> Self {
+        self.rare.get_or_insert_with(Box::default).originator_id = Some(id);
+        self
+    }
+
+    /// Sets the `CLUSTER_LIST` attribute (RFC 4456 §8), most recent cluster
+    /// first. An empty list is the same as not carrying the attribute and
+    /// does not allocate.
+    #[must_use]
+    pub fn cluster_list(mut self, list: Vec<u32>) -> Self {
+        if list.is_empty() {
+            if let Some(rare) = &mut self.rare {
+                rare.cluster_list.clear();
+            }
+        } else {
+            self.rare.get_or_insert_with(Box::default).cluster_list = list;
+        }
+        self
+    }
+
     /// Appends an unrecognized transitive optional attribute (RFC 4271 §5).
     #[must_use]
     pub fn unknown_attribute(mut self, attr: UnknownAttribute) -> Self {
@@ -736,6 +908,102 @@ mod tests {
 
         route.set_extended_communities(vec![ExtendedCommunity::route_target_as2(65000, 1)]);
         assert_eq!(route.extended_communities().len(), 1);
+    }
+
+    // ── EffectiveRouterId (RFC 4271 §9.1.2.2 (f), RFC 4456 §9) ─────────────
+
+    #[test]
+    fn effective_router_id_substitutes_originator_id_when_carried() {
+        // RFC 4456 §9: "If a route carries the ORIGINATOR_ID attribute, then
+        // in Step f) the ORIGINATOR_ID SHOULD be treated as the BGP
+        // Identifier of the BGP speaker that has advertised the route."
+        let peer = Ipv4Addr::new(1, 1, 1, 1);
+        let orig = Ipv4Addr::new(9, 9, 9, 9);
+        assert_eq!(
+            EffectiveRouterId::for_route(Some(peer), Some(orig)).get(),
+            Some(orig)
+        );
+        assert_eq!(
+            EffectiveRouterId::for_route(None, Some(orig)).get(),
+            Some(orig)
+        );
+        assert_eq!(
+            EffectiveRouterId::for_route(Some(peer), None).get(),
+            Some(peer)
+        );
+        assert_eq!(EffectiveRouterId::for_route(None, None).get(), None);
+        assert!(!EffectiveRouterId::for_route(None, None).is_known());
+    }
+
+    #[test]
+    fn effective_router_id_orders_as_unsigned_32_bit_integers() {
+        // RFC 4271 §6.8: BGP Identifiers are compared by "converting them to
+        // host byte order and treating them as 4-octet unsigned integers".
+        let ids = [
+            Ipv4Addr::new(0, 0, 0, 1),
+            Ipv4Addr::new(0, 255, 255, 255),
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(127, 255, 255, 255),
+            Ipv4Addr::new(128, 0, 0, 0),
+            Ipv4Addr::BROADCAST,
+        ];
+        for a in ids {
+            for b in ids {
+                assert_eq!(
+                    EffectiveRouterId::for_route(Some(a), None)
+                        .cmp(&EffectiveRouterId::for_route(Some(b), None)),
+                    u32::from(a).cmp(&u32::from(b)),
+                    "{a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effective_router_id_ranks_unknown_after_every_known_identifier() {
+        let unknown = EffectiveRouterId::for_route(None, None);
+        for known in [Ipv4Addr::new(0, 0, 0, 1), Ipv4Addr::BROADCAST] {
+            assert!(EffectiveRouterId::for_route(Some(known), None) < unknown);
+            assert!(EffectiveRouterId::for_route(None, Some(known)) < unknown);
+        }
+        assert_eq!(unknown, EffectiveRouterId::for_route(None, None));
+    }
+
+    #[test]
+    fn route_reflection_accessors_read_rare_attrs() {
+        let bare = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .peer_bgp_id(Ipv4Addr::new(2, 2, 2, 2))
+            .build();
+        assert_eq!(bare.originator_id(), None);
+        // RFC 4456 §9: "The CLUSTER_LIST length is zero if a route does not
+        // carry the CLUSTER_LIST attribute."
+        assert_eq!(bare.cluster_list_len(), 0);
+        assert_eq!(
+            bare.effective_router_id().get(),
+            Some(Ipv4Addr::new(2, 2, 2, 2))
+        );
+
+        let reflected = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .peer_bgp_id(Ipv4Addr::new(2, 2, 2, 2))
+            .originator_id(Ipv4Addr::new(7, 7, 7, 7))
+            .cluster_list(vec![10, 20, 30])
+            .build();
+        assert_eq!(reflected.originator_id(), Some(Ipv4Addr::new(7, 7, 7, 7)));
+        assert_eq!(reflected.rare_or_default().cluster_list, vec![10, 20, 30]);
+        assert_eq!(reflected.cluster_list_len(), 3);
+        assert_eq!(
+            reflected.effective_router_id().get(),
+            Some(Ipv4Addr::new(7, 7, 7, 7))
+        );
+    }
+
+    #[test]
+    fn route_builder_empty_cluster_list_does_not_allocate() {
+        let route = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, AsPath::new())
+            .cluster_list(Vec::new())
+            .build();
+        assert!(route.rare.is_none());
+        assert_eq!(route.cluster_list_len(), 0);
     }
 
     #[test]
