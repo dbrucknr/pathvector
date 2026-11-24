@@ -21,6 +21,76 @@ pub(super) struct SpawnConfig {
     /// Member-AS. Threaded into [`SessionConfig::confederation_member`]
     /// resolution at each session spawn via `effective_confederation_member`.
     pub(super) confederation_id: Option<u32>,
+    /// `[daemon] tcp_md5_enforcement`, applied to every dynamically added
+    /// peer that has an `md5_password`.
+    pub(super) md5_enforcement: Md5Enforcement,
+}
+
+/// The TCP MD5 keys for inbound connections, shared between the peer-set
+/// management (static setup, `AddPeer`, `RemovePeer`) and the BGP listeners,
+/// which install them on the listening sockets. `P` is the OS adapter; tests
+/// pass a fake.
+pub(super) type Md5Keys<P = KernelTcpMd5> = Arc<ListenerKeys<P>>;
+
+/// Configures `peer`'s key for inbound connections and logs the outcome.
+///
+/// Called before the peer is added to `incoming_senders`, so the listener
+/// never hands over a connection from the peer before its key is on the
+/// listening socket. A key that cannot be installed is logged at error
+/// level; the listener then rejects the peer's inbound connections (see
+/// [`ListenerKeys::set_peer`]). Outbound connections are governed
+/// separately, by the session's own [`TcpMd5Auth`].
+pub(super) fn set_listener_key<P: TcpMd5Port>(
+    keys: &ListenerKeys<P>,
+    peer: IpAddr,
+    auth: TcpMd5Auth,
+) {
+    match keys.set_peer(peer, auth) {
+        Ok(ListenerProtection::Enforced) => {
+            tracing::debug!(%peer, "TCP MD5 key installed on the BGP listener");
+        }
+        Ok(ListenerProtection::Deferred) => {
+            tracing::debug!(
+                %peer,
+                "TCP MD5 key will be installed when the BGP listener for its address family binds"
+            );
+        }
+        // `ListenerKeys` has already logged a warning.
+        Ok(ListenerProtection::Unenforced(_)) => {}
+        Err(e) => tracing::error!(%peer, "{e}"),
+    }
+}
+
+/// Removes `peer`'s key from the BGP listeners, logging a failure.
+pub(super) fn remove_listener_key<P: TcpMd5Port>(keys: &ListenerKeys<P>, peer: IpAddr) {
+    if let Err(e) = keys.remove_peer(peer) {
+        tracing::warn!(%peer, error = %e, "failed to remove TCP MD5 key from the BGP listener");
+    }
+}
+
+/// The session's TCP MD5 settings for `peer`, or `None` if it has no
+/// `md5_password`.
+pub(super) fn session_tcp_md5(
+    peer: &config::PeerConfig,
+    enforcement: Md5Enforcement,
+) -> Option<TcpMd5Auth> {
+    peer.md5_password
+        .as_ref()
+        .map(|p| TcpMd5Auth::new(p.key().clone(), enforcement))
+}
+
+/// Logs one warning at startup per peer whose MD5 key may go unenforced.
+pub(super) fn warn_if_md5_best_effort(enforcement: Md5Enforcement, peers: &[config::PeerConfig]) {
+    if enforcement != Md5Enforcement::BestEffort {
+        return;
+    }
+    for peer in peers.iter().filter(|p| p.md5_password.is_some()) {
+        tracing::warn!(
+            peer = %peer.address,
+            "tcp_md5_enforcement = \"best-effort\": if this host cannot enforce TCP MD5, \
+             the session will connect WITHOUT authentication"
+        );
+    }
 }
 
 impl SpawnConfig {

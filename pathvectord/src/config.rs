@@ -4,6 +4,7 @@ use std::{
 };
 
 use pathvector_policy::DefaultAction;
+use pathvector_session::transport::tcp_md5::{Md5Enforcement, TcpMd5Key, TcpMd5KeyError};
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon configuration.
@@ -254,6 +255,26 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub rpki: Option<RpkiConfig>,
+    /// What to do when a peer has `md5_password` but this host cannot
+    /// enforce TCP MD5 (kernel built without `CONFIG_TCP_MD5SIG`, a non-Linux
+    /// build, or an IPv6 peer).
+    ///
+    /// - `"required"` (default): the session does not connect, and the
+    ///   connect error is logged. RFC 5925 §8: an endpoint configured to
+    ///   require TCP MD5 must sign all outgoing segments and validate all
+    ///   incoming ones.
+    /// - `"best-effort"`: the session connects **without authentication** and
+    ///   a warning is logged on every connection attempt. Meant for
+    ///   development hosts such as Docker Desktop, whose kernel lacks TCP MD5.
+    ///
+    /// ```toml
+    /// [daemon]
+    /// local_as            = 65001
+    /// bgp_id              = "10.0.0.1"
+    /// tcp_md5_enforcement = "best-effort"   # development only
+    /// ```
+    #[serde(default)]
+    pub tcp_md5_enforcement: TcpMd5EnforcementConfig,
 }
 
 /// RTR server connection settings for RPKI Route Origin Validation.
@@ -451,9 +472,19 @@ pub struct PeerConfig {
     pub export_default: Option<ExportDefault>,
     /// RFC 2385 TCP MD5 authentication key shared with this peer.
     ///
-    /// When set, the kernel signs and verifies every TCP segment for this BGP
-    /// session using HMAC-MD5. The peer must be configured with the same key.
-    /// Maximum 80 bytes (Linux kernel limit). Omit to disable MD5 (default).
+    /// When set, the kernel signs every TCP segment pathvectord sends to this
+    /// peer and drops segments from it that are unsigned or wrongly signed.
+    /// The peer must be configured with the same key. Must be 1 to 80 bytes:
+    /// an empty or longer value is a config error (Linux would read an empty
+    /// key as "delete the key", and rejects keys over 80 bytes). Omit to
+    /// disable MD5 (default).
+    ///
+    /// If the host cannot enforce the key (a kernel without
+    /// `CONFIG_TCP_MD5SIG`, a non-Linux build, or an IPv6 peer), the session
+    /// does not connect unless `[daemon] tcp_md5_enforcement = "best-effort"`.
+    ///
+    /// Currently applied to outbound connections only; inbound listener keys
+    /// are tracked in issue #66.
     ///
     /// ```toml
     /// [[peers]]
@@ -462,7 +493,7 @@ pub struct PeerConfig {
     /// md5_password = "secret"
     /// ```
     #[serde(default)]
-    pub md5_password: Option<String>,
+    pub md5_password: Option<Md5Password>,
     /// Whether this peer is a Route Reflector client (RFC 4456).
     ///
     /// When `true`, the daemon acts as a Route Reflector for this peer:
@@ -624,14 +655,142 @@ fn default_bgp_port() -> u16 {
     179
 }
 
+// ── TCP MD5 ───────────────────────────────────────────────────────────────────
+
+/// A peer's TCP MD5 password, validated when it is parsed.
+///
+/// Holds the text as written (so the dynamic-peer sidecar can store it again)
+/// and the [`TcpMd5Key`] built from it. Construction fails for an empty value
+/// or one longer than 80 bytes; see [`TcpMd5Key`]. `Debug` hides the value.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
+pub struct Md5Password {
+    text: String,
+    key: TcpMd5Key,
+}
+
+impl Md5Password {
+    /// The validated key.
+    pub fn key(&self) -> &TcpMd5Key {
+        &self.key
+    }
+}
+
+impl TryFrom<String> for Md5Password {
+    type Error = TcpMd5KeyError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        let key = TcpMd5Key::try_from(text.as_str())?;
+        Ok(Self { text, key })
+    }
+}
+
+impl std::str::FromStr for Md5Password {
+    type Err = TcpMd5KeyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_owned())
+    }
+}
+
+impl From<Md5Password> for String {
+    fn from(p: Md5Password) -> Self {
+        p.text
+    }
+}
+
+/// Hand-written so that no error ever contains the value: serde's default
+/// "invalid type" errors quote non-string input (an unquoted numeric
+/// password, say), and those errors end up in logs.
+impl<'de> Deserialize<'de> for Md5Password {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Md5Password;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a TCP MD5 password string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Md5Password, E> {
+                Md5Password::try_from(v.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Md5Password, E> {
+                Md5Password::try_from(v).map_err(E::custom)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Md5Password, E> {
+                Err(E::custom(NOT_A_STRING))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Md5Password, E> {
+                Err(E::custom(NOT_A_STRING))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Md5Password, E> {
+                Err(E::custom(NOT_A_STRING))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Md5Password, E> {
+                Err(E::custom(NOT_A_STRING))
+            }
+        }
+
+        const NOT_A_STRING: &str = "md5_password must be a quoted string";
+        d.deserialize_str(Visitor)
+    }
+}
+
+impl std::fmt::Debug for Md5Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Md5Password(<redacted>)")
+    }
+}
+
+/// `[daemon] tcp_md5_enforcement`: `"required"` (default) or `"best-effort"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TcpMd5EnforcementConfig {
+    /// Refuse to connect when a configured key cannot be enforced.
+    #[default]
+    Required,
+    /// Connect unauthenticated, with a warning, when a configured key cannot
+    /// be enforced.
+    BestEffort,
+}
+
+impl From<TcpMd5EnforcementConfig> for Md5Enforcement {
+    fn from(c: TcpMd5EnforcementConfig) -> Self {
+        match c {
+            TcpMd5EnforcementConfig::Required => Self::Required,
+            TcpMd5EnforcementConfig::BestEffort => Self::BestEffort,
+        }
+    }
+}
+
 // ── Dynamic peer persistence ──────────────────────────────────────────────────
 
-/// Internal sidecar file format — a flat list of peer configs.
+/// Internal sidecar file format: a flat `[[peers]]` list, kept as raw TOML
+/// tables so one entry that fails validation cannot take the others with it.
 #[derive(Serialize, Deserialize, Default)]
 struct SidecarFile {
     #[serde(default)]
-    peers: Vec<PeerConfig>,
+    peers: Vec<toml::Table>,
 }
+
+/// A sidecar read from disk: the entries that are valid peers, and the raw
+/// entries that are not (kept so a write never discards them).
+#[derive(Default)]
+struct LoadedSidecar {
+    peers: Vec<PeerConfig>,
+    rejected: Vec<toml::Table>,
+}
+
+/// Why the sidecar could not be read at all. Holds a description that never
+/// quotes the file (see [`describe_toml_error`]).
+struct SidecarUnreadable(String);
 
 /// Persists dynamically-added peers to a TOML sidecar file so they survive
 /// daemon restarts.
@@ -641,6 +800,12 @@ struct SidecarFile {
 /// manually.  Writes are atomic: the new content is written to a `.tmp` file
 /// then `rename`d over the target, so a crash mid-write never corrupts the
 /// sidecar.
+///
+/// An entry that is not a valid peer (for example an `md5_password` that is
+/// empty or longer than 80 bytes, which older versions accepted) is logged,
+/// skipped at load, and written back unchanged, so the operator can fix it.
+/// A file that cannot be read or parsed as TOML at all is never overwritten:
+/// writes are refused (and logged) until it is fixed or removed.
 pub struct DynamicPeerStore {
     path: PathBuf,
 }
@@ -650,20 +815,32 @@ impl DynamicPeerStore {
         Self { path }
     }
 
-    /// Load all persisted dynamic peers.  Returns an empty vec if the sidecar
-    /// does not exist yet (first run).
+    /// Load all valid persisted dynamic peers.  Returns an empty vec if the
+    /// sidecar does not exist yet (first run) or cannot be parsed (logged).
     pub fn load(&self) -> Vec<PeerConfig> {
-        Self::load_sync(&self.path)
+        match Self::load_sync(&self.path) {
+            Ok(loaded) => loaded.peers,
+            Err(SidecarUnreadable(why)) => {
+                tracing::error!(
+                    path = %self.path.display(),
+                    "dynamic peer sidecar unreadable, no dynamic peers loaded \
+                     and the file will not be modified: {why}"
+                );
+                vec![]
+            }
+        }
     }
 
     /// Upsert a peer into the sidecar (replace by address if already present).
     pub async fn upsert(&self, peer: PeerConfig) {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut peers = Self::load_sync(&path);
-            peers.retain(|p| p.address != peer.address);
-            peers.push(peer);
-            Self::write_sync(&path, &peers);
+            Self::modify_sync(&path, |s| {
+                s.peers.retain(|p| p.address != peer.address);
+                s.rejected
+                    .retain(|t| raw_address(t) != Some(peer.address.to_string()));
+                s.peers.push(peer);
+            });
         })
         .await
         .ok();
@@ -673,34 +850,70 @@ impl DynamicPeerStore {
     pub async fn remove(&self, address: IpAddr) {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut peers = Self::load_sync(&path);
-            peers.retain(|p| p.address != address);
-            Self::write_sync(&path, &peers);
+            Self::modify_sync(&path, |s| s.peers.retain(|p| p.address != address));
         })
         .await
         .ok();
     }
 
-    fn load_sync(path: &Path) -> Vec<PeerConfig> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str::<SidecarFile>(&text)
-                    .unwrap_or_default()
-                    .peers
+    /// Loads, applies `change`, and writes back — unless the file could not
+    /// be read, in which case nothing is written.
+    fn modify_sync(path: &Path, change: impl FnOnce(&mut LoadedSidecar)) {
+        match Self::load_sync(path) {
+            Ok(mut loaded) => {
+                change(&mut loaded);
+                Self::write_sync(path, &loaded);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "failed to read dynamic peer sidecar: {e}");
-                vec![]
-            }
+            Err(SidecarUnreadable(why)) => tracing::error!(
+                path = %path.display(),
+                "not persisting dynamic peer change: the sidecar is unreadable \
+                 and will not be overwritten ({why}); fix or remove the file"
+            ),
         }
     }
 
-    fn write_sync(path: &Path, peers: &[PeerConfig]) {
-        let sidecar = SidecarFile {
-            peers: peers.to_vec(),
+    fn load_sync(path: &Path) -> Result<LoadedSidecar, SidecarUnreadable> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadedSidecar::default());
+            }
+            Err(e) => return Err(SidecarUnreadable(e.to_string())),
         };
-        let text = match toml::to_string(&sidecar) {
+        let file: SidecarFile = toml::from_str(&text)
+            .map_err(|e| SidecarUnreadable(describe_toml_error(&e, Some(&text))))?;
+
+        let mut loaded = LoadedSidecar::default();
+        for table in file.peers {
+            match toml::Value::Table(table.clone()).try_into::<PeerConfig>() {
+                Ok(peer) => loaded.peers.push(peer),
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        peer = raw_address(&table).as_deref().unwrap_or("<no address>"),
+                        "skipping invalid dynamic peer (kept in the file): {}",
+                        describe_toml_error(&e, None)
+                    );
+                    loaded.rejected.push(table);
+                }
+            }
+        }
+        Ok(loaded)
+    }
+
+    fn write_sync(path: &Path, sidecar: &LoadedSidecar) {
+        let mut peers = Vec::with_capacity(sidecar.peers.len() + sidecar.rejected.len());
+        for peer in &sidecar.peers {
+            match toml::Table::try_from(peer) {
+                Ok(table) => peers.push(table),
+                Err(e) => {
+                    tracing::warn!("failed to serialise dynamic peers: {e}");
+                    return;
+                }
+            }
+        }
+        peers.extend(sidecar.rejected.iter().cloned());
+        let text = match toml::to_string(&SidecarFile { peers }) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("failed to serialise dynamic peers: {e}");
@@ -713,6 +926,30 @@ impl DynamicPeerStore {
         {
             tracing::warn!(path = %path.display(), "failed to persist dynamic peers: {e}");
         }
+    }
+}
+
+/// The `address` of a raw sidecar entry, for logs and de-duplication.
+fn raw_address(table: &toml::Table) -> Option<String> {
+    table.get("address")?.as_str().map(str::to_owned)
+}
+
+/// Describes a TOML error without quoting the input.
+///
+/// `toml::de::Error`'s `Display` prints the offending source line, which can
+/// contain an `md5_password`. This returns only the parser's message and,
+/// when `text` is given, the line number.
+pub fn describe_toml_error(err: &toml::de::Error, text: Option<&str>) -> String {
+    let message = err.message().trim_end();
+    match (err.span(), text) {
+        (Some(span), Some(text)) => {
+            let line = text
+                .get(..span.start)
+                .map_or(0, |before| before.matches('\n').count())
+                + 1;
+            format!("{message} (line {line})")
+        }
+        _ => message.to_owned(),
     }
 }
 
@@ -742,6 +979,141 @@ mod sidecar_tests {
             role: None,
             confederation_member: false,
         }
+    }
+
+    /// Captures what `f` logs through `tracing`, as plain text.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, text)
+    }
+
+    const SECRET: &str = "review-valid-secret";
+
+    /// PR #124 review: `toml::de::Error`'s `Display` quotes the offending
+    /// source line, so logging it would print a password that sits next to
+    /// a syntax error. Diagnostics must not echo the file.
+    #[test]
+    fn unparseable_sidecar_log_does_not_reveal_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_peers.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\nmd5_password = \"{SECRET}\" oops\n"
+            ),
+        )
+        .unwrap();
+
+        let (peers, logs) = capture_logs(|| DynamicPeerStore::new(path).load());
+        assert!(peers.is_empty());
+        assert!(!logs.is_empty(), "the failure must still be logged");
+        assert!(!logs.contains(SECRET), "password leaked into logs: {logs}");
+    }
+
+    /// Same for a password the validator rejects (over 80 bytes): the
+    /// rejection is logged, the password is not.
+    #[test]
+    fn rejected_sidecar_password_is_not_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_peers.toml");
+        let long = format!("{SECRET}-{}", "x".repeat(80));
+        std::fs::write(
+            &path,
+            format!(
+                "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\nmd5_password = \"{long}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let (_, logs) = capture_logs(|| DynamicPeerStore::new(path).load());
+        assert!(
+            logs.contains("too long"),
+            "rejection must be logged: {logs}"
+        );
+        assert!(!logs.contains(SECRET), "password leaked into logs: {logs}");
+    }
+
+    /// PR #124 review: a sidecar written before passwords were validated can
+    /// hold an entry that no longer parses. That entry must not take the
+    /// valid peers down with it, at load or at the next write.
+    #[tokio::test]
+    async fn invalid_entry_does_not_drop_valid_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_peers.toml");
+        std::fs::write(
+            &path,
+            "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\n\n\
+             [[peers]]\naddress = \"10.0.0.2\"\nremote_as = 65002\nmd5_password = \"\"\n",
+        )
+        .unwrap();
+        let store = DynamicPeerStore::new(path.clone());
+
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 1, "the valid peer must still load");
+        assert_eq!(loaded[0].address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+
+        store.upsert(peer(3, 65003)).await;
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("10.0.0.1"),
+            "valid peer lost on write:\n{text}"
+        );
+        assert!(
+            text.contains("10.0.0.2"),
+            "rejected entry must be kept for the operator:\n{text}"
+        );
+        assert!(
+            text.contains("10.0.0.3"),
+            "new peer must be written:\n{text}"
+        );
+        let addrs: Vec<IpAddr> = store.load().iter().map(|p| p.address).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+            ]
+        );
+    }
+
+    /// A sidecar that is not valid TOML at all cannot be split into entries,
+    /// so writes must leave it untouched rather than replace it.
+    #[tokio::test]
+    async fn unparseable_sidecar_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_peers.toml");
+        let original = "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001 garbage\n";
+        std::fs::write(&path, original).unwrap();
+        let store = DynamicPeerStore::new(path.clone());
+
+        store.upsert(peer(3, 65003)).await;
+        store.remove(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))).await;
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[tokio::test]
@@ -814,7 +1186,7 @@ mod sidecar_tests {
             import_default: Some(ImportDefault::Accept),
             import_default_v6: Some(ImportDefault::Reject),
             export_default: Some(ExportDefault::Accept),
-            md5_password: Some("s3cr3t".into()),
+            md5_password: Some("s3cr3t".parse().unwrap()),
             is_rr_client: true,
             next_hop_self: false,
             hold_time: Some(60),
@@ -834,7 +1206,7 @@ mod sidecar_tests {
         assert!(matches!(got.import_default, Some(ImportDefault::Accept)));
         assert!(matches!(got.import_default_v6, Some(ImportDefault::Reject)));
         assert!(matches!(got.export_default, Some(ExportDefault::Accept)));
-        assert_eq!(got.md5_password.as_deref(), Some("s3cr3t"));
+        assert_eq!(got.md5_password, Some("s3cr3t".parse().unwrap()));
         assert!(got.is_rr_client);
         assert_eq!(got.hold_time, Some(60));
         assert_eq!(got.shutdown_message.as_deref(), Some("planned maintenance"));
@@ -1097,7 +1469,108 @@ remote_as = 65002
 md5_password = "s3cr3t"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.peers[0].md5_password.as_deref(), Some("s3cr3t"));
+        assert_eq!(cfg.peers[0].md5_password, Some("s3cr3t".parse().unwrap()));
+    }
+
+    fn peer_with_md5(value: &str) -> String {
+        format!(
+            r#"
+[daemon]
+local_as = 65001
+bgp_id = "10.0.0.1"
+
+[[peers]]
+address = "10.0.0.2"
+remote_as = 65002
+md5_password = "{value}"
+"#
+        )
+    }
+
+    /// Linux `tcp_v4_parse_md5_keys` reads a zero key length as "delete the
+    /// key" (`tcp_md5_do_del`), so `md5_password = ""` would silently mean
+    /// "no authentication". It must be a config error instead.
+    #[test]
+    fn test_md5_password_empty_is_rejected() {
+        let err = toml::from_str::<Config>(&peer_with_md5(""))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    /// `TCP_MD5SIG_MAXKEYLEN` is 80 (`include/uapi/linux/tcp.h`); the kernel
+    /// returns `EINVAL` for longer keys, so reject them when parsing.
+    #[test]
+    fn test_md5_password_over_80_bytes_is_rejected() {
+        let err = toml::from_str::<Config>(&peer_with_md5(&"x".repeat(81)))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("too long"), "{err}");
+        let ok: Config = toml::from_str(&peer_with_md5(&"x".repeat(80))).unwrap();
+        assert!(ok.peers[0].md5_password.is_some());
+    }
+
+    /// PR #124 review: startup config errors must not print the password.
+    /// `toml::de::Error`'s `Display` quotes the source line;
+    /// `describe_toml_error` (used by `main`) must not, whether the problem
+    /// is a syntax error next to the password, an over-length password, or
+    /// a password written as a bare (non-string) value.
+    #[test]
+    fn test_config_errors_do_not_reveal_md5_password() {
+        let syntax =
+            peer_with_md5("hunter2-secret").replace("hunter2-secret\"", "hunter2-secret\" x");
+        let long = peer_with_md5(&format!("hunter2-secret{}", "x".repeat(80)));
+        let bare = peer_with_md5("x").replace("\"x\"", "73556120071");
+        for (text, secret) in [
+            (syntax, "hunter2-secret"),
+            (long, "hunter2-secret"),
+            (bare, "73556120071"),
+        ] {
+            let err = toml::from_str::<Config>(&text).err().expect("must fail");
+            let shown = describe_toml_error(&err, Some(&text));
+            assert!(!shown.contains(secret), "password leaked: {shown}");
+            assert!(shown.contains("(line "), "location expected: {shown}");
+        }
+    }
+
+    #[test]
+    fn test_md5_password_debug_is_redacted() {
+        let p: Md5Password = "hunter2".parse().unwrap();
+        assert_eq!(format!("{p:?}"), "Md5Password(<redacted>)");
+    }
+
+    /// Fail closed by default: without an explicit setting, a key the host
+    /// cannot enforce stops the session.
+    #[test]
+    fn test_tcp_md5_enforcement_defaults_to_required() {
+        let cfg: Config = toml::from_str(&peer_with_md5("k")).unwrap();
+        assert_eq!(
+            cfg.daemon.tcp_md5_enforcement,
+            TcpMd5EnforcementConfig::Required
+        );
+        assert_eq!(
+            Md5Enforcement::from(cfg.daemon.tcp_md5_enforcement),
+            Md5Enforcement::Required
+        );
+    }
+
+    #[test]
+    fn test_tcp_md5_enforcement_values() {
+        let parse = |v: &str| {
+            toml::from_str::<Config>(&format!(
+                "[daemon]\nlocal_as = 65001\nbgp_id = \"10.0.0.1\"\ntcp_md5_enforcement = \"{v}\"\n"
+            ))
+            .map(|c| c.daemon.tcp_md5_enforcement)
+        };
+        assert_eq!(
+            parse("required").unwrap(),
+            TcpMd5EnforcementConfig::Required
+        );
+        assert_eq!(
+            parse("best-effort").unwrap(),
+            TcpMd5EnforcementConfig::BestEffort
+        );
+        assert!(parse("off").is_err(), "unknown values must not parse");
     }
 
     #[test]

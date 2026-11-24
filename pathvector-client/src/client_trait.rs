@@ -615,6 +615,14 @@ impl DaemonClient for PathvectorClient {
     }
 
     async fn add_peer(&mut self, params: AddPeerParams) -> Result<(), ClientError> {
+        // The wire field is a proto3 string, where "" means "unset". Sending
+        // `Some("")` would silently add the peer *without* TCP MD5, so reject
+        // it here: `None` is how to ask for no authentication.
+        if params.md5_password.as_deref() == Some("") {
+            return Err(ClientError::Rpc(tonic::Status::invalid_argument(
+                "md5_password must not be empty (use None for no TCP MD5)",
+            )));
+        }
         let import_action =
             params
                 .import_default

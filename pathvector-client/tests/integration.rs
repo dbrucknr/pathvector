@@ -948,6 +948,23 @@ fn add_peer_params(import_default: Option<bool>, export_default: Option<bool>) -
     }
 }
 
+/// An empty password would travel as proto3's "unset" string and add the
+/// peer without TCP MD5. The client must refuse it before sending (the mock
+/// server here accepts every request, so success would mean it was sent).
+#[tokio::test]
+async fn add_peer_rejects_empty_md5_password() {
+    let addr = start_server().await;
+    let mut client = client_for(addr);
+    let mut params = add_peer_params(None, None);
+    params.md5_password = Some(String::new());
+    match client.add_peer(params).await {
+        Err(ClientError::Rpc(status)) => {
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
 /// `import_default = Some(true)` and `export_default = Some(false)` — hits
 /// the Accept branch of one policy-action closure and the Reject branch of
 /// the other in a single call.
