@@ -146,6 +146,9 @@ impl DaemonState {
         self.adj_ribs_out.remove(&peer_ip);
         self.adj_ribs_out_v6.remove(&peer_ip);
         self.peer_config_types.remove(&peer_ip);
+        // Normally `on_terminated` has already released the peer's null routes;
+        // this only matters if the peer is removed with claims still held.
+        self.release_peer_blackholes(peer_ip);
         self.import_policies.remove(&peer_ip);
         self.import_policies_v6.remove(&peer_ip);
         self.blackhole_sessions.remove(&peer_ip);
@@ -494,6 +497,22 @@ impl DaemonState {
             rib_prefixes,
             "session established"
         );
+    }
+
+    /// Releases every blackhole `peer_ip` holds, in both families, and
+    /// programs the resulting null-route withdrawals.
+    pub(super) fn release_peer_blackholes(&mut self, peer_ip: IpAddr) {
+        let peer = PeerId::from(peer_ip);
+        let v4 = self.blackholes.v4.release_peer(peer);
+        self.program_fib_v4(RibEffects {
+            best: Vec::new(),
+            blackhole: v4,
+        });
+        let v6 = self.blackholes.v6.release_peer(peer);
+        self.program_fib_v6(RibEffects {
+            best: Vec::new(),
+            blackhole: v6,
+        });
     }
 
     /// Removes everything `peer_ip` contributed to the IPv4 tables — the

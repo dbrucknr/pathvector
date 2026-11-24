@@ -1693,6 +1693,20 @@ pub(super) fn process_update(
 
     crate::metrics::on_import_reject(peer.ip(), import_v4.rejected);
     crate::metrics::on_import_reject(peer.ip(), import_v6.rejected);
+    // A refused BLACKHOLE request is silent on the wire and in the FIB, so say
+    // so: it is the visible symptom of a missing `blackhole_authorized_prefixes`
+    // (or a prefix outside it) after upgrading from a version that honored every
+    // BLACKHOLE-tagged route.
+    let denied = import_v4.blackhole_denied + import_v6.blackhole_denied;
+    if denied > 0 {
+        tracing::warn!(
+            peer = %peer,
+            denied,
+            "ignored BLACKHOLE announcement(s): session has no BLACKHOLE agreement, the prefix \
+             is outside `blackhole_authorized_prefixes`, or it is an RFC 9234 route leak \
+             (RFC 7999 §3.3)"
+        );
+    }
     tracing::info!(
         peer = %peer,
         withdrawn = withdrawn_count,
