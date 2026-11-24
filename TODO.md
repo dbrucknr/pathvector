@@ -1776,6 +1776,25 @@ honestly and completely unimplemented (every row ❌, explicit "Deferred:
 Everything" note) — no code exists to audit, so no findings possible.
 `RFC_REQUIREMENTS.md`'s ❌ status is accurate as-is.
 
+**21a. `pathvector-rpki` RTR client P1 defects (issues #86, #87, #88, #90) — fixed
+2026-11-24.** A review of `client.rs` after item 21 found four defects the earlier
+audit rated "confirmed correct": Cache Reset as the reply to a Serial Query was a
+fatal `UnexpectedPdu` with a futile reconnect loop (#87); session ID and protocol
+version were not enforced beyond End of Data vs. its own Cache Response (#90); VRPs
+were applied to the live table while the serial and notification waited for End of
+Data, and several invalidation paths cleared the table silently (#88); and the
+Expire Interval was never enforced (#86). All four are fixed in one series (state
+machine in `protocol.rs`, publication boundary in `cache.rs`, timers in `timers.rs`);
+see CHANGELOG 2026-11-24 and `pathvector-rpki/RFC.md`. Follow-ups still open and
+tracked as their own issues: #89, #91, #92, #93, #94. Interactions worth knowing
+about: #93 (application-level query deadline) is what bounds a *stalled* sync — expiry
+now bounds how stale the data can get meanwhile; #92 will want the staged transfer
+(`Staged`) as the place to detect duplicate/unknown records before anything is
+published; #89's persistent frame buffer replaces `read_frame` in `client.rs` and is
+independent of the new state machine; `pathvectord` should call
+`RtrConfig::validate()` when loading `[daemon.rpki]` timers (not done here — outside
+the crate).
+
 **22. "Audit-the-audit" pass — is anything not tracked that should be?**
 Prompted directly by the user asking whether `RFC_REQUIREMENTS.md` itself
 might be incomplete, rather than only re-checking RFCs already on the
@@ -2148,7 +2167,7 @@ integration rather than direct unit tests.
   harness or lightweight integration scaffolding to drive the event loop without real TCP.
 - `pathvector-sys/src/tcp.rs` (94.9%) — missed lines likely require real socket setup or
   Linux-only TCP MD5 paths; investigate whether mock sockets or platform-gated tests can close the gap.
-- No e2e test for AS_TRANS wire encoding against a real 2-byte-only peer (GoBGP `--as2` mode) — unit tests exist but no interop verification.
+- No e2e test for AS_TRANS wire encoding against a real 2-byte-only peer (GoBGP `--as2` mode) — unit, property and loopback-TCP tests with hand-derived RFC 6793 bytes exist (issue #95 closed the codec gap: two-octet `AS_PATH`/`AGGREGATOR`, AS4_PATH merge) but no interop verification.
 - No IPv6 route receive/withdraw tests for BIRD and FRR peers — requires IPv6 variants of `write_bird_config` / `write_frr_config`, new `BirdHarness::new_v6()` / `FrrHarness::new_v6()` constructors, and `address-family ipv6` blocks in each speaker's config.
 - `pathvector-session/src/transport/mod.rs` (96.0%) — `SessionCommand::Notification` branch
   (~line 411) and TCP send failure path (~line 479) require a real or mock transport pair

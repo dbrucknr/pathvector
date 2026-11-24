@@ -30,7 +30,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use ipnetx::{interfaces::IpAddress, prefix::IpPrefix};
 use routemap::RouteMap;
 
-use crate::pdu::{Pdu, PrefixFlags};
+use crate::pdu::Pdu;
 
 /// RFC 6811 §2 origin validation state for a `(prefix, origin AS)` pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,10 +95,6 @@ impl<A: IpAddress> FamilyTable<A> {
         self.0.iter().map(|(_, entries)| entries.len()).sum()
     }
 
-    fn clear(&mut self) {
-        self.0 = RouteMap::new();
-    }
-
     /// RFC 6811 §2, composed from `RouteMap` primitives — see module docs.
     fn validate(&self, prefix: A, prefix_len: u8, origin_asn: u32) -> RoaValidity {
         // Fast path: `longest_match_entry` finds the most specific *registered*
@@ -143,14 +139,92 @@ impl<A: IpAddress> FamilyTable<A> {
     }
 }
 
+/// One decoded VRP change: announce or withdraw one `(prefix, max_len, asn)`.
+///
+/// This is what a Prefix PDU becomes once it has been checked as
+/// representable. Staged transfers hold these instead of raw PDUs, so a
+/// staged delta can only ever contain prefix changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VrpOp {
+    announce: bool,
+    vrp: Vrp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vrp {
+    V4(IpPrefix<Ipv4Addr>, RoaEntry),
+    V6(IpPrefix<Ipv6Addr>, RoaEntry),
+}
+
+impl VrpOp {
+    /// Decodes the change a Prefix PDU describes. `None` for any other PDU,
+    /// and for a prefix length the address family cannot represent (such a
+    /// record is skipped, exactly as before — whether it should instead be
+    /// reported as corrupt data is the separate prefix-bounds validation
+    /// issue, #91).
+    pub(crate) fn from_pdu(pdu: &Pdu) -> Option<Self> {
+        match *pdu {
+            Pdu::Ipv4Prefix {
+                flags,
+                prefix_len,
+                max_len,
+                prefix,
+                asn,
+            } => Some(Self {
+                announce: flags.announce,
+                vrp: Vrp::V4(
+                    IpPrefix::new(prefix, prefix_len).ok()?,
+                    RoaEntry { max_len, asn },
+                ),
+            }),
+            Pdu::Ipv6Prefix {
+                flags,
+                prefix_len,
+                max_len,
+                prefix,
+                asn,
+            } => Some(Self {
+                announce: flags.announce,
+                vrp: Vrp::V6(
+                    IpPrefix::new(prefix, prefix_len).ok()?,
+                    RoaEntry { max_len, asn },
+                ),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A complete VRP set built off to the side — no locks, invisible to
+/// validation until [`RoaTable::install`] swaps it in. Used to stage a full
+/// (Reset Query) load.
+pub(crate) struct Snapshot {
+    v4: FamilyTable<Ipv4Addr>,
+    v6: FamilyTable<Ipv6Addr>,
+}
+
+impl Snapshot {
+    pub(crate) fn new() -> Self {
+        Self {
+            v4: FamilyTable::new(),
+            v6: FamilyTable::new(),
+        }
+    }
+
+    pub(crate) fn apply(&mut self, op: VrpOp) {
+        match op.vrp {
+            Vrp::V4(p, e) => apply_flagged(&mut self.v4, p, e, op.announce),
+            Vrp::V6(p, e) => apply_flagged(&mut self.v6, p, e, op.announce),
+        }
+    }
+}
+
 /// Combined IPv4 + IPv6 ROA cache. Uses interior mutability so an
 /// [`crate::RtrHandle`] can hand out cheap `Arc` clones while the RTR client
 /// task applies incremental diffs from the wire.
 pub struct RoaTable {
     v4: std::sync::RwLock<FamilyTable<Ipv4Addr>>,
     v6: std::sync::RwLock<FamilyTable<Ipv6Addr>>,
-    serial: std::sync::atomic::AtomicU32,
-    has_serial: std::sync::atomic::AtomicBool,
 }
 
 impl RoaTable {
@@ -158,8 +232,6 @@ impl RoaTable {
         Self {
             v4: std::sync::RwLock::new(FamilyTable::new()),
             v6: std::sync::RwLock::new(FamilyTable::new()),
-            serial: std::sync::atomic::AtomicU32::new(0),
-            has_serial: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -207,6 +279,7 @@ impl RoaTable {
     /// any other `Pdu` variant (the client only calls this for
     /// `Pdu::Ipv4Prefix`/`Pdu::Ipv6Prefix`, but taking the whole enum keeps
     /// the call site in `client.rs` a single match-free line).
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn apply_prefix_pdu(&self, pdu: &Pdu) {
         match *pdu {
             Pdu::Ipv4Prefix {
@@ -221,7 +294,7 @@ impl RoaTable {
                 };
                 let entry = RoaEntry { max_len, asn };
                 let mut table = self.v4.write().unwrap();
-                apply_flagged(&mut table, p, entry, flags);
+                apply_flagged(&mut table, p, entry, flags.announce);
             }
             Pdu::Ipv6Prefix {
                 flags,
@@ -235,36 +308,75 @@ impl RoaTable {
                 };
                 let entry = RoaEntry { max_len, asn };
                 let mut table = self.v6.write().unwrap();
-                apply_flagged(&mut table, p, entry, flags);
+                apply_flagged(&mut table, p, entry, flags.announce);
             }
             _ => {}
         }
     }
 
-    /// Clears all ROA data. Called on `CacheReset` / session-ID mismatch —
-    /// see `client.rs`'s state machine for when this fires.
-    pub(crate) fn clear(&self) {
-        self.v4.write().unwrap().clear();
-        self.v6.write().unwrap().clear();
-        self.has_serial
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_serial(&self, serial: u32) {
-        self.serial
-            .store(serial, std::sync::atomic::Ordering::Relaxed);
-        self.has_serial
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// `None` until the first successful sync (distinguishes "never synced"
-    /// from a legitimate serial value of `0`).
-    pub(crate) fn serial(&self) -> Option<u32> {
-        if self.has_serial.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(self.serial.load(std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
+    /// Replaces the whole VRP set with `snapshot` in O(1): both family locks
+    /// are taken (always v4 then v6) and the trees swapped, so a validation
+    /// sees either the old set or the new one — never a mixture, and never a
+    /// partially loaded one.
+    ///
+    /// The previous trees are *returned*, not dropped here: freeing a
+    /// 500 000-VRP tree is O(size), and doing it while the write guards are
+    /// held would block validation for that long. The caller drops the
+    /// [`Retired`] value once no lock is held.
+    #[must_use = "drop the retired trees after releasing locks, not while holding them"]
+    pub(crate) fn install(&self, snapshot: Snapshot) -> Retired {
+        let mut v4 = self.v4.write().unwrap();
+        let mut v6 = self.v6.write().unwrap();
+        Retired {
+            v4: std::mem::replace(&mut *v4, snapshot.v4),
+            v6: std::mem::replace(&mut *v6, snapshot.v6),
         }
+    }
+
+    /// Applies a staged change set in order under both family locks, so a
+    /// concurrent validation sees either none of it or all of it. The lock
+    /// hold is O(`ops.len()`); a typical RPKI serial-to-serial delta is a
+    /// few hundred to a few thousand VRPs.
+    pub(crate) fn apply_delta(&self, ops: &[VrpOp]) {
+        let mut v4 = self.v4.write().unwrap();
+        let mut v6 = self.v6.write().unwrap();
+        for op in ops {
+            match op.vrp {
+                Vrp::V4(p, e) => apply_flagged(&mut v4, p, e, op.announce),
+                Vrp::V6(p, e) => apply_flagged(&mut v6, p, e, op.announce),
+            }
+        }
+    }
+
+    /// Removes all ROA data in O(1), returning the old trees for the caller
+    /// to drop once no lock is held (see [`RoaTable::install`]).
+    #[must_use = "drop the retired trees after releasing locks, not while holding them"]
+    pub(crate) fn take_all(&self) -> Retired {
+        self.install(Snapshot::new())
+    }
+
+    /// Clears all ROA data. The old trees are freed after the table locks
+    /// are released.
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        drop(self.take_all());
+    }
+}
+
+/// The previous generation's trees, swapped out of the table so their
+/// destruction (O(size)) happens outside any lock.
+pub(crate) struct Retired {
+    // Held only so that dropping `Retired` drops them.
+    #[allow(dead_code)]
+    v4: FamilyTable<Ipv4Addr>,
+    #[allow(dead_code)]
+    v6: FamilyTable<Ipv6Addr>,
+}
+
+impl Retired {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
     }
 }
 
@@ -272,9 +384,9 @@ fn apply_flagged<A: IpAddress>(
     table: &mut FamilyTable<A>,
     prefix: IpPrefix<A>,
     entry: RoaEntry,
-    flags: PrefixFlags,
+    announce: bool,
 ) {
-    if flags.announce {
+    if announce {
         table.insert(prefix, entry);
     } else {
         table.remove(prefix, entry);
@@ -284,6 +396,7 @@ fn apply_flagged<A: IpAddress>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdu::PrefixFlags;
 
     fn p4(s: &str) -> IpPrefix<Ipv4Addr> {
         s.parse().unwrap()
@@ -605,18 +718,41 @@ mod tests {
         assert!(table.is_empty());
     }
 
+    /// `install` hands the previous generation back instead of freeing it
+    /// under the write locks (O(size) otherwise), and the new generation is
+    /// what validation sees.
     #[test]
-    fn roa_table_serial_starts_none_and_tracks_set_value() {
+    fn install_returns_the_previous_generation_for_deferred_drop() {
         let table = RoaTable::new();
-        assert_eq!(table.serial(), None);
-        table.set_serial(0);
-        assert_eq!(table.serial(), Some(0)); // 0 is a valid serial, distinct from "never synced"
-        table.set_serial(42);
-        assert_eq!(table.serial(), Some(42));
+        for asn in [65001, 65002] {
+            table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
+                flags: PrefixFlags { announce: true },
+                prefix_len: 24,
+                max_len: 24,
+                prefix: Ipv4Addr::new(192, 0, 2, 0),
+                asn,
+            });
+        }
+        let mut snap = Snapshot::new();
+        snap.apply(
+            VrpOp::from_pdu(&Pdu::Ipv6Prefix {
+                flags: PrefixFlags { announce: true },
+                prefix_len: 32,
+                max_len: 32,
+                prefix: "2001:db8::".parse().unwrap(),
+                asn: 65009,
+            })
+            .unwrap(),
+        );
+        let retired = table.install(snap);
+        assert_eq!(retired.len(), 2);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.take_all().len(), 1);
+        assert!(table.is_empty());
     }
 
     #[test]
-    fn roa_table_clear_resets_serial_and_data() {
+    fn roa_table_clear_removes_data() {
         let table = RoaTable::new();
         table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
             flags: PrefixFlags { announce: true },
@@ -625,10 +761,85 @@ mod tests {
             prefix: "192.0.2.0".parse().unwrap(),
             asn: 65001,
         });
-        table.set_serial(10);
         table.clear();
-        assert_eq!(table.serial(), None);
         assert!(table.is_empty());
+    }
+
+    /// Cost of staging vs applying records directly (issue #88's performance
+    /// question). Not a pass/fail test — run with
+    /// `cargo test --release -p pathvector-rpki -- --ignored --nocapture staging_cost`.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn staging_cost_report() {
+        use std::time::Instant;
+
+        fn pdus(n: u32, base: u32) -> Vec<Pdu> {
+            (0..n)
+                .map(|i| Pdu::Ipv4Prefix {
+                    flags: PrefixFlags { announce: true },
+                    prefix_len: 24,
+                    max_len: 24,
+                    prefix: Ipv4Addr::from((base + i) << 8),
+                    asn: 64_512 + (i % 1000),
+                })
+                .collect()
+        }
+        let full = pdus(500_000, 0x0A_0000);
+        let delta = pdus(20_000, 0x2A_0000);
+
+        // Before: every Prefix PDU applied to the live table as it arrived.
+        let live = RoaTable::new();
+        let t = Instant::now();
+        for p in &full {
+            live.apply_prefix_pdu(p);
+        }
+        println!(
+            "direct apply   500k VRPs (old behaviour): {:?}",
+            t.elapsed()
+        );
+
+        // After: build a private snapshot, then swap it in.
+        let staged_target = RoaTable::new();
+        let t = Instant::now();
+        let mut snap = Snapshot::new();
+        for p in &full {
+            snap.apply(VrpOp::from_pdu(p).unwrap());
+        }
+        let build = t.elapsed();
+        let t = Instant::now();
+        let retired = staged_target.install(snap);
+        println!(
+            "stage+install  500k VRPs over an empty table: build {build:?}, install (both locks held) {:?}",
+            t.elapsed()
+        );
+        drop(retired);
+
+        // The full-reload path replaces an already-populated table: the
+        // locks must be held only for the swap, not for freeing the old
+        // trees.
+        let mut replacement = Snapshot::new();
+        for p in &full {
+            replacement.apply(VrpOp::from_pdu(p).unwrap());
+        }
+        let t = Instant::now();
+        let retired = staged_target.install(replacement);
+        let held = t.elapsed();
+        let t = Instant::now();
+        drop(retired);
+        println!(
+            "replace populated 500k table: locks held {held:?}; old trees freed afterwards, lock-free: {:?}",
+            t.elapsed()
+        );
+
+        // Incremental: 20k-op delta applied under both locks.
+        let ops: Vec<VrpOp> = delta.iter().map(|p| VrpOp::from_pdu(p).unwrap()).collect();
+        let t = Instant::now();
+        staged_target.apply_delta(&ops);
+        println!(
+            "apply_delta    20k ops on a 500k table (both locks held): {:?}",
+            t.elapsed()
+        );
+        println!("VrpOp size: {} bytes", std::mem::size_of::<VrpOp>());
     }
 
     #[test]

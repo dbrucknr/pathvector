@@ -1,3 +1,7 @@
+use std::time::Duration;
+
+use crate::pdu::RtrVersion;
+
 /// Errors produced by the RTR PDU codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PduError {
@@ -41,6 +45,61 @@ impl std::error::Error for PduError {
     }
 }
 
+/// An [`RtrConfig`](crate::RtrConfig) timer is outside what RFC 8210 §6
+/// permits a cache to advertise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RtrConfigError {
+    /// `field` is outside `min..=max`.
+    OutOfRange {
+        field: &'static str,
+        value: Duration,
+        min: Duration,
+        max: Duration,
+    },
+    /// RFC 8210 §6: "Caches MUST set Expire Interval to a value larger than
+    /// either Refresh Interval or Retry Interval." The configured defaults
+    /// (used for the first sync and for every v0 session) should honour the
+    /// same relationship.
+    ExpireNotAfterPollIntervals {
+        expire: Duration,
+        refresh: Duration,
+        retry: Duration,
+    },
+}
+
+impl std::fmt::Display for RtrConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+            } => write!(
+                f,
+                "RTR {field} of {}s is outside the RFC 8210 §6 range {}s..={}s",
+                value.as_secs(),
+                min.as_secs(),
+                max.as_secs()
+            ),
+            Self::ExpireNotAfterPollIntervals {
+                expire,
+                refresh,
+                retry,
+            } => write!(
+                f,
+                "RTR expire_interval ({}s) must be larger than both refresh_interval ({}s) \
+                 and retry_interval ({}s) (RFC 8210 §6)",
+                expire.as_secs(),
+                refresh.as_secs(),
+                retry.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RtrConfigError {}
+
 /// Errors produced by an RTR client session.
 #[derive(Debug)]
 pub enum RtrError {
@@ -53,9 +112,26 @@ pub enum RtrError {
     UnexpectedPdu { expected: &'static str, got: String },
     /// The server sent an Error Report PDU.
     ErrorReported { code: u16, text: String },
-    /// The session ID in an End of Data PDU does not match the one
-    /// established by the preceding Cache Response.
+    /// A PDU's Session ID does not match the session the router is in (the
+    /// remembered session for a Serial Query's Cache Response or a Serial
+    /// Notify; the Cache Response's session for End of Data).
     SessionIdMismatch { expected: u16, got: u16 },
+    /// A PDU arrived at a Protocol Version other than the one negotiated for
+    /// this session (RFC 8210 §7: the version "is stable for the life of the
+    /// session"; the party that sees a different one MUST drop the session).
+    UnexpectedVersion {
+        expected: RtrVersion,
+        got: RtrVersion,
+    },
+    /// A cache answered a Serial Query that resumed a session of one protocol
+    /// version at a lower one. RFC 8210 §5.1: sessions of different versions
+    /// are separate sessions, so the incremental response cannot be applied;
+    /// the client reconnects and performs a full resynchronisation at the
+    /// lower version.
+    VersionChanged {
+        resumed: RtrVersion,
+        answered: RtrVersion,
+    },
     /// The TCP connection closed unexpectedly.
     Closed,
 }
@@ -74,6 +150,15 @@ impl std::fmt::Display for RtrError {
             Self::SessionIdMismatch { expected, got } => {
                 write!(f, "RTR session ID mismatch: expected {expected}, got {got}")
             }
+            Self::UnexpectedVersion { expected, got } => write!(
+                f,
+                "RTR protocol version {got:?} PDU in a {expected:?} session"
+            ),
+            Self::VersionChanged { resumed, answered } => write!(
+                f,
+                "RTR cache answered a {resumed:?} session resume at {answered:?}; \
+                 resynchronising from scratch at {answered:?}"
+            ),
             Self::Closed => write!(f, "RTR connection closed"),
         }
     }

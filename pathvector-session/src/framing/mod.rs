@@ -9,7 +9,7 @@ use std::io;
 use bytes::{BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::message::{BgpMessage, CodecError, MAX_LEN, MAX_LEN_EXTENDED};
+use crate::message::{AsnWidth, BgpMessage, CodecError, MAX_LEN, MAX_LEN_EXTENDED};
 
 /// Total size of the BGP message header in bytes (marker + length + type).
 const HEADER_LEN: usize = 19;
@@ -88,24 +88,21 @@ impl From<CodecError> for FramingError {
 /// ```
 pub struct BgpCodec {
     max_msg_len: usize,
-    four_byte_asn_negotiated: bool,
+    asn_width: AsnWidth,
 }
 
 impl BgpCodec {
     /// Create a codec with the default RFC 4271 4096-byte limit.
     ///
-    /// Defaults to assuming the 4-octet AS number capability (RFC 6793) is
-    /// negotiated, matching this codec's own `encode` behavior — which
-    /// always emits AGGREGATOR in the 8-byte, 4-byte-ASN form regardless of
-    /// peer capabilities (encode-side capability-downgrade is a separate,
-    /// not-yet-implemented gap; see `TODO.md`). Call
-    /// [`Self::set_four_byte_asn`] once real negotiation completes to
-    /// reflect the peer's actual capabilities on the decode side.
+    /// Starts at [`AsnWidth::Four`] — what this implementation advertises —
+    /// for both decoding and encoding. Call [`Self::set_asn_width`] once
+    /// capability negotiation completes to reflect the peer's actual
+    /// capabilities in both directions (RFC 6793 §4).
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_msg_len: MAX_LEN,
-            four_byte_asn_negotiated: true,
+            asn_width: AsnWidth::Four,
         }
     }
 
@@ -115,12 +112,19 @@ impl BgpCodec {
         self.max_msg_len = if enabled { MAX_LEN_EXTENDED } else { MAX_LEN };
     }
 
-    /// Record whether RFC 6793's 4-octet AS number capability was negotiated
-    /// bilaterally with the peer (advertised to *and* received from them).
-    /// Governs AGGREGATOR's expected length per RFC 7606 §7.7. Call this
-    /// after capability negotiation completes (i.e. once Established).
-    pub fn set_four_byte_asn(&mut self, negotiated: bool) {
-        self.four_byte_asn_negotiated = negotiated;
+    /// Set the width of AS numbers on this session (RFC 6793 §4), derived
+    /// once from the OPEN exchange via [`AsnWidth::negotiate`]. Governs how
+    /// `AS_PATH` / `AGGREGATOR` are decoded (and `AS4_*` consumed) and how
+    /// they are encoded. Call after capability negotiation completes (i.e.
+    /// once Established).
+    pub fn set_asn_width(&mut self, asn_width: AsnWidth) {
+        self.asn_width = asn_width;
+    }
+
+    /// The width currently in effect.
+    #[must_use]
+    pub fn asn_width(&self) -> AsnWidth {
+        self.asn_width
     }
 }
 
@@ -159,7 +163,7 @@ impl Decoder for BgpCodec {
         Ok(Some(BgpMessage::decode_with_limit_and_caps(
             &frame,
             self.max_msg_len,
-            self.four_byte_asn_negotiated,
+            self.asn_width,
         )?))
     }
 }
@@ -170,7 +174,7 @@ impl Encoder<BgpMessage> for BgpCodec {
     type Error = io::Error;
 
     fn encode(&mut self, msg: BgpMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.put_slice(&msg.encode());
+        dst.put_slice(&msg.encode_with(self.asn_width));
         Ok(())
     }
 }

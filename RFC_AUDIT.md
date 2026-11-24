@@ -736,6 +736,23 @@ verifiable given the larger gap. No new `TODO.md` item — the existing
 deferred entry in `pathvector-session/RFC.md` already accurately describes
 this.
 
+**Update 2026-11-24 (issue #95) — gap closed, and a larger one found in the
+same audit's blind spot.** The audit above checked the *daemon's* handling of
+`AS4_PATH` and rated the encode side "Confirmed correct" because
+`AsPath::downgrade_for_two_byte_peer` substitutes AS_TRANS. It never looked at
+the *wire codec*, which wrote every `AS_PATH` ASN as four octets and read
+them as four octets regardless of the negotiated capability — so the
+substitution changed numbers, not widths, and a genuine two-octet UPDATE
+(`02 01 fd ea`) was rejected as a truncated AS_PATH and withdrawn. The
+receive-side reconstruction (§4.2.3), confed-in-AS4_PATH discard and
+malformed-`AS4_PATH` rules are now implemented in `pathvector-session`
+(`reconcile_as4_attributes`) with `AsPath::reconstruct_with_as4_path`; the
+NEW-NEW "MUST be discarded" clause is now an explicit discard (and is
+reported for logging) rather than an accident of the daemon ignoring the
+attribute. See `pathvector-session/RFC.md` for the clause-by-clause table.
+Lesson consistent with `CLAUDE.md`: an "implemented" row verified at one
+layer says nothing about the layer beneath it.
+
 ---
 
 # RFC 6396 — MRT Routing Information Export Format
@@ -811,6 +828,23 @@ ASPA). One real gap found regardless.
 
 **RFC 8210/6810 summary:** 5 clauses reviewed — 4 confirmed correct, 1
 confirmed gap. Filed in `TODO.md` (#21).
+
+**Update 2026-11-24 — four rows above were "Confirmed correct" in a way a
+later clause-by-clause review (GitHub issues #86, #87, #88, #90) showed to be
+too generous; each is now fixed and proven by a black-box regression test
+that fails on the previous code:**
+
+| Row above | What the audit missed | Resolution |
+|---|---|---|
+| §8.3 Cache Reset → Reset Query ("Confirmed correct", cited `cache_reset_mid_stream_triggers_full_resync_on_same_connection`) | That test sent Cache Reset *after* a Cache Response to a **Reset** Query and cited "§5.7" (the IPv6 Prefix section). RFC 8210 defines Cache Reset only as the reply to a **Serial** Query (§§5.3, 5.9, 8.3). The real §8.3 case was `UnexpectedPdu`, and a reconnect re-sent the refused Serial Query forever. | #87: handled in the query-response state; resume state forgotten at once; the mid-transfer test is replaced by `cache_reset_in_reply_to_serial_query_triggers_reset_query_on_same_connection` and friends. A Cache Reset anywhere else is now a violation. |
+| "Session ID validation" ("Confirmed correct (cross-referenced)") | Only End of Data was compared, and only against its own Cache Response — never against the remembered session (§5.1/§5.5), never for Serial Notify, never the protocol version (§5.8, §7). | #90: `protocol.rs` enforces version and session on every PDU, sends Error Report 0/8, flushes where §5.1 requires. |
+| "Client-side serial number handling … not applicable" | Correct about wraparound arithmetic, but it overlooked that the *commensurability* test (§5.1: version + session + serial together) is the client's job. | #90: `Resume` bundles the three; there is no serial without a session and version. |
+| (not audited) §4/§5.8 "completed response" and §6 Expire Interval | The audit listed timer handling as present; nothing enforced Expire, and half-applied transfers were visible. | #88 (staged, atomic publication) and #86 (monotonic expiry, independent of the session). |
+
+Still open from the same review, deliberately not touched here: #89
+(cancelled idle read loses partial frames), #91 (prefix/max length bounds), #92
+(duplicate announcement / unknown withdrawal, Error Codes 6/7), #93 (stalled-query
+deadlines, retry timing across reconnects), #94 (coverage-claim documentation).
 
 ---
 

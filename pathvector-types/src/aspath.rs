@@ -504,6 +504,126 @@ impl AsPath {
         )
     }
 
+    /// Returns `true` if any ASN in this path (in any segment type) is
+    /// non-mappable to a two-octet AS number — i.e. does not fit in 16 bits
+    /// (RFC 6793 §3: "non-mappable").
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath};
+    ///
+    /// assert!(!AsPath::from_sequence(vec![Asn::new(65001)]).has_non_mappable_asn());
+    /// assert!(AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131_072)]).has_non_mappable_asn());
+    /// ```
+    #[must_use]
+    pub fn has_non_mappable_asn(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|seg| seg.asns().iter().any(|a| a.is_four_byte()))
+    }
+
+    /// Reconstructs the true AS path from this `AS_PATH` (received from a
+    /// two-octet-only peer, so non-mappable ASNs appear as `AS_TRANS`) and
+    /// that peer's `AS4_PATH`, per RFC 6793 §4.2.3.
+    ///
+    /// RFC 6793 §4.2.3: "If the number of AS numbers in the `AS_PATH`
+    /// attribute is less than the number of AS numbers in the `AS4_PATH`
+    /// attribute, then the `AS4_PATH` attribute SHALL be ignored, and the
+    /// `AS_PATH` attribute SHALL be taken as the AS path information. If the
+    /// number of AS numbers in the `AS_PATH` attribute is larger than or equal
+    /// to the number of AS numbers in the `AS4_PATH` attribute, then the AS
+    /// path information SHALL be constructed by taking as many AS numbers
+    /// and path segments as necessary from the leading part of the `AS_PATH`
+    /// attribute, and then prepending them to the `AS4_PATH` attribute so that
+    /// the AS path information has a number of AS numbers identical to that
+    /// of the `AS_PATH` attribute. Note that a valid `AS_CONFED_SEQUENCE` or
+    /// `AS_CONFED_SET` path segment SHALL be prepended if it is either the
+    /// leading path segment or is adjacent to a path segment that is
+    /// prepended."
+    ///
+    /// The AS-number counts use [`path_length`](Self::path_length) — the
+    /// RFC 4271 §9.1.2.2 / RFC 5065 method the RFC names — so an `AS_SET`
+    /// counts as one and confederation segments count as zero. An
+    /// `AS_SEQUENCE` that straddles the boundary is split: only its leading
+    /// ASNs are taken. Adjacent `AS_SEQUENCE` segments at the join are
+    /// coalesced (up to the 255-ASN wire limit), so the result matches what
+    /// a four-octet speaker would have produced.
+    ///
+    /// Confederation segments in `as4_path` are ignored (RFC 6793 §6 forbids
+    /// them there; the wire decoder already discards them).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath};
+    ///
+    /// // AS 131072 -> OLD AS 65001 -> us. The OLD speaker saw AS_TRANS and
+    /// // prepended itself, so the wire AS_PATH is [65001, AS_TRANS] while
+    /// // AS4_PATH still carries [131072].
+    /// let as_path = AsPath::from_sequence(vec![Asn::new(65001), Asn::TRANS]);
+    /// let as4_path = AsPath::from_sequence(vec![Asn::new(131_072)]);
+    /// assert_eq!(
+    ///     as_path.reconstruct_with_as4_path(&as4_path),
+    ///     AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131_072)]),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn reconstruct_with_as4_path(&self, as4_path: &Self) -> Self {
+        let as4 = as4_path.strip_confed_segments();
+        if as4.segments.is_empty() {
+            return self.clone();
+        }
+        let n = self.path_length();
+        let m = as4.path_length();
+        if n < m {
+            return self.clone();
+        }
+
+        let mut remaining = n - m;
+        let mut out: Vec<AsPathSegment> = Vec::new();
+        // Walking from the front, every segment visited so far was taken, so
+        // a confederation segment here is either leading or adjacent to a
+        // prepended segment — exactly the RFC's condition for taking it.
+        for seg in &self.segments {
+            match seg {
+                AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_) => {
+                    out.push(seg.clone());
+                }
+                AsPathSegment::Sequence(asns) => {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if asns.len() <= remaining {
+                        remaining -= asns.len();
+                        out.push(seg.clone());
+                    } else {
+                        out.push(AsPathSegment::Sequence(asns[..remaining].to_vec()));
+                        break;
+                    }
+                }
+                AsPathSegment::Set(_) => {
+                    if remaining == 0 {
+                        break;
+                    }
+                    remaining -= 1;
+                    out.push(seg.clone());
+                }
+            }
+        }
+
+        let mut tail = as4.segments.into_iter();
+        if let (Some(AsPathSegment::Sequence(head)), Some(AsPathSegment::Sequence(first))) =
+            (out.last_mut(), tail.as_slice().first())
+            && head.len() + first.len() <= 255
+        {
+            head.extend_from_slice(first);
+            tail.next();
+        }
+        out.extend(tail);
+        Self { segments: out }
+    }
+
     /// Returns a new `AsPath` with all confederation segments removed.
     ///
     /// RFC 5065 §5.1 requires that `AS_CONFED_SEQUENCE` and `AS_CONFED_SET`
@@ -913,6 +1033,134 @@ mod tests {
         assert_eq!(asns[0], Asn::new(65001));
         assert_eq!(asns[1], Asn::TRANS);
         assert_eq!(asns[2], Asn::new(65002));
+    }
+
+    // ── RFC 6793 §4.2.3 reconstruction ────────────────────────────────────────
+    //
+    // Expected values are derived by hand from the RFC text: take (N - M)
+    // leading AS numbers/segments from AS_PATH and prepend them to AS4_PATH,
+    // where N, M are the RFC 4271 §9.1.2.2 / RFC 5065 path lengths.
+
+    fn seq(v: &[u32]) -> AsPathSegment {
+        AsPathSegment::Sequence(v.iter().map(|&a| Asn::new(a)).collect())
+    }
+    fn set(v: &[u32]) -> AsPathSegment {
+        AsPathSegment::Set(v.iter().map(|&a| Asn::new(a)).collect())
+    }
+    fn cseq(v: &[u32]) -> AsPathSegment {
+        AsPathSegment::ConfedSequence(v.iter().map(|&a| Asn::new(a)).collect())
+    }
+
+    #[test]
+    fn reconstruct_equal_length_takes_as4_path_wholesale() {
+        // OLD speaker saw 131072 as AS_TRANS; no extra hops were added.
+        let as_path = AsPath::from_segments(vec![seq(&[23456, 65001])]);
+        let as4 = AsPath::from_segments(vec![seq(&[131_072, 65001])]);
+        assert_eq!(as_path.reconstruct_with_as4_path(&as4), as4);
+    }
+
+    #[test]
+    fn reconstruct_prepends_leading_as_path_hops_to_as4_path() {
+        // N=3, M=2: one leading AS (the OLD speaker, 64512) is prepended.
+        let as_path = AsPath::from_segments(vec![seq(&[64512, 23456, 65001])]);
+        let as4 = AsPath::from_segments(vec![seq(&[131_072, 65001])]);
+        assert_eq!(
+            as_path.reconstruct_with_as4_path(&as4),
+            AsPath::from_segments(vec![seq(&[64512, 131_072, 65001])]),
+        );
+    }
+
+    #[test]
+    fn reconstruct_ignores_as4_path_longer_than_as_path() {
+        // §4.2.3: N < M -> AS4_PATH SHALL be ignored.
+        let as_path = AsPath::from_segments(vec![seq(&[23456])]);
+        let as4 = AsPath::from_segments(vec![seq(&[131_072, 131_073])]);
+        assert_eq!(as_path.reconstruct_with_as4_path(&as4), as_path);
+    }
+
+    #[test]
+    fn reconstruct_counts_as_set_as_one() {
+        // AS_PATH: seq(64512) + set(23456, 65001) -> N = 2; AS4: set(...) -> M = 1.
+        let as_path = AsPath::from_segments(vec![seq(&[64512]), set(&[23456, 65001])]);
+        let as4 = AsPath::from_segments(vec![set(&[131_072, 65001])]);
+        assert_eq!(
+            as_path.reconstruct_with_as4_path(&as4),
+            AsPath::from_segments(vec![seq(&[64512]), set(&[131_072, 65001])]),
+        );
+    }
+
+    #[test]
+    fn reconstruct_takes_leading_confed_segment() {
+        // RFC 6793 §4.2.3: a leading AS_CONFED_SEQUENCE SHALL be prepended;
+        // it counts as zero ASNs (RFC 5065) so N = 2, M = 1.
+        let as_path = AsPath::from_segments(vec![cseq(&[65010]), seq(&[64512, 23456])]);
+        let as4 = AsPath::from_segments(vec![seq(&[131_072])]);
+        assert_eq!(
+            as_path.reconstruct_with_as4_path(&as4),
+            AsPath::from_segments(vec![cseq(&[65010]), seq(&[64512, 131_072])]),
+        );
+    }
+
+    #[test]
+    fn reconstruct_takes_confed_segment_adjacent_to_prepended_segment() {
+        // [seq(64512)] is prepended (N=2, M=1); the confed segment that
+        // follows is adjacent to it, so it is prepended too (§4.2.3).
+        let as_path = AsPath::from_segments(vec![seq(&[64512]), cseq(&[65010]), seq(&[23456])]);
+        let as4 = AsPath::from_segments(vec![seq(&[131_072])]);
+        assert_eq!(
+            as_path.reconstruct_with_as4_path(&as4),
+            AsPath::from_segments(vec![seq(&[64512]), cseq(&[65010]), seq(&[131_072])]),
+        );
+    }
+
+    #[test]
+    fn reconstruct_does_not_take_confed_segment_beyond_the_prepended_region() {
+        // N == M: nothing is prepended and the trailing confed segment is
+        // not adjacent to a prepended segment, so it is replaced by AS4_PATH.
+        let as_path = AsPath::from_segments(vec![seq(&[23456]), cseq(&[65010])]);
+        let as4 = AsPath::from_segments(vec![seq(&[131_072])]);
+        assert_eq!(as_path.reconstruct_with_as4_path(&as4), as4);
+    }
+
+    #[test]
+    fn reconstruct_ignores_confed_segments_in_as4_path() {
+        // RFC 6793 §6 forbids confed segments in AS4_PATH; they must not
+        // contribute to M or be copied into the result.
+        let as_path = AsPath::from_segments(vec![seq(&[64512, 23456])]);
+        let as4 = AsPath::from_segments(vec![cseq(&[65010]), seq(&[131_072])]);
+        assert_eq!(
+            as_path.reconstruct_with_as4_path(&as4),
+            AsPath::from_segments(vec![seq(&[64512, 131_072])]),
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_empty_as4_path_is_identity() {
+        let as_path = AsPath::from_segments(vec![seq(&[64512, 23456])]);
+        assert_eq!(as_path.reconstruct_with_as4_path(&AsPath::new()), as_path);
+        let confed_only = AsPath::from_segments(vec![cseq(&[65010])]);
+        assert_eq!(as_path.reconstruct_with_as4_path(&confed_only), as_path);
+    }
+
+    #[test]
+    fn reconstruct_does_not_coalesce_past_255_asns() {
+        let head: Vec<u32> = (1..=200).collect();
+        let tail: Vec<u32> = (1001..=1100).collect();
+        let mut wire: Vec<u32> = head.clone();
+        wire.extend(std::iter::repeat_n(23456, 100));
+        let as_path = AsPath::from_segments(vec![seq(&wire)]);
+        let as4 = AsPath::from_segments(vec![seq(&tail)]);
+        let got = as_path.reconstruct_with_as4_path(&as4);
+        assert_eq!(got.path_length(), 300);
+        assert_eq!(got.segments(), &[seq(&head), seq(&tail)]);
+    }
+
+    #[test]
+    fn has_non_mappable_asn_inspects_every_segment_type() {
+        assert!(!AsPath::new().has_non_mappable_asn());
+        assert!(!AsPath::from_segments(vec![seq(&[65535, 23456])]).has_non_mappable_asn());
+        assert!(AsPath::from_segments(vec![seq(&[1]), set(&[65536])]).has_non_mappable_asn());
+        assert!(AsPath::from_segments(vec![cseq(&[70000])]).has_non_mappable_asn());
     }
 
     #[test]

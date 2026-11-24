@@ -44,6 +44,7 @@ field live in `pathvector-session`.
 |---|---|---|---|
 | `Asn` stored as 32-bit value | `src/asn.rs` | ✅ | `test_asn_new_and_value`, `test_asn_is_four_byte` |
 | `AS_TRANS` (23456) is a named constant | `src/asn.rs` | ✅ | `test_asn_is_trans` |
+| §4.2.3: `AsPath::reconstruct_with_as4_path` — N<M ignores `AS4_PATH`; otherwise take N−M leading ASNs (sets count 1, confed 0), split a straddling sequence, keep leading/adjacent confed segments, ignore confed in `AS4_PATH` | `src/aspath.rs` | ✅ | `reconstruct_*`, `has_non_mappable_asn_inspects_every_segment_type` |
 
 ---
 
