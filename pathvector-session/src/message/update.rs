@@ -1001,19 +1001,20 @@ pub fn encode_attributes(attrs: &[PathAttribute]) -> Vec<u8> {
 ///   has not attached them already, `AS4_PATH` (confederation segments
 ///   excluded, and only when some non-confederation ASN is non-mappable) and
 ///   `AS4_AGGREGATOR` (only when the aggregating AS is non-mappable) are
-///   appended, so the true values are never silently lost.
+///   appended, so the true values are never silently lost. An `AS4_PATH`
+///   with no segments is never written: RFC 6793 §6 calls an `AS4_PATH`
+///   "too small (i.e., less than 6)" malformed.
 fn encode_path_attributes(attrs: &[PathAttribute], asn_width: AsnWidth) -> Vec<u8> {
     let mut out = Writer::new();
     for attr in attrs {
-        if asn_width.is_four()
-            && matches!(
-                attr,
-                PathAttribute::As4Path(_) | PathAttribute::As4Aggregator { .. }
-            )
-        {
-            continue;
+        let skip = match attr {
+            PathAttribute::As4Path(p) => asn_width.is_four() || p.is_empty(),
+            PathAttribute::As4Aggregator { .. } => asn_width.is_four(),
+            _ => false,
+        };
+        if !skip {
+            encode_one_path_attr(&mut out, attr, asn_width);
         }
-        encode_one_path_attr(&mut out, attr, asn_width);
     }
     if !asn_width.is_four() {
         append_missing_as4_attributes(&mut out, attrs);
@@ -1025,7 +1026,9 @@ fn encode_path_attributes(attrs: &[PathAttribute], asn_width: AsnWidth) -> Vec<u
 /// peer when `attrs` carries non-mappable ASNs but not the attribute that
 /// preserves them.
 fn append_missing_as4_attributes(out: &mut Writer, attrs: &[PathAttribute]) {
-    let has_as4_path = attrs.iter().any(|a| matches!(a, PathAttribute::As4Path(_)));
+    let has_as4_path = attrs
+        .iter()
+        .any(|a| matches!(a, PathAttribute::As4Path(p) if !p.is_empty()));
     if !has_as4_path
         && let Some(PathAttribute::AsPath(path)) =
             attrs.iter().find(|a| matches!(a, PathAttribute::AsPath(_)))

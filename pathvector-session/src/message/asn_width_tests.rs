@@ -834,3 +834,30 @@ fn encode_for_old_peer_then_decode_as_old_peer_recovers_the_true_path() {
             .any(|a| matches!(a, PathAttribute::As4Path(_)))
     );
 }
+
+/// RFC 6793 §6 calls an AS4_PATH shorter than 6 octets malformed, so an
+/// empty one (e.g. a caller that stripped confederation segments from a
+/// path that had only those) must never be written — and it must not
+/// suppress the generation of a real one either.
+#[test]
+fn empty_as4_path_is_never_written() {
+    let msg = update_with(vec![
+        p(vec![seq(&[65001])]),
+        PathAttribute::As4Path(AsPath::new()),
+    ]);
+    assert_eq!(
+        attr_block(&msg.encode_with(AsnWidth::Two)),
+        &[0x40, 0x02, 0x04, 0x02, 0x01, 0xfd, 0xe9]
+    );
+    let msg = update_with(vec![
+        p(vec![seq(&[131_072])]),
+        PathAttribute::As4Path(AsPath::new()),
+    ]);
+    assert_eq!(
+        attr_block(&msg.encode_with(AsnWidth::Two)),
+        &[
+            0x40, 0x02, 0x04, 0x02, 0x01, 0x5b, 0xa0, 0xC0, 0x11, 0x06, 0x02, 0x01, 0x00, 0x02,
+            0x00, 0x00
+        ]
+    );
+}
