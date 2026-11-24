@@ -370,10 +370,21 @@ impl Exchange {
             {
                 Ok(Step::DowngradeToV0 { text: text.clone() })
             }
-            // §12 Error Code 2 is the only non-fatal error code.
+            // §12 Error Code 2 is the only non-fatal error code. It is still
+            // a PDU of the session: once the version is agreed, one at
+            // another version ends the session (§7) — silently, since no
+            // Error Report is sent in reply to an Error Report.
             Pdu::ErrorReport {
                 error_code, text, ..
             } if *error_code == ERROR_CODE_NO_DATA_AVAILABLE => {
+                if let Negotiation::Agreed(v) = self.negotiation
+                    && wire != v
+                {
+                    return Err(Violation {
+                        report: None,
+                        ..Violation::unexpected_version(v, wire)
+                    });
+                }
                 Ok(Step::NoDataAvailable { text: text.clone() })
             }
             Pdu::ErrorReport {
@@ -695,6 +706,35 @@ mod tests {
                 got: V0
             }
         ));
+    }
+
+    /// §7: "If either party receives a PDU for a different Protocol Version
+    /// once the above negotiation completes, that party MUST drop the
+    /// session" — the Error Report exception only means no Error Report is
+    /// *sent back*. So even the one non-fatal error (code 2) at another
+    /// version ends the session, silently.
+    #[test]
+    fn error_code_2_at_other_version_after_agreement_drops_the_session_silently() {
+        let report = Pdu::ErrorReport {
+            error_code: ERROR_CODE_NO_DATA_AVAILABLE,
+            pdu_copy: vec![],
+            text: "no data".into(),
+        };
+        let v = violation(Exchange::new(Query::Reset, Negotiation::Agreed(V1)).on_pdu(V0, &report));
+        assert!(matches!(v.error, RtrError::UnexpectedVersion { .. }));
+        assert_eq!(v.report, None, "never answer an Error Report with one");
+        assert_eq!(v.consequence, Consequence::Drop);
+        // At the agreed version it is still the non-fatal retry signal, and
+        // while negotiating any version is acceptable.
+        for (neg, wire) in [
+            (Negotiation::Agreed(V1), V1),
+            (Negotiation::Proposed(V1), V0),
+        ] {
+            assert!(matches!(
+                Exchange::new(Query::Reset, neg).on_pdu(wire, &report),
+                Ok(Step::NoDataAvailable { .. })
+            ));
+        }
     }
 
     /// Cache Reset is a PDU of the session too.

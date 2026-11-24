@@ -31,7 +31,8 @@
 //!
 //! * Full load: records are inserted into a private [`Snapshot`] (same
 //!   per-record cost as before) and installed with an O(1) pointer swap under
-//!   both family locks. Peak memory is old + new table for the duration of
+//!   both family locks; the replaced trees are freed afterwards, outside every
+//!   lock (freeing 500 000 VRPs takes ≈ 20 ms). Peak memory is old + new table for the duration of
 //!   the load — the price of keeping the old generation valid meanwhile.
 //! * Incremental: one `VrpOp` (≈ 32 bytes) per Prefix PDU is staged, then
 //!   applied in order under both family locks. Validation is blocked for
@@ -47,7 +48,7 @@ use tokio::{sync::watch, time::Instant as MonotonicInstant};
 use crate::{
     pdu::{Pdu, RtrVersion},
     protocol::{Query, Resume},
-    table::{RoaTable, Snapshot, VrpOp},
+    table::{Retired, RoaTable, Snapshot, VrpOp},
 };
 
 /// A point-in-time snapshot of RTR session health, for operator visibility
@@ -267,17 +268,19 @@ impl Shared {
         resume: Resume,
         expire: Duration,
     ) -> Result<(), Stale> {
+        let retired;
         {
             let mut core = self.core.write().unwrap();
-            match staged {
-                Staged::Full(snapshot) => self.table.install(snapshot),
+            retired = match staged {
+                Staged::Full(snapshot) => Some(self.table.install(snapshot)),
                 Staged::Delta { base, ops } => {
                     if base != core.epoch {
                         return Err(Stale);
                     }
                     self.table.apply_delta(&ops);
+                    None
                 }
-            }
+            };
             core.resume = Some(resume);
             let now = MonotonicInstant::now();
             let deadline = now + expire;
@@ -295,7 +298,10 @@ impl Shared {
                 expired: false,
             };
         }
+        // Free the replaced generation only now: no lock is held and
+        // subscribers already know the new one is live.
         self.notify();
+        drop(retired);
         Ok(())
     }
 
@@ -304,21 +310,23 @@ impl Shared {
     /// validation results just changed — notifies subscribers so policy is
     /// re-evaluated against the (now empty) cache.
     pub(crate) fn flush(&self) {
-        let had_data = {
+        let (had_data, retired) = {
             let mut core = self.core.write().unwrap();
             self.invalidate(&mut core)
         };
         if had_data {
             self.notify();
         }
+        drop(retired);
     }
 
     /// Discards every VRP and all resume state, under the caller's `core`
     /// lock. Returns whether there was any data (i.e. whether validation
-    /// results changed).
-    fn invalidate(&self, core: &mut Core) -> bool {
-        let had_data = !self.table.is_empty();
-        self.table.clear();
+    /// results changed) and the discarded trees, which the caller must drop
+    /// only after releasing the lock (freeing them is O(size)).
+    fn invalidate(&self, core: &mut Core) -> (bool, Retired) {
+        let had_data = core.status.roa_count != 0;
+        let retired = self.table.take_all();
         core.resume = None;
         core.epoch = Epoch(core.epoch.0.wrapping_add(1));
         core.expiry = None;
@@ -327,7 +335,7 @@ impl Shared {
         core.status.roa_count = 0;
         core.status.version = None;
         core.status.expires_at = None;
-        had_data
+        (had_data, retired)
     }
 
     /// RFC 8210 §6: "The router MUST NOT retain the data past the time
@@ -339,23 +347,24 @@ impl Shared {
     /// Returns `false` without effect if `deadline` is no longer the current
     /// one (a sync completed, or the data was flushed, in the meantime).
     pub(crate) fn expire(&self, deadline: MonotonicInstant) -> bool {
-        let had_data = {
+        let (had_data, retired) = {
             let mut core = self.core.write().unwrap();
             if core.expiry != Some(deadline) {
                 return false;
             }
-            let had_data = self.invalidate(&mut core);
+            let (had_data, retired) = self.invalidate(&mut core);
             core.status.expired = true;
             core.status.last_error = Some(
                 "cache data expired: no sync completed within the cache's Expire Interval \
                  (RFC 8210 §6); all VRPs discarded"
                     .to_string(),
             );
-            had_data
+            (had_data, retired)
         };
         if had_data {
             self.notify();
         }
+        drop(retired);
         true
     }
 

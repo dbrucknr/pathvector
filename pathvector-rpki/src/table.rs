@@ -95,10 +95,6 @@ impl<A: IpAddress> FamilyTable<A> {
         self.0.iter().map(|(_, entries)| entries.len()).sum()
     }
 
-    fn clear(&mut self) {
-        self.0 = RouteMap::new();
-    }
-
     /// RFC 6811 §2, composed from `RouteMap` primitives — see module docs.
     fn validate(&self, prefix: A, prefix_len: u8, origin_asn: u32) -> RoaValidity {
         // Fast path: `longest_match_entry` finds the most specific *registered*
@@ -322,11 +318,19 @@ impl RoaTable {
     /// are taken (always v4 then v6) and the trees swapped, so a validation
     /// sees either the old set or the new one — never a mixture, and never a
     /// partially loaded one.
-    pub(crate) fn install(&self, snapshot: Snapshot) {
+    ///
+    /// The previous trees are *returned*, not dropped here: freeing a
+    /// 500 000-VRP tree is O(size), and doing it while the write guards are
+    /// held would block validation for that long. The caller drops the
+    /// [`Retired`] value once no lock is held.
+    #[must_use = "drop the retired trees after releasing locks, not while holding them"]
+    pub(crate) fn install(&self, snapshot: Snapshot) -> Retired {
         let mut v4 = self.v4.write().unwrap();
         let mut v6 = self.v6.write().unwrap();
-        *v4 = snapshot.v4;
-        *v6 = snapshot.v6;
+        Retired {
+            v4: std::mem::replace(&mut *v4, snapshot.v4),
+            v6: std::mem::replace(&mut *v6, snapshot.v6),
+        }
     }
 
     /// Applies a staged change set in order under both family locks, so a
@@ -344,11 +348,35 @@ impl RoaTable {
         }
     }
 
-    /// Clears all ROA data. Called on `CacheReset` / session-ID mismatch —
-    /// see `client.rs`'s state machine for when this fires.
+    /// Removes all ROA data in O(1), returning the old trees for the caller
+    /// to drop once no lock is held (see [`RoaTable::install`]).
+    #[must_use = "drop the retired trees after releasing locks, not while holding them"]
+    pub(crate) fn take_all(&self) -> Retired {
+        self.install(Snapshot::new())
+    }
+
+    /// Clears all ROA data. The old trees are freed after the table locks
+    /// are released.
+    #[cfg(test)]
     pub(crate) fn clear(&self) {
-        self.v4.write().unwrap().clear();
-        self.v6.write().unwrap().clear();
+        drop(self.take_all());
+    }
+}
+
+/// The previous generation's trees, swapped out of the table so their
+/// destruction (O(size)) happens outside any lock.
+pub(crate) struct Retired {
+    // Held only so that dropping `Retired` drops them.
+    #[allow(dead_code)]
+    v4: FamilyTable<Ipv4Addr>,
+    #[allow(dead_code)]
+    v6: FamilyTable<Ipv6Addr>,
+}
+
+impl Retired {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
     }
 }
 
@@ -690,6 +718,39 @@ mod tests {
         assert!(table.is_empty());
     }
 
+    /// `install` hands the previous generation back instead of freeing it
+    /// under the write locks (O(size) otherwise), and the new generation is
+    /// what validation sees.
+    #[test]
+    fn install_returns_the_previous_generation_for_deferred_drop() {
+        let table = RoaTable::new();
+        for asn in [65001, 65002] {
+            table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
+                flags: PrefixFlags { announce: true },
+                prefix_len: 24,
+                max_len: 24,
+                prefix: Ipv4Addr::new(192, 0, 2, 0),
+                asn,
+            });
+        }
+        let mut snap = Snapshot::new();
+        snap.apply(
+            VrpOp::from_pdu(&Pdu::Ipv6Prefix {
+                flags: PrefixFlags { announce: true },
+                prefix_len: 32,
+                max_len: 32,
+                prefix: "2001:db8::".parse().unwrap(),
+                asn: 65009,
+            })
+            .unwrap(),
+        );
+        let retired = table.install(snap);
+        assert_eq!(retired.len(), 2);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.take_all().len(), 1);
+        assert!(table.is_empty());
+    }
+
     #[test]
     fn roa_table_clear_removes_data() {
         let table = RoaTable::new();
@@ -746,9 +807,27 @@ mod tests {
         }
         let build = t.elapsed();
         let t = Instant::now();
-        staged_target.install(snap);
+        let retired = staged_target.install(snap);
         println!(
-            "stage+install  500k VRPs: build {build:?}, install (both locks held) {:?}",
+            "stage+install  500k VRPs over an empty table: build {build:?}, install (both locks held) {:?}",
+            t.elapsed()
+        );
+        drop(retired);
+
+        // The full-reload path replaces an already-populated table: the
+        // locks must be held only for the swap, not for freeing the old
+        // trees.
+        let mut replacement = Snapshot::new();
+        for p in &full {
+            replacement.apply(VrpOp::from_pdu(p).unwrap());
+        }
+        let t = Instant::now();
+        let retired = staged_target.install(replacement);
+        let held = t.elapsed();
+        let t = Instant::now();
+        drop(retired);
+        println!(
+            "replace populated 500k table: locks held {held:?}; old trees freed afterwards, lock-free: {:?}",
             t.elapsed()
         );
 

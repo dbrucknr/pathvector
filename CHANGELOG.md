@@ -33,7 +33,7 @@ none of the four clauses is changed by them.
   update) and published with the serial, status and the notification at a validated End
   of Data, so a failed sync leaves the previous generation intact and resumable. Required
   invalidation (§5.1 flush) now notifies subscribers. Measured on an M2 Max: a 500 000-VRP
-  load stages in 51 ms and installs in ≈ 0.3 µs; a 20 000-record delta applies in 1.9 ms
+  load stages in 51 ms and installs in ≈ 0.3 µs (the replaced tables are freed after the locks are released, ≈ 20 ms); a 20 000-record delta applies in 1.9 ms
   under the table locks. A full load now needs old + new tables in memory at once.
 - **#86 Cache expiry (§6).** The Expire Interval was read and thrown away. A monotonic
   deadline (`End of Data + Expire`) is now enforced by a watcher that runs independently

@@ -225,7 +225,7 @@ notification change *together*. A transfer that fails (connection loss, malforme
 protocol violation) leaves the previous generation, its serial and its notifications
 untouched, and the reconnect resumes from exactly that generation. See `src/cache.rs`.
 Cost, measured on an M2 Max: staging a 500 000-VRP load takes 51 ms and installing it is a
-pointer swap under the table locks (≈ 0.3 µs); applying a 20 000-record delta holds the
+pointer swap under the table locks (≈ 0.3 µs; the replaced 500 000-VRP tables are freed afterwards, outside the locks, in ≈ 20 ms); applying a 20 000-record delta holds the
 locks for ≈ 1.9 ms. The price is memory — old and new tables coexist during a full load.
 
 **What the client does about a protocol violation** (all decided in the pure
