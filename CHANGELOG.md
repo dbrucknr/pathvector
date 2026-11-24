@@ -252,10 +252,12 @@ changing the architecture. New Prometheus histograms (real buckets, 100 µs–30
 so `histogram_quantile()` works):
 
 - `pathvectord_state_lock_wait_seconds{kind}` / `pathvectord_state_lock_hold_seconds{kind}` —
-  every production write-lock acquisition on `DaemonState` (event loop,
+  every steady-state write-lock acquisition on `DaemonState` (event loop,
   RPKI install/re-evaluation, FIB change, GR deadline, selection deferral,
   max-prefix idle, MRAI, and the mutating gRPC handlers) via the new
   `lock_timing::write_timed` guard. `kind` is the call site, never peer-derived.
+  The single startup acquisition that wires the FIB writer and route oracles
+  before any session exists is deliberately not timed.
 - `pathvectord_event_loop_batch_events` — events coalesced under one
   `event_batch` hold (the drain loop is currently uncapped).
 - `pathvector_session_event_send_blocked_seconds{peer}` — time a session task
