@@ -5,6 +5,7 @@ use pathvector_types::{
     LargeCommunity, NextHop, Nlri, Origin, Safi,
 };
 
+use super::asn_width::AsnWidth;
 use super::error::CodecError;
 use super::header::{MessageType, encode_header};
 use super::notification::{NotificationError, UpdateMsgError};
@@ -198,13 +199,13 @@ pub struct UpdateMessage {
 }
 
 impl UpdateMessage {
-    /// `four_byte_asn` reflects whether RFC 6793's 4-octet AS number
-    /// capability was negotiated bilaterally with this peer (advertised to
-    /// *and* received from them) — it governs AGGREGATOR's expected length
-    /// per RFC 7606 §7.7 (see `decode_attr_value`).
+    /// `asn_width` is the session's negotiated AS-number width (RFC 6793
+    /// §4): it sets the width of every ASN in `AS_PATH` and `AGGREGATOR`
+    /// (RFC 7606 §7.7 lengths included) and decides how `AS4_PATH` /
+    /// `AS4_AGGREGATOR` are consumed (see [`reconcile_as4_attributes`]).
     pub(super) fn decode(
         cur: &mut Cursor<'_>,
-        four_byte_asn: bool,
+        asn_width: AsnWidth,
     ) -> Result<UpdateDecodeOutcome, CodecError> {
         // Withdrawn routes — structural error → session reset.
         let withdrawn_len = cur.read_u16()? as usize;
@@ -215,7 +216,7 @@ impl UpdateMessage {
         // per-attribute errors collected for RFC 7606 handling.
         let attrs_len = cur.read_u16()? as usize;
         let mut attrs_cur = cur.fork(attrs_len)?;
-        let (attributes, attr_errors) = decode_path_attributes(&mut attrs_cur, four_byte_asn)?;
+        let (attributes, attr_errors) = decode_path_attributes(&mut attrs_cur, asn_width)?;
 
         // Announced NLRIs — structural error → session reset.
         let announced = decode_nlri_list_v4(cur)?;
@@ -244,9 +245,9 @@ impl UpdateMessage {
         }
     }
 
-    pub(super) fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode_with(&self, asn_width: AsnWidth) -> Vec<u8> {
         let withdrawn_bytes = encode_nlri_list_v4(&self.withdrawn);
-        let attrs_bytes = encode_path_attributes(&self.attributes);
+        let attrs_bytes = encode_path_attributes(&self.attributes, asn_width);
         let announced_bytes = encode_nlri_list_v4(&self.announced);
 
         let mut body = Writer::new();
@@ -353,7 +354,7 @@ fn encode_nlri_list_v4(nlris: &[Nlri<Ipv4Addr>]) -> Vec<u8> {
 /// first occurrence is kept, later ones are dropped with no error at all.
 fn decode_path_attributes(
     cur: &mut Cursor<'_>,
-    four_byte_asn: bool,
+    asn_width: AsnWidth,
 ) -> Result<(Vec<PathAttribute>, Vec<AttributeDecodeError>), CodecError> {
     let mut attrs = Vec::new();
     let mut errors: Vec<AttributeDecodeError> = Vec::new();
@@ -459,7 +460,7 @@ fn decode_path_attributes(
             continue;
         }
 
-        match decode_attr_value(flags, type_code, &mut val, four_byte_asn) {
+        match decode_attr_value(flags, type_code, &mut val, asn_width) {
             Ok(attr) => attrs.push(attr),
             Err(e) => errors.push(AttributeDecodeError {
                 type_code,
@@ -469,6 +470,8 @@ fn decode_path_attributes(
         }
     }
 
+    reconcile_as4_attributes(&mut attrs, &mut errors, asn_width);
+
     Ok((attrs, errors))
 }
 
@@ -477,7 +480,7 @@ fn decode_attr_value(
     flags: u8,
     type_code: u8,
     cur: &mut Cursor<'_>,
-    four_byte_asn: bool,
+    asn_width: AsnWidth,
 ) -> Result<PathAttribute, CodecError> {
     match type_code {
         ATTR_ORIGIN => {
@@ -493,7 +496,7 @@ fn decode_attr_value(
         }
 
         ATTR_AS_PATH => {
-            let segments = decode_as_path_segments(cur)?;
+            let segments = decode_as_path_segments(cur, ATTR_AS_PATH, asn_width)?;
             Ok(PathAttribute::AsPath(AsPath::from_segments(segments)))
         }
 
@@ -556,7 +559,7 @@ fn decode_attr_value(
             // number capability is *not* negotiated bilaterally with this
             // peer, or != 8 when it *is* (both advertised to and received
             // from the peer — RFC 6793).
-            if four_byte_asn {
+            if asn_width.is_four() {
                 if cur.remaining() != 8 {
                     return Err(CodecError::InvalidAttribute {
                         type_code,
@@ -671,7 +674,17 @@ fn decode_attr_value(
         }
 
         ATTR_AS4_PATH => {
-            let segments = decode_as_path_segments(cur)?;
+            // RFC 6793 §6: "the attribute length is not a multiple of two or
+            // is too small (i.e., less than 6) for the attribute to carry at
+            // least one AS number" is malformed (attribute discard).
+            if cur.remaining() < 6 || !cur.remaining().is_multiple_of(2) {
+                return Err(CodecError::InvalidAttribute {
+                    type_code,
+                    detail: "AS4_PATH length must be an even number of at least 6 bytes",
+                });
+            }
+            // AS4_PATH always carries four-octet ASNs, whatever the session width.
+            let segments = decode_as_path_segments(cur, ATTR_AS4_PATH, AsnWidth::Four)?;
             Ok(PathAttribute::As4Path(AsPath::from_segments(segments)))
         }
 
@@ -719,32 +732,175 @@ fn decode_attr_value(
     }
 }
 
-/// Decode `AS_PATH` or `AS4_PATH` segments (always 4-byte ASNs).
-fn decode_as_path_segments(cur: &mut Cursor<'_>) -> Result<Vec<AsPathSegment>, CodecError> {
+/// Decode `AS_PATH` (at the session's `width`) or `AS4_PATH` (always
+/// [`AsnWidth::Four`]) segments. `type_code` only labels errors.
+///
+/// Each segment is `type(1) | count(1) | count × width.octets()`. Per RFC 7606
+/// §7.2 a segment is malformed — and the attribute therefore treated as
+/// withdraw — when its type is unrecognized, its count is zero, or its count
+/// would overrun the attribute; RFC 6793 §6 lists the same three conditions
+/// as malformed for `AS4_PATH`. A single trailing octet (no room for a segment
+/// header) fails the `count` read and is the RFC's "underrun" case.
+fn decode_as_path_segments(
+    cur: &mut Cursor<'_>,
+    type_code: u8,
+    width: AsnWidth,
+) -> Result<Vec<AsPathSegment>, CodecError> {
     let mut segments = Vec::new();
     while cur.remaining() > 0 {
         let seg_type = cur.read_u8()?;
         let count = cur.read_u8()? as usize;
-        let mut asns = Vec::with_capacity(count);
-        for _ in 0..count {
-            if cur.remaining() < 4 {
-                return Err(CodecError::InvalidAttribute {
-                    type_code: ATTR_AS_PATH,
-                    detail: "truncated ASN in AS_PATH segment",
-                });
-            }
-            asns.push(Asn::new(cur.read_u32()?));
+        if !matches!(
+            seg_type,
+            SEG_SET | SEG_SEQUENCE | SEG_CONFED_SEQUENCE | SEG_CONFED_SET
+        ) {
+            return Err(CodecError::UnknownAsPathSegmentType(seg_type));
         }
-        let seg = match seg_type {
+        if count == 0 {
+            return Err(CodecError::InvalidAttribute {
+                type_code,
+                detail: "AS_PATH segment has zero length",
+            });
+        }
+        // One bounds check per segment instead of one per ASN.
+        let raw =
+            cur.read_bytes(count * width.octets())
+                .map_err(|_| CodecError::InvalidAttribute {
+                    type_code,
+                    detail: "truncated ASN in AS_PATH segment",
+                })?;
+        let asns: Vec<Asn> = match width {
+            AsnWidth::Four => raw
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| Asn::new(u32::from_be_bytes(*c)))
+                .collect(),
+            AsnWidth::Two => raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| Asn::new(u32::from(u16::from_be_bytes(*c))))
+                .collect(),
+        };
+        segments.push(match seg_type {
             SEG_SET => AsPathSegment::Set(asns),
             SEG_SEQUENCE => AsPathSegment::Sequence(asns),
             SEG_CONFED_SEQUENCE => AsPathSegment::ConfedSequence(asns),
-            SEG_CONFED_SET => AsPathSegment::ConfedSet(asns),
-            _ => return Err(CodecError::UnknownAsPathSegmentType(seg_type)),
-        };
-        segments.push(seg);
+            _ => AsPathSegment::ConfedSet(asns),
+        });
     }
     Ok(segments)
+}
+
+/// Apply RFC 6793's `AS4_PATH` / `AS4_AGGREGATOR` receive rules to the
+/// decoded attributes, so the rest of the system only ever sees the true
+/// four-octet path and aggregator, never the transition attributes.
+///
+/// - [`AsnWidth::Four`] (RFC 6793 §4.1 / §6): "A NEW BGP speaker that
+///   receives the `AS4_PATH` attribute or the `AS4_AGGREGATOR` attribute in an
+///   UPDATE message from another NEW BGP speaker MUST discard the path
+///   attribute and continue processing the UPDATE message. This case SHOULD
+///   be logged locally" — so both are removed and recorded as
+///   attribute-discard entries (the transport logs every entry).
+/// - [`AsnWidth::Two`] (§4.2.3): the attributes are consumed:
+///   - `AS_CONFED_SEQUENCE` / `AS_CONFED_SET` segments in `AS4_PATH` are
+///     discarded and logged (§6);
+///   - when both `AGGREGATOR` and `AS4_AGGREGATOR` are present, an
+///     `AGGREGATOR` whose AS is not `AS_TRANS` means "the `AS4_AGGREGATOR`
+///     attribute and the `AS4_PATH` attribute SHALL be ignored"; otherwise
+///     `AS4_AGGREGATOR` replaces `AGGREGATOR`;
+///   - a surviving `AS4_PATH` is merged into `AS_PATH` with
+///     [`AsPath::reconstruct_with_as4_path`];
+///   - an `AS4_AGGREGATOR` with no `AGGREGATOR` to supersede is ignored.
+fn reconcile_as4_attributes(
+    attrs: &mut Vec<PathAttribute>,
+    errors: &mut Vec<AttributeDecodeError>,
+    asn_width: AsnWidth,
+) {
+    let has_as4 = attrs.iter().any(|a| {
+        matches!(
+            a,
+            PathAttribute::As4Path(_) | PathAttribute::As4Aggregator { .. }
+        )
+    });
+    if !has_as4 {
+        return;
+    }
+
+    let mut as4_path: Option<AsPath> = None;
+    let mut as4_agg: Option<(u32, Ipv4Addr)> = None;
+    attrs.retain(|a| match a {
+        PathAttribute::As4Path(p) => {
+            as4_path = Some(p.clone());
+            false
+        }
+        PathAttribute::As4Aggregator { asn, bgp_id } => {
+            as4_agg = Some((*asn, *bgp_id));
+            false
+        }
+        _ => true,
+    });
+
+    if asn_width.is_four() {
+        if as4_path.is_some() {
+            errors.push(AttributeDecodeError {
+                type_code: ATTR_AS4_PATH,
+                policy: AttributeErrorPolicy::AttributeDiscard,
+                detail: "AS4_PATH received from a four-octet-AS peer (RFC 6793 §4.1); discarded",
+            });
+        }
+        if as4_agg.is_some() {
+            errors.push(AttributeDecodeError {
+                type_code: ATTR_AS4_AGGREGATOR,
+                policy: AttributeErrorPolicy::AttributeDiscard,
+                detail: "AS4_AGGREGATOR received from a four-octet-AS peer (RFC 6793 §4.1); discarded",
+            });
+        }
+        return;
+    }
+
+    if let Some(p) = &as4_path
+        && p.segments().iter().any(|s| {
+            matches!(
+                s,
+                AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)
+            )
+        })
+    {
+        errors.push(AttributeDecodeError {
+            type_code: ATTR_AS4_PATH,
+            policy: AttributeErrorPolicy::AttributeDiscard,
+            detail: "AS_CONFED segment in AS4_PATH discarded (RFC 6793 §6)",
+        });
+        as4_path = as4_path.map(|p| p.strip_confed_segments());
+    }
+
+    let mut ignore_as4_path = false;
+    if let Some((as4_asn, as4_id)) = as4_agg {
+        let slot = attrs.iter_mut().find_map(|a| match a {
+            PathAttribute::Aggregator(agg) => Some(agg),
+            _ => None,
+        });
+        if let Some(agg) = slot {
+            if agg.asn.is_trans() {
+                *agg = Aggregator::new(Asn::new(as4_asn), as4_id);
+            } else {
+                // §4.2.3: AGGREGATOR's AS is not AS_TRANS, so AS4_AGGREGATOR
+                // *and* AS4_PATH are ignored.
+                ignore_as4_path = true;
+            }
+        }
+    }
+
+    if let (Some(as4), false) = (as4_path, ignore_as4_path)
+        && let Some(slot) = attrs.iter_mut().find_map(|a| match a {
+            PathAttribute::AsPath(p) => Some(p),
+            _ => None,
+        })
+    {
+        *slot = slot.reconstruct_with_as4_path(&as4);
+    }
 }
 
 /// Decode the `NEXT_HOP` value from `MP_REACH_NLRI` based on the `AFI` and byte
@@ -816,24 +972,92 @@ pub fn nlri_v6_encoded_len(nlri: &Nlri<Ipv6Addr>) -> usize {
 /// The returned bytes are the raw attribute TLVs with no length prefix —
 /// suitable for use as a grouping key or for computing the attribute portion
 /// of a BGP UPDATE's wire size.
+///
+/// This is a faithful, width-independent serialization (four-octet ASNs,
+/// every attribute written exactly as given), *not* what any particular peer
+/// receives: unlike [`UpdateMessage`] encoding it neither narrows ASNs nor
+/// adds or removes `AS4_PATH` / `AS4_AGGREGATOR`. Because it never drops an
+/// attribute and writes ASNs at the widest width, its length is an upper
+/// bound on the attribute bytes of the wire form for either [`AsnWidth`],
+/// provided the caller has attached any `AS4_AGGREGATOR` the route needs.
 #[must_use]
 pub fn encode_attributes(attrs: &[PathAttribute]) -> Vec<u8> {
-    encode_path_attributes(attrs)
-}
-
-// ── Path attribute encode ────────────────────────────────────────────────────
-
-fn encode_path_attributes(attrs: &[PathAttribute]) -> Vec<u8> {
     let mut out = Writer::new();
     for attr in attrs {
-        encode_one_path_attr(&mut out, attr);
+        encode_one_path_attr(&mut out, attr, AsnWidth::Four);
     }
     out.finish()
 }
 
+// ── Path attribute encode ────────────────────────────────────────────────────
+
+/// Encode `attrs` for a session of the given `asn_width` (RFC 6793 §4).
+///
+/// - [`AsnWidth::Four`]: `AS4_PATH` / `AS4_AGGREGATOR` are omitted — §4.1:
+///   "The new attributes, `AS4_PATH` and `AS4_AGGREGATOR`, MUST NOT be carried in
+///   an UPDATE message between NEW BGP speakers."
+/// - [`AsnWidth::Two`]: `AS_PATH` and `AGGREGATOR` use two-octet ASNs with
+///   `AS_TRANS` standing in for each non-mappable ASN (§4.2.2). If the caller
+///   has not attached them already, `AS4_PATH` (confederation segments
+///   excluded, and only when some non-confederation ASN is non-mappable) and
+///   `AS4_AGGREGATOR` (only when the aggregating AS is non-mappable) are
+///   appended, so the true values are never silently lost.
+fn encode_path_attributes(attrs: &[PathAttribute], asn_width: AsnWidth) -> Vec<u8> {
+    let mut out = Writer::new();
+    for attr in attrs {
+        if asn_width.is_four()
+            && matches!(
+                attr,
+                PathAttribute::As4Path(_) | PathAttribute::As4Aggregator { .. }
+            )
+        {
+            continue;
+        }
+        encode_one_path_attr(&mut out, attr, asn_width);
+    }
+    if !asn_width.is_four() {
+        append_missing_as4_attributes(&mut out, attrs);
+    }
+    out.finish()
+}
+
+/// RFC 6793 §4.2.2: generate `AS4_PATH` / `AS4_AGGREGATOR` for a two-octet
+/// peer when `attrs` carries non-mappable ASNs but not the attribute that
+/// preserves them.
+fn append_missing_as4_attributes(out: &mut Writer, attrs: &[PathAttribute]) {
+    let has_as4_path = attrs.iter().any(|a| matches!(a, PathAttribute::As4Path(_)));
+    if !has_as4_path
+        && let Some(PathAttribute::AsPath(path)) =
+            attrs.iter().find(|a| matches!(a, PathAttribute::AsPath(_)))
+    {
+        // "Whenever the AS path information contains the AS_CONFED_SEQUENCE
+        // or AS_CONFED_SET path segment, the NEW BGP speaker MUST exclude
+        // such path segments from the AS4_PATH attribute being constructed."
+        let as4 = path.strip_confed_segments();
+        if as4.has_non_mappable_asn() {
+            encode_one_path_attr(out, &PathAttribute::As4Path(as4), AsnWidth::Two);
+        }
+    }
+    let has_as4_agg = attrs
+        .iter()
+        .any(|a| matches!(a, PathAttribute::As4Aggregator { .. }));
+    if !has_as4_agg
+        && let Some(PathAttribute::Aggregator(agg)) = attrs
+            .iter()
+            .find(|a| matches!(a, PathAttribute::Aggregator(_)))
+        && agg.asn.is_four_byte()
+    {
+        let attr = PathAttribute::As4Aggregator {
+            asn: agg.asn.as_u32(),
+            bgp_id: agg.ip,
+        };
+        encode_one_path_attr(out, &attr, AsnWidth::Two);
+    }
+}
+
 /// Write one complete path attribute (flags + type + length + value) into `w`.
-fn encode_one_path_attr(w: &mut Writer, attr: &PathAttribute) {
-    let (flags, type_code, value) = encode_attr_value(attr);
+fn encode_one_path_attr(w: &mut Writer, attr: &PathAttribute, asn_width: AsnWidth) {
+    let (flags, type_code, value) = encode_attr_value(attr, asn_width);
     let ext_len = value.len() > 255;
     let flags = if ext_len { flags | FLAG_EXT_LEN } else { flags };
     w.put_u8(flags);
@@ -849,13 +1073,13 @@ fn encode_one_path_attr(w: &mut Writer, attr: &PathAttribute) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
+fn encode_attr_value(attr: &PathAttribute, asn_width: AsnWidth) -> (u8, u8, Vec<u8>) {
     match attr {
         PathAttribute::Origin(origin) => (FLAGS_WKM, ATTR_ORIGIN, vec![origin.as_u8()]),
 
         PathAttribute::AsPath(path) => {
             let mut v = Writer::new();
-            encode_as_path_segments(&mut v, path);
+            encode_as_path_segments(&mut v, path, asn_width);
             (FLAGS_WKM, ATTR_AS_PATH, v.finish())
         }
 
@@ -875,7 +1099,10 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
 
         PathAttribute::Aggregator(agg) => {
             let mut v = Writer::new();
-            v.put_u32(u32::from(agg.asn));
+            match asn_width {
+                AsnWidth::Four => v.put_u32(agg.asn.as_u32()),
+                AsnWidth::Two => v.put_u16(two_octet_asn(agg.asn)),
+            }
             v.put_slice(&agg.ip.octets());
             (FLAGS_OT, ATTR_AGGREGATOR, v.finish())
         }
@@ -939,7 +1166,8 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
 
         PathAttribute::As4Path(path) => {
             let mut v = Writer::new();
-            encode_as_path_segments(&mut v, path);
+            // AS4_PATH is four-octet on every session.
+            encode_as_path_segments(&mut v, path, AsnWidth::Four);
             (FLAGS_OT, ATTR_AS4_PATH, v.finish())
         }
 
@@ -977,7 +1205,31 @@ fn encode_attr_value(attr: &PathAttribute) -> (u8, u8, Vec<u8>) {
     }
 }
 
-fn encode_as_path_segments(w: &mut Writer, path: &AsPath) {
+/// The two-octet wire form of `asn`: itself when mappable, otherwise
+/// `AS_TRANS` (RFC 6793 §4.2.2: "non-mappable four-octet AS numbers are
+/// represented by the well-known two-octet AS number, `AS_TRANS`").
+fn two_octet_asn(asn: Asn) -> u16 {
+    u16::try_from(asn.as_u32()).unwrap_or(AS_TRANS_U16)
+}
+
+/// RFC 6793 §9: `AS_TRANS` = 23456.
+const AS_TRANS_U16: u16 = 23456;
+
+/// Largest ASN count one path segment can carry (its length field is one
+/// octet; RFC 4271 §4.3).
+const MAX_SEGMENT_ASNS: usize = 255;
+
+/// Write `path` as `AS_PATH`-style segments at the given width.
+///
+/// A segment holding more than [`MAX_SEGMENT_ASNS`] ASNs is split across
+/// consecutive segments of the same type (RFC 4271 §5.1.2(b) does the same
+/// when prepending to a full `AS_SEQUENCE`): a bare `len as u8` would wrap
+/// and corrupt the framing. For `AS_SEQUENCE` / `AS_CONFED_SEQUENCE` the split
+/// preserves meaning and path length; an `AS_SET` that large cannot be
+/// expressed exactly (each split set counts as one hop) but keeps every
+/// member visible to loop detection. Empty segments are skipped because a
+/// zero-length segment is malformed (RFC 7606 §7.2).
+fn encode_as_path_segments(w: &mut Writer, path: &AsPath, width: AsnWidth) {
     for seg in path.segments() {
         let (seg_type, asns) = match seg {
             AsPathSegment::Set(a) => (SEG_SET, a),
@@ -985,11 +1237,16 @@ fn encode_as_path_segments(w: &mut Writer, path: &AsPath) {
             AsPathSegment::ConfedSequence(a) => (SEG_CONFED_SEQUENCE, a),
             AsPathSegment::ConfedSet(a) => (SEG_CONFED_SET, a),
         };
-        w.put_u8(seg_type);
-        #[allow(clippy::cast_possible_truncation)]
-        w.put_u8(asns.len() as u8);
-        for asn in asns {
-            w.put_u32(u32::from(*asn));
+        for chunk in asns.chunks(MAX_SEGMENT_ASNS) {
+            w.put_u8(seg_type);
+            #[allow(clippy::cast_possible_truncation)]
+            w.put_u8(chunk.len() as u8);
+            for asn in chunk {
+                match width {
+                    AsnWidth::Four => w.put_u32(asn.as_u32()),
+                    AsnWidth::Two => w.put_u16(two_octet_asn(*asn)),
+                }
+            }
         }
     }
 }
@@ -1019,7 +1276,11 @@ pub enum PathAttribute {
     /// `ORIGIN` (type 1) — IGP, EGP, or Incomplete.
     Origin(Origin),
     /// `AS_PATH` (type 2) — the sequence of ASes the route has traversed.
-    /// Decoded assuming 4-byte ASNs (modern default).
+    ///
+    /// Always holds full 32-bit ASNs in memory. On the wire the width follows
+    /// the session's [`AsnWidth`]: decoding reads two-octet ASNs from an OLD
+    /// peer and merges any `AS4_PATH` into this value (RFC 6793 §4.2.3);
+    /// encoding for such a peer writes `AS_TRANS` for non-mappable ASNs.
     AsPath(AsPath),
     /// `NEXT_HOP` (type 3) — IPv4 forwarding address for IPv4 unicast routes.
     NextHop(Ipv4Addr),
@@ -1031,6 +1292,7 @@ pub enum PathAttribute {
     /// during aggregation.
     AtomicAggregate,
     /// `AGGREGATOR` (type 7) — ASN and router-id of the aggregating router.
+    /// Wire width follows the session's [`AsnWidth`], like `AS_PATH`.
     Aggregator(Aggregator),
     /// `COMMUNITY` (type 8, RFC 1997) — standard 32-bit community tags.
     Communities(Vec<Community>),
@@ -1055,9 +1317,14 @@ pub enum PathAttribute {
     ExtendedCommunities(Vec<ExtendedCommunity>),
     /// `AS4_PATH` (type 17, RFC 6793) — 4-byte AS path used during the
     /// 2-byte → 4-byte ASN transition.
+    ///
+    /// Only meaningful on a two-octet ([`AsnWidth::Two`]) session. Decoding
+    /// consumes it into [`PathAttribute::AsPath`] (or discards it from a
+    /// four-octet peer), so received UPDATEs never carry this variant;
+    /// encoding for a four-octet peer omits it.
     As4Path(AsPath),
-    /// `AS4_AGGREGATOR` (type 18, RFC 6793) — 4-byte AGGREGATOR used during
-    /// the transition.
+    /// `AS4_AGGREGATOR` (type 18, RFC 6793) — 4-byte `AGGREGATOR` used during
+    /// the transition. Handled like [`PathAttribute::As4Path`].
     As4Aggregator { asn: u32, bgp_id: Ipv4Addr },
     /// `LARGE_COMMUNITY` (type 32, RFC 8092) — three-field community designed
     /// for 4-byte ASN operators.
@@ -1133,10 +1400,10 @@ mod tests {
     use super::*;
 
     fn roundtrip(msg: UpdateMessage) {
-        let encoded = msg.encode();
+        let encoded = msg.encode_with(AsnWidth::Four);
         let mut cur = Cursor::new(&encoded[19..]);
         assert_eq!(
-            UpdateMessage::decode(&mut cur, true).unwrap(),
+            UpdateMessage::decode(&mut cur, AsnWidth::Four).unwrap(),
             UpdateDecodeOutcome::Clean(msg)
         );
     }
@@ -1254,7 +1521,7 @@ mod tests {
     fn test_only_to_customer_encodes_as_optional_transitive() {
         // RFC 9234 §3: OTC must be optional (0x80) + transitive (0x40) = 0xC0.
         let attr = PathAttribute::OnlyToCustomer(Asn::new(65000));
-        let (flags, type_code, _) = encode_attr_value(&attr);
+        let (flags, type_code, _) = encode_attr_value(&attr, AsnWidth::Four);
         assert_eq!(flags, FLAGS_OT);
         assert_eq!(type_code, 35);
     }
@@ -1316,10 +1583,10 @@ mod tests {
             }],
             announced: vec![],
         };
-        let encoded = msg.encode();
+        let encoded = msg.encode_with(AsnWidth::Four);
         let mut cur = Cursor::new(&encoded[19..]);
         assert_eq!(
-            UpdateMessage::decode(&mut cur, true).unwrap(),
+            UpdateMessage::decode(&mut cur, AsnWidth::Four).unwrap(),
             UpdateDecodeOutcome::Clean(UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![PathAttribute::Unknown {
@@ -1423,30 +1690,6 @@ mod tests {
     }
 
     #[test]
-    fn test_as4_path_roundtrip() {
-        let path = AsPath::from_sequence(vec![Asn::new(131_072), Asn::new(131_073)]);
-        let msg = UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![PathAttribute::As4Path(path)],
-            announced: vec![],
-        };
-        roundtrip(msg);
-    }
-
-    #[test]
-    fn test_as4_aggregator_roundtrip() {
-        let msg = UpdateMessage {
-            withdrawn: vec![],
-            attributes: vec![PathAttribute::As4Aggregator {
-                asn: 131_072,
-                bgp_id: Ipv4Addr::new(10, 0, 0, 1),
-            }],
-            announced: vec![],
-        };
-        roundtrip(msg);
-    }
-
-    #[test]
     fn test_mp_reach_ipv4_roundtrip() {
         let msg = UpdateMessage {
             withdrawn: vec![],
@@ -1519,18 +1762,18 @@ mod tests {
     // ── Raw-byte decode helpers ───────────────────────────────────────────────
 
     fn decode_raw(body: &[u8]) -> Result<UpdateDecodeOutcome, CodecError> {
-        decode_raw_with_four_byte_asn(body, true)
+        decode_raw_with_width(body, AsnWidth::Four)
     }
 
-    /// Like `decode_raw`, but lets the caller control whether the 4-octet AS
-    /// number capability is treated as negotiated with the peer — needed for
-    /// the AGGREGATOR length tests (RFC 7606 §7.7).
-    fn decode_raw_with_four_byte_asn(
+    /// Like `decode_raw`, but lets the caller choose the session's ASN
+    /// width — needed for the `AS_PATH` / `AGGREGATOR` width tests (RFC 6793,
+    /// RFC 7606 §7.7).
+    fn decode_raw_with_width(
         body: &[u8],
-        four_byte_asn: bool,
+        width: AsnWidth,
     ) -> Result<UpdateDecodeOutcome, CodecError> {
         let mut cur = Cursor::new(body);
-        UpdateMessage::decode(&mut cur, four_byte_asn)
+        UpdateMessage::decode(&mut cur, width)
     }
 
     /// Build an UPDATE body: no withdrawn routes, one path attribute (short len).
@@ -1780,7 +2023,7 @@ mod tests {
         let value: [u8; 6] = [0x12, 0x34, 10, 0, 0, 1];
         let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &value);
         assert_eq!(
-            decode_raw_with_four_byte_asn(&body, false).unwrap(),
+            decode_raw_with_width(&body, AsnWidth::Two).unwrap(),
             UpdateDecodeOutcome::Clean(UpdateMessage {
                 withdrawn: vec![],
                 attributes: vec![PathAttribute::Aggregator(Aggregator::new(
@@ -1802,7 +2045,7 @@ mod tests {
         let value: [u8; 8] = [0, 0, 0x12, 0x34, 10, 0, 0, 1];
         let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &value);
         assert_eq!(
-            decode_raw_with_four_byte_asn(&body, false).unwrap(),
+            decode_raw_with_width(&body, AsnWidth::Two).unwrap(),
             UpdateDecodeOutcome::Partial {
                 update: UpdateMessage {
                     withdrawn: vec![],
@@ -1828,7 +2071,7 @@ mod tests {
         let value: [u8; 6] = [0x12, 0x34, 10, 0, 0, 1];
         let body = update_with_attr(FLAGS_OT, ATTR_AGGREGATOR, &value);
         assert_eq!(
-            decode_raw_with_four_byte_asn(&body, true).unwrap(),
+            decode_raw_with_width(&body, AsnWidth::Four).unwrap(),
             UpdateDecodeOutcome::Partial {
                 update: UpdateMessage {
                     withdrawn: vec![],
@@ -2010,7 +2253,7 @@ mod tests {
     /// attributes of the same type produces genuinely duplicate TLVs on the
     /// wire, exactly as a real (malformed) peer message would.
     fn body_with_attrs(attrs: &[PathAttribute]) -> Vec<u8> {
-        let attrs_bytes = encode_path_attributes(attrs);
+        let attrs_bytes = encode_path_attributes(attrs, AsnWidth::Four);
         let mut body = vec![0x00, 0x00]; // no withdrawn
         body.extend_from_slice(&u16::try_from(attrs_bytes.len()).unwrap().to_be_bytes());
         body.extend_from_slice(&attrs_bytes);
@@ -2400,7 +2643,7 @@ mod tests {
         msg.extend_from_slice(attr);
 
         let mut cur = Cursor::new(&msg[19..]);
-        let result = UpdateMessage::decode(&mut cur, true);
+        let result = UpdateMessage::decode(&mut cur, AsnWidth::Four);
         assert!(
             result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
             "ORIGINATOR_ID with 3-byte value must be an error or partial decode"
@@ -2428,7 +2671,7 @@ mod tests {
         msg.extend_from_slice(attr);
 
         let mut cur = Cursor::new(&msg[19..]);
-        let result = UpdateMessage::decode(&mut cur, true);
+        let result = UpdateMessage::decode(&mut cur, AsnWidth::Four);
         assert!(
             result.is_err() || matches!(result, Ok(UpdateDecodeOutcome::Partial { .. })),
             "CLUSTER_LIST with a length not a multiple of 4 must be an error or partial decode"
@@ -2809,9 +3052,9 @@ mod prop_tests {
         /// Withdraw-only updates survive a full encode→decode roundtrip.
         #[test]
         fn prop_withdraw_only_update_roundtrip(msg in arb_withdraw_only_update()) {
-            let encoded = msg.encode();
+            let encoded = msg.encode_with(AsnWidth::Four);
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur, true)
+            let decoded = UpdateMessage::decode(&mut cur, AsnWidth::Four)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2819,9 +3062,9 @@ mod prop_tests {
         /// Announce updates with mandatory attributes survive a full encode→decode roundtrip.
         #[test]
         fn prop_announce_update_roundtrip(msg in arb_announce_update()) {
-            let encoded = msg.encode();
+            let encoded = msg.encode_with(AsnWidth::Four);
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur, true)
+            let decoded = UpdateMessage::decode(&mut cur, AsnWidth::Four)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2829,19 +3072,19 @@ mod prop_tests {
         /// encode→decode is idempotent: encoding the decoded message produces identical bytes.
         #[test]
         fn prop_encode_is_idempotent(msg in arb_announce_update()) {
-            let first = msg.encode();
+            let first = msg.encode_with(AsnWidth::Four);
             let mut cur = Cursor::new(&first[19..]);
-            let roundtripped = match UpdateMessage::decode(&mut cur, true).unwrap() {
+            let roundtripped = match UpdateMessage::decode(&mut cur, AsnWidth::Four).unwrap() {
                 UpdateDecodeOutcome::Clean(m) => m,
                 UpdateDecodeOutcome::Partial { .. } => panic!("expected Clean, got Partial"),
             };
-            let second = roundtripped.encode();
+            let second = roundtripped.encode_with(AsnWidth::Four);
             prop_assert_eq!(first, second, "double-encode must be byte-identical");
         }
 
         /// RFC 9234: `ONLY_TO_CUSTOMER` round-trips for any ASN value,
         /// including edge cases the hand-picked unit tests don't hit
-        /// (0, AS_TRANS, 4-byte-only values, u32::MAX).
+        /// (0, `AS_TRANS`, 4-byte-only values, u32::MAX).
         #[test]
         fn prop_only_to_customer_roundtrip(asn in proptest::num::u32::ANY) {
             let msg = UpdateMessage {
@@ -2854,9 +3097,9 @@ mod prop_tests {
                 ],
                 announced: vec!["10.0.0.0/8".parse().unwrap()],
             };
-            let encoded = msg.encode();
+            let encoded = msg.encode_with(AsnWidth::Four);
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur, true)
+            let decoded = UpdateMessage::decode(&mut cur, AsnWidth::Four)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2876,9 +3119,9 @@ mod prop_tests {
                 ],
                 announced: vec!["10.0.0.0/8".parse().unwrap()],
             };
-            let encoded = msg.encode();
+            let encoded = msg.encode_with(AsnWidth::Four);
             let mut cur = Cursor::new(&encoded[19..]);
-            let decoded = UpdateMessage::decode(&mut cur, true)
+            let decoded = UpdateMessage::decode(&mut cur, AsnWidth::Four)
                 .expect("structural decode error on well-formed message");
             prop_assert_eq!(decoded, UpdateDecodeOutcome::Clean(msg));
         }
@@ -2945,7 +3188,7 @@ mod prop_tests {
 
     fn decode_outcome(body: &[u8]) -> UpdateDecodeOutcome {
         let mut cur = Cursor::new(body);
-        UpdateMessage::decode(&mut cur, true).expect("structural decode error")
+        UpdateMessage::decode(&mut cur, AsnWidth::Four).expect("structural decode error")
     }
 
     proptest! {
