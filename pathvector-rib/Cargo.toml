@@ -33,6 +33,10 @@ name    = "loc_rib_insert"
 harness = false
 
 [[bench]]
+name    = "loc_rib_insert_steady"
+harness = false
+
+[[bench]]
 name    = "outbound_pipeline"
 harness = false
 

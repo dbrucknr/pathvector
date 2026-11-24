@@ -42,11 +42,15 @@ extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 
 
   `list_peers` paid the scan column once per peer; a management read can no longer cause the
   right-hand column.
-- Insert cost: `loc_rib_insert` is 10 k: 518 → 506 ns, 100 k: 517 → 507 ns (the new write reuses
-  the winner the caller already read). The 500 k group is dominated by cold-cache first touches
-  (criterion rebuilds a ~1 M-entry RIB per sample) and read 1.9 → 2.4–2.6 µs in four runs; a
-  separate hot/cold probe at 500 k showed no difference (first-1000 inserts 572–608 ns before,
-  592–630 ns after).
+- Insert cost (new steady-state bench `loc_rib_insert_steady`: RIB built once, long loop, so no
+  cold-start artifact; 3 alternating before/after runs; before = `19d82fc`): a winner-changing
+  insert on one hot prefix costs 459–485 ns before and 490–530 ns after (+25–40 ns, about 5–8 %,
+  the two per-peer count updates); across all prefixes of a 10k / 100k / 500k table ("scattered",
+  cache-cold) the runs overlap (545–570 / 938–963 / 929–969 ns before, 537–607 / 890–1036 /
+  924–1248 ns after). A route's whole UPDATE path (policy, Adj-RIB-In, propagation) is many
+  microseconds, so this is well under 1 % of it. The older `loc_rib_insert` bench rebuilds a
+  ~1 M-entry RIB per criterion sample, so its 500 k group measures cold first touches and was not
+  a reliable comparison (it read 1.9 → 2.4–2.6 µs; the steady bench does not reproduce that).
 - Not done: the `just loadtest <mrt> --scenarios converge,cow` comparison from the issue's
   acceptance criteria (needs a full-table MRT file). The other `snapshot()` callers
   (`list_routes`, `watch_routes`, ...) legitimately walk the table and still clone the `Arc`; moving

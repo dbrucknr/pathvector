@@ -166,6 +166,7 @@ cargo bench -p pathvector-rib -- --baseline before
 | `select_best` | 2 / 10 / 100 candidates | RFC 4271 §9.1 10-step comparison loop across competing routes for one prefix |
 | `select_best_reflected_tie` | 2 / 10 / 100 candidates | Candidates tied through step (e), so every comparison reaches the RFC 4456 §9 tie-breakers and (g) |
 | `loc_rib_insert` | 10k / 100k / 500k prefixes | `LocRib::insert` + best-path recompute; simulates a RIB of increasing size up to ~½ a full internet table |
+| `loc_rib_insert_steady` | 10k / 100k / 500k prefixes | Steady-state `LocRib::insert` on a RIB built once: `hot` (one prefix, winner flips) and `scattered` (stride over the whole table, cache-cold). Use this, not `loc_rib_insert`, to compare insert cost at 500k |
 | `peer_win_count` | 100 / 1k / 10k / 100k / 1M prefixes | Per-peer win count: the old `best_routes()` scan vs `best_win_count`, plus the `LocRib::clone` that copy-on-write performs |
 | `outbound_pipeline` | 1 / 10 / 50 peers | `prepare_outbound` + `AdjRibOut::insert` per peer; simulates the Update-Send Process for one prefix change |
 
