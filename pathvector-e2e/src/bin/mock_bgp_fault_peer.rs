@@ -126,7 +126,7 @@
 //!   second UPDATE for the same prefix whose AS_PATH contains pathvectord's
 //!   own AS (RFC 4271 §9.1.2). Well formed, so the session stays up, but the
 //!   route is ineligible: RFC 4271 §9 says the replacement "thus implicitly
-//!   withdraw[s] the older route from service", so the first route must leave
+//!   withdrawing the older route from service", so the first route must leave
 //!   the Loc-RIB (issue #138).
 //! - `invalid-next-hop-replacement` — same shape, but the second UPDATE's
 //!   NEXT_HOP is 0.0.0.0, not a valid host address (RFC 4271 §6.3). RFC 7606

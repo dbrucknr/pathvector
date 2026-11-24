@@ -799,7 +799,7 @@ async fn confederation_id_in_as_path_is_treated_as_loop_and_dropped() {
 /// Issue #138, RFC 4271 §9 + §9.1.2: the fault peer announces a prefix, then
 /// replaces it with a route whose AS_PATH contains pathvectord's own AS. The
 /// replacement is ineligible (an AS loop), but it still "thus implicitly
-/// withdraw[s] the older route from service" — so the first route must leave
+/// withdrawing the older route from service" — so the first route must leave
 /// the Loc-RIB rather than stay selected. The session must stay Established:
 /// the UPDATE is well formed.
 #[tokio::test]
