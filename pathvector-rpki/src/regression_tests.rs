@@ -19,7 +19,7 @@ use std::{
 
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{Notify, mpsc},
 };
 
 use crate::{
@@ -339,5 +339,427 @@ async fn reconnect_after_cache_reset_opens_with_reset_query_not_serial_query() {
         after_reconnect.pdu,
         Pdu::ResetQuery,
         "must not resume from a serial the cache said it cannot serve"
+    );
+}
+
+// ── Shared scenario pieces for #90 / #88 / #86 ───────────────────────────
+
+/// One-shot-per-`open` latch letting the test decide when a scripted server
+/// proceeds (so assertions about intermediate client state cannot race the
+/// server's next move).
+#[derive(Clone)]
+struct Gate(Arc<Notify>);
+
+impl Gate {
+    fn new() -> Self {
+        Self(Arc::new(Notify::new()))
+    }
+
+    fn open(&self) {
+        self.0.notify_one();
+    }
+
+    async fn wait(&self) {
+        self.0.notified().await;
+    }
+}
+
+/// Server side of a normal first sync at v1: Reset Query → session 1 → VRP A
+/// (192.0.2.0/24 AS65001) → End of Data serial 1.
+async fn initial_v1_sync(s: &mut TcpStream, tap: &Tap) {
+    assert_eq!(tap.read(s).await, Some(Pdu::ResetQuery));
+    send(s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+    send(s, RtrVersion::V1, v4("192.0.2.0", 24, 65001)).await;
+    send(s, RtrVersion::V1, eod(1, 1)).await;
+}
+
+async fn notify(s: &mut TcpStream, version: RtrVersion, session_id: u16, serial: u32) {
+    send(s, version, Pdu::SerialNotify { session_id, serial }).await;
+}
+
+fn error_report(seen: &Seen) -> (u16, Vec<u8>) {
+    match &seen.pdu {
+        Pdu::ErrorReport {
+            error_code,
+            pdu_copy,
+            ..
+        } => (*error_code, pdu_copy.clone()),
+        other => panic!("expected an Error Report from the client, saw {other:?}"),
+    }
+}
+
+const CORRUPT_DATA: u16 = 0;
+const UNEXPECTED_PROTOCOL_VERSION: u16 = 8;
+
+// ── #90: negotiated version and session identity ─────────────────────────
+
+/// RFC 8210 §5.1: "If, at any time after the protocol version has been
+/// negotiated (Section 7), either the router or the cache finds that the
+/// value of the Session ID is not the same as the other's, the party which
+/// detects the mismatch MUST immediately terminate the session with an Error
+/// Report PDU with code 0 ("Corrupt Data"), and the router MUST flush all
+/// data learned from that cache." §5.5: "In response to a Serial Query, the
+/// Session ID being the same reassures the router that the Serial Numbers
+/// are commensurate".
+///
+/// Issue #90: a Cache Response with session 99 to a Serial Query for session
+/// 1 was accepted as a continuation, and its diff applied on top of the
+/// session-1 VRPs.
+#[tokio::test]
+async fn cache_response_with_other_session_id_to_serial_query_is_rejected_and_flushed() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_v1_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 1, 2).await;
+                tap.read(&mut s).await; // Serial Query {1, 1}
+                send(
+                    &mut s,
+                    RtrVersion::V1,
+                    Pdu::CacheResponse { session_id: 99 },
+                )
+                .await;
+                send(&mut s, RtrVersion::V1, v4("198.51.100.0", 24, 65020)).await;
+                send(&mut s, RtrVersion::V1, eod(99, 2)).await;
+                tap.read(&mut s).await; // expect the client's Error Report
+                hold_open().await;
+            } else {
+                // Recovery: a fresh full load under the new session.
+                tap.read(&mut s).await;
+                send(
+                    &mut s,
+                    RtrVersion::V1,
+                    Pdu::CacheResponse { session_id: 99 },
+                )
+                .await;
+                send(&mut s, RtrVersion::V1, v4("198.51.100.0", 24, 65020)).await;
+                send(&mut s, RtrVersion::V1, eod(99, 7)).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    let mut changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    changed.mark_unchanged();
+    go.open();
+
+    cache.next_seen("Serial Query").await;
+    let report = cache
+        .next_seen("Error Report for the session mismatch")
+        .await;
+    assert_eq!(report.conn, 0);
+    assert_eq!(error_report(&report).0, CORRUPT_DATA, "§5.1: code 0");
+
+    // §5.1: flush everything learned from that cache — and nothing from the
+    // rejected response may have been combined with it.
+    wait_for("flush", || handle.status().roa_count == 0).await;
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::NotFound);
+    assert!(
+        changed.has_changed().unwrap(),
+        "the flush changes validity results, so subscribers must hear of it"
+    );
+
+    // Recovery is a full resynchronisation, not a resumed Serial Query.
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!((reconnect.conn, reconnect.pdu), (1, Pdu::ResetQuery));
+    wait_for("full resync", || handle.status().serial == Some(7)).await;
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::Valid);
+}
+
+/// RFC 8210 §7: "Once the cache and router have agreed upon a Protocol
+/// Version ... that version is stable for the life of the session ... If
+/// either party receives a PDU for a different Protocol Version once the
+/// above negotiation completes, that party MUST drop the session; unless the
+/// PDU containing the unexpected Protocol Version was itself an Error Report
+/// PDU, the party dropping the session SHOULD send an Error Report with an
+/// error code of 8 ("Unexpected Protocol Version")."
+///
+/// Issue #90: the client adopted a different version on *any* Cache
+/// Response, even after negotiation.
+#[tokio::test]
+async fn cache_response_at_other_version_after_negotiation_drops_session_with_error_8() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_v1_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 1, 2).await;
+                tap.read(&mut s).await; // Serial Query
+                // Negotiated v1; the cache now answers at v0.
+                send(&mut s, RtrVersion::V0, Pdu::CacheResponse { session_id: 1 }).await;
+                tap.read(&mut s).await; // Error Report
+                hold_open().await;
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    go.open();
+
+    cache.next_seen("Serial Query").await;
+    let report = cache.next_seen("Error Report 8").await;
+    assert_eq!(error_report(&report).0, UNEXPECTED_PROTOCOL_VERSION);
+
+    // A version violation does not make the installed data wrong (§5.1 only
+    // mandates a flush for a Session ID mismatch) and the session identity
+    // is intact, so the reconnect resumes at the agreed version.
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!(reconnect.conn, 1);
+    assert_eq!(reconnect.version, RtrVersion::V1);
+    assert_eq!(
+        reconnect.pdu,
+        Pdu::SerialQuery {
+            session_id: 1,
+            serial: 1
+        }
+    );
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+}
+
+/// Same §7 clause, for a payload PDU: a Prefix PDU whose version differs
+/// from the Cache Response that opened the transfer. The Error Report's
+/// encapsulated PDU must be the offending bytes, bounded.
+#[tokio::test]
+async fn prefix_pdu_at_other_version_mid_transfer_drops_session_with_error_8() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_v1_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 1, 2).await;
+                tap.read(&mut s).await; // Serial Query
+                send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+                send(&mut s, RtrVersion::V0, v4("198.51.100.0", 24, 65020)).await;
+                tap.read(&mut s).await; // Error Report
+                hold_open().await;
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    go.open();
+    cache.next_seen("Serial Query").await;
+
+    let report = cache.next_seen("Error Report 8").await;
+    let (code, copy) = error_report(&report);
+    assert_eq!(code, UNEXPECTED_PROTOCOL_VERSION);
+    assert_eq!(copy.len(), 20, "the offending IPv4 Prefix PDU, 20 bytes");
+    assert_eq!(copy[0], 0, "...as received, i.e. with version byte 0");
+    assert_eq!(copy[1], 4, "...type 4 (IPv4 Prefix)");
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::NotFound);
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+}
+
+/// §5.1 applies to the idle-phase notification as well: a Serial Notify is
+/// a PDU carrying a Session ID and a Protocol Version.
+#[tokio::test]
+async fn idle_serial_notify_at_other_version_drops_session_with_error_8() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_v1_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V0, 1, 2).await;
+                tap.read(&mut s).await; // Error Report
+                hold_open().await;
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    go.open();
+
+    let report = cache
+        .next_seen("Error Report 8 (client probably accepted the notify and sent a Serial Query)")
+        .await;
+    assert_eq!(error_report(&report).0, UNEXPECTED_PROTOCOL_VERSION);
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+}
+
+/// §5.2: a Serial Notify "reassures the router that the Serial Numbers are
+/// commensurate, i.e., the cache session has not been changed" — one for a
+/// different session is the §5.1 mismatch: code 0, flush.
+#[tokio::test]
+async fn idle_serial_notify_with_other_session_id_flushes_with_error_0() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            if conn == 0 {
+                initial_v1_sync(&mut s, &tap).await;
+                go.wait().await;
+                notify(&mut s, RtrVersion::V1, 7, 2).await;
+                tap.read(&mut s).await; // Error Report
+                hold_open().await;
+            } else {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    let mut changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    changed.mark_unchanged();
+    go.open();
+
+    let report = cache
+        .next_seen("Error Report 0 (client probably accepted the notify)")
+        .await;
+    assert_eq!(error_report(&report).0, CORRUPT_DATA);
+    wait_for("flush", || handle.status().roa_count == 0).await;
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
+    assert!(changed.has_changed().unwrap());
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!(reconnect.pdu, Pdu::ResetQuery);
+}
+
+/// RFC 8210 §7: "The router MUST ignore any Serial Notify PDUs it might
+/// receive from the cache during this initial startup period, regardless of
+/// the Protocol Version field in the Serial Notify PDU." — valid, and
+/// required for caches that speak v0.
+#[tokio::test]
+async fn serial_notify_during_version_negotiation_is_ignored() {
+    let mut cache = MockCache::spawn(|_conn, mut s, tap| async move {
+        tap.read(&mut s).await; // Reset Query
+        // Wrong version *and* an unrelated session/serial: still ignorable.
+        notify(&mut s, RtrVersion::V0, 9, 5).await;
+        notify(&mut s, RtrVersion::V1, 9, 6).await;
+        send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+        send(&mut s, RtrVersion::V1, v4("192.0.2.0", 24, 65001)).await;
+        send(&mut s, RtrVersion::V1, eod(1, 1)).await;
+        hold_open().await;
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    wait_for("sync despite startup notifies", || {
+        handle.status().serial == Some(1)
+    })
+    .await;
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+    assert_eq!(
+        cache.accepted(),
+        1,
+        "ignoring the notifies keeps the session"
+    );
+}
+
+/// RFC 8210 §5.1: "routers MUST treat sessions with different Protocol
+/// Version fields as separate sessions even if they do happen to have the
+/// same Session ID" and §7 (a reply "at version 0 ... the router MUST either
+/// downgrade to version 0 or terminate the connection").
+///
+/// After a reconnect the client resumes a v1 session with a Serial Query. A
+/// cache that answers at v0 is a *different* session, so its diff must not
+/// be applied to the v1 data. The client must start over with a Reset Query
+/// at v0 and end up with only the v0 session's data.
+#[tokio::test]
+async fn resume_answered_at_lower_version_is_a_new_session_and_forces_full_resync() {
+    let mut cache = MockCache::spawn(|conn, mut s, tap| async move {
+        match conn {
+            0 => {
+                initial_v1_sync(&mut s, &tap).await;
+                drop(s); // transport failure
+            }
+            1 => {
+                // Resume attempt at v1...
+                assert_matches_serial_query(tap.read(&mut s).await.as_ref());
+                // ...answered at v0 with a "diff" that would add B.
+                send(&mut s, RtrVersion::V0, Pdu::CacheResponse { session_id: 1 }).await;
+                send(&mut s, RtrVersion::V0, v4("198.51.100.0", 24, 65020)).await;
+                send(
+                    &mut s,
+                    RtrVersion::V0,
+                    Pdu::EndOfData {
+                        session_id: 1,
+                        serial: 2,
+                        intervals: None,
+                    },
+                )
+                .await;
+                hold_open().await;
+            }
+            _ => {
+                // The full load at v0: only B (A is gone from this cache).
+                tap.read(&mut s).await;
+                send(&mut s, RtrVersion::V0, Pdu::CacheResponse { session_id: 4 }).await;
+                send(&mut s, RtrVersion::V0, v4("198.51.100.0", 24, 65020)).await;
+                send(
+                    &mut s,
+                    RtrVersion::V0,
+                    Pdu::EndOfData {
+                        session_id: 4,
+                        serial: 9,
+                        intervals: None,
+                    },
+                )
+                .await;
+                hold_open().await;
+            }
+        }
+    })
+    .await;
+
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("initial Reset Query").await;
+    let resume = cache.next_seen("Serial Query on reconnect").await;
+    assert_eq!(resume.version, RtrVersion::V1);
+    let reset = cache
+        .next_seen("Reset Query at v0 (client probably continued the v1 session)")
+        .await;
+    assert_eq!(reset.pdu, Pdu::ResetQuery);
+    assert_eq!(reset.version, RtrVersion::V0);
+    wait_for("v0 full load", || handle.status().serial == Some(9)).await;
+    assert_eq!(handle.status().version, Some(RtrVersion::V0));
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
+    assert_eq!(validate(&handle, b(), 65020), RoaValidity::Valid);
+}
+
+fn assert_matches_serial_query(pdu: Option<&Pdu>) {
+    assert!(
+        matches!(pdu, Some(Pdu::SerialQuery { .. })),
+        "expected a Serial Query, got {pdu:?}"
     );
 }

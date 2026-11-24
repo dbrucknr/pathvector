@@ -24,7 +24,7 @@ use tracing::warn;
 use crate::{
     error::{PduError, RtrError},
     pdu::{self, EndOfDataIntervals, Pdu, RtrVersion},
-    protocol::{Exchange, Query, Response, Resume, Serial, SessionId},
+    protocol::{self, Consequence, Exchange, Negotiation, Query, Resume, Step, Violation},
     table::{RoaTable, RoaValidity},
 };
 
@@ -283,6 +283,24 @@ impl Shared {
         *self.resume.lock().unwrap() = Some(resume);
     }
 
+    /// RFC 8210 §5.1: "the router MUST flush all data learned from that
+    /// cache." Clears every VRP and the resume state, and — because
+    /// validation results just changed — notifies subscribers so policy is
+    /// re-evaluated against the (now empty) cache.
+    fn flush(&self) {
+        let had_data = !self.table.is_empty();
+        self.table.clear();
+        self.forget_resume();
+        {
+            let mut status = self.status.write().unwrap();
+            status.roa_count = 0;
+            status.version = None;
+        }
+        if had_data {
+            self.changed.send_modify(|g| *g = g.wrapping_add(1));
+        }
+    }
+
     /// Drops the incremental resume state — the cache said (Cache Reset,
     /// session error, version change) that the remembered serial cannot be
     /// used. The installed VRPs are *not* touched: whether they are kept or
@@ -320,6 +338,12 @@ async fn run_session_loop(config: RtrConfig, shared: Arc<Shared>) {
                         "RTR session error"
                     );
                     set_disconnected(&shared, e.to_string());
+                    // RFC 8210 §6: "a protocol version mismatch overrides"
+                    // the Retry Interval — the cache just told us which
+                    // version it speaks, so reconnect at once.
+                    if matches!(e, RtrError::VersionChanged { .. }) {
+                        continue;
+                    }
                 }
             }
             Err(e) => {
@@ -342,26 +366,14 @@ fn set_disconnected(shared: &Arc<Shared>, error: String) {
     status.last_error = Some(error);
 }
 
-/// Outcome of draining the diff stream after a successful sync handshake.
-enum DiffOutcome {
-    /// Reached `EndOfData`; the table now reflects the server's current
-    /// state. Carries the server-advertised intervals, if the session is v1.
-    Complete(Option<EndOfDataIntervals>),
-    /// The server sent `CacheReset`: it cannot serve an incremental update
-    /// from our serial. The table has been cleared; the caller should
-    /// immediately re-sync with a Reset Query on the same connection (no
-    /// need to reconnect).
-    ResyncNeeded,
-}
-
 /// One TCP connection's lifecycle: repeated sync-then-idle cycles until an
-/// error occurs (malformed PDU, session ID mismatch, EOF, ...), at which
+/// error occurs (malformed PDU, protocol violation, EOF, ...), at which
 /// point control returns to `run_session_loop` for backoff-and-reconnect.
 async fn run_one_connection(
     stream: &mut TcpStream,
     config: &RtrConfig,
     shared: &Arc<Shared>,
-    negotiated_version: &mut RtrVersion,
+    version_hint: &mut RtrVersion,
 ) -> Result<(), RtrError> {
     let mut refresh = config.refresh_interval;
     // RFC 8210 §6: "The router SHOULD NOT retry sooner than [the cache's
@@ -371,222 +383,255 @@ async fn run_one_connection(
     // read directly from `RtrConfig`/`RtrStatus::is_stale` by callers that
     // need it; nothing here needs to hold onto it beyond this point.
     let mut retry = config.retry_interval;
+    // §7: every connection starts a fresh negotiation. A remembered session
+    // is resumed at the version it was learned at; otherwise start from the
+    // last version known to work with this cache.
+    let mut negotiation =
+        Negotiation::Proposed(shared.resume().map_or(*version_hint, |r| r.version));
 
     loop {
-        let session = sync_once(stream, shared, negotiated_version, retry).await?;
+        let intervals = sync(stream, shared, &mut negotiation, version_hint, retry).await?;
+        if let Some(iv) = intervals {
+            refresh = Duration::from_secs(u64::from(iv.refresh));
+            retry = Duration::from_secs(u64::from(iv.retry));
+        }
 
-        match apply_diff_stream(stream, shared, session, *negotiated_version).await? {
-            DiffOutcome::ResyncNeeded => {}
-            DiffOutcome::Complete(intervals) => {
-                if let Some(iv) = intervals {
-                    refresh = Duration::from_secs(u64::from(iv.refresh));
-                    retry = Duration::from_secs(u64::from(iv.retry));
-                }
+        {
+            let mut status = shared.status.write().unwrap();
+            status.connected = true;
+            status.version = Some(negotiation.version());
+            status.serial = shared.resume().map(|r| r.serial.get());
+            status.roa_count = shared.table.len();
+            status.last_update = Some(Instant::now());
+            status.wall_clock_update = Some(SystemTime::now());
+            status.last_error = None;
+        }
 
-                {
-                    let mut status = shared.status.write().unwrap();
-                    status.connected = true;
-                    status.version = Some(*negotiated_version);
-                    status.serial = shared.resume().map(|r| r.serial.get());
-                    status.roa_count = shared.table.len();
-                    status.last_update = Some(Instant::now());
-                    status.wall_clock_update = Some(SystemTime::now());
-                    status.last_error = None;
-                }
-
-                // Idle until the refresh timer fires or the server sends an
-                // unsolicited Serial Notify — either way, loop back to the
-                // top and re-sync via Serial Query.
-                tokio::select! {
-                    () = tokio::time::sleep(refresh) => {}
-                    pdu_result = read_pdu(stream) => {
-                        match pdu_result?.1 {
-                            Pdu::SerialNotify { .. } => {}
-                            other => {
-                                return Err(RtrError::UnexpectedPdu {
-                                    expected: "Serial Notify",
-                                    got: format!("{other:?}"),
-                                });
-                            }
-                        }
-                    }
+        // Idle until the refresh timer fires or the server sends an
+        // unsolicited Serial Notify — either way, loop back to the top and
+        // re-sync via Serial Query.
+        tokio::select! {
+            () = tokio::time::sleep(refresh) => {}
+            frame = read_frame(stream) => {
+                let frame = frame?;
+                if let Err(violation) = protocol::on_idle(
+                    negotiation.version(),
+                    shared.resume(),
+                    frame.version,
+                    &frame.pdu,
+                ) {
+                    return Err(reject(stream, shared, negotiation.version(), violation, &frame.raw).await);
                 }
             }
         }
     }
 }
 
-/// Sends a Reset Query (first sync, or whenever there is no usable resume
-/// state) or a Serial Query (resuming), and interprets the cache's first
-/// reply via [`Exchange`]. Returns the session ID from the resulting Cache
-/// Response; the payload that follows is read by `apply_diff_stream`.
+/// Runs query/response/transfer exchanges until one completes, returning the
+/// cache-advertised intervals (v1) of the completed End of Data.
 ///
 /// Handles, without dropping the connection: one round of v1→v0 fallback
 /// (RFC 8210 §7), Cache Reset (§8.3 — forget the resume state and issue a
-/// Reset Query), and Error Code 2 (§8.4 — retry with a Reset Query).
-async fn sync_once(
+/// Reset Query), and Error Code 2 (§8.4 — retry with a Reset Query). What
+/// each received PDU *means* is decided by [`Exchange`]; this function only
+/// performs the I/O and table effects the verdicts call for.
+async fn sync(
     stream: &mut TcpStream,
     shared: &Arc<Shared>,
-    negotiated_version: &mut RtrVersion,
+    negotiation: &mut Negotiation,
+    version_hint: &mut RtrVersion,
     retry_interval: Duration,
-) -> Result<SessionId, RtrError> {
-    let mut attempted_fallback = false;
+) -> Result<Option<EndOfDataIntervals>, RtrError> {
     // Forces the *next* query to be a `ResetQuery` regardless of remembered
     // serial/session state. Set by Cache Reset and by Error Code 2.
     // Deliberately does not clear `shared.table` itself — see the
     // `Accepted` arm for why the clear is deferred until the replacement
     // load actually starts.
     let mut force_reset = false;
-    loop {
+    'exchange: loop {
         let query = Query::choose(shared.resume(), force_reset);
-        let exchange = Exchange::new(query, !attempted_fallback);
-        write_pdu(stream, *negotiated_version, &query.pdu()).await?;
+        let mut exchange = Exchange::new(query, *negotiation);
+        write_pdu(stream, negotiation.version(), &query.pdu()).await?;
 
-        let (observed_version, pdu) = read_pdu(stream).await?;
+        loop {
+            let frame = read_frame(stream).await?;
+            let step = match exchange.on_pdu(frame.version, &frame.pdu) {
+                Ok(step) => step,
+                Err(violation) => {
+                    // Remember what the cache actually speaks, even when the
+                    // exchange is being abandoned (a v0 answer to a v1
+                    // resume), so the reconnect starts at the right version.
+                    *negotiation = exchange.negotiation();
+                    *version_hint = negotiation.version();
+                    return Err(reject(
+                        stream,
+                        shared,
+                        negotiation.version(),
+                        violation,
+                        &frame.raw,
+                    )
+                    .await);
+                }
+            };
+            *negotiation = exchange.negotiation();
+            *version_hint = negotiation.version();
 
-        match exchange.on_response(observed_version, &pdu)? {
-            // RFC 8210 §5: a v0-only cache receiving a v1 query may simply
-            // "respond with a version 0 response" instead of an
-            // ErrorReport. `decode_payload` always trusts each PDU's own
-            // wire version byte (so the data itself decodes correctly
-            // regardless), but our *outbound* encoding for the next query
-            // is chosen from `negotiated_version` — if we don't adopt what
-            // the server actually used, every subsequent query is sent at
-            // the wrong version. Catch that here, not only on an explicit
-            // error.
-            Response::Accepted { session, version } => {
-                if version != *negotiated_version {
+            match step {
+                // RFC 8210 §5: a v0-only cache receiving a v1 query may
+                // simply "respond with a version 0 response" instead of an
+                // ErrorReport. §7: the router MUST then "either downgrade to
+                // version 0 or terminate the connection".
+                Step::Accepted {
+                    downgraded_from, ..
+                } => {
+                    if let Some(proposed) = downgraded_from {
+                        warn!(
+                            sent = ?proposed,
+                            got = ?negotiation.version(),
+                            "RTR server answered at a lower protocol version than requested; downgrading"
+                        );
+                    }
+                    if matches!(query, Query::Reset) {
+                        // The cache just accepted our Reset Query and is
+                        // about to send the replacement full load — safe to
+                        // drop the stale table now, right before the new one
+                        // is applied. Clearing any earlier (e.g. as soon as
+                        // Error Code 2 or Cache Reset arrived) would discard
+                        // the last successfully validated data for the
+                        // entire, possibly long, retry window — exactly the
+                        // condition RFC 8210 §12 describes as transient, and
+                        // exactly what this crate's own
+                        // stale-but-recent-is-better-than-no-data design (see
+                        // `RtrStatus::is_stale`'s doc comment) exists to
+                        // avoid.
+                        shared.table.clear();
+                    }
+                }
+                Step::Prefix => shared.table.apply_prefix_pdu(&frame.pdu),
+                Step::Ignore => {}
+                Step::Complete {
+                    session,
+                    serial,
+                    intervals,
+                } => {
+                    shared.set_resume(Resume {
+                        version: negotiation.version(),
+                        session,
+                        serial,
+                    });
+                    // Fires on every completed sync, full or incremental —
+                    // the single, correct point to notify subscribers (see
+                    // `RtrHandle::subscribe`) that the table just changed.
+                    shared.changed.send_modify(|g| *g = g.wrapping_add(1));
+                    return Ok(intervals);
+                }
+                // RFC 8210 §8.3: "When a router receives this, the router
+                // SHOULD attempt to connect to any more-preferred caches in
+                // its cache list. If there are no more-preferred caches, it
+                // MUST issue a Reset Query and get an entire new load from
+                // the cache." This client has a single cache. The remembered
+                // serial is exactly what the cache just refused to serve, so
+                // forget it *now*: if the connection dies before the
+                // replacement load completes, the next connection must not
+                // repeat the refused Serial Query.
+                Step::ResetRequired => {
                     warn!(
-                        sent = ?*negotiated_version,
-                        got = ?version,
-                        "RTR server accepted at a different protocol version than requested; adopting it"
+                        "RTR cache cannot serve an incremental update (Cache Reset); \
+                         issuing a Reset Query"
                     );
-                    *negotiated_version = version;
+                    shared.forget_resume();
+                    force_reset = true;
+                    continue 'exchange;
                 }
-                if matches!(query, Query::Reset) {
-                    // The cache just accepted our Reset Query and is about
-                    // to send the replacement full load — safe to drop the
-                    // stale table now, right before `apply_diff_stream`
-                    // applies the new one. Clearing any earlier (e.g. as
-                    // soon as Error Code 2 or Cache Reset arrived) would
-                    // discard the last successfully validated data for the
-                    // entire, possibly long, retry window — exactly the
-                    // condition RFC 8210 §12 describes as transient, and
-                    // exactly what this crate's own
-                    // stale-but-recent-is-better-than-no-data design (see
-                    // `RtrStatus::is_stale`'s doc comment) exists to avoid.
+                Step::MidTransferReset => {
                     shared.table.clear();
+                    shared.forget_resume();
+                    force_reset = true;
+                    continue 'exchange;
                 }
-                return Ok(session);
-            }
-            // RFC 8210 §8.3: "When a router receives this, the router SHOULD
-            // attempt to connect to any more-preferred caches in its cache
-            // list. If there are no more-preferred caches, it MUST issue a
-            // Reset Query and get an entire new load from the cache." This
-            // client has a single cache. The remembered serial is exactly
-            // what the cache just refused to serve, so forget it *now*: if
-            // the connection dies before the replacement load completes, the
-            // next connection must not repeat the refused Serial Query.
-            Response::ResetRequired => {
-                warn!(
-                    "RTR cache cannot serve an incremental update (Cache Reset); issuing a Reset Query"
-                );
-                shared.forget_resume();
-                force_reset = true;
-            }
-            Response::DowngradeToV0 { text } => {
-                warn!(text = %text, "RTR server rejected protocol v1, falling back to v0");
-                *negotiated_version = RtrVersion::V0;
-                // v0 and v1 session state (serial, session ID) are not
-                // interchangeable — force a full resync under the new version.
-                shared.table.clear();
-                shared.forget_resume();
-                attempted_fallback = true;
-            }
-            // RFC 8210 §12/§8.4: Error Code 2 ("No Data Available") is the
-            // only error code not marked "(fatal)" — the cache is healthy
-            // but has nothing to answer with yet (typically: still pulling
-            // its initial data set after a reboot). This MUST NOT tear down
-            // the session, but §8.4 is explicit about *what* to retry with:
-            // "If no other caches are available, the router MUST issue
-            // periodic Reset Queries until it gets a new usable load" — not
-            // a repeat of whatever query just failed.
-            Response::NoDataAvailable { text } => {
-                warn!(
-                    text = %text,
-                    "RTR cache reports no data available yet; forcing a Reset \
-                     Query retry on the same connection"
-                );
-                {
-                    // Transport is still live — only the last sync attempt
-                    // failed — so `connected` is deliberately left as-is.
-                    let mut status = shared.status.write().unwrap();
-                    status.last_error = Some(text);
+                Step::DowngradeToV0 { text } => {
+                    warn!(text = %text, "RTR server rejected protocol v1, falling back to v0");
+                    *negotiation = Negotiation::Proposed(RtrVersion::V0);
+                    *version_hint = RtrVersion::V0;
+                    // v0 and v1 session state (serial, session ID) are not
+                    // interchangeable — force a full resync under the new
+                    // version.
+                    shared.table.clear();
+                    shared.forget_resume();
+                    continue 'exchange;
                 }
-                force_reset = true;
-                tokio::time::sleep(retry_interval).await;
+                // RFC 8210 §12/§8.4: Error Code 2 ("No Data Available") is
+                // the only error code not marked "(fatal)" — the cache is
+                // healthy but has nothing to answer with yet (typically:
+                // still pulling its initial data set after a reboot). This
+                // MUST NOT tear down the session, but §8.4 is explicit about
+                // *what* to retry with: "If no other caches are available,
+                // the router MUST issue periodic Reset Queries until it gets
+                // a new usable load" — not a repeat of whatever query just
+                // failed.
+                Step::NoDataAvailable { text } => {
+                    warn!(
+                        text = %text,
+                        "RTR cache reports no data available yet; forcing a Reset \
+                         Query retry on the same connection"
+                    );
+                    {
+                        // Transport is still live — only the last sync
+                        // attempt failed — so `connected` is deliberately
+                        // left as-is.
+                        let mut status = shared.status.write().unwrap();
+                        status.last_error = Some(text);
+                    }
+                    force_reset = true;
+                    tokio::time::sleep(retry_interval).await;
+                    continue 'exchange;
+                }
             }
         }
     }
 }
 
-/// Reads PDUs until `EndOfData` (or `CacheReset`), applying Prefix PDUs to
-/// the table as they arrive.
-async fn apply_diff_stream(
+/// Upper bound on the offending-PDU copy placed in an outgoing Error Report
+/// (RFC 8210 §5.11: the "Erroneous PDU field MAY be truncated" for a PDU of
+/// excessive length). Every legal non-Error-Report PDU a cache sends is at
+/// most 32 bytes, so this never truncates one; it only stops a hostile
+/// oversized PDU from being echoed back at full length.
+const MAX_ERROR_REPORT_PDU_COPY: usize = 256;
+
+/// How long to wait for an Error Report to be accepted by the socket before
+/// giving up and closing anyway.
+const ERROR_REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Carries out the RFC-mandated reaction to a protocol [`Violation`]: send the
+/// Error Report (best effort), apply the consequence to the cached data, and
+/// return the error that ends the session.
+async fn reject(
     stream: &mut TcpStream,
     shared: &Arc<Shared>,
-    expected_session: SessionId,
     version: RtrVersion,
-) -> Result<DiffOutcome, RtrError> {
-    loop {
-        let (_version, pdu) = read_pdu(stream).await?;
-        match &pdu {
-            Pdu::Ipv4Prefix { .. } | Pdu::Ipv6Prefix { .. } => {
-                shared.table.apply_prefix_pdu(&pdu);
-            }
-            Pdu::RouterKey => {
-                // Decoded-and-discarded — Phase 1 doesn't act on BGPsec keys.
-            }
-            Pdu::CacheReset => {
-                shared.table.clear();
-                shared.forget_resume();
-                return Ok(DiffOutcome::ResyncNeeded);
-            }
-            Pdu::EndOfData {
-                session_id,
-                serial,
-                intervals,
-            } => {
-                if *session_id != expected_session.get() {
-                    // Invalidates everything just applied in this diff — the
-                    // server is telling us, after the fact, that this data
-                    // belonged to a session we don't recognize.
-                    shared.table.clear();
-                    shared.forget_resume();
-                    return Err(RtrError::SessionIdMismatch {
-                        expected: expected_session.get(),
-                        got: *session_id,
-                    });
-                }
-                shared.set_resume(Resume {
-                    version,
-                    session: expected_session,
-                    serial: Serial::new(*serial),
-                });
-                // Fires on every completed sync, full or incremental — the
-                // single, correct point to notify subscribers (see
-                // `RtrHandle::subscribe`) that the table just changed.
-                shared.changed.send_modify(|g| *g = g.wrapping_add(1));
-                return Ok(DiffOutcome::Complete(*intervals));
-            }
-            other => {
-                return Err(RtrError::UnexpectedPdu {
-                    expected: "Prefix, Router Key, Cache Reset, or End of Data",
-                    got: format!("{other:?}"),
-                });
-            }
-        }
+    violation: Violation,
+    offending_pdu: &[u8],
+) -> RtrError {
+    if let Some(spec) = violation.report {
+        let report = Pdu::ErrorReport {
+            error_code: spec.code,
+            pdu_copy: offending_pdu[..offending_pdu.len().min(MAX_ERROR_REPORT_PDU_COPY)].to_vec(),
+            text: spec.text.to_string(),
+        };
+        // The session is being dropped either way; a stuck or closed peer
+        // must not delay the cleanup below.
+        let _ = tokio::time::timeout(
+            ERROR_REPORT_WRITE_TIMEOUT,
+            write_pdu(stream, version, &report),
+        )
+        .await;
     }
+    match violation.consequence {
+        Consequence::Drop => {}
+        Consequence::ForgetResume => shared.forget_resume(),
+        Consequence::Flush => shared.flush(),
+    }
+    violation.error
 }
 
 /// Reads one complete PDU off the wire: the 8-byte header first (to learn the
@@ -598,7 +643,21 @@ async fn apply_diff_stream(
 /// v0-only cache receiving a v1 query "responds with a version 0 response."
 /// Callers that care about version negotiation (`sync_once`) must inspect
 /// this rather than assuming the response matches what was sent.
+#[cfg(test)]
 pub(crate) async fn read_pdu(stream: &mut TcpStream) -> Result<(RtrVersion, Pdu), RtrError> {
+    let frame = read_frame(stream).await?;
+    Ok((frame.version, frame.pdu))
+}
+
+/// One PDU off the wire: decoded, plus the exact bytes it arrived as (so an
+/// Error Report can echo an offending PDU back — RFC 8210 §5.11).
+struct Frame {
+    version: RtrVersion,
+    pdu: Pdu,
+    raw: Vec<u8>,
+}
+
+async fn read_frame(stream: &mut TcpStream) -> Result<Frame, RtrError> {
     let mut header = [0u8; 8];
     read_exact_mapped(stream, &mut header).await?;
     let (version, pdu_type, field, len) = pdu::decode_header(&header)?;
@@ -617,7 +676,11 @@ pub(crate) async fn read_pdu(stream: &mut TcpStream) -> Result<(RtrVersion, Pdu)
     // own length check below reports a proper InvalidLength error rather
     // than us needing a separate underflow guard.
     let pdu = pdu::decode_payload(version, pdu_type, field, len, &full)?;
-    Ok((version, pdu))
+    Ok(Frame {
+        version,
+        pdu,
+        raw: full,
+    })
 }
 
 async fn read_exact_mapped(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), RtrError> {

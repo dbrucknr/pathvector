@@ -1,3 +1,5 @@
+use crate::pdu::RtrVersion;
+
 /// Errors produced by the RTR PDU codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PduError {
@@ -53,9 +55,26 @@ pub enum RtrError {
     UnexpectedPdu { expected: &'static str, got: String },
     /// The server sent an Error Report PDU.
     ErrorReported { code: u16, text: String },
-    /// The session ID in an End of Data PDU does not match the one
-    /// established by the preceding Cache Response.
+    /// A PDU's Session ID does not match the session the router is in (the
+    /// remembered session for a Serial Query's Cache Response or a Serial
+    /// Notify; the Cache Response's session for End of Data).
     SessionIdMismatch { expected: u16, got: u16 },
+    /// A PDU arrived at a Protocol Version other than the one negotiated for
+    /// this session (RFC 8210 §7: the version "is stable for the life of the
+    /// session"; the party that sees a different one MUST drop the session).
+    UnexpectedVersion {
+        expected: RtrVersion,
+        got: RtrVersion,
+    },
+    /// A cache answered a Serial Query that resumed a session of one protocol
+    /// version at a lower one. RFC 8210 §5.1: sessions of different versions
+    /// are separate sessions, so the incremental response cannot be applied;
+    /// the client reconnects and performs a full resynchronisation at the
+    /// lower version.
+    VersionChanged {
+        resumed: RtrVersion,
+        answered: RtrVersion,
+    },
     /// The TCP connection closed unexpectedly.
     Closed,
 }
@@ -74,6 +93,15 @@ impl std::fmt::Display for RtrError {
             Self::SessionIdMismatch { expected, got } => {
                 write!(f, "RTR session ID mismatch: expected {expected}, got {got}")
             }
+            Self::UnexpectedVersion { expected, got } => write!(
+                f,
+                "RTR protocol version {got:?} PDU in a {expected:?} session"
+            ),
+            Self::VersionChanged { resumed, answered } => write!(
+                f,
+                "RTR cache answered a {resumed:?} session resume at {answered:?}; \
+                 resynchronising from scratch at {answered:?}"
+            ),
             Self::Closed => write!(f, "RTR connection closed"),
         }
     }
