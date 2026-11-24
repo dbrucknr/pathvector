@@ -52,6 +52,9 @@ messages lives in `pathvectord`. Export policy filtering lives in `pathvector-po
 | Adj-RIB-Out: per-peer table of routes after export policy | `src/adj_rib_out.rs` | ✅ | `test_adj_rib_out_insert_and_remove` |
 | Withdrawal propagated to all peers' Adj-RIB-Out when best path changes | `src/rib.rs` | ✅ | `test_loc_rib_withdrawal_propagates` |
 | `RibSnapshot` captures a consistent point-in-time read of Loc-RIB | `src/snapshot.rs` | ✅ | `test_rib_snapshot_consistency` |
+| §9.1.2 "Unresolvable routes SHALL be removed from the Loc-RIB and the routing table" — including when a replacement UPDATE (§9 implicit withdrawal) makes the last feasible candidate unresolvable: `BestPathChange::Withdrawn` | `src/loc_rib.rs` (`BestTransition`) | ✅ | `test_insert_replacing_sole_best_with_unresolvable_next_hop_is_withdrawn` (+ `_v6`), `test_insert_last_feasible_of_several_candidates_is_withdrawn`, `test_insert_all_candidates_become_infeasible_one_by_one`, `test_best_transition_truth_table`; daemon: `daemon::last_feasible_tests` (FIB + WITHDRAWN ROUTES / MP_UNREACH_NLRI, both families) |
+| §9.1.2 "unresolvable routes SHOULD be kept in the Adj-RIBs-In (in case they become resolvable)" — kept as Loc-RIB candidates, excluded from selection | `src/loc_rib.rs` | ✅ | `test_insert_unresolvable_replacement_is_kept_as_candidate`, `unresolvable_replacement_of_sole_best_withdraws_from_fib_and_peers_v4` |
+| §9.2 "newly unfeasible routes for which there is no replacement route SHALL be advertised": `Withdrawn` only when a best existed and none remains; a feasible alternative yields `Announced`; a never-selected prefix yields `Unchanged` | `src/loc_rib.rs` | ✅ | `test_insert_unresolvable_replacement_promotes_feasible_alternative`, `test_insert_infeasible_into_prefix_without_best_is_unchanged`, `test_withdraw_infeasible_candidate_when_no_best_is_unchanged`, proptest: `prop_loc_rib_change_stream_replays_to_best_table` |
 
 ---
 

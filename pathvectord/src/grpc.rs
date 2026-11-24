@@ -507,10 +507,15 @@ impl PeerService for PeerServiceImpl {
 
         let import_default = proto_policy_to_config_import(req.import_default);
         let export_default = proto_policy_to_config_export(req.export_default);
+        // proto3 cannot tell an unset string from an empty one, so "" means
+        // "no TCP MD5". Anything else must be a valid key (1–80 bytes).
         let md5_password = if req.md5_password.is_empty() {
             None
         } else {
-            Some(req.md5_password)
+            Some(
+                crate::config::Md5Password::try_from(req.md5_password)
+                    .map_err(|e| Status::invalid_argument(format!("md5_password: {e}")))?,
+            )
         };
 
         let peer = crate::config::PeerConfig {
@@ -1946,6 +1951,63 @@ mod tests {
         );
         assert_eq!(cfg.remote_as, 65002);
         assert_eq!(cfg.port, 179, "port 0 must default to 179");
+    }
+
+    /// Linux limits keys to `TCP_MD5SIG_MAXKEYLEN` (80) bytes; a longer
+    /// key must be rejected when the peer is added, not left to fail on
+    /// every connect attempt.
+    #[tokio::test]
+    async fn test_add_peer_rejects_md5_password_over_80_bytes() {
+        let state = arc_state(65001, &[]);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let svc = PeerServiceImpl {
+            state,
+            cmd_tx,
+            stop_senders: noop_stop_senders(),
+        };
+        let err = svc
+            .add_peer(Request::new(AddPeerRequest {
+                address: "10.0.0.2".into(),
+                remote_as: 65002,
+                md5_password: "x".repeat(81),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("md5_password"), "{}", err.message());
+        assert!(cmd_rx.try_recv().is_err(), "no peer may be added");
+    }
+
+    /// A valid key reaches the daemon as a validated `Md5Password`. An empty
+    /// proto3 string is "unset" (proto3 has no presence for scalars), so it
+    /// means no TCP MD5, exactly as omitting the field does.
+    #[tokio::test]
+    async fn test_add_peer_md5_password_valid_and_unset() {
+        for (sent, expected) in [
+            ("k".repeat(80), Some("k".repeat(80).parse().unwrap())),
+            (String::new(), None),
+        ] {
+            let state = arc_state(65001, &[]);
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+            let svc = PeerServiceImpl {
+                state,
+                cmd_tx,
+                stop_senders: noop_stop_senders(),
+            };
+            svc.add_peer(Request::new(AddPeerRequest {
+                address: "10.0.0.2".into(),
+                remote_as: 65002,
+                md5_password: sent,
+                ..Default::default()
+            }))
+            .await
+            .expect("add_peer must succeed");
+            let Ok(DaemonCommand::AddPeer(cfg)) = cmd_rx.try_recv() else {
+                panic!("expected AddPeer command")
+            };
+            assert_eq!(cfg.md5_password, expected);
+        }
     }
 
     #[tokio::test]

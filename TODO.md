@@ -2249,6 +2249,44 @@ plus loop-detection to prevent infinite recursion. Explicitly not implemented; t
 current design excludes BGP routes from `FibSnapshot` for correctness (no feedback loop,
 semantic separation of IGP and BGP RIBs).
 
+**Negative routes: what the snapshot still cannot see** (follow-ups to #57):
+
+- *Policy routing.* A `throw` route, or any route in a table other than the mirrored
+  one, is resolved against the mirrored table alone: thrown traffic is reported
+  unreachable even if a later `ip rule` table would carry it. Modelling the rule chain
+  (`fib_rules_lookup`) would need a rule dump and per-table snapshots.
+- *Nexthop objects.* A route through `RTA_NH_ID` is classified by the type the kernel
+  reports; changing the object (for example to a blackhole nexthop) sends no route
+  notification. Needs an `RTM_NEWNEXTHOP` subscription.
+- *IPv6 unicast via `lo`.* `fib6_is_reject` turns it into a reject route but it is still
+  reported as unicast.
+- *BGP-installed blackholes.* RFC 7999 null routes installed by `FibWriter` are excluded
+  with every other BGP route, so a next hop beneath one is still reported reachable
+  through the IGP route. Belongs with recursive next-hop resolution above.
+
+**Snapshot recovery: what the supervisor still cannot see** (follow-ups to #59):
+
+- *Silent kernel flushes.* When a link goes down, `fib_table_flush` removes the IPv4
+  routes through it and sends `RTM_DELROUTE` only if their preferred source address was
+  removed (`fi->pfsrc_removed`). Subscribing to link / address groups and resyncing (or
+  applying the flush) on a link-down event would close this.
+- *No periodic verification.* A divergence that is never signalled lasts until the next
+  detected loss. An optional low-rate verification dump that compares and, on mismatch,
+  degrades and resyncs would bound it.
+- *Metrics.* `FibStatus` (health, losses, resyncs) is logged by `pathvectord` but not
+  exported to Prometheus.
+- *Readiness gate.* `pathvectord` does not wait for the first `Ready` before starting
+  sessions; it relies on the change notification to re-evaluate next hops when the
+  first dump lands.
+- *Stale-route dump.* `KernelFib::stale_bgp_routes` uses `rtnetlink`'s dump, which
+  cannot tell a complete dump from one cut short by a closed connection; it should use
+  the supervisor's `read_dump`.
+- *Resync cost.* A resync dumps every route of both families, BGP-installed ones
+  included: the mirror keeps them as identities so replaces displace the right route,
+  so a protocol filter is not an option. With a full table in the kernel that is a large
+  dump (and the dump deadline must allow for it); with `NETLINK_GET_STRICT_CHK`,
+  dumping only the tracked table would shrink it.
+
 **Testing gaps:**
 
 - E2e test (Gap 8): after session with GoBGP establishes and a prefix is learned,
@@ -2300,6 +2338,7 @@ What remains as optional future work:
   side is not a mismatch); implemented behavior matches the non-strict default.
   Add if an operator needs to enforce Role negotiation as a hard requirement.
 - IPv6 peer MD5 authentication — currently `Unsupported` in `pathvector-sys`; would need a separate ABI path (`sockaddr_in6` in the `TcpMd5Sig` struct)
+- Metric for unauthenticated MD5 connects — under `tcp_md5_enforcement = "best-effort"` an unenforced connect is logged (`warn!`) and returned as `Md5Protection::Unenforced`, but not counted; a `pathvectord_bgp_tcp_md5_unenforced_total{peer,reason}` counter would make it alertable (issue #58 follow-up)
 
 RFC 8538 (2026-06-24), RFC 4724 Phase 1+2 (2026-06-22), RFC 7313 (2026-06-18), RFC 9003
 (2026-06-18), per-peer hold timer (2026-06-18), outbound ROUTE-REFRESH trigger
@@ -2322,18 +2361,12 @@ Not yet started. Key work items:
 ### Dynamic peer management — known gaps (2026-06-18)
 
 Six gaps identified during a correctness audit of the `AddPeer`/`RemovePeer` feature.
-Items 1, 2, 4, 5, 6 resolved 2026-06-18 — see CHANGELOG.md. Item 3 remains open.
+Items 1, 2, 4, 5, 6 resolved 2026-06-18, item 3 on 2026-11-23 — see CHANGELOG.md.
 
-**3. MD5 password on dynamically-added peers doesn't work for inbound connections**
-
-The BGP listener socket is bound once at startup; TCP MD5SIG keys cannot be added to
-an existing listening socket on Linux without rebinding. Dynamically-added peers with
-`md5_password` only work for outbound connections (pathvectord dials them). If the
-remote peer tries to initiate toward us, the listener rejects the TCP handshake because
-no key is installed for that source address.
-
-Fix (full): re-bind the listener socket when a new MD5 peer is added — requires moving
-the listener into a task that can be restarted. Documented in `pathvectord/README.md`.
+**3. ~~MD5 password on dynamically-added peers doesn't work for inbound connections~~**
+Resolved 2026-11-23 (issue #66), see CHANGELOG.md. The premise was wrong: Linux accepts
+`TCP_MD5SIG` on a listening socket at any time, so no rebind is needed. The real gap was
+wider: the listener installed no keys at all, for static peers either.
 
 ### watch_routes broadcast channel — guaranteed delivery
 
