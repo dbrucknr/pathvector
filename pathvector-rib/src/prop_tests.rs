@@ -1,11 +1,12 @@
 use std::{collections::HashMap, net::Ipv4Addr};
 
-use pathvector_types::{AsPath, Asn, LocalPref, Med, Nlri, Origin, PeerType};
+use pathvector_types::{AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType};
 use proptest::prelude::*;
 
 use crate::{
-    AdjRibIn, AdjRibOut, LocRib, PeerId, Route, RouteBuilder, best_path::select_best,
-    oracle::AlwaysReachable,
+    AdjRibIn, AdjRibOut, BestPathChange, LocRib, PeerId, Route, RouteBuilder,
+    best_path::select_best,
+    oracle::{AlwaysReachable, NextHopOracle},
 };
 
 // ── Strategies ───────────────────────────────────────────────────────────────
@@ -458,6 +459,183 @@ proptest! {
 
         for nlri in exclusive {
             prop_assert!(rib.best(&nlri).is_none());
+        }
+    }
+}
+
+// ── LocRib: BestPathChange stream is a faithful delta (issue #67) ───────────
+//
+// Every consumer of `BestPathChange` (FIB writer, Adj-RIB-Out propagation,
+// route-event streams) maintains its own copy of "the selected route per
+// prefix" by applying the changes it is handed. RFC 4271 §9.1.2 requires that
+// "Unresolvable routes SHALL be removed from the Loc-RIB and the routing
+// table", and §9.2 that "all newly unfeasible routes for which there is no
+// replacement route SHALL be advertised" — both are only possible if the
+// change stream never drops a transition. This model test drives a Loc-RIB
+// through arbitrary insert / withdraw / peer-down / reachability operations
+// and checks after every step that replaying the emitted changes onto an
+// empty map reproduces the Loc-RIB's own best-path table exactly.
+
+/// Next-hop pool. `NH_POOL[i]` is resolvable iff `ReachabilityOracle.0[i]`.
+const NH_POOL: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(192, 0, 2, 1),
+    Ipv4Addr::new(192, 0, 2, 2),
+    Ipv4Addr::new(192, 0, 2, 3),
+];
+
+/// Prefix pool, kept tiny so operations collide on the same destination.
+const PREFIX_POOL: [&str; 3] = ["10.0.0.0/8", "10.1.0.0/16", "192.168.0.0/24"];
+
+#[derive(Debug, Clone, Copy)]
+struct ReachabilityOracle([bool; 3]);
+
+impl NextHopOracle for ReachabilityOracle {
+    fn is_reachable(&self, next_hop: &NextHop) -> bool {
+        match next_hop {
+            NextHop::V4(addr) => NH_POOL
+                .iter()
+                .position(|nh| nh == addr)
+                .is_none_or(|i| self.0[i]),
+            _ => true,
+        }
+    }
+
+    fn igp_metric(&self, _: &NextHop) -> Option<u32> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RibOp {
+    /// UPDATE announcing (or replacing) `peer`'s route.
+    Insert(PeerId, Route<Ipv4Addr>),
+    /// UPDATE listing the prefix in WITHDRAWN ROUTES (or treat-as-withdraw).
+    Withdraw(PeerId, Nlri<Ipv4Addr>),
+    /// Session down: every route from `peer` is withdrawn.
+    WithdrawPeer(PeerId),
+    /// Next-hop `NH_POOL[i]` becomes (un)resolvable; the caller then runs
+    /// `recompute_all` (RFC 4271 §9.1.2: "Phase 2 Route Selection MUST be
+    /// performed again").
+    SetReachable(usize, bool),
+}
+
+fn arb_pool_nlri() -> impl Strategy<Value = Nlri<Ipv4Addr>> {
+    (0..PREFIX_POOL.len()).prop_map(|i| PREFIX_POOL[i].parse().unwrap())
+}
+
+fn arb_rib_op() -> impl Strategy<Value = RibOp> {
+    let insert = (
+        arb_peer_id(),
+        arb_pool_nlri(),
+        proptest::option::of(0..NH_POOL.len()),
+    )
+        .prop_flat_map(|(peer, nlri, nh)| {
+            arb_route_for(nlri).prop_map(move |mut route| {
+                route.next_hop = nh.map(|i| NextHop::V4(NH_POOL[i]));
+                RibOp::Insert(peer, route)
+            })
+        });
+    prop_oneof![
+        5 => insert,
+        2 => (arb_peer_id(), arb_pool_nlri()).prop_map(|(p, n)| RibOp::Withdraw(p, n)),
+        1 => arb_peer_id().prop_map(RibOp::WithdrawPeer),
+        2 => (0..NH_POOL.len(), any::<bool>()).prop_map(|(i, r)| RibOp::SetReachable(i, r)),
+    ]
+}
+
+/// Applies `change` to the consumer-side replay map, failing on a
+/// `Withdrawn` for a prefix the consumer was never told about (a spurious
+/// withdrawal would make the FIB writer delete a route it never installed).
+fn replay(
+    map: &mut HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>>,
+    change: BestPathChange<Ipv4Addr>,
+) -> Result<(), TestCaseError> {
+    match change {
+        BestPathChange::Announced(nlri, route) => {
+            prop_assert_eq!(nlri, route.nlri, "Announced NLRI must match its route");
+            map.insert(nlri, route);
+        }
+        BestPathChange::Withdrawn(nlri) => {
+            prop_assert!(
+                map.remove(&nlri).is_some(),
+                "Withdrawn({:?}) emitted for a prefix that was never announced",
+                nlri
+            );
+        }
+        BestPathChange::Unchanged => {}
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Replaying the `BestPathChange` stream onto an empty map always equals
+    /// the Loc-RIB's best-path table, and the Loc-RIB selects a route for a
+    /// prefix iff at least one of its candidates is feasible (RFC 4271
+    /// §9.1.2: unresolvable routes "MUST be excluded from the Phase 2
+    /// decision function"; a feasible route, if one exists, is installed).
+    #[test]
+    fn prop_loc_rib_change_stream_replays_to_best_table(
+        ops in proptest::collection::vec(arb_rib_op(), 1..=40usize),
+    ) {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let mut oracle = ReachabilityOracle([true; 3]);
+        let mut replayed: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>> = HashMap::new();
+        // Independent model of the candidate set: (prefix, peer) -> route.
+        let mut model: HashMap<(Nlri<Ipv4Addr>, PeerId), Route<Ipv4Addr>> = HashMap::new();
+
+        for op in ops {
+            let changes = match op {
+                RibOp::Insert(peer, route) => {
+                    model.insert((route.nlri, peer), route.clone());
+                    vec![rib.insert(peer, route, &oracle)]
+                }
+                RibOp::Withdraw(peer, nlri) => {
+                    model.remove(&(nlri, peer));
+                    vec![rib.withdraw(&peer, &nlri, &oracle)]
+                }
+                RibOp::WithdrawPeer(peer) => {
+                    model.retain(|(_, p), _| *p != peer);
+                    rib.withdraw_peer(&peer, &oracle)
+                }
+                RibOp::SetReachable(i, reachable) => {
+                    oracle.0[i] = reachable;
+                    rib.recompute_all(&oracle)
+                }
+            };
+            for change in changes {
+                replay(&mut replayed, change)?;
+            }
+
+            let actual: HashMap<Nlri<Ipv4Addr>, Route<Ipv4Addr>> = rib
+                .best_routes()
+                .map(|(nlri, route)| (nlri, route.clone()))
+                .collect();
+            prop_assert_eq!(&replayed, &actual);
+
+            for nlri in PREFIX_POOL.iter().map(|p| p.parse::<Nlri<Ipv4Addr>>().unwrap()) {
+                let feasible: Vec<(&PeerId, &Route<Ipv4Addr>)> = model
+                    .iter()
+                    .filter(|((n, _), r)| {
+                        *n == nlri && r.next_hop.as_ref().is_none_or(|nh| oracle.is_reachable(nh))
+                    })
+                    .map(|((_, p), r)| (p, r))
+                    .collect();
+                match rib.best_peer(&nlri) {
+                    None => prop_assert!(
+                        feasible.is_empty(),
+                        "{:?} has feasible candidates but no best route", nlri
+                    ),
+                    Some(winner) => {
+                        let selected = feasible.iter().find(|(p, _)| **p == winner);
+                        prop_assert!(
+                            selected.is_some_and(|(_, r)| Some(*r) == rib.best(&nlri)),
+                            "{:?}: best route is not a feasible candidate", nlri
+                        );
+                    }
+                }
+            }
         }
     }
 }
