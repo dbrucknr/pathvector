@@ -36,5 +36,9 @@ harness = false
 name    = "outbound_pipeline"
 harness = false
 
+[[bench]]
+name    = "peer_win_count"
+harness = false
+
 [lints]
 workspace = true
