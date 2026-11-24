@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::{Duration, Instant};
 
 use pathvector_rib::BestPathChange;
 use pathvector_rib::oracle::NextHopOracle;
@@ -33,7 +34,7 @@ use pathvector_session::message::{Capability, MpReachNlri, PathAttribute, Prefix
 use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::mpsc;
 
-use super::DaemonState;
+use super::{DaemonState, MRAI};
 use crate::daemon::tests::{make_state, with_recording_fib};
 
 pub(super) const LOCAL_AS: u32 = 65001;
@@ -120,6 +121,19 @@ pub(super) fn sent_to(
     state.flush_pending();
     let rx = receivers.get_mut(&IpAddr::V4(peer)).unwrap();
     std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+/// Simulates the MRAI timer arm in `run_with` once B's
+/// MinRouteAdvertisementIntervalTimer has expired (RFC 4271 §9.2.1.1: "the
+/// last route selected SHALL be advertised at the end of
+/// MinRouteAdvertisementIntervalTimer").
+pub(super) fn expire_mrai(state: &mut DaemonState) {
+    let past = Instant::now()
+        .checked_sub(MRAI + Duration::from_secs(1))
+        .expect("monotonic clock far enough from its epoch");
+    state.mrai.backdate_peer(IpAddr::V4(PEER_B), past);
+    state.mrai_v6.backdate_peer(IpAddr::V4(PEER_B), past);
+    state.flush_mrai_pending();
 }
 
 fn announce_v4(path: &[u32], next_hop: Ipv4Addr) -> UpdateMessage {
@@ -290,10 +304,18 @@ fn unresolvable_replacement_promotes_feasible_alternative_v4() {
     );
     // RFC 4271 §9.2: a replacement exists, so B must never see a withdrawal.
     // B (eBGP) was sent A's path moments ago, so the replacement itself is
-    // held by MinRouteAdvertisementIntervalTimer (§9.2.1.1); what #67 requires
-    // is that the outbound state already reflects C's path, not a withdrawal.
+    // held by MinRouteAdvertisementIntervalTimer (§9.2.1.1) and goes out when
+    // the interval expires.
     let to_b = sent_to(&mut state, &mut receivers, PEER_B);
     assert!(!withdraws_v4(&to_b), "a replacement exists; got {to_b:?}");
+    assert!(state.has_mrai_pending(), "C's path must be held for B");
+
+    expire_mrai(&mut state);
+    let to_b = sent_to(&mut state, &mut receivers, PEER_B);
+    assert!(
+        announces_v4(&to_b) && !withdraws_v4(&to_b),
+        "B must receive C's path as a replacement at MRAI expiry, got {to_b:?}"
+    );
     assert_eq!(
         state.adj_ribs_out[&IpAddr::V4(PEER_B)]
             .get(&n4())
@@ -303,9 +325,8 @@ fn unresolvable_replacement_promotes_feasible_alternative_v4() {
             Asn::new(AS_C),
             Asn::new(65005)
         ])),
-        "B's Adj-RIB-Out must hold C's path"
+        "B's Adj-RIB-Out must hold C's path once it has been sent"
     );
-    assert!(state.mrai_pending[&IpAddr::V4(PEER_B)].contains(&n4()));
 }
 
 /// IPv6 with a feasible alternative.
@@ -328,10 +349,16 @@ fn unresolvable_replacement_promotes_feasible_alternative_v6() {
             [BestPathChange::Announced(n, r)] if *n == n6() && r.next_hop == Some(NextHop::V6(alt))),
         "FIB must switch to C's next hop, got {changes:?}"
     );
+    // B (eBGP) was sent A's path moments ago, so the replacement is held by
+    // MRAI (RFC 4271 §9.2.1.1; RFC 4760 gives MP_REACH_NLRI no exemption).
+    let to_b = sent_to(&mut state, &mut receivers, PEER_B);
+    assert!(!withdraws_v6(&to_b), "a replacement exists; got {to_b:?}");
+
+    expire_mrai(&mut state);
     let to_b = sent_to(&mut state, &mut receivers, PEER_B);
     assert!(
         announces_v6(&to_b) && !withdraws_v6(&to_b),
-        "B must receive C's path as a replacement, got {to_b:?}"
+        "B must receive C's path as a replacement at MRAI expiry, got {to_b:?}"
     );
 }
 

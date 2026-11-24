@@ -381,7 +381,8 @@ fn restart_time_expiry_falls_back_to_the_fresh_alternative() {
     drain(&mut rxs);
     let fib = with_recording_fib(&mut state);
     // Keep MRAI from deferring the replacement past this test's horizon.
-    state.mrai_last_sent.clear();
+    state.mrai.clear_last_sent();
+    state.mrai_v6.clear_last_sent();
 
     state.gr.deadlines.remove(&IpAddr::V4(PEER_A));
     state.on_gr_deadline_expired(IpAddr::V4(PEER_A));
