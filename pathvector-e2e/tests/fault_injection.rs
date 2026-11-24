@@ -795,3 +795,74 @@ async fn confederation_id_in_as_path_is_treated_as_loop_and_dropped() {
 
     assert_control_peer_established(&mut h).await;
 }
+
+/// Issue #138, RFC 4271 §9 + §9.1.2: the fault peer announces a prefix, then
+/// replaces it with a route whose AS_PATH contains pathvectord's own AS. The
+/// replacement is ineligible (an AS loop), but it still "thus implicitly
+/// withdraw[s] the older route from service" — so the first route must leave
+/// the Loc-RIB rather than stay selected. The session must stay Established:
+/// the UPDATE is well formed.
+#[tokio::test]
+async fn as_loop_replacement_withdraws_the_older_route_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("as-loop-replacement").await;
+    assert_control_peer_established(&mut h).await;
+
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect(
+            "RFC 4271 §9: the looped replacement supersedes the first route, which must \
+             be withdrawn from the Loc-RIB within 15 s",
+        );
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "an AS loop is ineligible, not malformed: the session must stay Established"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}
+
+/// Issue #138, RFC 4271 §6.3 + RFC 7606 §3(e): the replacement's NEXT_HOP is
+/// 0.0.0.0, not "a valid IP host address". Treat-as-withdraw removes the
+/// first route; no NOTIFICATION is sent.
+#[tokio::test]
+async fn invalid_next_hop_replacement_withdraws_the_older_route_session_stays_up() {
+    let mut h = FaultInjectionHarness::new("invalid-next-hop-replacement").await;
+    assert_control_peer_established(&mut h).await;
+
+    wait_for_route(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect("10.99.0.0/24 did not appear in Loc-RIB within 15 s");
+
+    wait_for_route_withdrawn(&mut h.client, "10.99.0.0/24", Duration::from_secs(15))
+        .await
+        .expect(
+            "RFC 7606 §3(e): the replacement with an invalid NEXT_HOP is treat-as-withdraw, \
+             so the first route must leave the Loc-RIB within 15 s",
+        );
+
+    let fault_peer = h.fault_peer;
+    let state = h
+        .client
+        .get_peer(IpAddr::from(fault_peer))
+        .await
+        .expect("get_peer(fault_peer) gRPC call succeeded");
+    assert_eq!(
+        state.session_state,
+        SessionState::Established,
+        "RFC 7606 §3(e): treat-as-withdraw must not reset the session"
+    );
+
+    assert_control_peer_established(&mut h).await;
+}

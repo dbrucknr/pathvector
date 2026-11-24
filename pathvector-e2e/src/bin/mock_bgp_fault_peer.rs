@@ -122,6 +122,16 @@
 //!   Run via `FaultInjectionHarness::new`, which always pairs the fault
 //!   peer with a well-behaved GoBGP control peer — this scenario's test
 //!   also asserts that control peer's session is unaffected.
+//! - `as-loop-replacement` — a real handshake, one clean UPDATE, then a
+//!   second UPDATE for the same prefix whose AS_PATH contains pathvectord's
+//!   own AS (RFC 4271 §9.1.2). Well formed, so the session stays up, but the
+//!   route is ineligible: RFC 4271 §9 says the replacement "thus implicitly
+//!   withdraw[s] the older route from service", so the first route must leave
+//!   the Loc-RIB (issue #138).
+//! - `invalid-next-hop-replacement` — same shape, but the second UPDATE's
+//!   NEXT_HOP is 0.0.0.0, not a valid host address (RFC 4271 §6.3). RFC 7606
+//!   §3(e) makes that treat-as-withdraw, so the first route must be removed
+//!   and the session must stay up (issue #138).
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -138,6 +148,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 const FAULT_PEER_AS: u16 = 65098;
+/// pathvectord's own AS in `FaultInjectionHarness`'s config. Kept in sync
+/// manually with `write_daemon_config_fault_injection` in
+/// `pathvector-e2e/src/lib.rs`.
+const PATHVECTORD_AS: u32 = 65_002;
 const FAULT_PEER_BGP_ID: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 98);
 const TEST_PREFIX: &str = "10.99.0.0/24";
 
@@ -189,6 +203,22 @@ async fn handle_connection(stream: TcpStream, scenario: String) {
         "confederation-id-loop" => confederation_id_loop_update(stream).await,
         "unrecognized-well-known-attribute" => {
             unrecognized_well_known_attribute_update(stream).await;
+        }
+        "as-loop-replacement" => {
+            replacement_update(
+                stream,
+                &[Asn::new(u32::from(FAULT_PEER_AS)), Asn::new(PATHVECTORD_AS)],
+                FAULT_PEER_BGP_ID,
+            )
+            .await;
+        }
+        "invalid-next-hop-replacement" => {
+            replacement_update(
+                stream,
+                &[Asn::new(u32::from(FAULT_PEER_AS))],
+                Ipv4Addr::UNSPECIFIED,
+            )
+            .await;
         }
         other => panic!("unknown scenario: {other}"),
     }
@@ -1574,6 +1604,95 @@ async fn confederation_id_loop_update(stream: TcpStream) {
         "sent UPDATE with confederation identifier ({CONFEDERATION_ID}) in AS_PATH for {TEST_PREFIX}"
     );
 
+    let mut stream = framed.into_inner();
+    let mut buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(3)) => {
+                if stream.write_all(&keepalive_frame()).await.is_err() {
+                    return;
+                }
+            }
+            n = stream.read(&mut buf) => {
+                if matches!(n, Ok(0) | Err(_)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Issue #138: a real handshake, one clean UPDATE for `TEST_PREFIX`, then a
+/// well-formed replacement for the same prefix carrying `replacement_path`
+/// and `replacement_next_hop`. The replacement is dropped by pathvectord
+/// before import policy (AS loop, invalid NEXT_HOP), and RFC 4271 §9 says it
+/// still supersedes the first route, which must therefore leave service.
+async fn replacement_update(
+    stream: TcpStream,
+    replacement_path: &[Asn],
+    replacement_next_hop: Ipv4Addr,
+) {
+    let mut framed = Framed::new(stream, BgpCodec::new());
+
+    let Some(Ok(BgpMessage::Open(peer_open))) = framed.next().await else {
+        eprintln!("expected OPEN as the first message; closing");
+        return;
+    };
+    println!("received OPEN from peer AS {}", peer_open.my_as);
+
+    let our_open = OpenMessage {
+        version: 4,
+        my_as: FAULT_PEER_AS,
+        hold_time: 9,
+        bgp_id: FAULT_PEER_BGP_ID,
+        capabilities: vec![],
+    };
+    if framed.send(BgpMessage::Open(our_open)).await.is_err() {
+        return;
+    }
+    if framed.send(BgpMessage::Keepalive).await.is_err() {
+        return;
+    }
+    loop {
+        match framed.next().await {
+            Some(Ok(BgpMessage::Keepalive)) => break,
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    println!("session established");
+
+    let announce = |path: Vec<Asn>, next_hop: Ipv4Addr| UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(path)),
+            PathAttribute::NextHop(next_hop),
+        ],
+        announced: vec![TEST_PREFIX.parse().expect("valid prefix literal")],
+    };
+
+    let clean = announce(vec![Asn::new(u32::from(FAULT_PEER_AS))], FAULT_PEER_BGP_ID);
+    if framed.send(BgpMessage::Update(clean)).await.is_err() {
+        return;
+    }
+    println!("sent clean UPDATE for {TEST_PREFIX}");
+
+    // Give the test a real window to observe the clean route in Loc-RIB
+    // before the replacement removes it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let replacement = announce(replacement_path.to_vec(), replacement_next_hop);
+    if framed.send(BgpMessage::Update(replacement)).await.is_err() {
+        return;
+    }
+    println!(
+        "sent replacement UPDATE for {TEST_PREFIX} (AS_PATH {replacement_path:?}, \
+         NEXT_HOP {replacement_next_hop})"
+    );
+
+    // Hold the session open: the replacement is well formed, so the session
+    // must survive it.
     let mut stream = framed.into_inner();
     let mut buf = [0u8; 256];
     loop {
