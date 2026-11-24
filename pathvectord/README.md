@@ -18,9 +18,11 @@ and decides which routes to install in the local routing table.
    If a connection drops it retries automatically.
 
 2. **RIB management** — when a peer advertises a prefix, it is stored in Adj-RIB-In
-   (raw, pre-policy). If import policy accepts it, it enters Loc-RIB (the decision table)
-   and best-path selection picks a winner. The winner goes to Adj-RIB-Out for each peer
-   that export policy allows it to reach.
+   (raw, pre-policy), replacing that peer's older advertisement. If import policy accepts
+   it, it becomes the peer's candidate in Loc-RIB (the decision table); if policy rejects
+   it, the peer's older candidate is withdrawn, because the new advertisement implicitly
+   withdraws the old one (RFC 4271 §9). Best-path selection then picks a winner, which
+   goes to Adj-RIB-Out for each peer that export policy allows it to reach.
 
 3. **gRPC API** — a management interface (not BGP) where you inspect peers, query
    routes, and change policy at runtime.

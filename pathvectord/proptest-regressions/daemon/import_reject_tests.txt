@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9c9aaee4ce64ea282f0d2c0d8633a70412cdf443372eafd8ccbadd9603e93b13 # shrinks to steps = [Step { peer: 0, prefix: 0, v6: true, kind: Announce { rejected: false, path_len: 1 } }, Step { peer: 0, prefix: 0, v6: true, kind: Announce { rejected: true, path_len: 1 } }]

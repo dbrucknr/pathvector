@@ -9,6 +9,42 @@ the workspace that ties all other crates together.
 
 ---
 
+## RFC 4271 §9 / §9.1.1 — Import (Phase 1) and Implicit Withdrawal
+
+**Owns:** `daemon/import.rs`: `ImportDecision`, `import_announcement` and
+`reapply_import_policy`, the one path (both address families) by which a received
+route goes through import policy into the Loc-RIB, on arrival and on re-evaluation.  
+**Boundary:** Policy evaluation lives in `pathvector-policy`; candidate storage and
+best-path selection (§9.1.2) live in `pathvector-rib`; FIB and outbound side effects stay
+with the caller (`DaemonState::on_route_update`, `reevaluate_import_for_peer`).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9
+
+Clauses implemented (quoted from the RFC text):
+
+- §9: "if the NLRI of the new route is identical to the one the route currently has
+  stored in the Adj-RIB-In, then the new route SHALL replace the older route in the
+  Adj-RIB-In, thus implicitly withdrawing the older route from service."
+- §9.1: Phase 1 returns a preference or "a value denoting that this route is ineligible
+  to be installed in Loc-RIB and will be excluded from the next phase of route selection."
+- §9.1.2: "The Phase 2 process considers all routes that are eligible in the Adj-RIBs-In."
+- RFC 9234 §3/§5: a leaked route "MUST be considered ineligible", with RFC 4271's meaning.
+
+RFC 7606 does not apply: it revises error handling for *malformed* UPDATEs and does not
+mention policy. A policy rejection is a well-formed route found ineligible.
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| A replacement route replaces the peer's older route in Adj-RIB-In (pre-policy), whether or not policy accepts it, so later re-evaluation judges the latest advertisement | `src/daemon/import.rs` `import_announcement` | ✅ | `import_announcement_keeps_rejected_replacement_in_adj_rib_in`, `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6` |
+| A replacement that import policy rejects withdraws the peer's older Loc-RIB candidate; with no other candidate the FIB gets `Withdrawn` and peers get WITHDRAWN ROUTES / `MP_UNREACH_NLRI` (§9.2) | `src/daemon/import.rs` `ImportDecision::apply` | ✅ | `rejected_replacement_of_sole_best_withdraws_from_fib_and_peers_v4`/`_v6` (issue #80) |
+| …and another peer's eligible route takes over: FIB switches next hop, peers get a replacement, never a withdrawal | `src/daemon/import.rs` | ✅ | `rejected_replacement_promotes_other_peers_route_v4`/`_v6` |
+| …and a rejected replacement of a non-selected candidate removes it without FIB or peer churn | `src/daemon/import.rs` | ✅ | `rejected_replacement_of_losing_candidate_causes_no_churn_v4`/`_v6` |
+| An accepted replacement of a rejected route is installed and advertised | `src/daemon/import.rs` | ✅ | `accepted_replacement_of_rejected_route_is_installed_v4`/`_v6` |
+| The same holds for RFC 6811 ROV Invalid and RFC 9234 §5 OTC-leak replacements | `src/daemon/import.rs` | ✅ | `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6`, `otc_leak_replacement_withdraws_old_route_v4`/`_v6` |
+| Model: after any per-peer sequence of accepted/rejected announcements and withdrawals, Loc-RIB candidates == each peer's latest advertisement that passed policy; Adj-RIB-In == latest advertisement; re-evaluation agrees with initial import | `src/daemon/import_reject_tests.rs` | ✅ | `prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer` |
+| Replacements dropped *before* import policy also implicitly withdraw the older route | `src/daemon/route.rs` | ⚠️ | Open, outside #80: these paths `continue` before `import_announcement`, so the older route stays in Adj-RIB-In and Loc-RIB. AS_PATH loop: §9.1.2 says the route "should be excluded from the Phase 2 decision function", i.e. ineligible, which by the reasoning above should withdraw the older route. AS 0: RFC 7607 §2 delegates to RFC 7606 (treat-as-withdraw); tracked by #111. Semantically invalid NEXT_HOP: RFC 4271 §6.3 says "the route SHOULD be ignored" (RFC 7606 §7.3 only covers a wrong attribute length), and whether "ignored" keeps the older route is not settled here. |
+
+---
+
 ## RFC 4271 §9.2 — Update-Send Process
 
 **Owns:** `propagate_prefix`, `prepare_outbound`, and `flush_updates`: the pipeline that

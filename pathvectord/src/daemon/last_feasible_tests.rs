@@ -37,26 +37,26 @@ use tokio::sync::mpsc;
 use super::{DaemonState, MRAI};
 use crate::daemon::tests::{make_state, with_recording_fib};
 
-const LOCAL_AS: u32 = 65001;
+pub(super) const LOCAL_AS: u32 = 65001;
 /// Source of the route under test.
-const PEER_A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
-const AS_A: u32 = 65002;
+pub(super) const PEER_A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+pub(super) const AS_A: u32 = 65002;
 /// Observer: receives whatever the daemon advertises.
-const PEER_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
-const AS_B: u32 = 65003;
+pub(super) const PEER_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
+pub(super) const AS_B: u32 = 65003;
 /// Second source offering a feasible, less-preferred alternative.
-const PEER_C: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 4);
-const AS_C: u32 = 65004;
+pub(super) const PEER_C: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 4);
+pub(super) const AS_C: u32 = 65004;
 
-const RESOLVABLE_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
-const RESOLVABLE_V4_ALT: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 4);
+pub(super) const RESOLVABLE_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+pub(super) const RESOLVABLE_V4_ALT: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 4);
 const UNRESOLVABLE_V4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 99);
-const RESOLVABLE_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+pub(super) const RESOLVABLE_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 const UNRESOLVABLE_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 0x99);
 
 /// Fixed oracle: every next-hop resolves except the two `UNRESOLVABLE_*`
 /// addresses.
-struct FixedOracle;
+pub(super) struct FixedOracle;
 
 impl NextHopOracle for FixedOracle {
     fn is_reachable(&self, nh: &NextHop) -> bool {
@@ -69,19 +69,19 @@ impl NextHopOracle for FixedOracle {
     }
 }
 
-type Receivers = HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>;
+pub(super) type Receivers = HashMap<IpAddr, mpsc::Receiver<UpdateMessage>>;
 
-fn n4() -> Nlri<Ipv4Addr> {
+pub(super) fn n4() -> Nlri<Ipv4Addr> {
     "10.0.0.0/8".parse().unwrap()
 }
 
-fn n6() -> Nlri<Ipv6Addr> {
+pub(super) fn n6() -> Nlri<Ipv6Addr> {
     "2001:db8:1::/48".parse().unwrap()
 }
 
 /// Builds a daemon with peers A, B and C established (all eBGP, IPv4 + IPv6
 /// unicast) and the fixed oracle installed. Returns the drained receivers.
-fn established() -> (DaemonState, Receivers) {
+pub(super) fn established() -> (DaemonState, Receivers) {
     let (mut state, mut receivers) = make_state(
         LOCAL_AS,
         &[
@@ -104,7 +104,7 @@ fn established() -> (DaemonState, Receivers) {
     (state, receivers)
 }
 
-fn drain(state: &mut DaemonState, receivers: &mut Receivers) {
+pub(super) fn drain(state: &mut DaemonState, receivers: &mut Receivers) {
     state.flush_pending();
     for rx in receivers.values_mut() {
         while rx.try_recv().is_ok() {}
@@ -113,7 +113,7 @@ fn drain(state: &mut DaemonState, receivers: &mut Receivers) {
 
 /// Flushes the outbound coalescing buffers, then returns every UPDATE queued
 /// for `peer`.
-fn sent_to(
+pub(super) fn sent_to(
     state: &mut DaemonState,
     receivers: &mut Receivers,
     peer: Ipv4Addr,
@@ -127,7 +127,7 @@ fn sent_to(
 /// MinRouteAdvertisementIntervalTimer has expired (RFC 4271 §9.2.1.1: "the
 /// last route selected SHALL be advertised at the end of
 /// MinRouteAdvertisementIntervalTimer").
-fn expire_mrai(state: &mut DaemonState) {
+pub(super) fn expire_mrai(state: &mut DaemonState) {
     let past = Instant::now()
         .checked_sub(MRAI + Duration::from_secs(1))
         .expect("monotonic clock far enough from its epoch");
@@ -168,22 +168,22 @@ fn announce_v6(path: &[u32], next_hop: Ipv6Addr) -> UpdateMessage {
     }
 }
 
-fn withdraws_v4(msgs: &[UpdateMessage]) -> bool {
+pub(super) fn withdraws_v4(msgs: &[UpdateMessage]) -> bool {
     msgs.iter().any(|m| m.withdrawn.contains(&n4()))
 }
 
-fn announces_v4(msgs: &[UpdateMessage]) -> bool {
+pub(super) fn announces_v4(msgs: &[UpdateMessage]) -> bool {
     msgs.iter().any(|m| m.announced.contains(&n4()))
 }
 
-fn withdraws_v6(msgs: &[UpdateMessage]) -> bool {
+pub(super) fn withdraws_v6(msgs: &[UpdateMessage]) -> bool {
     msgs.iter().flat_map(|m| &m.attributes).any(|a| {
         matches!(a, PathAttribute::MpUnreachNlri(u)
             if u.afi_safi == AfiSafi::IPV6_UNICAST && u.prefixes.contains(&Prefix::V6(n6())))
     })
 }
 
-fn announces_v6(msgs: &[UpdateMessage]) -> bool {
+pub(super) fn announces_v6(msgs: &[UpdateMessage]) -> bool {
     msgs.iter().flat_map(|m| &m.attributes).any(|a| {
         matches!(a, PathAttribute::MpReachNlri(r)
             if r.afi_safi == AfiSafi::IPV6_UNICAST && r.prefixes.contains(&Prefix::V6(n6())))
