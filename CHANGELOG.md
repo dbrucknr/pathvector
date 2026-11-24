@@ -4,6 +4,52 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-24 (pathvector-rpki: Cache Reset, negotiated version/session, atomic publication, cache expiry)
+
+Four P1 defects in the RTR client (`pathvector-rpki`), fixed together because they share
+the sync state machine. Expected behaviour was derived from RFC 8210 §§4–8, 12 (read
+from the RFC Editor text) with RFC 6810 and the 8210bis draft checked for amendments;
+none of the four clauses is changed by them.
+
+- **#87 Cache Reset as a normal reply to a Serial Query (§5.3/§5.9/§8.3).** It was
+  `UnexpectedPdu`: the connection dropped and, because the old serial was still
+  remembered, every reconnect repeated the refused Serial Query. Now the serial is
+  forgotten at once and a Reset Query follows on the same connection; the old VRPs keep
+  being served until the replacement load completes. A Cache Reset anywhere else (in
+  reply to a Reset Query, or after a Cache Response) is a protocol violation — the old
+  test that expected a resync there cited §5.7 and has been replaced.
+- **#90 Negotiated version and session identity (§5.1, §5.8, §7).** A Cache Response
+  with another session ID was accepted as a continuation; any Cache Response could change
+  the protocol version; End of Data was checked only against its own Cache Response;
+  idle Serial Notifies were not checked at all. Now: a session mismatch sends Error
+  Report 0, flushes the cache and reconnects with a Reset Query; a PDU at another version
+  than the negotiated one sends Error Report 8 and drops the session; a v0 answer to a
+  v1 resume is a separate session and restarts at v0; Serial Notifies during negotiation
+  are ignored whatever their version. The decisions live in a socket-free `protocol.rs`
+  (`SessionId`, `Serial`, `Resume`, `Negotiation`, `Exchange`, `Violation`).
+- **#88 Consistent data, serial and notifications.** Prefix PDUs were applied to the
+  live table as they arrived, while the serial and the notification waited for End of
+  Data. Records are now staged (a snapshot for a full load, a delta for an incremental
+  update) and published with the serial, status and the notification at a validated End
+  of Data, so a failed sync leaves the previous generation intact and resumable. Required
+  invalidation (§5.1 flush) now notifies subscribers. Measured on an M2 Max: a 500 000-VRP
+  load stages in 51 ms and installs in ≈ 0.3 µs (the replaced tables are freed after the locks are released, ≈ 20 ms); a 20 000-record delta applies in 1.9 ms
+  under the table locks. A full load now needs old + new tables in memory at once.
+- **#86 Cache expiry (§6).** The Expire Interval was read and thrown away. A monotonic
+  deadline (`End of Data + Expire`) is now enforced by a watcher that runs independently
+  of the connection: when it passes, all VRPs and the resume state are discarded (every
+  validation result becomes `NotFound`), `RtrStatus::expired` is set and subscribers are
+  notified. Connecting, bytes, Serial Notifies, stalled queries, "No Data Available" and
+  reconnect back-off do not extend it; only a completed sync does. v0 sessions use
+  `RtrConfig::expire_interval`; advertised intervals are clamped to the RFC ranges;
+  `RtrConfig::validate()` checks the configured defaults. A delta that was in flight when
+  the cache expired is discarded and a Reset Query issued.
+
+Proof: 27 black-box regression tests (`src/regression_tests.rs`, loopback cache that
+accepts every connection, paused clock for expiry) all fail on the previous `main` and
+pass now, plus 36 socket-free unit tests of the state machine and timers and 4 of config validation. Not changed (separate
+issues): #89, #91, #92, #93, #94.
+
 ## 2026-11-24 (RFC 6793: AS_PATH and AGGREGATOR used four-octet ASNs on every session)
 
 **Bug (issue #95).** `pathvector-session` read and wrote every ASN in `AS_PATH` as four

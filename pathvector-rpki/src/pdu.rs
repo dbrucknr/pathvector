@@ -130,7 +130,7 @@ impl Writer {
 // ── Wire types ─────────────────────────────────────────────────────────────
 
 /// RTR protocol version negotiated for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RtrVersion {
     /// RFC 6810.
     V0,
