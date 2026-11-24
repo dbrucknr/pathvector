@@ -115,20 +115,21 @@ Notes:
 - An `Ineligible` route stays in the Adj-RIB-In for soft reconfiguration, so every path
   that turns Adj-RIB-In routes into candidates asks the same `IngressGate` first:
   `reapply_import_policy`, and Graceful Restart stale marking (`mark_stale_and_repropagate`
-  re-judges each retained route with `ImportDecision::evaluate_gated`; RFC 4724 §4.2
+  re-imports each retained route through `ImportPipeline::classify_gated` — gate, BLACKHOLE agreement, import policy (issue #82); RFC 4724 §4.2
   retains routes, it does not make an ineligible one eligible). The gate is built before
   teardown forgets the local address, and `GracefulRestartState::retained_local_v4` keeps our
   last address toward the peer for the life of the retained routes, so own-NEXT_HOP routes stay
   rejected through later soft reconfiguration too
   (`own_next_hop_stays_rejected_through_soft_reconfiguration_in_the_gr_window`). It counts toward
   max-prefix like a policy-rejected route.
-- A BLACKHOLE-tagged (RFC 7999) announcement that is dropped is **not** retained: no null
-  route is installed for it, and a stored tag would later read as "this peer owns a kernel
-  null route" (`holds_blackhole`, peer teardown) and could delete another peer's. It is
-  handled like treat-as-withdraw instead. An older BLACKHOLE route superseded by a dropped
-  announcement is reported in `blackhole_withdrawn_*` so its null route is removed.
-- Still open, outside this issue: an *accepted* (or policy-rejected) replacement that is
-  not BLACKHOLE-tagged does not retire an older BLACKHOLE route either.
+- A BLACKHOLE-tagged (RFC 7999) announcement that is dropped is stored like any other
+  ineligible replacement (RFC 4271 §9; RFC 7999 §3.3 encourages keeping them) but owns no null
+  route: ownership is recorded in `BlackholeBook`, not read off the stored route's communities
+  (issue #81 replaced the earlier `holds_blackhole` tag scan, which is why the tag no longer
+  has to be discarded). An older BLACKHOLE route superseded by a dropped announcement releases
+  its claim, and the null route is withdrawn when no other peer holds the prefix
+  (`dropped_replacement_of_a_blackhole_route_withdraws_the_null_route`,
+  `dropped_blackhole_announcement_owns_no_null_route_and_its_withdrawal_removes_none`).
 - The session-side half of RFC 7607 (OPEN, AGGREGATOR, AS4 attributes) remains issue #111.
 
 | Requirement | File | Status | Verified by |
@@ -305,6 +306,9 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | §4.2 MUST: retained routes marked stale (`Staleness::GrStale`) — **and stale routes keep their ordinary preference** ("MUST NOT differentiate between stale and other routing information during forwarding"; RFC 9494 §1: "in conventional GR, route preference is not affected") | `src/daemon/gr.rs`, `pathvector-rib/src/adj_rib_in.rs`, `pathvector-rib/src/best_path.rs` | ✅ | `daemon::gr_preference_tests::conventional_gr_keeps_stale_higher_local_pref_route_selected`, `stale_marking_keeps_equally_preferred_route_selected`, `pathvector-rib` `best_path::tests::conventional_gr_*` + `prop_conventional_gr_staleness_never_changes_the_winner`. **Corrected 2026-11-23 (issue #68):** this row previously read "SHOULD: retained routes de-preferred in best-path so a fresh peer wins immediately", backed by tests asserting that a stale LOCAL_PREF-300 route lost to a fresh LOCAL_PREF-100 one. RFC 4724 has no such SHOULD; de-preferencing is RFC 9494 (LLGR) behavior, which is not implemented. |
 | §4.2 + RFC 9494 §1: marking routes stale sends no UPDATE (conventional GR resolves the trade-off "in favor of not advertising"); staleness is never part of the advertised route | `pathvector-rib/src/outbound.rs` (`prepare_outbound{,_v6}` reset staleness) | ✅ | `daemon::gr_preference_tests::{conventional_gr_stale_marking_does_not_readvertise_when_an_alternative_exists, stale_marking_of_sole_route_sends_no_duplicate_update, stale_marking_of_sole_v6_route_sends_no_duplicate_update}`, `stale_mark_sends_no_update_to_established_observer`, `outbound::tests::test_prepare_outbound_never_carries_staleness`. Before issue #68, marking a selected route stale re-sent an identical UPDATE for it to every peer. |
 | §4.2 MUST: re-announcement replaces the stale route; End-of-RIB removes the rest; Restart Time expiry falls back to the fresh alternative | `src/daemon/route.rs`, `src/daemon/gr.rs` | ✅ | `daemon::gr_preference_tests::{reannouncement_replaces_stale_route_and_end_of_rib_removes_the_rest, restart_time_expiry_falls_back_to_the_fresh_alternative}` |
+| §4.2: retained is not eligible — stale marking re-imports each route through the same pipeline as arrival (ingress gate, BLACKHOLE agreement, import policy): policy-/ROV-/OTC-rejected routes stay out of the Loc-RIB, LOCAL_PREF / communities / next-hop rewrites / ingress OTC survive, a BLACKHOLE route stays a blackhole (RFC 4271 §9.1.1–§9.1.2, RFC 8538 §4.1, RFC 9234 §5). **Issue #82** (the originally reported rejected-route and LOCAL_PREF repros were already fixed on main by #139/#140; the BLACKHOLE-as-unicast half was not) | `src/daemon/gr.rs`, `src/daemon/import.rs`, `pathvector-rib/src/adj_rib_in.rs` (`mark_all_stale` no longer returns raw routes for re-insertion) | ✅ | `graceful_restart_does_not_admit_a_policy_rejected_route`, `graceful_restart_preserves_local_pref_set_by_import_policy`, `graceful_restart_keeps_otc_leak_rejection_and_ingress_otc_attachment`, `graceful_restart_keeps_rov_rejection`, `graceful_restart_never_turns_a_blackhole_route_into_unicast` (all IPv4 + IPv6) |
+| §4.2: full lifecycle — drop (retain + mark stale, still exported), re-establish, refresh replaces, End-of-RIB sweeps the un-refreshed (Loc-RIB, FIB, peers told, null routes), expiry deletes the rest | `src/daemon/gr.rs`, `src/daemon/route.rs` | ✅ | `graceful_restart_lifecycle_retains_refreshes_and_sweeps`, `graceful_restart_retains_refreshes_and_sweeps_null_routes`, `graceful_restart_deadline_expiry_deletes_retained_routes` |
+| §4.2: only families in the peer's GR capability are retained; the rest are flushed at once (Adj-RIB-In, Loc-RIB, FIB, other peers) — **fixed 2026-11-24**: previously only the Adj-RIB-In was cleared, so the family's Loc-RIB entries, FIB routes and advertisements lingered until the Restart Time | `src/daemon/peer.rs` (`flush_family_v4/v6`) | ✅ | `graceful_restart_flushes_families_the_peer_did_not_advertise` |
 | e2e: unclean disconnect holds routes; window expiry flushes them | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry` |
 | e2e: clean disconnect (NOTIFICATION) flushes routes immediately, no GR window | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_clean_disconnect_flushes_routes_immediately` |
 | e2e: peer restart with partial RIB — un-refreshed routes pruned on EOR | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` |
@@ -351,36 +355,80 @@ FRR 8.x with `neighbor X graceful-restart-notification` sends `CEASE/Administrat
 
 ## RFC 7999 — BLACKHOLE Community (Discard Action)
 
-**Owns:** The discard action: when a received UPDATE contains BLACKHOLE community
-(0xFFFF029A), the route is stored in Adj-RIB-In but bypasses Loc-RIB and outbound
-advertisement, and a kernel null route (`RTN_BLACKHOLE`) is programmed via rtnetlink.
-On withdrawal, the kernel null route is removed. Relies on `is_blackhole()` from
-`pathvector-types`, `BlackholeCondition` from `pathvector-policy`, and
-`FibWrite::install_blackhole_v4/v6` from `pathvector-sys`.  
-**Boundary:** The `BLACKHOLE` constant lives in `pathvector-types`. The policy condition
-lives in `pathvector-policy`. Kernel programming lives in `pathvector-sys`.  
-**Datatracker:** https://datatracker.ietf.org/doc/html/rfc7999
+**Owns:** Authorization and the discard action. A BLACKHOLE-tagged (0xFFFF029A) announcement
+is honored only on a session that agreed to it, for prefixes the peer is authorized to
+blackhole (RFC 7999 §3.3). An honored request is stored in Adj-RIB-In, never enters Loc-RIB
+(so is never exported), and is programmed as a kernel null route (`RTN_BLACKHOLE`) via
+rtnetlink; it is removed when the request is withdrawn, superseded, revoked or its session
+ends. Relies on `is_blackhole()` from `pathvector-types` and `FibWrite::install_blackhole_v4/v6`
+from `pathvector-sys`.  
+**Boundary:** The `BLACKHOLE` constant lives in `pathvector-types`. Kernel programming lives in
+`pathvector-sys`. Authorization lives here: `src/blackhole.rs` (`BlackholeScope`, the validated
+config value), `src/daemon/blackhole.rs` (`BlackholeAgreement` → `AuthorizedBlackhole` →
+`BlackholeBook`), `src/daemon/import.rs` (`ImportPipeline::classify`).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc7999  
+**Amendments checked (2026-11-24):** no RFC updates 7999; RFC 7606 (error handling for
+malformed communities) and RFC 6811 (ROV, §3.3's "MUST ensure ... do not inadvertently block")
+are the only cross-references.
+
+**Design (issues #81, #82).** One pipeline — `ImportPipeline::classify_gated` — decides what a
+received route *is*, and is used by UPDATE arrival, `set_import_default`, RPKI ROA-change
+re-evaluation, Graceful Restart stale marking and (via `retire_routes` /
+`BlackholeBook::release_peer`) cleanup:
+
+| Outcome (`ImportDecision`) | Meaning | Loc-RIB | Null route |
+|---|---|---|---|
+| `Accepted(route)` | ordinary route, post-policy | candidate | — (a held claim by this peer is released) |
+| `Blackhole(AuthorizedBlackhole)` | agreed session + prefix covered (RFC 7999 §3.3) | — (peer's unicast candidate evicted) | claimed |
+| `Rejected` | ingress gate or import policy said no | — | released |
+| `BlackholeDenied(why)` | BLACKHOLE-tagged, not agreed / out of scope / RFC 9234 leak | — | released |
+
+`AuthorizedBlackhole` can only be minted by `BlackholeAgreement::authorize`, and
+`BlackholeBook::claim` accepts nothing else, so a null route for an unauthorized prefix does not
+type-check. The book records who owns which null route and is refcounted per prefix; `BlackholeChange`
+changes (`Install` on the first holder, `Withdraw` on the last) are the only thing that reaches
+the FIB port. `program_effects` (`src/daemon/fib.rs`) is the single place best-path and null-route
+changes are translated into port calls.
+
+**Why a denied request is not imported as unicast.** RFC 7999 §3.1 says the community "SHOULD be
+ignored" by a network not using it, which could be read as "treat as an ordinary route". We
+refuse instead: §3.3 says speakers "MUST only accept and honor" such announcements when both
+conditions hold, and an ordinary Loc-RIB entry carrying 65535:666 could be selected, programmed
+as a forwarding route and exported to other peers — spreading a blackhole beyond the one
+session that agreed to it (§3.2). The route stays in Adj-RIB-In.
+
+**ROV exception.** Origin validation is an import-policy term, and an authorized request is
+classified *instead of* by the import policy, so RFC 6811 Invalid (a `/32` is longer than any
+ROA `maxLength`) and `import_default = "reject"` cannot block it. The explicit scope takes ROV's
+place. RFC 9234 §5 leak detection is the one ordinary import rule that still applies.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| Route with BLACKHOLE community stored in Adj-RIB-In but not installed in Loc-RIB | `src/daemon/route.rs` | ✅ | `blackhole_route_not_in_loc_rib` |
-| BLACKHOLE route not advertised to peers | `src/daemon/route.rs` | ✅ | `blackhole_route_not_in_loc_rib` (LocRib empty → nothing propagated) |
-| Kernel null route (`RTN_BLACKHOLE`) programmed on announce | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_programs_kernel_null_route` |
-| Kernel null route removed on withdrawal | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_withdrawal_removes_kernel_null_route` |
-| BLACKHOLE routes for non-GR address families withdrawn on unclean peer termination | `src/daemon/peer.rs` | ✅ | `blackhole_route_removed_for_non_gr_family_on_unclean_termination` |
-| Surviving unicast best path re-installed after BLACKHOLE withdrawal | `src/daemon/route.rs` | ✅ | `blackhole_withdrawal_restores_surviving_peer_unicast_route` |
+| §3.3 cond. 2: honored only if the session agreed (`blackhole_authorized_prefixes`); default denied (§4) | `src/daemon/blackhole.rs`, `src/daemon/import.rs`, `src/config.rs` | ✅ | `reject_default_blackhole_announcement_has_no_fib_effect`, `agreement_is_per_session`, `unagreed_blackhole_is_denied_even_under_accept_all`, `configuration_becomes_the_session_agreement` |
+| §3.3 cond. 1: prefix covered by an equal or shorter authorized prefix; /32 and /128 inside an authorized /24 or /48 | `src/blackhole.rs` | ✅ | `covers_is_equal_or_shorter_scope_prefix`, `blackholes_outside_the_authorized_scope_are_denied`, `authorized_host_blackholes_are_honored_under_reject_default_and_never_exported` (IPv4 + IPv6) |
+| §3.3: origin validation must not block a legitimate blackhole | `src/daemon/import.rs` | ✅ | `authorized_blackholes_are_exempt_from_origin_validation` (control: the same host route untagged is ROV-rejected), `authorized_blackhole_is_exempt_from_import_policy` |
+| RFC 9234 §5 leak is still ineligible | `src/daemon/blackhole.rs` | ✅ | `route_leak_blackhole_request_is_still_ineligible`, `leak_guard_still_applies_to_authorized_blackholes` |
+| Never exported / never a unicast Loc-RIB candidate (§3.2), through arrival, re-evaluation and GR | `src/daemon/import.rs` | ✅ | `reevaluation_never_imports_a_blackhole_route_as_unicast`, `graceful_restart_never_turns_a_blackhole_route_into_unicast`, `accepted_blackholes_remain_blackholes_across_reevaluation`, model property `ipv{4,6}_pipeline_invariants` (no BLACKHOLE-tagged candidate) |
+| Kernel null route programmed on announce, removed on withdraw / supersede | `src/daemon/route.rs`, `src/fib.rs` | ✅ | `blackhole_route_programs_kernel_null_route`, `explicit_withdrawal_removes_the_null_route`, `unicast_replacement_of_a_blackhole_removes_the_null_route`; e2e `authorized_ipv4_host_blackhole_is_installed_and_withdrawn`, `authorized_ipv6_host_blackhole_is_installed_withdrawn_and_scoped` (Docker/Linux) |
+| Revocation / narrowing of the agreement re-evaluates and removes null routes — no stale kernel entry | `src/daemon/policy.rs` | ✅ | `revoking_or_narrowing_the_agreement_removes_null_routes_without_leaving_stale_ones`, `revocation_during_the_gr_window_removes_retained_null_routes` |
+| One null route per prefix across peers; a denied peer's withdrawal removes nothing | `src/daemon/blackhole.rs` | ✅ | `null_route_is_shared_and_withdrawn_only_by_the_last_holder`, `releasing_a_blackhole_the_peer_never_held_is_a_noop` |
+| A held null route is not overwritten by a unicast best-path change; the Loc-RIB route is restored when the blackhole goes | `src/daemon/fib.rs` | ✅ | `unicast_best_path_changes_never_overwrite_a_held_null_route`, `blackhole_withdrawal_restores_surviving_peer_unicast_route` |
+| Session end / GR expiry / EOR sweep release the peer's null routes (IPv4 + IPv6) | `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | `clean_session_end_removes_the_peers_null_routes`, `graceful_restart_retains_refreshes_and_sweeps_null_routes`, `graceful_restart_expiry_removes_null_routes`, `blackhole_route_removed_for_non_gr_family_on_unclean_termination` |
+| Re-evaluation equals fresh import; idempotent; book == authorized stored requests | `src/daemon/import.rs` | ✅ | proptests `ipv4_pipeline_invariants`, `ipv6_pipeline_invariants` |
+| Not implemented: §3.2 "SHOULD add NO_ADVERTISE or NO_EXPORT" — moot, a blackhole is never exported at all | — | n/a | — |
+| Not implemented: §3.3 "store all updates carrying BLACKHOLE for audit" beyond the Adj-RIB-In (BMP covers the long-term case) | — | ⚠️ | — |
 
-**Known limitation — BLACKHOLE-to-unicast failover coalescing:** when a BLACKHOLE route is
-withdrawn and a competing unicast best path exists in Loc-RIB for the same prefix, the
-FibManager coalescing map receives `WithdrawBlackhole` immediately followed by
-`Install { gateway }`. Because the map keeps only the latest desired state per prefix, the
-`Install` overwrites `WithdrawBlackhole` — the explicit `RTN_BLACKHOLE` kernel delete is
-skipped, and the kernel receives `RTM_NEWROUTE` (unicast) while the null route may still be
-present. In practice this works because `RTM_NEWROUTE` with `NLM_F_REPLACE` replaces the
-existing entry regardless of route type, but this code path has not been exercised by a
-multi-peer end-to-end test. If you operate a topology where a peer simultaneously
-originates both a BLACKHOLE and a unicast for the same prefix, verify this behavior in
-your environment.
+**Known limitation — BLACKHOLE-to-unicast failover coalescing:** when the last blackhole for a
+prefix is withdrawn and the Loc-RIB has a best path for it, `FibManager`'s coalescing map
+receives `WithdrawBlackhole` immediately followed by `Install { gateway }`; the `Install`
+overwrites the pending delete, and the kernel receives `RTM_NEWROUTE` with `NLM_F_REPLACE`
+(`pathvector-sys` install path), which replaces the existing entry regardless of route type.
+Unit-tested against `RecordingFib`; not yet exercised by a Linux e2e with a competing unicast.
+
+**Not runnable on macOS:** the e2e tests above need Docker and a Linux kernel
+(`CAP_NET_ADMIN` for `RTM_NEWROUTE`); they compile on macOS (`cargo check -p pathvector-e2e
+--tests`) but were not run here. Revocation has no e2e: there is no runtime configuration
+reload yet, so the agreement is fixed at `add_peer`.
 
 ---
 

@@ -499,6 +499,54 @@ handling) genuinely matches the RFC text on a fresh read.
 **§4.2 summary:** 8 clauses reviewed, all confirmed correct — genuinely one
 of the stronger, more thoroughly-tested corners of this codebase.
 
+> **Correction (2026-11-24, issues #81/#82):** "all confirmed correct" held for
+> the clauses as tested, but two things the §4.2 text implies were wrong in the
+> code, both found by tracing what the *stale marking path does with the
+> Adj-RIB-In* rather than by re-reading the clauses:
+>
+> 1. *Retained ≠ eligible.* `mark_stale_and_repropagate` reinserted the raw,
+>    **pre-policy** Adj-RIB-In routes as Loc-RIB candidates (`AdjRibIn::mark_all_stale`
+>    returned clones "for `LocRib` re-insertion"), so policy-/ROV-/OTC-rejected
+>    routes entered the Loc-RIB and LOCAL_PREF/OTC rewrites were lost. #139/#140
+>    had already routed the stale routes back through import policy; the remaining
+>    hole was BLACKHOLE-tagged routes, which that path imported as ordinary
+>    unicast. Fixed by one classification pipeline shared with arrival
+>    (`ImportPipeline::classify_gated`); `mark_all_stale` no longer returns routes.
+>    RFC 4724 §4.2 only requires "retain" and "mark them as stale"; RFC 4271
+>    §9.1.1–§9.1.2 still decide eligibility; RFC 8538 §4.1 changes neither.
+> 2. *Only advertised families are retained.* §4.2: "retain the routes received from
+>    the peer for all the address families that were previously received in the
+>    Graceful Restart Capability". For a family the peer did **not** list,
+>    `on_terminated` cleared the Adj-RIB-In and withdrew blackhole null routes but
+>    left the peer's Loc-RIB entries, FIB routes and advertisements in place until
+>    the Restart Time expired. Fixed (`flush_family_v4/v6`).
+>
+> Still open from this pass: RFC 8538 §4.1 says that when the N-bit has been
+> exchanged a route "previously marked as stale" is **not** deleted on a
+> consecutive restart; this daemon re-marks all retained routes and does not
+> distinguish, which is the safe direction but is not tracked by a test.
+
+---
+
+## RFC 7999 — BLACKHOLE Community (audited 2026-11-24, issues #81/#82)
+
+**Method:** read RFC 7999 §3.1–§3.3, §4 and §6 directly (no amending RFC; RFC 7606 and
+RFC 6811 are cross-referenced by §3.3), then traced every code path that reads the
+BLACKHOLE community. The pre-existing implementation and tests had been derived from the
+community's *meaning* ("discard this prefix"), not from the §3.3 conditions on honoring it.
+
+| Clause | Confidence | Notes | What closed / would close it |
+|---|---|---|---|
+| §3.3 MUST only accept and honor under two conditions: prefix covered by an equal-or-shorter authorized prefix; receiving party agreed on the session | **Confirmed gap — fixed** | `handle_update` tested only for the community, before import policy, so any peer — under import default Reject too — installed a kernel null route. Nothing modeled "agreement" or "authorized prefix". | `blackhole_authorized_prefixes` (validated `BlackholeScope`), `BlackholeAgreement::authorize` → `AuthorizedBlackhole`; regression tests in `issue_81_82_tests.rs` fail on the pre-fix tree |
+| §3.3 MUST ensure origin validation does not inadvertently block legitimate blackholes | **Confirmed correct after the fix** | Before: ROV never saw blackholes (bypass) — correct by accident, wrong by being unconditional. After: structural exemption (authorized requests are classified instead of by the import policy); a control test shows the same untagged host route *is* ROV-rejected. | `authorized_blackholes_are_exempt_from_origin_validation` |
+| §3.3 / §4 default: do not discard traffic without an explicit directive | **Confirmed gap — fixed** | Default was "honor". Now default is denied. | `reject_default_blackhole_announcement_has_no_fib_effect` |
+| §3.2 SHOULD keep a blackhole local (NO_ADVERTISE / NO_EXPORT) | **Confirmed correct** | An honored blackhole never enters the Loc-RIB, so it is never exported. The bug was the *re*-evaluation path: `reapply_import_policy` and GR stale marking imported the stored raw route as unicast, and the next propagation exported it. | `reevaluation_never_imports_a_blackhole_route_as_unicast`, `graceful_restart_never_turns_a_blackhole_route_into_unicast`, property `ipv{4,6}_pipeline_invariants` |
+| §3.3 error handling: malformed community ⇒ RFC 7606 treat-as-withdraw | **Confirmed correct (not changed here)** | Handled at the wire layer; the community attribute length check is in `pathvector-session`. | — |
+| Null-route ownership: a route that was never installed must not remove a null route | **Found while fixing** | The old code inferred "this peer owns a null route" from the stored route's community, which is wrong for any route that was dropped/denied, and could not tell two peers asking for the same prefix apart. | `BlackholeBook` (per-prefix holder set; kernel route withdrawn only by the last holder) |
+
+---
+
+
 ## §5 — Changes to BGP Finite State Machine
 
 | Clause | Confidence | Notes | What would close this out |

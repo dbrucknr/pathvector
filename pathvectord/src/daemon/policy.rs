@@ -142,7 +142,7 @@ impl DaemonState {
         let nlris: Vec<Nlri<Ipv4Addr>> = self
             .adj_ribs_in
             .get(&peer_ip)
-            .map(|a| a.routes().map(|(n, _)| *n).collect())
+            .map(super::gr::sorted_nlris)
             .unwrap_or_default();
         let gate = self.ingress_gate(peer_ip);
 
@@ -158,7 +158,7 @@ impl DaemonState {
         let nlris_v6: Vec<Nlri<Ipv6Addr>> = self
             .adj_ribs_in_v6
             .get(&peer_ip)
-            .map(|a| a.routes().map(|(n, _)| *n).collect())
+            .map(super::gr::sorted_nlris)
             .unwrap_or_default();
         if let Some(effects) = self.reimport_peer_v6(peer_ip, &gate) {
             self.program_fib_v6(effects);

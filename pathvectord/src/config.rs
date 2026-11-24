@@ -1280,7 +1280,10 @@ mod sidecar_tests {
             max_prefixes_restart: Some(300),
             role: Some(PeerRole::Provider),
             confederation_member: true,
-            blackhole_authorized_prefixes: None,
+            blackhole_authorized_prefixes: Some(
+                crate::blackhole::BlackholeScope::new(["192.0.2.0/24", "2001:db8:100::/40"])
+                    .unwrap(),
+            ),
         };
         store.upsert(full_peer.clone()).await;
 
@@ -1313,6 +1316,10 @@ mod sidecar_tests {
         assert!(
             got.confederation_member,
             "confederation_member must round-trip"
+        );
+        assert_eq!(
+            got.blackhole_authorized_prefixes, full_peer.blackhole_authorized_prefixes,
+            "blackhole_authorized_prefixes must round-trip"
         );
     }
 
@@ -1724,5 +1731,70 @@ import_default_v6 = "reject"
             DefaultAction::from(ExportDefault::Reject),
             DefaultAction::Reject
         ));
+    }
+
+    // ── blackhole_authorized_prefixes (RFC 7999 §3.3) ────────────────────────
+
+    fn peer_with_blackhole(line: &str) -> String {
+        format!(
+            r#"
+[daemon]
+local_as = 65002
+bgp_id   = "10.0.0.2"
+
+[[peers]]
+address   = "10.0.0.1"
+remote_as = 65001
+{line}
+"#
+        )
+    }
+
+    /// RFC 7999 §4: no directive, no discard. Omitting the setting is the
+    /// denied default.
+    #[test]
+    fn blackhole_agreement_defaults_to_denied() {
+        let cfg: Config = toml::from_str(&peer_with_blackhole("")).unwrap();
+        assert!(cfg.peers[0].blackhole_authorized_prefixes.is_none());
+    }
+
+    #[test]
+    fn blackhole_authorized_prefixes_parse_both_families() {
+        let cfg: Config = toml::from_str(&peer_with_blackhole(
+            r#"blackhole_authorized_prefixes = ["192.0.2.0/24", "2001:db8:100::/40"]"#,
+        ))
+        .unwrap();
+        let scope = cfg.peers[0].blackhole_authorized_prefixes.as_ref().unwrap();
+        assert!(
+            scope.covers(
+                &"192.0.2.9/32"
+                    .parse::<pathvector_types::Nlri<std::net::Ipv4Addr>>()
+                    .unwrap()
+            )
+        );
+        assert!(
+            scope.covers(
+                &"2001:db8:100::1/128"
+                    .parse::<pathvector_types::Nlri<std::net::Ipv6Addr>>()
+                    .unwrap()
+            )
+        );
+    }
+
+    /// Invalid agreements are config errors, never silently-empty scopes: an
+    /// empty list, a host-bits prefix, and non-prefix text.
+    #[test]
+    fn invalid_blackhole_scopes_are_config_errors() {
+        for bad in [
+            "blackhole_authorized_prefixes = []",
+            r#"blackhole_authorized_prefixes = ["192.0.2.5/24"]"#,
+            r#"blackhole_authorized_prefixes = ["not-a-prefix"]"#,
+            r#"blackhole_authorized_prefixes = "192.0.2.0/24""#,
+        ] {
+            assert!(
+                toml::from_str::<Config>(&peer_with_blackhole(bad)).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 }

@@ -753,3 +753,39 @@ fn graceful_restart_flushes_families_the_peer_did_not_advertise() {
         "B must be told the flushed IPv4 route is gone: {to_b:?}"
     );
 }
+
+/// Wall-clock cost of Graceful Restart stale marking (`on_terminated` for a GR
+/// peer) at table scale. Not an assertion — timings are machine-dependent —
+/// so it is `#[ignore]`d; run it with
+///
+/// ```text
+/// cargo test --release -p pathvectord gr_stale_marking_cost -- --ignored --nocapture
+/// ```
+///
+/// Peer A and peer B each announce the same 60 000 /24s (so every prefix has
+/// two candidates and a third peer, C, receives the table); A then drops.
+#[test]
+#[ignore = "performance measurement; see the doc comment"]
+fn gr_stale_marking_cost() {
+    const N: u32 = 60_000;
+    let (mut state, mut receivers, _fib) = established_gr();
+    for chunk in (0..N).collect::<Vec<_>>().chunks(1000) {
+        let announced: Vec<Nlri<Ipv4Addr>> = chunk
+            .iter()
+            .map(|i| p4(&format!("10.{}.{}.0/24", (i >> 8) & 255, i & 255)))
+            .collect();
+        let mut msg = v4_update("10.0.0.0/24", &[]);
+        msg.announced = announced;
+        state.on_route_update(a(), msg.clone());
+        state.on_route_update(b(), msg);
+        drain(&mut state, &mut receivers);
+    }
+    let started = std::time::Instant::now();
+    drop_a(&mut state);
+    let elapsed = started.elapsed();
+    drain(&mut state, &mut receivers);
+    println!(
+        "GR stale marking of {N} IPv4 routes (2 candidates each): {elapsed:?} ({:.0} ns/route)",
+        elapsed.as_secs_f64() * 1e9 / f64::from(N)
+    );
+}
