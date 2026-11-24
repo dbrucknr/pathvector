@@ -42,15 +42,17 @@ extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 
 
   `list_peers` paid the scan column once per peer; a management read can no longer cause the
   right-hand column.
-- Insert cost (new steady-state bench `loc_rib_insert_steady`: RIB built once, long loop, so no
-  cold-start artifact; 3 alternating before/after runs; before = `19d82fc`): a winner-changing
-  insert on one hot prefix costs 459–485 ns before and 490–530 ns after (+25–40 ns, about 5–8 %,
-  the two per-peer count updates); across all prefixes of a 10k / 100k / 500k table ("scattered",
-  cache-cold) the runs overlap (545–570 / 938–963 / 929–969 ns before, 537–607 / 890–1036 /
-  924–1248 ns after). A route's whole UPDATE path (policy, Adj-RIB-In, propagation) is many
-  microseconds, so this is well under 1 % of it. The older `loc_rib_insert` bench rebuilds a
-  ~1 M-entry RIB per criterion sample, so its 500 k group measures cold first touches and was not
-  a reliable comparison (it read 1.9 → 2.4–2.6 µs; the steady bench does not reproduce that).
+- Insert cost (new steady-state bench `loc_rib_insert_steady`: RIB built once with exactly n distinct
+  /24s, asserted `rib.len() == n`, then a long loop, so no cold-start artifact; 3 alternating
+  before/after runs; before = `19d82fc`). A winner-changing insert on one hot prefix costs
+  533–552 ns before and 549–579 ns after (+~25–30 ns, about 5 %, the two per-peer count updates)
+  at 10k / 100k / 500k. Across every prefix of the table ("scattered", cache-cold) the runs overlap:
+  10k 731–778 ns before vs 705–788 ns after, 100k 1.30–1.42 µs vs 1.36–1.43 µs, 500k 1.59–1.71 µs
+  vs 1.57–1.67 µs. A route's whole UPDATE path (policy, Adj-RIB-In, propagation) is many
+  microseconds, so this is on the order of 1 % of it (an estimate, not a measurement). The older
+  `loc_rib_insert` bench is not a reliable comparison: it rebuilds the RIB per criterion sample
+  (cold first touches at 500k), and its `nlri_for` keeps only 16 bits of the index, so its 100k
+  and 500k RIBs hold 65,536 distinct prefixes, not 100k/500k (left unchanged here).
 - Full-table harness comparison (PR #114's `loadtest`, real `latest-bview.gz`: 1,133,510 IPv4
   prefixes, one loader on 127.0.0.1 + control peer on the LAN address, release builds, Apple M2 Max,
   `--scenarios converge,cow`, one run per cell). "old" = #114 head, "new" = #114 head + this change.

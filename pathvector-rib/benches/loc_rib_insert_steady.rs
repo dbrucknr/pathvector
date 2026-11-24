@@ -14,12 +14,20 @@ fn peer(n: u8) -> PeerId {
     PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
 }
 
+/// The `idx`-th distinct /24: `(11 + idx / 65536).(idx / 256 % 256).(idx % 256).0/24`.
+///
+/// Distinct for every `idx` below 2^24 (the first octet reaches 223 only
+/// beyond that), so a 500k RIB really holds 500k prefixes. (The original
+/// `loc_rib_insert` generator keeps only 16 bits of `idx` and wraps at 65,536.)
 fn nlri_for(prefix_idx: usize) -> Nlri<Ipv4Addr> {
+    assert!(prefix_idx < 1 << 24, "prefix index out of /24 range");
     #[allow(clippy::cast_possible_truncation)]
-    let b = (prefix_idx / 256) as u8;
-    #[allow(clippy::cast_possible_truncation)]
-    let c = (prefix_idx % 256) as u8;
-    format!("10.{b}.{c}.0/24").parse().unwrap()
+    let (a, b, c) = (
+        (11 + prefix_idx / 65_536) as u8,
+        ((prefix_idx / 256) % 256) as u8,
+        (prefix_idx % 256) as u8,
+    );
+    format!("{a}.{b}.{c}.0/24").parse().unwrap()
 }
 
 fn make_route(prefix_idx: usize, lp: u32, path_len: usize, pt: PeerType) -> Route<Ipv4Addr> {
@@ -52,6 +60,7 @@ fn build_rib(n: usize) -> LocRib<Ipv4Addr> {
             &AlwaysReachable,
         );
     }
+    assert_eq!(rib.len(), n, "benchmark RIB must hold n distinct prefixes");
     rib
 }
 
