@@ -63,6 +63,7 @@ mod listener_md5_tests;
 mod mrai_flush_tests;
 mod origination;
 mod peer;
+mod peer_stats;
 mod policy;
 mod route;
 
@@ -206,9 +207,13 @@ fn make_adj_ribs_out_pair(
 ///
 /// Stored inside `DaemonState` as an `Arc<RibSnapshot>`. The event loop
 /// mutates it via [`Arc::make_mut`] (zero-cost when no readers hold a clone;
-/// copy-on-write when a gRPC call is in flight). gRPC handlers clone the `Arc`
-/// in O(1) and release the outer `RwLock` immediately, so reads never block
-/// BGP event processing.
+/// a full deep copy of both Loc-RIBs when one does). Handlers that must walk
+/// the table (`list_routes`, `watch_routes`, ...) clone the `Arc` in O(1) and
+/// release the outer `RwLock`; that clone is the price of a slow scan.
+/// Handlers that only need per-peer facts (`list_peers`, `get_peer`,
+/// `watch_peers`) must not take that clone: they read the counters through
+/// [`peer_stats`] under the read guard, which costs O(peers) and never
+/// triggers a copy (issue #106).
 #[derive(Clone)]
 pub(crate) struct RibSnapshot {
     pub(crate) loc_rib: LocRib<Ipv4Addr>,
