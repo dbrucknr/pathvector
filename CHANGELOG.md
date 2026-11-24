@@ -35,6 +35,50 @@ reads, and an overrun while reading ahead. Still unresolved: the misclassificati
 the head is installed, non-head siblings of sets of three or more, failed re-reads, and
 deletes notified during a resynchronization's IPv6 dump (see the crate README).
 
+## 2026-11-23 (RFC 4271 §9.2.1.1: MRAI-suppressed replacements were never sent)
+
+**Bug.** `propagate_to_all_peers` ran `propagate_prefix`, which commits the new
+route to the peer's Adj-RIB-Out, *before* the MRAI check. When MRAI held back a
+replacement toward an eBGP peer (< 30 s since that destination was last
+announced), the destination went into `mrai_pending`, but the Adj-RIB-Out
+already claimed the replacement had been sent. At expiry `flush_mrai_pending`
+re-propagated it, the Adj-RIB-Out diff came out `NoChange`, and the peer kept the
+stale path indefinitely. That violates §9.2.1.1: "the last route selected SHALL
+be advertised at the end of MinRouteAdvertisementIntervalTimer". The IPv6 path
+applied no MRAI at all, although the clause is per destination and RFC 4760 does
+not exempt MP_REACH_NLRI.
+
+**Fix** (`pathvectord/src/daemon/route.rs`, `pathvectord/src/outbound.rs`). A new
+generic `MraiTracker<A>` replaces the `mrai_last_sent`/`mrai_pending` maps, with
+one instance per address family. `MraiTracker::gate` wraps each destination's
+Adj-RIB-Out diff. When an announcement inside the interval is held back, the
+gate restores the Adj-RIB-Out entry the peer actually has, so the release at
+expiry diffs against that entry and sends the last route selected. Withdrawals
+still bypass MRAI and cancel any held-back announcement. This deliberate
+deviation from RFC 4271 follows RFC 1771 §9.2.3.1's "to avoid long-lived black
+holes" exemption and is now cited in `pathvectord/RFC.md`. A family-agnostic
+`OutboundDecision` trait lets one gate serve `PrefixDecision` and
+`PrefixDecisionV6`.
+
+**Tests.** `daemon/mrai_flush_tests.rs` drives real UPDATEs through
+`on_route_update` and the MRAI timer sequence (`flush_mrai_pending` →
+`flush_pending`). It asserts that the held-back replacement reaches the peer at
+expiry (v4 and v6), that the *last* selection wins, that a reverted selection
+sends nothing extra, that the Adj-RIB-Out holds the route actually sent, that
+withdrawals go out immediately and cancel a held-back announcement (v4 and v6),
+and that iBGP peers are exempt (§9.2.1.1 option (b)). Five of these failed
+before the fix. The tautological `mrai_*` unit tests in `daemon/mod.rs` (one
+asserted only that an enum it had just built matched itself) were replaced by
+tracker unit tests, including real per-destination readiness coverage.
+
+`pathvectord/RFC.md` §9.2.1.1 was rewritten. iBGP moves from ❌ to ✅: the RFC
+offers "SHOULD NOT apply to routes sent to internal peers" as a compliant option,
+and the old row misread the 5 s §10 default as a SHOULD. The section also lists
+the paths that still bypass the gate: session termination, graceful restart,
+selection-deferral release, and the initial dump.
+
+---
+
 ## 2026-11-23 (issue #80: a rejected replacement withdraws the old candidate)
 
 `handle_update` stored a replacement advertisement in Adj-RIB-In before running

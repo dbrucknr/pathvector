@@ -53,7 +53,8 @@ use super::import::reapply_import_policy;
 use super::install_otc_import_term;
 use super::last_feasible_tests::{
     AS_A, AS_C, LOCAL_AS, PEER_A, PEER_B, PEER_C, RESOLVABLE_V4, RESOLVABLE_V4_ALT, RESOLVABLE_V6,
-    announces_v4, announces_v6, drain, established, n4, n6, sent_to, withdraws_v4, withdraws_v6,
+    announces_v4, announces_v6, drain, established, expire_mrai, n4, n6, sent_to, withdraws_v4,
+    withdraws_v6,
 };
 use super::route::handle_update;
 use crate::daemon::tests::with_recording_fib;
@@ -270,10 +271,18 @@ fn rejected_replacement_promotes_other_peers_route_v4() {
         "FIB must switch to C's next hop, got {changes:?}"
     );
     // B (eBGP) was sent A's path moments ago, so the replacement itself is held
-    // by MinRouteAdvertisementIntervalTimer (§9.2.1.1). What matters here is
-    // that no withdrawal goes out and B's Adj-RIB-Out already holds C's path.
+    // by MinRouteAdvertisementIntervalTimer (§9.2.1.1) and goes out when the
+    // interval expires. No withdrawal may go out in the meantime.
     let to_b = sent_to(&mut state, &mut receivers, PEER_B);
     assert!(!withdraws_v4(&to_b), "a replacement exists; got {to_b:?}");
+    assert!(state.has_mrai_pending(), "C's path must be held for B");
+
+    expire_mrai(&mut state);
+    let to_b = sent_to(&mut state, &mut receivers, PEER_B);
+    assert!(
+        announces_v4(&to_b) && !withdraws_v4(&to_b),
+        "B must receive C's path as a replacement at MRAI expiry, got {to_b:?}"
+    );
     assert_eq!(
         as_path_of(state.adj_ribs_out[&IpAddr::V4(PEER_B)].get(&n4())),
         Some(AsPath::from_sequence(vec![
@@ -281,12 +290,12 @@ fn rejected_replacement_promotes_other_peers_route_v4() {
             Asn::new(AS_C),
             Asn::new(65005)
         ])),
-        "B's Adj-RIB-Out must hold C's path"
+        "B's Adj-RIB-Out must hold C's path once it has been sent"
     );
 }
 
-/// IPv6 counterpart (no MRAI on the IPv6 path): B receives C's path as a
-/// replacement announcement, never a withdrawal.
+/// IPv6 counterpart: MRAI applies to MP_REACH_NLRI too (RFC 4760 gives it no
+/// exemption), so B receives C's path at MRAI expiry, never a withdrawal.
 #[test]
 fn rejected_replacement_promotes_other_peers_route_v6() {
     let (mut state, mut receivers) = established();
@@ -311,9 +320,13 @@ fn rejected_replacement_promotes_other_peers_route_v6() {
         "FIB must switch to C's next hop, got {changes:?}"
     );
     let to_b = sent_to(&mut state, &mut receivers, PEER_B);
+    assert!(!withdraws_v6(&to_b), "a replacement exists; got {to_b:?}");
+
+    expire_mrai(&mut state);
+    let to_b = sent_to(&mut state, &mut receivers, PEER_B);
     assert!(
         announces_v6(&to_b) && !withdraws_v6(&to_b),
-        "B must receive C's path as a replacement, got {to_b:?}"
+        "B must receive C's path as a replacement at MRAI expiry, got {to_b:?}"
     );
 }
 
