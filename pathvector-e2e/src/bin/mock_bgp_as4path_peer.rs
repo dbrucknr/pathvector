@@ -8,26 +8,21 @@
 //! real ASN and excludes the confed segment entirely (RFC 6793 §§3, 4.2.2:
 //! "declared invalid for the AS4_PATH attribute and MUST NOT be included").
 //!
-//! **Scope note (flagged by code review on PR #52):** the `two-byte-observer`
-//! role name refers to *capability negotiation only* — this peer omits the
-//! `FourByteAsn` capability in its own OPEN, which is what makes pathvectord
-//! classify the session as needing the AS_TRANS/AS4_PATH downgrade. It does
-//! **not** prove genuine two-octet-per-ASN wire encoding: pathvectord's own
-//! AS_PATH encoder (`encode_as_path_segments` in
-//! `pathvector-session/src/message/update.rs`) unconditionally writes each
-//! ASN as 4 bytes regardless of negotiation (encode-side capability
-//! downgrade is implemented for AGGREGATOR only, not AS_PATH — a separate,
-//! still-open gap; see `TODO.md`'s "No e2e test for AS_TRANS wire encoding
-//! against a real 2-byte-only peer" item). This observer's own `BgpCodec`
-//! is never switched into a genuine 2-byte decode mode either, so it happens
-//! to parse the (still 4-byte-wide) wire bytes correctly by construction,
-//! not because real 2-byte interop was exercised. What this test does prove,
-//! validly: pathvectord's *logical* decision to substitute AS_TRANS and
-//! split AS4_PATH out (as opposed to sending the raw 4-byte ASN unmodified)
-//! is triggered correctly by capability non-negotiation, and the confed-
-//! segment inclusion/exclusion split between AS_PATH and AS4_PATH is
-//! correct. Real 2-byte-only wire interop (e.g. against GoBGP's `--as2`
-//! mode) remains an open gap, tracked in `TODO.md`.
+//! **What "two-byte" means here:** the `two-byte-observer` role omits the
+//! `FourByteAsn` capability in its own OPEN, so the session negotiates
+//! [`AsnWidth::Two`](pathvector_session::message::AsnWidth) (RFC 6793 §4.2 —
+//! pathvectord is talking to an OLD BGP speaker). Since issue #95 pathvectord
+//! really does emit two-octet AS_PATH on such a session, and its own
+//! `BgpCodec` would merge AS4_PATH back into AS_PATH on receipt (§4.2.3) — so
+//! this observer does **not** use `BgpCodec` after the handshake. It reads the
+//! raw UPDATE bytes and parses AS_PATH at two octets per ASN and AS4_PATH at
+//! four, exactly as an OLD speaker would see them. `wire_as_path_two_octet`
+//! in the outcome line is true only if AS_PATH parses cleanly (consumed
+//! exactly) at two octets per ASN, so a four-octet encoding on this session
+//! fails the scenario. (Before #95 this peer silently decoded 4-octet bytes
+//! and proved only the *logical* downgrade decision.) Real interop against a
+//! third-party 2-byte-only implementation (e.g. GoBGP `--as2`) remains
+//! untested; see `TODO.md`.
 //!
 //! Listens on `:179` and, on the accepted connection, plays one of two roles
 //! selected by its only argument:
@@ -40,16 +35,17 @@
 //!   side) followed by an ordinary `AS_SEQUENCE` segment containing
 //!   [`FOUR_BYTE_ASN`] (a value that doesn't fit in 2 bytes).
 //! - `two-byte-observer` — deliberately does **not** advertise `FourByteAsn`
-//!   (see the scope note above — this affects capability negotiation only),
-//!   then decodes the real wire bytes of pathvectord's re-advertised UPDATE
-//!   and logs a `SCENARIO_OUTCOME:` line recording: whether the AS_PATH
+//!   (so the session is two-octet — see above), then parses the raw wire
+//!   bytes of pathvectord's re-advertised UPDATE and logs a
+//!   `SCENARIO_OUTCOME:` line recording: whether AS_PATH is genuinely
+//!   two-octet on the wire, whether the AS_PATH
 //!   value still contains the leading `AS_CONFED_SEQUENCE` segment (it
 //!   must — RFC 5065 §5.3), whether it substitutes AS_TRANS (23456) for the
 //!   4-byte ASN (RFC 6793 §4), whether AS4_PATH is present and carries the
 //!   real 4-byte ASN, and whether AS4_PATH excludes the confed segment.
 //!
-//! Fully expressible via `pathvector_session`'s own `BgpMessage`/
-//! `PathAttribute`/`Capability` encoder — no raw-byte hand-rolling needed.
+//! The source role is built with `pathvector_session`'s own `BgpMessage`
+//! encoder; only the observer's receive side parses raw bytes (see above).
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -58,6 +54,7 @@ use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
 use pathvector_session::message::{BgpMessage, Capability, OpenMessage, PathAttribute};
 use pathvector_types::{AfiSafi, AsPath, AsPathSegment, Asn, Origin};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -166,78 +163,196 @@ async fn confed_source(stream: TcpStream) {
 }
 
 async fn two_byte_observer(stream: TcpStream) {
-    let mut framed = do_handshake(stream, OBSERVER_AS, OBSERVER_BGP_ID, false).await;
+    let framed = do_handshake(stream, OBSERVER_AS, OBSERVER_BGP_ID, false).await;
+
+    // This peer is a genuine OLD BGP speaker (RFC 6793 §4.2): neither side
+    // negotiated FourByteAsn, so AS_PATH carries two octets per ASN. pathvectord's
+    // `BgpCodec` would hand us the *reconciled* path (RFC 6793 §4.2.3 merges
+    // AS4_PATH back into AS_PATH on receipt), hiding exactly the wire shape this
+    // scenario exists to check — so from here on read the raw bytes ourselves.
+    let parts = framed.into_parts();
+    let mut stream = parts.io;
+    let mut buf: Vec<u8> = parts.read_buf.to_vec();
 
     loop {
-        match framed.next().await {
-            Some(Ok(BgpMessage::Update(update))) => {
-                if !update
-                    .announced
-                    .iter()
-                    .any(|nlri| nlri.to_string() == TEST_PREFIX)
-                {
-                    continue;
-                }
+        let (msg_type, body) = read_raw_message(&mut stream, &mut buf).await;
+        if msg_type != MSG_UPDATE {
+            continue;
+        }
+        let Some(update) = parse_raw_update(&body) else {
+            continue;
+        };
+        if !update.announced.iter().any(|n| n == TEST_PREFIX) {
+            continue;
+        }
 
-                let as_path = update.attributes.iter().find_map(|attr| match attr {
-                    PathAttribute::AsPath(p) => Some(p.clone()),
-                    _ => None,
-                });
-                let as4_path = update.attributes.iter().find_map(|attr| match attr {
-                    PathAttribute::As4Path(p) => Some(p.clone()),
-                    _ => None,
-                });
+        let as_path = update.as_path.as_ref();
+        let as4_path = update.as4_path.as_ref();
 
-                // The leading segment must still be an AS_CONFED_SEQUENCE (RFC
-                // 5065 §5.3 — confed segments are NOT stripped toward a
-                // fellow ConfedMember peer), and it must still contain the
-                // source's own AS somewhere within it. pathvectord's own
-                // prepend_confed() extends this same leading segment with
-                // its own Member-AS number rather than appending a second
-                // one, so the source's AS need not be the first element —
-                // only that it's still present in a leading confed segment.
-                let wire_as_path_keeps_confed_sequence = as_path.as_ref().is_some_and(|p| {
-                    matches!(
-                        p.segments().first(),
-                        Some(AsPathSegment::ConfedSequence(asns))
-                            if asns.contains(&Asn::new(u32::from(SOURCE_AS)))
-                    )
-                });
-                let wire_as_path_has_as_trans = as_path.as_ref().is_some_and(|p| {
-                    p.segments()
-                        .iter()
-                        .flat_map(|s| s.asns().to_vec())
-                        .any(|a| a == Asn::new(AS_TRANS))
-                });
-                let as4_path_present = as4_path.is_some();
-                let as4_path_has_real_asn = as4_path.as_ref().is_some_and(|p| {
-                    p.segments()
-                        .iter()
-                        .flat_map(|s| s.asns().to_vec())
-                        .any(|a| a == Asn::new(FOUR_BYTE_ASN))
-                });
-                let as4_path_excludes_confed_segments = as4_path.as_ref().is_none_or(|p| {
-                    !p.segments().iter().any(|s| {
-                        matches!(
-                            s,
-                            AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)
-                        )
-                    })
-                });
+        // The leading segment must still be an AS_CONFED_SEQUENCE (RFC
+        // 5065 §5.3 — confed segments are NOT stripped toward a fellow
+        // ConfedMember peer), and it must still contain the source's own AS
+        // somewhere within it. pathvectord's own prepend_confed() extends
+        // this same leading segment with its own Member-AS number rather
+        // than appending a second one, so the source's AS need not be the
+        // first element — only that it's still present in a leading confed
+        // segment.
+        let wire_as_path_keeps_confed_sequence = as_path.is_some_and(|p| {
+            matches!(
+                p.first(),
+                Some((SEG_CONFED_SEQUENCE, asns)) if asns.contains(&u32::from(SOURCE_AS))
+            )
+        });
+        let wire_as_path_has_as_trans =
+            as_path.is_some_and(|p| p.iter().any(|(_, asns)| asns.contains(&AS_TRANS)));
+        let as4_path_present = as4_path.is_some();
+        let as4_path_has_real_asn =
+            as4_path.is_some_and(|p| p.iter().any(|(_, asns)| asns.contains(&FOUR_BYTE_ASN)));
+        let as4_path_excludes_confed_segments = as4_path.is_none_or(|p| {
+            !p.iter()
+                .any(|(t, _)| *t == SEG_CONFED_SEQUENCE || *t == SEG_CONFED_SET)
+        });
 
-                println!(
-                    "SCENARIO_OUTCOME: wire_as_path_keeps_confed_sequence={wire_as_path_keeps_confed_sequence} \
-                     wire_as_path_has_as_trans={wire_as_path_has_as_trans} \
-                     as4_path_present={as4_path_present} \
-                     as4_path_has_real_asn={as4_path_has_real_asn} \
-                     as4_path_excludes_confed_segments={as4_path_excludes_confed_segments}"
-                );
+        println!(
+            "SCENARIO_OUTCOME: wire_as_path_two_octet={} \
+             wire_as_path_keeps_confed_sequence={wire_as_path_keeps_confed_sequence} \
+             wire_as_path_has_as_trans={wire_as_path_has_as_trans} \
+             as4_path_present={as4_path_present} \
+             as4_path_has_real_asn={as4_path_has_real_asn} \
+             as4_path_excludes_confed_segments={as4_path_excludes_confed_segments}",
+            as_path.is_some(),
+        );
 
-                hold_forever(framed).await;
-                return;
+        hold_forever_raw(stream).await;
+        return;
+    }
+}
+
+const MSG_UPDATE: u8 = 2;
+const ATTR_AS_PATH: u8 = 2;
+const ATTR_AS4_PATH: u8 = 17;
+const SEG_CONFED_SET: u8 = 4;
+const SEG_CONFED_SEQUENCE: u8 = 3;
+
+/// Reads one complete BGP message (RFC 4271 §4.1: 16-byte marker, 2-byte
+/// length, 1-byte type) from `stream`, using `buf` as the carry-over buffer.
+/// Returns the message type and the body after the 19-byte header.
+async fn read_raw_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> (u8, Vec<u8>) {
+    loop {
+        if buf.len() >= 19 {
+            let len = usize::from(u16::from_be_bytes([buf[16], buf[17]]));
+            assert!(len >= 19, "BGP message length {len} below the 19-byte header");
+            if buf.len() >= len {
+                let msg_type = buf[18];
+                let body = buf[19..len].to_vec();
+                buf.drain(..len);
+                return (msg_type, body);
             }
-            Some(Ok(_)) => {}
-            other => panic!("connection closed unexpectedly while waiting for UPDATE: {other:?}"),
+        }
+        let n = stream
+            .read_buf(buf)
+            .await
+            .expect("read from pathvectord failed");
+        assert!(n > 0, "connection closed unexpectedly while waiting for UPDATE");
+    }
+}
+
+/// A path as `(segment type, ASNs)` pairs.
+type RawPath = Vec<(u8, Vec<u32>)>;
+
+struct RawUpdate {
+    announced: Vec<String>,
+    /// AS_PATH parsed at two octets per ASN — `None` if the attribute is
+    /// absent *or* does not parse cleanly as a two-octet path (so a four-octet
+    /// encoding on this OLD-speaker session fails the scenario).
+    as_path: Option<RawPath>,
+    /// AS4_PATH parsed at four octets per ASN (RFC 6793 §3.2: always four).
+    as4_path: Option<RawPath>,
+}
+
+/// Parses an UPDATE body (RFC 4271 §4.3) by hand, without `BgpCodec`.
+fn parse_raw_update(body: &[u8]) -> Option<RawUpdate> {
+    let wd_len = usize::from(u16::from_be_bytes([*body.first()?, *body.get(1)?]));
+    let attrs_off = 2 + wd_len;
+    let attr_len = usize::from(u16::from_be_bytes([
+        *body.get(attrs_off)?,
+        *body.get(attrs_off + 1)?,
+    ]));
+    let attrs = body.get(attrs_off + 2..attrs_off + 2 + attr_len)?;
+    let nlri = body.get(attrs_off + 2 + attr_len..)?;
+
+    let mut as_path = None;
+    let mut as4_path = None;
+    let mut i = 0;
+    while i < attrs.len() {
+        let flags = *attrs.get(i)?;
+        let type_code = *attrs.get(i + 1)?;
+        let (len, hdr) = if flags & 0x10 != 0 {
+            (
+                usize::from(u16::from_be_bytes([*attrs.get(i + 2)?, *attrs.get(i + 3)?])),
+                4,
+            )
+        } else {
+            (usize::from(*attrs.get(i + 2)?), 3)
+        };
+        let value = attrs.get(i + hdr..i + hdr + len)?;
+        match type_code {
+            ATTR_AS_PATH => as_path = parse_segments(value, 2),
+            ATTR_AS4_PATH => as4_path = parse_segments(value, 4),
+            _ => {}
+        }
+        i += hdr + len;
+    }
+
+    // IPv4 NLRI: 1-byte prefix length, then ceil(len/8) address bytes.
+    let mut announced = Vec::new();
+    let mut j = 0;
+    while j < nlri.len() {
+        let bits = usize::from(nlri[j]);
+        let octets = bits.div_ceil(8);
+        let mut addr = [0u8; 4];
+        addr[..octets].copy_from_slice(nlri.get(j + 1..j + 1 + octets)?);
+        announced.push(format!("{}/{bits}", Ipv4Addr::from(addr)));
+        j += 1 + octets;
+    }
+
+    Some(RawUpdate {
+        announced,
+        as_path,
+        as4_path,
+    })
+}
+
+/// Parses AS_PATH / AS4_PATH segments with `octets` bytes per ASN (RFC 4271
+/// §4.3 segment layout). Returns `None` unless the value is consumed exactly.
+fn parse_segments(value: &[u8], octets: usize) -> Option<RawPath> {
+    let mut segments = Vec::new();
+    let mut i = 0;
+    while i < value.len() {
+        let seg_type = *value.get(i)?;
+        let count = usize::from(*value.get(i + 1)?);
+        let end = i + 2 + count * octets;
+        let raw = value.get(i + 2..end)?;
+        let asns = raw
+            .chunks_exact(octets)
+            .map(|c| c.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b)))
+            .collect();
+        segments.push((seg_type, asns));
+        i = end;
+    }
+    Some(segments)
+}
+
+/// Keepalive-only hold loop over the raw stream (the observer has no codec
+/// any more once it has taken the stream apart).
+async fn hold_forever_raw(mut stream: TcpStream) {
+    // RFC 4271 §4.4: marker (16 × 0xFF), length 19, type 4.
+    let mut keepalive = vec![0xFFu8; 16];
+    keepalive.extend_from_slice(&[0, 19, 4]);
+    loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if stream.write_all(&keepalive).await.is_err() {
+            return;
         }
     }
 }
