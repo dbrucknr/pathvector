@@ -1776,6 +1776,25 @@ honestly and completely unimplemented (every row ❌, explicit "Deferred:
 Everything" note) — no code exists to audit, so no findings possible.
 `RFC_REQUIREMENTS.md`'s ❌ status is accurate as-is.
 
+**21a. `pathvector-rpki` RTR client P1 defects (issues #86, #87, #88, #90) — fixed
+2026-11-24.** A review of `client.rs` after item 21 found four defects the earlier
+audit rated "confirmed correct": Cache Reset as the reply to a Serial Query was a
+fatal `UnexpectedPdu` with a futile reconnect loop (#87); session ID and protocol
+version were not enforced beyond End of Data vs. its own Cache Response (#90); VRPs
+were applied to the live table while the serial and notification waited for End of
+Data, and several invalidation paths cleared the table silently (#88); and the
+Expire Interval was never enforced (#86). All four are fixed in one series (state
+machine in `protocol.rs`, publication boundary in `cache.rs`, timers in `timers.rs`);
+see CHANGELOG 2026-11-24 and `pathvector-rpki/RFC.md`. Follow-ups still open and
+tracked as their own issues: #89, #91, #92, #93, #94. Interactions worth knowing
+about: #93 (application-level query deadline) is what bounds a *stalled* sync — expiry
+now bounds how stale the data can get meanwhile; #92 will want the staged transfer
+(`Staged`) as the place to detect duplicate/unknown records before anything is
+published; #89's persistent frame buffer replaces `read_frame` in `client.rs` and is
+independent of the new state machine; `pathvectord` should call
+`RtrConfig::validate()` when loading `[daemon.rpki]` timers (not done here — outside
+the crate).
+
 **22. "Audit-the-audit" pass — is anything not tracked that should be?**
 Prompted directly by the user asking whether `RFC_REQUIREMENTS.md` itself
 might be incomplete, rather than only re-checking RFCs already on the

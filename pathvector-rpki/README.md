@@ -215,6 +215,55 @@ table would care about. See `src/table.rs` for the algorithm.
 
 ---
 
+## Session behaviour: consistency, expiry, and what validation returns
+
+**What a reader of the cache can rely on.** Records learned during a transfer are
+*staged* — a private snapshot for a full (Reset Query) load, a change list for an
+incremental (Serial Query) one — and become visible only when a validated End of Data
+arrives. At that moment the VRPs, the resume serial, `status()` and the `subscribe()`
+notification change *together*. A transfer that fails (connection loss, malformed PDU,
+protocol violation) leaves the previous generation, its serial and its notifications
+untouched, and the reconnect resumes from exactly that generation. See `src/cache.rs`.
+Cost, measured on an M2 Max: staging a 500 000-VRP load takes 51 ms and installing it is a
+pointer swap under the table locks (≈ 0.3 µs); applying a 20 000-record delta holds the
+locks for ≈ 1.9 ms. The price is memory — old and new tables coexist during a full load.
+
+**What the client does about a protocol violation** (all decided in the pure
+`src/protocol.rs`, tested without sockets):
+
+| Situation | Reaction |
+|---|---|
+| Cache Reset in reply to a Serial Query (RFC 8210 §8.3) | forget the serial, send a Reset Query on the same connection; keep serving the old VRPs until the replacement load completes |
+| Session ID differs from the remembered / Cache Response session (§5.1) | Error Report 0 "Corrupt Data", **flush every VRP**, notify subscribers, reconnect with a Reset Query |
+| PDU at a protocol version other than the negotiated one (§7) | Error Report 8 "Unexpected Protocol Version", drop the session; data and serial are left alone |
+| v0 answer to a v1 resume (§5.1: separate sessions) | no continuation; reconnect at once and resynchronise from scratch at v0 |
+| Serial Notify during version negotiation | ignored, whatever its version (§7) |
+
+**Expiry (RFC 8210 §6).** From the End of Data of the last *completed* sync, the data may
+be kept for the cache's advertised Expire Interval (v1) or `RtrConfig::expire_interval`
+(v0). When it elapses the client discards every VRP and the resume state, so **all
+validation results become `NotFound`** (route origin validation fails open), `status()`
+shows `expired == true` with an explanatory `last_error`, and subscribers are notified so
+policy is re-evaluated. A monotonic timer enforces this independently of the session:
+being connected, receiving bytes or Serial Notifies, a stalled query, repeated "No Data
+Available" answers and reconnect back-off do not extend it — only a completed sync does.
+Retaining data across a short outage is deliberate (that is what the interval is for);
+retaining it past the interval is not allowed.
+
+**Timer ranges.** Advertised intervals are clamped to RFC 8210 §6 (Refresh 1 s – 1 day,
+Retry 1 s – 2 h, Expire 10 min – 2 days). `RtrConfig::validate()` checks the configured
+defaults against the same ranges and the "Expire larger than Refresh and Retry" rule;
+`RtrClient::spawn` does not reject a bad config, so callers taking operator input should
+call it.
+
+**Not (yet) handled** — tracked separately: partial-frame loss when the refresh timer
+cancels an idle read (#89), prefix length/max-length bounds (#91), duplicate-announcement
+and unknown-withdrawal errors (#92), application-level query/connect deadlines and
+retaining the advertised retry interval across reconnects (#93), and a single cache only.
+RTR over plain TCP assumes a trusted network (RFC 8210 §9).
+
+---
+
 ## RFC target
 
 | RFC | Title | Status |

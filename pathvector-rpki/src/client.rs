@@ -7,6 +7,16 @@
 //! health via [`RtrHandle::status`] rather than through a `Result` — there is
 //! no "did the client start successfully" moment to report on, only
 //! "is it currently connected."
+//!
+//! # Where things live
+//!
+//! * `protocol.rs` — pure state machine: what a PDU *means* (RFC 8210 §§5, 7, 8)
+//!   and how to react (`Violation`). No sockets, no clocks.
+//! * `cache.rs` — the publication boundary: staging, atomic commit, flush and
+//!   expiry; what `validate_*`, `status()` and `subscribe()` read.
+//! * `timers.rs` — RFC 8210 §6 interval ranges and the effective timers.
+//! * this module — the I/O loop that connects the three: reads frames, feeds
+//!   them to the state machine, writes queries and Error Reports, sleeps.
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
@@ -169,8 +179,12 @@ impl RtrHandle {
         self.0.status()
     }
 
-    /// Returns a receiver that fires whenever the ROA table changes — a
-    /// completed sync, full or incremental. Callers should re-evaluate
+    /// Returns a receiver that fires whenever validation results may have
+    /// changed: a completed sync (full or incremental, even an empty one), a
+    /// flush the protocol requires (RFC 8210 §5.1 session mismatch), or the
+    /// cache's data expiring (RFC 8210 §6 — every result becomes `NotFound`).
+    /// It never fires for a transfer that did not complete. Callers should
+    /// re-evaluate
     /// anything derived from ROA validity (e.g. `pathvectord`'s import
     /// policies) on each change; this is what lets a route accepted before
     /// the first sync (or before a ROA update) get correctly re-judged once
