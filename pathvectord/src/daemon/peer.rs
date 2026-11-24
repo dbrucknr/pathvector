@@ -100,6 +100,8 @@ impl DaemonState {
             install_otc_export_term(&mut export_policy, role, Asn::new(local_as));
             install_otc_export_term(&mut export_policy_v6, role, Asn::new(local_as));
         });
+        self.blackhole_sessions
+            .insert(peer.address, peer_blackhole(peer, resolved_role));
         self.import_policies.insert(peer.address, import_policy);
         self.import_policies_v6
             .insert(peer.address, import_policy_v6);
@@ -146,6 +148,7 @@ impl DaemonState {
         self.peer_config_types.remove(&peer_ip);
         self.import_policies.remove(&peer_ip);
         self.import_policies_v6.remove(&peer_ip);
+        self.blackhole_sessions.remove(&peer_ip);
         self.export_policies.remove(&peer_ip);
         self.export_policies_v6.remove(&peer_ip);
         self.update_senders.remove(&peer_ip);
@@ -493,49 +496,27 @@ impl DaemonState {
         );
     }
 
-    /// Called when a BGP session terminates.
-    /// Scans the peer's AdjRibIn for BLACKHOLE-tagged routes and issues
-    /// `withdraw_blackhole_v4/v6` for each, so the kernel null routes installed
-    /// by RFC 7999 processing are removed before the RIB is cleared.
-    ///
-    /// Must be called before any `adj_ribs_in.clear()` on session teardown,
-    /// GR deadline expiry, or stale-route pruning — BLACKHOLE routes bypass
-    /// LocRib and are therefore invisible to `rib_withdraw_peer_v4/v6`.
-    pub(super) fn withdraw_peer_blackhole_kernel_routes_v4(&self, peer_ip: IpAddr) {
-        let Some(fm) = &self.fib_manager else { return };
-        if let Some(ari) = self.adj_ribs_in.get(&peer_ip) {
-            for (nlri, route) in ari.routes() {
-                if route
-                    .rare_or_default()
-                    .communities
-                    .iter()
-                    .any(|c| c.is_blackhole())
-                {
-                    fm.withdraw_blackhole_v4(*nlri);
-                }
-            }
-        }
+    /// Releases every blackhole `peer_ip` holds in the IPv4 book and programs
+    /// the resulting null-route withdrawals (a session ended, or a family left
+    /// Graceful Restart). RFC 7999 null routes bypass the Loc-RIB, so
+    /// `rib_withdraw_peer_v4` never sees them; the book is the record of what
+    /// the peer owns, so nothing is inferred from stored route attributes and
+    /// a prefix another peer still holds keeps its null route.
+    pub(super) fn release_peer_blackholes_v4(&mut self, peer_ip: IpAddr) {
+        let changes = self.blackholes.v4.release_peer(PeerId::from(peer_ip));
+        self.program_fib_v4(RibEffects {
+            best: Vec::new(),
+            blackhole: changes,
+        });
     }
 
-    pub(super) fn withdraw_peer_blackhole_kernel_routes_v6(&self, peer_ip: IpAddr) {
-        let Some(fm) = &self.fib_manager else { return };
-        if let Some(ari) = self.adj_ribs_in_v6.get(&peer_ip) {
-            for (nlri, route) in ari.routes() {
-                if route
-                    .rare_or_default()
-                    .communities
-                    .iter()
-                    .any(|c| c.is_blackhole())
-                {
-                    fm.withdraw_blackhole_v6(*nlri);
-                }
-            }
-        }
-    }
-
-    pub(super) fn withdraw_peer_blackhole_kernel_routes(&self, peer_ip: IpAddr) {
-        self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
-        self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
+    /// IPv6 counterpart of [`release_peer_blackholes_v4`](Self::release_peer_blackholes_v4).
+    pub(super) fn release_peer_blackholes_v6(&mut self, peer_ip: IpAddr) {
+        let changes = self.blackholes.v6.release_peer(PeerId::from(peer_ip));
+        self.program_fib_v6(RibEffects {
+            best: Vec::new(),
+            blackhole: changes,
+        });
     }
 
     ///
@@ -637,16 +618,16 @@ impl DaemonState {
                 families.is_some_and(|fs| fs.iter().any(|f| f.afi_safi == AfiSafi::IPV6_UNICAST));
 
             // Flush routes for families NOT covered by the peer's GR capability.
-            // Withdraw kernel null routes first — BLACKHOLE routes bypass LocRib
-            // and are invisible to rib_withdraw_peer_v4/v6 (RFC 7999).
+            // Release the peer's blackholes — they bypass LocRib and are
+            // invisible to rib_withdraw_peer_v4/v6 (RFC 7999).
             if !gr_v4 {
-                self.withdraw_peer_blackhole_kernel_routes_v4(peer_ip);
+                self.release_peer_blackholes_v4(peer_ip);
                 if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
                     ari.clear();
                 }
             }
             if !gr_v6 {
-                self.withdraw_peer_blackhole_kernel_routes_v6(peer_ip);
+                self.release_peer_blackholes_v6(peer_ip);
                 if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
                     ari.clear();
                 }
@@ -679,12 +660,6 @@ impl DaemonState {
             return;
         }
 
-        // Before clearing AdjRibIn, withdraw any kernel null routes that were
-        // installed for BLACKHOLE-tagged prefixes from this peer (RFC 7999).
-        // BLACKHOLE routes bypass LocRib, so rib_withdraw_peer_v4/v6 never
-        // sees them — they must be removed explicitly here.
-        self.withdraw_peer_blackhole_kernel_routes(peer_ip);
-
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
         }
@@ -697,17 +672,19 @@ impl DaemonState {
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
-        let fib_changes_v4 = self.rib_withdraw_peer_v4(&peer_id);
-        let fib_changes_v6 = self.rib_withdraw_peer_v6(&peer_id);
-
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes_v4 {
-                fm.apply_v4(change);
-            }
-            for change in fib_changes_v6 {
-                fm.apply_v6(change);
-            }
-        }
+        // The Loc-RIB withdrawals and the peer's blackhole claims leave the
+        // FIB as one batch (RFC 7999 null routes bypass the Loc-RIB, so
+        // `rib_withdraw_peer_*` never reports them).
+        let fx_v4 = RibEffects {
+            best: self.rib_withdraw_peer_v4(&peer_id),
+            blackhole: self.blackholes.v4.release_peer(peer_id),
+        };
+        let fx_v6 = RibEffects {
+            best: self.rib_withdraw_peer_v6(&peer_id),
+            blackhole: self.blackholes.v6.release_peer(peer_id),
+        };
+        self.program_fib_v4(fx_v4);
+        self.program_fib_v6(fx_v6);
 
         // Reset this peer's outbound state for a clean reconnect.
         let cfg_pt = self

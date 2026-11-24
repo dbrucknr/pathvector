@@ -88,15 +88,24 @@ impl GracefulRestartState {
 }
 
 impl DaemonState {
-    /// Marks `peer_ip`'s retained routes stale and re-installs them as Phase 2
-    /// candidates (RFC 4724 §4.2).
+    /// Marks `peer_ip`'s retained routes stale and re-imports them through the
+    /// same pipeline an arriving UPDATE uses (RFC 4724 §4.2).
     ///
-    /// "Retained" does not mean "eligible": each route is re-judged by `gate`
-    /// and the peer's import policy exactly as on arrival
-    /// ([`ImportDecision::evaluate_gated`]), so an AS-looped or
-    /// own-NEXT_HOP route (RFC 4271 §9.1.2, §6.3) or a policy-rejected one
-    /// that sits in the Adj-RIB-In stays out of the Loc-RIB. `gate` is built
-    /// by the caller before session teardown forgets the local address.
+    /// The Adj-RIB-In holds routes *before* import policy, so "retain" cannot
+    /// mean "reinstall what is stored": that would admit policy-rejected
+    /// routes, drop LOCAL_PREF/OTC/next-hop rewrites, and turn BLACKHOLE
+    /// requests into unicast routes (issue #82). RFC 4724 §4.2 only requires
+    /// the Receiving Speaker to "retain the routes received from the peer"
+    /// and "mark them as stale"; it does not exempt them from eligibility
+    /// (RFC 4271 §9.1.1–§9.1.2), and RFC 8538 §4.1 leaves that unchanged. So
+    /// the routes are marked in place ([`AdjRibIn::mark_all_stale`]) and then
+    /// each is re-classified by [`ImportPipeline::classify_gated`] — gate,
+    /// BLACKHOLE agreement, import policy — which yields the post-policy
+    /// candidate (now carrying the stale mark), a retained authorized
+    /// blackhole, or an ineligible route that stays out. `gate` is built by
+    /// the caller before session teardown forgets the local address.
+    ///
+    /// Only this peer's prefixes are re-propagated, not the whole table.
     pub(super) fn mark_stale_and_repropagate(
         &mut self,
         peer_ip: IpAddr,
@@ -104,97 +113,48 @@ impl DaemonState {
         do_v6: bool,
         gate: &IngressGate,
     ) {
-        let stale_peer = PeerId::from(peer_ip);
-
         // v4 ─────────────────────────────────────────────────────────────────
         if do_v4 {
-            let stale_v4: Vec<_> = self
+            let marked = self
                 .adj_ribs_in
                 .get_mut(&peer_ip)
-                .map(AdjRibIn::mark_all_stale)
-                .unwrap_or_default();
-
-            if !stale_v4.is_empty() {
-                let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
-                    self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
-                let oracle = Arc::clone(&self.oracle_v4);
-                let decisions: Vec<_> = match self.import_policies.get(&peer_ip) {
-                    Some(policy) => stale_v4
-                        .iter()
-                        .map(|r| (r.nlri, ImportDecision::evaluate_gated(gate, policy, r)))
-                        .collect(),
-                    None => Vec::new(),
-                };
-                let fib_changes: Vec<_> = decisions
-                    .into_iter()
-                    .map(|(nlri, d)| {
-                        d.apply(stale_peer, &nlri, &mut self.rib_mut().loc_rib, &*oracle)
-                    })
+                .map_or(0, AdjRibIn::mark_all_stale);
+            if marked > 0 {
+                let affected: Vec<Nlri<Ipv4Addr>> = self.adj_ribs_in[&peer_ip]
+                    .routes()
+                    .map(|(n, _)| *n)
                     .collect();
-                if let Some(fm) = &self.fib_manager {
-                    for change in fib_changes {
-                        fm.apply_v4(change);
-                    }
+                if let Some(effects) = self.reimport_peer_v4(peer_ip, gate) {
+                    self.program_fib_v4(effects);
                 }
-                self.repropagate_after_stale_mark_v4(peer_ip, &prev_prefixes);
-                self.emit_route_events(&prev_prefixes);
+                self.repropagate_after_stale_mark_v4(peer_ip, &affected);
+                self.emit_route_events(&affected);
             }
         }
 
         // v6 ─────────────────────────────────────────────────────────────────
         if do_v6 {
-            let stale_v6: Vec<_> = self
+            let marked = self
                 .adj_ribs_in_v6
                 .get_mut(&peer_ip)
-                .map(AdjRibIn::mark_all_stale)
-                .unwrap_or_default();
-
-            if !stale_v6.is_empty() {
-                let oracle = Arc::clone(&self.oracle_v6);
-                let decisions: Vec<_> = match self.import_policies_v6.get(&peer_ip) {
-                    Some(policy) => stale_v6
-                        .iter()
-                        .map(|r| (r.nlri, ImportDecision::evaluate_gated(gate, policy, r)))
-                        .collect(),
-                    None => Vec::new(),
-                };
-                let fib_changes_v6: Vec<_> = decisions
-                    .into_iter()
-                    .map(|(nlri, d)| {
-                        d.apply(stale_peer, &nlri, &mut self.rib_mut().loc_rib_v6, &*oracle)
-                    })
+                .map_or(0, AdjRibIn::mark_all_stale);
+            if marked > 0 {
+                let affected: Vec<Nlri<Ipv6Addr>> = self.adj_ribs_in_v6[&peer_ip]
+                    .routes()
+                    .map(|(n, _)| *n)
                     .collect();
-                if let Some(fm) = &self.fib_manager {
-                    for change in fib_changes_v6 {
-                        fm.apply_v6(change);
-                    }
+                if let Some(effects) = self.reimport_peer_v6(peer_ip, gate) {
+                    self.program_fib_v6(effects);
                 }
-                self.repropagate_after_stale_mark_v6(peer_ip);
+                self.repropagate_after_stale_mark_v6(peer_ip, &affected);
             }
         }
     }
 
     /// Propagates v4 best-path changes caused by stale marking to other peers.
-    fn repropagate_after_stale_mark_v4(
-        &mut self,
-        peer_ip: IpAddr,
-        prev_prefixes: &[Nlri<Ipv4Addr>],
-    ) {
-        // Use a HashSet for O(1) membership tests; the slice-based contains is O(n²).
-        let prev_set: HashSet<Nlri<Ipv4Addr>> = prev_prefixes.iter().copied().collect();
-        let affected: Vec<Nlri<Ipv4Addr>> = self
-            .rib
-            .loc_rib
-            .best_routes()
-            .filter_map(|(n, _)| if prev_set.contains(&n) { Some(n) } else { None })
-            .chain(
-                prev_prefixes
-                    .iter()
-                    .copied()
-                    .filter(|n| self.rib.loc_rib.best(n).is_none()),
-            )
-            .collect();
-
+    /// `affected` is the peer's own prefixes — the only ones re-import can
+    /// change.
+    fn repropagate_after_stale_mark_v4(&mut self, peer_ip: IpAddr, affected: &[Nlri<Ipv4Addr>]) {
         let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
@@ -270,10 +230,7 @@ impl DaemonState {
     }
 
     /// Propagates v6 best-path changes caused by stale marking to other peers.
-    fn repropagate_after_stale_mark_v6(&mut self, peer_ip: IpAddr) {
-        let affected: Vec<Nlri<Ipv6Addr>> =
-            self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
-
+    fn repropagate_after_stale_mark_v6(&mut self, peer_ip: IpAddr, affected: &[Nlri<Ipv6Addr>]) {
         let other_peers: Vec<IpAddr> = self
             .rib
             .peer_types
@@ -350,44 +307,23 @@ impl DaemonState {
     /// resulting best-path changes to all established peers.
     pub(super) fn prune_stale_nlri(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv4Addr>>) {
         let stale_peer = PeerId::from(peer_ip);
+        let prev_prefixes: Vec<Nlri<Ipv4Addr>> = stale.iter().copied().collect();
 
-        // Withdraw kernel null routes for any BLACKHOLE-tagged stale NLRIs before
-        // removing them from AdjRibIn — they bypass LocRib and are invisible to
-        // the normal FIB change path below.
-        if let Some(fm) = &self.fib_manager
-            && let Some(ari) = self.adj_ribs_in.get(&peer_ip)
-        {
-            for nlri in stale {
-                if ari.get(nlri).is_some_and(|r| {
-                    r.rare_or_default()
-                        .communities
-                        .iter()
-                        .any(|c| c.is_blackhole())
-                }) {
-                    fm.withdraw_blackhole_v4(*nlri);
-                }
-            }
-        }
-
-        if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
-            for nlri in stale {
-                ari.withdraw(nlri);
-            }
-        }
-
-        let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
-            self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
-
+        // RFC 4724 §4.2: stale routes the peer did not refresh before its
+        // End-of-RIB "MUST be deleted". They leave the Adj-RIB-In, the Loc-RIB
+        // and — for an authorized BLACKHOLE request, which has no Loc-RIB
+        // entry — the null-route book, so no kernel null route outlives the
+        // route that justified it.
         let oracle = Arc::clone(&self.oracle_v4);
-        let fib_changes: Vec<_> = stale
-            .iter()
-            .map(|nlri| self.rib_mut().loc_rib.withdraw(&stale_peer, nlri, &*oracle))
-            .collect();
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes {
-                fm.apply_v4(change);
-            }
-        }
+        let effects = retire_routes(
+            stale_peer,
+            stale.iter().copied(),
+            self.adj_ribs_in.get_mut(&peer_ip),
+            &mut Arc::make_mut(&mut self.rib).loc_rib,
+            &mut self.blackholes.v4,
+            &*oracle,
+        );
+        self.program_fib_v4(effects);
 
         let other_peers: Vec<IpAddr> = self
             .rib
@@ -469,42 +405,17 @@ impl DaemonState {
     pub(super) fn prune_stale_nlri_v6(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv6Addr>>) {
         let stale_peer = PeerId::from(peer_ip);
 
-        // Same as prune_stale_nlri: check for BLACKHOLE routes before removal.
-        if let Some(fm) = &self.fib_manager
-            && let Some(ari) = self.adj_ribs_in_v6.get(&peer_ip)
-        {
-            for nlri in stale {
-                if ari.get(nlri).is_some_and(|r| {
-                    r.rare_or_default()
-                        .communities
-                        .iter()
-                        .any(|c| c.is_blackhole())
-                }) {
-                    fm.withdraw_blackhole_v6(*nlri);
-                }
-            }
-        }
-
-        if let Some(ari) = self.adj_ribs_in_v6.get_mut(&peer_ip) {
-            for nlri in stale {
-                ari.withdraw(nlri);
-            }
-        }
-
+        // Same sweep as `prune_stale_nlri` (RFC 4724 §4.2).
         let oracle = Arc::clone(&self.oracle_v6);
-        let fib_changes: Vec<_> = stale
-            .iter()
-            .map(|nlri| {
-                self.rib_mut()
-                    .loc_rib_v6
-                    .withdraw(&stale_peer, nlri, &*oracle)
-            })
-            .collect();
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes {
-                fm.apply_v6(change);
-            }
-        }
+        let effects = retire_routes(
+            stale_peer,
+            stale.iter().copied(),
+            self.adj_ribs_in_v6.get_mut(&peer_ip),
+            &mut Arc::make_mut(&mut self.rib).loc_rib_v6,
+            &mut self.blackholes.v6,
+            &*oracle,
+        );
+        self.program_fib_v6(effects);
 
         let other_peers: Vec<IpAddr> = self
             .rib
@@ -589,8 +500,6 @@ impl DaemonState {
         // Remove any stale tracking (re-establishment was not attempted).
         self.gr.stale_nlri.remove(&peer_ip);
         self.gr.stale_nlri_v6.remove(&peer_ip);
-        // Remove kernel null routes for BLACKHOLE prefixes before clearing AdjRibIn.
-        self.withdraw_peer_blackhole_kernel_routes(peer_ip);
         // Clear AdjRibIn and flush LocRib exactly as on_terminated does.
         if let Some(ari) = self.adj_ribs_in.get_mut(&peer_ip) {
             ari.clear();
@@ -602,16 +511,19 @@ impl DaemonState {
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
         let prev_prefixes_v6: Vec<Nlri<Ipv6Addr>> =
             self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
-        let fib_changes_v4 = self.rib_withdraw_peer_v4(&expired_peer);
-        let fib_changes_v6 = self.rib_withdraw_peer_v6(&expired_peer);
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes_v4 {
-                fm.apply_v4(change);
-            }
-            for change in fib_changes_v6 {
-                fm.apply_v6(change);
-            }
-        }
+        // The Loc-RIB withdrawals and the peer's blackhole claims leave the
+        // FIB together, so a prefix another peer still holds as a blackhole
+        // keeps its null route and one nobody holds loses it.
+        let fx_v4 = RibEffects {
+            best: self.rib_withdraw_peer_v4(&expired_peer),
+            blackhole: self.blackholes.v4.release_peer(expired_peer),
+        };
+        let fx_v6 = RibEffects {
+            best: self.rib_withdraw_peer_v6(&expired_peer),
+            blackhole: self.blackholes.v6.release_peer(expired_peer),
+        };
+        self.program_fib_v4(fx_v4);
+        self.program_fib_v6(fx_v6);
         // Reset AdjRibOut for a clean reconnect.
         let cfg_pt = self
             .peer_config_types

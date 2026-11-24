@@ -53,6 +53,7 @@ use pathvector_types::{AfiSafi, AsPath, Asn, Community, NextHop, Nlri, Origin, P
 use proptest::prelude::*;
 
 use super::DaemonState;
+use super::blackhole::BlackholeChange;
 use super::ingress::IngressGate;
 use super::last_feasible_tests::{
     AS_A, AS_C, LOCAL_AS, PEER_A, PEER_B, PEER_C, RESOLVABLE_V4, RESOLVABLE_V4_ALT, RESOLVABLE_V6,
@@ -792,47 +793,54 @@ fn dropped_replacement_of_a_blackhole_route_withdraws_the_null_route() {
         blackhole
             .attributes
             .push(PathAttribute::Communities(vec![Community::BLACKHOLE]));
-        let first = run(
+        let mut books = super::BlackholeBooks::default();
+        let first = run_agreed(
             &mut adj,
             &mut adj_v6,
             &mut loc,
             &mut loc_v6,
             &policy,
             &policy_v6,
+            &mut books,
             blackhole,
         );
-        assert_eq!(first.blackhole_announced_v4, vec![n4()]);
+        assert_eq!(first.v4.blackhole, vec![BlackholeChange::Install(n4())]);
 
-        let second = run(
+        let second = run_agreed(
             &mut adj,
             &mut adj_v6,
             &mut loc,
             &mut loc_v6,
             &policy,
             &policy_v6,
+            &mut books,
             fault.update_v4(),
         );
 
         assert_eq!(
-            second.blackhole_withdrawn_v4,
-            vec![n4()],
+            second.v4.blackhole,
+            vec![BlackholeChange::Withdraw(n4())],
             "{fault:?}: RFC 4271 §9: the superseded blackhole must be withdrawn"
         );
-        assert!(second.blackhole_announced_v4.is_empty(), "{fault:?}");
     }
 }
 
+/// Runs one UPDATE from peer A on a session that agreed to honor BLACKHOLE for
+/// `10.0.0.0/8` / `2001:db8::/32` (RFC 7999 §3.3), with the null-route books
+/// supplied.
 #[allow(clippy::too_many_arguments)]
-fn run(
+fn run_agreed(
     adj: &mut AdjRibIn<Ipv4Addr>,
     adj_v6: &mut AdjRibIn<Ipv6Addr>,
     loc: &mut LocRib<Ipv4Addr>,
     loc_v6: &mut LocRib<Ipv6Addr>,
     policy: &Policy<Route<Ipv4Addr>>,
     policy_v6: &Policy<Route<Ipv6Addr>>,
+    books: &mut super::BlackholeBooks,
     msg: UpdateMessage,
 ) -> super::route::UpdateResult {
-    handle_update(
+    let scope = crate::blackhole::BlackholeScope::new(["10.0.0.0/8", "2001:db8::/32"]).unwrap();
+    super::route::process_update(
         pid(PEER_A),
         msg,
         adj,
@@ -849,6 +857,8 @@ fn run(
         Some(CONFED_ID),
         Some(OWN_V4),
         Some(OWN_V6),
+        &super::PeerBlackhole::from_config(Some(&scope), None),
+        books,
     )
 }
 
@@ -1090,15 +1100,17 @@ fn unused_classic_next_hop_is_ignored_when_mp_reach_is_the_only_nlri() {
     );
 }
 
-// ── BLACKHOLE tags are never retained on a dropped route ─────────────────────
+// ── A dropped BLACKHOLE announcement never owns a null route ─────────────────
 
-/// An ineligible announcement installs no kernel null route, so it must not be
-/// kept with its BLACKHOLE tag: `holds_blackhole` and teardown read that tag as
-/// "this peer owns a null route". Otherwise A's later withdrawal of a looped
-/// BLACKHOLE route would schedule deletion of C's active null route (Codex
-/// review of #139).
+/// An ineligible announcement installs no kernel null route. The daemon's
+/// record of who owns a null route is the blackhole book, not the BLACKHOLE
+/// tag on a stored route, so keeping the dropped replacement in the
+/// Adj-RIB-In (RFC 4271 §9, RFC 7999 §3.3 "store all BGP updates … carrying
+/// the BLACKHOLE community") cannot let A's later withdrawal delete C's active
+/// null route for the same prefix (Codex review of #139, now fixed
+/// structurally).
 #[test]
-fn dropped_blackhole_announcement_is_not_retained_and_withdrawal_removes_no_null_route() {
+fn dropped_blackhole_announcement_owns_no_null_route_and_its_withdrawal_removes_none() {
     let policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Accept);
     let policy_v6: Policy<Route<Ipv6Addr>> = Policy::new(DefaultAction::Accept);
     for fault in [Fault::AsLoop, Fault::OwnNextHop] {
@@ -1106,46 +1118,61 @@ fn dropped_blackhole_announcement_is_not_retained_and_withdrawal_removes_no_null
         let mut adj_v6 = AdjRibIn::new(pid(PEER_A));
         let mut loc: LocRib<Ipv4Addr> = LocRib::new();
         let mut loc_v6: LocRib<Ipv6Addr> = LocRib::new();
+        let mut books = super::BlackholeBooks::default();
+
+        // C already holds a null route for the same prefix.
+        let scope = crate::blackhole::BlackholeScope::new(["10.0.0.0/8"]).unwrap();
+        let c_claim = super::blackhole::BlackholeAgreement::<Ipv4Addr>::agreed(scope)
+            .authorize(
+                &pathvector_rib::RouteBuilder::new(n4(), Origin::Igp, AsPath::new())
+                    .community(Community::BLACKHOLE)
+                    .build(),
+            )
+            .unwrap();
+        assert!(books.v4.claim(pid(PEER_C), c_claim).is_some());
 
         let mut tagged = fault.update_v4();
         tagged
             .attributes
             .push(PathAttribute::Communities(vec![Community::BLACKHOLE]));
-        let first = run(
+        let first = run_agreed(
             &mut adj,
             &mut adj_v6,
             &mut loc,
             &mut loc_v6,
             &policy,
             &policy_v6,
+            &mut books,
             tagged,
         );
         assert!(
-            first.blackhole_announced_v4.is_empty(),
+            first.v4.blackhole.is_empty(),
             "{fault:?}: no null route for an ineligible announcement"
         );
-        assert!(
-            adj.get(&n4()).is_none(),
-            "{fault:?}: BLACKHOLE tag retained"
-        );
+        assert!(!books.v4.holds(pid(PEER_A), &n4()), "{fault:?}");
 
         let withdraw = UpdateMessage {
             withdrawn: vec![n4()],
             attributes: vec![],
             announced: vec![],
         };
-        let second = run(
+        let second = run_agreed(
             &mut adj,
             &mut adj_v6,
             &mut loc,
             &mut loc_v6,
             &policy,
             &policy_v6,
+            &mut books,
             withdraw,
         );
         assert!(
-            second.blackhole_withdrawn_v4.is_empty(),
+            second.v4.blackhole.is_empty(),
             "{fault:?}: withdrawing a never-installed route must not delete a null route"
+        );
+        assert!(
+            books.v4.holds(pid(PEER_C), &n4()),
+            "{fault:?}: C's null route survives"
         );
     }
 }
@@ -1405,10 +1432,10 @@ proptest! {
         let mut before: Vec<_> = loc_rib.best_routes().map(|(n, r)| (n, r.clone())).collect();
         let mut before_v6: Vec<_> = loc_rib_v6.best_routes().map(|(n, r)| (n, r.clone())).collect();
         for i in 0..3 {
-            let _ = super::import::reapply_import_policy(
+            let _ = super::import::reapply_without_blackholes(
                 model_peer(i), &adj[i], &mut loc_rib, &policy, &gate, &AlwaysReachable,
             );
-            let _ = super::import::reapply_import_policy(
+            let _ = super::import::reapply_without_blackholes(
                 model_peer(i), &adj_v6[i], &mut loc_rib_v6, &policy_v6, &gate, &AlwaysReachable,
             );
         }

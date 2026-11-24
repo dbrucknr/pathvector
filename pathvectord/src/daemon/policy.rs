@@ -62,72 +62,139 @@ impl DaemonState {
         )
     }
 
+    /// Re-imports `peer_ip`'s IPv4 Adj-RIB-In through the import pipeline
+    /// ([`ImportPipeline`]: ingress gate, BLACKHOLE agreement, import policy)
+    /// and reconciles the Loc-RIB and the null-route book with the result.
+    ///
+    /// The one re-evaluation entry point: policy changes, RPKI ROA changes,
+    /// agreement changes and Graceful Restart stale marking all call it, so a
+    /// retained route is judged exactly as arrival would judge it. Returns
+    /// `None` for a peer with no policy (an unknown peer). The caller programs
+    /// the effects ([`program_fib_v4`](Self::program_fib_v4)) and propagates.
+    pub(super) fn reimport_peer_v4(
+        &mut self,
+        peer_ip: IpAddr,
+        gate: &IngressGate,
+    ) -> Option<RibEffects<Ipv4Addr>> {
+        let policy = self.import_policies.get(&peer_ip)?;
+        let adj_rib_in = self.adj_ribs_in.get(&peer_ip)?;
+        let no_agreement = PeerBlackhole::denied();
+        let blackhole = self
+            .blackhole_sessions
+            .get(&peer_ip)
+            .unwrap_or(&no_agreement);
+        let pipeline = ImportPipeline {
+            policy,
+            blackhole: &blackhole.v4,
+        };
+        // Clone the oracle Arc so the borrow checker sees `oracle_v4` and
+        // `rib` as independent fields of `self`.
+        let oracle = Arc::clone(&self.oracle_v4);
+        Some(reapply_import_policy(
+            PeerId::from(peer_ip),
+            adj_rib_in,
+            &mut Arc::make_mut(&mut self.rib).loc_rib,
+            &mut self.blackholes.v4,
+            &pipeline,
+            gate,
+            &*oracle,
+        ))
+    }
+
+    /// IPv6 counterpart of [`reimport_peer_v4`](Self::reimport_peer_v4).
+    pub(super) fn reimport_peer_v6(
+        &mut self,
+        peer_ip: IpAddr,
+        gate: &IngressGate,
+    ) -> Option<RibEffects<Ipv6Addr>> {
+        let policy = self.import_policies_v6.get(&peer_ip)?;
+        let adj_rib_in = self.adj_ribs_in_v6.get(&peer_ip)?;
+        let no_agreement = PeerBlackhole::denied();
+        let blackhole = self
+            .blackhole_sessions
+            .get(&peer_ip)
+            .unwrap_or(&no_agreement);
+        let pipeline = ImportPipeline {
+            policy,
+            blackhole: &blackhole.v6,
+        };
+        let oracle = Arc::clone(&self.oracle_v6);
+        Some(reapply_import_policy(
+            PeerId::from(peer_ip),
+            adj_rib_in,
+            &mut Arc::make_mut(&mut self.rib).loc_rib_v6,
+            &mut self.blackholes.v6,
+            &pipeline,
+            gate,
+            &*oracle,
+        ))
+    }
+
     /// Re-evaluates one peer's Adj-RIB-In (both address families) against
-    /// its current import policy, updates Loc-RIB and the FIB, and
-    /// propagates any resulting changes to other peers. Shared by
+    /// its current import policy and BLACKHOLE agreement, updates Loc-RIB and
+    /// the FIB, and propagates any resulting changes to other peers. Shared by
     /// `set_import_default` (policy replaced first) and
     /// `reevaluate_all_import_policies` (policy left as-is). Does **not**
     /// call `flush_pending` — callers do that once, after their own loop.
     fn reevaluate_import_for_peer(&mut self, peer_ip: IpAddr) {
-        // Collect affected NLRIs before the mutable borrow of loc_rib so the
-        // borrow checker does not see two simultaneous borrows of `self`.
+        // The prefixes this peer's Adj-RIB-In holds: the only ones whose
+        // state can change.
         let nlris: Vec<Nlri<Ipv4Addr>> = self
             .adj_ribs_in
             .get(&peer_ip)
             .map(|a| a.routes().map(|(n, _)| *n).collect())
             .unwrap_or_default();
-
-        // Re-evaluate the peer's Adj-RIB-In against the current policy.
-        // Clone oracle before the mutable borrow of rib so the borrow checker
-        // sees oracle_v4 and rib as independent fields of self.
-        let oracle = Arc::clone(&self.oracle_v4);
         let gate = self.ingress_gate(peer_ip);
-        let loc_rib = &mut Arc::make_mut(&mut self.rib).loc_rib;
-        let fib_changes = reapply_import_policy(
-            PeerId::from(peer_ip),
-            &self.adj_ribs_in[&peer_ip],
-            loc_rib,
-            &self.import_policies[&peer_ip],
-            &gate,
-            &*oracle,
-        );
 
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes {
-                fm.apply_v4(change);
-            }
+        if let Some(effects) = self.reimport_peer_v4(peer_ip, &gate) {
+            self.program_fib_v4(effects);
         }
-
         self.propagate_to_all_peers(&nlris);
         // propagate_to_all_peers fires PeerEvent::Changed (ADV); fire route
         // events too so the dashboard reflects the Loc-RIB change.
         self.emit_route_events(&nlris);
 
-        // Re-evaluate IPv6 Adj-RIB-In against the same policy.
+        // IPv6 Adj-RIB-In, same pipeline.
         let nlris_v6: Vec<Nlri<Ipv6Addr>> = self
             .adj_ribs_in_v6
             .get(&peer_ip)
             .map(|a| a.routes().map(|(n, _)| *n).collect())
             .unwrap_or_default();
-
-        let oracle_v6 = Arc::clone(&self.oracle_v6);
-        let loc_rib_v6 = &mut Arc::make_mut(&mut self.rib).loc_rib_v6;
-        let fib_changes_v6 = reapply_import_policy(
-            PeerId::from(peer_ip),
-            &self.adj_ribs_in_v6[&peer_ip],
-            loc_rib_v6,
-            &self.import_policies_v6[&peer_ip],
-            &gate,
-            &*oracle_v6,
-        );
-
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes_v6 {
-                fm.apply_v6(change);
-            }
+        if let Some(effects) = self.reimport_peer_v6(peer_ip, &gate) {
+            self.program_fib_v6(effects);
         }
-
         self.propagate_to_all_peers_v6(&nlris_v6);
+    }
+
+    /// Replaces `peer_ip`'s RFC 7999 BLACKHOLE agreement (`None` revokes it)
+    /// and re-evaluates the peer's Adj-RIB-In under it: newly authorized
+    /// requests are programmed, revoked or out-of-scope ones have their null
+    /// routes removed.
+    ///
+    /// There is no runtime configuration reload yet, so production sessions get
+    /// their agreement from `add_peer`; this is the policy-change entry point
+    /// the re-evaluation tests drive.
+    #[cfg(test)]
+    pub(crate) fn set_blackhole_scope(
+        &mut self,
+        peer_ip: IpAddr,
+        scope: Option<&crate::blackhole::BlackholeScope>,
+    ) {
+        if !self.import_policies.contains_key(&peer_ip) {
+            tracing::warn!(peer = %peer_ip, "set_blackhole_scope: unknown peer — ignoring");
+            return;
+        }
+        let leak = self
+            .rib
+            .peer_roles
+            .get(&peer_ip)
+            .copied()
+            .zip(self.rib.peer_remote_as.get(&peer_ip).copied())
+            .map(|(role, asn)| (role, Asn::new(asn)));
+        self.blackhole_sessions
+            .insert(peer_ip, PeerBlackhole::from_config(scope, leak));
+        self.reevaluate_import_for_peer(peer_ip);
+        self.flush_pending();
     }
 
     /// Replaces the export-policy default for `peer_ip` — both address

@@ -1,8 +1,84 @@
 // daemon/fib.rs — RIB/FIB operations: insert, withdraw, recompute, snapshot, FIB change handling.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use pathvector_types::IpAddress;
+
+/// Which port calls a batch of [`RibEffects`] translates to.
+///
+/// The kernel route for a prefix is either the Loc-RIB's forwarding route or an
+/// RFC 7999 null route, never both:
+///
+/// - a best-path change for a prefix that currently holds an authorized
+///   blackhole is **not** programmed — the null route owns the kernel entry
+///   (it is the more specific, locally authorized intent) and the Loc-RIB's
+///   candidate stays in the Loc-RIB, ready for when the blackhole goes;
+/// - when the last blackhole for a prefix is withdrawn, the null route is
+///   removed and, if the Loc-RIB has a best route for it, that route is
+///   programmed again (a blackhole bypasses the Loc-RIB, so no best-path
+///   change announces it).
+///
+/// Pure: only calls the closures it is given.
+fn program_effects<A: IpAddress>(
+    effects: RibEffects<A>,
+    book: &BlackholeBook<A>,
+    loc_rib: &LocRib<A>,
+    apply: impl Fn(BestPathChange<A>),
+    install_blackhole: impl Fn(Nlri<A>),
+    withdraw_blackhole: impl Fn(Nlri<A>),
+) {
+    for change in effects.best {
+        let nlri = match &change {
+            BestPathChange::Announced(n, _) | BestPathChange::Withdrawn(n) => *n,
+            BestPathChange::Unchanged => continue,
+        };
+        if !book.is_blackholed(&nlri) {
+            apply(change);
+        }
+    }
+    for change in effects.blackhole {
+        match change {
+            BlackholeChange::Install(n) => install_blackhole(n),
+            BlackholeChange::Withdraw(n) => {
+                withdraw_blackhole(n);
+                if !book.is_blackholed(&n)
+                    && let Some(route) = loc_rib.best(&n)
+                {
+                    apply(BestPathChange::Announced(n, route.clone()));
+                }
+            }
+        }
+    }
+}
 
 impl DaemonState {
+    /// Programs one IPv4 batch of RIB effects into the FIB port, if there is one.
+    pub(super) fn program_fib_v4(&self, effects: RibEffects<Ipv4Addr>) {
+        if let Some(fm) = &self.fib_manager {
+            program_effects(
+                effects,
+                &self.blackholes.v4,
+                &self.rib.loc_rib,
+                |c| fm.apply_v4(c),
+                |n| fm.apply_blackhole_v4(n),
+                |n| fm.withdraw_blackhole_v4(n),
+            );
+        }
+    }
+
+    /// IPv6 counterpart of [`program_fib_v4`](Self::program_fib_v4).
+    pub(super) fn program_fib_v6(&self, effects: RibEffects<Ipv6Addr>) {
+        if let Some(fm) = &self.fib_manager {
+            program_effects(
+                effects,
+                &self.blackholes.v6,
+                &self.rib.loc_rib_v6,
+                |c| fm.apply_v6(c),
+                |n| fm.apply_blackhole_v6(n),
+                |n| fm.withdraw_blackhole_v6(n),
+            );
+        }
+    }
+
     pub(crate) fn rib_insert_v4(
         &mut self,
         peer: PeerId,
