@@ -4,6 +4,49 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-24 (pathvectord: withdraw the older route when a replacement is dropped before import policy — issue #138)
+
+Same bug shape as #80 (PR #131), for announcements that never reach import policy.
+`handle_update` dropped an AS_PATH loop (local AS or Confederation Identifier), AS 0, an
+invalid IPv4 NEXT_HOP and an invalid IPv6 next hop with a bare `continue`. If the dropped
+announcement replaced a route the same peer had advertised earlier, that older route stayed
+in Adj-RIB-In and Loc-RIB: still selected, installed in the FIB and advertised, although
+RFC 4271 §9 says the new route "SHALL replace the older route in the Adj-RIB-In, thus
+implicitly withdrawing the older route from service". (A loop in the MP_REACH_NLRI
+IPv4/IPv6 lists was worse: the NLRI were cleared without being counted or logged.)
+
+- New pure module `daemon/ingress.rs`: `IngressGate` (our AS, Confederation Identifier and
+  addresses) returns an `IngressDrop` for an AS_PATH or next hop, and
+  `IngressDrop::disposition` maps the reason to what happens to the peer's route:
+  `TreatAsWithdraw` for AS 0 (RFC 7607 → RFC 7606) and a syntactically invalid NEXT_HOP
+  (RFC 4271 §6.3 + RFC 7606 §3(e): unspecified, loopback, multicast, broadcast; IPv6
+  unspecified or multicast) — removed from Adj-RIB-In and Loc-RIB; `Ineligible` for an AS
+  loop (RFC 4271 §9.1.2, RFC 5065 §4) and our own address as NEXT_HOP (RFC 4271 §6.3 (a)) —
+  the replacement is stored in Adj-RIB-In and the peer has no Loc-RIB candidate, the same
+  `ImportDecision::Rejected` reconciliation as #80.
+- `route.rs`: one `withdraw_route` helper now serves WITHDRAWN ROUTES, MP_UNREACH_NLRI and
+  every treat-as-withdraw (it replaces seven copies of the same eight lines), so the ways a
+  route can be withdrawn cannot drift apart. A superseded BLACKHOLE route's kernel null
+  route is reported for removal on every one of them.
+- `reapply_import_policy` takes the gate, so soft reconfiguration (default-policy or ROA
+  change) reaches the same verdict as arrival and cannot install a looped route kept in
+  Adj-RIB-In.
+- The next-hop check is now one function for both families and every NLRI source (it also
+  covers a v4 next hop on an MP_REACH IPv6 route and a v6 one on an IPv4 route, which were
+  unchecked).
+- Behavior change: an AS-looped announcement is now stored in Adj-RIB-In (it was silently
+  not stored). It counts toward max-prefix like a policy-rejected route.
+
+Regression tests: `daemon/ingress_drop_tests.rs` — through `DaemonState::on_route_update`,
+sole best replaced, takeover, no earlier route, mixed UPDATEs, re-evaluation, BLACKHOLE,
+IPv4 and IPv6, every drop reason — plus a model property test; unit tests in
+`daemon/ingress.rs`; e2e `as_loop_replacement_withdraws_the_older_route_session_stays_up`
+and `invalid_next_hop_replacement_withdraws_the_older_route_session_stays_up`. See
+`pathvectord/RFC.md`. Still open: the session-side AS 0 checks (#111), and a *non-dropped*
+replacement does not retire an older BLACKHOLE route.
+
+---
+
 ## 2026-11-23 (IPv6 ECMP: re-read a set after a delete leaves an inferred head)
 
 Follow-up to PR #122. A dump describes an IPv6 ECMP set only through its first sibling,
@@ -103,9 +146,8 @@ Adj-RIB-In and candidate set for sole-best, takeover, no-churn, rejected →
 accepted, ROV and OTC cases, both families) and the model property test
 `prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer`.
 
-Still open: replacements dropped before import policy (AS_PATH loop, AS 0,
-semantically invalid NEXT_HOP) leave the older route in place; see
-`pathvectord/RFC.md` §9 / §9.1.1 and issue #111.
+Replacements dropped before import policy (AS_PATH loop, AS 0, invalid NEXT_HOP) were
+fixed afterwards by issue #138, above.
 
 ---
 

@@ -41,7 +41,90 @@ mention policy. A policy rejection is a well-formed route found ineligible.
 | An accepted replacement of a rejected route is installed and advertised | `src/daemon/import.rs` | ✅ | `accepted_replacement_of_rejected_route_is_installed_v4`/`_v6` |
 | The same holds for RFC 6811 ROV Invalid and RFC 9234 §5 OTC-leak replacements | `src/daemon/import.rs` | ✅ | `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6`, `otc_leak_replacement_withdraws_old_route_v4`/`_v6` |
 | Model: after any per-peer sequence of accepted/rejected announcements and withdrawals, Loc-RIB candidates == each peer's latest advertisement that passed policy; Adj-RIB-In == latest advertisement; re-evaluation agrees with initial import | `src/daemon/import_reject_tests.rs` | ✅ | `prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer` |
-| Replacements dropped *before* import policy also implicitly withdraw the older route | `src/daemon/route.rs` | ⚠️ | Open, outside #80: these paths `continue` before `import_announcement`, so the older route stays in Adj-RIB-In and Loc-RIB. AS_PATH loop: §9.1.2 says the route "should be excluded from the Phase 2 decision function", i.e. ineligible, which by the reasoning above should withdraw the older route. AS 0: RFC 7607 §2 delegates to RFC 7606 (treat-as-withdraw); tracked by #111. Semantically invalid NEXT_HOP: RFC 4271 §6.3 says "the route SHOULD be ignored" (RFC 7606 §7.3 only covers a wrong attribute length), and whether "ignored" keeps the older route is not settled here. |
+| Replacements dropped *before* import policy (AS loop, AS 0, invalid NEXT_HOP) also implicitly withdraw the older route | `src/daemon/ingress.rs`, `src/daemon/route.rs` | ✅ | See the next section (issue #138) |
+
+---
+
+## RFC 4271 §9 / §9.1.2 / §6.3 — Announcements Dropped Before Import Policy
+
+**Owns:** `daemon/ingress.rs`: `IngressGate` (pure: AS_PATH and next-hop verdicts),
+`IngressDrop` (the reason) and `Disposition` (what the reason does to the peer's older
+route). `route.rs` applies the verdict (`withdraw_route`, `import_ineligible`);
+`import.rs` re-applies it on soft reconfiguration.  
+**Boundary:** No RIB access in `ingress.rs`. Policy stays in `pathvector-policy`; the
+Adj-RIB-In/Loc-RIB reconciliation is the same `ImportDecision::Rejected` path as the
+import-policy case above (issue #80).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9.1.2
+
+Before issue #138 these announcements were dropped with a bare `continue`, so the older
+route the *same peer* advertised for the same NLRI stayed in the Adj-RIB-In, selected,
+installed in the FIB and advertised, although the peer had replaced it.
+
+Clauses (quoted from the RFC text):
+
+- RFC 4271 §9: "the new route SHALL replace the older route in the Adj-RIB-In, thus
+  implicitly withdrawing the older route from service."
+- RFC 4271 §9.1.2: "If the AS_PATH attribute of a BGP route contains an AS loop, the
+  BGP route should be excluded from the Phase 2 decision function." Excluded, not
+  discarded: the route is *ineligible*, so it replaces the older route (§9) and the peer
+  is left with no candidate.
+- RFC 5065 §4: "A BGP speaker receiving an AS_PATH attribute containing an autonomous
+  system matching its own AS Confederation Identifier SHALL treat the path in the same
+  fashion as if it had received a path containing its own AS number."
+- RFC 4271 §6.3: "Syntactic correctness means that the NEXT_HOP attribute represents a
+  valid IP host address." The error is Invalid NEXT_HOP Attribute (session reset), which
+  RFC 7606 §3(e) replaces: "'Treat-as-withdraw' MUST be used for the cases that specify a
+  session reset and involve any of the attributes ORIGIN, AS_PATH, NEXT_HOP, ...".
+  RFC 7606 §2: the routes are handled "just as if they had been listed in the WITHDRAWN
+  ROUTES field", "thus causing them to be removed from the Adj-RIB-In".
+- RFC 4271 §6.3 (a): the NEXT_HOP "MUST NOT be the IP address of the receiving speaker";
+  if it is, "the error SHOULD be logged, and the route SHOULD be ignored. In this case, a
+  NOTIFICATION message SHOULD NOT be sent, and the connection SHOULD NOT be closed." No
+  session reset is specified, so RFC 7606 §3(e) does not apply; RFC 7606 §7.3 only covers
+  a NEXT_HOP of the wrong length.
+- RFC 7607 §2 prohibits AS 0 in AS_PATH and delegates the handling of such an UPDATE to
+  RFC 7606, i.e. treat-as-withdraw.
+
+Decisions, and why:
+
+| Reason | Disposition | Adj-RIB-In | Loc-RIB | Basis |
+|---|---|---|---|---|
+| AS loop (local AS or Confederation Identifier) | `Ineligible` | holds the replacement | no candidate | §9.1.2 "excluded from the Phase 2 decision function"; §9 replacement |
+| Own address as NEXT_HOP | `Ineligible` | holds the replacement | no candidate | §6.3 (a) "SHOULD be ignored", read as *not used*; the route still supersedes the older one (§9), so keeping the superseded route would contradict §9 |
+| Unspecified, loopback, multicast or broadcast IPv4 NEXT_HOP; unspecified or multicast IPv6 next hop (incl. a multicast link-local) | `TreatAsWithdraw` | removed | no candidate | §6.3 syntax + RFC 7606 §3(e), §2 (RFC 1122 §3.2.1.3 and RFC 4291 §2.5.2 / §2.7 say these are not host addresses) |
+| AS 0 in AS_PATH | `TreatAsWithdraw` | removed | no candidate | RFC 7607 §2 → RFC 7606 |
+
+Notes:
+
+- Each NLRI is judged against the next hop that applies to *it*: the NEXT_HOP attribute
+  for the classic NLRI field, the MP_REACH_NLRI next hop for its own prefixes. One UPDATE
+  can therefore withdraw some NLRI and replace others. RFC 7606 §2 speaks of "all
+  contained routes" for a malformed attribute; a well-formed attribute with an invalid
+  *value* is a route-level check (§5.1.3), so the verdict is route-level too.
+- If both an `Ineligible` and a `TreatAsWithdraw` reason apply, treat-as-withdraw wins
+  (`IngressDrop::most_severe`).
+- An `Ineligible` route stays in the Adj-RIB-In for soft reconfiguration, so
+  `reapply_import_policy` asks the same `IngressGate` first; a ROA or default-policy change
+  cannot install a looped route. It counts toward max-prefix like a policy-rejected route.
+- An older BLACKHOLE route (RFC 7999) superseded by a dropped announcement is reported in
+  `blackhole_withdrawn_*` so its kernel null route is removed.
+- Still open, outside this issue: an *accepted* (or policy-rejected) replacement that is
+  not BLACKHOLE-tagged does not retire an older BLACKHOLE route either.
+- The session-side half of RFC 7607 (OPEN, AGGREGATOR, AS4 attributes) remains issue #111.
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Dropped replacement of the sole best route: FIB `Withdrawn`, peers get WITHDRAWN ROUTES / `MP_UNREACH_NLRI`, no NOTIFICATION (§9, §9.2) | `src/daemon/route.rs` | ✅ | `dropped_replacement_of_sole_best_withdraws_from_fib_and_peers_v4`/`_v6` (AS loop, confederation-ID loop, AS 0, unspecified/loopback/multicast/broadcast NEXT_HOP, own-address NEXT_HOP) |
+| …another peer's route takes over, peers never see a withdrawal | `src/daemon/route.rs` | ✅ | `dropped_replacement_promotes_other_peers_route_v4`/`_v6` |
+| No earlier route from the peer: no FIB change, nothing sent, other peers' routes untouched | `src/daemon/route.rs` | ✅ | `dropped_announcement_without_earlier_route_is_a_no_op_v4`/`_v6` |
+| Adj-RIB-In: removed for treat-as-withdraw, holds the replacement for ineligible routes | `src/daemon/route.rs` | ✅ | `assert_adj_rib_in_v4`/`_v6` in every test above |
+| Several NLRI in one UPDATE: only the dropped ones are withdrawn | `src/daemon/route.rs` | ✅ | `mixed_update_withdraws_only_the_nlri_with_a_bad_next_hop_v4`, `mixed_update_withdraws_only_the_bad_family_v4_good_v6_bad`, `loop_update_with_several_nlri_withdraws_only_prefixes_with_an_earlier_route`, `loop_update_with_several_v6_nlri_withdraws_only_prefixes_with_an_earlier_route` |
+| Re-evaluation does not resurrect an ineligible replacement | `src/daemon/import.rs` | ✅ | `reevaluation_keeps_an_ineligible_replacement_out_of_the_loc_rib` |
+| An eligible route after a dropped one is installed | `src/daemon/route.rs` | ✅ | `eligible_replacement_of_a_dropped_route_is_installed` |
+| A superseded BLACKHOLE route's null route is withdrawn | `src/daemon/route.rs` | ✅ | `dropped_replacement_of_a_blackhole_route_withdraws_the_null_route` |
+| Model: after any per-peer sequence of accepted / ineligible / treat-as-withdraw announcements and withdrawals, candidates == latest accepted advertisement, Adj-RIB-In as the table above says, re-evaluation agrees | `src/daemon/ingress_drop_tests.rs` | ✅ | `prop_dropped_announcements_leave_the_peer_with_no_candidate` |
+| Verdicts and dispositions as pure values | `src/daemon/ingress.rs` | ✅ | `ingress::tests::*` |
+| e2e: real session, AS-loop and 0.0.0.0-NEXT_HOP replacements withdraw the first route, session stays up | `pathvector-e2e` | ✅ | `as_loop_replacement_withdraws_the_older_route_session_stays_up`, `invalid_next_hop_replacement_withdraws_the_older_route_session_stays_up` |
 
 ---
 
