@@ -516,6 +516,13 @@ pub fn write_gobgp_config_with_as(as_number: u32) -> NamedTempFile {
 /// Use a short `restart_secs` (e.g. `10`) for Phase 2 tests so the GR window
 /// expires quickly without waiting the full 120 s default.
 ///
+/// Graceful Restart is enabled per address family (`mp-graceful-restart`) as
+/// well as globally: GoBGP lists only the families that opt in inside the
+/// capability's family list, and RFC 4724 §4.2 lets a helper retain routes
+/// only for families listed there. Without the per-family opt-in the peer
+/// advertises GR for *no* family and pathvectord correctly flushes its routes
+/// at once, which is not the hold-then-expire scenario these tests exercise.
+///
 /// # Panics
 ///
 /// Panics if the temporary file cannot be created or written.
@@ -546,10 +553,14 @@ pub fn write_gobgp_config_with_restart_time(restart_secs: u16) -> NamedTempFile 
   [[peer-groups.afi-safis]]
     [peer-groups.afi-safis.config]
       afi-safi-name = "ipv4-unicast"
+    [peer-groups.afi-safis.mp-graceful-restart.config]
+      enabled = true
 
   [[peer-groups.afi-safis]]
     [peer-groups.afi-safis.config]
       afi-safi-name = "ipv6-unicast"
+    [peer-groups.afi-safis.mp-graceful-restart.config]
+      enabled = true
 
 [[dynamic-neighbors]]
   [dynamic-neighbors.config]
@@ -599,10 +610,14 @@ pub fn write_gobgp_config_with_notification_and_restart_time(restart_secs: u16) 
   [[peer-groups.afi-safis]]
     [peer-groups.afi-safis.config]
       afi-safi-name = "ipv4-unicast"
+    [peer-groups.afi-safis.mp-graceful-restart.config]
+      enabled = true
 
   [[peer-groups.afi-safis]]
     [peer-groups.afi-safis.config]
       afi-safi-name = "ipv6-unicast"
+    [peer-groups.afi-safis.mp-graceful-restart.config]
+      enabled = true
 
 [[dynamic-neighbors]]
   [dynamic-neighbors.config]
