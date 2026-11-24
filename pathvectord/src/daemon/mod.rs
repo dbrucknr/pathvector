@@ -48,6 +48,8 @@ mod deferral;
 mod fib;
 mod gr;
 #[cfg(test)]
+mod last_feasible_tests;
+#[cfg(test)]
 mod listener_md5_tests;
 #[cfg(test)]
 mod mrai_flush_tests;
