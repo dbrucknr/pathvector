@@ -1,6 +1,8 @@
 // daemon/route.rs — Route processing: import/export, propagation, MRAI, handle_update.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::outbound::{DecisionKind, OutboundDecision};
+use pathvector_types::IpAddress;
 
 impl DaemonState {
     #[allow(clippy::similar_names)]
@@ -452,6 +454,12 @@ impl DaemonState {
             let loc_rib = &self.rib.loc_rib;
             let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
+            // RFC 4271 §9.2.1.1: MRAI is applied to eBGP peers only (option
+            // (b) of the iBGP SHOULD), per destination. The gate wraps the
+            // Adj-RIB-Out diff so a held-back announcement is rolled back out
+            // of the Adj-RIB-Out (see `MraiTracker::gate`).
+            let mut mrai = (peer_type == PeerType::External).then_some(&mut self.mrai);
+            let now = Instant::now();
             let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
@@ -472,56 +480,26 @@ impl DaemonState {
                             return PrefixDecision::NoChange;
                         }
                     }
-                    propagate_prefix(
-                        nlri,
-                        loc_rib,
-                        adj_rib_out,
-                        export_policy,
-                        peer_type,
-                        local_as,
-                        public_as,
-                        local_next_hop,
-                        next_hop_self,
-                        v4_deferred,
-                    )
+                    let propagate = |adj: &mut AdjRibOut<Ipv4Addr>| {
+                        propagate_prefix(
+                            nlri,
+                            loc_rib,
+                            adj,
+                            export_policy,
+                            peer_type,
+                            local_as,
+                            public_as,
+                            local_next_hop,
+                            next_hop_self,
+                            v4_deferred,
+                        )
+                    };
+                    match mrai.as_deref_mut() {
+                        Some(mrai) => mrai.gate(peer_ip, nlri, now, adj_rib_out, propagate),
+                        None => propagate(adj_rib_out),
+                    }
                 })
                 .collect();
-            // RFC 4271 §9.2.1.1: apply MRAI for eBGP peers.
-            // Withdrawals bypass MRAI (must be sent immediately per the RFC).
-            let now = Instant::now();
-            let decisions = if peer_type == PeerType::External {
-                let last_sent = self.mrai_last_sent.entry(peer_ip).or_default();
-                let pending = self.mrai_pending.entry(peer_ip).or_default();
-                decisions
-                    .into_iter()
-                    .map(|d| match d {
-                        PrefixDecision::Announce(ref route) => {
-                            let nlri = route.nlri;
-                            let elapsed = last_sent
-                                .get(&nlri)
-                                .map_or(MRAI, |t| now.saturating_duration_since(*t));
-                            if elapsed >= MRAI {
-                                last_sent.insert(nlri, now);
-                                pending.remove(&nlri);
-                                d
-                            } else {
-                                pending.insert(nlri);
-                                PrefixDecision::NoChange
-                            }
-                        }
-                        // Withdrawals are always sent immediately; also clear any
-                        // pending MRAI entry so we don't re-announce after withdrawal.
-                        PrefixDecision::Withdraw(nlri) => {
-                            pending.remove(&nlri);
-                            last_sent.remove(&nlri);
-                            d
-                        }
-                        PrefixDecision::NoChange => d,
-                    })
-                    .collect()
-            } else {
-                decisions
-            };
             // Accumulate into the coalescing buffer; flush_pending() will drain
             // all peers at once when the event channel goes quiet.
             self.pending_decisions
@@ -540,54 +518,34 @@ impl DaemonState {
         });
     }
 
-    /// Re-propagates NLRIs that were suppressed by MRAI and whose window has now elapsed.
+    /// Re-propagates destinations held back by MRAI whose interval has now
+    /// elapsed, for both address families.
     ///
-    /// Should be called roughly every MRAI interval (30 s) by the event loop.
-    /// For each eBGP peer with pending NLRIs, this re-runs `propagate_to_all_peers`
-    /// for the pending set so routes reach the peer after the suppression window closes.
+    /// Called every MRAI/2 by the event loop, which must call `flush_pending`
+    /// afterwards (propagation only buffers). Because a held-back announcement
+    /// never reached the peer's Adj-RIB-Out (see [`MraiTracker::gate`]), the
+    /// re-propagation diffs the current best route against what the peer
+    /// actually holds and so yields the announcement — RFC 4271 §9.2.1.1: "the
+    /// last route selected SHALL be advertised at the end of
+    /// MinRouteAdvertisementIntervalTimer".
     pub(crate) fn flush_mrai_pending(&mut self) {
         let now = Instant::now();
-        // Per-NLRI readiness check: only flush NLRIs whose individual MRAI window
-        // has elapsed. A bulk "max of all last_sent" check would incorrectly
-        // suppress a pending NLRI if any *other* (non-pending) NLRI was sent
-        // recently enough to make the max appear within the window.
-        let peers_with_pending: Vec<IpAddr> = self
-            .mrai_pending
-            .iter()
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(&p, _)| p)
-            .collect();
-
-        for peer_ip in peers_with_pending {
-            let Some(pending) = self.mrai_pending.get(&peer_ip) else {
-                continue;
-            };
-            let (ready, not_ready): (Vec<Nlri<Ipv4Addr>>, Vec<Nlri<Ipv4Addr>>) =
-                pending.iter().copied().partition(|nlri| {
-                    self.mrai_last_sent
-                        .get(&peer_ip)
-                        .and_then(|m| m.get(nlri))
-                        .is_none_or(|t| now.saturating_duration_since(*t) >= MRAI)
-                });
-
-            if ready.is_empty() {
-                continue;
-            }
-
-            // Replace pending with the still-suppressed NLRIs before propagating,
-            // so propagate_to_all_peers sees an accurate pending set.
-            if let Some(p) = self.mrai_pending.get_mut(&peer_ip) {
-                *p = not_ready.into_iter().collect();
-            }
+        let ready = self.mrai.take_ready(now);
+        if !ready.is_empty() {
             self.propagate_to_all_peers(&ready);
+        }
+        let ready_v6 = self.mrai_v6.take_ready(now);
+        if !ready_v6.is_empty() {
+            self.propagate_to_all_peers_v6(&ready_v6);
         }
     }
 
-    /// Returns `true` if any eBGP peer has NLRIs pending for MRAI flush.
+    /// Returns `true` if any eBGP peer has destinations held back by MRAI, in
+    /// either address family.
     ///
-    /// Used by the event loop to decide whether to schedule a wakeup timer.
+    /// Used by the event loop to decide whether to run `flush_mrai_pending`.
     pub(crate) fn has_mrai_pending(&self) -> bool {
-        self.mrai_pending.values().any(|s| !s.is_empty())
+        self.mrai.has_pending() || self.mrai_v6.has_pending()
     }
 
     /// Emits a `RouteEvent` for each NLRI in `affected` based on the current
@@ -653,6 +611,11 @@ impl DaemonState {
             let loc_rib_v6 = &self.rib.loc_rib_v6;
             let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
+            // RFC 4271 §9.2.1.1 is per destination, not per address family,
+            // and RFC 4760 does not exempt MP_REACH_NLRI: same eBGP gate as
+            // `propagate_to_all_peers`.
+            let mut mrai = (peer_type == PeerType::External).then_some(&mut self.mrai_v6);
+            let now = Instant::now();
             let decisions: Vec<PrefixDecisionV6> = nlris
                 .iter()
                 .map(|&nlri| {
@@ -670,18 +633,24 @@ impl DaemonState {
                             return PrefixDecisionV6::NoChange;
                         }
                     }
-                    propagate_prefix_v6(
-                        nlri,
-                        loc_rib_v6,
-                        adj_rib_out_v6,
-                        export_policy_v6,
-                        peer_type,
-                        local_as,
-                        public_as,
-                        local_ipv6,
-                        next_hop_self,
-                        v6_deferred,
-                    )
+                    let propagate = |adj: &mut AdjRibOut<Ipv6Addr>| {
+                        propagate_prefix_v6(
+                            nlri,
+                            loc_rib_v6,
+                            adj,
+                            export_policy_v6,
+                            peer_type,
+                            local_as,
+                            public_as,
+                            local_ipv6,
+                            next_hop_self,
+                            v6_deferred,
+                        )
+                    };
+                    match mrai.as_deref_mut() {
+                        Some(mrai) => mrai.gate(peer_ip, nlri, now, adj_rib_out_v6, propagate),
+                        None => propagate(adj_rib_out_v6),
+                    }
                 })
                 .collect();
             self.pending_decisions_v6
@@ -774,6 +743,176 @@ impl DaemonState {
                 )
             {
                 self.stalled_peers.push(peer_ip);
+            }
+        }
+    }
+}
+
+/// RFC 4271 §9.2.1.1 MinRouteAdvertisementIntervalTimer state for one address
+/// family, kept per eBGP peer and per destination.
+///
+/// > "Two UPDATE messages sent by a BGP speaker to a peer that advertise
+/// > feasible routes and/or withdrawal of unfeasible routes to some common
+/// > set of destinations MUST be separated by at least
+/// > MinRouteAdvertisementIntervalTimer. [...] If new routes are selected
+/// > multiple times while awaiting the expiration of
+/// > MinRouteAdvertisementIntervalTimer, the last route selected SHALL be
+/// > advertised at the end of MinRouteAdvertisementIntervalTimer."
+///
+/// Withdrawals are deliberately **not** held back (the RFC 1771 §9.2.3.1
+/// behaviour, which RFC 4271 dropped). Delaying a withdrawal keeps a
+/// blackholed path alive at the peer; see `pathvectord/RFC.md` §9.2.1.1.
+pub(crate) struct MraiTracker<A: IpAddress> {
+    /// When each destination was last announced to each peer.
+    last_sent: HashMap<IpAddr, HashMap<Nlri<A>, Instant>>,
+    /// Destinations whose announcement is being held back. A set, so several
+    /// selections inside one interval collapse to one release.
+    pending: HashMap<IpAddr, HashSet<Nlri<A>>>,
+}
+
+impl<A: IpAddress> MraiTracker<A> {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_sent: HashMap::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Runs `propagate` (one destination's Adj-RIB-Out diff for `peer`) under
+    /// the MRAI gate.
+    ///
+    /// An announcement inside the interval is held back: the Adj-RIB-Out is
+    /// restored to the route the peer actually has, the destination is marked
+    /// pending, and `NoChange` is returned. Restoring is what makes the later
+    /// release work: [`take_ready`](Self::take_ready) re-propagates the
+    /// destination, and the diff against the restored entry yields the
+    /// announcement. Committing the held-back route instead would make that
+    /// diff `NoChange` and strand the peer on a stale path.
+    ///
+    /// A withdrawal is passed through immediately and cancels any pending
+    /// announcement for the destination.
+    pub(crate) fn gate<D: OutboundDecision>(
+        &mut self,
+        peer: IpAddr,
+        nlri: Nlri<A>,
+        now: Instant,
+        adj_rib_out: &mut AdjRibOut<A>,
+        propagate: impl FnOnce(&mut AdjRibOut<A>) -> D,
+    ) -> D {
+        // Only a destination inside its interval can be held back, so only
+        // it needs a snapshot of what the peer currently holds.
+        let sent = self
+            .in_window(peer, &nlri, now)
+            .then(|| adj_rib_out.get(&nlri).cloned());
+        let decision = propagate(adj_rib_out);
+        match decision.kind() {
+            DecisionKind::Announce => {
+                if let Some(sent) = sent {
+                    match sent {
+                        // eBGP Adj-RIB-Out: `insert` always accepts, and its
+                        // confed-segment strip is idempotent on a stored route.
+                        Some(route) => {
+                            let _ = adj_rib_out.insert(route);
+                        }
+                        None => {
+                            let _ = adj_rib_out.withdraw(&nlri);
+                        }
+                    }
+                    self.pending.entry(peer).or_default().insert(nlri);
+                    D::NO_CHANGE
+                } else {
+                    self.last_sent.entry(peer).or_default().insert(nlri, now);
+                    self.cancel_pending(peer, &nlri);
+                    decision
+                }
+            }
+            DecisionKind::Withdraw => {
+                self.cancel_pending(peer, &nlri);
+                if let Some(m) = self.last_sent.get_mut(&peer) {
+                    m.remove(&nlri);
+                }
+                decision
+            }
+            DecisionKind::NoChange => decision,
+        }
+    }
+
+    /// `true` if `nlri` was announced to `peer` less than [`MRAI`] ago.
+    fn in_window(&self, peer: IpAddr, nlri: &Nlri<A>, now: Instant) -> bool {
+        self.last_sent
+            .get(&peer)
+            .and_then(|m| m.get(nlri))
+            .is_some_and(|t| now.saturating_duration_since(*t) < MRAI)
+    }
+
+    fn cancel_pending(&mut self, peer: IpAddr, nlri: &Nlri<A>) {
+        if let Some(p) = self.pending.get_mut(&peer) {
+            p.remove(nlri);
+        }
+    }
+
+    /// Removes and returns every pending destination whose interval has
+    /// elapsed for its peer, deduplicated across peers.
+    ///
+    /// Readiness is per (peer, destination): a destination announced recently
+    /// stays pending even if other destinations for the same peer are ready.
+    /// A destination still inside its interval for some other peer is safe
+    /// to re-propagate anyway — the gate holds it back again for that peer.
+    pub(crate) fn take_ready(&mut self, now: Instant) -> Vec<Nlri<A>> {
+        let mut ready = HashSet::new();
+        for (peer, pending) in &mut self.pending {
+            let last_sent = self.last_sent.get(peer);
+            pending.retain(|nlri| {
+                let elapsed = last_sent
+                    .and_then(|m| m.get(nlri))
+                    .is_none_or(|t| now.saturating_duration_since(*t) >= MRAI);
+                if elapsed {
+                    ready.insert(*nlri);
+                }
+                !elapsed
+            });
+        }
+        ready.into_iter().collect()
+    }
+
+    /// `true` if any peer has a held-back destination.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.values().any(|s| !s.is_empty())
+    }
+
+    /// Drops all state for `peer` (session down / peer removed).
+    pub(crate) fn remove_peer(&mut self, peer: IpAddr) {
+        self.last_sent.remove(&peer);
+        self.pending.remove(&peer);
+    }
+
+    /// Marks `nlri` as held back for `peer` without going through
+    /// [`gate`](Self::gate).
+    #[cfg(test)]
+    pub(crate) fn defer(&mut self, peer: IpAddr, nlri: Nlri<A>) {
+        self.pending.entry(peer).or_default().insert(nlri);
+    }
+
+    /// Sets the last-sent stamp of `nlri` for `peer`.
+    #[cfg(test)]
+    pub(crate) fn set_last_sent(&mut self, peer: IpAddr, nlri: Nlri<A>, at: Instant) {
+        self.last_sent.entry(peer).or_default().insert(nlri, at);
+    }
+
+    /// Forgets every last-sent stamp, so the next announcement of any
+    /// destination to any peer is outside its interval.
+    #[cfg(test)]
+    pub(crate) fn clear_last_sent(&mut self) {
+        self.last_sent.clear();
+    }
+
+    /// Moves every last-sent stamp for `peer` to `at` — lets tests expire the
+    /// interval without sleeping.
+    #[cfg(test)]
+    pub(crate) fn backdate_peer(&mut self, peer: IpAddr, at: Instant) {
+        if let Some(m) = self.last_sent.get_mut(&peer) {
+            for t in m.values_mut() {
+                *t = at;
             }
         }
     }

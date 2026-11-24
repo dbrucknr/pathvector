@@ -368,6 +368,50 @@ pub(crate) enum PrefixDecisionV6 {
     NoChange,
 }
 
+/// What a per-prefix outbound decision would put on the wire, independent of
+/// address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionKind {
+    Announce,
+    Withdraw,
+    NoChange,
+}
+
+/// Family-agnostic view of [`PrefixDecision`] / [`PrefixDecisionV6`], so the
+/// RFC 4271 §9.2.1.1 MRAI gate in `daemon/route.rs` is written once for both
+/// families.
+pub(crate) trait OutboundDecision {
+    /// The "send nothing" decision for this family.
+    const NO_CHANGE: Self;
+
+    /// Classifies this decision.
+    fn kind(&self) -> DecisionKind;
+}
+
+impl OutboundDecision for PrefixDecision {
+    const NO_CHANGE: Self = Self::NoChange;
+
+    fn kind(&self) -> DecisionKind {
+        match self {
+            Self::Announce(_) => DecisionKind::Announce,
+            Self::Withdraw(_) => DecisionKind::Withdraw,
+            Self::NoChange => DecisionKind::NoChange,
+        }
+    }
+}
+
+impl OutboundDecision for PrefixDecisionV6 {
+    const NO_CHANGE: Self = Self::NoChange;
+
+    fn kind(&self) -> DecisionKind {
+        match self {
+            Self::Announce(_) => DecisionKind::Announce,
+            Self::Withdraw(_) => DecisionKind::Withdraw,
+            Self::NoChange => DecisionKind::NoChange,
+        }
+    }
+}
+
 /// IPv6 equivalent of [`propagate_prefix`]: determines the outbound decision
 /// for one IPv6 NLRI for a single peer.
 ///
