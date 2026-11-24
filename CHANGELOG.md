@@ -4,6 +4,65 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-24 (pathvectord: authorize BLACKHOLE and re-import retained routes through one pipeline — issues #81, #82)
+
+Both issues share one root cause: the daemon had no single import classification path.
+`handle_update` looked for the BLACKHOLE community before import policy and programmed a
+kernel null route for any peer, whatever its import default; `reapply_import_policy` and
+Graceful Restart stale marking then treated the stored raw route as an ordinary unicast
+candidate. RFC 7999 §3.3 allows honoring BLACKHOLE only if "the announced prefix is covered
+by an equal or shorter prefix that the neighboring network is authorized to advertise" and
+"the receiving party agreed to honor the BLACKHOLE community on the particular BGP
+session", and requires that origin validation not "inadvertently block legitimate
+announcements carrying the BLACKHOLE community".
+
+- **New config: `blackhole_authorized_prefixes`** (per peer, list of IPv4/IPv6 prefixes).
+  Setting it is the agreement; the list is the authorized scope; omitted = **denied**
+  (RFC 7999 §4). Validated at parse time (`BlackholeScope`): non-empty, canonical prefixes.
+  **Behavior change:** a BLACKHOLE-tagged announcement from a peer with no setting is now
+  ignored (no null route, never unicast). Existing deployments that rely on BLACKHOLE must add
+  the setting. Peers added over gRPC have no agreement.
+- **One pipeline.** `ImportPipeline::classify_gated` (`daemon/import.rs`) turns a received
+  route into `Accepted` / `Blackhole(AuthorizedBlackhole)` / `Rejected` / `BlackholeDenied`;
+  UPDATE arrival, `set_import_default`, RPKI ROA-change re-evaluation and Graceful Restart
+  stale marking all use it, and `ImportDecision::apply` reconciles the Loc-RIB and the
+  blackhole book identically. `AuthorizedBlackhole` can only be minted by
+  `BlackholeAgreement::authorize` (`daemon/blackhole.rs`) and is the only thing
+  `BlackholeBook::claim` takes. Authorized requests are judged by the agreement *instead of* the
+  import policy, so ROV and `import_default = "reject"` cannot block them; an RFC 9234 leak is
+  still ineligible. A denied request is stored but never imported as unicast.
+- **Null-route ownership is recorded, not inferred.** `BlackholeBook` replaces the
+  `holds_blackhole` community scan: a null route is installed by the first peer to claim a
+  prefix and withdrawn by the last to release it, so a denied/dropped request can never delete
+  another peer's route and two peers share one. `program_effects` (`daemon/fib.rs`) is the one
+  place best-path and null-route changes become FIB port calls: a unicast change for a
+  blackholed prefix is not programmed over the null route, and the Loc-RIB best route is
+  restored when the blackhole goes.
+- **Graceful Restart (#82).** Stale marking marks the Adj-RIB-In in place
+  (`AdjRibIn::mark_all_stale` now returns the count, not raw clones) and re-imports through the
+  pipeline: rejected routes stay out, LOCAL_PREF / communities / next hop / ingress OTC survive,
+  authorized blackholes stay blackholes, and EOR / expiry sweeps release null routes. The
+  originally reported rejected-route and LOCAL_PREF repros had already been fixed on main by
+  #139/#140; they remain as pinned regression tests. Only the peer's own prefixes are
+  re-propagated, in address order.
+- **Also fixed:** an address family a GR peer did not advertise was cleared from the Adj-RIB-In
+  at unclean termination but its Loc-RIB entries, FIB routes and advertisements lingered until
+  the restart timer (`flush_family_v4/v6`).
+- **Performance** (`gr_stale_marking_cost`, 60 000 IPv4 routes × 2 candidates, release build,
+  Apple M2 Max): stale marking ~110 ms (~1.9 µs/route) vs ~130–145 ms before — one fewer
+  `Route` clone per route, a single `Arc::make_mut`, and propagation limited to the peer's
+  prefixes in address order (hash-order propagation was ~25 % slower).
+- **Tests:** `issue_81_82_tests.rs` (the reported defects through the real entry points; the
+  three BLACKHOLE ones fail on the pre-fix tree), `blackhole_tests.rs` (authorization, ROV
+  exception, leak, revocation, multi-peer, GR lifecycle, config → agreement, model property
+  tests: never unicast, book == authorized stored requests, fresh import == arrival, idempotent),
+  unit tests for `BlackholeScope`, `BlackholeAgreement`, `BlackholeBook`. e2e: BLACKHOLE tests
+  in `pathvector-e2e/tests/fib.rs` now configure the agreement and gain denied / out-of-scope /
+  IPv4 `/32` / IPv6 `/128` cases (Docker + Linux kernel; compiled, not run on macOS).
+- Docs: `pathvectord/RFC.md` (RFC 7999, RFC 4724), `RFC_AUDIT.md`, `pathvectord/README.md`.
+
+---
+
 ## 2026-11-24 (pathvector-session: malformed-UPDATE recovery goes through the FSM — issue #98)
 
 `handle_primary_message` handed a `BgpMessage::MalformedUpdate` straight to

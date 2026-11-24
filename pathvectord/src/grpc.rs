@@ -540,6 +540,7 @@ impl PeerService for PeerServiceImpl {
             // configured as confederation members until the proto surface
             // is extended.
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
 
         // Reject the add if the peer is currently being torn down.  The command
@@ -1448,6 +1449,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .collect();
         DaemonState::new(

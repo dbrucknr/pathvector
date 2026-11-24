@@ -43,6 +43,7 @@ use crate::outbound::{
 use crate::{config, fib as crate_fib, grpc, proto};
 use crate_fib::ApplyFibChange;
 
+mod blackhole;
 mod capabilities;
 mod deferral;
 mod fib;
@@ -66,6 +67,13 @@ mod peer;
 mod policy;
 mod route;
 
+// Issues #81 and #82: BLACKHOLE authorization and import eligibility through
+// Graceful Restart.
+#[cfg(test)]
+mod blackhole_tests;
+#[cfg(test)]
+mod issue_81_82_tests;
+
 // Issue #68: conventional-GR stale routes keep their ordinary preference.
 #[cfg(test)]
 mod gr_preference_tests;
@@ -76,6 +84,7 @@ mod rr_tie_break_tests;
 
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
+use blackhole::{BlackholeBook, BlackholeBooks, BlackholeChange, PeerBlackhole};
 use capabilities::{
     Md5Keys, SpawnConfig, build_local_capabilities, remove_listener_key, session_tcp_md5,
     set_listener_key, warn_if_md5_best_effort,
@@ -83,8 +92,11 @@ use capabilities::{
 use deferral::SelectionDeferral;
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
+#[cfg(test)]
+use import::reapply_without_blackholes;
 use import::{
-    ImportDecision, ImportTally, import_announcement, import_ineligible, reapply_import_policy,
+    ImportPipeline, ImportTally, RibEffects, import_announcement, import_ineligible,
+    reapply_import_policy, retire_routes, withdraw_route,
 };
 use ingress::{Disposition, IngressDrop, IngressGate};
 use peer::{run_bgp_listener, run_command_processor};
@@ -453,6 +465,13 @@ pub(crate) struct DaemonState {
     /// Cheap to clone (Arc-backed); gRPC handlers clone it per-request like
     /// `fib_manager`.
     pub(crate) rpki: Option<pathvector_rpki::RtrHandle>,
+    /// RFC 7999 §3.3: each session's BLACKHOLE agreement and authorized prefix
+    /// scope. A peer without an entry, or whose entry is denied (the default),
+    /// has every BLACKHOLE-tagged announcement refused with no FIB effect.
+    pub(crate) blackhole_sessions: HashMap<IpAddr, PeerBlackhole>,
+    /// RFC 7999: which peers hold an authorized blackhole for which prefix —
+    /// the single record of the kernel null routes this daemon asked for.
+    pub(crate) blackholes: BlackholeBooks,
     /// Next-hop oracle consulted on every IPv4 best-path recompute (RFC 4271 §9.1
     /// steps 1 & 8). Defaults to `AlwaysReachable`; replaced with `DaemonOracle`
     /// once `KernelFib` is initialised at startup.
@@ -492,6 +511,16 @@ impl DaemonState {
         let peer_roles: HashMap<IpAddr, Role> = peers
             .iter()
             .filter_map(|p| effective_role(p, local_as).map(|r| (p.address, r)))
+            .collect();
+
+        let blackhole_sessions: HashMap<IpAddr, PeerBlackhole> = peers
+            .iter()
+            .map(|p| {
+                (
+                    p.address,
+                    peer_blackhole(p, peer_roles.get(&p.address).copied()),
+                )
+            })
             .collect();
 
         let import_policies = peers
@@ -686,6 +715,8 @@ impl DaemonState {
             peer_tx,
             fib_manager: None,
             rpki: None,
+            blackhole_sessions,
+            blackholes: BlackholeBooks::default(),
             oracle_v4: Arc::new(AlwaysReachable),
             oracle_v6: Arc::new(AlwaysReachable),
         }
@@ -777,6 +808,16 @@ fn effective_confederation_member(
         return false;
     }
     true
+}
+
+/// The BLACKHOLE agreement a peer's configuration describes (RFC 7999 §3.3):
+/// denied unless `blackhole_authorized_prefixes` is set. A session with an
+/// RFC 9234 role keeps leak detection in force for blackhole requests.
+fn peer_blackhole(peer: &config::PeerConfig, role: Option<Role>) -> PeerBlackhole {
+    PeerBlackhole::from_config(
+        peer.blackhole_authorized_prefixes.as_ref(),
+        role.map(|r| (r, Asn::new(peer.remote_as))),
+    )
 }
 
 /// RFC 9234 §5 ingress terms for a peer configured with `session_role`.
@@ -1864,6 +1905,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -2093,6 +2135,7 @@ mod tests {
             max_prefixes_restart: None,
             role,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
@@ -2160,6 +2203,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -2497,6 +2541,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(peer_ip, tx);
@@ -2580,6 +2625,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let mut state = DaemonState::new(
             65001,
@@ -3486,6 +3532,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: Some(role),
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -4079,6 +4126,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             mpsc::channel(64).0,
         );
@@ -4291,6 +4339,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             mpsc::channel(64).0,
         );
@@ -4913,7 +4962,7 @@ mod tests {
         ari.insert(route_v4("198.51.100.0/24"));
         let mut rib = LocRib::new();
         let snap = capture(|| {
-            let _ = reapply_import_policy(
+            let _ = reapply_without_blackholes(
                 peer(),
                 &ari,
                 &mut rib,
@@ -4935,7 +4984,7 @@ mod tests {
         ari.insert(route_v6("2001:db8::/32"));
         let mut rib: LocRib<Ipv6Addr> = LocRib::new();
         let snap = capture(|| {
-            let _ = reapply_import_policy(
+            let _ = reapply_without_blackholes(
                 peer(),
                 &ari,
                 &mut rib,
@@ -4951,6 +5000,16 @@ mod tests {
     }
 
     // ── RFC 7999 blackhole FIB integration ───────────────────────────────────
+
+    /// RFC 7999 §3.3: the operator agrees to honor BLACKHOLE on `peer`'s
+    /// session for the prefixes the tests below announce. Without this a
+    /// BLACKHOLE-tagged announcement is denied (the default).
+    fn agree_blackholes(state: &mut DaemonState, peer: IpAddr) {
+        state.set_blackhole_scope(
+            peer,
+            Some(&crate::blackhole::BlackholeScope::new(["10.0.0.0/8", "192.0.0.0/8"]).unwrap()),
+        );
+    }
 
     fn blackhole_announce(prefix: &str) -> UpdateMessage {
         UpdateMessage {
@@ -5003,6 +5062,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
 
@@ -5033,6 +5093,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
 
@@ -5062,6 +5123,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
         fib.blackhole_v4.lock().unwrap().clear();
@@ -5097,6 +5159,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
         fib.blackhole_v4.lock().unwrap().clear();
@@ -5130,6 +5193,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         // First announce as unicast — enters LocRib.
         state.on_route_update(
@@ -5190,6 +5254,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         // Install a BLACKHOLE kernel null route.
         state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.2.0/24"));
@@ -5241,6 +5306,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer));
 
         // Peer announces an IPv4 BLACKHOLE prefix.
         state.on_route_update(IpAddr::V4(peer), blackhole_announce("192.0.5.0/24"));
@@ -5295,6 +5361,7 @@ mod tests {
             None,
         );
         state.set_import_default(IpAddr::V4(peer_a), DefaultAction::Accept);
+        agree_blackholes(&mut state, IpAddr::V4(peer_a));
         state.set_import_default(IpAddr::V4(peer_b), DefaultAction::Accept);
 
         // Peer B announces a unicast route for the prefix.
@@ -5781,6 +5848,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -5832,6 +5900,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let state = DaemonState::new(
             65001,
@@ -6526,7 +6595,7 @@ mod tests {
         );
         assert!(rib.is_empty());
 
-        reapply_import_policy(
+        reapply_without_blackholes(
             peer(),
             &ari,
             &mut rib,
@@ -6558,7 +6627,7 @@ mod tests {
         );
         assert!(rib.best(&nlri("10.0.0.0/8")).is_some());
 
-        reapply_import_policy(
+        reapply_without_blackholes(
             peer(),
             &ari,
             &mut rib,
@@ -6598,7 +6667,7 @@ mod tests {
                 .then(Accept),
         ));
 
-        reapply_import_policy(
+        reapply_without_blackholes(
             peer(),
             &ari,
             &mut rib,
@@ -6655,7 +6724,7 @@ mod tests {
         let mut new_policy: Policy<Route<Ipv4Addr>> = Policy::new(DefaultAction::Accept);
         new_policy.add_term(Term::new(CommunityCondition::new(blocked), Reject));
 
-        reapply_import_policy(
+        reapply_without_blackholes(
             peer(),
             &ari,
             &mut rib,
@@ -6712,7 +6781,7 @@ mod tests {
         );
         assert!(rib_v6.is_empty(), "route rejected by initial policy");
 
-        reapply_import_policy(
+        reapply_without_blackholes(
             peer(),
             &ari_v6,
             &mut rib_v6,
@@ -6763,7 +6832,7 @@ mod tests {
         );
         assert!(rib_v6.best(&nlri_v6("2001:db8::/32")).is_some());
 
-        reapply_import_policy(
+        reapply_without_blackholes(
             peer(),
             &ari_v6,
             &mut rib_v6,
@@ -10151,6 +10220,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .chain(non_clients.iter().map(|&address| config::PeerConfig {
                 address: IpAddr::V4(address),
@@ -10170,6 +10240,7 @@ mod tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             }))
             .collect();
         let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
@@ -11120,6 +11191,7 @@ mod tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         let (tx, _rx) = mpsc::channel(64);
         state.add_peer(&new_peer, tx);
@@ -11188,6 +11260,7 @@ mod stall_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .collect();
         let state = DaemonState::new(
@@ -11293,6 +11366,7 @@ mod stall_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             config::PeerConfig {
                 import_default_v6: None,
@@ -11312,6 +11386,7 @@ mod stall_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -11470,6 +11545,7 @@ mod stall_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -11489,6 +11565,7 @@ mod stall_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -12010,6 +12087,7 @@ mod coalescing_tests {
                     max_prefixes_restart: None,
                     role: None,
                     confederation_member: false,
+                    blackhole_authorized_prefixes: None,
                 }
             })
             .collect();
@@ -12394,6 +12472,7 @@ mod coalescing_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -12413,6 +12492,7 @@ mod coalescing_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -12587,6 +12667,7 @@ mod coalescing_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -12606,6 +12687,7 @@ mod coalescing_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -12868,6 +12950,7 @@ mod event_loop_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .collect();
 
@@ -13027,6 +13110,7 @@ mod event_loop_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             config::PeerConfig {
                 address: IpAddr::V4(peer_b),
@@ -13046,6 +13130,7 @@ mod event_loop_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
         ];
         let mut update_senders = HashMap::new();
@@ -13276,6 +13361,7 @@ mod event_loop_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
@@ -13842,6 +13928,7 @@ mod event_loop_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         let state = Arc::new(RwLock::new(DaemonState::new(
             65001,
@@ -14067,6 +14154,7 @@ mod event_loop_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         assert_eq!(
             peer_cfg_with_override.hold_time.unwrap_or(global_hold_time),
@@ -14172,6 +14260,7 @@ mod event_loop_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
 
         cmd_tx.send(DaemonCommand::AddPeer(peer_cfg)).await.unwrap();
@@ -14739,6 +14828,7 @@ mod dynamic_peer_prop_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
@@ -14928,6 +15018,7 @@ mod rib_consistency_prop_tests {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
@@ -15371,6 +15462,7 @@ mod run_with_tests {
                     max_prefixes_restart: None,
                     role: None,
                     confederation_member: false,
+                    blackhole_authorized_prefixes: None,
                 })
                 .collect(),
             sidecar_path: None,
@@ -16114,6 +16206,7 @@ mod run_with_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .await;
 
@@ -16170,6 +16263,7 @@ mod run_with_tests {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .await;
 
@@ -17018,6 +17112,7 @@ mod test_gr_phase2 {
                     max_prefixes_restart: None,
                     role: None,
                     confederation_member: false,
+                    blackhole_authorized_prefixes: None,
                 }
             })
             .collect();
@@ -18899,6 +18994,7 @@ mod test_ipv6_peer_identity {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             })
             .collect();
         let state = DaemonState::new(
@@ -19003,6 +19099,7 @@ mod test_ipv6_peer_identity {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
             config::PeerConfig {
                 address: peer_v6,
@@ -19022,6 +19119,7 @@ mod test_ipv6_peer_identity {
                 max_prefixes_restart: None,
                 role: None,
                 confederation_member: false,
+                blackhole_authorized_prefixes: None,
             },
         ];
         let mut senders = HashMap::new();
@@ -19194,6 +19292,7 @@ mod test_rfc8538 {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         // Build local capabilities with GR time 120 and N-bit set, matching a
         // realistic pathvectord deployment that participates in RFC 8538.
@@ -19496,6 +19595,7 @@ mod test_rfc8538 {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         // Local daemon has graceful_restart_time = 0 → no N-bit advertised.
         let mut state = DaemonState::new(
@@ -19609,6 +19709,7 @@ mod test_max_prefix {
             },
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(IpAddr::V4(PEER_IP), tx);
@@ -19755,6 +19856,7 @@ mod test_max_prefix {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }];
         let mut senders = HashMap::new();
         senders.insert(IpAddr::V4(PEER_IP), tx);
@@ -19801,6 +19903,7 @@ mod test_max_prefix {
             max_prefixes_restart: Some(30),
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         let mut state = DaemonState::new(
             LOCAL_AS,
@@ -19942,6 +20045,7 @@ mod test_max_prefix {
             },
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         let mut senders = HashMap::new();
         senders.insert(peer_ip, update_tx);
@@ -20361,6 +20465,7 @@ mod test_max_prefix {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         }
     }
 
@@ -20499,6 +20604,7 @@ mod test_max_prefix {
             max_prefixes_restart: None,
             role: None,
             confederation_member: false,
+            blackhole_authorized_prefixes: None,
         };
         let mut state = DaemonState::new(
             LOCAL_AS,

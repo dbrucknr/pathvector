@@ -2424,17 +2424,17 @@ priority.
 
 **1. `mark_stale_and_repropagate` performance at full-table scale**
 
-When a GR-capable peer disconnects, `mark_stale_and_repropagate` iterates every
-NLRI from that peer and calls `rib_mut()` in a loop (repeated `Arc::make_mut`).
-For the DDoS blackhole use case (tens of prefixes, handful of peers) this is
-negligible. For a full-table iBGP peer (~800k prefixes) this loop would be
-noticeable — potentially hundreds of milliseconds under the write lock, causing
-hold-timer pressure on other peers.
+Updated 2026-11-24 (issues #81/#82): stale marking now marks the Adj-RIB-In in place, re-imports
+through `reapply_import_policy` (one `Route` clone per route, one `Arc::make_mut` for the whole
+pass) and re-propagates only the peer's own prefixes in address order. Measured by the ignored
+`gr_stale_marking_cost` test: ~110 ms for 60 000 IPv4 routes (release, M2 Max), ~1.9 µs/route,
+about 15–25 % faster than before. It still runs under the DaemonState write lock, so a
+full-table iBGP peer (~800k prefixes) would hold it for on the order of 1.5 s.
 
-The right fix if full-table peers are ever needed: replace eager `Arc::make_mut`
-marking with a generation-counter or stale-epoch approach — routes are considered
-stale if their epoch < the current GR epoch for that peer, computed lazily at
-best-path selection time rather than eagerly on disconnect.
+The right fix if full-table peers are ever needed: replace eager marking with a
+generation-counter or stale-epoch approach — routes are considered stale if their epoch < the
+current GR epoch for that peer, computed lazily at best-path selection time rather than eagerly
+on disconnect — and chunk the re-import so the lock is released between batches.
 
 **2. EOR-prune e2e test timing margin**
 
@@ -2477,6 +2477,21 @@ CHANGELOG.md. Added a v6 re-propagation loop mirroring
 export-policy-aware, gated on `ipv6_capable_peers`.
 
 ### Remaining
+
+**RFC 7999 BLACKHOLE follow-ups (from issues #81/#82, 2026-11-24)**
+
+- *Runtime reload / gRPC.* The agreement (`blackhole_authorized_prefixes`) is fixed when a peer is
+  added; `AddPeer` over gRPC has no field for it, and there is no config reload. Revocation is
+  tested at the daemon level (`DaemonState::set_blackhole_scope`, test-only) but has no e2e.
+- *Derived scope.* The authorized scope is a static list. §6 recommends "strict filtering (see
+  Section 6.2.1.1.2 of [RFC7454])"; deriving it from IRR / RPKI-ASPA-style data is future work.
+- *e2e gaps.* No Linux e2e yet for a GR lifecycle with blackholes or for a competing unicast
+  route when the last blackhole is withdrawn (unit-tested against `RecordingFib` only).
+- *RFC 7999 §3.2 SHOULD NO_EXPORT/NO_ADVERTISE:* moot while a blackhole is never exported; revisit
+  if blackholes are ever redistributed to iBGP peers as routes.
+- *RFC 8538 §4.1 consecutive restarts:* with the N-bit exchanged, a route "previously marked as
+  stale" must not be deleted on a consecutive restart. Stale marking here is idempotent
+  (re-marks everything retained) but there is no test pinning the N-bit case.
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
 

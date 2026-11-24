@@ -2070,9 +2070,40 @@ impl FibHarness {
     /// Panics if Docker is not running, either image is missing, or the BGP
     /// session does not reach `Established` within 30 seconds.
     pub async fn new() -> Self {
+        Self::start(None, false).await
+    }
+
+    /// Like [`FibHarness::new`] but the GoBGP session has agreed to honor the
+    /// RFC 7999 BLACKHOLE community for `authorized_prefixes`
+    /// (`blackhole_authorized_prefixes` in the peer's config). Without that
+    /// agreement — the default of every other harness — pathvectord ignores
+    /// BLACKHOLE announcements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing, or the BGP
+    /// session does not reach `Established` within 30 seconds.
+    pub async fn new_with_blackhole(authorized_prefixes: &[&str]) -> Self {
+        Self::start(Some(authorized_prefixes), false).await
+    }
+
+    /// [`FibHarness::new_with_blackhole`] plus the metrics port of
+    /// [`FibHarness::new_with_metrics`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if Docker is not running, either image is missing, or the BGP
+    /// session does not reach `Established` within 30 seconds.
+    pub async fn new_with_metrics_and_blackhole(authorized_prefixes: &[&str]) -> Self {
+        Self::start(Some(authorized_prefixes), true).await
+    }
+
+    async fn start(blackhole: Option<&[&str]>, metrics: bool) -> Self {
         let test_id = alloc_test_id();
         let grpc_host_port = alloc_grpc_port();
-        let network_name = format!("pathvector-fib-test-{test_id}");
+        let metrics_host_port = metrics.then(alloc_metrics_port);
+        let tag = if metrics { "fib-metrics" } else { "fib" };
+        let network_name = format!("pathvector-{tag}-test-{test_id}");
 
         let subnet = fib_test_subnet(test_id);
         let gobgp_ip_str = fib_gobgp_ip(test_id);
@@ -2085,11 +2116,29 @@ impl FibHarness {
         let gobgpd_config = write_gobgp_config();
         let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
 
-        let pathvectord_config = write_daemon_config(&[(gobgp_ip, 65001)]);
+        let mut pathvectord_config = if metrics {
+            write_daemon_config_with_metrics(&[(gobgp_ip, 65001)])
+        } else {
+            write_daemon_config(&[(gobgp_ip, 65001)])
+        };
+        if let Some(prefixes) = blackhole {
+            // The writers above end inside the one `[[peers]]` table, so a
+            // trailing key belongs to it.
+            let list = prefixes
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                pathvectord_config,
+                "blackhole_authorized_prefixes = [{list}]"
+            )
+            .expect("write blackhole_authorized_prefixes");
+        }
         let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
 
         let gobgpd = docker_start(
-            &format!("gobgpd-fib-{test_id}"),
+            &format!("gobgpd-{tag}-{test_id}"),
             GOBGPD_IMAGE,
             &network_name,
             Some(&gobgp_ip_str),
@@ -2103,17 +2152,31 @@ impl FibHarness {
         wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
 
         // CAP_NET_ADMIN is required for FibWriter to issue RTM_NEWROUTE via netlink.
-        let pathvectord = docker_start(
-            &format!("pathvectord-fib-{test_id}"),
-            PATHVECTORD_IMAGE,
-            &network_name,
-            Some(&pathvectord_ip_str),
-            true,
-            &pathvectord_config_path,
-            "/etc/pathvectord.toml",
-            Some(grpc_host_port),
-            Some("/etc/pathvectord.toml"),
-        );
+        let pathvectord = if let Some(metrics_host_port) = metrics_host_port {
+            docker_start_with_net_admin_and_metrics(
+                &format!("pathvectord-{tag}-{test_id}"),
+                PATHVECTORD_IMAGE,
+                &network_name,
+                &pathvectord_ip_str,
+                &pathvectord_config_path,
+                "/etc/pathvectord.toml",
+                grpc_host_port,
+                metrics_host_port,
+                "/etc/pathvectord.toml",
+            )
+        } else {
+            docker_start(
+                &format!("pathvectord-{tag}-{test_id}"),
+                PATHVECTORD_IMAGE,
+                &network_name,
+                Some(&pathvectord_ip_str),
+                true,
+                &pathvectord_config_path,
+                "/etc/pathvectord.toml",
+                Some(grpc_host_port),
+                Some("/etc/pathvectord.toml"),
+            )
+        };
 
         let gobgpd_id = gobgpd.0.clone();
         let pathvectord_id = pathvectord.0.clone();
@@ -2134,7 +2197,7 @@ impl FibHarness {
             gobgpd_id,
             pathvectord_id,
             gobgp_ip,
-            metrics_host_port: None,
+            metrics_host_port,
             _network: network,
         }
     }
@@ -2152,74 +2215,7 @@ impl FibHarness {
     /// Panics if Docker is not running, either image is missing, or the BGP
     /// session does not reach `Established` within 30 seconds.
     pub async fn new_with_metrics() -> Self {
-        let test_id = alloc_test_id();
-        let grpc_host_port = alloc_grpc_port();
-        let metrics_host_port = alloc_metrics_port();
-        let network_name = format!("pathvector-fib-metrics-test-{test_id}");
-
-        let subnet = fib_test_subnet(test_id);
-        let gobgp_ip_str = fib_gobgp_ip(test_id);
-        let pathvectord_ip_str = fib_pathvectord_ip(test_id);
-
-        let network = DockerNetwork::create_with_subnet(network_name.clone(), &subnet);
-
-        let gobgp_ip: Ipv4Addr = gobgp_ip_str.parse().unwrap();
-
-        let gobgpd_config = write_gobgp_config();
-        let gobgpd_config_path = gobgpd_config.path().to_str().unwrap().to_owned();
-
-        let pathvectord_config = write_daemon_config_with_metrics(&[(gobgp_ip, 65001)]);
-        let pathvectord_config_path = pathvectord_config.path().to_str().unwrap().to_owned();
-
-        let gobgpd = docker_start(
-            &format!("gobgpd-fib-metrics-{test_id}"),
-            GOBGPD_IMAGE,
-            &network_name,
-            Some(&gobgp_ip_str),
-            false,
-            &gobgpd_config_path,
-            "/etc/gobgp/gobgpd.conf",
-            None,
-            None,
-        );
-
-        wait_container_healthy(&gobgpd.0, Duration::from_secs(30));
-
-        // CAP_NET_ADMIN is required for FibWriter to issue RTM_NEWROUTE via netlink.
-        let pathvectord = docker_start_with_net_admin_and_metrics(
-            &format!("pathvectord-fib-metrics-{test_id}"),
-            PATHVECTORD_IMAGE,
-            &network_name,
-            &pathvectord_ip_str,
-            &pathvectord_config_path,
-            "/etc/pathvectord.toml",
-            grpc_host_port,
-            metrics_host_port,
-            "/etc/pathvectord.toml",
-        );
-
-        let gobgpd_id = gobgpd.0.clone();
-        let pathvectord_id = pathvectord.0.clone();
-
-        let mut client = PathvectorClient::connect(format!("http://127.0.0.1:{grpc_host_port}"))
-            .expect("connect PathvectorClient for FibHarness (metrics)");
-
-        wait_for_established(&mut client, gobgp_ip, Duration::from_secs(30))
-            .await
-            .expect("BGP session did not reach Established within 30 s");
-
-        Self {
-            _gobgpd: gobgpd,
-            _pathvectord: pathvectord,
-            _gobgpd_config: gobgpd_config,
-            _pathvectord_config: pathvectord_config,
-            client,
-            gobgpd_id,
-            pathvectord_id,
-            gobgp_ip,
-            metrics_host_port: Some(metrics_host_port),
-            _network: network,
-        }
+        Self::start(None, true).await
     }
 
     /// Announce a prefix from GoBGP into pathvectord's RIB.
@@ -2250,6 +2246,57 @@ impl FibHarness {
             .status()
             .expect("docker exec gobgp withdraw");
         assert!(status.success(), "gobgp withdraw {prefix} failed: {status}");
+    }
+
+    /// Withdraw an IPv6 prefix from GoBGP's RIB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_withdraw_v6(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args(["gobgp", "global", "rib", "-a", "ipv6", "del", prefix])
+            .status()
+            .expect("docker exec gobgp withdraw v6");
+        assert!(
+            status.success(),
+            "gobgp withdraw v6 {prefix} failed: {status}"
+        );
+    }
+
+    /// Announce an IPv6 prefix tagged with the BLACKHOLE community (65535:666,
+    /// RFC 7999) from GoBGP, so pathvectord receives it in an MP_REACH_NLRI.
+    /// The next hop is the unspecified-free documentation address
+    /// `2001:db8::1` (a blackhole's next hop is never used).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `docker exec gobgp` fails or returns a non-zero exit status.
+    pub fn gobgp_announce_blackhole_v6(&self, prefix: &str) {
+        let status = Command::new("docker")
+            .args(["exec", &self.gobgpd_id])
+            .args([
+                "gobgp",
+                "global",
+                "rib",
+                "-a",
+                "ipv6",
+                "add",
+                prefix,
+                "nexthop",
+                "2001:db8::1",
+                "origin",
+                "igp",
+                "community",
+                "65535:666",
+            ])
+            .status()
+            .expect("docker exec gobgp announce blackhole v6");
+        assert!(
+            status.success(),
+            "gobgp announce blackhole v6 {prefix} failed: {status}"
+        );
     }
 
     /// Announce a prefix tagged with the BLACKHOLE community (65535:666,
@@ -3034,6 +3081,120 @@ pub async fn wait_for_kernel_blackhole_route(
                 return Ok(());
             }
         }
+    }
+}
+
+/// `ip route show table 254 proto bgp` (or `ip -6 route …`) inside
+/// `container_id`, as text — the kernel's view of the BGP-installed routes.
+fn kernel_bgp_routes(container_id: &str, ipv6: bool) -> String {
+    let mut args = vec!["exec", container_id, "ip"];
+    if ipv6 {
+        args.push("-6");
+    }
+    args.extend(["route", "show", "table", "254", "proto", "bgp"]);
+    Command::new("docker").args(args).output().map_or_else(
+        |e| format!("<ip route failed: {e}>"),
+        |o| String::from_utf8_lossy(&o.stdout).into_owned(),
+    )
+}
+
+/// How `ip route` renders `prefix`: host routes (`/32`, `/128`) are printed
+/// without the length.
+fn kernel_route_needle(prefix: &str) -> &str {
+    prefix
+        .strip_suffix("/32")
+        .or_else(|| prefix.strip_suffix("/128"))
+        .unwrap_or(prefix)
+}
+
+/// Waits until the kernel shows `prefix` (IPv4, or IPv6 when `ipv6`) as an
+/// `RTN_BLACKHOLE` route installed by BGP. `ip` renders it
+/// `blackhole <prefix> … proto bgp`; host routes lose their `/32` / `/128`.
+///
+/// # Errors
+///
+/// Returns the kernel table when `timeout` expires first.
+pub async fn wait_for_kernel_blackhole_route_family(
+    container_id: &str,
+    prefix: &str,
+    ipv6: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let needle = kernel_route_needle(prefix);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let text = kernel_bgp_routes(container_id, ipv6);
+        if text
+            .lines()
+            .any(|l| l.starts_with("blackhole") && l.contains(needle))
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for kernel blackhole route {prefix} in {container_id}\n\
+                 bgp routes:\n{text}"
+            ));
+        }
+    }
+}
+
+/// Waits until the kernel no longer shows any BGP-installed route for `prefix`.
+///
+/// # Errors
+///
+/// Returns the kernel table when `timeout` expires first.
+pub async fn wait_for_kernel_route_absent_family(
+    container_id: &str,
+    prefix: &str,
+    ipv6: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let needle = kernel_route_needle(prefix);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let text = kernel_bgp_routes(container_id, ipv6);
+        if !text.lines().any(|l| l.contains(needle)) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for kernel route {prefix} to disappear in {container_id}\n\
+                 bgp routes:\n{text}"
+            ));
+        }
+    }
+}
+
+/// Asserts that, for `settle` after the call, the kernel never shows a
+/// BGP-installed route for `prefix` — the negative counterpart of
+/// [`wait_for_kernel_blackhole_route_family`]. Callers order the check after an
+/// UPDATE they know was processed (e.g. a later, ordinary route appearing in
+/// the kernel) so "absent" cannot just mean "not yet".
+///
+/// # Panics
+///
+/// Panics, quoting the kernel table, if a route for `prefix` appears.
+pub async fn assert_no_kernel_route_family(
+    container_id: &str,
+    prefix: &str,
+    ipv6: bool,
+    settle: Duration,
+) {
+    let needle = kernel_route_needle(prefix);
+    let deadline = tokio::time::Instant::now() + settle;
+    loop {
+        let text = kernel_bgp_routes(container_id, ipv6);
+        assert!(
+            !text.lines().any(|l| l.contains(needle)),
+            "kernel route for {prefix} appeared in {container_id}:\n{text}"
+        );
+        if tokio::time::Instant::now() > deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
