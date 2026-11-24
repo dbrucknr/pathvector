@@ -316,14 +316,19 @@ The FSM restart behavior is deferred.
 | Key that cannot be enforced, with `Md5Enforcement::Required` (default): no connection attempt, `ErrorKind::Unsupported` (RFC 5925 §8: required MD5 "must be added to all outgoing segments and validated on all incoming segments"; issue #58) | `transport/tcp_md5.rs` `protect_socket` | ✅ | `required_key_that_cannot_be_enforced_is_an_error`, `required_but_unenforceable_never_connects` |
 | `Md5Enforcement::BestEffort` is an explicit opt-in; connects unauthenticated, logs a warning, returns `Md5Protection::Unenforced(reason)` | `transport/tcp_md5.rs` | ✅ | `best_effort_reports_unenforced_with_reason`, `best_effort_connects_when_unenforceable` |
 | `BestEffort` does not hide real `setsockopt` failures | `transport/tcp_md5.rs` | ✅ | `best_effort_does_not_hide_os_errors` |
-| `TCP_MD5SIG` key on BGP listener socket per configured peer | `pathvectord` `run_bgp_listener` | ❌ | Not applied yet — issue #66 |
+| `TCP_MD5SIG` key on the BGP listening socket for each configured peer, installed before `listen()` (RFC 5925 §8: required MD5 "validated on all incoming segments"; issue #66) | `transport/listener.rs` `BgpListener::bind`, `pathvectord` `run_bgp_listener` | ✅ | `key_configured_before_bind_is_installed_before_listen`, `static_key_admits_only_the_matching_key` (live, CI), `static_peer_inbound_requires_the_key` |
+| Keys added, rotated and removed on the live listening socket; after an add or rotation the socket is replaced, with every key installed before `listen()` | `transport/listener.rs` `ListenerKeys::{set_peer, remove_peer}`, `pathvectord` `run_command_processor` | ✅ | `dynamically_added_key_is_enforced`, `rotated_key_replaces_the_old_one`, `removed_key_is_no_longer_enforced` (live, CI), `key_change_replaces_the_socket_with_keys_installed_before_listen`, `add_peer_installs_listener_key_before_routing_inbound`, `remove_peer_removes_the_listener_key`, `dynamic_peer_inbound_requires_the_key_until_removed` |
+| A connection that completed before a key change carries no key (Linux copies the key at `tcp_v4_syn_recv_sock`); it is closed, not handed over. Barrier: the old socket is shut down (`tcp_disconnect` → `inet_csk_listen_stop`; a late `inet_csk_reqsk_queue_add` sees `sk_state != TCP_LISTEN`) | `transport/listener.rs` `BgpListener::{accept, replace_socket}` | ✅ | `connection_queued_before_a_new_key_is_rejected`, `rotation_installs_the_new_key_and_replaces_the_socket`, `connection_completed_before_a_dynamic_key_is_rejected` (live, CI) |
+| A connection screened before its peer's key was set (buffered while replacing the socket, or accepted just before `AddPeer`) is never used | `transport/listener.rs` `AuthStamp`, `ListenerKeys::is_current`; `pathvectord` `route_inbound` | ✅ | `buffered_connection_is_dropped_when_its_peer_gains_a_key`, `buffered_connection_is_dropped_when_its_peers_key_is_refused`, `accepted_connection_stops_being_current_when_its_peer_gains_a_key`, `connection_accepted_before_add_peer_is_not_routed_to_the_new_session` |
+| Listener key that cannot be enforced under `Required`, or any `setsockopt` failure: the peer's inbound connections are closed; `BestEffort` admits them unauthenticated with a warning | `transport/listener.rs` | ✅ | `required_key_that_cannot_be_enforced_rejects_the_peer`, `os_error_rejects_even_a_best_effort_peer`, `best_effort_key_that_cannot_be_enforced_admits_unauthenticated`, `required_key_on_a_host_without_md5_rejects_the_peer` (live), `add_peer_with_unenforceable_required_key_refuses_inbound` |
 | `md5_password` TOML field validated (1–80 bytes) and wired into `SessionConfig::tcp_md5` | `pathvectord` `config.rs`, `daemon/` | ✅ | `test_md5_password_empty_is_rejected`, `test_md5_password_over_80_bytes_is_rejected`, `build_daemon_md5_password_reaches_session_config` |
 
 **Platform note:** keys are only enforced on Linux kernels built with
 `CONFIG_TCP_MD5SIG`, for IPv4 peers. Elsewhere `pathvector-sys` reports
 `TcpMd5Error::Unsupported` and the session applies its `Md5Enforcement` policy.
 The kernel-level proof (matching keys connect; unsigned and wrong-key SYNs are
-dropped) is `pathvector-sys/tests/tcp_md5_loopback.rs`.
+dropped) is `pathvector-sys/tests/tcp_md5_loopback.rs` for the raw adapter and
+`pathvector-session/tests/listener_md5_loopback.rs` for `BgpListener`.
 
 ---
 

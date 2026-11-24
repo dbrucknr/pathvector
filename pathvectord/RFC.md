@@ -9,6 +9,42 @@ the workspace that ties all other crates together.
 
 ---
 
+## RFC 4271 §9 / §9.1.1 — Import (Phase 1) and Implicit Withdrawal
+
+**Owns:** `daemon/import.rs`: `ImportDecision`, `import_announcement` and
+`reapply_import_policy`, the one path (both address families) by which a received
+route goes through import policy into the Loc-RIB, on arrival and on re-evaluation.  
+**Boundary:** Policy evaluation lives in `pathvector-policy`; candidate storage and
+best-path selection (§9.1.2) live in `pathvector-rib`; FIB and outbound side effects stay
+with the caller (`DaemonState::on_route_update`, `reevaluate_import_for_peer`).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-9
+
+Clauses implemented (quoted from the RFC text):
+
+- §9: "if the NLRI of the new route is identical to the one the route currently has
+  stored in the Adj-RIB-In, then the new route SHALL replace the older route in the
+  Adj-RIB-In, thus implicitly withdrawing the older route from service."
+- §9.1: Phase 1 returns a preference or "a value denoting that this route is ineligible
+  to be installed in Loc-RIB and will be excluded from the next phase of route selection."
+- §9.1.2: "The Phase 2 process considers all routes that are eligible in the Adj-RIBs-In."
+- RFC 9234 §3/§5: a leaked route "MUST be considered ineligible", with RFC 4271's meaning.
+
+RFC 7606 does not apply: it revises error handling for *malformed* UPDATEs and does not
+mention policy. A policy rejection is a well-formed route found ineligible.
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| A replacement route replaces the peer's older route in Adj-RIB-In (pre-policy), whether or not policy accepts it, so later re-evaluation judges the latest advertisement | `src/daemon/import.rs` `import_announcement` | ✅ | `import_announcement_keeps_rejected_replacement_in_adj_rib_in`, `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6` |
+| A replacement that import policy rejects withdraws the peer's older Loc-RIB candidate; with no other candidate the FIB gets `Withdrawn` and peers get WITHDRAWN ROUTES / `MP_UNREACH_NLRI` (§9.2) | `src/daemon/import.rs` `ImportDecision::apply` | ✅ | `rejected_replacement_of_sole_best_withdraws_from_fib_and_peers_v4`/`_v6` (issue #80) |
+| …and another peer's eligible route takes over: FIB switches next hop, peers get a replacement, never a withdrawal | `src/daemon/import.rs` | ✅ | `rejected_replacement_promotes_other_peers_route_v4`/`_v6` |
+| …and a rejected replacement of a non-selected candidate removes it without FIB or peer churn | `src/daemon/import.rs` | ✅ | `rejected_replacement_of_losing_candidate_causes_no_churn_v4`/`_v6` |
+| An accepted replacement of a rejected route is installed and advertised | `src/daemon/import.rs` | ✅ | `accepted_replacement_of_rejected_route_is_installed_v4`/`_v6` |
+| The same holds for RFC 6811 ROV Invalid and RFC 9234 §5 OTC-leak replacements | `src/daemon/import.rs` | ✅ | `rov_invalid_replacement_withdraws_and_reevaluates_replacement_v4`/`_v6`, `otc_leak_replacement_withdraws_old_route_v4`/`_v6` |
+| Model: after any per-peer sequence of accepted/rejected announcements and withdrawals, Loc-RIB candidates == each peer's latest advertisement that passed policy; Adj-RIB-In == latest advertisement; re-evaluation agrees with initial import | `src/daemon/import_reject_tests.rs` | ✅ | `prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer` |
+| Replacements dropped *before* import policy also implicitly withdraw the older route | `src/daemon/route.rs` | ⚠️ | Open, outside #80: these paths `continue` before `import_announcement`, so the older route stays in Adj-RIB-In and Loc-RIB. AS_PATH loop: §9.1.2 says the route "should be excluded from the Phase 2 decision function", i.e. ineligible, which by the reasoning above should withdraw the older route. AS 0: RFC 7607 §2 delegates to RFC 7606 (treat-as-withdraw); tracked by #111. Semantically invalid NEXT_HOP: RFC 4271 §6.3 says "the route SHOULD be ignored" (RFC 7606 §7.3 only covers a wrong attribute length), and whether "ignored" keeps the older route is not settled here. |
+
+---
+
 ## RFC 4271 §9.2 — Update-Send Process
 
 **Owns:** `propagate_prefix`, `prepare_outbound`, and `flush_updates`: the pipeline that
@@ -144,7 +180,9 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
 | §4.2 IPv6 EOR triggers pruning of stale IPv6 NLRIs | `src/daemon.rs` | ✅ | `prune_stale_nlri_v6` + IPv6 EOR branch |
 | §4.2 MUST: GR window expiry without re-establishment flushes all stale routes | `src/daemon.rs` | ✅ | `gr_deadline_expiry_flushes_stale_routes` |
-| §4.2 SHOULD: stale route marking — retained routes de-preferred in best-path so a fresh peer wins immediately | `src/daemon.rs`, `pathvector-rib/src/best_path.rs`, `pathvector-rib/src/adj_rib_in.rs` | ✅ | `stale_marking_lets_fresh_peer_win_immediately`, `stale_loses_to_non_stale_before_all_other_criteria` |
+| §4.2 MUST: retained routes marked stale (`Staleness::GrStale`) — **and stale routes keep their ordinary preference** ("MUST NOT differentiate between stale and other routing information during forwarding"; RFC 9494 §1: "in conventional GR, route preference is not affected") | `src/daemon/gr.rs`, `pathvector-rib/src/adj_rib_in.rs`, `pathvector-rib/src/best_path.rs` | ✅ | `daemon::gr_preference_tests::conventional_gr_keeps_stale_higher_local_pref_route_selected`, `stale_marking_keeps_equally_preferred_route_selected`, `pathvector-rib` `best_path::tests::conventional_gr_*` + `prop_conventional_gr_staleness_never_changes_the_winner`. **Corrected 2026-11-23 (issue #68):** this row previously read "SHOULD: retained routes de-preferred in best-path so a fresh peer wins immediately", backed by tests asserting that a stale LOCAL_PREF-300 route lost to a fresh LOCAL_PREF-100 one. RFC 4724 has no such SHOULD; de-preferencing is RFC 9494 (LLGR) behavior, which is not implemented. |
+| §4.2 + RFC 9494 §1: marking routes stale sends no UPDATE (conventional GR resolves the trade-off "in favor of not advertising"); staleness is never part of the advertised route | `pathvector-rib/src/outbound.rs` (`prepare_outbound{,_v6}` reset staleness) | ✅ | `daemon::gr_preference_tests::{conventional_gr_stale_marking_does_not_readvertise_when_an_alternative_exists, stale_marking_of_sole_route_sends_no_duplicate_update, stale_marking_of_sole_v6_route_sends_no_duplicate_update}`, `stale_mark_sends_no_update_to_established_observer`, `outbound::tests::test_prepare_outbound_never_carries_staleness`. Before issue #68, marking a selected route stale re-sent an identical UPDATE for it to every peer. |
+| §4.2 MUST: re-announcement replaces the stale route; End-of-RIB removes the rest; Restart Time expiry falls back to the fresh alternative | `src/daemon/route.rs`, `src/daemon/gr.rs` | ✅ | `daemon::gr_preference_tests::{reannouncement_replaces_stale_route_and_end_of_rib_removes_the_rest, restart_time_expiry_falls_back_to_the_fresh_alternative}` |
 | e2e: unclean disconnect holds routes; window expiry flushes them | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry` |
 | e2e: clean disconnect (NOTIFICATION) flushes routes immediately, no GR window | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_clean_disconnect_flushes_routes_immediately` |
 | e2e: peer restart with partial RIB — un-refreshed routes pruned on EOR | `pathvector-e2e/tests/graceful_restart_phase2.rs` | ✅ | `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` |
@@ -326,6 +364,9 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | Non-client iBGP → clients: reflect with correct RR attributes | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_route_reflected_to_client`, `test_rr_non_client_ibgp_to_client_injects_rr_attrs` |
 | Non-client iBGP → non-client iBGP: blocked (standard split-horizon) | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_to_non_client_ibgp_still_blocked` |
 | ORIGINATOR_ID + CLUSTER_LIST included in outbound UPDATE attributes | `src/outbound.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
+| ORIGINATOR_ID + CLUSTER_LIST stored on ingested routes as received, IPv4 **and IPv6** (the IPv6 path used to drop both, so reflected IPv6 routes left this RR without them) | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ipv6_reflected_routes_store_rr_attributes_and_select_by_originator_id, ipv6_route_reflected_to_another_client_carries_originator_id_and_cluster_list}` |
+| §9 tie-breakers (ORIGINATOR_ID for step (f), then shorter CLUSTER_LIST before peer address) applied to ingested routes | `src/daemon/route.rs` → `pathvector-rib` `best_path` | ✅ | `rr_tie_break_tests::{reflected_routes_are_selected_by_originator_id_not_reflector_id, shorter_cluster_list_is_selected_before_peer_address}` |
+| RFC 7606 §7.9 / §7.10: ORIGINATOR_ID / CLUSTER_LIST "received from an external neighbor ... SHALL be discarded using the approach of 'attribute discard'". Kept only from `Internal` peers. A `ConfedMember` peer is in "a different Autonomous System" (RFC 4271) and RFC 5065 grants no exception for these attributes, which matches the outbound stripping toward `ConfedMember` | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ebgp_originator_id_and_cluster_list_are_discarded, confed_member_originator_id_and_cluster_list_are_discarded}` |
 | adj_ribs_out_v6 uses reflecting mode for all iBGP peers when acting as RR | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_is_reflecting_for_ibgp_peer` |
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in propagation | `src/daemon.rs` | ✅ | `test_rr_v6_split_horizon_blocks_non_client_to_non_client` |

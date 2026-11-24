@@ -2264,6 +2264,29 @@ semantic separation of IGP and BGP RIBs).
   with every other BGP route, so a next hop beneath one is still reported reachable
   through the IGP route. Belongs with recursive next-hop resolution above.
 
+**Snapshot recovery: what the supervisor still cannot see** (follow-ups to #59):
+
+- *Silent kernel flushes.* When a link goes down, `fib_table_flush` removes the IPv4
+  routes through it and sends `RTM_DELROUTE` only if their preferred source address was
+  removed (`fi->pfsrc_removed`). Subscribing to link / address groups and resyncing (or
+  applying the flush) on a link-down event would close this.
+- *No periodic verification.* A divergence that is never signalled lasts until the next
+  detected loss. An optional low-rate verification dump that compares and, on mismatch,
+  degrades and resyncs would bound it.
+- *Metrics.* `FibStatus` (health, losses, resyncs) is logged by `pathvectord` but not
+  exported to Prometheus.
+- *Readiness gate.* `pathvectord` does not wait for the first `Ready` before starting
+  sessions; it relies on the change notification to re-evaluate next hops when the
+  first dump lands.
+- *Stale-route dump.* `KernelFib::stale_bgp_routes` uses `rtnetlink`'s dump, which
+  cannot tell a complete dump from one cut short by a closed connection; it should use
+  the supervisor's `read_dump`.
+- *Resync cost.* A resync dumps every route of both families, BGP-installed ones
+  included: the mirror keeps them as identities so replaces displace the right route,
+  so a protocol filter is not an option. With a full table in the kernel that is a large
+  dump (and the dump deadline must allow for it); with `NETLINK_GET_STRICT_CHK`,
+  dumping only the tracked table would shrink it.
+
 **Testing gaps:**
 
 - E2e test (Gap 8): after session with GoBGP establishes and a prefix is learned,
@@ -2338,18 +2361,12 @@ Not yet started. Key work items:
 ### Dynamic peer management — known gaps (2026-06-18)
 
 Six gaps identified during a correctness audit of the `AddPeer`/`RemovePeer` feature.
-Items 1, 2, 4, 5, 6 resolved 2026-06-18 — see CHANGELOG.md. Item 3 remains open.
+Items 1, 2, 4, 5, 6 resolved 2026-06-18, item 3 on 2026-11-23 — see CHANGELOG.md.
 
-**3. MD5 password on dynamically-added peers doesn't work for inbound connections**
-
-The BGP listener socket is bound once at startup; TCP MD5SIG keys cannot be added to
-an existing listening socket on Linux without rebinding. Dynamically-added peers with
-`md5_password` only work for outbound connections (pathvectord dials them). If the
-remote peer tries to initiate toward us, the listener rejects the TCP handshake because
-no key is installed for that source address.
-
-Fix (full): re-bind the listener socket when a new MD5 peer is added — requires moving
-the listener into a task that can be restarted. Documented in `pathvectord/README.md`.
+**3. ~~MD5 password on dynamically-added peers doesn't work for inbound connections~~**
+Resolved 2026-11-23 (issue #66), see CHANGELOG.md. The premise was wrong: Linux accepts
+`TCP_MD5SIG` on a listening socket at any time, so no rebind is needed. The real gap was
+wider: the listener installed no keys at all, for static peers either.
 
 ### watch_routes broadcast channel — guaranteed delivery
 

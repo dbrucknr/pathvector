@@ -242,19 +242,65 @@ BGP-first mixed set with the same bytes as an all-BGP set (the reason for the in
 policy), a BGP alias prepended ahead of a static alias and then replaced, and the
 re-read after a delete: a BGP-first static+BGP set learned from the dump regains its
 static path once the BGP route is deleted, and a static-first set stops counting its BGP
-route once the static route is deleted (both fail without the re-read). The adapter's unit
-tests cover when a delete triggers a re-read (only when the set's new head has an
-inferred protocol), how slots are grouped into dumps, the dump request against the
-kernel's strict-check rules, and applying the answer; the domain tests cover
-`RouteMirror::inferred_set_head` and `RouteMirror::redescribe`. For #57 they compare the oracle's
+route once the static route is deleted (both fail without the re-read). Both wait for the
+re-read's result rather than for a marker route, whose notification can be applied
+while the re-read is still running. The adapter's unit tests cover when a delete
+triggers a re-read (only when the set's new head has an inferred protocol), how slots
+are grouped into dumps, the dump request against the kernel's strict-check rules, and
+applying the answer. The supervisor's fake-kernel tests cover the re-read in the event
+loop: the change it signals when the delete alone changed nothing tracked, one read per
+table and device for deletes already received, a stalled or failed read that keeps the
+inference without blocking later notifications for longer than the dump timeout, and an
+overrun met while reading ahead that leaves the set to the resynchronization. The
+domain tests cover `RouteMirror::inferred_set_head` and `RouteMirror::redescribe`. For #57 they compare the oracle's
 verdict with the kernel's own lookup (`RTM_GETROUTE` for one destination, as
 `ip route get` sends) for each negative type beneath a covering route, its deletion,
 `ip route replace <type>` over a unicast route, an initial dump with mixed metrics and a
 unicast route inside a throw prefix, IPv6 router preference between negative and
 unicast routes of one metric, and negative routes over link-local space; the expected
-errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and `ENETUNREACH`. The tests run in
+errors are `EINVAL`, `EHOSTUNREACH`, `EACCES` and `ENETUNREACH`. For #59 a burst of
+notifications lost to `ENOBUFS` must be recovered by a resync. The tests run in
 parallel in one namespace, so each uses its own prefixes and interfaces (prefixed
 `pvtest`) and none adds a real default route.
+
+#### Kernel FIB recovery after netlink loss (issue #59)
+
+The supervisor that keeps the snapshot in step with the kernel is platform-independent
+and talks to the kernel through a port (`RouteSource` / `RouteFeed`), so
+`pathvector-sys/src/fib/supervisor/tests.rs` drives it on every platform with a scripted
+fake kernel under paused tokio time (every backoff is exact). The fake reproduces how
+each fault surfaces according to netlink(7), `net/netlink/af_netlink.c` and
+`netlink-proto` 0.12: a full buffer starts a congestion episode with one `Overrun` and
+then drops every notification until the reader empties the queue; a terminated
+connection ends the feed; a dump can fail, stop without `NLMSG_DONE`, carry
+`NLM_F_DUMP_INTR`, race a change, or skip an unchanged route the way `fib6_dump_table`
+does after a tree change.
+
+| Invariant | Why it matters |
+|---|---|
+| Whenever the status is `Ready`, the snapshot equals the kernel's table (proptest over any history of changes and faults, checked at every quiescent point) | `Ready` is what callers trust; it must never be claimed after a loss |
+| Once faults stop, the status returns to `Ready` and the snapshot equals a fresh dump | Recovery is automatic and complete |
+| An overrun, a closed connection, a failed / cut-short / interrupted / racing dump each produce the matching `DegradedCause` | Degradation is observable, with the reason |
+| A cut-short dump or an attempt hit by an overrun is never installed; lookups during a resync see the previous snapshot | No partial or empty snapshot is ever visible |
+| A channel that never runs dry cannot delay a finished dump, the dump deadline, or other tasks on the thread (the dump and the deadline are polled before each notification, the deadline is also checked against the clock, and the supervisor yields cooperatively) | tokio's `biased` select starves later branches, and the notification channel is outside tokio's cooperative budget |
+| An overrun while a dump is pending abandons it and replaces the socket (no dump is retried on it: the fake answers `EBUSY` like `__netlink_dump_start`); a dump that never answers hits its deadline | A dump `netlink_dump` stopped with `-ENOBUFS` would otherwise block recovery forever |
+| Notifications for the other family during a dump are not inconsistencies, and later ones are applied to the fresh snapshot | Exactly the changes a dump cannot show are replayed |
+| Retry delays are `initial · 2ⁿ` capped at the maximum; a burst of overruns costs one resync; a quiet period resets the sequence | Bounded recovery without redumping on every transient |
+| Only the first failed connect is returned to the caller | Later failures are retried, not fatal |
+
+The detection and replay rules were checked by mutation (same-family inconsistency,
+`NLM_F_DUMP_INTR`, which notifications are replayed, overruns while following, overruns
+during a dump, reconnecting after abandoning a dump, the dump deadline, polling order and
+cooperative yielding under a busy channel, the drain cap): removing
+any one makes at least one of these tests fail. The Linux adapter tests (`linux.rs`)
+cover the dump reader (complete only with `NLMSG_DONE`; `NLM_F_DUMP_INTR` on any reply; errors in `NLMSG_ERROR` and
+`NLMSG_DONE`) and message classification (overrun, new/delete with header flags, other
+families ignored). The live test `notifications_lost_to_enobufs_are_recovered_by_a_resync`
+in `kernel_fib_netns.rs` blocks its single-threaded runtime while another thread adds
+1000 routes, so the kernel really drops notifications; the snapshot must count the loss,
+resync, and then equal a fresh dump. The same scenario fails against the code before the
+fix.
+
 They are `#[ignore]`d because they need `CAP_NET_ADMIN` in a throwaway network
 namespace; CI runs them with `sudo unshare --net`. Locally on Linux:
 
@@ -614,8 +660,11 @@ just e2e-down  # stop and clean up
 |---|---|---|
 | `md5_matching_key_session_establishes` | RFC 2385 §2.0 | Matching `md5_password` on both sides → BGP session reaches Established; **CI-only** |
 | `md5_key_mismatch_session_never_establishes` | RFC 2385 §2.0 | Mismatched keys → session cannot establish; **CI-only** |
+| `md5_inbound_matching_key_session_establishes` | RFC 2385 §2.0, RFC 5925 §8 | GoBGP dials pathvectord's listener with the shared key while pathvectord's own dial goes nowhere → Established, so the inbound path works with MD5 (issue #66); **CI-only** |
+| `md5_inbound_unsigned_peer_never_establishes` | RFC 2385 §2.0, RFC 5925 §8 | GoBGP dials without a key → the listener's kernel drops the SYN and the session never establishes. Before #66 this established unauthenticated; **CI-only** |
+| `md5_inbound_wrong_key_never_establishes` | RFC 2385 §2.0 | GoBGP dials with the wrong key → never establishes; **CI-only** |
 
-> **CI-only gate on both MD5 tests.** TCP MD5SIG is enforced by the Linux kernel. Docker
+> **CI-only gate on all MD5 tests.** TCP MD5SIG is enforced by the Linux kernel. Docker
 > Desktop on macOS runs a `LinuxKit` kernel built with `# CONFIG_TCP_MD5SIG is not set`,
 > where `setsockopt(TCP_MD5SIG)` fails with `ENOPROTOOPT`. Since issue #58, pathvectord
 > reports that as "cannot enforce" and, with the default `tcp_md5_enforcement =
@@ -707,36 +756,30 @@ UAPI exactly.
 | Config / sidecar | Parse errors never print a password (syntax error, over-length, bare value) | `test_config_errors_do_not_reveal_md5_password`, `unparseable_sidecar_log_does_not_reveal_passwords`, `rejected_sidecar_password_is_not_logged` |
 | Config / sidecar | One invalid sidecar entry keeps the others and is preserved on write; an unparseable file is never overwritten | `invalid_entry_does_not_drop_valid_peers`, `unparseable_sidecar_is_never_overwritten` |
 | Daemon wiring | Key and policy reach static and dynamic sessions | `build_daemon_md5_password_reaches_session_config`, `build_daemon_best_effort_md5_reaches_session_config`, `add_peer_wires_md5_key_and_enforcement_into_session_config` |
+| Listener (fake port) | Keys installed before `listen()`; per address family; add / rotate / remove on the live socket; same key again is a no-op | `key_configured_before_bind_is_installed_before_listen`, `listener_installs_only_its_own_family`, `rotation_installs_the_new_key_and_replaces_the_socket`, `removing_an_installed_key_takes_it_off_the_socket`, `setting_the_same_key_again_is_a_no_op` |
+| Listener (fake port) | Connection queued before a key change is closed, not handed over; a key installed while listening makes the listener replace its socket, with every key installed before the new `listen()`; the per-family unsettled counter matches a scan through every transition | `connection_queued_before_a_new_key_is_rejected`, `key_change_replaces_the_socket_with_keys_installed_before_listen`, `unsettled_count_follows_every_transition` |
+| Listener / daemon (fake port) | A connection screened before its peer's key was set is never used: buffered ones are re-checked when handed over, and the daemon re-checks after the session lookup | `buffered_connection_is_dropped_when_its_peer_gains_a_key`, `buffered_connection_is_dropped_when_its_peers_key_is_refused`, `accepted_connection_stops_being_current_when_its_peer_gains_a_key`, `connection_accepted_before_add_peer_is_not_routed_to_the_new_session` |
+| Listener (fake port) | Required + unenforceable, or any OS error → peer's connections closed; best-effort → admitted with a warning | `required_key_that_cannot_be_enforced_rejects_the_peer`, `set_peer_reports_a_required_key_it_cannot_enforce`, `os_error_rejects_even_a_best_effort_peer`, `best_effort_key_that_cannot_be_enforced_admits_unauthenticated` |
+| Listener live kernel (CI) | Static, added, rotated and removed keys enforced on inbound connections; pre-key connection closed | `static_key_admits_only_the_matching_key`, `dynamically_added_key_is_enforced`, `rotated_key_replaces_the_old_one`, `removed_key_is_no_longer_enforced`, `connection_completed_before_a_dynamic_key_is_rejected` |
+| Listener live (host without MD5) | Required key → handshake completes but the connection is closed, never handed over | `required_key_on_a_host_without_md5_rejects_the_peer` |
+| Daemon listener wiring | `AddPeer` installs the key before inbound is routed; `RemovePeer` removes it; unenforceable key keeps inbound away from the session; static and dynamic peers live | `add_peer_installs_listener_key_before_routing_inbound`, `remove_peer_removes_the_listener_key`, `add_peer_with_unenforceable_required_key_refuses_inbound`, `static_peer_inbound_requires_the_key`, `dynamic_peer_inbound_requires_the_key_until_removed` |
 | E2E interop (CI) | Matching keys → Established against GoBGP; mismatch never establishes | `md5_matching_key_session_establishes`, `md5_key_mismatch_session_never_establishes` |
+| E2E interop, inbound only (CI) | GoBGP dialing pathvectord's listener: matching key establishes; unsigned or wrong key never does | `md5_inbound_matching_key_session_establishes`, `md5_inbound_unsigned_peer_never_establishes`, `md5_inbound_wrong_key_never_establishes` |
 
-The live-kernel tests are in `pathvector-sys/tests/tcp_md5_loopback.rs` and run over
-loopback with no privileges. On a kernel without `CONFIG_TCP_MD5SIG` they check the
+The live-kernel tests are in `pathvector-sys/tests/tcp_md5_loopback.rs`,
+`pathvector-session/tests/listener_md5_loopback.rs` and pathvectord's
+`daemon::listener_md5_tests`, and run over loopback with no privileges. On a kernel without `CONFIG_TCP_MD5SIG` they check the
 `Unsupported` report and skip; when `CI` is set they fail instead, so CI cannot pass
 without proving enforcement.
 
 ### Platform behaviour
 
-| Platform | `install_tcp_md5_key` | Enforcement | Session (default `required`) |
+| Platform | `install_tcp_md5_key` | Enforcement | Session and listener (default `required`) |
 |---|---|---|---|
-| Linux with `CONFIG_TCP_MD5SIG` | `Ok(())` (no capability needed) | Kernel signs and verifies every segment | Connects |
-| Linux without it (Docker Desktop `LinuxKit`) | `Err(Unsupported(Kernel { errno: ENOPROTOOPT }))` | None | Refuses to connect; `best-effort` connects unauthenticated with a warning |
+| Linux with `CONFIG_TCP_MD5SIG` | `Ok(())` (no capability needed) | Kernel signs and verifies every segment | Connects; the listener's kernel drops the peer's unsigned and wrong-key SYNs |
+| Linux without it (Docker Desktop `LinuxKit`) | `Err(Unsupported(Kernel { errno: ENOPROTOOPT }))` | None | Refuses to connect and closes the peer's inbound connections; `best-effort` connects and accepts unauthenticated with a warning |
 | macOS / other | `Err(Unsupported(Platform))` | None | Same as above |
 | IPv6 peer (any OS) | `Err(Unsupported(Ipv6Peer))` | None | Same as above |
-
----
-
-## Platform behaviour
-
-| Platform | `setsockopt(TCP_MD5SIG)` | Enforcement | Notes |
-|---|---|---|---|
-| Linux (native) | Succeeds if `CAP_NET_ADMIN` held | Kernel enforces signature on every segment | CI and production |
-| Linux in Docker Desktop VM | Returns `ENOPROTOOPT` (no `CONFIG_TCP_MD5SIG`) | Not enforced | Handled: `ENOPROTOOPT`/`EOPNOTSUPP` → `Ok(())` with a warning; session continues |
-| macOS (native) | No-op; `#[cfg(not(target_os = "linux"))]` | Not enforced | Development-only; no kernel path taken |
-
-The graceful-degrade on `ENOPROTOOPT` is the reason the positive e2e test passes on
-macOS: both sides are configured consistently, the no-op call succeeds, and the session
-establishes without kernel-level authentication — which is the correct behaviour for a
-host that cannot enforce it.
 
 ---
 

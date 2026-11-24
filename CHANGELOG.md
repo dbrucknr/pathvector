@@ -13,21 +13,324 @@ deleted, and a static-first set counted its BGP route until that route was delet
 
 A delete changes which sibling the kernel describes. When an `RTM_DELROUTE` leaves a set
 headed by a route whose protocol is inferred (`RouteMirror::inferred_set_head`), the
-event loop dumps that route's table again and applies the set with
-`RouteMirror::redescribe`: the new head's protocol is reported, a lone route is
-described in full, and the remaining inferred siblings take the new head's protocol.
-The dump runs on a second netlink connection with `NETLINK_GET_STRICT_CHK`, filtered by
-table and device, because no request can select one prefix (`ip_valid_fib_dump_req`
-rejects a nonzero `rtm_dst_len`; `RTM_F_FIB_MATCH` describes the sibling the multipath
-hash picks). Events already queued (up to 1024) are applied before the dump, so a burst
-of deletes costs one dump per table and device; each change is still signalled at once,
-and the snapshot lock is not held across the dump. Untracked routes
+snapshot supervisor (from #59) dumps that route's table again through a new port method,
+`RouteFeed::reread`, and applies the set with `RouteMirror::redescribe`: the new head's
+protocol is reported, a lone route is described in full, and the remaining inferred
+siblings take the new head's protocol. The netlink adapter runs each read on a socket of
+its own with `NETLINK_GET_STRICT_CHK`, filtered by table and device, because no request
+can select one prefix (`ip_valid_fib_dump_req` rejects a nonzero `rtm_dst_len`;
+`RTM_F_FIB_MATCH` describes the sibling the multipath hash picks), and accepts it only
+on `NLMSG_DONE`. Notifications already received (up to 1024) are applied before the
+dump, so a burst of deletes costs one dump per table and device; each change is still
+signalled at once, and the snapshot lock is not held across the dump. A read that fails
+or outlasts the dump timeout is dropped; an overrun met while reading ahead leaves the
+set to the resynchronization. Untracked routes
 with an inferred protocol are now kept whole instead of as a hash.
 
 Live tests: a BGP-first mixed set regains its static path after the BGP delete, and a
-static-first set stops counting its BGP route after the static delete; both fail on the
-previous commit. Still unresolved: the misclassification while the head is installed,
-non-head siblings of sets of three or more, and failed re-reads (see the crate README).
+static-first set stops counting its BGP route after the static delete; both fail without
+the re-read, and both wait for its result (a marker route's notification can be applied
+while it runs). The supervisor's fake-kernel tests cover batching, stalled and failed
+reads, and an overrun while reading ahead. Still unresolved: the misclassification while
+the head is installed, non-head siblings of sets of three or more, failed re-reads, and
+deletes notified during a resynchronization's IPv6 dump (see the crate README).
+
+## 2026-11-23 (issue #80: a rejected replacement withdraws the old candidate)
+
+`handle_update` stored a replacement advertisement in Adj-RIB-In before running
+import policy, and on `Reject`/`Next` only counted the rejection. The peer's
+previously accepted route stayed in the Loc-RIB, selected, installed in the FIB
+and advertised, although RFC 4271 §9 says the replacement "SHALL replace the
+older route in the Adj-RIB-In, thus implicitly withdrawing the older route from
+service" and §9.1.2 only considers "routes that are eligible". Both address
+families, and therefore ROV-Invalid (RFC 6811) and OTC-leak (RFC 9234 §5)
+replacements too, were affected.
+
+Import is now one generic path, `pathvectord/src/daemon/import.rs`:
+`ImportDecision::{Accepted(Route), Rejected}` (`#[must_use]`) is the Phase 1
+result, and its only consumer, `apply`, inserts an accepted route or withdraws
+the peer's candidate. `import_announcement` serves both `handle_update`
+branches; `reapply_import_policy` is now generic and replaces the v4/v6 copies,
+so arrival and re-evaluation apply identical decisions. Per accepted route the
+cost is unchanged; a rejected route costs one extra Loc-RIB lookup.
+
+Regression tests: `pathvectord::daemon::import_reject_tests` (FIB, peers,
+Adj-RIB-In and candidate set for sole-best, takeover, no-churn, rejected →
+accepted, ROV and OTC cases, both families) and the model property test
+`prop_loc_rib_candidates_are_latest_accepted_advertisement_per_peer`.
+
+Still open: replacements dropped before import policy (AS_PATH loop, AS 0,
+semantically invalid NEXT_HOP) leave the older route in place; see
+`pathvectord/RFC.md` §9 / §9.1.1 and issue #111.
+
+---
+
+## 2026-11-23 (pathvector-rib, pathvectord: RFC 4456 §9 reflected-route tie-breakers — issue #69)
+
+### [pathvector-rib] ORIGINATOR_ID and CLUSTER_LIST now take part in selection
+
+`best_path::prefer` compared the advertising peer's BGP Identifier at RFC 4271
+§9.1.2.2 (f) and then the peer address. It ignored the ORIGINATOR_ID and
+CLUSTER_LIST stored on the route, so two reflected routes were ordered by their
+reflectors' identifiers. RFC 4456 §9: "If a route carries the ORIGINATOR_ID
+attribute, then in Step f) the ORIGINATOR_ID SHOULD be treated as the BGP
+Identifier of the BGP speaker that has advertised the route", and "a BGP Speaker
+SHOULD prefer a route with the shorter CLUSTER_LIST length" between (f) and (g),
+with an absent list counting as zero.
+
+- New `EffectiveRouterId` (re-exported from the crate root). Its constructor
+  `for_route(peer_bgp_id, originator_id)` is the only place the substitution
+  rule lives. Its `Ord` is preference order: the RFC 4271 §6.8 unsigned-integer
+  comparison, with an unknown identifier ranked after every known one.
+- New accessors `Route::originator_id`, `Route::cluster_list_len` and
+  `Route::effective_router_id`, and builder setters
+  `RouteBuilder::originator_id` / `RouteBuilder::cluster_list`.
+- **Behavior change:** step (f) is no longer *skipped* when only one side's
+  identifier is known. That rule was not transitive: a = 1.1.1.1 on .3,
+  b = unknown on .2 and c = 1.1.1.2 on .1 formed a cycle, so `max_by` picked an
+  iteration-order-dependent winner. The test asserting the skip was rewritten
+  as `test_select_best_known_bgp_identifier_beats_unknown`.
+
+### [pathvectord] Ingestion stores the attributes selection now depends on
+
+- The IPv6 path parsed ORIGINATOR_ID and CLUSTER_LIST but never stored them. A
+  route reflector therefore re-advertised IPv6 routes without the attributes it
+  had inserted on ingress, which defeats RFC 4456 §8 loop prevention downstream.
+- RFC 7606 §7.9/§7.10: these attributes "received from an external neighbor
+  [...] SHALL be discarded using the approach of 'attribute discard'". They were
+  stored from any peer. Once they decide step (f), an eBGP peer could win the
+  tie-break with a forged ORIGINATOR_ID. They are now kept only from `Internal`
+  peers. A confederation Member-AS peer gets no RFC 5065 exception for them,
+  which matches the existing outbound stripping toward `ConfedMember`.
+
+### Tests
+
+- `pathvector-rib` `best_path::reflection_tests`: both issue acceptance cases;
+  absent CLUSTER_LIST = 0; (f) before CLUSTER_LIST before (g); direct versus
+  reflected; ORIGINATOR_ID without a known peer identifier; unknown identifiers;
+  earlier steps still dominate. Proptests: an RFC reference model, and a strict
+  total order over tied candidates. `prop_prefer_is_a_strict_total_order` now
+  mixes known/unknown identifiers and RR attributes, and its saved seed is the
+  pre-fix cycle. `route::tests` covers `EffectiveRouterId` ordering and
+  substitution.
+- `pathvectord` `daemon/rr_tie_break_tests.rs`, through real UPDATE ingestion:
+  IPv4 and IPv6 selection, attribute discard from External and ConfedMember
+  peers (both families, plus selection), and RR reflection of IPv6 routes with
+  ORIGINATOR_ID and CLUSTER_LIST.
+- Every new test fails against either the old selector or the old ingestion.
+
+### Performance
+
+New `select_best_reflected_tie` benchmark (M2 Max). The candidates tie through
+step (e), so every comparison reaches the tie-breakers. The existing
+`select_best` group is unchanged (within ±0.7%). With equal decision work (no
+ORIGINATOR_ID) the tie-break path costs +0% / +1.7% / +8.4% at 2 / 10 / 100
+candidates, about 2.5 ns per comparison that reaches step (f). The extra cost is
+the heap read of the boxed `RareAttrs` that ORIGINATOR_ID now requires. Keys are
+built only once every earlier step has tied, without allocation.
+
+---
+
+## 2026-11-23 (pathvector-rib, pathvectord: conventional Graceful Restart keeps ordinary route preference — issue #68)
+
+### [pathvector-rib] Stale routes are no longer depreferenced
+
+`best_path::prefer` ranked any fresh route above any Graceful-Restart-stale
+route before every other criterion, so a peer restart could move selection
+(and forwarding) from a LOCAL_PREF-300 route to a LOCAL_PREF-100 one for the
+whole restart window. The test that proved it,
+`stale_loses_to_non_stale_before_all_other_criteria`, cited RFC 4724 §4.2 —
+which requires the opposite: the router "MUST NOT differentiate between stale
+and other routing information during forwarding" (kept verbatim by RFC 8538
+§4.1). RFC 9494 §1 is explicit: "in conventional GR, route preference is not
+affected"; only Long-Lived GR depreferences retained routes (§4.4), and only
+for a speaker that advertised the LLGR Capability (§4.3).
+
+- **Breaking (workspace-internal):** `Route::stale: bool` is replaced by
+  `Route::staleness: Staleness` (`Fresh` | `GrStale`, `#[non_exhaustive]`,
+  re-exported from the crate root). Its rustdoc carries the selection
+  semantics and RFC basis, and states that LLGR is not implemented — an LLGR
+  variant would be added separately rather than overloading `GrStale`.
+- `prefer` no longer reads staleness. A stale route competes on its
+  attributes until the peer replaces it, End-of-RIB sweeps it, or the
+  Restart Time expires (all unchanged).
+- `prepare_outbound` / `prepare_outbound_v6` reset staleness on the
+  advertised copy. Staleness took part in `Route`'s `PartialEq`, so marking a
+  selected route stale made the outbound copy differ from `AdjRibOut` and
+  re-sent an identical UPDATE for every retained prefix to every peer —
+  the churn RFC 9494 §1 says conventional GR avoids.
+
+### Tests
+
+- `pathvector-rib`: `conventional_gr_stale_route_keeps_its_higher_local_pref_preference`
+  (the issue's acceptance case), `..._with_lower_local_pref_still_loses`,
+  `..._wins_on_every_later_decision_step`, `conventional_gr_staleness_is_not_a_tie_breaker`
+  (§9.1.2.2 (f) and (g)); proptests `prop_conventional_gr_staleness_never_changes_the_winner`,
+  `prop_prefer_ignores_conventional_gr_staleness`, and
+  `prop_prefer_is_a_strict_total_order` (irreflexive, asymmetric, total,
+  transitive over every triple of 3–6 candidates, staleness mixed in);
+  `test_prepare_outbound_never_carries_staleness`; `AdjRibIn` mark/replace tests.
+- `pathvectord`: new `daemon/gr_preference_tests.rs` — iBGP LOCAL_PREF-300
+  route retained over a fresh LOCAL_PREF-100 one (Loc-RIB and FIB), no UPDATE
+  on stale marking (with and without an alternative, IPv4 and IPv6), fallback
+  to the fresh route on Restart Time expiry, replacement on re-announcement
+  and End-of-RIB sweep. All failed before the fix.
+- Rewritten because they asserted the old behavior:
+  `stale_marking_lets_fresh_peer_win_immediately` →
+  `stale_marking_keeps_equally_preferred_route_selected`;
+  `stale_mark_repropagates_withdrawals_to_established_observer` →
+  `stale_mark_sends_no_update_to_established_observer`. The two
+  repropagation stall-path tests now force an Adj-RIB-Out desync, since stale
+  marking alone no longer sends anything.
+
+Found while writing the ordering proptest, **not** fixed here (unrelated to
+staleness): step (f) is skipped when only one side's BGP Identifier is known,
+which is not transitive — with ids `a=1`, `b=None`, `c=2` on peers `.3`,
+`.2`, `.1`, `c ≻ b ≻ a ≻ c`. The proptest keeps each candidate set
+all-known or all-unknown and documents why.
+
+---
+
+## 2026-11-23 (issue #67: withdraw when an UPDATE removes the last feasible path)
+
+`LocRib::insert` returned `BestPathChange::Unchanged` whenever no best route
+remained after the insert, without checking whether one existed before. A
+replacement UPDATE (RFC 4271 §9 implicit withdrawal) whose NEXT_HOP is
+unresolvable could therefore remove the only selected route from the Loc-RIB
+(§9.1.2: "Unresolvable routes SHALL be removed from the Loc-RIB and the
+routing table") without the FIB writer ever hearing about it — the kernel kept
+forwarding via the old next hop. Outbound withdrawal to peers was already
+correct, because propagation re-reads the Loc-RIB per affected prefix.
+
+The replay-model property test written for this fix also found the mirror
+bug in `LocRib::withdraw`: removing one of several candidates that were *all*
+unresolvable emitted a spurious `Withdrawn` for a prefix that was never
+selected, which would make the FIB writer delete a kernel route BGP never
+installed.
+
+Both are fixed structurally: `insert`, `withdraw` and `recompute_all` now
+derive their `BestPathChange` from one private
+`BestTransition::between(previous, next, replaced)`, an exhaustive match on
+the `(Option<PeerId>, Option<PeerId>)` selected-peer pair. No extra clones
+on the insert path. Regression tests: RIB unit tests (both families), a
+`BestTransition` truth table, `prop_loc_rib_change_stream_replays_to_best_table`
+(change stream replayed onto an empty map equals `best_routes()` after every
+insert / withdraw / peer-down / reachability operation), and
+`pathvectord::daemon::last_feasible_tests` (FIB `Withdrawn`, WITHDRAWN ROUTES /
+MP_UNREACH_NLRI to peers, Adj-RIB-In retention, both families).
+
+---
+
+## 2026-11-23 (issue #66: TCP MD5 keys on the BGP listener)
+
+`run_bgp_listener` received the TCP MD5 key map as `_md5_passwords` and never used it, and
+its comment claimed the listener used "the keys that were active at bind time". No key was
+ever installed on the listening socket, for static or dynamic peers, so a configured
+`md5_password` protected only the connections pathvectord dialled. An unsigned connection
+from the peer's address was accepted and handed to the session. RFC 5925 §8: required
+TCP MD5 "must be added to all outgoing segments and validated on all incoming segments".
+
+**New in `pathvector-session`: `transport::listener`.**
+
+- `ListenerKeys` is the table of inbound keys and their state on the listening sockets
+  (`set_peer`, `remove_peer`, `admission`, `is_current`, `configured`), over the
+  `TcpMd5Port` from #58.
+- `BgpListener::bind` creates the socket (`IPV6_V6ONLY` for IPv6, `SO_REUSEADDR`, never
+  `SO_REUSEPORT`), installs its family's keys, and only then calls `listen()`. Later
+  `set_peer` / `remove_peer` calls change the live socket at once (Linux updates an
+  existing key in place, `__tcp_md5_do_add`).
+- **Key changes replace the socket.** Linux copies the listener's key into each
+  connection when its handshake completes (`tcp_v4_syn_recv_sock`, `tcp_md5_key_copy`)
+  and appends it to the accept queue a moment later (`inet_csk_reqsk_queue_add`), so a
+  connection created before a key was added or changed has no key, and no amount of
+  waiting proves that every such connection has reached the queue. After a key is
+  installed while listening, `BgpListener` takes up to `backlog + 1` queued connections
+  off the socket (rejecting the changed peer's), shuts it down, and binds a new socket at
+  the same address with every key installed before `listen()`. `shutdown(SHUT_RD)` on a
+  listener runs `tcp_disconnect` → `inet_csk_listen_stop`, which discards the queue; a
+  late append checks `sk_state != TCP_LISTEN` under the queue lock and discards the
+  connection; a half-open handshake on the closed socket is re-looked-up and checked
+  against the new socket's keys. Only installed adds and rotations trigger this, not
+  removals or refused keys. This replaces an earlier draft of this PR that waited 100 ms
+  between two clearings of the queue, which the PR review showed could not be a barrier.
+- **Accepted connections carry a stamp.** `BgpListener::accept` returns an `Inbound` with
+  an `AuthStamp`; `ListenerKeys::is_current` is false once the peer's key has been set
+  since. The listener re-checks connections it buffered while replacing the socket, and
+  pathvectord re-checks after looking up the session (`route_inbound`), so a connection
+  accepted unkeyed just before `AddPeer` never reaches the new session.
+- Whether a socket replacement is needed is a per-family counter, so screening a
+  connection costs O(1) in the number of configured keys.
+- A required key the host cannot enforce, or any `setsockopt` failure, rejects the peer's
+  inbound connections (the kernel would not have checked them) and is reported to the
+  caller. `best-effort` admits them unauthenticated with a warning.
+
+**`pathvectord`.** Static peers' keys are recorded by `build_daemon` and installed by each
+listener before it listens. `AddPeer` installs the key before the peer is added to
+`incoming_senders`; `RemovePeer` removes the peer from `incoming_senders`, then removes the
+key. Inbound connections are routed only if still current after the session lookup, and
+an accept error (for example, a failed socket replacement) backs off 100 ms. Failures are
+logged at error level as `refusing inbound connections from <peer>`.
+`bind_listener` moved into `BgpListener::bind`. TODO.md's "re-bind the listener for
+dynamic MD5 peers" item is closed: keys can be added to a listening socket at any time;
+the socket is now replaced after a runtime key change for a different reason (the
+barrier above).
+
+**Behaviour change.** On a host that enforces TCP MD5, a peer with `md5_password` must now
+sign its inbound connections too; a peer that dials in without the key times out. On a
+host that cannot enforce it, the peer's inbound connections are closed unless
+`tcp_md5_enforcement = "best-effort"`.
+
+**Proof.** Fake-port unit tests for install-before-listen, per-family keys, add / rotate /
+remove, socket replacement (the replacement's keys go on before `listen()`), stale
+buffered and routed connections (the three review regressions), the unsettled counter,
+and the refusal paths, each run on every platform. Mutating the listener to admit
+everything, to settle without replacing the socket, to skip the buffered or routed
+re-check, or to miscount, or the daemon to skip the key on `AddPeer`, fails them. `pathvector-session/tests/listener_md5_loopback.rs` and
+pathvectord's `daemon::listener_md5_tests` open real loopback connections and observe the
+client's handshake and whether the connection reaches the session, for static, added,
+rotated and removed keys. They fail rather than skip under `CI` on Linux, and on hosts
+without TCP MD5 they check the fail-closed path live instead. Three CI-only e2e tests in
+`pathvector-e2e/tests/auth.rs` have GoBGP dial pathvectord while pathvectord's own dial
+goes to a dead port, so only the listener can bring the session up: matching key
+establishes; unsigned (the #66 bug: it used to establish) and wrong key never do.
+
+Also corrected TESTING.md's second "Platform behaviour" table, left over from before #58,
+which said `ENOPROTOOPT` was treated as success.
+
+## 2026-11-23 (issue #59: the FIB snapshot recovers from netlink loss)
+
+`pathvector-sys`'s `KernelFib` ignored `NLMSG_OVERRUN` (how `netlink-proto` reports
+`ENOBUFS`), treated the end of its notification stream as success, ran its netlink
+connection as a detached task, and accepted any dump whose reply stream ended, including
+one cut short by a closed connection. netlink(7) is explicit that the kernel drops
+notifications when the receive buffer is full and that "It is up to the application to
+detect when this happens [...] and resynchronize"; nothing did, so one dropped
+notification left the next-hop oracle answering from stale state for good. Confirmed on
+a live kernel: after a 1000-route burst while the reader was blocked, the old snapshot
+never learned the dropped routes.
+
+A supervisor (`fib/supervisor.rs`, behind a `RouteSource` / `RouteFeed` port) now
+detects overruns, connection loss, dumps that end without `NLMSG_DONE` or fail, and
+dumps that may have missed routes (`NLM_F_DUMP_INTR`, or a notification for the same
+family during that family's dump: the kernel's route dumpers never set
+`NLM_F_DUMP_INTR`, and `fib6_dump_table` can skip an unchanged route after a tree
+change). It marks the snapshot `Degraded`, waits with bounded exponential backoff while
+still applying notifications, redumps both families, and swaps the result in with one
+move under the write lock; it reconnects the same way. Notifications are read while a
+dump runs and each dump has a deadline (`DumpTimeout`), because `netlink_dump` can stop
+a dump with `-ENOBUFS` and resume it only after another message is read; abandoning a
+running dump replaces the socket, since a new dump on it would get `EBUSY`. The dump and
+its deadline are polled ahead of the notification channel and the supervisor yields
+cooperatively, so sustained route churn cannot starve them. New public API: `SnapshotHealth`,
+`DegradedCause`, `FibStatus`, `ResyncBackoff`, `DumpTimeout`, `KernelFib::builder`
+(backoff, dump deadline, `SO_RCVBUF`), `KernelFib::status`, `KernelOracle::health` / `status`. Lookups while
+degraded answer from the last snapshot (stale but flagged). `KernelFib::spawn` now
+returns only if the first netlink socket cannot be opened; `pathvectord` logs that, the
+status present when its logger starts, every health transition, and reminders during a
+long outage. Proof: 26 supervisor tests against a scripted fake kernel that
+models the congestion bit, a proptest model check (Ready always means the snapshot equals
+the kernel table; convergence once faults stop), Linux adapter tests, and a live-kernel
+test that forces `ENOBUFS` and checks agreement with a fresh dump.
 
 ## 2026-11-23 (issue #58: TCP MD5 never reports an unenforced key as enabled)
 
@@ -194,6 +497,8 @@ longest prefix and then the lowest priority. New validated types: `Ipv4Prefix`,
 `FibEntry6` types are removed (nothing outside the crate used them). Proof: domain unit
 and property tests against an independent reference model, netlink adapter tests, and
 live-kernel tests run in a network namespace in CI.
+
+---
 
 ## 2026-08-05 (PR #52 code review, round 3: the round-2 fix's own doc comment overclaimed)
 

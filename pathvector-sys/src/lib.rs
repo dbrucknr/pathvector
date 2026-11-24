@@ -14,7 +14,10 @@
 pub mod fib;
 pub mod tcp;
 
-pub use fib::{FibSnapshot, FibWrite, FibWriter, KernelFib, KernelOracle, RT_TABLE_MAIN};
+pub use fib::{
+    FibSnapshot, FibStatus, FibWrite, FibWriter, KernelFib, KernelOracle, RT_TABLE_MAIN,
+    SnapshotHealth,
+};
 pub use tcp::{
     KernelTcpMd5, TCP_MD5SIG_MAXKEYLEN, TcpMd5Error, TcpMd5Key, TcpMd5KeyError, TcpMd5Port,
     TcpMd5Unsupported, install_tcp_md5_key, remove_tcp_md5_key,

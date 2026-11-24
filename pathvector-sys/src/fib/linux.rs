@@ -1,15 +1,23 @@
-//! Linux [`FibWriter`]: installs and withdraws BGP-learned routes via rtnetlink.
+//! Linux netlink adapters: [`FibWriter`] installs and withdraws BGP-learned
+//! routes via rtnetlink, and [`NetlinkSource`] is the kernel side of the
+//! snapshot supervisor's port (`supervisor.rs`).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
+    future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
-    sync::{Arc, RwLock},
 };
 
-use futures::{FutureExt, StreamExt, TryStreamExt};
-use netlink_packet_core::{NLM_F_APPEND, NLM_F_REPLACE, NetlinkMessage, NetlinkPayload, Nla};
+use futures::{
+    Stream, StreamExt, TryStreamExt,
+    channel::mpsc::{TryRecvError, UnboundedReceiver},
+};
+use netlink_packet_core::{
+    NLM_F_APPEND, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage,
+    NetlinkPayload, Nla,
+};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{
@@ -17,13 +25,20 @@ use netlink_packet_route::{
         RouteScope, RouteType, RouteVia,
     },
 };
-use rtnetlink::{MulticastGroup, RouteMessageBuilder, sys::AsyncSocket};
-use tokio::sync::watch;
+use rtnetlink::{
+    MulticastGroup, RouteMessageBuilder,
+    sys::{AsyncSocket, SocketAddr},
+};
+use tokio::task::JoinHandle;
 
 use super::{
     FibSnapshot, FibWrite, Ipv4Prefix, Ipv6Prefix, KernelRouteV4, KernelRouteV6, MultipathLeg,
     NextHopPath, NextHopV4, NextHopV6, Position, RoutePreference, RouteSlotV4, RouteSlotV6,
     TableId,
+    supervisor::{
+        DumpError, DumpReport, Family, Notification, Received, RereadFilter, RouteFeed,
+        RouteSource, RouteUpdate,
+    },
 };
 
 // ── FibWriter ─────────────────────────────────────────────────────────────────
@@ -154,147 +169,169 @@ impl FibWrite for FibWriter {
     }
 }
 
-// ── KernelFib event loop ──────────────────────────────────────────────────────
+// ── Snapshot supervisor port ──────────────────────────────────────────────────
 
-pub(super) async fn run(
-    snapshot: Arc<RwLock<FibSnapshot>>,
-    change_tx: watch::Sender<()>,
+/// Opens `NETLINK_ROUTE` sockets subscribed to `RTNLGRP_IPV4_ROUTE` and
+/// `RTNLGRP_IPV6_ROUTE`, tracking routing `table` (0 for all tables).
+pub(super) struct NetlinkSource {
     table: u32,
-) -> io::Result<()> {
-    // Step 1 — Open a multicast connection subscribed to route change groups
-    // BEFORE the dump so no events are missed during the window between dump
-    // completion and subscription start. Events arriving during the dump are
-    // idempotent (insert of an already-known prefix is a no-op update).
-    let (conn, handle, mut events) = rtnetlink::new_multicast_connection(&[
-        MulticastGroup::Ipv4Route,
-        MulticastGroup::Ipv6Route,
-    ])?;
-    tokio::spawn(conn);
-
-    // A second connection re-reads IPv6 sibling sets (see `reread_sets`).
-    // NETLINK_GET_STRICT_CHK (Linux 4.20+) makes the kernel apply the dump's
-    // table and device filters (`ip_valid_fib_dump_req`); without it the
-    // dump is unfiltered, which costs more but gives the same result,
-    // because the sets are picked out by slot here.
-    let (mut reread_conn, reread_handle, _) = rtnetlink::new_connection()?;
-    let _ = reread_conn
-        .socket_mut()
-        .socket_ref()
-        .set_netlink_get_strict_chk(true);
-    tokio::spawn(reread_conn);
-
-    // Step 2 — Populate snapshot from current kernel FIB.
-    //
-    // Build into a local snapshot while awaiting so the RwLockWriteGuard is
-    // never held across an await point (std::sync::RwLockWriteGuard is !Send).
-    // The dump lists each slot's routes in kernel order, so appending them
-    // reproduces that order.
-    let mut fresh = FibSnapshot::new();
-    let mut stream = handle
-        .route()
-        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
-        .execute();
-    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
-        apply_dumped(&mut fresh, &msg, table);
-    }
-
-    let mut stream = handle
-        .route()
-        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
-        .execute();
-    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
-        apply_dumped(&mut fresh, &msg, table);
-    }
-
-    *snapshot.write().expect("FibSnapshot poisoned") = fresh;
-
-    // Notify watchers: initial FIB loaded.
-    let _ = change_tx.send(());
-
-    // Step 3 — Apply incremental changes delivered by the multicast connection.
-    //
-    // `change_tx` fires only when the snapshot actually changes.  BGP routes
-    // (RTPROT_BGP) are excluded from the snapshot entirely — they represent
-    // destinations we reach *via* BGP, not the IGP paths used to reach BGP
-    // next-hops.  Including them would create a feedback loop: every route we
-    // install via `FibWriter` would trigger a `change_tx`, waking the event
-    // loop and causing a spurious full `recompute_all` scan over the Loc-RIB.
-    //
-    // This matches the approach used by BIRD (krt.c protocol-tag filter) and
-    // FRR/Zebra (rtm_protocol == RTPROT_ZEBRA skip) — both daemon suites filter
-    // self-installed routes before deciding whether to re-run the decision
-    // process.
-    //
-    // The netlink header flags matter: NLM_F_REPLACE means the kernel replaced
-    // an existing route without sending RTM_DELROUTE for it, and NLM_F_APPEND
-    // says where in its slot an IPv4 route was inserted.
-    //
-    // Once a delete calls for a re-read, events already queued (up to
-    // `REREAD_BATCH`) are applied before it, so a burst of deletes costs one
-    // dump per table and device. Each change is still signalled at once.
-    while let Some(event) = events.next().await {
-        let mut reread = HashSet::new();
-        let mut next = Some(event);
-        let mut applied = 0;
-        while let Some((msg, _addr)) = next {
-            if apply_event(&snapshot, msg, table, &mut reread) {
-                let _ = change_tx.send(());
-            }
-            applied += 1;
-            next = if reread.is_empty() || applied >= REREAD_BATCH {
-                None
-            } else {
-                events.next().now_or_never().flatten()
-            };
-        }
-        if !reread.is_empty() && reread_sets(&reread_handle, &snapshot, reread).await {
-            let _ = change_tx.send(());
-        }
-    }
-
-    Ok(())
+    receive_buffer: Option<NonZeroU32>,
 }
 
-/// The most queued events applied before a pending re-read runs.
-const REREAD_BATCH: usize = 1024;
+impl NetlinkSource {
+    pub(super) fn new(table: u32, receive_buffer: Option<NonZeroU32>) -> Self {
+        Self {
+            table,
+            receive_buffer,
+        }
+    }
+}
 
-/// Applies one multicast route event. An IPv6 delete that leaves a route with
-/// an inferred protocol in its slot adds the slot to `reread`.
-fn apply_event(
-    snapshot: &RwLock<FibSnapshot>,
-    msg: NetlinkMessage<RouteNetlinkMessage>,
+impl RouteSource for NetlinkSource {
+    type Feed = NetlinkFeed;
+
+    /// Must be called inside a tokio runtime: the connection task is spawned.
+    fn connect(&mut self) -> io::Result<NetlinkFeed> {
+        // Subscribing before any dump is sent means every change made while a
+        // dump runs is also notified on this socket.
+        let (mut conn, handle, events) = rtnetlink::new_multicast_connection(&[
+            MulticastGroup::Ipv4Route,
+            MulticastGroup::Ipv6Route,
+        ])?;
+        // netlink-proto 0.12 does not pass NLMSG_DONE on by default; without
+        // it a dump that stops because the connection ended looks the same as
+        // a complete one (see `read_dump`).
+        conn.set_forward_done(true);
+        if let Some(bytes) = self.receive_buffer {
+            let bytes = libc::c_int::try_from(bytes.get()).unwrap_or(libc::c_int::MAX);
+            conn.socket_mut().socket_mut().set_rx_buf_sz(bytes)?;
+        }
+        Ok(NetlinkFeed {
+            handle,
+            events,
+            table: self.table,
+            _connection: AbortOnDrop(tokio::spawn(conn)),
+        })
+    }
+}
+
+/// Aborts the connection task when the feed is dropped, so a replaced
+/// connection never lingers.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One supervised netlink connection.
+///
+/// The connection task reads the socket and forwards multicast messages to
+/// `events`. When it finishes (a receive error other than `ENOBUFS`, a send
+/// error, an undecodable datagram) the sender is dropped and `events` ends,
+/// which is how connection loss reaches the supervisor.
+pub(super) struct NetlinkFeed {
+    handle: rtnetlink::Handle,
+    events: UnboundedReceiver<(NetlinkMessage<RouteNetlinkMessage>, SocketAddr)>,
     table: u32,
-    reread: &mut HashSet<RouteSlotV6>,
-) -> bool {
-    let flags = msg.header.flags;
-    let mut snap = snapshot.write().expect("FibSnapshot poisoned");
-    match msg.payload {
-        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
-            apply_new(&mut snap, &route, flags, table)
+    _connection: AbortOnDrop,
+}
+
+impl RouteFeed for NetlinkFeed {
+    type Update = NetlinkRouteUpdate;
+
+    async fn next(&mut self) -> Option<Notification<NetlinkRouteUpdate>> {
+        // `UnboundedReceiver::next` is cancel safe.
+        loop {
+            let (msg, _) = self.events.next().await?;
+            if let Some(n) = notification(msg, self.table) {
+                return Some(n);
+            }
         }
-        NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route)) => {
-            let changed = apply_del(&mut snap, &route, table);
-            reread.extend(slot_to_reread(&snap, &route, table));
-            changed
+    }
+
+    fn try_next(&mut self) -> Received<NetlinkRouteUpdate> {
+        loop {
+            match self.events.try_recv() {
+                Ok((msg, _)) => {
+                    if let Some(n) = notification(msg, self.table) {
+                        return Received::Notification(n);
+                    }
+                }
+                Err(TryRecvError::Empty) => return Received::Empty,
+                Err(TryRecvError::Closed) => return Received::Closed,
+            }
         }
-        _ => false,
+    }
+
+    fn dump(
+        &mut self,
+        family: Family,
+    ) -> impl Future<Output = Result<DumpReport, DumpError>> + Send + 'static {
+        let request = match family {
+            Family::V4 => RouteMessageBuilder::<Ipv4Addr>::new().build(),
+            Family::V6 => RouteMessageBuilder::<Ipv6Addr>::new().build(),
+        };
+        let mut request = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(request));
+        request.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        // The request is queued now; `request` fails only when the
+        // connection task has finished.
+        let replies = self.handle.request(request);
+        let table = self.table;
+        async move {
+            let replies = replies.map_err(|_| DumpError::ConnectionLost)?;
+            let mut routes = FibSnapshot::new();
+            let interrupted = read_dump(replies, &mut routes, table).await?;
+            Ok(DumpReport {
+                routes,
+                interrupted,
+            })
+        }
+    }
+
+    /// Dumps on a connection of its own, opened for this read and closed with
+    /// it. The feed's socket cannot take the strict checking that filters the
+    /// dump: the full dumps' headers (from `RouteMessageBuilder`) name table
+    /// main, protocol static and type unicast, which a strict-checked dump
+    /// would apply as filters. And a read abandoned on a socket of its own
+    /// leaves no dump running where `__netlink_dump_start` would answer the
+    /// feed's next dump with `EBUSY`.
+    fn reread(
+        &mut self,
+        filter: RereadFilter,
+        slots: HashSet<RouteSlotV6>,
+    ) -> impl Future<Output = Result<Vec<Vec<KernelRouteV6>>, DumpError>> + Send + 'static {
+        let mut request =
+            NetlinkMessage::from(RouteNetlinkMessage::GetRoute(reread_request(filter)));
+        request.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        async move {
+            let (mut conn, mut handle, _) =
+                rtnetlink::new_connection().map_err(DumpError::Failed)?;
+            conn.set_forward_done(true);
+            // NETLINK_GET_STRICT_CHK (Linux 4.20+) makes the kernel apply the
+            // table and device filters (`ip_valid_fib_dump_req`). Without it
+            // the dump is unfiltered: it costs more but gives the same
+            // result, because the sets are picked out by slot.
+            let _ = conn
+                .socket_mut()
+                .socket_ref()
+                .set_netlink_get_strict_chk(true);
+            let _connection = AbortOnDrop(tokio::spawn(conn));
+            let replies = handle
+                .request(request)
+                .map_err(|_| DumpError::ConnectionLost)?;
+            let mut sets = Vec::new();
+            read_replies(replies, |route| sets.extend(wanted_set(route, &slots))).await?;
+            Ok(sets)
+        }
     }
 }
 
 // ── Re-reading IPv6 sibling sets ──────────────────────────────────────────────
 //
-// An IPv6 ECMP sibling's protocol is reported only when a message describes
-// that sibling, and a dump describes a set only through its first sibling
-// (`fib6_dump_node`: "no need to dump the sibling routes again"). The other
-// siblings carry an inferred protocol (see the `route` module docs).
-//
-// A delete changes what the kernel describes: once the first sibling is gone
-// the next one heads the set, and a lone remaining route is described in
-// full. So after a delete that leaves a set headed by a route with an
-// inferred protocol, the set is read back and applied with
-// `RouteMirror::redescribe`.
-//
-// No request can target one prefix:
+// The supervisor decides when a set is re-read (see its module docs); this is
+// the request. No request can target one prefix:
 // - A strict-checked dump rejects a prefix (`ip_valid_fib_dump_req`:
 //   `rtm_dst_len || rtm_src_len || rtm_tos || rtm_scope` is "Invalid values
 //   in header for FIB dump request"); it filters only by table, protocol,
@@ -309,54 +346,19 @@ fn apply_event(
 // inferred route (`fib6_info_uses_dev` matches a set through any sibling),
 // and the wanted sets are picked out by slot.
 
-/// The slot to re-read after an IPv6 `RTM_DELROUTE` has been applied: the
-/// deleted route's slot, if its sibling set is now headed by a route whose
-/// protocol is inferred. That is the route a dump now describes; with a known
-/// head, a dump would only repeat what is known.
-fn slot_to_reread(snap: &FibSnapshot, msg: &RouteMessage, table: u32) -> Option<RouteSlotV6> {
-    if !in_table(msg, table) || msg.header.address_family != AddressFamily::Inet6 {
-        return None;
-    }
-    let slot = decode_v6(msg).first()?.slot;
-    snap.v6.inferred_set_head(&slot).map(|_| slot)
-}
-
-/// A re-read dump: one routing table, optionally only routes using a device.
-type DumpFilter = (TableId, Option<NonZeroU32>);
-
-/// Groups the slots whose set is still headed by an inferred route by the
-/// dump that will re-read them. Slots settled by later events in the same
-/// burst are dropped.
-fn reread_groups(
-    snap: &FibSnapshot,
-    slots: HashSet<RouteSlotV6>,
-) -> HashMap<DumpFilter, HashSet<RouteSlotV6>> {
-    let mut groups: HashMap<DumpFilter, HashSet<RouteSlotV6>> = HashMap::new();
-    for slot in slots {
-        let Some(route) = snap.v6.inferred_set_head(&slot) else {
-            continue;
-        };
-        let oif = match route.next_hop {
-            NextHopV6::Path(p) => p.oif,
-            NextHopV6::Object(_) => None,
-        };
-        groups.entry((slot.table, oif)).or_default().insert(slot);
-    }
-    groups
-}
-
-/// An `RTM_GETROUTE` dump request for IPv6 routes in `table`, limited to
-/// routes using `oif` if given. The header obeys `ip_valid_fib_dump_req`:
-/// zero prefix lengths, TOS and scope, and no protocol or type filter.
-fn reread_request(table: TableId, oif: Option<NonZeroU32>) -> RouteMessage {
+/// An `RTM_GETROUTE` dump request for the IPv6 routes `filter` selects. The
+/// header obeys `ip_valid_fib_dump_req`: zero prefix lengths, TOS and scope,
+/// and no protocol or type filter.
+fn reread_request(filter: RereadFilter) -> RouteMessage {
     let mut msg = RouteMessage::default();
     msg.header.address_family = AddressFamily::Inet6;
     msg.header.table = RouteHeader::RT_TABLE_UNSPEC;
     msg.header.protocol = RouteProtocol::Unspec;
     msg.header.kind = RouteType::Unspec;
     msg.header.scope = RouteScope::Universe;
-    msg.attributes.push(RouteAttribute::Table(table.get()));
-    if let Some(oif) = oif {
+    msg.attributes
+        .push(RouteAttribute::Table(filter.table.get()));
+    if let Some(oif) = filter.oif {
         msg.attributes.push(RouteAttribute::Oif(oif.get()));
     }
     msg
@@ -371,42 +373,123 @@ fn wanted_set(msg: &RouteMessage, slots: &HashSet<RouteSlotV6>) -> Option<Vec<Ke
     slots.contains(&set.first()?.slot).then_some(set)
 }
 
-/// Dumps the IPv6 routes `filter` selects and returns the sets in `slots`.
-async fn dump_sets(
-    handle: &rtnetlink::Handle,
-    (table, oif): DumpFilter,
-    slots: &HashSet<RouteSlotV6>,
-) -> io::Result<Vec<Vec<KernelRouteV6>>> {
-    let mut stream = handle.route().get(reread_request(table, oif)).execute();
-    let mut sets = Vec::new();
-    while let Some(msg) = stream.try_next().await.map_err(io::Error::other)? {
-        sets.extend(wanted_set(&msg, slots));
-    }
-    Ok(sets)
+/// Reads one dump's replies into `into`; returns whether the dump was
+/// interrupted (`NLM_F_DUMP_INTR`).
+///
+/// The dump is complete only when `NLMSG_DONE` arrives: netlink-proto closes
+/// a request's reply stream both after `NLMSG_DONE` and when the connection
+/// shuts down, so the end of the stream alone proves nothing. A non-zero
+/// error in `NLMSG_DONE` (`netlink_dump_done` copies the dumper's error
+/// there) or an `NLMSG_ERROR` reply fails the dump. `NLM_F_DUMP_INTR` on any
+/// reply, `NLMSG_DONE` included (`netlink_dump_done` calls
+/// `nl_dump_check_consistent`), marks it interrupted.
+pub(super) async fn read_dump(
+    replies: impl Stream<Item = NetlinkMessage<RouteNetlinkMessage>>,
+    into: &mut FibSnapshot,
+    table: u32,
+) -> Result<bool, DumpError> {
+    read_replies(replies, |route| {
+        apply_dumped(into, route, table);
+    })
+    .await
 }
 
-/// Re-reads the sibling sets in `slots` and applies them. The snapshot lock is
-/// not held while the kernel is read. If a dump fails, its slots keep their
-/// inferred protocols until a later delete re-reads them.
-///
-/// Returns `true` if the tracked routes changed.
-async fn reread_sets(
-    handle: &rtnetlink::Handle,
-    snapshot: &RwLock<FibSnapshot>,
-    slots: HashSet<RouteSlotV6>,
-) -> bool {
-    let groups = reread_groups(&snapshot.read().expect("FibSnapshot poisoned"), slots);
-    let mut changed = false;
-    for (filter, slots) in groups {
-        let Ok(sets) = dump_sets(handle, filter, &slots).await else {
-            continue;
-        };
-        let mut snap = snapshot.write().expect("FibSnapshot poisoned");
-        for set in sets {
-            changed |= snap.v6.redescribe(set);
+/// Reads a dump's replies, passing each route to `on_route`, with the
+/// completion rules of [`read_dump`].
+async fn read_replies(
+    replies: impl Stream<Item = NetlinkMessage<RouteNetlinkMessage>>,
+    mut on_route: impl FnMut(&RouteMessage),
+) -> Result<bool, DumpError> {
+    let mut replies = std::pin::pin!(replies);
+    let mut interrupted = false;
+    while let Some(msg) = replies.next().await {
+        interrupted |= msg.header.flags & NLM_F_DUMP_INTR != 0;
+        match msg.payload {
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
+                on_route(&route);
+            }
+            NetlinkPayload::Done(done) if done.code < 0 => {
+                return Err(DumpError::Failed(io::Error::from_raw_os_error(-done.code)));
+            }
+            NetlinkPayload::Done(_) => return Ok(interrupted),
+            NetlinkPayload::Error(e) if e.code.is_some() => {
+                return Err(DumpError::Failed(e.to_io()));
+            }
+            _ => {}
         }
     }
-    changed
+    Err(DumpError::ConnectionLost)
+}
+
+/// Classifies a message from the multicast channel.
+///
+/// netlink-proto 0.12 turns `ENOBUFS` from `recvmsg` into an `NLMSG_OVERRUN`
+/// message (`framed.rs`); route notifications carry `RTM_NEWROUTE` or
+/// `RTM_DELROUTE`. Anything else (another address family, a control message)
+/// is not a route change for the snapshot.
+pub(super) fn notification(
+    msg: NetlinkMessage<RouteNetlinkMessage>,
+    table: u32,
+) -> Option<Notification<NetlinkRouteUpdate>> {
+    let flags = msg.header.flags;
+    let (route, delete) = match msg.payload {
+        NetlinkPayload::Overrun(_) => return Some(Notification::Overrun),
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => (route, false),
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route)) => (route, true),
+        _ => return None,
+    };
+    let family = match route.header.address_family {
+        AddressFamily::Inet => Family::V4,
+        AddressFamily::Inet6 => Family::V6,
+        _ => return None,
+    };
+    Some(Notification::Route(NetlinkRouteUpdate {
+        route,
+        flags,
+        delete,
+        family,
+        table,
+    }))
+}
+
+/// A route notification with the netlink header flags it arrived with.
+#[derive(Debug)]
+pub(super) struct NetlinkRouteUpdate {
+    route: RouteMessage,
+    flags: u16,
+    delete: bool,
+    family: Family,
+    table: u32,
+}
+
+impl RouteUpdate for NetlinkRouteUpdate {
+    fn family(&self) -> Family {
+        self.family
+    }
+
+    /// Returns `true` only when the tracked routes changed (see
+    /// [`apply_new`] / [`apply_del`]), so `change_tx` never fires for BGP
+    /// routes: they are mirrored only as identities, which keeps every route
+    /// we install via `FibWriter` from waking the event loop and triggering a
+    /// spurious full `recompute_all` scan over the Loc-RIB.
+    ///
+    /// The netlink header flags matter: `NLM_F_REPLACE` means the kernel
+    /// replaced an existing route without sending `RTM_DELROUTE` for it, and
+    /// `NLM_F_APPEND` says where in its slot an IPv4 route was inserted.
+    fn apply(&self, snapshot: &mut FibSnapshot) -> bool {
+        if self.delete {
+            apply_del(snapshot, &self.route, self.table)
+        } else {
+            apply_new(snapshot, &self.route, self.flags, self.table)
+        }
+    }
+
+    fn deleted_v6(&self) -> Option<RouteSlotV6> {
+        if !self.delete || self.family != Family::V6 || !in_table(&self.route, self.table) {
+            return None;
+        }
+        decode_v6(&self.route).first().map(|r| r.slot)
+    }
 }
 
 // ── Stale BGP route dump ──────────────────────────────────────────────────────
@@ -1060,7 +1143,10 @@ async fn withdraw_route_v6(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::{
+        collections::HashMap,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
 
     use netlink_packet_route::{
         AddressFamily,
@@ -1070,7 +1156,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::fib::{RejectKind, RouteKind};
+    use crate::fib::{RejectKind, RouteKind, supervisor};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -2104,29 +2190,32 @@ mod tests {
         decode_v6(msg)[0].slot
     }
 
-    /// Applies an `RTM_DELROUTE` the way the event loop does.
-    fn delete_event(snap: &mut FibSnapshot, msg: &RouteMessage) -> HashSet<RouteSlotV6> {
-        let lock = RwLock::new(std::mem::take(snap));
-        let mut reread = HashSet::new();
-        apply_event(
-            &lock,
-            NetlinkMessage::from(RouteNetlinkMessage::DelRoute(msg.clone())),
-            254,
-            &mut reread,
-        );
-        *snap = lock.into_inner().unwrap();
-        reread
+    /// An `RTM_DELROUTE` notification for `msg`, tracking the main table.
+    fn delete_update(msg: &RouteMessage) -> NetlinkRouteUpdate {
+        let msg = NetlinkMessage::from(RouteNetlinkMessage::DelRoute(msg.clone()));
+        match notification(msg, 254) {
+            Some(Notification::Route(update)) => update,
+            other => panic!("not a route notification: {other:?}"),
+        }
     }
 
-    /// Applies the kernel's answer to a re-read the way `reread_sets` does.
+    /// Applies an `RTM_DELROUTE` the way the supervisor does; returns the
+    /// slots it would re-read.
+    fn delete_event(snap: &mut FibSnapshot, msg: &RouteMessage) -> HashSet<RouteSlotV6> {
+        let (_, reread) = supervisor::apply_update(snap, &delete_update(msg));
+        reread.into_iter().collect()
+    }
+
+    /// Applies the kernel's answer to a re-read the way the supervisor's
+    /// `reread_sets` does, with the sets picked out as `reread` picks them.
     fn reread_answer(
         snap: &mut FibSnapshot,
         slots: HashSet<RouteSlotV6>,
         dump: &[RouteMessage],
     ) -> bool {
         let mut changed = false;
-        for (filter, slots) in reread_groups(snap, slots) {
-            assert_eq!(filter.0, TableId::MAIN);
+        for (filter, slots) in supervisor::reread_groups(snap, slots) {
+            assert_eq!(filter.table, TableId::MAIN);
             for set in dump.iter().filter_map(|m| wanted_set(m, &slots)) {
                 changed |= snap.v6.redescribe(set);
             }
@@ -2266,11 +2355,7 @@ mod tests {
         apply_new(&mut snap, &v4, CREATE, 254);
         assert!(delete_event(&mut snap, &v4).is_empty());
         assert_eq!(
-            slot_to_reread(
-                &FibSnapshot::new(),
-                &igp_v6_msg("2001:db8::", 32, 10, 200),
-                254
-            ),
+            delete_update(&igp_v6_msg("2001:db8::", 32, 10, 200)).deleted_v6(),
             None
         );
     }
@@ -2306,16 +2391,19 @@ mod tests {
         snap.v6.upsert(settled.clone(), Position::Back);
         let settled = settled.slot;
 
-        let groups = reread_groups(&snap, HashSet::from([a, b, c, d, settled]));
+        let groups = supervisor::reread_groups(&snap, HashSet::from([a, b, c, d, settled]));
+        let filter = |table, oif| RereadFilter {
+            table,
+            oif: NonZeroU32::new(oif),
+        };
         let main = TableId::MAIN;
         let other = TableId::new(300).unwrap();
-        let oif = |i| NonZeroU32::new(i);
         assert_eq!(
             groups,
             HashMap::from([
-                ((main, oif(2)), HashSet::from([a, b])),
-                ((main, oif(3)), HashSet::from([c])),
-                ((other, oif(2)), HashSet::from([d])),
+                (filter(main, 2), HashSet::from([a, b])),
+                (filter(main, 3), HashSet::from([c])),
+                (filter(other, 2), HashSet::from([d])),
             ])
         );
     }
@@ -2327,7 +2415,10 @@ mod tests {
         // nonzero rtm_protocol or rtm_type would filter by the described
         // route's protocol or type. Without RTA_DST rtnetlink sends
         // NLM_F_DUMP.
-        let msg = reread_request(TableId::new(300).unwrap(), NonZeroU32::new(7));
+        let msg = reread_request(RereadFilter {
+            table: TableId::new(300).unwrap(),
+            oif: NonZeroU32::new(7),
+        });
         assert_eq!(msg.header.address_family, AddressFamily::Inet6);
         assert_eq!(
             (
@@ -2346,7 +2437,10 @@ mod tests {
             msg.attributes,
             [RouteAttribute::Table(300), RouteAttribute::Oif(7)]
         );
-        let any_device = reread_request(TableId::MAIN, None);
+        let any_device = reread_request(RereadFilter {
+            table: TableId::MAIN,
+            oif: None,
+        });
         assert_eq!(any_device.attributes, [RouteAttribute::Table(254)]);
     }
 
@@ -2736,5 +2830,169 @@ mod tests {
     fn dump_stale_v6_excludes_igp_route() {
         let msg = igp_v6_msg("2001:db8::", 32, 100, 254);
         assert!(!is_bgp_route(&msg));
+    }
+
+    // ── Snapshot supervisor port (issue #59) ─────────────────────────────────
+    //
+    // netlink-proto 0.12 closes a request's reply stream both after
+    // NLMSG_DONE and when the connection shuts down, and turns ENOBUFS into an
+    // NLMSG_OVERRUN message on the multicast channel (framed.rs). The kernel
+    // copies a dumper's error into NLMSG_DONE and may flag any reply with
+    // NLM_F_DUMP_INTR (netlink_dump_done, nl_dump_check_consistent).
+
+    use futures::{executor::block_on, stream};
+    use netlink_packet_core::{DoneMessage, ErrorMessage, NetlinkHeader};
+
+    use crate::fib::supervisor::{DumpError, Family, Notification, RouteUpdate};
+
+    fn reply(route: RouteMessage) -> NetlinkMessage<RouteNetlinkMessage> {
+        NetlinkMessage::from(RouteNetlinkMessage::NewRoute(route))
+    }
+
+    fn done(code: i32, flags: u16) -> NetlinkMessage<RouteNetlinkMessage> {
+        let mut msg = DoneMessage::default();
+        msg.code = code;
+        let mut header = NetlinkHeader::default();
+        header.flags = flags;
+        NetlinkMessage::new(header, NetlinkPayload::Done(msg))
+    }
+
+    fn dump_of(
+        msgs: Vec<NetlinkMessage<RouteNetlinkMessage>>,
+    ) -> (Result<bool, DumpError>, FibSnapshot) {
+        let mut snap = FibSnapshot::new();
+        let result = block_on(read_dump(stream::iter(msgs), &mut snap, 254));
+        (result, snap)
+    }
+
+    #[test]
+    fn a_dump_is_complete_only_with_its_done_message() {
+        let routes = || {
+            vec![
+                reply(igp_v4_msg("10.0.0.0", 8, 10, 254)),
+                reply(igp_v6_msg("2001:db8::", 32, 10, 254)),
+            ]
+        };
+        let (result, snap) = dump_of(routes());
+        assert!(
+            matches!(result, Err(DumpError::ConnectionLost)),
+            "a reply stream that just ends was cut short: {result:?}"
+        );
+        assert_eq!(
+            snap.routes_v4().count(),
+            1,
+            "read, but the caller discards it"
+        );
+
+        let mut msgs = routes();
+        msgs.push(done(0, 0));
+        let (result, snap) = dump_of(msgs);
+        assert!(!result.unwrap(), "not interrupted");
+        assert_eq!((snap.routes_v4().count(), snap.routes_v6().count()), (1, 1));
+    }
+
+    #[test]
+    fn dump_intr_on_any_reply_or_the_done_message_marks_the_dump_interrupted() {
+        let mut flagged = reply(igp_v4_msg("10.0.0.0", 8, 10, 254));
+        flagged.header.flags |= NLM_F_DUMP_INTR;
+        let (result, _) = dump_of(vec![flagged, done(0, 0)]);
+        assert!(result.unwrap());
+
+        let (result, _) = dump_of(vec![done(0, NLM_F_DUMP_INTR)]);
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn a_dump_error_fails_the_dump() {
+        const EBUSY: i32 = 16;
+        let (result, _) = dump_of(vec![done(-EBUSY, 0)]);
+        match result {
+            Err(DumpError::Failed(e)) => assert_eq!(e.raw_os_error(), Some(EBUSY)),
+            other => panic!("expected Failed(EBUSY), got {other:?}"),
+        }
+
+        let mut err = ErrorMessage::default();
+        err.code = std::num::NonZeroI32::new(-EBUSY);
+        let nack = NetlinkMessage::new(NetlinkHeader::default(), NetlinkPayload::Error(err));
+        let (result, _) = dump_of(vec![nack]);
+        match result {
+            Err(DumpError::Failed(e)) => assert_eq!(e.raw_os_error(), Some(EBUSY)),
+            other => panic!("expected Failed(EBUSY), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multicast_messages_are_classified() {
+        let overrun = NetlinkMessage::<RouteNetlinkMessage>::new(
+            NetlinkHeader::default(),
+            NetlinkPayload::Overrun(Vec::new()),
+        );
+        assert!(matches!(
+            notification(overrun, 254),
+            Some(Notification::Overrun)
+        ));
+
+        let new = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(igp_v6_msg(
+            "2001:db8::",
+            32,
+            10,
+            254,
+        )));
+        let Some(Notification::Route(update)) = notification(new, 254) else {
+            panic!("RTM_NEWROUTE is a route notification");
+        };
+        assert_eq!(update.family(), Family::V6);
+
+        // A route from another table or one installed by BGP changes nothing
+        // in the snapshot but still counts as a change to that family.
+        let bgp = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(bgp_v4_msg(
+            "10.0.0.0", 8, 254,
+        )));
+        let Some(Notification::Route(update)) = notification(bgp, 254) else {
+            panic!("a BGP route is still a route notification");
+        };
+        assert_eq!(update.family(), Family::V4);
+        assert!(!update.apply(&mut FibSnapshot::new()));
+
+        let mut mpls = igp_v4_msg("10.0.0.0", 8, 10, 254);
+        mpls.header.address_family = AddressFamily::Mpls;
+        let other = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(mpls));
+        assert!(notification(other, 254).is_none());
+    }
+
+    #[test]
+    fn route_updates_apply_with_their_header_flags() {
+        let mut snap = FibSnapshot::new();
+        let add = |metric, flags| {
+            let mut msg = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(igp_v4_msg(
+                "10.0.0.0", 8, metric, 254,
+            )));
+            msg.header.flags = flags;
+            match notification(msg, 254) {
+                Some(Notification::Route(u)) => u,
+                _ => unreachable!(),
+            }
+        };
+        assert!(add(10, 0).apply(&mut snap));
+        // NLM_F_REPLACE replaces the slot's route rather than adding another.
+        let mut replacing = igp_v4_msg("10.0.0.0", 8, 10, 254);
+        replacing.header.protocol = RouteProtocol::Static;
+        let mut msg = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(replacing));
+        msg.header.flags = NLM_F_REPLACE;
+        let Some(Notification::Route(update)) = notification(msg, 254) else {
+            unreachable!()
+        };
+        assert!(update.apply(&mut snap));
+        assert_eq!(snap.routes_v4().count(), 1);
+        assert_eq!(snap.routes_v4().next().unwrap().protocol, 4); // RTPROT_STATIC
+
+        let mut gone = igp_v4_msg("10.0.0.0", 8, 10, 254);
+        gone.header.protocol = RouteProtocol::Static;
+        let del = NetlinkMessage::from(RouteNetlinkMessage::DelRoute(gone));
+        let Some(Notification::Route(update)) = notification(del, 254) else {
+            unreachable!()
+        };
+        assert!(update.apply(&mut snap));
+        assert_eq!(snap.routes_v4().count(), 0);
     }
 }

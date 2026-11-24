@@ -981,7 +981,45 @@ mod sidecar_tests {
         }
     }
 
-    /// Captures what `f` logs through `tracing`, as plain text.
+    /// Runs `body` as the test `name` in a child process of its own: the
+    /// test binary is run again, filtered to that one test, and must pass.
+    ///
+    /// For the tests that check what `tracing` logs. tracing-core caches
+    /// each callsite's interest process-wide, and while only one scoped
+    /// subscriber is alive it registers a callsite against the default of
+    /// whichever thread reaches it first, without a lock. A test running
+    /// in parallel with no subscriber (`invalid_entry_does_not_drop_valid_peers`
+    /// logs through the same callsite) can then cache it as never enabled,
+    /// and the capturing test sees no output. In the child, nothing else
+    /// runs.
+    fn in_own_process(name: &str, body: impl FnOnce()) {
+        const CHILD: &str = "PATHVECTORD_ISOLATED_TEST";
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, m)| m);
+        let test = format!("{module}::{name}");
+        if std::env::var(CHILD).is_ok_and(|v| v == test) {
+            body();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact", "--test-threads=1"])
+            .env(CHILD, &test)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{test} failed in its own process:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "{test} did not run in its own process:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// Captures what `f` logs through `tracing`, as plain text. Call it only
+    /// inside [`in_own_process`].
     fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1017,43 +1055,47 @@ mod sidecar_tests {
     /// a syntax error. Diagnostics must not echo the file.
     #[test]
     fn unparseable_sidecar_log_does_not_reveal_passwords() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dynamic_peers.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\nmd5_password = \"{SECRET}\" oops\n"
-            ),
-        )
-        .unwrap();
+        in_own_process("unparseable_sidecar_log_does_not_reveal_passwords", || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dynamic_peers.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\nmd5_password = \"{SECRET}\" oops\n"
+                ),
+            )
+            .unwrap();
 
-        let (peers, logs) = capture_logs(|| DynamicPeerStore::new(path).load());
-        assert!(peers.is_empty());
-        assert!(!logs.is_empty(), "the failure must still be logged");
-        assert!(!logs.contains(SECRET), "password leaked into logs: {logs}");
+            let (peers, logs) = capture_logs(|| DynamicPeerStore::new(path).load());
+            assert!(peers.is_empty());
+            assert!(!logs.is_empty(), "the failure must still be logged");
+            assert!(!logs.contains(SECRET), "password leaked into logs: {logs}");
+        });
     }
 
     /// Same for a password the validator rejects (over 80 bytes): the
     /// rejection is logged, the password is not.
     #[test]
     fn rejected_sidecar_password_is_not_logged() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dynamic_peers.toml");
-        let long = format!("{SECRET}-{}", "x".repeat(80));
-        std::fs::write(
-            &path,
-            format!(
-                "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\nmd5_password = \"{long}\"\n"
-            ),
-        )
-        .unwrap();
+        in_own_process("rejected_sidecar_password_is_not_logged", || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dynamic_peers.toml");
+            let long = format!("{SECRET}-{}", "x".repeat(80));
+            std::fs::write(
+                &path,
+                format!(
+                    "[[peers]]\naddress = \"10.0.0.1\"\nremote_as = 65001\nmd5_password = \"{long}\"\n"
+                ),
+            )
+            .unwrap();
 
-        let (_, logs) = capture_logs(|| DynamicPeerStore::new(path).load());
-        assert!(
-            logs.contains("too long"),
-            "rejection must be logged: {logs}"
-        );
-        assert!(!logs.contains(SECRET), "password leaked into logs: {logs}");
+            let (_, logs) = capture_logs(|| DynamicPeerStore::new(path).load());
+            assert!(
+                logs.contains("too long"),
+                "rejection must be logged: {logs}"
+            );
+            assert!(!logs.contains(SECRET), "password leaked into logs: {logs}");
+        });
     }
 
     /// PR #124 review: a sidecar written before passwords were validated can

@@ -5,6 +5,7 @@
 //! interact with it via the returned [`SpawnedSessionHandle`], which
 //! implements the [`SessionHandle`] trait.
 
+pub mod listener;
 #[cfg(test)]
 mod prop_tests;
 pub mod tcp_md5;
