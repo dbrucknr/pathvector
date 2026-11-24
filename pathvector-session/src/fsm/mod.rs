@@ -10,6 +10,13 @@ use std::time::Duration;
 
 use pathvector_types::PeerType;
 
+mod recovery;
+
+use recovery::Outcome;
+pub use recovery::UpdateRecovery;
+#[cfg(test)]
+pub(crate) use recovery::make_treat_as_withdraw;
+
 use crate::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
     OpenMsgError, UpdateMessage, encode_capability_value,
@@ -115,6 +122,25 @@ pub enum FsmInput {
     /// The full [`NotificationMessage`] is carried so the RFC-mandated data
     /// field is preserved verbatim.
     ProtocolErrorNotificationToSend(crate::message::NotificationMessage),
+    /// An UPDATE with a malformed path attribute was received, together with
+    /// its RFC 7606 recovery decision.
+    ///
+    /// This is RFC 4271 §8.2.2 Event 27 or Event 28 depending on the
+    /// decision, and — like a normal UPDATE — is only acted on according to
+    /// the *current state*: ignored in `Idle`; connection dropped in
+    /// `Connect`/`Active`; a Finite State Machine Error NOTIFICATION in
+    /// `OpenSent`/`OpenConfirm` (regardless of the recovery decision, since
+    /// RFC 7606 does not authorize processing any UPDATE before
+    /// `Established`); and only in `Established` is the recovery applied
+    /// (a recovered UPDATE is forwarded and restarts the `HoldTimer`; a
+    /// session reset sends its NOTIFICATION and reconnects).
+    ///
+    /// The payload is an opaque [`UpdateRecovery`], obtainable only from
+    /// [`UpdateRecovery::classify`], so a recovery outcome cannot be
+    /// fabricated or applied outside this state machine. Feeding
+    /// `MessageReceived(BgpMessage::MalformedUpdate(_))` is equivalent: it is
+    /// classified and routed here.
+    MalformedUpdate(UpdateRecovery),
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -282,6 +308,15 @@ impl Fsm {
     /// Feed one input event, advance the FSM, and return the ordered list of
     /// actions to execute.
     pub fn process(&mut self, input: FsmInput) -> Vec<FsmOutput> {
+        // A raw `MalformedUpdate` message is the same event as the classified
+        // input; normalise so no state handler can mistake it for an
+        // "unexpected message type".
+        let input = match input {
+            FsmInput::MessageReceived(BgpMessage::MalformedUpdate(m)) => {
+                FsmInput::MalformedUpdate(UpdateRecovery::classify(m))
+            }
+            other => other,
+        };
         match self.state {
             State::Idle => self.on_idle(&input),
             State::Connect => self.on_connect(&input),
@@ -319,6 +354,14 @@ impl Fsm {
                 FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
             ],
             FsmInput::ManualStop => self.do_stop_pre_open(),
+            // RFC 4271 §8.2.2 Connect: "In response to any other events
+            // (Events 8, 10-11, 13, 19, 23, 25-28)": stop the
+            // ConnectRetryTimer, drop the TCP connection, → Idle. No
+            // NOTIFICATION is listed. Events 27 (UpdateMsg) and 28
+            // (UpdateMsgErr) are handled here for every recovery outcome.
+            FsmInput::MessageReceived(BgpMessage::Update(_)) | FsmInput::MalformedUpdate(_) => {
+                self.do_stop_pre_open()
+            }
             _ => vec![],
         }
     }
@@ -334,6 +377,11 @@ impl Fsm {
                 ]
             }
             FsmInput::ManualStop => self.do_stop_pre_open(),
+            // RFC 4271 §8.2.2 Active: "In response to any other event
+            // (Events 8, 10-11, 13, 19, 23, 25-28)" — as Connect above.
+            FsmInput::MessageReceived(BgpMessage::Update(_)) | FsmInput::MalformedUpdate(_) => {
+                self.do_stop_pre_open()
+            }
             _ => vec![],
         }
     }
@@ -419,8 +467,14 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
-            // Any other message type in OpenSent is unexpected (RFC 4271 §6.5 subcode 1).
-            FsmInput::MessageReceived(_) => {
+            // Any other message type in OpenSent is unexpected (RFC 4271 §6.5
+            // subcode 1). This includes UPDATE (Event 27) and *any* malformed
+            // UPDATE (Event 28 or a recovered one): §8.2.2 OpenSent, "In
+            // response to any other event (Events 9, 11-13, 20, 25-28), the
+            // local system: sends the NOTIFICATION with the Error Code
+            // Finite State Machine Error" — RFC 7606 recovery never applies
+            // before Established.
+            FsmInput::MessageReceived(_) | FsmInput::MalformedUpdate(_) => {
                 self.state = State::Idle;
                 vec![
                     FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
@@ -525,8 +579,12 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
-            // Any other message type in OpenConfirm is unexpected (RFC 4271 §6.5 subcode 2).
-            FsmInput::MessageReceived(_) => {
+            // Any other message type in OpenConfirm is unexpected (RFC 4271
+            // §6.5 subcode 2), including every malformed UPDATE: §8.2.2
+            // OpenConfirm, "In response to any other event (Events 9, 12-13,
+            // 20, 27-28), the local system: sends a NOTIFICATION with a code
+            // of Finite State Machine Error".
+            FsmInput::MessageReceived(_) | FsmInput::MalformedUpdate(_) => {
                 self.state = State::Idle;
                 vec![
                     FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {
@@ -546,11 +604,18 @@ impl Fsm {
     fn on_established(&mut self, input: FsmInput) -> Vec<FsmOutput> {
         match input {
             FsmInput::MessageReceived(BgpMessage::Keepalive) => self.reset_hold_if_active(),
-            FsmInput::MessageReceived(BgpMessage::Update(update)) => {
-                let mut out = self.reset_hold_if_active();
-                out.push(FsmOutput::RouteUpdate(update));
-                out
-            }
+            FsmInput::MessageReceived(BgpMessage::Update(update)) => self.accept_update(update),
+            // RFC 7606 recovery is applied *here, and only here*, after the
+            // state machine has established that an UPDATE is permitted.
+            FsmInput::MalformedUpdate(recovery) => match recovery.into_outcome() {
+                // RFC 4271 §8.2.2 Established, Event 28 (UpdateMsgErr).
+                Outcome::SessionReset(notif) => self.update_msg_err(notif),
+                // RFC 7606 §2: the recovered UPDATE is processed as an
+                // ordinary Event 27 UPDATE — including the HoldTimer restart.
+                Outcome::TreatAsWithdraw(update) | Outcome::AttributeDiscard(update) => {
+                    self.accept_update(update)
+                }
+            },
             FsmInput::MessageReceived(BgpMessage::Notification(_)) | FsmInput::TcpFailed => {
                 self.peer_open = None;
                 self.negotiated_hold_time = 0;
@@ -681,22 +746,39 @@ impl Fsm {
             // NOTIFICATION, drop the TCP connection, and (unlike
             // `NotificationToSend`) schedule an automatic reconnect rather
             // than leaving the peer stuck in Idle indefinitely.
-            FsmInput::ProtocolErrorNotificationToSend(msg) => {
-                self.state = State::Idle;
-                vec![
-                    FsmOutput::StopHoldTimer,
-                    FsmOutput::StopKeepaliveTimer,
-                    FsmOutput::SendMessage(BgpMessage::Notification(msg)),
-                    FsmOutput::CloseTcpConnection,
-                    FsmOutput::SessionTerminated,
-                    FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
-                ]
-            }
+            FsmInput::ProtocolErrorNotificationToSend(msg) => self.update_msg_err(msg),
             _ => vec![],
         }
     }
 
     // ── Shared sub-routines ────────────────────────────────────────────────────
+
+    /// RFC 4271 §8.2.2 Established, Event 27 (UpdateMsg): "processes the
+    /// message, restarts its `HoldTimer`, if the negotiated `HoldTime` value is
+    /// non-zero, and remains in the Established state."
+    fn accept_update(&self, update: UpdateMessage) -> Vec<FsmOutput> {
+        let mut out = self.reset_hold_if_active();
+        out.push(FsmOutput::RouteUpdate(update));
+        out
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 28 (UpdateMsgErr): "sends a
+    /// NOTIFICATION message with an Update error, ... deletes all routes
+    /// associated with this connection, ... drops the TCP connection, ...
+    /// changes its state to Idle." A locally detected protocol error on a
+    /// still-configured peer, so unlike [`FsmInput::NotificationToSend`] it
+    /// schedules an automatic reconnect.
+    fn update_msg_err(&mut self, notif: NotificationMessage) -> Vec<FsmOutput> {
+        self.state = State::Idle;
+        vec![
+            FsmOutput::StopHoldTimer,
+            FsmOutput::StopKeepaliveTimer,
+            FsmOutput::SendMessage(BgpMessage::Notification(notif)),
+            FsmOutput::CloseTcpConnection,
+            FsmOutput::SessionTerminated,
+            FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
+        ]
+    }
 
     /// [`FsmInput::TcpConnected`] from Connect or Active: send OPEN, enter [`State::OpenSent`].
     fn do_tcp_connected(&mut self) -> Vec<FsmOutput> {
@@ -957,6 +1039,9 @@ fn push_timer_actions(out: &mut Vec<FsmOutput>, negotiated: u16) {
 
 #[cfg(test)]
 mod prop_tests;
+
+#[cfg(test)]
+mod update_error_tests;
 
 #[cfg(test)]
 mod tests {
