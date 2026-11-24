@@ -27,7 +27,7 @@ that filters routes before they enter Adj-RIB-In lives in `pathvector-policy`.
 | Step 7: Prefer eBGP over iBGP (combined with step 3 via PeerType::Ord) | `src/best_path.rs` | ✅ | `test_select_best_prefers_ebgp_over_ibgp` |
 | Step 8: Prefer route with lowest IGP metric to next-hop | `src/best_path.rs` | ✅ | `test_oracle_lower_igp_metric_preferred`, `test_oracle_igp_metric_skipped_when_none`; daemon integration: `test_on_fib_change_reannounces_when_next_hop_recovers` |
 | Step 9: Prefer oldest eBGP route (received_at: Instant, only when both are eBGP) | `src/best_path.rs` | ✅ | `test_select_best_prefers_older_ebgp_route`, `test_step9_only_applies_to_ebgp` |
-| Step 10: (f) Prefer route from peer with lowest BGP Identifier (router-id); skipped if unknown on either side | `src/best_path.rs` | ✅ | `test_select_best_bgp_identifier_overrides_peer_ip_tiebreak`, `test_select_best_falls_back_to_peer_ip_when_bgp_identifier_unknown`, `test_select_best_falls_back_to_peer_ip_when_bgp_identifier_known_on_only_one_side`, proptest: `prop_select_best_lower_bgp_identifier_wins_on_full_tie` |
+| Step 10: (f) Prefer route from peer with lowest BGP Identifier (router-id), compared as unsigned 32-bit integers (§6.8); `ORIGINATOR_ID` substitutes on reflected routes (RFC 4456 §9, see below); an unknown identifier ranks after every known one (keeps the order transitive) | `src/best_path.rs`, `src/route.rs` (`EffectiveRouterId`) | ✅ | `test_select_best_bgp_identifier_overrides_peer_ip_tiebreak`, `test_select_best_falls_back_to_peer_ip_when_bgp_identifier_unknown`, `test_select_best_known_bgp_identifier_beats_unknown`, `reflection_tests::unknown_identifier_ranks_after_every_known_identifier_transitively`, `route::tests::effective_router_id_orders_as_unsigned_32_bit_integers`, proptests: `prop_select_best_lower_bgp_identifier_wins_on_full_tie`, `prop_prefer_is_a_strict_total_order` |
 | Step 11: (g) Prefer route from peer with lowest peer address (final tie-breaker) | `src/best_path.rs` | ✅ | `test_select_best_tiebreak_lower_peer_ip`, proptest: `prop_select_best_lower_peer_ip_wins_on_full_tie` |
 
 **Platform note:** Steps 1 and 8 are active on Linux via `DaemonOracle` wrapping
@@ -93,15 +93,46 @@ bypasses iBGP split-horizon so the daemon's propagation loop can implement corre
 | ORIGINATOR_ID (type 9) stored on Route; carried through LocRib | `src/route.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` (in pathvectord) |
 | CLUSTER_LIST (type 10) stored on Route; carried through LocRib | `src/route.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` (in pathvectord) |
 | AdjRibOut bypass mode for RR topologies (reflects flag) | `src/adj_rib_out.rs` | ✅ | (exercised by daemon RR tests) |
+| §9 SHOULD: "If a route carries the ORIGINATOR_ID attribute, then in Step f) the ORIGINATOR_ID SHOULD be treated as the BGP Identifier of the BGP speaker that has advertised the route" | `src/route.rs` (`EffectiveRouterId::for_route`), `src/best_path.rs` (`TieBreakKey`) | ✅ | `reflection_tests::{rfc4456_originator_id_replaces_reflector_bgp_identifier_in_step_f, mixed_direct_and_reflected_compare_peer_id_against_originator_id, originator_id_supplies_the_identifier_when_peer_bgp_id_is_unknown, prop_reflected_tie_break_matches_rfc_reference}`, `route::tests::effective_router_id_substitutes_originator_id_when_carried`; daemon: `rr_tie_break_tests::reflected_routes_are_selected_by_originator_id_not_reflector_id` |
+| §9 SHOULD: insert "prefer a route with the shorter CLUSTER_LIST length" between (f) and (g); "The CLUSTER_LIST length is zero if a route does not carry the CLUSTER_LIST attribute" | `src/route.rs` (`Route::cluster_list_len`), `src/best_path.rs` | ✅ | `reflection_tests::{rfc4456_shorter_cluster_list_wins_when_originator_ids_tie, rfc4456_cluster_list_length_is_compared_before_peer_address, rfc4456_absent_cluster_list_counts_as_length_zero, rfc4456_step_f_is_decided_before_cluster_list_length, prop_tie_breakers_are_a_strict_total_order}`; daemon: `rr_tie_break_tests::shorter_cluster_list_is_selected_before_peer_address` |
+
+**Corrected 2026-11-23 (issue #69):** `prefer` compared `Route::peer_bgp_id` at step (f) and
+then the peer address, ignoring the stored `ORIGINATOR_ID` and `CLUSTER_LIST`. Two reflected
+routes were ordered by their *reflectors'* identifiers, not their originators', and
+`CLUSTER_LIST` length was never compared. Step (f) was also skipped when only one side's
+identifier was known, which is not transitive (a three-route cycle). The old test asserting
+that skip was rewritten; see `best_path.rs`.
 
 ---
 
-## RFC 4724 — Graceful Restart: Stale Route Timer (Deferred)
+## RFC 4724 — Graceful Restart: stale routes in the RIB
 
-**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4724 (§4.2 as amended by RFC 8538 §4.1)  
+**Boundary:** this crate owns the stale *marking* and its effect (none) on selection; when a
+stale route is removed (replacement, End-of-RIB, Restart Time / stale timer) is decided by
+`pathvectord` — see its RFC 4724 table.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
+| §4.2 MUST: mark retained routes "as stale routing information" | `src/route.rs` (`Staleness`), `src/adj_rib_in.rs` (`mark_all_stale`) | ✅ | `adj_rib_in::tests::test_mark_all_stale_marks_every_route_and_keeps_attributes` |
+| §4.2 MUST NOT "differentiate between stale and other routing information during forwarding"; RFC 9494 §1 "in conventional GR, route preference is not affected" — a `GrStale` route competes on its attributes | `src/best_path.rs` (`prefer` does not read staleness) | ✅ | `best_path::tests::conventional_gr_*`, `best_path::prop_tests::{prop_conventional_gr_staleness_never_changes_the_winner, prop_prefer_ignores_conventional_gr_staleness, prop_prefer_is_a_strict_total_order}` |
+| §4.2 MUST: "replace the stale routes by the routing updates received from the peer" | `src/adj_rib_in.rs` (`insert`) | ✅ | `adj_rib_in::tests::test_reannouncement_replaces_stale_route_with_fresh_one` |
+| Staleness is local state, never advertised (no duplicate UPDATE on marking; RFC 9494 §1) | `src/outbound.rs` | ✅ | `outbound::tests::test_prepare_outbound_never_carries_staleness` |
+
+**Corrected 2026-11-23 (issue #68):** `prefer` used to rank any fresh route above any stale
+one before `LOCAL_PREF`, and `stale_loses_to_non_stale_before_all_other_criteria` asserted
+that while citing RFC 4724 §4.2 — which says the opposite.
+
+### RFC 9494 — Long-Lived Graceful Restart (not implemented)
+
+LLGR is the mechanism that depreferences retained routes ("A least preferred route MUST be
+treated as less preferred than any other route that is not also least preferred", §4.4), and
+§4.3 applies it only for a speaker that "has advertised the Long-Lived Graceful Restart
+Capability". pathvectord never advertises it, so a received `LLGR_STALE` community has no
+selection effect here (policy may still match on it, §3.2). `Staleness` is `#[non_exhaustive]`
+so an LLGR variant can be added alongside its negotiation, timer and propagation rules.
+
+---|---|---|---|
 | Mark routes stale when peer session resets during graceful restart | — | ❌ | — |
 | Remove stale routes when restart-time expires | — | ❌ | — |
 

@@ -10,6 +10,11 @@
 //!   and forwards them to a background task that issues `RTM_NEWROUTE` /
 //!   `RTM_DELROUTE` netlink calls.
 //!
+//! - [`log_fib_status`] — logs the kernel FIB snapshot's health transitions
+//!   (`pathvector-sys` has no logging of its own). While the snapshot is
+//!   degraded the oracle keeps answering from it; see
+//!   [`pathvector_sys::SnapshotHealth`].
+//!
 //! # Deduplication
 //!
 //! Rather than a bounded channel (which silently drops updates when full),
@@ -27,12 +32,15 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use pathvector_rib::{BestPathChange, oracle::NextHopOracle};
-use pathvector_sys::{FibWrite, KernelOracle as SysOracle};
+use pathvector_sys::{
+    FibStatus, FibWrite, KernelOracle as SysOracle, SnapshotHealth, fib::DegradedCause,
+};
 use pathvector_types::{NextHop, Nlri};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 // ── DaemonOracle ─────────────────────────────────────────────────────────────
 
@@ -405,6 +413,154 @@ fn spawn_writer<W: FibWrite + Send + Sync + 'static>(
             process_batch(&writer, v4_batch, v6_batch).await;
         }
     });
+}
+
+// ── Kernel FIB status logging ────────────────────────────────────────────────
+
+/// A health transition worth a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FibStatusEvent {
+    /// The first dump completed.
+    Loaded,
+    /// The snapshot may be stale, or the reason it is changed.
+    Degraded { cause: DegradedCause, attempts: u32 },
+    /// Still degraded for the same reason after `attempts` retries. Emitted
+    /// when the retry count reaches 4, 8, 16, …, so a long outage keeps
+    /// showing up in the log without one line per retry.
+    StillDegraded {
+        cause: DegradedCause,
+        attempts: u32,
+        since: Instant,
+    },
+    /// The snapshot mirrors the kernel again. `after` is how long it was
+    /// degraded; `None` when the status channel coalesced the whole episode
+    /// (only the resync count shows it happened).
+    Recovered {
+        after: Option<Duration>,
+        attempts: u32,
+    },
+}
+
+/// Retry counts at or above this, at each power of two, repeat the warning.
+const FIRST_REMINDER: u32 = 4;
+
+/// The number of bits needed to write `n`; grows by one at each power of two.
+fn bit_length(n: u32) -> u32 {
+    u32::BITS - n.leading_zeros()
+}
+
+/// The log-worthy transition between two observed `(health, resyncs)`
+/// states, if any.
+pub(crate) fn fib_status_event(
+    previous: (SnapshotHealth, u64),
+    current: (SnapshotHealth, u64),
+) -> Option<FibStatusEvent> {
+    let ((prev, prev_resyncs), (cur, resyncs)) = (previous, current);
+    match (prev, cur) {
+        (SnapshotHealth::Starting, SnapshotHealth::Ready { .. }) => Some(FibStatusEvent::Loaded),
+        (
+            SnapshotHealth::Degraded {
+                since, attempts, ..
+            },
+            SnapshotHealth::Ready { since: ready },
+        ) => Some(FibStatusEvent::Recovered {
+            after: Some(ready.saturating_duration_since(since)),
+            attempts,
+        }),
+        (SnapshotHealth::Ready { .. }, SnapshotHealth::Ready { .. }) if resyncs > prev_resyncs => {
+            Some(FibStatusEvent::Recovered {
+                after: None,
+                attempts: 0,
+            })
+        }
+        (
+            SnapshotHealth::Degraded {
+                cause: was,
+                attempts: before,
+                ..
+            },
+            SnapshotHealth::Degraded {
+                cause,
+                attempts,
+                since,
+            },
+        ) if was == cause => (attempts >= FIRST_REMINDER
+            && bit_length(attempts) > bit_length(before))
+        .then_some(FibStatusEvent::StillDegraded {
+            cause,
+            attempts,
+            since,
+        }),
+        (
+            _,
+            SnapshotHealth::Degraded {
+                cause, attempts, ..
+            },
+        ) => Some(FibStatusEvent::Degraded { cause, attempts }),
+        _ => None,
+    }
+}
+
+/// Feeds every log-worthy transition of a status channel to `emit`, until the
+/// channel closes.
+///
+/// The value the receiver holds on entry is treated as a transition from
+/// `Starting`, so a status published before this task first runs (the
+/// supervisor may already be degraded, or loaded) is not lost.
+pub(crate) async fn watch_fib_status<T>(
+    mut status: watch::Receiver<T>,
+    observe: impl Fn(&T) -> (SnapshotHealth, u64),
+    mut emit: impl FnMut(FibStatusEvent, &T),
+) {
+    let mut previous = (SnapshotHealth::Starting, 0);
+    loop {
+        let current = observe(&status.borrow_and_update());
+        if let Some(event) = fib_status_event(previous, current) {
+            emit(event, &status.borrow());
+        }
+        previous = current;
+        if status.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Logs the kernel FIB snapshot's health transitions until the status
+/// channel closes.
+pub(crate) async fn log_fib_status(status: watch::Receiver<FibStatus>) {
+    watch_fib_status(status, |s| (s.health(), s.resyncs()), log_fib_event).await;
+}
+
+fn log_fib_event(event: FibStatusEvent, status: &FibStatus) {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    match event {
+        FibStatusEvent::Loaded => tracing::info!("kernel FIB snapshot loaded"),
+        FibStatusEvent::Degraded { cause, attempts } => tracing::warn!(
+            %cause,
+            attempts,
+            losses = status.losses(),
+            "kernel FIB snapshot may be stale; next-hop reachability answers from \
+             the last known state while it resynchronizes"
+        ),
+        FibStatusEvent::StillDegraded {
+            cause,
+            attempts,
+            since,
+        } => tracing::warn!(
+            %cause,
+            attempts,
+            degraded_ms = ms(since.elapsed()),
+            losses = status.losses(),
+            "kernel FIB snapshot still stale; resynchronization keeps failing"
+        ),
+        FibStatusEvent::Recovered { after, attempts } => tracing::info!(
+            after_ms = after.map(ms),
+            attempts,
+            losses = status.losses(),
+            resyncs = status.resyncs(),
+            "kernel FIB snapshot resynchronized"
+        ),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1252,6 +1408,184 @@ mod tests {
         let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
         assert!(!oracle.is_reachable(&NextHop::V6(gw)));
         assert!(oracle.igp_metric(&NextHop::V6(gw)).is_none());
+    }
+
+    // ── Kernel FIB status logging (issue #59) ────────────────────────────────
+
+    #[test]
+    fn fib_status_events_mark_load_degradation_cause_changes_and_recovery() {
+        use std::time::{Duration, Instant};
+
+        use pathvector_sys::{SnapshotHealth, fib::DegradedCause};
+
+        use super::{FibStatusEvent, fib_status_event};
+
+        let t0 = Instant::now();
+        let ready = |at: Duration| SnapshotHealth::Ready { since: t0 + at };
+        let degraded = |cause, attempts| SnapshotHealth::Degraded {
+            since: t0 + Duration::from_secs(1),
+            cause,
+            attempts,
+        };
+        let lost = DegradedCause::NotificationsLost;
+        let inconsistent = DegradedCause::DumpInconsistent;
+
+        assert_eq!(
+            fib_status_event((SnapshotHealth::Starting, 0), (ready(Duration::ZERO), 1)),
+            Some(FibStatusEvent::Loaded)
+        );
+        assert_eq!(
+            fib_status_event((ready(Duration::ZERO), 1), (degraded(lost, 0), 1)),
+            Some(FibStatusEvent::Degraded {
+                cause: lost,
+                attempts: 0
+            })
+        );
+        // Another retry for the same reason is not news; a new reason is.
+        assert_eq!(
+            fib_status_event((degraded(lost, 0), 1), (degraded(lost, 1), 1)),
+            None
+        );
+        assert_eq!(
+            fib_status_event((degraded(lost, 1), 1), (degraded(inconsistent, 1), 2)),
+            Some(FibStatusEvent::Degraded {
+                cause: inconsistent,
+                attempts: 1
+            })
+        );
+        assert_eq!(
+            fib_status_event(
+                (degraded(inconsistent, 2), 2),
+                (ready(Duration::from_millis(1500)), 3)
+            ),
+            Some(FibStatusEvent::Recovered {
+                after: Some(Duration::from_millis(500)),
+                attempts: 2
+            })
+        );
+        // A whole episode coalesced by the watch channel still shows.
+        assert_eq!(
+            fib_status_event(
+                (ready(Duration::ZERO), 3),
+                (ready(Duration::from_secs(9)), 4)
+            ),
+            Some(FibStatusEvent::Recovered {
+                after: None,
+                attempts: 0
+            })
+        );
+        assert_eq!(
+            fib_status_event((ready(Duration::ZERO), 3), (ready(Duration::ZERO), 3)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_long_outage_with_one_cause_is_reported_again_at_powers_of_two() {
+        use std::time::{Duration, Instant};
+
+        use pathvector_sys::{SnapshotHealth, fib::DegradedCause};
+
+        use super::{FibStatusEvent, fib_status_event};
+
+        let since = Instant::now() + Duration::from_secs(1);
+        let stalled = DegradedCause::DumpStalled;
+        let degraded = |attempts| SnapshotHealth::Degraded {
+            since,
+            cause: stalled,
+            attempts,
+        };
+        let reminders: Vec<u32> = (0..200)
+            .filter_map(|n| fib_status_event((degraded(n), 0), (degraded(n + 1), 0)))
+            .map(|event| match event {
+                FibStatusEvent::StillDegraded {
+                    cause, attempts, ..
+                } => {
+                    assert_eq!(cause, stalled);
+                    attempts
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(reminders, [4, 8, 16, 32, 64, 128]);
+        // A coalesced jump across a power of two still reminds once.
+        assert!(matches!(
+            fib_status_event((degraded(5), 0), (degraded(9), 0)),
+            Some(FibStatusEvent::StillDegraded { attempts: 9, .. })
+        ));
+        assert_eq!(fib_status_event((degraded(9), 0), (degraded(9), 0)), None);
+    }
+
+    /// PR #125 review: the logger must not treat the status it finds on
+    /// entry as already reported. The supervisor can publish `Degraded` (or
+    /// `Ready`) before the logging task first runs.
+    #[tokio::test]
+    async fn the_status_present_before_the_logger_runs_is_reported() {
+        use std::time::{Duration, Instant};
+
+        use pathvector_sys::{SnapshotHealth, fib::DegradedCause};
+        use tokio::sync::watch;
+
+        use super::{FibStatusEvent, watch_fib_status};
+
+        async fn events_for(
+            initial: (SnapshotHealth, u64),
+            then: Option<(SnapshotHealth, u64)>,
+        ) -> Vec<FibStatusEvent> {
+            let (tx, rx) = watch::channel(initial);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let task = tokio::spawn(watch_fib_status(
+                rx,
+                |s| *s,
+                move |e, _| {
+                    sink.lock().unwrap().push(e);
+                },
+            ));
+            tokio::task::yield_now().await;
+            if let Some(next) = then {
+                tx.send(next).unwrap();
+            }
+            drop(tx);
+            task.await.unwrap();
+            Arc::try_unwrap(seen).unwrap().into_inner().unwrap()
+        }
+
+        let since = Instant::now();
+        let lost = DegradedCause::NotificationsLost;
+        let degraded = SnapshotHealth::Degraded {
+            since,
+            cause: lost,
+            attempts: 0,
+        };
+        let ready = SnapshotHealth::Ready {
+            since: since + Duration::from_secs(2),
+        };
+
+        assert_eq!(
+            events_for((degraded, 0), Some((ready, 1))).await,
+            [
+                FibStatusEvent::Degraded {
+                    cause: lost,
+                    attempts: 0
+                },
+                FibStatusEvent::Recovered {
+                    after: Some(Duration::from_secs(2)),
+                    attempts: 0
+                },
+            ]
+        );
+        assert_eq!(events_for((ready, 1), None).await, [FibStatusEvent::Loaded]);
+        assert_eq!(events_for((SnapshotHealth::Starting, 0), None).await, []);
+    }
+
+    #[test]
+    fn daemon_oracle_reads_health_from_the_kernel_fib() {
+        use pathvector_sys::KernelFib;
+        let (kfib, _rx) = KernelFib::new(254);
+        let oracle = super::DaemonOracle(kfib.oracle());
+        assert_eq!(oracle.0.health(), pathvector_sys::SnapshotHealth::Starting);
+        assert_eq!(oracle.0.status().resyncs(), 0);
     }
 
     #[test]

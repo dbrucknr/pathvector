@@ -27,6 +27,8 @@ use pathvector_session::{
     transport::{
         self, DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent,
         SessionHandle, TerminationReason,
+        listener::{BgpListener, Inbound, ListenerKeys, ListenerProtection},
+        tcp_md5::{KernelTcpMd5, Md5Enforcement, TcpMd5Auth, TcpMd5Port},
     },
 };
 use pathvector_types::{
@@ -50,14 +52,27 @@ mod import;
 mod import_reject_tests;
 #[cfg(test)]
 mod last_feasible_tests;
+#[cfg(test)]
+mod listener_md5_tests;
 mod origination;
 mod peer;
 mod policy;
 mod route;
 
+// Issue #68: conventional-GR stale routes keep their ordinary preference.
+#[cfg(test)]
+mod gr_preference_tests;
+
+// Issue #69: RFC 4456 §9 reflected-route tie-breakers through ingestion.
+#[cfg(test)]
+mod rr_tie_break_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
-use capabilities::{SpawnConfig, build_local_capabilities};
+use capabilities::{
+    Md5Keys, SpawnConfig, build_local_capabilities, remove_listener_key, session_tcp_md5,
+    set_listener_key, warn_if_md5_best_effort,
+};
 use deferral::SelectionDeferral;
 use fib::withdraw_stale_bgp_routes;
 use gr::GracefulRestartState;
@@ -858,7 +873,18 @@ where
                     tracing::warn!("failed to query stale BGP routes: {e}");
                 }
             }
-            tokio::spawn(kernel_fib.spawn());
+            // The supervisor recovers from netlink loss on its own and
+            // reports through the status channel; it returns only if no
+            // netlink socket can be opened at all.
+            tokio::spawn(crate_fib::log_fib_status(kernel_fib.status()));
+            tokio::spawn(async move {
+                if let Err(e) = kernel_fib.spawn().await {
+                    tracing::error!(
+                        "kernel FIB tracking unavailable: {e} — next-hop reachability will \
+                         not reflect the kernel routing table"
+                    );
+                }
+            });
             Some(w)
         }
         Err(e) => {
@@ -981,6 +1007,7 @@ where
         let state_cmd = Arc::clone(&state);
         let stop_cmd = Arc::clone(&stop_senders);
         let incoming_cmd = Arc::clone(&incoming_senders);
+        let keys_cmd = Arc::clone(&md5_passwords);
         let peer_store = cfg
             .sidecar_path
             .as_ref()
@@ -990,6 +1017,7 @@ where
             state_cmd,
             stop_cmd,
             incoming_cmd,
+            keys_cmd,
             event_tx,
             spawn_fn,
             SpawnConfig {
@@ -1000,6 +1028,7 @@ where
                 configured_restarting: cfg.daemon.restarting,
                 confederation_id: cfg.daemon.confederation_id,
                 startup_instant: daemon_start, // R-bit expires after graceful_restart_time secs
+                md5_enforcement: cfg.daemon.tcp_md5_enforcement.into(),
             },
             peer_store,
         ));
@@ -1076,6 +1105,26 @@ async fn install_rpki(
     }
 }
 
+/// Sets up BGP sessions for every configured peer and constructs the initial
+/// [`DaemonState`].
+///
+/// `spawn_fn` is called once per peer to create a [`SessionHandle`]; `start()`
+/// is then called on each handle so the session task begins the TCP connect /
+/// BGP open exchange.  The returned tuple contains:
+///
+/// - The shared daemon state (pre-populated with per-peer RIBs and policies).
+/// - The event receiver that drains `(peer_ip, SessionEvent)` messages from
+///   the per-peer forwarding tasks, and a sender for it.
+/// - The stop-sender map so the event loop can close a session whose outbound
+///   channel overflowed.
+/// - The incoming-sender map the BGP listeners use to hand inbound
+///   connections to sessions.
+/// - The TCP MD5 key table for inbound connections, holding every static
+///   peer's key. No listener is bound yet; each installs its family's keys
+///   when it binds, before it listens.
+///
+/// Extracted from `run_with()` so it can be driven in tests by supplying a
+/// mock `spawn_fn` — no real TCP sockets needed.
 pub(crate) async fn build_daemon<H, F>(
     cfg: &config::Config,
     spawn_fn: F,
@@ -1085,7 +1134,7 @@ pub(crate) async fn build_daemon<H, F>(
     mpsc::Sender<(IpAddr, SessionEvent)>, // kept alive for AddPeer forwarding
     Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
-    Arc<RwLock<HashMap<IpAddr, String>>>, // RFC 2385 MD5 passwords
+    Md5Keys, // RFC 2385 keys for inbound connections
 )
 where
     H: SessionHandle,
@@ -1104,8 +1153,11 @@ where
     // accepts inbound connections from newly configured peers.
     let incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    // md5_passwords: shared with the listener for TCP MD5SIG setup.
-    let md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    // md5_passwords: TCP MD5 keys for inbound connections. The listeners
+    // install them on their sockets when they bind, before listening.
+    let md5_passwords: Md5Keys = Arc::new(ListenerKeys::default());
+    let md5_enforcement = Md5Enforcement::from(cfg.daemon.tcp_md5_enforcement);
+    warn_if_md5_best_effort(md5_enforcement, &cfg.peers);
 
     // Capture startup instant here; used to expire the R-bit window per-session.
     let startup_instant = std::time::Instant::now();
@@ -1135,13 +1187,19 @@ where
             peer_as: Some(peer.remote_as),
             confederation_member: confed_member,
             peer_addr: SocketAddr::new(peer.address, peer.port),
-            md5_password: peer.md5_password.clone(),
+            tcp_md5: session_tcp_md5(peer, md5_enforcement),
             connect_retry_time: peer
                 .connect_retry_time
                 .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
                     std::time::Duration::from_secs(u64::from(s))
                 }),
         };
+
+        // The listener key is configured before the peer can appear in
+        // incoming_senders.
+        if let Some(auth) = session_tcp_md5(peer, md5_enforcement) {
+            set_listener_key(&md5_passwords, peer.address, auth);
+        }
 
         let mut handle = spawn_fn(session_cfg);
         handle.start().await;
@@ -1155,10 +1213,6 @@ where
             .write()
             .await
             .insert(peer.address, handle.incoming_sender());
-        if let Some(pw) = &peer.md5_password {
-            md5_passwords.write().await.insert(peer.address, pw.clone());
-        }
-
         let peer_addr = peer.address;
         let tx = event_tx.clone();
         tokio::spawn(async move {
@@ -10005,7 +10059,7 @@ mod tests {
 
     /// Builds a DaemonState acting as an RR for the given clients.
     /// `clients` and `non_clients` are all iBGP peers (same `local_as`).
-    fn make_rr_state(
+    pub(super) fn make_rr_state(
         local_as: u32,
         cluster_id: u32,
         clients: &[Ipv4Addr],
@@ -13390,11 +13444,12 @@ mod event_loop_tests {
             Arc::new(RwLock::new(HashMap::new()));
         let event_tx_clone = event_tx.clone();
 
-        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+        tokio::spawn(run_command_processor::<NeverSpawned, _, KernelTcpMd5>(
             cmd_rx,
             state_clone,
             stop_clone,
             incoming,
+            Arc::new(ListenerKeys::default()),
             event_tx_clone,
             |_cfg| unreachable!("spawn_fn must not be called by RemovePeer"),
             SpawnConfig {
@@ -13405,6 +13460,7 @@ mod event_loop_tests {
                 configured_restarting: false,
                 confederation_id: None,
                 startup_instant: std::time::Instant::now(),
+                md5_enforcement: Md5Enforcement::Required,
             },
             None,
         ));
@@ -13555,11 +13611,12 @@ mod event_loop_tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
 
-        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+        tokio::spawn(run_command_processor::<NeverSpawned, _, KernelTcpMd5>(
             cmd_rx,
             Arc::clone(&state),
             Arc::clone(&stop_senders),
             incoming,
+            Arc::new(ListenerKeys::default()),
             event_tx,
             // If spawn_fn is called the test panics — AddPeer must be dropped.
             |_cfg| panic!("spawn_fn must not be called while peer is in pending_removal"),
@@ -13571,6 +13628,7 @@ mod event_loop_tests {
                 configured_restarting: false,
                 confederation_id: None,
                 startup_instant: std::time::Instant::now(),
+                md5_enforcement: Md5Enforcement::Required,
             },
             None,
         ));
@@ -13639,11 +13697,12 @@ mod event_loop_tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
 
-        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+        tokio::spawn(run_command_processor::<NeverSpawned, _, KernelTcpMd5>(
             cmd_rx,
             Arc::clone(&state),
             Arc::clone(&stop_senders),
             Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(ListenerKeys::default()),
             event_tx,
             |_cfg| unreachable!(),
             SpawnConfig {
@@ -13654,6 +13713,7 @@ mod event_loop_tests {
                 configured_restarting: false,
                 confederation_id: None,
                 startup_instant: std::time::Instant::now(),
+                md5_enforcement: Md5Enforcement::Required,
             },
             None,
         ));
@@ -13747,11 +13807,12 @@ mod event_loop_tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
 
-        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+        tokio::spawn(run_command_processor::<NeverSpawned, _, KernelTcpMd5>(
             cmd_rx,
             Arc::clone(&state),
             Arc::clone(&stop_senders),
             Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(ListenerKeys::default()),
             event_tx,
             |_cfg| unreachable!(),
             SpawnConfig {
@@ -13762,6 +13823,7 @@ mod event_loop_tests {
                 configured_restarting: false,
                 confederation_id: None,
                 startup_instant: std::time::Instant::now(),
+                md5_enforcement: Md5Enforcement::Required,
             },
             None,
         ));
@@ -14013,11 +14075,12 @@ mod event_loop_tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
 
-        tokio::spawn(run_command_processor::<CaptureHandle, _>(
+        tokio::spawn(run_command_processor::<CaptureHandle, _, KernelTcpMd5>(
             cmd_rx,
             Arc::clone(&state),
             Arc::clone(&stop_senders),
             Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(ListenerKeys::default()),
             event_tx,
             move |cfg| {
                 *captured_clone.lock().unwrap() = Some(cfg);
@@ -14031,6 +14094,7 @@ mod event_loop_tests {
                 configured_restarting: false,
                 confederation_id: None,
                 startup_instant: std::time::Instant::now(),
+                md5_enforcement: Md5Enforcement::Required,
             },
             None,
         ));
@@ -14277,11 +14341,12 @@ mod event_loop_tests {
         let stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        tokio::spawn(run_command_processor::<NeverSpawned, _>(
+        tokio::spawn(run_command_processor::<NeverSpawned, _, KernelTcpMd5>(
             cmd_rx,
             Arc::clone(&state),
             Arc::clone(&stop_senders),
             Arc::clone(&incoming),
+            Arc::new(ListenerKeys::default()),
             event_tx,
             |_cfg| unreachable!("RemovePeer must not call spawn_fn"),
             SpawnConfig {
@@ -14292,6 +14357,7 @@ mod event_loop_tests {
                 configured_restarting: false,
                 confederation_id: None,
                 startup_instant: std::time::Instant::now(),
+                md5_enforcement: Md5Enforcement::Required,
             },
             None,
         ));
@@ -14331,7 +14397,7 @@ mod event_loop_tests {
         // incoming_senders — no peers are known.
         let incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let md5: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let md5: Md5Keys = Arc::new(ListenerKeys::default());
 
         // Spawn on port 0 so the OS assigns a free port.
         let listener_sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -14392,7 +14458,7 @@ mod event_loop_tests {
                 (IpAddr::V4(peer_v4), tx_v4),
                 (IpAddr::V6(peer_v6), tx_v6),
             ])));
-        let md5: Arc<RwLock<HashMap<IpAddr, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let md5: Md5Keys = Arc::new(ListenerKeys::default());
 
         let bind_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let bind_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
@@ -15258,6 +15324,7 @@ mod run_with_tests {
                 restarting: false,
                 selection_deferral_time: 0,
                 rpki: None,
+                tcp_md5_enforcement: config::TcpMd5EnforcementConfig::Required,
             },
             peers: peer_ips
                 .iter()
@@ -15572,15 +15639,15 @@ mod run_with_tests {
         let (spawn_fn, _peers) = make_mock_spawn();
 
         let mut cfg = make_config(&[(peer_ip, 65002)]);
-        cfg.peers[0].md5_password = Some("s3cr3t".to_string());
+        cfg.peers[0].md5_password = Some("s3cr3t".parse().unwrap());
 
         let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
             build_daemon(&cfg, spawn_fn).await;
 
         assert_eq!(
-            md5_passwords.read().await.get(&peer_ip).map(String::as_str),
-            Some("s3cr3t"),
-            "MD5 password must be present in the listener key map"
+            md5_passwords.configured(peer_ip),
+            Some(TcpMd5Auth::required("s3cr3t".parse().unwrap())),
+            "MD5 key must be present in the listener key table"
         );
     }
 
@@ -15594,9 +15661,10 @@ mod run_with_tests {
         let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
             build_daemon(&cfg, spawn_fn).await;
 
-        assert!(
-            md5_passwords.read().await.is_empty(),
-            "no MD5 passwords configured → map must be empty"
+        assert_eq!(
+            md5_passwords.configured(peer_ip),
+            None,
+            "no MD5 password configured → no listener key"
         );
     }
 
@@ -15609,20 +15677,19 @@ mod run_with_tests {
         let (spawn_fn, _peers) = make_mock_spawn();
 
         let mut cfg = make_config(&[(IpAddr::V4(peer_a), 65002), (IpAddr::V4(peer_b), 65003)]);
-        cfg.peers[0].md5_password = Some("key-for-a".to_string());
+        cfg.peers[0].md5_password = Some("key-for-a".parse().unwrap());
         // peer_b has no password
 
         let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
             build_daemon(&cfg, spawn_fn).await;
-        let md5 = md5_passwords.read().await;
-
         assert_eq!(
-            md5.get(&IpAddr::V4(peer_a)).map(String::as_str),
-            Some("key-for-a"),
+            md5_passwords.configured(IpAddr::V4(peer_a)),
+            Some(TcpMd5Auth::required("key-for-a".parse().unwrap())),
         );
-        assert!(
-            !md5.contains_key(&IpAddr::V4(peer_b)),
-            "peer_b has no MD5 password and must not be in the map"
+        assert_eq!(
+            md5_passwords.configured(IpAddr::V4(peer_b)),
+            None,
+            "peer_b has no MD5 password and must not be in the table"
         );
     }
 
@@ -15646,7 +15713,7 @@ mod run_with_tests {
         };
 
         let mut config = make_config(&[(peer_ip, 65002)]);
-        config.peers[0].md5_password = Some("session-key".to_string());
+        config.peers[0].md5_password = Some("session-key".parse().unwrap());
 
         build_daemon(&config, spawn_fn).await;
 
@@ -15656,10 +15723,95 @@ mod run_with_tests {
             .take()
             .expect("spawn_fn must be called");
         assert_eq!(
-            session_cfg.md5_password.as_deref(),
-            Some("session-key"),
-            "md5_password must be threaded into SessionConfig"
+            session_cfg.tcp_md5,
+            Some(TcpMd5Auth::required("session-key".parse().unwrap())),
+            "md5_password must reach SessionConfig with enforcement required by default"
         );
+    }
+
+    /// `[daemon] tcp_md5_enforcement = "best-effort"` is the only way a
+    /// session may connect without enforcement (issue #58: the fallback must
+    /// be an explicit choice). It must reach the static peer's session and
+    /// the listener key table unchanged.
+    #[tokio::test]
+    async fn build_daemon_best_effort_md5_reaches_session_config() {
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let captured: std::sync::Arc<
+            std::sync::Mutex<Option<pathvector_session::transport::SessionConfig>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = std::sync::Arc::clone(&captured);
+        let (base_spawn, _peers) = make_mock_spawn();
+        let spawn_fn = move |cfg: pathvector_session::transport::SessionConfig| {
+            *captured_clone.lock().unwrap() = Some(cfg.clone());
+            base_spawn(cfg)
+        };
+
+        let mut config = make_config(&[(peer_ip, 65002)]);
+        config.daemon.tcp_md5_enforcement = config::TcpMd5EnforcementConfig::BestEffort;
+        config.peers[0].md5_password = Some("session-key".parse().unwrap());
+
+        let (_state, _rx, _event_tx, _stop, _incoming, md5_passwords) =
+            build_daemon(&config, spawn_fn).await;
+
+        let expected = TcpMd5Auth::new("session-key".parse().unwrap(), Md5Enforcement::BestEffort);
+        let session_cfg = captured.lock().unwrap().take().unwrap();
+        assert_eq!(session_cfg.tcp_md5.as_ref(), Some(&expected));
+        assert_eq!(md5_passwords.configured(peer_ip), Some(expected));
+    }
+
+    /// Dynamic peers (gRPC `AddPeer`) get the daemon-wide
+    /// `tcp_md5_enforcement` from `SpawnConfig`, the same as static peers, so
+    /// the unenforced fallback is never applied to one path but not the other.
+    #[tokio::test]
+    async fn add_peer_wires_md5_key_and_enforcement_into_session_config() {
+        for enforcement in [Md5Enforcement::Required, Md5Enforcement::BestEffort] {
+            let captured: Arc<Mutex<Option<SessionConfig>>> = Arc::new(Mutex::new(None));
+            let captured_clone = Arc::clone(&captured);
+            let (base_spawn, _peers) = make_mock_spawn();
+            let spawn_fn = move |cfg: SessionConfig| {
+                *captured_clone.lock().unwrap() = Some(cfg.clone());
+                base_spawn(cfg)
+            };
+
+            let (unused_spawn, _) = make_mock_spawn();
+            let (state, _rx, event_tx, stop_senders, incoming, md5) =
+                build_daemon(&make_config(&[]), unused_spawn).await;
+            let (cmd_tx, cmd_rx) = mpsc::channel(4);
+            let processor = tokio::spawn(run_command_processor(
+                cmd_rx,
+                state,
+                stop_senders,
+                incoming,
+                md5,
+                event_tx,
+                spawn_fn,
+                SpawnConfig {
+                    local_as: 65001,
+                    local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+                    hold_time: 90,
+                    graceful_restart_time: 0,
+                    configured_restarting: false,
+                    confederation_id: None,
+                    startup_instant: std::time::Instant::now(),
+                    md5_enforcement: enforcement,
+                },
+                None,
+            ));
+
+            let mut peer = make_config(&[("10.0.5.2".parse().unwrap(), 65050)])
+                .peers
+                .remove(0);
+            peer.md5_password = Some("dyn-key".parse().unwrap());
+            cmd_tx.send(DaemonCommand::AddPeer(peer)).await.unwrap();
+            drop(cmd_tx);
+            processor.await.unwrap();
+
+            let session_cfg = captured.lock().unwrap().take().expect("session spawned");
+            assert_eq!(
+                session_cfg.tcp_md5,
+                Some(TcpMd5Auth::new("dyn-key".parse().unwrap(), enforcement))
+            );
+        }
     }
 
     // ── NOTIFICATION pipeline: malformed UPDATE → SessionCommand ─────────────
@@ -16591,6 +16743,7 @@ mod test_build_local_capabilities {
             configured_restarting,
             confederation_id: None,
             startup_instant: std::time::Instant::now().checked_sub(age).unwrap(),
+            md5_enforcement: Md5Enforcement::Required,
         }
     }
 
@@ -17207,12 +17360,16 @@ mod test_gr_phase2 {
         );
     }
 
-    /// When a second established peer has an update_sender, stale-route
-    /// repropagation after stale marking must reach it via `flush_updates`.
-    /// This exercises `repropagate_after_stale_mark_v4` and the inner loop
-    /// that calls `propagate_prefix` + `flush_updates` for each peer.
+    /// `repropagate_after_stale_mark_v4` runs its per-peer loop over an
+    /// established observer, and — because a conventional-GR stale route
+    /// keeps its selection and staleness is never advertised — sends it
+    /// nothing. RFC 4724 §4.2: the routes are retained, not withdrawn; RFC
+    /// 9494 §1: conventional GR resolves the trade-off "in favor of not
+    /// advertising". (This test previously asserted that an UPDATE *was*
+    /// sent; what was sent was an identical duplicate of the route already
+    /// advertised — issue #68.)
     #[test]
-    fn stale_mark_repropagates_withdrawals_to_established_observer() {
+    fn stale_mark_sends_no_update_to_established_observer() {
         const OBS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
         const OBS_AS: u32 = 65005;
 
@@ -17235,13 +17392,16 @@ mod test_gr_phase2 {
         let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
-        // Unclean disconnect — stale marking should propagate to OBS_IP.
+        // Unclean disconnect — the route is retained and marked stale.
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        // The observer must have received an UPDATE (withdrawal of the now-stale prefix).
         assert!(
-            obs_rx.try_recv().is_ok(),
-            "observer must receive an UPDATE after stale-route repropagation"
+            state.rib.loc_rib.best(&nlri("198.51.100.0/24")).is_some(),
+            "the route is retained"
+        );
+        assert!(
+            obs_rx.try_recv().is_err(),
+            "no UPDATE may be sent to the observer when a route is only marked stale"
         );
     }
 
@@ -17519,11 +17679,16 @@ mod test_gr_phase2 {
         );
     }
 
-    /// RFC 4724 §4.2 SHOULD — on unclean termination routes must be marked
-    /// stale in LocRib so a fresh route from a second peer immediately wins
-    /// best-path selection.
+    /// RFC 4724 §4.2 MUST — on unclean termination the retained routes are
+    /// marked stale in LocRib, and (RFC 9494 §1) "in conventional GR, route
+    /// preference is not affected": with equal attributes the retained route
+    /// keeps winning on the ordinary tie-breakers instead of losing to a fresh
+    /// route from a second peer. Previously named
+    /// `stale_marking_lets_fresh_peer_win_immediately`, which asserted the
+    /// opposite (issue #68); `daemon::gr_preference_tests` covers the
+    /// LOCAL_PREF case.
     #[test]
-    fn stale_marking_lets_fresh_peer_win_immediately() {
+    fn stale_marking_keeps_equally_preferred_route_selected() {
         const PEER2_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
         const PEER2_AS: u32 = 65003;
 
@@ -17541,36 +17706,33 @@ mod test_gr_phase2 {
             None,
         );
 
-        // Both peers announce the same prefix; PEER_IP wins (lower IP address tie-breaker).
+        // Both peers announce the same prefix with the same attributes;
+        // PEER_IP wins on the ordinary tie-breakers (older eBGP route, lower
+        // peer address).
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
-        // Same attributes as PEER_IP — tie-breaker (lower peer IP) decides winner.
         state.on_route_update(IpAddr::V4(PEER2_IP), announce(&["10.0.0.0/8"]));
 
         let winner_before = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
-        assert!(
-            winner_before.is_some(),
-            "must have a best path before termination"
+        assert_eq!(
+            winner_before.map(PeerId::ip),
+            Some(std::net::IpAddr::V4(PEER_IP)),
+            "precondition: PEER_IP wins the tie before termination"
         );
 
-        // PEER_IP disconnects uncleanly — its route is marked stale.
+        // PEER_IP disconnects uncleanly — its route is retained and marked stale.
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
-        // PEER2's fresh route must now be the best path.
         let best_after = state.rib.loc_rib.best(&nlri("10.0.0.0/8"));
-        assert!(
-            best_after.is_some(),
-            "route must still be present (held stale)"
+        assert_eq!(
+            best_after.map(|r| r.staleness),
+            Some(pathvector_rib::Staleness::GrStale),
+            "the retained route is marked stale"
         );
-        assert!(
-            !best_after.unwrap().stale,
-            "winning route must be the non-stale route from PEER2"
-        );
-
         let winner_after = state.rib.loc_rib.best_peer(&nlri("10.0.0.0/8"));
         assert_eq!(
             winner_after.map(PeerId::ip),
-            Some(std::net::IpAddr::V4(PEER2_IP)),
-            "PEER2 must be the winning peer after PEER_IP's routes are marked stale"
+            Some(std::net::IpAddr::V4(PEER_IP)),
+            "staleness must not move the selection to PEER2"
         );
     }
 
@@ -17641,20 +17803,20 @@ mod test_gr_phase2 {
             .is_ok()
         {}
 
-        // Unclean termination of PEER_IP — COMPETING_IP's route must now win and
-        // repropagate_after_stale_mark_v6 must iterate over observer.
+        // Unclean termination of PEER_IP — repropagate_after_stale_mark_v6
+        // must iterate over the observer. Staleness does not change the
+        // selection (RFC 9494 §1), so nothing needs re-advertising; the key
+        // invariant is that the loop runs and a best route remains.
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
         state.flush_pending();
 
-        // Observer should receive an UPDATE (re-announce from COMPETING_IP winning).
-        // The exact content depends on best-path: the key invariant is the loop ran.
         assert!(
             state
                 .rib
                 .loc_rib_v6
                 .best(&nlri_v6("2001:db8::/32"))
                 .is_some(),
-            "a best v6 route must still exist from COMPETING_IP"
+            "a best v6 route must still exist"
         );
     }
 
@@ -18078,6 +18240,15 @@ mod test_gr_phase2 {
         state.on_route_update(IpAddr::V4(PEER_IP), announce_v6(&["2001:db8::/32"]));
         while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
+        // With accept-all import and no transformations, stale marking alone
+        // sends nothing (RFC 9494 §1), so the send path is only reachable
+        // when Adj-RIB-Out is out of step with Loc-RIB. Force that by
+        // forgetting what was advertised.
+        state
+            .adj_ribs_out_v6
+            .get_mut(&IpAddr::V4(OBS_IP))
+            .unwrap()
+            .withdraw(&nlri_v6("2001:db8::/32"));
         drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
         state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
 
@@ -18551,6 +18722,15 @@ mod test_gr_phase2 {
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
         while rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap().try_recv().is_ok() {}
 
+        // With accept-all import and no transformations, stale marking alone
+        // sends nothing (RFC 9494 §1), so the send path is only reachable
+        // when Adj-RIB-Out is out of step with Loc-RIB. Force that by
+        // forgetting what was advertised.
+        state
+            .adj_ribs_out
+            .get_mut(&IpAddr::V4(OBS_IP))
+            .unwrap()
+            .withdraw(&nlri("10.0.0.0/8"));
         // Drop the observer's receiver so the next send fails.
         drop(rxs.remove(&IpAddr::V4(OBS_IP)).unwrap());
 

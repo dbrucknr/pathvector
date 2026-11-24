@@ -472,6 +472,19 @@ per-family retention, EOR-triggered pruning, GR-deadline-expiry flush,
 stale-route de-preference in best-path, and clean-vs-unclean termination
 handling) genuinely matches the RFC text on a fresh read.
 
+> **Correction (2026-11-23, issue #68):** the "stale-route de-preference in
+> best-path" item above was not RFC behavior and should not have been
+> confirmed. RFC 4724 §4.2 says the router "MUST NOT differentiate between
+> stale and other routing information during forwarding" (RFC 8538 §4.1
+> keeps the sentence), and RFC 9494 §1 says "in conventional GR, route
+> preference is not affected" — depreferencing is Long-Lived GR behavior.
+> The comparator ranked any fresh route above any stale one before
+> `LOCAL_PREF`, and the test proving it cited §4.2. Fixed: staleness is now a
+> `Staleness` enum that `prefer` does not read, and is reset on the
+> advertised copy (marking had also been re-sending identical UPDATEs). This
+> is the CLAUDE.md failure mode exactly — a test name citing an RFC for
+> behavior the RFC does not require.
+
 | Clause | Confidence | Notes | What would close this out |
 |---|---|---|---|
 | On (undetected) TCP termination + new incoming connection from a GR-capable peer: MUST treat as termination of the old session, close old, keep new, **no NOTIFICATION sent** | See the §5 finding below — this is the FSM-level mechanism for this clause, and it's missing | — | See §5 below |
@@ -659,6 +672,16 @@ Extended Community, ATTR_SET, Traffic Engineering Path Attribute) were not
 individually re-derived this pass — worth a follow-up if time allows,
 though the highest-risk, highest-blast-radius clauses (missing-mandatory,
 duplicate-attribute handling, attribute-flags) have already been covered.
+
+**Addendum 2026-11-23 (issue #69): §7.9 ORIGINATOR_ID and §7.10 CLUSTER_LIST.**
+Both say "if [...] received from an external neighbor, it SHALL be discarded
+using the approach of 'attribute discard'". Confirmed gap, now fixed:
+`handle_update` stored both from any peer. This became exploitable once RFC
+4456 §9 made them best-path tie-breakers, because an eBGP peer could forge an
+ORIGINATOR_ID to win step (f). They are now kept only from `Internal` peers.
+Tests: `pathvectord` `rr_tie_break_tests::{ebgp,confed_member}_originator_id_and_cluster_list_are_discarded`.
+The "internal neighbor, length not a multiple of 4 → treat-as-withdraw" half
+is a codec concern and was not re-derived here.
 
 All 4 new/independent gaps filed in `TODO.md` (#19). The missing-mandatory-
 attribute finding is flagged as the audit's single highest-priority item

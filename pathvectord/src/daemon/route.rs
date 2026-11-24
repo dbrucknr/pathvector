@@ -933,8 +933,27 @@ pub(super) fn handle_update(
             PathAttribute::ExtendedCommunities(ecs) => extended_communities.clone_from(ecs),
             PathAttribute::AtomicAggregate => atomic_aggregate = true,
             PathAttribute::Aggregator(a) => aggregator = Some(*a),
-            PathAttribute::OriginatorId(id) => originator_id = Some(*id),
-            PathAttribute::ClusterList(list) => cluster_list.clone_from(list),
+            // RFC 7606 §7.9 / §7.10 revise RFC 4456's error handling: "if
+            // the ORIGINATOR_ID [CLUSTER_LIST] attribute is received from an
+            // external neighbor, it SHALL be discarded using the approach of
+            // 'attribute discard'". Both feed best-path tie-breaking (RFC
+            // 4456 §9) and are reflected to iBGP peers, so a peer outside
+            // the local AS must not be able to set them.
+            //
+            // A confederation Member-AS peer is an external peer in RFC
+            // 4271's sense ("in a different Autonomous System"), and RFC
+            // 5065 lifts only specific restrictions for it (LOCAL_PREF in
+            // §5.2, path selection in §5.3) — none for these attributes, and
+            // RFC 4456 does not address confederations. They are therefore
+            // kept only from `Internal` peers, which matches the outbound
+            // side: `route_to_attributes` strips them toward `ConfedMember`
+            // peers so cluster IDs stay scoped to one Member-AS.
+            PathAttribute::OriginatorId(id) if peer_type == PeerType::Internal => {
+                originator_id = Some(*id);
+            }
+            PathAttribute::ClusterList(list) if peer_type == PeerType::Internal => {
+                cluster_list.clone_from(list);
+            }
             PathAttribute::OnlyToCustomer(asn) => otc = Some(*asn),
             // RFC 4271 §5: "Paths with unrecognized transitive optional
             // attributes SHOULD be accepted [and] passed... to other BGP
@@ -1383,12 +1402,17 @@ pub(super) fn handle_update(
             builder = builder.unknown_attribute(attr.clone());
         }
 
-        let mut raw = builder.build();
-        if originator_id.is_some() || !cluster_list.is_empty() {
-            let r = raw.rare_mut();
-            r.originator_id = originator_id;
-            r.cluster_list.clone_from(&cluster_list);
+        // RFC 4456 §9: best-path step (f) and the CLUSTER_LIST step read
+        // these from the stored route, so they are stored exactly as
+        // received (after the RR ingress handling above).
+        if let Some(id) = originator_id {
+            builder = builder.originator_id(id);
         }
+        if !cluster_list.is_empty() {
+            builder = builder.cluster_list(cluster_list.clone());
+        }
+
+        let raw = builder.build();
 
         // RFC 7999: routes tagged with the BLACKHOLE community bypass LocRib
         // and outbound advertisement. Store in AdjRibIn for soft-reconfig, and
@@ -1502,6 +1526,14 @@ pub(super) fn handle_update(
         }
         for attr in &unknown {
             builder = builder.unknown_attribute(attr.clone());
+        }
+        // Same as the IPv4 path: RFC 4456 §9 selection and RR loop
+        // prevention on re-advertisement both need these on IPv6 routes too.
+        if let Some(id) = originator_id {
+            builder = builder.originator_id(id);
+        }
+        if !cluster_list.is_empty() {
+            builder = builder.cluster_list(cluster_list.clone());
         }
 
         let raw = builder.build();

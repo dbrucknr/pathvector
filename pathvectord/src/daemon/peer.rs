@@ -657,8 +657,9 @@ impl DaemonState {
                  stale routes retained for up to {gr_restart_time} s"
             );
 
-            // RFC 4724 §4.2 SHOULD: mark retained routes as stale so fresh
-            // routes from other peers immediately win best-path selection.
+            // RFC 4724 §4.2 MUST: mark retained routes as stale. Staleness
+            // does not change their preference (RFC 9494 §1) — it scopes the
+            // End-of-RIB sweep and the Restart Time deadline.
             self.mark_stale_and_repropagate(peer_ip, gr_v4, gr_v6);
 
             if notify {
@@ -835,12 +836,29 @@ impl DaemonState {
     }
 }
 
+/// Applies `AddPeer` / `RemovePeer` commands at runtime.
+///
+/// TCP MD5 keys for inbound connections follow the peer set through
+/// `listener_keys`, on the live listening sockets:
+///
+/// - `AddPeer` with an `md5_password` installs the key on the listener
+///   *before* the peer is added to `incoming_senders`. The listener then
+///   replaces its socket, and [`route_inbound`] drops a connection screened
+///   before the key change, so no inbound connection from the peer reaches
+///   its session unless the listener enforced the key on it.
+/// - `RemovePeer` takes the peer out of `incoming_senders` first, then
+///   removes its key.
+/// - Key rotation is `RemovePeer` followed by `AddPeer` with the new key
+///   once the removal has completed (`AddPeer` is ignored while a removal is
+///   pending). The old session ends with the removal; an established
+///   connection keeps the key it was accepted with until then.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_command_processor<H, F>(
+pub(super) async fn run_command_processor<H, F, P>(
     mut cmd_rx: mpsc::Receiver<DaemonCommand>,
     state: Arc<RwLock<DaemonState>>,
     stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+    listener_keys: Md5Keys<P>,
     event_tx: mpsc::Sender<(IpAddr, SessionEvent)>,
     spawn_fn: F,
     cfg: SpawnConfig,
@@ -848,6 +866,7 @@ pub(super) async fn run_command_processor<H, F>(
 ) where
     H: SessionHandle + 'static,
     F: Fn(SessionConfig) -> H,
+    P: TcpMd5Port,
 {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -891,13 +910,18 @@ pub(super) async fn run_command_processor<H, F>(
                     peer_as: Some(peer.remote_as),
                     confederation_member: confed_member,
                     peer_addr: SocketAddr::new(peer.address, peer.port),
-                    md5_password: peer.md5_password.clone(),
+                    tcp_md5: session_tcp_md5(&peer, cfg.md5_enforcement),
                     connect_retry_time: peer
                         .connect_retry_time
                         .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
                             std::time::Duration::from_secs(u64::from(s))
                         }),
                 };
+
+                // Before the peer can appear in incoming_senders (below).
+                if let Some(auth) = &session_cfg.tcp_md5 {
+                    set_listener_key(&listener_keys, peer.address, auth.clone());
+                }
 
                 let mut handle = spawn_fn(session_cfg);
                 handle.start().await;
@@ -954,8 +978,12 @@ pub(super) async fn run_command_processor<H, F>(
                     continue;
                 }
 
-                // Stop accepting new inbound connections from this peer.
+                // Stop accepting new inbound connections from this peer, then
+                // take its TCP MD5 key off the listener. In this order the
+                // listener never hands over a connection from the peer
+                // without its key.
                 incoming_senders.write().await.remove(&peer_ip);
+                remove_listener_key(&listener_keys, peer_ip);
 
                 // Send Cease NOTIFICATION; the session will emit Terminated which
                 // triggers full state cleanup in the event loop.
@@ -999,66 +1027,35 @@ pub(super) async fn run_command_processor<H, F>(
     }
 }
 
-/// Builds and binds a `tokio::net::TcpListener` for `addr`.
+/// Runs the BGP listener for `bind_addr`'s address family (RFC 4271 §8:
+/// "A BGP implementation MUST connect to and listen on TCP port 179 for
+/// incoming connections") and hands each admitted connection to its peer's
+/// session.
 ///
-/// For an IPv6 address, explicitly sets `IPV6_V6ONLY` via `socket2` before
-/// binding, so this listener never also claims IPv4-mapped traffic — whether
-/// an IPv6 "any" bind is dual-stack by default is an OS setting, not
-/// something to rely on when a separate IPv4 listener is bound to the same
-/// port. IPv4 addresses are bound directly with no extra socket options.
-fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
-    use socket2::{Domain, Socket, Type};
-
-    let domain = if addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let socket = Socket::new(domain, Type::STREAM, None)?;
-    if addr.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    tokio::net::TcpListener::from_std(socket.into())
-}
-
-/// Sets up BGP sessions for every configured peer and constructs the initial
-/// [`DaemonState`].
+/// The socket is a [`BgpListener`]: it installs `keys`' TCP MD5 keys for
+/// this address family before it starts listening, puts keys added or
+/// rotated later on the live socket and then replaces the socket (so no
+/// connection that predates a key can get through), and only hands over
+/// connections the key table admits. In particular, a peer whose required
+/// key could not be installed on this socket is rejected, since the kernel
+/// would not have checked its handshake. A connection from an address that
+/// is not a configured peer is closed; see [`route_inbound`].
 ///
-/// `spawn_fn` is called once per peer to create a [`SessionHandle`]; `start()`
-/// is then called on each handle so the session task begins the TCP connect /
-/// BGP open exchange.  The returned tuple contains:
-///
-/// - The shared daemon state (pre-populated with per-peer RIBs and policies).
-/// - The event receiver that drains `(peer_ip, SessionEvent)` messages from
-///   the per-peer forwarding tasks.
-/// - The stop-sender map so the event loop can close a session whose outbound
-///   channel overflowed.
-///
-/// Extracted from `run_with()` so it can be driven in tests by supplying a
-/// mock `spawn_fn` — no real TCP sockets needed.
-///
-/// Binds a single address family (`bind_addr`'s own family). Callers that
-/// want both IPv4 and IPv6 inbound connections run two instances of this
-/// function concurrently — one bound to `0.0.0.0:<port>`, one to
-/// `[::]:<port>` — rather than relying on one dual-stack socket, since
-/// whether an IPv6 "any" bind also accepts IPv4-mapped connections is an OS
-/// default that varies by platform (Linux historically dual-stack, macOS/
-/// Windows historically v6-only). An IPv6 `bind_addr` always gets
-/// `IPV6_V6ONLY` set explicitly via `socket2`, so it never competes with a
-/// concurrently-bound IPv4 listener on the same port regardless of OS
-/// default. Each listener's bind failure is independent — if only one
-/// family fails to bind, the other keeps running (dial-only for the failed
-/// family, matching the existing single-family fallback behavior).
-pub(super) async fn run_bgp_listener(
+/// Callers that want both IPv4 and IPv6 inbound connections run two
+/// instances of this function concurrently, one bound to `0.0.0.0:<port>`
+/// and one to `[::]:<port>`, rather than relying on one dual-stack socket,
+/// since whether an IPv6 "any" bind also accepts IPv4-mapped connections is
+/// an OS default that varies by platform. The IPv6 socket is always
+/// `IPV6_V6ONLY`, so it never competes with the IPv4 listener on the same
+/// port, and IPv4 peers only reach the socket that holds their keys. Each
+/// listener's bind failure is independent: if only one family fails to
+/// bind, the other keeps running (dial-only for the failed family).
+pub(super) async fn run_bgp_listener<P: TcpMd5Port>(
     bind_addr: std::net::SocketAddr,
     incoming_senders: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
-    _md5_passwords: Arc<RwLock<HashMap<IpAddr, String>>>,
+    keys: Md5Keys<P>,
 ) {
-    let listener = match bind_listener(bind_addr) {
+    let mut listener = match BgpListener::bind(bind_addr, keys) {
         Ok(l) => {
             tracing::info!(addr = %bind_addr, "BGP listener started");
             l
@@ -1069,26 +1066,51 @@ pub(super) async fn run_bgp_listener(
         }
     };
 
-    // RFC 2385: MD5 keys are installed per-socket by the session's outbound
-    // dialler; the listener socket uses the keys that were active at bind time.
-    // Dynamic AddPeer MD5 support on the listener requires re-binding, which is
-    // not yet implemented — new MD5 peers work via outbound-only connections.
-
     loop {
         match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let tx = incoming_senders.read().await.get(&peer_addr.ip()).cloned();
-                if let Some(tx) = tx {
-                    tracing::debug!(peer = %peer_addr, "accepted inbound BGP connection");
-                    let _ = tx.send(SessionCommand::IncomingConnection(stream)).await;
-                } else {
-                    tracing::debug!(peer = %peer_addr, "rejected inbound BGP connection from unknown peer");
-                    // stream dropped here → TCP RST
-                }
-            }
+            Ok(inbound) => route_inbound(&listener, inbound, &incoming_senders).await,
             Err(e) => {
                 tracing::warn!(error = %e, "BGP listener accept error");
+                // Do not spin on a persistent error (for example, a failed
+                // socket replacement); `accept` retries on the next call.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+        }
+    }
+}
+
+/// Hands `inbound` to its peer's session, or closes it.
+///
+/// The connection must still be [current](BgpListener::is_current) *after*
+/// the session is looked up. `AddPeer` installs the peer's TCP MD5 key
+/// before adding the peer to `incoming_senders`, so if the lookup finds the
+/// peer, any key change made for it is visible here; a connection screened
+/// before that change (for example, accepted unkeyed just before `AddPeer`)
+/// is closed instead of reaching the new session.
+pub(super) async fn route_inbound<P: TcpMd5Port>(
+    listener: &BgpListener<P>,
+    inbound: Inbound,
+    incoming_senders: &RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
+) {
+    let peer = inbound.peer();
+    let tx = incoming_senders.read().await.get(&peer.ip()).cloned();
+    match tx {
+        Some(_) if !listener.is_current(&inbound) => {
+            tracing::warn!(
+                %peer,
+                "rejecting inbound BGP connection: the peer's TCP MD5 key changed while it was \
+                 being accepted"
+            );
+        }
+        Some(tx) => {
+            tracing::debug!(%peer, "accepted inbound BGP connection");
+            let _ = tx
+                .send(SessionCommand::IncomingConnection(inbound.into_stream()))
+                .await;
+        }
+        None => {
+            tracing::debug!(%peer, "rejected inbound BGP connection from unknown peer");
+            // dropped here → TCP RST
         }
     }
 }

@@ -44,7 +44,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         confederation_member: false,
         public_as: 65001,
         peer_addr,
-        md5_password: None,
+        tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
@@ -240,7 +240,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         confederation_member: false,
         public_as: 65001,
         peer_addr,
-        md5_password: None,
+        tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
     }
 }
@@ -1367,4 +1367,69 @@ async fn test_raw_unrecognized_well_known_attribute_sends_real_notification_byte
     );
 
     peer.await.unwrap();
+}
+
+// ── TCP MD5 policy through a spawned session (PR #124 review) ─────────────────
+
+/// A session whose required TCP MD5 key cannot be enforced must say why it
+/// is not connecting. The connect error itself is folded into `TcpFailed`
+/// by the session loop, so the diagnostic has to be logged where the policy
+/// decides. An IPv6 peer is unenforceable everywhere (`Platform` on macOS,
+/// `Ipv6Peer` on Linux), so this runs on every OS. The address is from the
+/// documentation range and is never dialled.
+#[tokio::test]
+async fn required_md5_failure_is_logged_by_running_session() {
+    use pathvector_session::transport::tcp_md5::TcpMd5Auth;
+
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    let buf = Buf::default();
+    // Thread-local default: the current-thread test runtime runs the session
+    // and its connect task on this thread.
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+
+    let mut cfg = local_config("[2001:db8::1]:179".parse().unwrap());
+    cfg.tcp_md5 = Some(TcpMd5Auth::required("k".parse().unwrap()));
+    let handle = spawn(cfg);
+    handle.start().await;
+
+    let logs = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            if text.contains("cannot be enforced") {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refusal must be logged");
+
+    assert!(logs.contains("2001:db8::1"), "peer missing: {logs}");
+    assert!(
+        logs.contains("reason=\"platform\"") || logs.contains("reason=\"ipv6_peer\""),
+        "reason missing: {logs}"
+    );
+    handle.stop().await;
 }
