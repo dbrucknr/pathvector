@@ -241,7 +241,10 @@ async fn read_raw_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> (u8, Vec
     loop {
         if buf.len() >= 19 {
             let len = usize::from(u16::from_be_bytes([buf[16], buf[17]]));
-            assert!(len >= 19, "BGP message length {len} below the 19-byte header");
+            assert!(
+                len >= 19,
+                "BGP message length {len} below the 19-byte header"
+            );
             if buf.len() >= len {
                 let msg_type = buf[18];
                 let body = buf[19..len].to_vec();
@@ -253,7 +256,10 @@ async fn read_raw_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> (u8, Vec
             .read_buf(buf)
             .await
             .expect("read from pathvectord failed");
-        assert!(n > 0, "connection closed unexpectedly while waiting for UPDATE");
+        assert!(
+            n > 0,
+            "connection closed unexpectedly while waiting for UPDATE"
+        );
     }
 }
 
