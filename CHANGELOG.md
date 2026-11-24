@@ -51,10 +51,30 @@ extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 
   microseconds, so this is well under 1 % of it. The older `loc_rib_insert` bench rebuilds a
   ~1 M-entry RIB per criterion sample, so its 500 k group measures cold first touches and was not
   a reliable comparison (it read 1.9 → 2.4–2.6 µs; the steady bench does not reproduce that).
-- Not done: the `just loadtest <mrt> --scenarios converge,cow` comparison from the issue's
-  acceptance criteria (needs a full-table MRT file). The other `snapshot()` callers
-  (`list_routes`, `watch_routes`, ...) legitimately walk the table and still clone the `Arc`; moving
-  them off the write-lock path is a separate change.
+- Full-table harness comparison (PR #114's `loadtest`, real `latest-bview.gz`: 1,133,510 IPv4
+  prefixes, one loader on 127.0.0.1 + control peer on the LAN address, release builds, Apple M2 Max,
+  `--scenarios converge,cow`, one run per cell). "old" = #114 head, "new" = #114 head + this change.
+  The "management client polling at 10 Hz" rows are the issue's scenario (default probe); the
+  "none" rows use `--probe-interval-ms 0`.
+
+  | `cow`, churn only (2000 prefixes, 12 s) | `list_peers` p50 | longest write-lock hold | peak RSS |
+  |---|---|---|---|
+  | old, 10 Hz client | 236 ms | ≤ 500 ms | 1651 MiB |
+  | old, no client | n/a | ≤ 10 ms | 1215 MiB |
+  | **new, 10 Hz client** | **526 µs** (max 11.5 ms) | **≤ 10 ms** | **1215 MiB** |
+  | new, no client | n/a | ≤ 10 ms | 1215 MiB |
+
+  With the polling client the new daemon behaves like one with no client (same lock-hold bucket,
+  RSS flat at the table size instead of +436 MiB). `converge`: `list_peers` p50 230 ms → 425 µs,
+  max 1.22 s → 454 ms; lock holds and convergence time (5.6–6.2 s) unchanged. The control peer's
+  keepalive stayed on cadence (≤ 3.45 s silence, hold 9 s) in all 8 windows. In the `cow`
+  "churn + concurrent `watch_routes` snapshots" window `list_peers` p99 is still 0.9 s (old: 1.3 s)
+  and RSS 2.1 GiB (old: 3.3 GiB with the client): `watch_routes` itself materialises the table and
+  is out of scope here. Each cell is a single run on a loaded laptop; treat differences of a bucket
+  as noise. Raw output is in the PR comment thread.
+- Not changed: the other `snapshot()` callers (`list_routes`, `watch_routes`, ...) legitimately
+  walk the table and still clone the `Arc`; moving them off the write-lock path is a separate
+  change.
 
 ---
 
