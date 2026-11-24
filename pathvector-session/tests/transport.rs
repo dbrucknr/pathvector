@@ -1433,3 +1433,272 @@ async fn required_md5_failure_is_logged_by_running_session() {
     );
     handle.stop().await;
 }
+
+// ── RFC 6793: negotiated ASN width, end to end over TCP (issue #95) ──────────
+//
+// A raw-socket "peer" speaks hand-written bytes in both directions, so these
+// prove the whole production chain — OPEN capabilities -> FSM ->
+// `SessionEstablished` -> `AsnWidth::negotiate` -> `BgpTransport::set_asn_width`
+// -> reader *and* writer codec — against independently derived wire bytes,
+// not the codec's own output.
+
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+
+/// Read exactly one framed BGP message (header + body) from `s`.
+async fn read_frame(s: &mut TcpStream) -> Vec<u8> {
+    let mut hdr = [0u8; 19];
+    s.read_exact(&mut hdr).await.unwrap();
+    let len = usize::from(u16::from_be_bytes([hdr[16], hdr[17]]));
+    let mut frame = hdr.to_vec();
+    frame.resize(len, 0);
+    s.read_exact(&mut frame[19..]).await.unwrap();
+    frame
+}
+
+/// Handshake over a raw stream; `capabilities` is the peer OPEN's capability
+/// list (empty = an OLD, two-octet-only speaker).
+async fn raw_handshake(listener: TcpListener, capabilities: Vec<Capability>) -> TcpStream {
+    let (mut s, _) = listener.accept().await.unwrap();
+    assert_eq!(read_frame(&mut s).await[18], 1, "local OPEN"); // type 1
+    let open = BgpMessage::Open(OpenMessage {
+        version: 4,
+        my_as: 65002,
+        hold_time: 90,
+        bgp_id: Ipv4Addr::new(10, 0, 0, 2),
+        capabilities,
+    });
+    s.write_all(&open.encode()).await.unwrap();
+    assert_eq!(read_frame(&mut s).await[18], 4, "local KEEPALIVE"); // type 4
+    s.write_all(&BgpMessage::Keepalive.encode()).await.unwrap();
+    s
+}
+
+/// `ORIGIN` IGP, `as_path` value as `AS_PATH`, `extra` attribute TLVs, `NEXT_HOP`
+/// 192.0.2.1, NLRI 198.51.100.0/24 — as one framed UPDATE.
+fn raw_update(as_path: &[u8], extra: &[u8]) -> Vec<u8> {
+    let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02];
+    attrs.push(u8::try_from(as_path.len()).unwrap());
+    attrs.extend_from_slice(as_path);
+    attrs.extend_from_slice(extra);
+    attrs.extend_from_slice(&[0x40, 0x03, 0x04, 192, 0, 2, 1]);
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&u16::try_from(attrs.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&attrs);
+    body.extend_from_slice(&[24, 198, 51, 100]);
+    let mut f = vec![0xFF; 16];
+    f.extend_from_slice(&u16::try_from(19 + body.len()).unwrap().to_be_bytes());
+    f.push(2);
+    f.extend_from_slice(&body);
+    f
+}
+
+fn expect_route_update(event: SessionEvent) -> UpdateMessage {
+    match event {
+        SessionEvent::RouteUpdate(u) => u,
+        other => panic!("expected RouteUpdate, got {other:?}"),
+    }
+}
+
+fn as_path_asns(u: &UpdateMessage) -> Vec<u32> {
+    u.attributes
+        .iter()
+        .find_map(|a| match a {
+            PathAttribute::AsPath(p) => Some(
+                p.segments()
+                    .iter()
+                    .flat_map(|s| s.asns().iter().map(|a| a.as_u32()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .expect("AS_PATH present")
+}
+
+async fn next_event(handle: &mut impl SessionHandle) -> SessionEvent {
+    tokio::time::timeout(Duration::from_secs(5), handle.next_event())
+        .await
+        .expect("timed out waiting for a session event")
+        .expect("session exited")
+}
+
+/// Issue #95, end to end: a legacy (no four-octet capability) peer sends the
+/// issue's exact `AS_PATH` `02 01 fd ea`. The route must be *announced* with
+/// AS 65002 — before the fix it was converted to a withdrawal.
+#[tokio::test]
+async fn legacy_peer_two_octet_as_path_is_announced_not_withdrawn() {
+    let (listener, addr) = loopback_listener().await;
+    let peer = tokio::spawn(async move {
+        let mut s = raw_handshake(listener, vec![]).await;
+        s.write_all(&raw_update(&[0x02, 0x01, 0xfd, 0xea], &[]))
+            .await
+            .unwrap();
+        // AS_TRANS + AS4_PATH carrying the true four-octet origin 131072.
+        s.write_all(&raw_update(
+            &[0x02, 0x02, 0xfd, 0xea, 0x5b, 0xa0],
+            &[
+                0xC0, 0x11, 0x0a, 0x02, 0x02, 0, 0, 0xfd, 0xea, 0, 0x02, 0, 0,
+            ],
+        ))
+        .await
+        .unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+    assert!(matches!(
+        next_event(&mut handle).await,
+        SessionEvent::Established(_)
+    ));
+
+    let first = expect_route_update(next_event(&mut handle).await);
+    assert!(
+        first.withdrawn.is_empty(),
+        "must not be withdrawn: {first:?}"
+    );
+    assert_eq!(first.announced.len(), 1);
+    assert_eq!(as_path_asns(&first), vec![65002]);
+
+    let second = expect_route_update(next_event(&mut handle).await);
+    assert!(second.withdrawn.is_empty());
+    assert_eq!(as_path_asns(&second), vec![65002, 131_072]);
+    assert!(
+        !second
+            .attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::As4Path(_))),
+        "AS4_PATH is consumed by the merge: {second:?}"
+    );
+    peer.abort();
+}
+
+/// Outbound to an OLD peer: the writer half must encode two-octet `AS_PATH`,
+/// `AS_TRANS`, and the generated `AS4_PATH`. Expected bytes are RFC 6793 §4.2.2
+/// by hand: `AS_PATH` `02 02 fd e9 5b a0`, `AS4_PATH` (optional transitive)
+/// `c0 11 0a 02 02 00 00 fd e9 00 02 00 00`.
+#[tokio::test]
+async fn updates_to_a_legacy_peer_are_encoded_with_two_octet_asns() {
+    let (listener, addr) = loopback_listener().await;
+    let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut s = raw_handshake(listener, vec![]).await;
+        loop {
+            let f = read_frame(&mut s).await;
+            if f[18] == 2 {
+                let _ = frame_tx.send(f);
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+    assert!(matches!(
+        next_event(&mut handle).await,
+        SessionEvent::Established(_)
+    ));
+
+    let msg = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(pathvector_types::Origin::Igp),
+            PathAttribute::AsPath(pathvector_types::AsPath::from_sequence(vec![
+                pathvector_types::Asn::new(65001),
+                pathvector_types::Asn::new(131_072),
+            ])),
+            PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
+        ],
+        announced: vec![pathvector_types::Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap()],
+    };
+    handle.update_sender().send(msg).await.unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+        .await
+        .expect("timed out waiting for the UPDATE")
+        .unwrap();
+    let mut want_attrs = vec![0x40, 0x01, 0x01, 0x00];
+    want_attrs.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x02, 0xfd, 0xe9, 0x5b, 0xa0]);
+    want_attrs.extend_from_slice(&[0x40, 0x03, 0x04, 192, 0, 2, 1]);
+    want_attrs.extend_from_slice(&[
+        0xC0, 0x11, 0x0a, 0x02, 0x02, 0x00, 0x00, 0xfd, 0xe9, 0x00, 0x02, 0x00, 0x00,
+    ]);
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&u16::try_from(want_attrs.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&want_attrs);
+    body.extend_from_slice(&[24, 198, 51, 100]);
+    assert_eq!(&frame[19..], &body[..], "wire body");
+    peer.abort();
+}
+
+/// Four-octet peers: outbound `AS_PATH` keeps four-octet ASNs, and an `AS4_PATH`
+/// received from the peer is discarded (RFC 6793 §4.1) rather than merged or
+/// leaked — a well-formed but policy-violating input.
+#[tokio::test]
+async fn four_octet_peer_keeps_four_octet_as_path_and_as4_path_is_discarded() {
+    let (listener, addr) = loopback_listener().await;
+    let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut s = raw_handshake(listener, vec![Capability::FourByteAsn(65002)]).await;
+        // Four-octet AS_PATH [65002] plus a (forbidden) AS4_PATH [131072].
+        s.write_all(&raw_update(
+            &[0x02, 0x01, 0x00, 0x00, 0xfd, 0xea],
+            &[0xC0, 0x11, 0x06, 0x02, 0x01, 0x00, 0x02, 0x00, 0x00],
+        ))
+        .await
+        .unwrap();
+        loop {
+            let f = read_frame(&mut s).await;
+            if f[18] == 2 {
+                let _ = frame_tx.send(f);
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let mut handle = spawn(local_config(addr));
+    handle.start().await;
+    assert!(matches!(
+        next_event(&mut handle).await,
+        SessionEvent::Established(_)
+    ));
+
+    let got = expect_route_update(next_event(&mut handle).await);
+    assert!(got.withdrawn.is_empty());
+    assert_eq!(as_path_asns(&got), vec![65002]);
+    assert!(
+        !got.attributes
+            .iter()
+            .any(|a| matches!(a, PathAttribute::As4Path(_))),
+        "AS4_PATH from a four-octet peer must be discarded: {got:?}"
+    );
+
+    let msg = UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(pathvector_types::Origin::Igp),
+            PathAttribute::AsPath(pathvector_types::AsPath::from_sequence(vec![
+                pathvector_types::Asn::new(131_072),
+            ])),
+            PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
+        ],
+        announced: vec![pathvector_types::Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap()],
+    };
+    handle.update_sender().send(msg).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+        .await
+        .expect("timed out waiting for the UPDATE")
+        .unwrap();
+    let as_path_tlv = [0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x02, 0x00, 0x00];
+    assert!(
+        frame.windows(as_path_tlv.len()).any(|w| w == as_path_tlv),
+        "four-octet AS_PATH expected on the wire: {frame:02x?}"
+    );
+    assert!(
+        !frame.windows(2).any(|w| w == [0xC0, 0x11]),
+        "no AS4_PATH between NEW speakers: {frame:02x?}"
+    );
+    peer.abort();
+}

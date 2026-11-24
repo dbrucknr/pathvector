@@ -283,7 +283,8 @@ The following should remain visible without becoming universal release blockers:
 - AS-path regular-expression policy;
 - BMP export/monitoring;
 - full confederation-member operation;
-- legacy two-byte-only peer AS4 reconstruction;
+- live interop evidence for legacy two-byte-only peers (RFC 6793 wire handling is
+  implemented and tested against hand-derived bytes, but never run against a real OLD speaker);
 - route flap dampening;
 - commercial router interoperability beyond the current open-source peers.
 

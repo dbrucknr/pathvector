@@ -174,6 +174,17 @@ The OPEN message's "My AS" field is only 2 bytes, a limitation from the original
 
 When both peers support this capability, the real ASN is taken from the capability value and "My AS" is ignored. When a router with a 4-byte ASN peers with a 2-byte-only router (which cannot understand the capability), it substitutes `AS_TRANS` (23456) in the "My AS" field and uses a separate `AS4_PATH` attribute to carry the true AS path through the 2-byte-only segment of the network.
 
+### ASN width on the wire
+
+The same bilateral decision also fixes how every ASN in `AS_PATH` and `AGGREGATOR` is encoded on that session. It is made once, when the session establishes, as an `AsnWidth` (`Two` or `Four`) derived by `AsnWidth::negotiate(local, peer)` — `Four` only if the capability was advertised to *and* received from the peer. The width is then given to both halves of the codec (`BgpCodec::set_asn_width`):
+
+| Direction | `AsnWidth::Four` (both sides advertised the capability) | `AsnWidth::Two` (an OLD peer) |
+|---|---|---|
+| Receive | 4-octet `AS_PATH`/`AGGREGATOR`; `AS4_PATH`/`AS4_AGGREGATOR` are discarded and reported (RFC 6793 §4.1) | 2-octet `AS_PATH`/`AGGREGATOR`; `AS4_PATH`/`AS4_AGGREGATOR` are merged back into the true path/aggregator (§4.2.3) and removed |
+| Send | 4-octet; `AS4_*` are never written | 2-octet with `AS_TRANS` for each non-mappable ASN; `AS4_PATH` / `AS4_AGGREGATOR` are generated when the caller has not attached them (§4.2.2) |
+
+`PathAttribute::AsPath` therefore always holds the true 32-bit path in memory. Segments longer than 255 ASNs are split on encode, and zero-length or overrunning segments are RFC 7606 treat-as-withdraw at either width. `BgpMessage::encode()` is shorthand for `encode_with(AsnWidth::Four)`.
+
 ---
 
 ## Hold time and keepalives

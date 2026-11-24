@@ -2148,7 +2148,7 @@ integration rather than direct unit tests.
   harness or lightweight integration scaffolding to drive the event loop without real TCP.
 - `pathvector-sys/src/tcp.rs` (94.9%) — missed lines likely require real socket setup or
   Linux-only TCP MD5 paths; investigate whether mock sockets or platform-gated tests can close the gap.
-- No e2e test for AS_TRANS wire encoding against a real 2-byte-only peer (GoBGP `--as2` mode) — unit tests exist but no interop verification.
+- No e2e test for AS_TRANS wire encoding against a real 2-byte-only peer (GoBGP `--as2` mode) — unit, property and loopback-TCP tests with hand-derived RFC 6793 bytes exist (issue #95 closed the codec gap: two-octet `AS_PATH`/`AGGREGATOR`, AS4_PATH merge) but no interop verification.
 - No IPv6 route receive/withdraw tests for BIRD and FRR peers — requires IPv6 variants of `write_bird_config` / `write_frr_config`, new `BirdHarness::new_v6()` / `FrrHarness::new_v6()` constructors, and `address-family ipv6` blocks in each speaker's config.
 - `pathvector-session/src/transport/mod.rs` (96.0%) — `SessionCommand::Notification` branch
   (~line 411) and TCP send failure path (~line 479) require a real or mock transport pair

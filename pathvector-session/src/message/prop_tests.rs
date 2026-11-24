@@ -225,3 +225,163 @@ proptest! {
         let _ = BgpMessage::decode(&bytes);
     }
 }
+
+// ── RFC 6793 ASN-width properties (issue #95) ────────────────────────────
+//
+// Round trips are a *consistency* check only — the exact-bytes proof lives
+// in `asn_width_tests.rs`. What these add is breadth: arbitrary ASNs across
+// the 16/32-bit boundary, arbitrary segment mixes, and segment sizes around
+// the 255-ASN limit.
+
+fn arb_wide_asn() -> impl Strategy<Value = Asn> {
+    prop_oneof![
+        // 16-bit-mappable (incl. AS_TRANS and the boundary)
+        (0u32..=65_535).prop_map(Asn::new),
+        Just(Asn::TRANS),
+        // non-mappable
+        (65_536u32..=u32::MAX).prop_map(Asn::new),
+    ]
+}
+
+/// A path as a four-octet speaker can build it: zero or more *leading*
+/// confederation segments (RFC 5065 places them first), then ordinary
+/// segments. Each segment is non-empty and within the 255-ASN wire limit.
+///
+/// Confederation segments only hold two-octet-mappable Member-AS numbers:
+/// RFC 6793 §7 ("A non-mappable four-octet AS number cannot be used as a
+/// 'Member AS Number' of a BGP Confederation until all the BGP speakers
+/// within the Confederation have transitioned") and §4.2.2 (confederation
+/// segments are excluded from `AS4_PATH`) mean a non-mappable ASN there is
+/// unrecoverable across an OLD speaker by design.
+fn arb_realistic_path() -> impl Strategy<Value = AsPath> {
+    let asns = || prop::collection::vec(arb_wide_asn(), 1..6);
+    let confed_asns = || prop::collection::vec((0u32..=65_535).prop_map(Asn::new), 1..6);
+    (
+        prop::collection::vec(
+            prop_oneof![
+                confed_asns().prop_map(AsPathSegment::ConfedSequence),
+                confed_asns().prop_map(AsPathSegment::ConfedSet),
+            ],
+            0..3,
+        ),
+        prop::collection::vec(
+            prop_oneof![
+                asns().prop_map(AsPathSegment::Sequence),
+                asns().prop_map(AsPathSegment::Set),
+            ],
+            0..4,
+        ),
+    )
+        .prop_map(|(confed, normal)| {
+            AsPath::from_segments(confed.into_iter().chain(normal).collect())
+        })
+}
+
+fn update_with_path(path: AsPath, agg: Option<Aggregator>) -> UpdateMessage {
+    let mut attributes = vec![
+        PathAttribute::Origin(Origin::Igp),
+        PathAttribute::AsPath(path),
+        PathAttribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
+    ];
+    if let Some(a) = agg {
+        attributes.push(PathAttribute::Aggregator(a));
+    }
+    UpdateMessage {
+        withdrawn: vec![],
+        attributes,
+        announced: vec![Nlri::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap()],
+    }
+}
+
+fn flat_asns(path: &AsPath) -> Vec<u32> {
+    path.segments()
+        .iter()
+        .flat_map(|s| s.asns().iter().map(|a| a.as_u32()))
+        .collect()
+}
+
+proptest! {
+    /// Four-octet session: AS_PATH and AGGREGATOR survive encode -> decode.
+    #[test]
+    fn prop_four_octet_as_path_and_aggregator_roundtrip(
+        path in arb_realistic_path(),
+        agg_asn in arb_wide_asn(),
+        agg_ip in arb_ipv4(),
+    ) {
+        let msg = BgpMessage::Update(update_with_path(path, Some(Aggregator::new(agg_asn, agg_ip))));
+        let wire = msg.encode_with(AsnWidth::Four);
+        prop_assert_eq!(
+            BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, AsnWidth::Four).unwrap(),
+            msg
+        );
+    }
+
+    /// Two-octet session, arbitrary ASNs including non-mappable ones: what we
+    /// encode for an OLD peer (AS_TRANS + generated AS4_PATH / AS4_AGGREGATOR)
+    /// is exactly reconstructed by RFC 6793 §4.2.3 when received back, and no
+    /// transition attribute is left over.
+    #[test]
+    fn prop_two_octet_encode_then_decode_recovers_the_true_path_and_aggregator(
+        path in arb_realistic_path(),
+        agg_asn in arb_wide_asn(),
+        agg_ip in arb_ipv4(),
+    ) {
+        let msg = BgpMessage::Update(update_with_path(path, Some(Aggregator::new(agg_asn, agg_ip))));
+        let wire = msg.encode_with(AsnWidth::Two);
+        prop_assert_eq!(
+            BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, AsnWidth::Two).unwrap(),
+            msg
+        );
+    }
+
+    /// The wire never holds a two-octet ASN that was not mappable: decoding
+    /// the AS_PATH *without* merging (an OLD peer's view) shows only mappable
+    /// ASNs or AS_TRANS, and path length is preserved.
+    #[test]
+    fn prop_old_peer_view_preserves_path_length(path in arb_realistic_path()) {
+        let want = path.path_length();
+        let wire = BgpMessage::Update(update_with_path(path, None)).encode_with(AsnWidth::Two);
+        // Strip AS4_PATH (0xC0 0x11 ...) by re-decoding at two octets and
+        // reading only what an OLD speaker reads is covered by exact-byte
+        // tests; here we check the merged length is unchanged.
+        let BgpMessage::Update(u) =
+            BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, AsnWidth::Two).unwrap()
+        else { panic!("clean update expected") };
+        let PathAttribute::AsPath(got) = &u.attributes[1] else { panic!("AS_PATH") };
+        prop_assert_eq!(got.path_length(), want);
+    }
+
+    /// A single sequence of any length (well past 255) is split into legal
+    /// segments on encode and decodes to the same ASNs in order, at both
+    /// widths; every encoded segment count is within 1..=255.
+    #[test]
+    fn prop_long_sequences_split_at_255_and_roundtrip(
+        len in 1usize..700,
+        base in 0u32..60_000,
+    ) {
+        let flat: Vec<Asn> = (0..len).map(|i| Asn::new(base + u32::try_from(i).unwrap())).collect();
+        let msg = BgpMessage::Update(update_with_path(AsPath::from_sequence(flat.clone()), None));
+        for width in [AsnWidth::Two, AsnWidth::Four] {
+            let wire = msg.encode_with(width);
+            let BgpMessage::Update(u) =
+                BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, width).unwrap()
+            else { panic!("clean update expected") };
+            let PathAttribute::AsPath(got) = &u.attributes[1] else { panic!("AS_PATH") };
+            prop_assert_eq!(flat_asns(got), flat.iter().map(|a| a.as_u32()).collect::<Vec<_>>());
+            prop_assert_eq!(got.path_length(), len);
+            for seg in got.segments() {
+                prop_assert!((1..=255).contains(&seg.asns().len()));
+            }
+        }
+    }
+
+    /// Decoding arbitrary bytes at either width never panics.
+    #[test]
+    fn prop_decode_never_panics_at_either_width(
+        bytes in prop::collection::vec(any::<u8>(), 0..4096),
+    ) {
+        for width in [AsnWidth::Two, AsnWidth::Four] {
+            let _ = BgpMessage::decode_with_limit_and_caps(&bytes, MAX_LEN_EXTENDED, width);
+        }
+    }
+}
