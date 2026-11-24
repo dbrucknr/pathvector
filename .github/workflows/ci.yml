@@ -131,9 +131,10 @@ jobs:
   # the final compile step is invalidated when source changes.
   e2e:
     name: End-to-end (Docker)
-    # Heavy job: skipped on pull_request, runs on push to main and on
-    # workflow_dispatch. Test/Lint/MSRV/Docs still gate PRs.
-    if: github.event_name != 'pull_request'
+    # Runs on pull requests as well as main: skipping it on PRs let a change
+    # that broke two GR tests (#145) merge with a green PR run. Superseded PR
+    # runs are cancelled by the workflow-level concurrency group, which keeps
+    # re-sync pushes cheap.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
