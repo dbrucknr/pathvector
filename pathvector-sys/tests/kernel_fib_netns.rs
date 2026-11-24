@@ -1178,14 +1178,16 @@ async fn bgp_first_mixed_set_returns_the_static_path_once_the_bgp_route_goes() {
         "inferred from the dump"
     );
     del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Bgp)).await;
-    barrier_v6(&handle, &snap, oif, "2001:db8:221::".parse().unwrap()).await;
-    assert_eq!(
-        snap.read().unwrap().igp_metric_v6(probe),
-        Some(10),
-        "the static route via fe80::2 is the kernel's only route for the prefix"
-    );
+    // The re-read runs after the delete event, and a marker route's event can
+    // be applied before it ends, so wait for the result itself.
+    eventually(
+        &snap,
+        "the static route via fe80::2, the kernel's only route for the prefix",
+        |s| s.igp_metric_v6(probe) == Some(10),
+    )
+    .await;
     del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Static)).await;
-    barrier_v6(&handle, &snap, oif, "2001:db8:222::".parse().unwrap()).await;
+    eventually(&snap, "no route for the prefix", |s| count_v6(s, dst) == 0).await;
     assert_eq!(snap.read().unwrap().igp_metric_v6(probe), None);
     task.abort();
 }
@@ -1210,16 +1212,13 @@ async fn static_first_mixed_set_stops_counting_the_bgp_route_once_the_static_rou
     let (snap, task) = start_fib().await;
     assert_eq!(count_v6(&snap.read().unwrap(), dst), 2, "inferred static");
     del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Static)).await;
-    barrier_v6(&handle, &snap, oif, "2001:db8:224::".parse().unwrap()).await;
-    {
-        let s = snap.read().unwrap();
-        assert_eq!(
-            s.igp_metric_v6(probe),
-            None,
-            "only the BGP route via fe80::2 is left in the kernel"
-        );
-        assert_eq!(count_v6(&s, dst), 0);
-    }
+    // Until the re-read ends, the BGP route still counts as static.
+    eventually(
+        &snap,
+        "only the BGP route via fe80::2, which does not count",
+        |s| s.igp_metric_v6(probe).is_none() && count_v6(s, dst) == 0,
+    )
+    .await;
     del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Bgp)).await;
     task.abort();
 }
