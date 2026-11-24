@@ -161,9 +161,10 @@ impl Writer {
 /// A BGP UPDATE whose attributes could not all be decoded cleanly.
 ///
 /// Produced by [`BgpMessage::decode`] when one or more path attributes are
-/// malformed but the error policy (RFC 7606 §5) does not require a session
-/// reset. The transport layer inspects [`MalformedUpdate::treat_as_withdraw`]
-/// to decide whether to forward a synthetic withdrawal or the cleaned UPDATE.
+/// malformed. It is data only: the RFC 7606 recovery decision is made by
+/// [`UpdateRecovery::classify`](crate::fsm::UpdateRecovery::classify) and
+/// applied by the FSM (RFC 4271 §8.2.2 state rules first), never by the
+/// transport.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MalformedUpdate {
     /// The UPDATE with bad attributes removed.
@@ -193,8 +194,10 @@ pub enum BgpMessage {
     RouteRefresh(RouteRefreshMessage),
     /// UPDATE with one or more malformed attributes handled per RFC 7606.
     ///
-    /// The session is not reset. The transport layer applies the per-attribute
-    /// error policy: treat-as-withdraw or attribute-discard.
+    /// Not acted on where it is received: the transport hands it to the FSM as
+    /// [`FsmInput::MalformedUpdate`](crate::fsm::FsmInput::MalformedUpdate), which
+    /// applies the RFC 4271 §8.2.2 state rules before any RFC 7606 recovery
+    /// (treat-as-withdraw, attribute discard, or session reset).
     MalformedUpdate(MalformedUpdate),
 }
 
@@ -304,6 +307,25 @@ impl BgpMessage {
                 Ok(Self::RouteRefresh(rr))
             }
         }
+    }
+
+    /// The BGP message Type octet this message carries on the wire (RFC 4271
+    /// §4.1: 1 OPEN, 2 UPDATE, 3 NOTIFICATION, 4 KEEPALIVE; RFC 2918: 5
+    /// ROUTE-REFRESH). A [`BgpMessage::MalformedUpdate`] was received as an
+    /// UPDATE, so it reports 2.
+    ///
+    /// This is the value RFC 6608 §4 requires in the Data field of a Finite
+    /// State Machine Error NOTIFICATION identifying the unexpected message.
+    #[must_use]
+    pub fn type_code(&self) -> u8 {
+        match self {
+            Self::Open(_) => MsgType::Open,
+            Self::Update(_) | Self::MalformedUpdate(_) => MsgType::Update,
+            Self::Notification(_) => MsgType::Notification,
+            Self::Keepalive => MsgType::Keepalive,
+            Self::RouteRefresh(_) => MsgType::RouteRefresh,
+        }
+        .as_u8()
     }
 
     /// Encode this message to wire format, including the 19-byte header,

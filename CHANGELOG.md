@@ -63,6 +63,59 @@ announcements carrying the BLACKHOLE community".
 
 ---
 
+## 2026-11-24 (pathvector-session: malformed-UPDATE recovery goes through the FSM — issue #98)
+
+`handle_primary_message` handed a `BgpMessage::MalformedUpdate` straight to
+`handle_malformed_update`, which applied RFC 7606 recovery itself and sent
+`SessionEvent::RouteUpdate` on the event channel without ever asking the FSM. So a recoverable
+malformed UPDATE (attribute discard, treat-as-withdraw) crossed the route-event boundary in
+`OpenSent`/`OpenConfirm` — states where RFC 4271 §8.2.2 processes no UPDATE at all — and a
+session-reset outcome in those states fed `ProtocolErrorNotificationToSend` to an FSM that only
+handled it in `Established`, so no NOTIFICATION was sent and the connection stayed open. Real-wire
+reproduction (before the fix): an UPDATE with a malformed `AGGREGATOR` in place of the peer's
+OPEN made the session emit a `RouteUpdate` and send nothing.
+
+RFC basis (read from the primary text; RFC 4271 §8.2.2, RFC 7606 §2/§3/§5.2, RFC 6608 §3):
+Events 27 (`UpdateMsg`) and 28 (`UpdateMsgErr`) are *state-dependent*. Idle ignores them;
+Connect/Active stop the ConnectRetryTimer, drop TCP and go Idle; OpenSent/OpenConfirm send a
+Finite State Machine Error NOTIFICATION (RFC 6608 subcodes 1/2) and go Idle; Established processes
+a valid UPDATE (Event 27: restart the HoldTimer) or, for an UPDATE error, sends an Update-error
+NOTIFICATION and goes Idle (Event 28). RFC 7606 only changes *which* errors are Event 28 versus
+recovered in place; it does not authorize processing an UPDATE before Established.
+
+- New `fsm::UpdateRecovery` (`src/fsm/recovery.rs`): the pure RFC 7606 decision (session reset /
+  treat-as-withdraw / attribute discard, incl. §3(h) precedence and §5.2 Missing-NLRI escalation).
+  `make_treat_as_withdraw` and `is_nlri_less_with_attributes` moved here from the transport,
+  with their tests. The type is opaque and only the FSM can consume it, so recovery cannot take
+  effect outside the state machine: the transport has no path from a `MalformedUpdate` to
+  `event_tx` any more (`handle_malformed_update` is gone).
+- New `FsmInput::MalformedUpdate(UpdateRecovery)` (`MessageReceived(MalformedUpdate)` is
+  normalised to it) with per-state handling as above. A recovered UPDATE in Established is now an
+  ordinary Event 27 UPDATE, which also fixes a latent bug: recovered UPDATEs did **not** restart
+  the HoldTimer, so a peer sending only RFC 7606-recovered UPDATEs would have been timed out.
+- Review follow-up (Codex, PR #143): RFC 6608 §4 requires the FSM Error NOTIFICATION's Data
+  to be "a 1-octet, unsigned integer that indicates the type of the unexpected message" in
+  OpenSent, OpenConfirm *and* Established; every such NOTIFICATION was sent with empty Data. All
+  four sites now carry the type octet (2 for an UPDATE, malformed or not; 1 OPEN, 4 KEEPALIVE,
+  5 ROUTE-REFRESH) via the new `BgpMessage::type_code`.
+- Connect/Active now treat a received UPDATE (valid or not) per §8.2.2 (drop to Idle) instead of
+  silently ignoring it.
+- The transport still classifies a session-reset recovery as `TerminationReason::OperatorStop`
+  (locally detected: immediate flush, reconnect scheduled), unchanged.
+
+Regression tests (each confirmed failing before the fix): the full state × outcome matrix with
+exact outputs and normal-UPDATE parity in `src/fsm/update_error_tests.rs`; real loopback-TCP /
+real-`BgpCodec` tests in `tests/malformed_update_fsm.rs` — raw payload bytes in OpenSent and
+OpenConfirm (exact NOTIFICATION incl. the RFC 6608 type octet off the wire, connection closed, no session event), Established
+discard/withdraw/reset (exact NOTIFICATION Data, `Terminated(OperatorStop)`, reconnect on a new
+connection) and HoldTimer restart. Not done: a Docker/pathvectord scenario (the e2e images are
+shared tags; building them from this branch would replace other work's images) — the daemon-side
+defenses behind the session boundary are unchanged and not re-exercised end to end. Pre-existing,
+unchanged and noted for follow-up: an FSM-error teardown before Established leaves the peer in
+Idle with no ConnectRetryTimer (same as any other OpenSent/OpenConfirm protocol error).
+
+---
+
 ## 2026-11-24 (pathvectord: withdraw the older route when a replacement is dropped before import policy — issue #138)
 
 Same bug shape as #80 (PR #131), for announcements that never reach import policy.
