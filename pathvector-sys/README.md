@@ -161,6 +161,25 @@ alternatives are worse in the common case: counting every unreported sibling as 
 each all-BGP ECMP set count as IGP reachability after a restart, and counting none loses
 the second path of every all-static set.
 
+**Re-read after a delete:** a delete changes which sibling the kernel describes. When an
+`RTM_DELROUTE` leaves a set headed by a route whose protocol is inferred, the supervisor
+dumps that route's table again and applies the set's new description: the new head's
+protocol is now reported, a lone remaining route is described in full, and the other
+siblings take the new head's protocol as their inference (what a restart's dump would
+give). No request can target one prefix: a strict-checked dump rejects a nonzero
+`rtm_dst_len` and filters only by table, protocol, type and device
+(`ip_valid_fib_dump_req`), and `RTM_GETROUTE` with `RTM_F_FIB_MATCH` answers a policy
+lookup with whichever sibling the multipath hash picks. So the dump is filtered by table
+and by the device of the inferred head (Linux 4.20+, `NETLINK_GET_STRICT_CHK`; older
+kernels dump everything and the set is picked out here). It runs on a netlink socket of
+its own, opened for that read: the notification socket's full dumps would be filtered
+by their own header fields under strict checking, and an abandoned read must not leave
+a dump running there. Notifications already received (up to 1024) are applied before the
+dump, so a burst of deletes costs one dump per table and device; each change is still
+signalled at once, and the snapshot lock is not held during the dump. An untracked route
+with an inferred protocol is kept whole rather than as a hash so that it can be found and
+settled.
+
 A lookup takes the longest matching prefix and, among its routes, the lowest priority,
 as the kernel does. For IPv6, routes of that priority are then ranked by router
 preference (`RTA_PREF`; `rt6_score_route` adds `IPV6_DECODE_PREF(pref) << 2`, and
@@ -215,15 +234,31 @@ BGP route (see "BGP route exclusion" in the `fib` module docs).
 Known limits:
 
 - **Mixed-protocol IPv6 ECMP sets learned from a dump (or a multipath `NLM_F_APPEND`)**
-  are the one case the inference gets wrong, in either direction, because netlink never
-  reports the unreported siblings' protocols:
-  - static first, BGP second: the BGP sibling counts as a path until it is deleted;
-  - BGP first, static second: the static sibling is not used until a message reports it,
-    even after the BGP sibling is deleted.
+  are the one case the inference gets wrong, in either direction, because netlink reports
+  only the head sibling's protocol. The re-read limits how long that lasts:
+  - BGP first, static second: the static sibling is **not used while the BGP sibling is
+    installed**. Once the BGP sibling is deleted, the re-read restores the static path.
+  - static first, BGP second: the BGP sibling counts as a path while the static sibling
+    is installed. No lookup result changes (the static sibling is in the same slot and
+    comes first), only what `routes_v6` lists. Once the static sibling is deleted, the
+    re-read stops counting the BGP one.
+  - Sets of three or more: a re-read settles only the new head. The other inferred
+    siblings take its protocol as a fresh inference, which is still wrong for a sibling
+    of a third protocol until it becomes the head itself.
+  - A re-read whose dump fails or outlasts the dump timeout keeps the inference until a
+    later delete re-reads the set. Notifications wait meanwhile, so a stalled read
+    delays them by up to the dump timeout; it is not counted as a loss.
+  - A delete notified while a resynchronization's IPv6 dump runs is not re-read: it is
+    replayed onto a dump that may predate it. An overrun met while notifications are
+    read ahead of a re-read drops the re-read, since the resynchronization that follows
+    dumps every set afresh.
 
   Such sets need two daemons (or an operator) appending into one ECMP set. `FibWriter`
-  replaces rather than appends, so it never creates them. Re-reading the set after its
-  first sibling is deleted would narrow the second case; that is a possible follow-up.
+  replaces rather than appends, so it never creates them. The re-read also runs for
+  single-protocol sets learned from a dump whenever their head is deleted (their other
+  siblings are inferred too), for example in an all-BGP ECMP set installed by another
+  daemon. Each such delete costs a dump of the table filtered to one device, which for a
+  full BGP table behind one interface is a full-table read.
 - Untracked identities are compared by a 64-bit hash within one slot; a collision
   between two routes of the same slot is possible in principle but negligible.
 - IPv4 aliases that differ only in `RTA_METRICS` are treated as one route.

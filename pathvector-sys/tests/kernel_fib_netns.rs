@@ -1183,6 +1183,78 @@ async fn negative_route_over_link_local_space_agrees_with_the_kernel() {
     task.abort();
 }
 
+// ── Re-reading a set after a delete ──────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn bgp_first_mixed_set_returns_the_static_path_once_the_bgp_route_goes() {
+    // The dump describes the set through its BGP route, so the static route
+    // is inferred to be BGP. Once the BGP route is deleted the kernel
+    // describes the static route on its own, and a re-read must find it.
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest56i").await;
+    let dst: Ipv6Addr = "2001:db8:220::".parse().unwrap();
+    let probe: Ipv6Addr = "2001:db8:220::1".parse().unwrap();
+    ecmp_pair(
+        &handle,
+        dst,
+        oif,
+        [RouteProtocol::Bgp, RouteProtocol::Static],
+    )
+    .await;
+
+    let (snap, task) = start_fib().await;
+    assert_eq!(
+        snap.read().unwrap().igp_metric_v6(probe),
+        None,
+        "inferred from the dump"
+    );
+    del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Bgp)).await;
+    // The re-read runs after the delete event, and a marker route's event can
+    // be applied before it ends, so wait for the result itself.
+    eventually(
+        &snap,
+        "the static route via fe80::2, the kernel's only route for the prefix",
+        |s| s.igp_metric_v6(probe) == Some(10),
+    )
+    .await;
+    del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Static)).await;
+    eventually(&snap, "no route for the prefix", |s| count_v6(s, dst) == 0).await;
+    assert_eq!(snap.read().unwrap().igp_metric_v6(probe), None);
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a disposable network namespace; see module docs"]
+async fn static_first_mixed_set_stops_counting_the_bgp_route_once_the_static_route_goes() {
+    // The mirror image: the BGP route is inferred to be static and counts
+    // until a re-read after the static route's delete describes it as BGP.
+    let handle = connect();
+    let oif = dummy(&handle, "pvtest56j").await;
+    let dst: Ipv6Addr = "2001:db8:223::".parse().unwrap();
+    let probe: Ipv6Addr = "2001:db8:223::1".parse().unwrap();
+    ecmp_pair(
+        &handle,
+        dst,
+        oif,
+        [RouteProtocol::Static, RouteProtocol::Bgp],
+    )
+    .await;
+
+    let (snap, task) = start_fib().await;
+    assert_eq!(count_v6(&snap.read().unwrap(), dst), 2, "inferred static");
+    del(&handle, v6_via(dst, "fe80::1", oif, RouteProtocol::Static)).await;
+    // Until the re-read ends, the BGP route still counts as static.
+    eventually(
+        &snap,
+        "only the BGP route via fe80::2, which does not count",
+        |s| s.igp_metric_v6(probe).is_none() && count_v6(s, dst) == 0,
+    )
+    .await;
+    del(&handle, v6_via(dst, "fe80::2", oif, RouteProtocol::Bgp)).await;
+    task.abort();
+}
+
 // ── Issue #59: recovery after notification loss ──────────────────────────────
 
 /// The snapshot's routes inside `10.59.0.0/16`, the prefix the loss test uses

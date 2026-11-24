@@ -4,6 +4,37 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-23 (IPv6 ECMP: re-read a set after a delete leaves an inferred head)
+
+Follow-up to PR #122. A dump describes an IPv6 ECMP set only through its first sibling,
+so a mixed-protocol set learned from a dump was misclassified for as long as it existed:
+a BGP-first static+BGP set never used its static route, even after the BGP route was
+deleted, and a static-first set counted its BGP route until that route was deleted.
+
+A delete changes which sibling the kernel describes. When an `RTM_DELROUTE` leaves a set
+headed by a route whose protocol is inferred (`RouteMirror::inferred_set_head`), the
+snapshot supervisor (from #59) dumps that route's table again through a new port method,
+`RouteFeed::reread`, and applies the set with `RouteMirror::redescribe`: the new head's
+protocol is reported, a lone route is described in full, and the remaining inferred
+siblings take the new head's protocol. The netlink adapter runs each read on a socket of
+its own with `NETLINK_GET_STRICT_CHK`, filtered by table and device, because no request
+can select one prefix (`ip_valid_fib_dump_req` rejects a nonzero `rtm_dst_len`;
+`RTM_F_FIB_MATCH` describes the sibling the multipath hash picks), and accepts it only
+on `NLMSG_DONE`. Notifications already received (up to 1024) are applied before the
+dump, so a burst of deletes costs one dump per table and device; each change is still
+signalled at once, and the snapshot lock is not held across the dump. A read that fails
+or outlasts the dump timeout is dropped; an overrun met while reading ahead leaves the
+set to the resynchronization. Untracked routes
+with an inferred protocol are now kept whole instead of as a hash.
+
+Live tests: a BGP-first mixed set regains its static path after the BGP delete, and a
+static-first set stops counting its BGP route after the static delete; both fail without
+the re-read, and both wait for its result (a marker route's notification can be applied
+while it runs). The supervisor's fake-kernel tests cover batching, stalled and failed
+reads, and an overrun while reading ahead. Still unresolved: the misclassification while
+the head is installed, non-head siblings of sets of three or more, failed re-reads, and
+deletes notified during a resynchronization's IPv6 dump (see the crate README).
+
 ## 2026-11-23 (RFC 4271 §9.2.1.1: MRAI-suppressed replacements were never sent)
 
 **Bug.** `propagate_to_all_peers` ran `propagate_prefix`, which commits the new

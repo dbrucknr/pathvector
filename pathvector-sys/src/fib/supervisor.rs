@@ -104,10 +104,37 @@
 //! receive, so a degraded snapshot drifts no further than necessary, and
 //! further overruns fold into the pending resynchronization instead of
 //! triggering one dump each.
+//!
+//! # Re-reading IPv6 sibling sets
+//!
+//! An IPv6 ECMP sibling's protocol is reported only when a message describes
+//! that sibling, and a dump describes a set only through its first sibling
+//! (`fib6_dump_node` in `net/ipv6/ip6_fib.c`: "no need to dump the sibling
+//! routes again"). The other siblings carry an inferred protocol (see the
+//! `route` module docs).
+//!
+//! A delete changes what the kernel describes: once the first sibling is gone
+//! the next one heads the set, and a lone remaining route is described in
+//! full. So while the supervisor follows notifications, a delete that leaves
+//! a set headed by a route whose protocol is inferred has that set read back
+//! ([`RouteFeed::reread`]) and applied with `RouteMirror::redescribe`.
+//! Notifications already received (up to [`REREAD_BATCH`]) are applied
+//! first, so a burst of deletes costs one read per table and device, and
+//! each change is still signalled at once. An overrun or a connection loss
+//! met on the way drops the pending reads: the resynchronization that
+//! follows dumps every set afresh.
+//!
+//! A read that fails or outlasts the [`DumpTimeout`] is dropped, and its sets
+//! keep their inferred protocols until a later delete re-reads them. So does
+//! a delete applied during a resynchronization: the waits between attempts
+//! end in a fresh dump, but a delete notified while the IPv6 dump runs is
+//! replayed onto a dump that may predate it.
 
 use std::{
+    collections::{HashMap, HashSet},
     future::Future,
     io, mem,
+    num::NonZeroU32,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -119,7 +146,7 @@ use tokio::{
 };
 
 use super::{
-    FibSnapshot,
+    FibSnapshot, KernelRouteV6, NextHopV6, RouteSlotV6, TableId,
     health::{DegradedCause, DumpTimeout, FibStatus, IoFailure, ResyncBackoff, SnapshotHealth},
 };
 
@@ -141,6 +168,11 @@ pub(crate) trait RouteUpdate: Send + 'static {
 
     /// Applies the change; returns `true` if the snapshot changed.
     fn apply(&self, snapshot: &mut FibSnapshot) -> bool;
+
+    /// The slot of the IPv6 route this notification deletes, if it deletes
+    /// one in the tracked table. Its set may need re-reading (see the module
+    /// docs).
+    fn deleted_v6(&self) -> Option<RouteSlotV6>;
 }
 
 /// What a feed delivers.
@@ -169,6 +201,14 @@ pub(crate) struct DumpReport {
     pub(crate) routes: FibSnapshot,
     /// The kernel set `NLM_F_DUMP_INTR` on one of the dump's messages.
     pub(crate) interrupted: bool,
+}
+
+/// Which routes a re-read dump lists: one routing table, and only the routes
+/// using a device if one is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RereadFilter {
+    pub(crate) table: TableId,
+    pub(crate) oif: Option<NonZeroU32>,
 }
 
 /// Why a dump did not complete.
@@ -203,6 +243,19 @@ pub(crate) trait RouteFeed: Send {
         &mut self,
         family: Family,
     ) -> impl Future<Output = Result<DumpReport, DumpError>> + Send + 'static;
+
+    /// Reads back the IPv6 sibling sets in `slots` from the routes `filter`
+    /// selects. Each set comes as one message decodes it: the route the
+    /// message describes first, then its siblings (see
+    /// `RouteMirror::redescribe`). Like [`dump`](Self::dump), the future
+    /// does not borrow the feed, and it succeeds only if the read ends with
+    /// `NLMSG_DONE`. Dropping it abandons the read; that must not affect the
+    /// feed.
+    fn reread(
+        &mut self,
+        filter: RereadFilter,
+        slots: HashSet<RouteSlotV6>,
+    ) -> impl Future<Output = Result<Vec<Vec<KernelRouteV6>>, DumpError>> + Send + 'static;
 }
 
 /// Opens connections subscribed to IPv4 and IPv6 route notifications.
@@ -242,12 +295,17 @@ impl Shared {
         (shared, change_rx, status_rx)
     }
 
-    /// Applies one notification to the live snapshot.
-    fn apply(&self, update: &impl RouteUpdate) {
-        let changed = update.apply(&mut self.snapshot.write().expect("FibSnapshot poisoned"));
+    /// Applies one notification to the live snapshot. Returns the slot to
+    /// re-read, if any (see [`apply_update`]).
+    fn apply(&self, update: &impl RouteUpdate) -> Option<RouteSlotV6> {
+        let (changed, reread) = apply_update(
+            &mut self.snapshot.write().expect("FibSnapshot poisoned"),
+            update,
+        );
         if changed {
             let _ = self.change_tx.send(());
         }
+        reread
     }
 
     /// Replaces the live snapshot with a freshly dumped one, and signals a
@@ -317,6 +375,53 @@ impl Shared {
         self.status_tx
             .send_modify(|s| s.health = SnapshotHealth::Ready { since });
     }
+}
+
+/// Applies `update` to `snapshot`. Returns whether the snapshot changed, and
+/// the deleted route's slot if its set is now headed by a route whose
+/// protocol is inferred: that is the route the kernel now describes. With a
+/// known head a read would only repeat what is known.
+///
+/// The slot is returned even if no tracked route changed: deleting the BGP
+/// route that heads a set changes nothing tracked, yet the kernel then
+/// describes the next sibling.
+pub(super) fn apply_update(
+    snapshot: &mut FibSnapshot,
+    update: &impl RouteUpdate,
+) -> (bool, Option<RouteSlotV6>) {
+    let changed = update.apply(snapshot);
+    let reread = update
+        .deleted_v6()
+        .filter(|slot| snapshot.v6.inferred_set_head(slot).is_some());
+    (changed, reread)
+}
+
+/// Groups the slots whose set is still headed by an inferred route by the
+/// read that will cover them: the head's table and device
+/// (`fib6_info_uses_dev` lets a device filter match a set through any
+/// sibling). Slots that later notifications have settled are dropped.
+pub(super) fn reread_groups(
+    snapshot: &FibSnapshot,
+    slots: HashSet<RouteSlotV6>,
+) -> HashMap<RereadFilter, HashSet<RouteSlotV6>> {
+    let mut groups: HashMap<RereadFilter, HashSet<RouteSlotV6>> = HashMap::new();
+    for slot in slots {
+        let Some(head) = snapshot.v6.inferred_set_head(&slot) else {
+            continue;
+        };
+        let oif = match head.next_hop {
+            NextHopV6::Path(p) => p.oif,
+            NextHopV6::Object(_) => None,
+        };
+        groups
+            .entry(RereadFilter {
+                table: slot.table,
+                oif,
+            })
+            .or_default()
+            .insert(slot);
+    }
+    groups
 }
 
 /// `std` time that follows tokio's clock, so paused-time tests stay coherent.
@@ -438,26 +543,92 @@ async fn run_connection<F: RouteFeed>(
         }
 
         // The snapshot mirrors the kernel; keep it that way.
-        loop {
-            match feed.next().await {
-                Some(Notification::Route(update)) => {
-                    shared.apply(&update);
-                    coop::consume_budget().await;
-                }
-                Some(Notification::Overrun) => {
-                    shared.degrade(DegradedCause::NotificationsLost);
-                    if settle(&mut feed, shared, retry.next_delay()).await.is_err() {
-                        shared.degrade(DegradedCause::ConnectionLost);
-                        return;
-                    }
-                    break;
-                }
-                None => {
+        match follow(&mut feed, shared, dump_timeout).await {
+            Followed::Overrun => {
+                shared.degrade(DegradedCause::NotificationsLost);
+                if settle(&mut feed, shared, retry.next_delay()).await.is_err() {
                     shared.degrade(DegradedCause::ConnectionLost);
                     return;
                 }
             }
+            Followed::Closed => {
+                shared.degrade(DegradedCause::ConnectionLost);
+                return;
+            }
         }
+    }
+}
+
+/// Why [`follow`] stopped.
+enum Followed {
+    Overrun,
+    Closed,
+}
+
+/// The most notifications applied ahead of a pending re-read (see the module
+/// docs). A connection task on another thread can keep refilling the
+/// channel, so the read must not wait for it to empty.
+pub(super) const REREAD_BATCH: usize = 1024;
+
+/// Applies notifications to the live snapshot as they arrive, re-reading
+/// sibling sets as the module docs describe, until an overrun or the end of
+/// the feed.
+async fn follow<F: RouteFeed>(
+    feed: &mut F,
+    shared: &Shared,
+    dump_timeout: DumpTimeout,
+) -> Followed {
+    loop {
+        let update = match feed.next().await {
+            Some(Notification::Route(update)) => update,
+            Some(Notification::Overrun) => return Followed::Overrun,
+            None => return Followed::Closed,
+        };
+        let mut reread: HashSet<RouteSlotV6> = shared.apply(&update).into_iter().collect();
+        if !reread.is_empty() {
+            for _ in 1..REREAD_BATCH {
+                match feed.try_next() {
+                    Received::Notification(Notification::Route(update)) => {
+                        reread.extend(shared.apply(&update));
+                    }
+                    Received::Notification(Notification::Overrun) => return Followed::Overrun,
+                    Received::Empty => break,
+                    Received::Closed => return Followed::Closed,
+                }
+            }
+            reread_sets(feed, shared, reread, dump_timeout).await;
+        }
+        coop::consume_budget().await;
+    }
+}
+
+/// Re-reads the sibling sets in `slots` and applies them, then signals a
+/// change if a tracked route changed. The snapshot lock is not held while the
+/// kernel is read; notifications that arrive meanwhile wait in the feed and
+/// are applied afterwards, in order.
+async fn reread_sets<F: RouteFeed>(
+    feed: &mut F,
+    shared: &Shared,
+    slots: HashSet<RouteSlotV6>,
+    dump_timeout: DumpTimeout,
+) {
+    let groups = reread_groups(
+        &shared.snapshot.read().expect("FibSnapshot poisoned"),
+        slots,
+    );
+    let mut changed = false;
+    for (filter, slots) in groups {
+        let read = feed.reread(filter, slots);
+        let Ok(Ok(sets)) = time::timeout(dump_timeout.get(), read).await else {
+            continue;
+        };
+        let mut snapshot = shared.snapshot.write().expect("FibSnapshot poisoned");
+        for set in sets {
+            changed |= snapshot.v6.redescribe(set);
+        }
+    }
+    if changed {
+        let _ = shared.change_tx.send(());
     }
 }
 
@@ -476,7 +647,10 @@ async fn settle<F: RouteFeed>(
         tokio::select! {
             () = &mut deadline => return Ok(()),
             notification = feed.next() => match notification {
-                Some(Notification::Route(update)) => shared.apply(&update),
+                // The dump that follows the wait describes every set afresh.
+                Some(Notification::Route(update)) => {
+                    shared.apply(&update);
+                }
                 Some(Notification::Overrun) => shared.degrade(DegradedCause::NotificationsLost),
                 None => return Err(Closed),
             },
@@ -520,7 +694,9 @@ async fn resync<F: RouteFeed>(feed: &mut F, shared: &Shared, dump_timeout: DumpT
     // counts against consistency: conservative, never wrong.
     for _ in 0..DRAIN_LIMIT {
         match feed.try_next() {
-            Received::Notification(Notification::Route(update)) => shared.apply(&update),
+            Received::Notification(Notification::Route(update)) => {
+                shared.apply(&update);
+            }
             Received::Notification(Notification::Overrun) => {
                 return Attempt::Retry(DegradedCause::NotificationsLost);
             }

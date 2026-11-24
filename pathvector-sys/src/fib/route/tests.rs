@@ -784,6 +784,147 @@ fn inferred_protocol_is_used_until_a_message_reports_it() {
     assert_eq!(m.iter().count(), 1);
 }
 
+// ── Re-reading a sibling set after a delete ──────────────────────────────────
+//
+// fib6_dump_node dumps an ECMP set once, through its first sibling
+// (rt6_fill_node takes rtm_protocol from that route). After that sibling is
+// deleted, a dump describes the next one, and a lone route is described in
+// full. `redescribe` applies such a message.
+
+fn inferred(mut r: KernelRouteV6) -> KernelRouteV6 {
+    r.protocol_inferred = true;
+    r
+}
+
+const SET: &str = "2001:db8::/32";
+
+#[test]
+fn an_untracked_inferred_route_is_kept_and_found_once_it_heads_its_set() {
+    // BGP-first dump of a BGP+static set: the static route is inferred BGP.
+    let b1 = bgp6(SET, 10, Some("fe80::1"));
+    let s2 = inferred(bgp6(SET, 10, Some("fe80::2")));
+    let mut m = Mirror6::default();
+    m.upsert(b1.clone(), Position::Back);
+    m.insert(s2.clone(), Position::Back);
+    assert_eq!(m.iter().count(), 0, "neither is a path");
+    assert!(order6(&m, &[&b1, &s2]));
+    assert_eq!(
+        m.inferred_set_head(&b1.slot),
+        None,
+        "a dump describes b1, which is known"
+    );
+    assert!(!m.remove(&b1));
+    assert_eq!(m.inferred_set_head(&b1.slot), Some(&s2), "kept whole");
+    assert!(!m.remove(&s2));
+    assert_eq!(m.inferred_set_head(&b1.slot), None);
+    assert!(m.is_empty());
+}
+
+#[test]
+fn the_set_head_skips_routes_that_cannot_be_siblings() {
+    // A device route (no gateway) in the same metric is not an ECMP route
+    // (rt6_qualify_for_ecmp), so it is dumped on its own and is not the head.
+    let dev = v6(SET, 10, None);
+    let s2 = inferred(bgp6(SET, 10, Some("fe80::2")));
+    let mut m = Mirror6::default();
+    m.insert(dev.clone(), Position::Back);
+    m.insert(s2.clone(), Position::Back);
+    assert_eq!(m.inferred_set_head(&dev.slot), Some(&s2));
+    let mut known = Mirror6::default();
+    known.insert(v6(SET, 10, Some("fe80::3")), Position::Back);
+    assert_eq!(known.inferred_set_head(&dev.slot), None);
+    assert_eq!(Mirror6::default().inferred_set_head(&dev.slot), None);
+}
+
+#[test]
+fn redescribe_settles_the_lone_survivor_of_a_bgp_first_set() {
+    let b1 = bgp6(SET, 10, Some("fe80::1"));
+    let mut m = Mirror6::default();
+    m.upsert(b1.clone(), Position::Back);
+    m.insert(inferred(bgp6(SET, 10, Some("fe80::2"))), Position::Back);
+    m.remove(&b1);
+    assert_eq!(metric6(&m, "2001:db8::1"), None);
+    // The kernel now describes the static route itself.
+    let s2 = v6(SET, 10, Some("fe80::2"));
+    assert!(m.redescribe([s2.clone()]));
+    assert_eq!(metric6(&m, "2001:db8::1"), Some(10));
+    assert_eq!(m.inferred_set_head(&s2.slot), None);
+    assert!(!m.redescribe([s2]), "nothing new");
+}
+
+#[test]
+fn redescribe_stops_counting_the_bgp_survivor_of_a_static_first_set() {
+    let s1 = v6(SET, 10, Some("fe80::1"));
+    let mut m = Mirror6::default();
+    m.upsert(s1.clone(), Position::Back);
+    m.insert(inferred(v6(SET, 10, Some("fe80::2"))), Position::Back);
+    m.remove(&s1);
+    assert_eq!(
+        metric6(&m, "2001:db8::1"),
+        Some(10),
+        "still inferred static"
+    );
+    assert!(m.redescribe([bgp6(SET, 10, Some("fe80::2"))]));
+    assert_eq!(metric6(&m, "2001:db8::1"), None);
+    assert_eq!(m.len(), 1, "still mirrored");
+}
+
+#[test]
+fn redescribe_reinfers_inferred_siblings_and_keeps_reported_ones() {
+    // Kernel order [x, y, z]. y's protocol was reported (static); x and z
+    // are inferred BGP (their head was deleted). The kernel now describes x
+    // as static.
+    let x = inferred(bgp6(SET, 10, Some("fe80::1")));
+    let y = v6(SET, 10, Some("fe80::2"));
+    let z = inferred(bgp6(SET, 10, Some("fe80::3")));
+    let mut m = Mirror6::default();
+    for r in [&x, &y, &z] {
+        m.insert(r.clone(), Position::Back);
+    }
+    assert_eq!(m.iter().count(), 1);
+    // A kernel message lists the siblings under x's protocol; y is given as
+    // BGP here to show that no inference overrides a reported protocol.
+    let message = [
+        v6(SET, 10, Some("fe80::1")),
+        bgp6(SET, 10, Some("fe80::2")),
+        v6(SET, 10, Some("fe80::3")),
+    ];
+    assert!(m.redescribe(message));
+    let got: Vec<_> = m
+        .iter()
+        .map(|r| (r.next_hop, r.protocol_inferred))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(x.next_hop, false), (y.next_hop, false), (z.next_hop, true)],
+        "all static, in kernel order; only z is still a guess"
+    );
+    assert_eq!(
+        m.inferred_set_head(&x.slot),
+        None,
+        "a dump would describe x again"
+    );
+}
+
+#[test]
+fn redescribe_touches_only_mirrored_routes_of_the_described_slot() {
+    let b1 = bgp6(SET, 10, Some("fe80::1"));
+    let mut m = Mirror6::default();
+    m.upsert(b1.clone(), Position::Back);
+    m.insert(inferred(bgp6(SET, 10, Some("fe80::2"))), Position::Back);
+    let before = m.clone();
+    // A route the events have not added yet is left to its own event.
+    assert!(!m.redescribe([v6(SET, 10, Some("fe80::9"))]));
+    // So is a slot with nothing mirrored, and an empty message.
+    assert!(!m.redescribe([v6(SET, 20, Some("fe80::2"))]));
+    assert!(!m.redescribe([]));
+    assert_eq!(m.len(), before.len());
+    assert_eq!(m.slot_order(&b1.slot), before.slot_order(&b1.slot));
+    // A sibling leg from another slot cannot occur, and is ignored.
+    assert!(!m.redescribe([b1.clone(), v6(SET, 20, Some("fe80::2"))]));
+    assert_eq!(m.iter().count(), 0);
+}
+
 // ── IPv4 NLM_F_REPLACE ────────────────────────────────────────────────────────
 
 #[test]

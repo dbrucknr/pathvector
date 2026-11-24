@@ -22,7 +22,7 @@
 //! snapshot equals the fake kernel's table.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
     sync::{Arc, Mutex, RwLock},
@@ -38,7 +38,7 @@ use tokio::{
 
 use super::*;
 use crate::fib::{
-    FibSnapshot, KernelRouteV4, KernelRouteV6, Position,
+    FibSnapshot, KernelRouteV4, KernelRouteV6, Position, RTPROT_BGP,
     health::{DegradedCause, DumpTimeout, FibStatus, ResyncBackoff, SnapshotHealth},
 };
 
@@ -103,6 +103,13 @@ impl RouteUpdate for Change {
             Self::Del(Route::V6(r)) => s.v6.remove(r),
         }
     }
+
+    fn deleted_v6(&self) -> Option<RouteSlotV6> {
+        match self {
+            Self::Del(Route::V6(r)) => Some(r.slot),
+            _ => None,
+        }
+    }
 }
 
 // ── Fake kernel ───────────────────────────────────────────────────────────────
@@ -135,6 +142,17 @@ enum DumpAct {
     FloodDuring(Vec<Change>),
 }
 
+/// What one re-read does.
+#[derive(Debug)]
+enum RereadAct {
+    /// The kernel lists these sets.
+    Answer(Vec<Vec<KernelRouteV6>>),
+    /// The kernel answers with this errno.
+    Fail(i32),
+    /// Never answers.
+    Stall,
+}
+
 struct FeedSlot {
     tx: Option<mpsc::UnboundedSender<Notification<Change>>>,
     /// Notifications that will find the receive buffer full.
@@ -164,13 +182,22 @@ struct Kernel {
     /// Flooded notifications still unread when the IPv6 dump was requested.
     flood_left_at_v6_dump: Option<usize>,
     dump_times: Vec<Instant>,
+    /// What the next re-reads do; an unscripted one lists nothing.
+    reread_script: VecDeque<RereadAct>,
+    /// Every re-read requested, in order.
+    rereads: Vec<(RereadFilter, HashSet<RouteSlotV6>)>,
 }
 
 impl Kernel {
     /// Changes the table and notifies every live socket, unless the change is
     /// a no-op.
     fn change(&mut self, change: &Change) -> bool {
-        if !change.apply(&mut self.truth) {
+        // Not `apply`'s answer: that says whether a tracked route changed,
+        // and a BGP route's add or delete changes none, yet is notified.
+        let size = |t: &FibSnapshot| (t.v4.len(), t.v6.len());
+        let before = size(&self.truth);
+        change.apply(&mut self.truth);
+        if size(&self.truth) == before {
             return false;
         }
         for slot in &mut self.feeds {
@@ -285,6 +312,14 @@ impl FakeKernel {
         }
         let cost = k.flood_cost;
         k.flood.pop_front().map(|c| (c, cost))
+    }
+
+    fn script_reread(&self, act: RereadAct) {
+        self.lock().reread_script.push_back(act);
+    }
+
+    fn rereads(&self) -> Vec<(RereadFilter, HashSet<RouteSlotV6>)> {
+        self.lock().rereads.clone()
     }
 
     fn truth(&self) -> FibSnapshot {
@@ -441,6 +476,29 @@ impl RouteFeed for FakeFeed {
                 }
             }
             Ok(report)
+        }
+    }
+
+    fn reread(
+        &mut self,
+        filter: RereadFilter,
+        slots: HashSet<RouteSlotV6>,
+    ) -> impl Future<Output = Result<Vec<Vec<KernelRouteV6>>, DumpError>> + Send + 'static {
+        let act = {
+            let mut k = self.kernel.lock();
+            k.rereads.push((filter, slots));
+            k.reread_script
+                .pop_front()
+                .unwrap_or(RereadAct::Answer(Vec::new()))
+        };
+        async move {
+            match act {
+                RereadAct::Answer(sets) => Ok(sets),
+                RereadAct::Fail(errno) => {
+                    Err(DumpError::Failed(io::Error::from_raw_os_error(errno)))
+                }
+                RereadAct::Stall => std::future::pending().await,
+            }
         }
     }
 }
@@ -1044,6 +1102,196 @@ async fn a_drain_that_hits_its_cap_is_not_trusted() {
     assert_eq!(status.resyncs(), 1, "installed, but not trusted");
     h.wait_ready().await;
     assert!(h.agrees());
+}
+
+// ── Re-reading IPv6 sibling sets ──────────────────────────────────────────────
+//
+// A dump describes an IPv6 ECMP set through its first sibling only, so the
+// others carry an inferred protocol; after the head's delete the kernel
+// describes the next sibling (see the module docs). The fake kernel does not
+// model that: each re-read's answer is scripted as the kernel would give it.
+
+const RTPROT_STATIC: u8 = 4;
+
+/// A leg of the ECMP set for `prefix` on device `oif`, with its protocol
+/// reported or inferred.
+fn leg(prefix: &str, gateway: &str, oif: u32, protocol: u8, inferred: bool) -> KernelRouteV6 {
+    KernelRouteV6 {
+        protocol,
+        protocol_inferred: inferred,
+        next_hop: NextHopV6::Path(crate::fib::NextHopPath {
+            gateway: Some(gateway.parse().unwrap()),
+            oif: NonZeroU32::new(oif),
+        }),
+        ..crate::fib::tests::r6(prefix, 48, 10)
+    }
+}
+
+/// A dumped pair: the described head and a sibling inferred to share its
+/// protocol.
+fn dumped_pair(prefix: &str, oif: u32, head: u8) -> (KernelRouteV6, KernelRouteV6) {
+    (
+        leg(prefix, "fe80::1", oif, head, false),
+        leg(prefix, "fe80::2", oif, head, true),
+    )
+}
+
+/// A kernel holding `routes`, and a supervisor that has them. They are added
+/// after the first dump, as notifications that carry each route as given,
+/// inferred protocol included: the fake's dump lists only tracked routes
+/// (`RouteMirror::iter`), and a BGP route is not tracked.
+async fn with_sets(routes: &[&KernelRouteV6]) -> (FakeKernel, Harness) {
+    let kernel = FakeKernel::default();
+    let h = Harness::ready(&kernel).await;
+    for r in routes {
+        assert!(kernel.add(&Route::V6((*r).clone())));
+    }
+    h.quiesce(Duration::from_millis(1)).await;
+    assert_eq!(kernel.rereads(), []);
+    (kernel, h)
+}
+
+fn metric(h: &Harness, addr: &str) -> Option<u32> {
+    h.snapshot().igp_metric_v6(addr.parse().unwrap())
+}
+
+fn filter(oif: u32) -> RereadFilter {
+    RereadFilter {
+        table: crate::fib::TableId::MAIN,
+        oif: NonZeroU32::new(oif),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn deleting_a_bgp_head_rereads_the_set_and_signals_the_static_path() {
+    // Deleting the BGP route changes no tracked route; the re-read does.
+    let (head, sibling) = dumped_pair("2001:db8:56::", 2, RTPROT_BGP);
+    let (kernel, mut h) = with_sets(&[&head, &sibling]).await;
+    assert_eq!(metric(&h, "2001:db8:56::1"), None, "inferred BGP");
+
+    let lone_static = KernelRouteV6 {
+        protocol: RTPROT_STATIC,
+        protocol_inferred: false,
+        ..sibling.clone()
+    };
+    kernel.script_reread(RereadAct::Answer(vec![vec![lone_static]]));
+    h.changes.mark_unchanged();
+    kernel.del(&Route::V6(head));
+    h.quiesce(Duration::from_millis(1)).await;
+
+    assert_eq!(
+        kernel.rereads(),
+        [(filter(2), HashSet::from([sibling.slot]))]
+    );
+    assert_eq!(metric(&h, "2001:db8:56::1"), Some(10));
+    assert!(h.changes.has_changed().unwrap(), "watchers learn of it");
+    assert!(h.health().is_ready());
+    assert_eq!(h.status().resyncs(), 1, "a re-read is not a resync");
+}
+
+#[tokio::test(start_paused = true)]
+async fn deleting_a_static_head_rereads_the_set_and_drops_the_bgp_path() {
+    let (head, sibling) = dumped_pair("2001:db8:56::", 2, RTPROT_STATIC);
+    let (kernel, h) = with_sets(&[&head, &sibling]).await;
+    let lone_bgp = KernelRouteV6 {
+        protocol: RTPROT_BGP,
+        protocol_inferred: false,
+        ..sibling
+    };
+    kernel.script_reread(RereadAct::Answer(vec![vec![lone_bgp]]));
+    kernel.del(&Route::V6(head));
+    h.quiesce(Duration::from_millis(1)).await;
+    assert_eq!(metric(&h, "2001:db8:56::1"), None, "only BGP is left");
+    assert_eq!(kernel.rereads().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deletes_already_received_cost_one_reread_per_table_and_device() {
+    let (head_a, leg_a) = dumped_pair("2001:db8:a::", 2, RTPROT_BGP);
+    let (head_b, leg_b) = dumped_pair("2001:db8:b::", 2, RTPROT_BGP);
+    let (head_c, leg_c) = dumped_pair("2001:db8:c::", 3, RTPROT_BGP);
+    let (lone_d, _) = dumped_pair("2001:db8:d::", 2, RTPROT_STATIC);
+    let (kernel, h) =
+        with_sets(&[&head_a, &leg_a, &head_b, &leg_b, &head_c, &leg_c, &lone_d]).await;
+
+    // All received before the supervisor runs again. The last leaves no set
+    // to re-read: a lone route is described in full.
+    for r in [&head_a, &head_b, &head_c, &lone_d] {
+        kernel.del(&Route::V6(r.clone()));
+    }
+    h.quiesce(Duration::from_millis(1)).await;
+
+    let rereads: HashMap<_, _> = kernel.rereads().into_iter().collect();
+    assert_eq!(
+        rereads,
+        HashMap::from([
+            (filter(2), HashSet::from([head_a.slot, head_b.slot])),
+            (filter(3), HashSet::from([head_c.slot])),
+        ])
+    );
+    assert_eq!(kernel.rereads().len(), 2, "one read per group");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delete_leaving_a_known_head_is_not_reread() {
+    // Deleting the inferred sibling leaves the described head.
+    let (head, sibling) = dumped_pair("2001:db8:56::", 2, RTPROT_STATIC);
+    let (kernel, h) = with_sets(&[&head, &sibling]).await;
+    kernel.del(&Route::V6(sibling));
+    h.quiesce(Duration::from_millis(1)).await;
+    assert_eq!(kernel.rereads(), []);
+    assert!(h.agrees());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_or_failed_reread_keeps_the_inference_and_the_feed_moving() {
+    let (a, a2) = dumped_pair("2001:db8:a::", 2, RTPROT_STATIC);
+    let (b, b2) = dumped_pair("2001:db8:b::", 2, RTPROT_STATIC);
+    let (kernel, h) = with_sets(&[&a, &a2, &b, &b2]).await;
+    let later = v4("192.0.2.0", 24, 0);
+
+    kernel.script_reread(RereadAct::Stall);
+    kernel.del(&Route::V6(a));
+    h.quiesce(Duration::from_millis(1)).await;
+    kernel.add(&later); // waits in the feed while the read stalls
+    h.quiesce(DUMP_TIMEOUT).await;
+    let s = h.snapshot();
+    assert!(
+        reachable(&s, "192.0.2.1"),
+        "applied once the read is dropped"
+    );
+    assert_eq!(
+        s.igp_metric_v6("2001:db8:a::1".parse().unwrap()),
+        Some(10),
+        "still inferred static"
+    );
+
+    kernel.script_reread(RereadAct::Fail(ENOMEM));
+    kernel.del(&Route::V6(b));
+    h.quiesce(Duration::from_millis(1)).await;
+    assert_eq!(
+        metric(&h, "2001:db8:b::1"),
+        Some(10),
+        "still inferred static"
+    );
+    assert_eq!(kernel.rereads().len(), 2);
+    assert!(h.health().is_ready(), "a failed re-read is not a loss");
+    assert_eq!((h.status().resyncs(), h.status().losses()), (1, 0));
+    assert_eq!(kernel.connects(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_overrun_met_while_reading_ahead_leaves_the_set_to_the_resync() {
+    let (head, sibling) = dumped_pair("2001:db8:56::", 2, RTPROT_BGP);
+    let (kernel, mut h) = with_sets(&[&head, &sibling]).await;
+    kernel.del(&Route::V6(head));
+    kernel.lose_next(1);
+    kernel.add(&v4("192.0.2.0", 24, 0)); // dropped: ENOBUFS
+    h.wait_degraded(DegradedCause::NotificationsLost).await;
+    let status = h.wait_ready().await;
+    assert_eq!(kernel.rereads(), [], "the resync dumps every set");
+    assert_eq!((status.resyncs(), status.losses()), (2, 1));
+    assert!(h.snapshot().same_tracked(&kernel.truth()));
 }
 
 // ── Pacing ────────────────────────────────────────────────────────────────────
