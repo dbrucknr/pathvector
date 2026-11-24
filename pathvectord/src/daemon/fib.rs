@@ -190,14 +190,10 @@ impl DaemonState {
             );
         }
 
-        if let Some(fm) = &self.fib_manager {
-            for change in fib_changes_v4 {
-                fm.apply_v4(change);
-            }
-            for change in fib_changes_v6 {
-                fm.apply_v6(change);
-            }
-        }
+        // Through the blackhole-aware path: a next hop that becomes resolvable
+        // must not replace a null route the book still holds for the prefix.
+        self.program_fib_v4(RibEffects::from_best(fib_changes_v4));
+        self.program_fib_v6(RibEffects::from_best(fib_changes_v6));
 
         if !changed_nlris_v4.is_empty() {
             self.propagate_to_all_peers(&changed_nlris_v4);

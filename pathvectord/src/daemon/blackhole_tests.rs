@@ -403,6 +403,151 @@ fn unicast_best_path_changes_never_overwrite_a_held_null_route() {
     );
 }
 
+/// Reachability that a test can flip: every next hop except `BAD_*` resolves,
+/// and `BAD_*` resolves once `recovered` is set.
+struct FlipOracle(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+const BAD_V4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 99);
+const BAD_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 0x99);
+
+impl pathvector_rib::oracle::NextHopOracle for FlipOracle {
+    fn is_reachable(&self, nh: &pathvector_types::NextHop) -> bool {
+        let bad = matches!(nh, pathvector_types::NextHop::V4(a) if *a == BAD_V4)
+            || matches!(nh, pathvector_types::NextHop::V6(a) if *a == BAD_V6);
+        !bad || self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn igp_metric(&self, _: &pathvector_types::NextHop) -> Option<u32> {
+        None
+    }
+}
+
+/// Codex review of #145: next-hop recomputation (`on_fib_change`) used to call
+/// the FIB port directly, so when a competing unicast route's next hop became
+/// resolvable its `Announced` replaced the null route while the book still
+/// held the blackhole — and the book's idempotent `claim` meant a repeat
+/// BLACKHOLE announcement could not reinstall it. Every Loc-RIB-to-FIB path
+/// goes through `program_fib_*`; this proves the recomputation one for both
+/// families, and that the Loc-RIB route is programmed once the blackhole goes.
+#[test]
+fn next_hop_recovery_does_not_overwrite_a_held_null_route() {
+    let (mut state, mut receivers, fib) = established_gr();
+    let recovered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.set_oracles(FlipOracle(recovered.clone()), FlipOracle(recovered.clone()));
+    agree(&mut state, a(), &SCOPE);
+
+    // B's unicast route for each prefix has an unresolvable next hop: stored
+    // as a candidate, not selected, not in the FIB.
+    let mut b4 = v4_update(HOST_V4, &[]);
+    b4.attributes
+        .retain(|x| !matches!(x, PathAttribute::NextHop(_)));
+    b4.attributes.push(PathAttribute::NextHop(BAD_V4));
+    let mut b6 = v6_update(HOST_V6, &[]);
+    for attr in &mut b6.attributes {
+        if let PathAttribute::MpReachNlri(mp) = attr {
+            mp.next_hop = pathvector_types::NextHop::V6(BAD_V6);
+        }
+    }
+    state.on_route_update(b(), b4);
+    state.on_route_update(b(), b6);
+    assert!(
+        state.rib.loc_rib.best(&p4(HOST_V4)).is_none(),
+        "precondition"
+    );
+    assert!(
+        state.rib.loc_rib_v6.best(&p6(HOST_V6)).is_none(),
+        "precondition"
+    );
+
+    state.on_route_update(a(), v4_update(HOST_V4, &[BH]));
+    state.on_route_update(a(), v6_update(HOST_V6, &[BH]));
+    drain(&mut state, &mut receivers);
+    assert_eq!(bh4(&fib), vec![(p4(HOST_V4), true)]);
+    assert_eq!(bh6(&fib), vec![(p6(HOST_V6), true)]);
+    fib.v4.lock().unwrap().clear();
+    fib.v6.lock().unwrap().clear();
+
+    // B's next hop becomes resolvable; the daemon recomputes best paths.
+    recovered.store(true, std::sync::atomic::Ordering::SeqCst);
+    state.on_fib_change();
+
+    assert!(
+        state.rib.loc_rib.best(&p4(HOST_V4)).is_some(),
+        "B's route is now selectable"
+    );
+    assert!(
+        fib.v4_changes()
+            .iter()
+            .all(|c| !matches!(c, BestPathChange::Announced(..))),
+        "recomputation programmed a unicast IPv4 route over the null route: {:?}",
+        fib.v4_changes()
+    );
+    assert!(
+        fib.v6
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !matches!(c, BestPathChange::Announced(..))),
+        "recomputation programmed a unicast IPv6 route over the null route"
+    );
+
+    // When the blackholes go, B's now-resolvable routes are programmed.
+    state.on_route_update(a(), v4_withdraw(HOST_V4));
+    state.on_route_update(a(), v6_withdraw(HOST_V6));
+    assert!(
+        fib.v4_changes()
+            .iter()
+            .any(|c| matches!(c, BestPathChange::Announced(n, _) if *n == p4(HOST_V4)))
+    );
+    assert!(
+        fib.v6
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, BestPathChange::Announced(n, _) if *n == p6(HOST_V6)))
+    );
+}
+
+/// Local origination programs the FIB too: originating a prefix that a peer
+/// has blackholed must not replace the null route either.
+#[test]
+fn originating_a_blackholed_prefix_does_not_overwrite_the_null_route() {
+    use pathvector_rib::RouteBuilder;
+    use pathvector_types::{AsPath, NextHop, Origin};
+
+    let (mut state, mut receivers, fib) = established_gr();
+    agree(&mut state, a(), &SCOPE);
+    state.on_route_update(a(), v4_update(HOST_V4, &[BH]));
+    state.on_route_update(a(), v6_update(HOST_V6, &[BH]));
+    drain(&mut state, &mut receivers);
+    fib.v4.lock().unwrap().clear();
+    fib.v6.lock().unwrap().clear();
+
+    state.originate_route(
+        RouteBuilder::new(p4(HOST_V4), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V4(Ipv4Addr::new(192, 0, 2, 1)))
+            .build(),
+    );
+    state.originate_route_v6(
+        RouteBuilder::new(p6(HOST_V6), Origin::Igp, AsPath::new())
+            .next_hop(NextHop::V6("2001:db8::1".parse().unwrap()))
+            .build(),
+    );
+
+    assert!(
+        fib.v4_changes()
+            .iter()
+            .all(|c| !matches!(c, BestPathChange::Announced(..)))
+    );
+    assert!(
+        fib.v6
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !matches!(c, BestPathChange::Announced(..)))
+    );
+}
+
 // ── Session lifecycle ────────────────────────────────────────────────────────
 
 /// A clean session end releases every null route the peer held, both families,

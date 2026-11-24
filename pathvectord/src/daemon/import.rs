@@ -217,6 +217,16 @@ impl<A: IpAddress> Default for RibEffects<A> {
 }
 
 impl<A: IpAddress> RibEffects<A> {
+    /// Best-path changes only, for callers that change the Loc-RIB outside the
+    /// import pipeline (next-hop recomputation, local origination) but must
+    /// still program the FIB through the blackhole-aware path.
+    pub(crate) fn from_best(best: Vec<BestPathChange<A>>) -> Self {
+        Self {
+            best,
+            blackhole: Vec::new(),
+        }
+    }
+
     /// Appends one effect.
     pub(crate) fn push(&mut self, effect: ImportEffect<A>) {
         self.best.push(effect.best);
