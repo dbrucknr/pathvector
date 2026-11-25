@@ -195,6 +195,30 @@ fn permitted_on_wire<A: IpAddress>(route: &Route<A>, peer: PeerId) -> bool {
     }
 }
 
+/// Whether route reflection keeps `best`, learned from `source`, out of this
+/// peer's Adj-RIB-Out.
+///
+/// RFC 4456 §6: "A route from a Non-Client IBGP peer: Reflect to all the
+/// Clients." / "A route from a Client peer: Reflect to all the Non-Client
+/// peers and also to the Client peers." So a reflector never passes a route
+/// from one non-client to another.
+///
+/// A reflecting Adj-RIB-Out (an iBGP peer of a route reflector) does not apply
+/// iBGP split horizon itself, so this is where the rule lives. The source's
+/// peer type comes from the route, not from the live sessions: a route retained
+/// for Graceful Restart is still a non-client's route.
+fn excluded_by_reflection<A: IpAddress>(
+    best: &Route<A>,
+    source: Option<PeerId>,
+    adj_rib_out: &AdjRibOut<A>,
+    rr_clients: &HashSet<IpAddr>,
+) -> bool {
+    adj_rib_out.reflects()
+        && best.peer_type == PeerType::Internal
+        && !rr_clients.contains(&adj_rib_out.peer().ip())
+        && source.is_some_and(|source| !rr_clients.contains(&source.ip()))
+}
+
 /// The outbound decision for a single prefix after AdjRibOut processing.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -211,6 +235,12 @@ pub(crate) enum PrefixDecision {
 /// Returns what should be sent without transmitting anything — callers batch
 /// decisions and flush via [`flush_updates`].
 ///
+/// Every send path decides through this function (or [`propagate_prefix_v6`]),
+/// so the rules for excluding a route from a peer's Adj-RIB-Out belong here. An
+/// excluded route that was advertised before yields a `Withdraw` (RFC 4271
+/// §9.1.3). `rr_clients` is the reflector's client set (RFC 4456 §6), empty
+/// when not a route reflector.
+///
 /// `deferred` implements RFC 4724 §4.1's Restarting-Speaker
 /// outbound-advertisement deferral: when `true`, returns `NoChange`
 /// immediately without touching `loc_rib`/`adj_rib_out`/`export_policy` at
@@ -221,6 +251,7 @@ pub(crate) fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &impl RibView<Ipv4Addr>,
     adj_rib_out: &mut AdjRibOut<Ipv4Addr>,
+    rr_clients: &HashSet<IpAddr>,
     export_policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
     local_as: u32,
@@ -232,9 +263,6 @@ pub(crate) fn propagate_prefix(
     if deferred {
         return PrefixDecision::NoChange;
     }
-    // Compute best_peer once; callers that already looked it up for split-horizon
-    // checks pass the same call, but the real savings is removing the internal
-    // second call that used to exist here.
     let best_peer = loc_rib.best_peer(&nlri);
     match loc_rib.best(&nlri) {
         Some(best) => {
@@ -243,7 +271,9 @@ pub(crate) fn propagate_prefix(
             // iBGP case is also enforced by AdjRibOut::insert, but catching it
             // here avoids unnecessary prepare_outbound work and keeps eviction
             // logic consistent.
-            if best_peer == Some(adj_rib_out.peer()) {
+            if best_peer == Some(adj_rib_out.peer())
+                || excluded_by_reflection(best, best_peer, adj_rib_out, rr_clients)
+            {
                 return if adj_rib_out.withdraw(&nlri).is_some() {
                     PrefixDecision::Withdraw(nlri)
                 } else {
@@ -530,6 +560,7 @@ pub(crate) fn propagate_prefix_v6(
     nlri: Nlri<Ipv6Addr>,
     loc_rib: &LocRib<Ipv6Addr>,
     adj_rib_out: &mut AdjRibOut<Ipv6Addr>,
+    rr_clients: &HashSet<IpAddr>,
     export_policy: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
     local_as: u32,
@@ -548,8 +579,11 @@ pub(crate) fn propagate_prefix_v6(
     let best_peer = loc_rib.best_peer(&nlri);
     match loc_rib.best(&nlri) {
         Some(best) if can_announce => {
-            // Never re-advertise a route back to the peer it was learned from.
-            if best_peer == Some(adj_rib_out.peer()) {
+            // Never re-advertise a route back to the peer it was learned from,
+            // nor reflect one between non-clients.
+            if best_peer == Some(adj_rib_out.peer())
+                || excluded_by_reflection(best, best_peer, adj_rib_out, rr_clients)
+            {
                 return if adj_rib_out.withdraw(&nlri).is_some() {
                     PrefixDecisionV6::Withdraw(nlri)
                 } else {
@@ -2278,6 +2312,7 @@ mod route_to_attributes_tests {
 
 #[cfg(test)]
 mod propagate_tests {
+    use std::collections::HashSet;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::{
@@ -2348,6 +2383,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2379,6 +2415,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2411,6 +2448,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &reject_policy_v6(),
             PeerType::External,
             65001,
@@ -2444,6 +2482,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2460,6 +2499,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &reject_policy_v6(),
             PeerType::External,
             65001,
@@ -2490,6 +2530,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2504,6 +2545,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2555,6 +2597,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
@@ -2591,6 +2634,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
@@ -2655,6 +2699,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2686,6 +2731,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::Internal,
             65001,
@@ -2718,6 +2764,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ebgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2737,6 +2784,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ibgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::Internal,
             65001,
@@ -2769,6 +2817,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ebgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2788,6 +2837,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ibgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::Internal,
             65001,
@@ -2820,6 +2870,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2840,6 +2891,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2871,6 +2923,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2903,6 +2956,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ebgp_adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2922,6 +2976,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ibgp_adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
@@ -2973,6 +3028,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &policy,
             PeerType::External,
             65001,
@@ -3019,6 +3075,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &policy,
             PeerType::External,
             65001,
@@ -3054,6 +3111,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -3093,6 +3151,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -3129,6 +3188,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -3157,6 +3217,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -3178,6 +3239,7 @@ mod propagate_tests {
 /// source.
 #[cfg(test)]
 mod egress_rules_tests {
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::{DefaultAction, Policy};
@@ -3224,6 +3286,7 @@ mod egress_rules_tests {
                 n4(),
                 &loc_rib,
                 &mut out,
+                &HashSet::new(),
                 &policy,
                 peer_type,
                 65001,
@@ -3250,6 +3313,7 @@ mod egress_rules_tests {
                 n6(),
                 &loc_rib,
                 &mut out,
+                &HashSet::new(),
                 &policy,
                 peer_type,
                 65001,
