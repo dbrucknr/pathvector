@@ -676,7 +676,7 @@ impl RibService for RibServiceImpl {
                     });
                     RouteResponse {
                         found: true,
-                        route: Some(route_to_proto(peer_id, nlri, route)),
+                        route: Some(route_to_proto(peer_id, route.nlri, route)),
                     }
                 }
                 None => RouteResponse {
@@ -695,7 +695,7 @@ impl RibService for RibServiceImpl {
                     });
                     RouteResponse {
                         found: true,
-                        route: Some(route_v6_to_proto(peer_id, nlri, route)),
+                        route: Some(route_v6_to_proto(peer_id, route.nlri, route)),
                     }
                 }
                 None => RouteResponse {
@@ -873,7 +873,7 @@ impl RibService for RibServiceImpl {
             .candidates(&nlri)
             .map(|map| {
                 map.iter()
-                    .map(|(peer_id, route)| route_to_proto(*peer_id, nlri, route))
+                    .map(|(peer_id, route)| route_to_proto(*peer_id, route.nlri, route))
                     .collect()
             })
             .unwrap_or_default();
@@ -2782,6 +2782,72 @@ mod tests {
             resp.next_page_token.is_empty(),
             "no pagination token when all returned"
         );
+    }
+
+    /// Issue #71 through the management API: `OriginateRoute` accepts a prefix
+    /// with host bits, which RFC 4271 §4.3 says are irrelevant ("the value of
+    /// the trailing bits is irrelevant"). Every spelling must name the one
+    /// destination, and every response must name it canonically.
+    #[tokio::test]
+    async fn issue_71_originate_with_host_bits_is_one_canonical_destination() {
+        let state = arc_state(65001, &[]);
+        let origination = OriginationServiceImpl {
+            state: Arc::clone(&state),
+        };
+        let rib = RibServiceImpl {
+            state: Arc::clone(&state),
+        };
+
+        for prefix in ["10.1.2.3/8", "10.200.0.1/8"] {
+            let req = OriginateRouteRequest {
+                prefix: prefix.into(),
+                ..minimal_originate_req()
+            };
+            origination
+                .originate_route(Request::new(req))
+                .await
+                .expect("originate_route");
+        }
+
+        let listed = origination
+            .list_originated_routes(Request::new(ListOriginatedRoutesRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .routes;
+        let prefixes: Vec<&str> = listed.iter().map(|r| r.prefix.as_str()).collect();
+        assert_eq!(prefixes, ["10.0.0.0/8"], "one destination, listed once");
+
+        let best = rib
+            .get_best_route(Request::new(GetBestRouteRequest {
+                prefix: "10.9.9.9/8".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(best.found);
+        assert_eq!(best.route.unwrap().prefix, "10.0.0.0/8");
+
+        let candidates = rib
+            .list_candidates(Request::new(ListCandidatesRequest {
+                prefix: "10.9.9.9/8".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .routes;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].prefix, "10.0.0.0/8");
+
+        origination
+            .withdraw_originated_route(Request::new(WithdrawOriginatedRouteRequest {
+                prefix: "10.3.3.3/8".into(),
+            }))
+            .await
+            .unwrap();
+        let s = state.read().await;
+        assert!(s.rib.originated_routes.is_empty());
+        assert!(s.rib.loc_rib.is_empty());
     }
 
     // ── RibService::list_candidates ───────────────────────────────────────────
