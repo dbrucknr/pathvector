@@ -222,6 +222,16 @@ Quick reference:
 
 ---
 
+## Changelog entries
+
+Don't edit `CHANGELOG.md` in a pull request. Add a file under `changelog.d/`
+instead — see [changelog.d/README.md](changelog.d/README.md).
+
+A pull request only needs syncing with `main` when GitHub reports a conflict:
+`main` doesn't require branches to be up to date, and every push re-runs CI.
+
+---
+
 ## Commit style
 
 - Present-tense imperative subject line: `fix: collapse nested if in grpc test`

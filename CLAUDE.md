@@ -1,5 +1,13 @@
 # Project instructions
 
+## Changelog entries go in `changelog.d/`
+
+Never add an entry to `CHANGELOG.md` directly. Create a new file,
+`changelog.d/YYYY-MM-DD-short-slug.md`, starting with its `## ` heading — see
+`changelog.d/README.md`. Direct edits make open PRs conflict with each other
+and re-run CI. If a branch already edits `CHANGELOG.md`, move its entry into a
+fragment the next time it syncs with `main`.
+
 ## RFC-governed behavior: implementation and testing discipline
 
 This project implements BGP and related protocols across many RFCs
