@@ -153,6 +153,7 @@ impl DaemonState {
                     self.program_fib_v6(effects);
                 }
                 self.repropagate_peer_prefixes_v6(peer_ip, &affected);
+                self.emit_route_events_v6(&affected);
             }
         }
     }
@@ -498,6 +499,8 @@ impl DaemonState {
             }
             self.sync_advertised(other_ip);
         }
+        let affected: Vec<Nlri<Ipv6Addr>> = stale.iter().copied().collect();
+        self.emit_route_events_v6(&affected);
     }
 
     /// Flush stale routes held during GR deadline expiry.
@@ -536,6 +539,7 @@ impl DaemonState {
             best: self.rib_withdraw_peer_v6(&expired_peer),
             blackhole: self.blackholes.v6.release_peer(expired_peer),
         };
+        let changed_v6 = changed_nlris(&fx_v6.best);
         self.program_fib_v4(fx_v4);
         self.program_fib_v6(fx_v6);
         // Reset AdjRibOut for a clean reconnect.
@@ -697,6 +701,7 @@ impl DaemonState {
         }
 
         self.emit_route_events(&prev_prefixes);
+        self.emit_route_events_v6(&changed_v6);
         let _ = self.peer_tx.send(proto::PeerEvent {
             r#type: proto::PeerEventType::Changed as i32,
             peer: None,

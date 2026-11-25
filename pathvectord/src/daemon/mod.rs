@@ -69,6 +69,9 @@ mod peer;
 mod peer_stats;
 mod policy;
 mod route;
+// Issue #160: session loss must withdraw or replace routes in both families.
+#[cfg(test)]
+mod session_loss_tests;
 
 // Issues #81 and #82: BLACKHOLE authorization and import eligibility through
 // Graceful Restart.
@@ -93,7 +96,7 @@ use capabilities::{
     set_listener_key, warn_if_md5_best_effort,
 };
 use deferral::SelectionDeferral;
-use fib::withdraw_stale_bgp_routes;
+use fib::{changed_nlris, withdraw_stale_bgp_routes};
 use gr::GracefulRestartState;
 #[cfg(test)]
 use import::reapply_without_blackholes;

@@ -4,6 +4,24 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (Session loss now withdraws and replaces IPv6 routes at other peers — issue #160)
+
+### Fixes
+
+- When a session ended outside Graceful Restart helper mode (TCP failure, hold timer,
+  NOTIFICATION, `RemovePeer`), the lost peer's IPv6 routes left the Loc-RIB and FIB but no
+  UPDATE was sent: other peers kept the unreachable prefixes and never learned the
+  replacement path. RFC 4271 §3.1 / §8.2.2 delete those routes and §9.2 requires
+  advertising the result. IPv6-capable peers now get `MP_UNREACH_NLRI` or the new best
+  route.
+- `WatchRoutes` subscribers were not told about IPv6 changes on any teardown path: session
+  loss, the Graceful Restart flush, stale marking, deadline expiry and the End-of-RIB prune.
+  They now are.
+- Not covered: IPv6 changes outside teardown (a received UPDATE, a next-hop change, an
+  import-policy change, origination) still emit no `WatchRoutes` event.
+
+---
+
 ## 2026-11-25 (AS-number rules on the wire: RFC 6793 AS4_PATH, RFC 7607 AS 0, RFC 9774 AS_SET — issues #109, #110, #111)
 
 ### Behavior changes (read before upgrading)
