@@ -15,6 +15,11 @@
 //! enforced on every PDU; and the data is discarded when the cache's Expire Interval
 //! elapses without a completed sync (after which every validation is `NotFound`). See
 //! the crate README for the details and the cost of staging.
+//!
+//! Input handling: PDUs are delimited by their Length field however the bytes arrive, and
+//! a partly received PDU survives the refresh timer. A Prefix PDU outside the bounds of
+//! RFC 8210 §§5.1, 5.6 and 5.7 is answered with Error Report 0 ("Corrupt Data") and ends
+//! the session without publishing any of that transfer.
 
 mod cache;
 mod client;

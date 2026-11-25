@@ -238,6 +238,26 @@ locks for ≈ 1.9 ms. The price is memory — old and new tables coexist during 
 | PDU at a protocol version other than the negotiated one (§7) | Error Report 8 "Unexpected Protocol Version", drop the session; data and serial are left alone |
 | v0 answer to a v1 resume (§5.1: separate sessions) | no continuation; reconnect at once and resynchronise from scratch at v0 |
 | Serial Notify during version negotiation | ignored, whatever its version (§7) |
+| Prefix PDU with Prefix Length or Max Length past the family, or Max Length below Prefix Length (§§5.1, 5.6, 5.7) | Error Report 0 "Corrupt Data" carrying the PDU, drop the session; nothing of that transfer is published, the completed generation is kept, and the next query is a Reset Query |
+
+**Which records are accepted.** A Prefix PDU decodes straight into a `Vrp<A>`
+(`src/vrp.rs`), whose only constructor requires `prefix_len <= max_len <=` the family
+width, and the table accepts nothing else. Address bits beyond the Prefix Length are
+cleared: RFC 6811 §2 gives them no meaning, so `192.0.2.99/24` and `192.0.2.0/24` are the
+same record, for withdrawal too. (The version 2 draft, 8210bis, would reject such bits;
+this client speaks versions 0 and 1, whose RFCs do not.) Reserved Flags bits and reserved
+octets are ignored.
+
+A cache that serves even one forbidden record therefore cannot update this router: the
+last completed generation stays in use until it expires (below). `status().last_error`
+names the violated bound.
+
+**Reading the stream.** PDUs are delimited by their Length field, never by how TCP
+happened to deliver them. `src/frame.rs` is a pure incremental decoder (bytes in, PDUs
+out; at most one 64 KiB PDU plus one 16 KiB read buffered) and `src/transport.rs` the
+only socket code around it. Because partial PDUs live in the connection rather than in a
+read future, the refresh timer can interrupt an idle read at any byte without losing
+anything.
 
 **Expiry (RFC 8210 §6).** From the End of Data of the last *completed* sync, the data may
 be kept for the cache's advertised Expire Interval (v1) or `RtrConfig::expire_interval`
@@ -256,10 +276,11 @@ defaults against the same ranges and the "Expire larger than Refresh and Retry" 
 `RtrClient::spawn` does not reject a bad config, so callers taking operator input should
 call it.
 
-**Not (yet) handled** — tracked separately: partial-frame loss when the refresh timer
-cancels an idle read (#89), prefix length/max-length bounds (#91), duplicate-announcement
+**Not (yet) handled** — tracked separately: duplicate-announcement
 and unknown-withdrawal errors (#92), application-level query/connect deadlines and
-retaining the advertised retry interval across reconnects (#93), and a single cache only.
+retaining the advertised retry interval across reconnects (#93), Error Reports for other
+malformed input (an unknown PDU type or protocol version, or a wrong Length, ends the
+session without one — see `TODO.md`), and a single cache only.
 RTR over plain TCP assumes a trusted network (RFC 8210 §9).
 
 ---

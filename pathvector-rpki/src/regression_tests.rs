@@ -2064,6 +2064,9 @@ async fn trailing_address_bits_do_not_affect_a_vrp_or_its_withdrawal() {
 /// the completed-sync notification, over loopback TCP with the whole response
 /// written at once. Run with
 /// `cargo test --release -p pathvector-rpki -- --ignored --nocapture sync_cost`.
+///
+/// Each run opens ~600 short connections; many back-to-back runs exhaust the
+/// ephemeral port range (reported as a stall with the connect error).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "benchmark: prints timings, asserts nothing"]
 async fn sync_cost_report() {
@@ -2100,8 +2103,22 @@ async fn sync_cost_report() {
                 ..Default::default()
             });
             let mut changed = handle.subscribe();
-            let started = started_rx.await.unwrap();
-            changed.changed().await.unwrap();
+            // A failed attempt would sit out the 600 s retry interval: say why
+            // instead.
+            let stalled = |handle: &RtrHandle| -> ! {
+                panic!("sync stalled: {:?}", handle.status().last_error)
+            };
+            let limit = Duration::from_secs(5);
+            let Ok(started) = tokio::time::timeout(limit, started_rx).await else {
+                stalled(&handle)
+            };
+            let started = started.unwrap();
+            if tokio::time::timeout(limit, changed.changed())
+                .await
+                .is_err()
+            {
+                stalled(&handle)
+            }
             samples.push(started.elapsed());
             assert_eq!(handle.status().roa_count, records as usize);
             join.abort();
