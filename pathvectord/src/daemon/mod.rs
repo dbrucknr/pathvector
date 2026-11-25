@@ -85,6 +85,10 @@ mod gr_preference_tests;
 #[cfg(test)]
 mod rr_tie_break_tests;
 
+// Issues #177 / #135: RFC 4456 §8 attributes are added on reflection.
+#[cfg(test)]
+mod rr_reflection_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use blackhole::{BlackholeBook, BlackholeBooks, BlackholeChange, PeerBlackhole};
@@ -191,9 +195,9 @@ fn effective_session_as(local_as: u32, confederation_id: Option<u32>, peer_type:
 /// Creates a matched pair of `AdjRibOut` tables (IPv4 + IPv6) for one peer.
 ///
 /// Both tables are created with identical reflecting/non-reflecting mode so they
-/// can never diverge. When acting as a route reflector (`is_rr = true`) and the
-/// peer is iBGP, both tables use [`AdjRibOut::new_reflecting`]; otherwise both
-/// use [`AdjRibOut::new`].
+/// can never diverge. When acting as a route reflector (`reflector_cluster_id`
+/// is `Some`) and the peer is iBGP, both tables use
+/// [`AdjRibOut::new_reflecting`]; otherwise both use [`AdjRibOut::new`].
 ///
 /// All sites that construct outbound RIBs for a peer MUST use this function
 /// instead of calling `AdjRibOut::new` / `new_reflecting` directly. This is the
@@ -202,18 +206,17 @@ fn effective_session_as(local_as: u32, confederation_id: Option<u32>, peer_type:
 fn make_adj_ribs_out_pair(
     peer_id: PeerId,
     peer_type: PeerType,
-    is_rr: bool,
+    reflector_cluster_id: Option<u32>,
 ) -> (AdjRibOut<Ipv4Addr>, AdjRibOut<Ipv6Addr>) {
-    if is_rr && peer_type == PeerType::Internal {
-        (
-            AdjRibOut::new_reflecting(peer_id, peer_type),
-            AdjRibOut::new_reflecting(peer_id, peer_type),
-        )
-    } else {
-        (
+    match reflector_cluster_id {
+        Some(cluster_id) if peer_type == PeerType::Internal => (
+            AdjRibOut::new_reflecting(peer_id, peer_type, cluster_id),
+            AdjRibOut::new_reflecting(peer_id, peer_type, cluster_id),
+        ),
+        _ => (
             AdjRibOut::new(peer_id, peer_type),
             AdjRibOut::new(peer_id, peer_type),
-        )
+        ),
     }
 }
 
@@ -287,8 +290,9 @@ pub(crate) struct RibSnapshot {
     pub(crate) confederation_id: Option<u32>,
     /// BGP Identifier of each established peer, received in their OPEN message.
     ///
-    /// Used to set `ORIGINATOR_ID` when reflecting routes from a client (RFC 4456
-    /// §8). Populated on `Established`; removed on `Terminated`.
+    /// Copied onto each route the peer sends (`Route::peer_bgp_id`), where it
+    /// supplies the `ORIGINATOR_ID` when the route is reflected (RFC 4456 §8).
+    /// Populated on `Established`; removed on `Terminated`.
     pub(crate) peer_bgp_ids: HashMap<IpAddr, Ipv4Addr>,
     /// Peers that have sent us an IPv4 End-of-RIB marker (RFC 4724 §2).
     /// Cleared on session termination. Used to signal initial sync complete.
@@ -336,6 +340,14 @@ pub(crate) struct RibSnapshot {
     /// advertised Role capability in OPEN. Populated on `Established`;
     /// removed on `Terminated` — mirrors `peer_bgp_ids`'s lifecycle exactly.
     pub(crate) negotiated_roles: HashMap<IpAddr, Role>,
+}
+
+impl RibSnapshot {
+    /// The `CLUSTER_ID` to reflect routes with, or `None` when this speaker is
+    /// not a route reflector (RFC 4456).
+    fn reflector_cluster_id(&self) -> Option<u32> {
+        (!self.rr_clients.is_empty()).then_some(self.cluster_id)
+    }
 }
 
 /// Holds all per-peer routing state and applies BGP event semantics.
@@ -619,7 +631,11 @@ impl DaemonState {
             let mut v6 = HashMap::new();
             for p in peers {
                 let pt = config_peer_type(local_as, p.remote_as, confed_member(p));
-                let (aro_v4, aro_v6) = make_adj_ribs_out_pair(PeerId::from(p.address), pt, is_rr);
+                let (aro_v4, aro_v6) = make_adj_ribs_out_pair(
+                    PeerId::from(p.address),
+                    pt,
+                    is_rr.then_some(cluster_id),
+                );
                 v4.insert(p.address, aro_v4);
                 v6.insert(p.address, aro_v6);
             }
@@ -10646,69 +10662,6 @@ mod tests {
         );
     }
 
-    /// Regression test for the IPv6 peer-identity migration: `peer_bgp_ids`'s
-    /// fallback (when the peer's own BGP ID was never recorded) used to be
-    /// `peer_ip` — safe only because `peer_ip` was guaranteed `Ipv4Addr` at
-    /// the time. Now that peer identity is `IpAddr` (and could be IPv6), the
-    /// fallback is `self.rib.local_bgp_id` instead. This proves the injected
-    /// ORIGINATOR_ID is our own BGP ID in that fallback case, not the client's
-    /// transport address.
-    #[test]
-    fn test_rr_originator_id_falls_back_to_local_bgp_id_when_peer_bgp_id_unknown() {
-        let cluster_id: u32 = 99;
-        let local_bgp_id = Ipv4Addr::new(10, 0, 0, 1);
-        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
-        let other: Ipv4Addr = "10.0.0.3".parse().unwrap();
-        let (mut state, mut receivers) = make_rr_state(65001, cluster_id, &[client, other], &[]);
-
-        state.on_established(
-            IpAddr::V4(client),
-            client,
-            PeerType::Internal,
-            65001,
-            90,
-            &[],
-            None,
-        );
-        state.on_established(
-            IpAddr::V4(other),
-            other,
-            PeerType::Internal,
-            65001,
-            90,
-            &[],
-            None,
-        );
-        drain_all(&mut receivers);
-
-        // Simulate the defensive case this fallback exists for: the client's
-        // BGP ID was never recorded (or was since evicted), even though the
-        // session is Established and routes are flowing.
-        Arc::make_mut(&mut state.rib)
-            .peer_bgp_ids
-            .remove(&IpAddr::V4(client));
-
-        state.on_route_update(IpAddr::V4(client), update_announce("192.0.2.0/24"));
-        state.flush_pending();
-
-        let msg = receivers
-            .get_mut(&IpAddr::V4(other))
-            .unwrap()
-            .try_recv()
-            .expect("reflected UPDATE expected");
-
-        let originator = msg.attributes.iter().find_map(|a| match a {
-            PathAttribute::OriginatorId(id) => Some(*id),
-            _ => None,
-        });
-        assert_eq!(
-            originator,
-            Some(local_bgp_id),
-            "with no recorded peer BGP ID, ORIGINATOR_ID must fall back to our own \
-             local_bgp_id, not the client's transport address"
-        );
-    }
-
     /// Regression test for the RFC 4271 §9.1.2.2 (f) best-path fix: proves
     /// the peer's BGP Identifier (learned at `Established`, tracked in
     /// `rib.peer_bgp_ids`) is actually threaded onto the `Route` built by a
@@ -10938,7 +10891,9 @@ mod tests {
     // the iBGP source so split-horizon has a peer to look up.
     fn inject_v6_route(state: &mut DaemonState, src_peer: Ipv4Addr, prefix: &str) {
         let peer_id = PeerId::new(IpAddr::V4(src_peer));
-        let route = route_v6_ibgp(prefix);
+        let mut route = route_v6_ibgp(prefix);
+        // As on ingest: reflecting it needs the source's BGP Identifier.
+        route.peer_bgp_id = Some(src_peer);
         state.rib_insert_v6(peer_id, route);
         Arc::make_mut(&mut state.rib)
             .peer_types

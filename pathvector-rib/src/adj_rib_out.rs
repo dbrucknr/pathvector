@@ -72,11 +72,11 @@ pub enum InsertOutcome<A: IpAddress> {
 pub struct AdjRibOut<A: IpAddress> {
     peer: PeerId,
     peer_type: PeerType,
-    /// When `true`, the iBGP split-horizon check in [`insert`](AdjRibOut::insert)
-    /// is bypassed. Set for Route Reflector destinations (RFC 4456) where the
-    /// caller has already enforced the correct split-horizon at the propagation
-    /// level.
-    reflects: bool,
+    /// The route reflector's `CLUSTER_ID`, set for Route Reflector
+    /// destinations (RFC 4456). When set, the iBGP split-horizon check in
+    /// [`insert`](AdjRibOut::insert) is bypassed: the caller has already
+    /// enforced the correct split-horizon at the propagation level.
+    cluster_id: Option<u32>,
     routes: AHashMap<Nlri<A>, Route<A>>,
 }
 
@@ -87,7 +87,7 @@ impl<A: IpAddress> AdjRibOut<A> {
         Self {
             peer,
             peer_type,
-            reflects: false,
+            cluster_id: None,
             routes: AHashMap::new(),
         }
     }
@@ -95,15 +95,18 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// Creates an `AdjRibOut` that bypasses iBGP split-horizon.
     ///
     /// Use this for peers that receive reflected routes in an RFC 4456 Route
-    /// Reflector topology. The caller is responsible for enforcing the correct
-    /// RR split-horizon rules (non-client→non-client blocking) before calling
-    /// [`insert`](AdjRibOut::insert).
+    /// Reflector topology, passing the reflector's `CLUSTER_ID`. The caller is
+    /// responsible for enforcing the correct RR split-horizon rules
+    /// (non-client→non-client blocking) and for adding `ORIGINATOR_ID` and
+    /// `CLUSTER_LIST` to reflected routes (RFC 4456 §8) before calling
+    /// [`insert`](AdjRibOut::insert), which stores routes with those
+    /// attributes as given.
     #[must_use]
-    pub fn new_reflecting(peer: PeerId, peer_type: PeerType) -> Self {
+    pub fn new_reflecting(peer: PeerId, peer_type: PeerType, cluster_id: u32) -> Self {
         Self {
             peer,
             peer_type,
-            reflects: true,
+            cluster_id: Some(cluster_id),
             routes: AHashMap::new(),
         }
     }
@@ -111,7 +114,14 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// Returns `true` if this table was created in RR reflecting mode.
     #[must_use]
     pub fn reflects(&self) -> bool {
-        self.reflects
+        self.cluster_id.is_some()
+    }
+
+    /// Returns the reflector's `CLUSTER_ID` if this table was created in RR
+    /// reflecting mode.
+    #[must_use]
+    pub fn cluster_id(&self) -> Option<u32> {
+        self.cluster_id
     }
 
     /// Returns the peer this outbound table belongs to.
@@ -139,7 +149,7 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// route's `AS_PATH` before it is stored (RFC 5065 §5.1).  The inner
     /// `Option` is the previous route for this prefix, if any.
     pub fn insert(&mut self, route: Route<A>) -> InsertOutcome<A> {
-        if !self.reflects
+        if !self.reflects()
             && self.peer_type == PeerType::Internal
             && route.peer_type == PeerType::Internal
         {
@@ -199,6 +209,27 @@ mod tests {
 
     fn ibgp_peer() -> PeerId {
         PeerId::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)))
+    }
+
+    /// RFC 4456 §5: a route reflector advertises iBGP-learned routes to iBGP
+    /// peers, so a reflecting table accepts what RFC 4271 §9.2 split horizon
+    /// would otherwise filter. It stores the attributes as given.
+    #[test]
+    fn test_new_reflecting_bypasses_ibgp_split_horizon() {
+        let mut rib: AdjRibOut<Ipv4Addr> =
+            AdjRibOut::new_reflecting(ibgp_peer(), PeerType::Internal, 7);
+        assert!(rib.reflects());
+        assert_eq!(rib.cluster_id(), Some(7));
+        let nlri: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+        let route = RouteBuilder::new(nlri, Origin::Igp, AsPath::new())
+            .peer_type(PeerType::Internal)
+            .build();
+        assert!(matches!(rib.insert(route), InsertOutcome::Accepted(None)));
+        assert_eq!(rib.get(&nlri).unwrap().cluster_list_len(), 0);
+
+        let plain: AdjRibOut<Ipv4Addr> = AdjRibOut::new(ibgp_peer(), PeerType::Internal);
+        assert!(!plain.reflects());
+        assert_eq!(plain.cluster_id(), None);
     }
 
     fn nlri(s: &str) -> Nlri<Ipv4Addr> {

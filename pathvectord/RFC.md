@@ -533,9 +533,9 @@ carries it, and never advertising it.
 
 ## RFC 4456 — BGP Route Reflection
 
-**Owns:** Route Reflector configuration, inbound attribute processing (ORIGINATOR_ID,
-CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the propagation loop, and
-outbound inclusion of reflection attributes in UPDATE messages.  
+**Owns:** Route Reflector configuration, inbound loop detection (ORIGINATOR_ID,
+CLUSTER_LIST), RR-aware iBGP split-horizon in the propagation loop, and adding the
+reflection attributes to routes as they are reflected.  
 **Boundary:** ORIGINATOR_ID / CLUSTER_LIST wire codec lives in `pathvector-session`.
 Route struct fields for carrying the attributes live in `pathvector-rib`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4456
@@ -546,16 +546,17 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | Loop detection: discard UPDATE if our `cluster_id` in CLUSTER_LIST (client peers) | `src/daemon.rs` | ✅ | `test_rr_loop_detection_discards_update` |
 | Loop detection: discard UPDATE if our `cluster_id` in CLUSTER_LIST (non-client iBGP peers) | `src/daemon.rs` | ✅ | `test_rr_cluster_list_loop_detection_applies_to_non_client_ibgp` |
 | Loop detection: discard UPDATE if ORIGINATOR_ID == local BGP ID | `src/daemon.rs` | ✅ | `test_rr_originator_id_loop_detection_discards_update` |
-| ORIGINATOR_ID set to peer's BGP ID on first reflection (client) | `src/daemon.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
-| ORIGINATOR_ID set to peer's BGP ID on first reflection (non-client iBGP) | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_to_client_injects_rr_attrs` |
-| cluster_id prepended to CLUSTER_LIST on each reflection | `src/daemon.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
+| ORIGINATOR_ID "will be created by an RR in reflecting a route" = source peer's BGP ID; an existing one is kept. Added on reflection, never on receipt | `src/outbound.rs` (`add_reflection_attributes`) | ✅ | `rr_reflection_tests::{reflector_stores_a_route_as_received_and_adds_attributes_on_reflection, reflector_prepends_to_a_received_cluster_list_and_keeps_originator_id, table_dump_from_a_reflector_carries_the_reflection_attributes}` |
+| No ORIGINATOR_ID substitute when the source's BGP ID is unknown (not reachable on an Established session): the route is not reflected | `src/outbound.rs` (`add_reflection_attributes`) | ✅ | `rr_reflection_tests::a_route_with_no_known_originator_is_not_reflected` |
+| "When an RR reflects a route, it MUST prepend the local CLUSTER_ID to the CLUSTER_LIST"; routes that are not reflected gain neither attribute | `src/outbound.rs` (`add_reflection_attributes`) | ✅ | `rr_reflection_tests::{reflector_prepends_to_a_received_cluster_list_and_keeps_originator_id, replacement_after_session_loss_carries_the_new_originator, repeating_an_announcement_does_not_re_advertise_the_reflected_route, routes_that_are_not_reflected_gain_no_reflection_attributes}` |
+| A withdraw-only UPDATE from an iBGP peer is accepted by a reflector (RFC 4271 §4.3, RFC 4760 §4); RFC 7606 §5.2 judges only the attributes the peer sent | `src/daemon/route.rs` (`on_route_update`) | ✅ | `rr_reflection_tests::{withdraw_only_update_from_ibgp_peer_is_accepted_by_a_reflector, withdrawal_through_run_event_loop_keeps_the_reflector_session_up, received_attributes_without_nlri_or_origin_still_reset_the_session}` |
 | Client → all other clients: reflect (not back to originating client) | `src/daemon.rs` | ✅ | `test_rr_client_route_reflected_to_other_client` |
 | Client → non-client iBGP peers: reflect | `src/daemon.rs` | ✅ | `test_rr_client_route_reflected_to_non_client_ibgp` |
 | Non-client iBGP → clients: reflect with correct RR attributes | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_route_reflected_to_client`, `test_rr_non_client_ibgp_to_client_injects_rr_attrs` |
 | Non-client iBGP → non-client iBGP: blocked (standard split-horizon) | `src/daemon.rs` | ✅ | `test_rr_non_client_ibgp_to_non_client_ibgp_still_blocked` |
 | ORIGINATOR_ID + CLUSTER_LIST included in outbound UPDATE attributes | `src/outbound.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` |
-| ORIGINATOR_ID + CLUSTER_LIST stored on ingested routes as received, IPv4 **and IPv6** (the IPv6 path used to drop both, so reflected IPv6 routes left this RR without them) | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ipv6_reflected_routes_store_rr_attributes_and_select_by_originator_id, ipv6_route_reflected_to_another_client_carries_originator_id_and_cluster_list}` |
-| §9 tie-breakers (ORIGINATOR_ID for step (f), then shorter CLUSTER_LIST before peer address) applied to ingested routes | `src/daemon/route.rs` → `pathvector-rib` `best_path` | ✅ | `rr_tie_break_tests::{reflected_routes_are_selected_by_originator_id_not_reflector_id, shorter_cluster_list_is_selected_before_peer_address}` |
+| ORIGINATOR_ID + CLUSTER_LIST stored on ingested routes exactly as received (nothing added: RFC 4271 §3.2), IPv4 **and IPv6** (the IPv6 path used to drop both, so reflected IPv6 routes left this RR without them) | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ipv6_reflected_routes_store_rr_attributes_and_select_by_originator_id, ipv6_route_reflected_to_another_client_carries_originator_id_and_cluster_list}` |
+| §9 tie-breakers (ORIGINATOR_ID for step (f), then shorter CLUSTER_LIST before peer address) applied to ingested routes | `src/daemon/route.rs` → `pathvector-rib` `best_path` | ✅ | `rr_tie_break_tests::{reflected_routes_are_selected_by_originator_id_not_reflector_id, shorter_cluster_list_is_selected_before_peer_address}`, `rr_reflection_tests::being_a_reflector_does_not_lengthen_the_received_cluster_list_for_selection` |
 | RFC 7606 §7.9 / §7.10: ORIGINATOR_ID / CLUSTER_LIST "received from an external neighbor ... SHALL be discarded using the approach of 'attribute discard'". Kept only from `Internal` peers. A `ConfedMember` peer is in "a different Autonomous System" (RFC 4271) and RFC 5065 grants no exception for these attributes, which matches the outbound stripping toward `ConfedMember` | `src/daemon/route.rs` (`handle_update`) | ✅ | `rr_tie_break_tests::{ebgp_originator_id_and_cluster_list_are_discarded, confed_member_originator_id_and_cluster_list_are_discarded}` |
 | adj_ribs_out_v6 uses reflecting mode for all iBGP peers when acting as RR | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_is_reflecting_for_ibgp_peer` |
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |

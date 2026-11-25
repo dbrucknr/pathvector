@@ -194,6 +194,49 @@ fn permitted_on_wire<A: IpAddress>(route: &Route<A>, peer: PeerId) -> bool {
     }
 }
 
+/// Adds `ORIGINATOR_ID` and `CLUSTER_LIST` to a route about to be reflected.
+///
+/// A route is reflected when a route reflector advertises an iBGP-learned route
+/// to an iBGP peer (RFC 4456 §5); any other route is left unchanged. RFC 4456
+/// §8:
+///
+/// - `ORIGINATOR_ID` "will be created by an RR in reflecting a route" and
+///   carries "the BGP Identifier of the originator of the route in the local
+///   AS". One that the route already has is kept.
+/// - "When an RR reflects a route, it MUST prepend the local `CLUSTER_ID` to
+///   the `CLUSTER_LIST`. If the `CLUSTER_LIST` is empty, it MUST create a new
+///   one."
+///
+/// `route` is the outbound copy, so the Adj-RIB-In and Loc-RIB keep what was
+/// received, and the Adj-RIB-Out holds what is advertised.
+///
+/// Returns `false` if the route must not be advertised: it needs an
+/// `ORIGINATOR_ID` and the source peer's BGP Identifier is unknown. An
+/// Established session always has one.
+fn add_reflection_attributes<A: IpAddress>(
+    route: &mut Route<A>,
+    adj_rib_out: &AdjRibOut<A>,
+) -> bool {
+    let Some(cluster_id) = adj_rib_out.cluster_id() else {
+        return true;
+    };
+    if route.peer_type != PeerType::Internal {
+        return true;
+    }
+    let Some(originator_id) = route.originator_id().or(route.peer_bgp_id) else {
+        tracing::error!(
+            peer = %adj_rib_out.peer(),
+            prefix = %route.nlri,
+            "not reflecting route: the source peer's BGP Identifier is unknown"
+        );
+        return false;
+    };
+    let rare = route.rare_mut();
+    rare.originator_id = Some(originator_id);
+    rare.cluster_list.insert(0, cluster_id);
+    true
+}
+
 /// The outbound decision for a single prefix after AdjRibOut processing.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -206,7 +249,8 @@ pub(crate) enum PrefixDecision {
 /// Determines the outbound decision for `nlri` for one peer.
 ///
 /// Reads the current best from `loc_rib`, applies export policy, runs eBGP
-/// attribute transforms, and calls `AdjRibOut::insert` to record the change.
+/// attribute transforms (and, on a route reflector, adds the reflection
+/// attributes), and calls `AdjRibOut::insert` to record the change.
 /// Returns what should be sent without transmitting anything — callers batch
 /// decisions and flush via [`flush_updates`].
 ///
@@ -263,7 +307,8 @@ pub(crate) fn propagate_prefix(
                 // regardless of what the export policy decided.
                 Decision::Accept
                     if !is_export_suppressed(&route.rare_or_default().communities, peer_type)
-                        && permitted_on_wire(&route, adj_rib_out.peer()) =>
+                        && permitted_on_wire(&route, adj_rib_out.peer())
+                        && add_reflection_attributes(&mut route, adj_rib_out) =>
                 {
                     match adj_rib_out.insert(route.clone()) {
                         InsertOutcome::Accepted(prev) => {
@@ -517,7 +562,8 @@ pub(crate) fn propagate_prefix_v6(
                 // regardless of what the export policy decided.
                 Decision::Accept
                     if !is_export_suppressed(&route.rare_or_default().communities, peer_type)
-                        && permitted_on_wire(&route, adj_rib_out.peer()) =>
+                        && permitted_on_wire(&route, adj_rib_out.peer())
+                        && add_reflection_attributes(&mut route, adj_rib_out) =>
                 {
                     match adj_rib_out.insert(route.clone()) {
                         InsertOutcome::Accepted(prev) => {
