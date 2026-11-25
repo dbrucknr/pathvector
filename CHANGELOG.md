@@ -4,6 +4,22 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (outbound UPDATE ordering — issue #159)
+
+### Fixes
+
+- A peer could be left with a route the daemon had withdrawn, or with replaced attributes,
+  when several decisions for one prefix were buffered before a flush: withdrawals were sent
+  first and announcements grouped by attributes, regardless of decision order. Only the
+  last announce or withdraw per prefix is now sent.
+- Session teardown, Graceful Restart, End-of-RIB catch-up and export-policy changes sent
+  their UPDATEs ahead of decisions still buffered, with the same result. They now go
+  through the peer's buffer.
+- IPv6 prefixes with equal attributes but different next hops were packed into one
+  `MP_REACH_NLRI` and advertised with the first one's next hop (RFC 4760 §3).
+
+---
+
 ## 2026-11-25 (AS-number rules on the wire: RFC 6793 AS4_PATH, RFC 7607 AS 0, RFC 9774 AS_SET — issues #109, #110, #111)
 
 ### Behavior changes (read before upgrading)
