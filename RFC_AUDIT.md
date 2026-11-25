@@ -1067,7 +1067,7 @@ whether they are ever delivered while the session is busy.
 |---|---|---|
 | §8.2.2 Events 9–11 were starved: the `biased;` `select!` polled commands and messages ahead of the timers (a KEEPALIVE was sent only after 5,000 of 5,000 ready UPDATEs) | Confirmed gap (reproduced) | Fixed: timers and input alternate |
 | Socket writes and event sends were awaited inline, so a non-reading peer or a stalled consumer suspended every timer and command | Confirmed gap (reproduced) | Fixed: the session loop waits in one place; writes and event delivery are polled alongside timers |
-| A failed NOTIFICATION write skipped the rest of the teardown, so `Terminated` was never delivered | Confirmed gap (reproduced) | Fixed |
+| A failed NOTIFICATION write skipped the rest of the teardown, so `Terminated` was never delivered | Confirmed gap (reproduced) | Fixed, on `main` first by PR #167 |
 | §8.2.2 "Each time the local system sends a KEEPALIVE or UPDATE message, it restarts its KeepaliveTimer": UPDATEs did not | Confirmed gap (reproduced) | Fixed |
 | RFC 9687 (`SendHoldTimer`) not implemented at all | Confirmed gap | Implemented; see `pathvector-session/RFC.md` |
 | §10 jitter SHOULD on KeepaliveTimer / ConnectRetryTimer | Confirmed gap (read from code) | Open, `TODO.md` |

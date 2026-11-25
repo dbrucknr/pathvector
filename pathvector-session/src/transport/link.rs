@@ -121,6 +121,11 @@ impl FramedBgpTransport {
     pub(super) async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
         self.reader.recv().await
     }
+
+    /// Shut down the local write half, so that the next write fails.
+    pub(super) async fn shutdown_write(&mut self) -> io::Result<()> {
+        self.writer.half.shutdown().await
+    }
 }
 
 pub(super) struct SocketReader(FramedRead<OwnedReadHalf, BgpCodec>);

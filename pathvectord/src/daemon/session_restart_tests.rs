@@ -1,27 +1,33 @@
-// daemon/session_restart_tests.rs — a session the daemon resets on its own
-// authority must come back without operator action.
+// daemon/session_restart_tests.rs — which of the daemon's own resets bring a
+// session back, and when.
 //
 // RFC 4271 §8.1.2 separates the two kinds of stop. Event 2 (ManualStop) is
-// "Local system administrator manually stops the peer connection"; §8.2.2
-// leaves it in Idle until a start event. Event 8 (AutomaticStop) is "Local
-// system automatically stops the BGP connection", and its example is "exceeding
-// the number of prefixes for a given peer". §8.1.1: "The term "automatic"
-// refers to a start being issued to the BGP peer connection FSM when such logic
-// determines that the BGP peer connection should be restarted." When to restart
-// is local policy; pathvectord's documented policy is the ConnectRetry interval,
-// held off further by `max_prefixes_restart`.
+// "Local system administrator manually stops the peer connection". Event 8
+// (AutomaticStop) is "Local system automatically stops the BGP connection",
+// and its example is "exceeding the number of prefixes for a given peer".
+// §6.7 leaves terminating on a prefix limit "under control of local
+// configuration" and requires the Cease. Whether and when the session starts
+// again is local policy too: §8.1.1 `AllowAutomaticStart`, and the
+// IdleHoldTimer that "keeps the BGP peer in Idle for a particular duration".
 //
-// A NOTIFICATION for an UPDATE error the daemon detects is §8.2.2 Established
-// Event 28, which likewise ends in Idle with no operator involved.
+// pathvectord's policy for a prefix limit:
+// - `max_prefixes_restart` absent or 0: the session stays down until an
+//   operator acts (AllowAutomaticStart false).
+// - positive N: it is started again N seconds after the Cease
+//   (IdleHoldTimer, Event 13), whatever `connect_retry_time` is.
+// Every other reset the daemon decides on reconnects after
+// `connect_retry_time`, including a NOTIFICATION for an UPDATE error it
+// detects (§8.2.2 Established, Event 28).
 //
-// These tests drive `run_event_loop` with a real session task over loopback TCP
-// and a hand-driven peer, because a mock command channel can only show which
-// command was sent, not what the session does afterwards.
+// These tests drive `run_event_loop` and `run_command_processor` with a real
+// session task over loopback TCP and a hand-driven peer, because a mock command
+// channel can only show which command was sent, not what the session does
+// afterwards.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use pathvector_session::framing::BgpCodec;
@@ -29,14 +35,17 @@ use pathvector_session::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
     PathAttribute, UpdateMessage, UpdateMsgError,
 };
-use pathvector_session::transport::{self, SessionConfig, SessionHandle};
+use pathvector_session::transport::{
+    self, SessionCommand, SessionConfig, SessionEvent, SpawnedSessionHandle,
+};
 use pathvector_types::{AsPath, Asn, Nlri, Origin};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use super::{DaemonState, run_event_loop};
+use super::peer::run_command_processor;
+use super::{DaemonCommand, DaemonState, SpawnConfig, build_daemon, run_event_loop};
 use crate::config;
 
 const LOCAL_AS: u32 = 65001;
@@ -45,6 +54,8 @@ const LOCAL_ID: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PEER_ID: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
+/// Many `CONNECT_RETRY` intervals: long enough that no dial means none is due.
+const QUIET: Duration = Duration::from_millis(1500);
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The remote end of one TCP connection from the session under test.
@@ -95,27 +106,33 @@ impl PeerConn {
             }
         }
     }
-
-    /// A NOTIFICATION arriving within `within`, if any.
-    async fn notification_within(&mut self, within: Duration) -> Option<NotificationMessage> {
-        tokio::time::timeout(within, self.notification()).await.ok()
-    }
 }
 
 struct Daemon {
     listener: TcpListener,
+    peer_cfg: config::PeerConfig,
     state: Arc<RwLock<DaemonState>>,
+    event_tx: mpsc::Sender<(IpAddr, SessionEvent)>,
+    incoming: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+    commands: mpsc::Sender<DaemonCommand>,
 }
 
 impl Daemon {
-    /// A daemon with one configured peer, a real session task dialling this
-    /// test's listener, and `run_event_loop` consuming its events.
     async fn start(max_prefixes_v4: Option<u32>, max_prefixes_restart: Option<u16>) -> Self {
+        Self::start_with_retry(max_prefixes_v4, max_prefixes_restart, CONNECT_RETRY).await
+    }
+
+    /// The daemon as `run_with` assembles it, with one configured peer that
+    /// dials this test's listener every `connect_retry`.
+    async fn start_with_retry(
+        max_prefixes_v4: Option<u32>,
+        max_prefixes_restart: Option<u16>,
+        connect_retry: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = listener.local_addr().unwrap();
         let peer_cfg = config::PeerConfig {
             address: PEER_IP,
-            port: peer_addr.port(),
+            port: listener.local_addr().unwrap().port(),
             remote_as: PEER_AS,
             import_default: Some(config::ImportDefault::Accept),
             export_default: Some(config::ExportDefault::Accept),
@@ -133,51 +150,71 @@ impl Daemon {
             confederation_member: false,
             blackhole_authorized_prefixes: None,
         };
+        let cfg = config::Config {
+            daemon: config::DaemonConfig {
+                local_as: LOCAL_AS,
+                bgp_id: LOCAL_ID,
+                hold_time: 90,
+                grpc_port: 0,
+                bgp_port: 0,
+                metrics_port: None,
+                local_ipv6: None,
+                cluster_id: None,
+                confederation_id: None,
+                fib_table: 254,
+                fib_metric: 20,
+                graceful_restart_time: 0,
+                restarting: false,
+                selection_deferral_time: 0,
+                rpki: None,
+                tcp_md5_enforcement: config::TcpMd5EnforcementConfig::Required,
+            },
+            peers: vec![peer_cfg.clone()],
+            sidecar_path: None,
+        };
+        let spawn = move |mut session: SessionConfig| -> SpawnedSessionHandle {
+            session.connect_retry_time = connect_retry;
+            transport::spawn(session)
+        };
 
-        let mut handle = transport::spawn(SessionConfig {
-            local_as: LOCAL_AS,
-            local_bgp_id: LOCAL_ID,
-            hold_time: 90,
-            connect_retry_time: CONNECT_RETRY,
-            capabilities: vec![Capability::FourByteAsn(LOCAL_AS)],
-            required_capabilities: vec![],
-            peer_as: Some(PEER_AS),
-            confederation_member: false,
-            public_as: LOCAL_AS,
-            peer_addr,
-            tcp_md5: None,
-            send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
-        });
-        handle.start().await;
-
-        let state = Arc::new(RwLock::new(DaemonState::new(
-            LOCAL_AS,
-            LOCAL_ID,
-            None,
-            None,
-            None,
-            &[peer_cfg],
-            HashMap::from([(PEER_IP, handle.update_sender())]),
-            vec![],
-        )));
-        let stop_senders = Arc::new(Mutex::new(HashMap::from([(PEER_IP, handle.stop_sender())])));
-
-        let (event_tx, event_rx) = mpsc::channel(16);
-        tokio::spawn(async move {
-            while let Some(event) = handle.next_event().await {
-                if event_tx.send((PEER_IP, event)).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let (state, event_rx, event_tx, stop_senders, incoming, md5) =
+            build_daemon(&cfg, spawn).await;
         tokio::spawn(run_event_loop(
             event_rx,
             Arc::clone(&state),
-            stop_senders,
+            Arc::clone(&stop_senders),
+            None,
+        ));
+        let (commands, command_rx) = mpsc::channel(4);
+        tokio::spawn(run_command_processor(
+            command_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::clone(&incoming),
+            md5,
+            event_tx.clone(),
+            spawn,
+            SpawnConfig {
+                local_as: LOCAL_AS,
+                local_bgp_id: LOCAL_ID,
+                hold_time: 90,
+                graceful_restart_time: 0,
+                configured_restarting: false,
+                confederation_id: None,
+                startup_instant: Instant::now(),
+                md5_enforcement: cfg.daemon.tcp_md5_enforcement.into(),
+            },
             None,
         ));
 
-        Self { listener, state }
+        Self {
+            listener,
+            peer_cfg,
+            state,
+            event_tx,
+            incoming,
+            commands,
+        }
     }
 
     /// Accepts the session's next dial and completes the handshake.
@@ -187,6 +224,38 @@ impl Daemon {
             .expect("the session never dialled the peer again")
             .unwrap();
         PeerConn::handshake(stream).await
+    }
+
+    async fn assert_no_dial(&self, within: Duration) {
+        assert!(
+            tokio::time::timeout(within, self.listener.accept())
+                .await
+                .is_err(),
+            "the session dialled the peer again"
+        );
+    }
+
+    /// Hands the session a connection from the peer and requires it to be
+    /// closed without a byte of BGP.
+    async fn assert_inbound_refused(&self) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let session = self.incoming.read().await[&PEER_IP].clone();
+        session
+            .send(SessionCommand::IncomingConnection(accepted.unwrap().0))
+            .await
+            .unwrap();
+        let (read, _write) = peer.unwrap().into_split();
+        let next = tokio::time::timeout(TIMEOUT, FramedRead::new(read, BgpCodec::new()).next())
+            .await
+            .expect("the inbound connection was left open");
+        assert!(
+            next.is_none(),
+            "the inbound connection was answered: {next:?}"
+        );
     }
 
     async fn is_registered(&self) -> bool {
@@ -199,14 +268,58 @@ impl Daemon {
     }
 
     async fn wait_until_registered(&self) {
-        tokio::time::timeout(TIMEOUT, async {
-            while !self.is_registered().await {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+        wait_for("the peer to be registered", async || {
+            self.is_registered().await
         })
-        .await
-        .expect("peer never registered as established");
+        .await;
     }
+
+    async fn wait_until_unregistered(&self) {
+        wait_for("the teardown to be processed", async || {
+            !self.is_registered().await
+        })
+        .await;
+    }
+
+    /// Sends two prefixes to a peer limited to one, and returns after the
+    /// Cease and its teardown.
+    async fn exceed_limit(&self, mut conn: PeerConn) {
+        self.wait_until_registered().await;
+        conn.send(two_prefixes()).await;
+        assert_eq!(
+            conn.notification().await.error,
+            NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+        );
+        self.wait_until_unregistered().await;
+    }
+
+    async fn remove_peer(&self) {
+        self.commands
+            .send(DaemonCommand::RemovePeer(PEER_IP))
+            .await
+            .unwrap();
+        wait_for("the peer to be removed", async || {
+            !self.state.read().await.adj_ribs_in.contains_key(&PEER_IP)
+        })
+        .await;
+    }
+
+    async fn add_peer(&self) {
+        self.commands
+            .send(DaemonCommand::AddPeer(self.peer_cfg.clone()))
+            .await
+            .unwrap();
+    }
+}
+
+async fn wait_for(what: &str, mut done: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(TIMEOUT, async {
+        while !done().await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
 fn announce(prefixes: &[[u8; 4]]) -> BgpMessage {
@@ -228,64 +341,138 @@ fn two_prefixes() -> BgpMessage {
     announce(&[[192, 0, 2, 0], [198, 51, 100, 0]])
 }
 
-#[tokio::test]
-async fn session_reconnects_after_max_prefix_cease() {
-    let daemon = Daemon::start(Some(1), None).await;
-    let mut conn = daemon.accept().await;
-    conn.send(two_prefixes()).await;
-    assert_eq!(
-        conn.notification().await.error,
-        NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
-    );
-    drop(conn);
+/// Absent or zero `max_prefixes_restart`: no dial, no inbound connection and no
+/// repeated `AddPeer` brings the session back.
+async fn assert_latched_down(max_prefixes_restart: Option<u16>) {
+    let daemon = Daemon::start(Some(1), max_prefixes_restart).await;
+    let conn = daemon.accept().await;
+    daemon.exceed_limit(conn).await;
 
-    // No `max_prefixes_restart`: back after the ConnectRetry interval.
+    daemon.assert_no_dial(QUIET).await;
+    daemon.assert_inbound_refused().await;
+    daemon.add_peer().await;
+    daemon.assert_no_dial(QUIET).await;
+    assert!(!daemon.is_registered().await);
+}
+
+#[tokio::test]
+async fn max_prefix_without_restart_time_stays_down() {
+    assert_latched_down(None).await;
+}
+
+#[tokio::test]
+async fn max_prefix_with_zero_restart_time_stays_down() {
+    assert_latched_down(Some(0)).await;
+}
+
+#[tokio::test]
+async fn removing_and_adding_the_peer_clears_the_latch() {
+    let daemon = Daemon::start(Some(1), None).await;
+    let conn = daemon.accept().await;
+    daemon.exceed_limit(conn).await;
+
+    daemon.remove_peer().await;
+    daemon.add_peer().await;
+
     let _conn = daemon.accept().await;
     daemon.wait_until_registered().await;
 }
 
+/// The restart follows `max_prefixes_restart`, not a longer ConnectRetry time.
 #[tokio::test]
-async fn session_is_rejected_during_idle_hold_and_accepted_after_it() {
+async fn max_prefix_restart_shorter_than_connect_retry() {
+    let daemon = Daemon::start_with_retry(Some(1), Some(1), Duration::from_secs(60)).await;
+    let conn = daemon.accept().await;
+    daemon.wait_until_registered().await;
+    let before_cease = Instant::now();
+    daemon.exceed_limit(conn).await;
+
+    let _conn = daemon.accept().await;
+    let waited = before_cease.elapsed();
+    assert!(
+        (Duration::from_secs(1)..Duration::from_secs(3)).contains(&waited),
+        "restarted after {waited:?}, expected 1 s"
+    );
+    daemon.wait_until_registered().await;
+}
+
+/// Nor is it brought forward by a shorter one: nothing happens before it.
+#[tokio::test]
+async fn max_prefix_restart_longer_than_connect_retry() {
+    let daemon = Daemon::start(Some(1), Some(2)).await;
+    let conn = daemon.accept().await;
+    daemon.wait_until_registered().await;
+    let before_cease = Instant::now();
+    daemon.exceed_limit(conn).await;
+
+    daemon.assert_inbound_refused().await;
+    daemon.assert_no_dial(QUIET).await;
+
+    let _conn = daemon.accept().await;
+    let waited = before_cease.elapsed();
+    assert!(
+        (Duration::from_secs(2)..Duration::from_secs(4)).contains(&waited),
+        "restarted after {waited:?}, expected 2 s"
+    );
+    daemon.wait_until_registered().await;
+}
+
+#[tokio::test]
+async fn removing_a_peer_cancels_its_pending_restart() {
     let daemon = Daemon::start(Some(1), Some(1)).await;
+    let conn = daemon.accept().await;
+    daemon.exceed_limit(conn).await;
+
+    daemon.remove_peer().await;
+
+    daemon.assert_no_dial(QUIET).await;
+}
+
+fn over_limit_event() -> (IpAddr, SessionEvent) {
+    let BgpMessage::Update(update) = two_prefixes() else {
+        unreachable!()
+    };
+    (PEER_IP, SessionEvent::RouteUpdate(update))
+}
+
+/// The same peer is also marked stalled in the batch that exceeds its limit, so
+/// the daemon queues a reconnecting reset behind the Cease. It must not undo
+/// the latch. `earlier` is handled first, which puts the over-limit UPDATE on
+/// the drain-loop path.
+async fn assert_stays_down_with_stalled_reset(earlier: Option<BgpMessage>) {
+    let daemon = Daemon::start(Some(1), None).await;
     let mut conn = daemon.accept().await;
-    conn.send(two_prefixes()).await;
+    daemon.wait_until_registered().await;
+
+    {
+        // Held so that both events are queued before the loop handles either.
+        let mut state = daemon.state.write().await;
+        state.stalled_peers.push(PEER_IP);
+        if let Some(BgpMessage::Update(update)) = earlier {
+            daemon
+                .event_tx
+                .send((PEER_IP, SessionEvent::RouteUpdate(update)))
+                .await
+                .unwrap();
+        }
+        daemon.event_tx.send(over_limit_event()).await.unwrap();
+    }
+
     assert_eq!(
         conn.notification().await.error,
         NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
     );
-    drop(conn);
-    let ceased_at = tokio::time::Instant::now();
+    daemon.assert_no_dial(QUIET).await;
+}
 
-    // Every reconnect inside the hold-off is refused, and the session keeps
-    // retrying until one lands after it.
-    let mut rejections = 0;
-    let _conn = loop {
-        let mut conn = daemon.accept().await;
-        match conn.notification_within(Duration::from_millis(300)).await {
-            Some(n) => {
-                // RFC 4486 §4: "If a BGP speaker decides to disallow a BGP
-                // connection ... the BGP speaker SHOULD send a NOTIFICATION
-                // message with ... the Error Subcode "Connection Rejected"."
-                assert_eq!(
-                    n.error,
-                    NotificationError::Cease(CeaseError::ConnectionRejected)
-                );
-                rejections += 1;
-            }
-            None => break conn,
-        }
-        assert!(
-            ceased_at.elapsed() < TIMEOUT,
-            "still rejected long after the idle-hold expired"
-        );
-    };
+#[tokio::test]
+async fn stalled_reset_does_not_undo_the_latch_first_event_path() {
+    assert_stays_down_with_stalled_reset(None).await;
+}
 
-    assert!(rejections > 0, "no reconnect was attempted during the hold");
-    assert!(
-        ceased_at.elapsed() >= Duration::from_millis(900),
-        "accepted before the idle-hold expired"
-    );
-    daemon.wait_until_registered().await;
+#[tokio::test]
+async fn stalled_reset_does_not_undo_the_latch_drain_loop_path() {
+    assert_stays_down_with_stalled_reset(Some(announce(&[[192, 0, 2, 0]]))).await;
 }
 
 #[tokio::test]
