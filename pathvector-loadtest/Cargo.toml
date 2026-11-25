@@ -1,0 +1,35 @@
+[package]
+name         = "pathvector-loadtest"
+version      = "0.1.0"
+description  = "Multi-peer full-table load harness for pathvectord (PRODUCTION_READINESS.md PR-1)"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+publish = false
+
+[lib]
+name = "pathvector_loadtest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "loadtest"
+path = "src/main.rs"
+# Not a test harness: `main` unconditionally spawns a real pathvectord child
+# and runs the workload. All unit-testable logic lives in the library crate so
+# `cargo test` still covers it; see scripts/check-test-bins.sh for why this
+# bin must say `test = false`.
+test = false
+
+[dependencies]
+pathvector-mrt     = { path = "../pathvector-mrt" }
+pathvector-client  = { workspace = true }
+pathvector-session = { workspace = true }
+pathvector-types   = { workspace = true }
+clap    = { workspace = true }
+futures = { workspace = true }
+tokio   = { workspace = true, features = ["process", "io-util", "fs"] }
+
+[lints]
+workspace = true
