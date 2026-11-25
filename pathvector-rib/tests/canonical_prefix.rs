@@ -1,12 +1,12 @@
 //! Every RIB identifies a destination by its prefix, not by the bits a caller
 //! happened to supply beyond the prefix length (issue #71).
 //!
-//! RFC 4271 §4.3, for both Withdrawn Routes and NLRI: "The Prefix field
-//! contains an IP address prefix, followed by [the] trailing bits [needed] to
-//! make the end of the field fall on an octet boundary. Note that the value of
-//! [the] trailing bits is irrelevant." RFC 4760 §5 says the same for
-//! `MP_REACH_NLRI` / `MP_UNREACH_NLRI`: "Note that the value of trailing bits
-//! is irrelevant."
+//! RFC 4271 §4.3, of the NLRI field: "The Prefix field contains an IP address
+//! prefix, followed by enough trailing bits to make the end of the field fall
+//! on an octet boundary. Note that the value of the trailing bits is
+//! irrelevant." Its Withdrawn Routes field says the same. So does RFC 4760 §5
+//! for `MP_REACH_NLRI` / `MP_UNREACH_NLRI`: "Note that the value of trailing
+//! bits is irrelevant."
 //!
 //! So `10.1.2.3/8` and `10.0.0.0/8` name one destination. Consequently:
 //!
