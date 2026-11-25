@@ -234,7 +234,7 @@ pub enum State {
 ///
 /// ```rust
 /// use std::net::Ipv4Addr;
-/// use pathvector_session::fsm::{Fsm, FsmConfig, FsmInput, State};
+/// use pathvector_session::fsm::{Fsm, FsmConfig, FsmInput, SendHoldTime, State};
 ///
 /// let fsm = Fsm::new(FsmConfig {
 ///     local_as: 65001,
@@ -245,6 +245,7 @@ pub enum State {
 ///     peer_as: Some(65002),
 ///     confederation_member: false,
 ///     public_as: 65001,
+///     send_hold_time: SendHoldTime::RECOMMENDED,
 /// });
 /// assert_eq!(fsm.state(), State::Idle);
 /// ```
