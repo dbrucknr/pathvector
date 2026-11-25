@@ -378,6 +378,23 @@ mrt mrt_file='':
     sleep 1
     ./target/release/pathvector-mrt --mrt "{{mrt_file}}" --peer 127.0.0.1:1179
 
+# PR-1 control-plane stall harness: N full-table loaders + a control peer with
+# a short hold timer against a real pathvectord, measuring lock-hold times,
+# keepalive spacing and gRPC latency per scenario.
+#
+# Needs distinct loopback source addresses — on macOS add aliases first (see
+# pathvector-loadtest/README.md). Extra arguments pass through, e.g.:
+#   just loadtest ./latest-bview.gz --limit 20000 --scenarios converge,teardown
+loadtest mrt_file='' *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{mrt_file}}" ]; then
+        echo "Usage: just loadtest ./latest-bview.gz [loadtest options…]"
+        exit 1
+    fi
+    cargo build --release -p pathvectord -p pathvector-loadtest
+    ./target/release/loadtest --mrt "{{mrt_file}}" {{args}}
+
 # ── Fuzz ──────────────────────────────────────────────────────────────────────
 
 # Compile all fuzz targets (no fuzzing — fast compile check)
