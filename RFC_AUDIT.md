@@ -1005,3 +1005,32 @@ the encode-only tier. Remaining open threads: the "needs investigation"
 rows scattered through earlier sections, the newly-found RFC 1997/5065
 gaps, and a possible future pass specifically hunting for more
 "tracked-but-overclaiming" cases the way this round found two.)*
+
+---
+
+# AS-number rules: RFC 6793, 7607, 9774 (issues #109–#111)
+
+**Audited and fixed:** 2026-11-25
+**Method:** Each clause re-read from the RFC text (7607, 9774, 6793, 7606, and
+5492 §4 for repeated capabilities); tests written from the text and run against
+the unfixed code first.
+
+| Clause | Finding | Resolution |
+|---|---|---|
+| RFC 6793 §4.2.2: confed segments MUST be excluded from AS4_PATH | Public helper returned a copy of the whole path. The daemon builders stripped them already | `As4Path` type, one constructor |
+| RFC 7607 §2: zero peer AS in OPEN → Bad Peer AS | Accepted when `peer_as` was unset, or set to 0 | Checked before the expected-AS match |
+| RFC 7607 §2: MUST NOT initiate a connection claiming AS 0 | Not enforced | FSM and config |
+| RFC 7607 §2: AS 0 in AGGREGATOR / AS4_PATH / AS4_AGGREGATOR is malformed | Accepted | Attribute discard |
+| RFC 7607 §2: MUST NOT originate or propagate | Not enforced on send | `egress.rs` |
+| RFC 7607 index entry (2026-07-16, "genuinely implemented") | **Overclaimed**: that audit checked only configured `remote_as` and received AS_PATH, and marked the RFC ✅ | Corrected |
+| RFC 9774 §3 (published 2025; no earlier audit covered it) | Not implemented in either direction | Receive and send defaults; no operator exception |
+| RFC 7606 §2: treat-as-withdraw covers the UPDATE's routes | `make_treat_as_withdraw` dropped existing MP_UNREACH_NLRI | Kept |
+
+**Interpretations, where the text does not settle it:**
+- RFC 9774 §3 against RFC 6793: a set in AS4_PATH withdraws even where 6793
+  alone would discard the attribute (four-octet session) or the segment
+  (AS_CONFED_SET), by RFC 7606 §3(h).
+- Differing repeated FourByteAsn capabilities: no RFC says which counts; any
+  zero instance is refused. Differing non-zero instances still use the first
+  (see `TODO.md`).
+- A non-mappable AS only inside a confederation segment yields no AS4_PATH.

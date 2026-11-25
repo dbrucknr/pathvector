@@ -15,8 +15,9 @@ use pathvector_types::{Aggregator, AsPath, Asn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressBlock {
     /// RFC 7607 §2: "A BGP speaker MUST NOT originate or propagate a route
-    /// with an AS number of zero in the AS_PATH [or] AS4_PATH". AS4_PATH is
-    /// derived from AS_PATH, so checking the latter covers both.
+    /// with an AS number of zero in the AS_PATH, AS4_PATH, AGGREGATOR, or
+    /// AS4_AGGREGATOR attributes." AS4_PATH is derived from AS_PATH, so
+    /// checking the latter covers both.
     AsZero,
     /// RFC 9774 §3: "BGP speakers: MUST NOT advertise BGP UPDATE messages
     /// containing AS_SETs or AS_CONFED_SETs". No operator exception is

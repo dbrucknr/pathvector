@@ -332,6 +332,32 @@ fn originated_route_with_a_set_is_not_advertised() {
     }
 }
 
+/// RFC 7606 §5.2: "if any path attribute errors are encountered" in an UPDATE
+/// that has path attributes but no reachable NLRI, and the action is anything
+/// but attribute discard, "the "session reset" approach MUST be used". A set
+/// or AS 0 in such a withdraw-only UPDATE is that case.
+#[test]
+fn prohibited_path_on_an_update_without_reachable_nlri_resets_the_session() {
+    for fault in [Fault::AsSet, Fault::AsZero] {
+        let update = UpdateMessage {
+            withdrawn: vec![n4()],
+            attributes: fault.attributes(),
+            announced: vec![],
+        };
+        let wire = BgpMessage::Update(update).encode();
+        let decoded = BgpMessage::decode(&wire).unwrap();
+        let mut fsm = session();
+        let outputs = fsm.process(FsmInput::MessageReceived(decoded));
+        assert_eq!(fsm.state(), State::Idle, "{fault:?}");
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, FsmOutput::RouteUpdate(_))),
+            "{fault:?}: {outputs:?}"
+        );
+    }
+}
+
 /// Received routes with sets never reach the Loc-RIB through the session, and
 /// the daemon's own gate holds for a session implementation that does not use
 /// this codec.

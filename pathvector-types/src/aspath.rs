@@ -458,7 +458,9 @@ impl AsPath {
     /// Creates an AS path from an explicit list of segments.
     ///
     /// Use this when constructing paths with mixed segment types, such as
-    /// a sequence followed by a set (common in aggregated routes).
+    /// a sequence followed by a set — the shape of historical aggregated
+    /// routes, which RFC 9774 no longer lets a live speaker advertise or
+    /// accept (see [`Self::contains_as_set`]).
     ///
     /// # Examples
     ///
