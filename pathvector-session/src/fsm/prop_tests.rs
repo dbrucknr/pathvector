@@ -60,7 +60,8 @@ fn arb_fsm_input() -> impl Strategy<Value = FsmInput> {
 
 fn arb_non_start_input() -> impl Strategy<Value = FsmInput> {
     prop_oneof![
-        Just(FsmInput::ManualStop),
+        // ManualStop is excluded: in Idle it cancels a pending restart (see
+        // `test_manual_stop_from_idle_only_cancels_pending_restart`).
         Just(FsmInput::TcpConnected),
         Just(FsmInput::TcpFailed),
         // ConnectRetryTimerExpired is intentionally excluded: it now triggers

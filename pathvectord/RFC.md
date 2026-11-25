@@ -600,8 +600,10 @@ to the `pathvector-session` transport layer via `SessionHandle`.
 ## RFC 4486 §4 — Maximum Number of Prefixes (Daemon Integration)
 
 **Owns:** Per-AFI Adj-RIB-In size checking after each UPDATE; sending
-`CEASE/MaximumNumberOfPrefixesReached`; enforcing an idle-hold period before the peer
-may reconnect.  
+`CEASE/MaximumNumberOfPrefixesReached`; keeping the session down afterwards, or starting it
+again after `max_prefixes_restart` seconds. RFC 4271 §6.7 and RFC 4486 §4 require only the
+Cease: whether and when to start again is local policy (RFC 4271 §8.1.1
+`AllowAutomaticStart`, `IdleHoldTimer`).  
 **Boundary:** The `CeaseError::MaximumNumberOfPrefixesReached` subcode constant and NOTIFICATION
 wire encoding live in `pathvector-session`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4486#section-4
@@ -615,9 +617,13 @@ wire encoding live in `pathvector-session`.
 | No CEASE when count is at or below limit | `src/daemon/route.rs` | ✅ | `no_cease_at_exact_limit`, `no_cease_when_under_limit` |
 | Send `CEASE/MaximumNumberOfPrefixesReached` when limit exceeded | `src/daemon/route.rs` | ✅ | `cease_when_limit_exceeded` |
 | Set idle-hold deadline when `max_prefixes_restart > 0` | `src/daemon/route.rs` | ✅ | `idle_hold_inserted_when_restart_configured` |
-| No idle-hold when `max_prefixes_restart` is absent or zero | `src/daemon/route.rs` | ✅ | `no_idle_hold_without_restart` |
-| Block `SessionEvent::Established` during idle-hold; send Stop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
-| Block reconnect during idle-hold via coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop`, `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification` |
+| Absent or zero `max_prefixes_restart`: no idle-hold; the peer is latched down | `src/daemon/route.rs` | ✅ | `no_idle_hold_without_restart` |
+| A latched session neither redials nor accepts a connection (RFC 4271 §8.2.2 Idle) | `src/daemon/mod.rs` | ✅ | `max_prefix_without_restart_time_stays_down`, `max_prefix_with_zero_restart_time_stays_down` |
+| Another reset queued for the same peer does not undo the latch | `src/daemon/mod.rs` | ✅ | `stalled_reset_does_not_undo_the_latch_first_event_path`, `stalled_reset_does_not_undo_the_latch_drain_loop_path` |
+| Removing the peer completes while it is held down, so it can be added again | `src/daemon/peer.rs` | ✅ | `removing_and_adding_the_peer_clears_the_latch`, `removing_a_peer_cancels_its_pending_restart` |
+| Positive N: session started N seconds after the CEASE, independently of `connect_retry_time` (RFC 4271 §8.1.3 `IdleHoldTimer_Expires`) | `src/daemon/mod.rs` | ✅ | `max_prefix_restart_shorter_than_connect_retry`, `max_prefix_restart_longer_than_connect_retry` |
+| Do not register a session that reaches Established while held down; stop it with CEASE/Connection Rejected | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
+| Same via the coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop`, `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification` |
 | Ignore UPDATEs from a session refused during idle-hold, or otherwise unregistered (RFC 4271 §9) | `src/daemon/route.rs` | ✅ | `update_behind_rejected_established_is_ignored`, `coalesced_update_behind_rejected_established_is_ignored`, `update_from_rejected_session_does_not_rearm_idle_hold`, `update_from_unregistered_session_is_ignored` |
 | Clear idle-hold deadline when timer expires (event loop) | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_timer_clears_expired_deadline` |
 | `add_peer` populates `peer_max_prefixes_v4/v6` + `peer_max_prefixes_restart` | `src/daemon/peer.rs` | ✅ | `add_peer_populates_max_prefix_maps` |
@@ -625,11 +631,16 @@ wire encoding live in `pathvector-session`.
 | No limit enforced when `max_prefixes_v4`/`v6` is not configured | `src/daemon/route.rs` | ✅ | `no_limit_when_unconfigured` |
 | LocRib reverts correctly when over-limit peer displaces an existing best path | `src/daemon/mod.rs` | ✅ | `displaced_best_path_reverts_after_termination` |
 
+**Clearing a latched peer** (no `max_prefixes_restart`): restart the daemon, which reads the
+peer's limits from the config again, or `RemovePeer` then `AddPeer`. A peer re-added that way has
+only the settings `AddPeer` carries, which do not include a prefix limit, until the daemon
+restarts. `AddPeer` on its own and `SoftReset` do not clear it. The latch is held in memory only.
+
 **Deferred:**
-- RFC 4486 §4 does not specify behaviour when the peer reconnects after the idle-hold
-  expires and immediately re-floods the same table. pathvectord will CEASE again —
-  this is correct but can produce rapid reconnect loops. Operators should size
-  `max_prefixes_restart` to allow time for the peer's operator to intervene.
+- No operator action restarts a latched peer while keeping its limits, short of restarting the
+  daemon.
+- A peer that floods the same table after each restart is reset again every
+  `max_prefixes_restart` seconds; there is no upper bound on the number of retries.
 
 ---
 
