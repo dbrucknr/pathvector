@@ -623,6 +623,7 @@ wire encoding live in `pathvector-session`.
 | Positive N: session started N seconds after the CEASE, independently of `connect_retry_time` (RFC 4271 §8.1.3 `IdleHoldTimer_Expires`) | `src/daemon/mod.rs` | ✅ | `max_prefix_restart_shorter_than_connect_retry`, `max_prefix_restart_longer_than_connect_retry` |
 | Do not register a session that reaches Established while held down; stop it with CEASE/Connection Rejected | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
 | Same via the coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop`, `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification` |
+| Ignore UPDATEs from a session refused during idle-hold, or otherwise unregistered (RFC 4271 §9) | `src/daemon/route.rs` | ✅ | `update_behind_rejected_established_is_ignored`, `coalesced_update_behind_rejected_established_is_ignored`, `update_from_rejected_session_does_not_rearm_idle_hold`, `update_from_unregistered_session_is_ignored` |
 | Clear idle-hold deadline when timer expires (event loop) | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_timer_clears_expired_deadline` |
 | `add_peer` populates `peer_max_prefixes_v4/v6` + `peer_max_prefixes_restart` | `src/daemon/peer.rs` | ✅ | `add_peer_populates_max_prefix_maps` |
 | `remove_peer` clears all max-prefix maps | `src/daemon/peer.rs` | ✅ | `remove_peer_clears_max_prefix_maps` |

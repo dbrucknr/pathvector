@@ -1503,7 +1503,9 @@ pub(crate) async fn run_event_loop(
                     SessionEvent::Established(info) => {
                         // A peer held down after a max-prefix CEASE is not
                         // registered, even if its session got as far as
-                        // Established before the stop reached it.
+                        // Established before the stop reached it. Skipping
+                        // `on_established` leaves the session unregistered, so
+                        // `on_route_update` ignores any UPDATE already queued.
                         if s.is_max_prefix_held(peer_ip) {
                             tracing::info!(
                                 peer = %peer_ip,
@@ -9574,6 +9576,16 @@ mod tests {
         // let-else guard fires; must not panic and RIB stays empty.
         let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        // Registered, so the UPDATE gets past the unregistered-session guard.
+        state.on_established(
+            peer_ip,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         state.adj_ribs_in.remove(&peer_ip);
 
         state.on_route_update(
@@ -9870,8 +9882,8 @@ mod tests {
         assert!(!state.rib.peer_types.contains_key(&IpAddr::V4(peer_a)));
     }
 
-    /// Calling `on_route_update` with an unknown peer IP logs an error and
-    /// returns without panicking.
+    /// Calling `on_route_update` with an unknown peer IP does nothing: not even
+    /// an End-of-RIB marker is recorded.
     #[test]
     fn test_on_route_update_unknown_peer_is_noop() {
         let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
@@ -9887,6 +9899,7 @@ mod tests {
             },
         );
         assert_eq!(state.rib.loc_rib.len(), 0);
+        assert!(!state.rib.eor_received.contains(&IpAddr::V4(unknown)));
     }
 
     /// When `on_route_update` propagates to established peers, a ghost peer
@@ -13629,6 +13642,191 @@ mod event_loop_tests {
             Some(0.0),
             "Loc-RIB size gauge must be refreshed when the drain loop leaves early"
         );
+    }
+
+    // ── UPDATEs from a session the daemon did not register ────────────────────
+
+    // A reconnect during the max-prefix idle-hold is refused: the daemon never
+    // runs `on_established` for it. Its UPDATEs can already be queued behind
+    // the `Established` and must change nothing: to the daemon that session is
+    // not established, and RFC 4271 §9 says "An UPDATE message may be received
+    // only in the Established state". The hold-off itself is local policy.
+
+    /// A and B configured, A inside its idle-hold window.
+    fn idle_held_state() -> StateBundle {
+        let (state, rxs, stop_senders) =
+            make_state(&[(DRAIN_PEER_A, 65002), (DRAIN_PEER_B, 65003)], 64);
+        state.try_write().unwrap().max_prefix_idle.insert(
+            DRAIN_PEER_A,
+            Instant::now() + std::time::Duration::from_secs(300),
+        );
+        (state, rxs, stop_senders)
+    }
+
+    fn rejected_update() -> SessionEvent {
+        SessionEvent::RouteUpdate(update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16"))
+    }
+
+    /// Runs the loop over `events`, all queued before it starts, so that
+    /// everything behind the first event is eligible for coalescing.
+    async fn run_queued(
+        events: Vec<(IpAddr, SessionEvent)>,
+        state: &Arc<RwLock<DaemonState>>,
+        stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(events.len());
+        for event in events {
+            event_tx.send(event).await.unwrap();
+        }
+        drop(event_tx);
+        run_event_loop(event_rx, Arc::clone(state), stop_senders, None).await;
+    }
+
+    fn assert_nothing_installed_from_a(s: &DaemonState) {
+        assert_eq!(s.rib.loc_rib.len(), 0, "Loc-RIB must stay empty");
+        assert_eq!(
+            s.adj_ribs_in[&DRAIN_PEER_A].routes().count(),
+            0,
+            "Adj-RIB-In must stay empty"
+        );
+        assert!(
+            !s.rib.prefixes_received.contains_key(&DRAIN_PEER_A),
+            "no received-prefix count for an unregistered session"
+        );
+    }
+
+    /// First-event path: the rejected `Established` ends its own iteration, so
+    /// the UPDATE behind it starts the next one.
+    #[tokio::test]
+    async fn update_behind_rejected_established_is_ignored() {
+        let (state, _rxs, stop_senders) = idle_held_state();
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+
+        run_queued(
+            vec![
+                (
+                    DRAIN_PEER_A,
+                    SessionEvent::Established(established_info(65002)),
+                ),
+                (DRAIN_PEER_A, rejected_update()),
+            ],
+            &state,
+            stop_senders,
+        )
+        .await;
+
+        assert_nothing_installed_from_a(&*state.read().await);
+        let commands = drain_commands(&mut a);
+        assert!(
+            matches!(commands.as_slice(), [SessionCommand::Notification(_)]),
+            "got {commands:?}"
+        );
+    }
+
+    /// Drain-loop path: both the rejected `Established` and its UPDATE are
+    /// coalesced behind another peer's event. Nothing may be installed, and
+    /// the established peer must not be sent the prefix.
+    #[tokio::test]
+    async fn coalesced_update_behind_rejected_established_is_ignored() {
+        let (state, mut rxs, stop_senders) = idle_held_state();
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+
+        run_queued(
+            vec![
+                (
+                    DRAIN_PEER_B,
+                    SessionEvent::Established(established_info(65003)),
+                ),
+                (
+                    DRAIN_PEER_A,
+                    SessionEvent::Established(established_info(65002)),
+                ),
+                (DRAIN_PEER_A, rejected_update()),
+            ],
+            &state,
+            stop_senders,
+        )
+        .await;
+
+        assert_nothing_installed_from_a(&*state.read().await);
+        let b_updates = rxs.get_mut(&DRAIN_PEER_B).unwrap();
+        while let Ok(msg) = b_updates.try_recv() {
+            assert!(
+                msg.announced.is_empty(),
+                "the refused route was advertised to an established peer: {msg:?}"
+            );
+        }
+        let commands = drain_commands(&mut a);
+        assert!(
+            matches!(commands.as_slice(), [SessionCommand::Notification(_)]),
+            "got {commands:?}"
+        );
+    }
+
+    /// An over-limit UPDATE from a refused session must not send a second
+    /// Cease or push the idle-hold deadline out.
+    #[tokio::test]
+    async fn update_from_rejected_session_does_not_rearm_idle_hold() {
+        let (state, _rxs, stop_senders) = idle_held_state();
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+        let deadline = {
+            let mut s = state.write().await;
+            s.peer_max_prefixes_v4.insert(DRAIN_PEER_A, 1);
+            s.peer_max_prefixes_restart.insert(DRAIN_PEER_A, 600);
+            s.max_prefix_idle[&DRAIN_PEER_A]
+        };
+        let mut over_limit = update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16");
+        over_limit.announced.push(nlri("10.2.0.0/16"));
+
+        run_queued(
+            vec![
+                (
+                    DRAIN_PEER_A,
+                    SessionEvent::Established(established_info(65002)),
+                ),
+                (DRAIN_PEER_A, SessionEvent::RouteUpdate(over_limit)),
+            ],
+            &state,
+            stop_senders,
+        )
+        .await;
+
+        assert_eq!(state.read().await.max_prefix_idle[&DRAIN_PEER_A], deadline);
+        let commands = drain_commands(&mut a);
+        assert!(
+            matches!(commands.as_slice(), [SessionCommand::Notification(_)]),
+            "got {commands:?}"
+        );
+    }
+
+    /// The rule is registration, not the idle-hold: no session the daemon has
+    /// not established may change state, End-of-RIB markers included
+    /// (RFC 4724 §2), nor draw a NOTIFICATION.
+    #[test]
+    fn update_from_unregistered_session_is_ignored() {
+        let (state, _rxs, _stop_senders) = make_state(&[(DRAIN_PEER_A, 65002)], 64);
+        let mut s = state.try_write().unwrap();
+
+        let notification = s.on_route_update(
+            DRAIN_PEER_A,
+            update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16"),
+        );
+        assert!(notification.is_none());
+        let SessionEvent::RouteUpdate(reset) = session_reset_update(65002) else {
+            unreachable!()
+        };
+        assert!(s.on_route_update(DRAIN_PEER_A, reset).is_none());
+        s.on_route_update(
+            DRAIN_PEER_A,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![],
+                announced: vec![],
+            },
+        );
+
+        assert_nothing_installed_from_a(&s);
+        assert!(!s.rib.eor_received.contains(&DRAIN_PEER_A));
     }
 
     // ── Terminated dispatch ───────────────────────────────────────────────────
