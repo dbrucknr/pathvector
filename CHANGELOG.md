@@ -70,15 +70,14 @@ this is not PR-1's two-full-table-peer run.
 | Reconvergence, median of 9 runs (range) | 5.99 s (5.92–6.11) | 5.94 s (5.90–7.19, one outlier) |
 | Peer teardown, median of 9 runs | 2.07 s | 2.09 s |
 | Control peer longest silence in convergence (hold 9 s) | ≤ 3.01 s | ≤ 3.01 s |
-| `event_send_blocked` total in convergence, 3 alternated runs | 736–915 ms | 805–959 ms |
+| `event_send_blocked` total in convergence, median of 18 alternated runs (range) | 640 ms (364–915) | 634 ms (395–973) |
 
-`keepalive_lateness` is unchanged in kind. It grows only while `watch_routes` snapshots run: with the
+Base and branch runs were alternated except for six a side in the first two rows. `keepalive_lateness` is unchanged in kind. It grows only while `watch_routes` snapshots run: with the
 harness temporarily set to a 9 s loader hold time and 60 s churn phases (5 alternated runs a side,
 about 20 KEEPALIVEs per session per run), the loader and control sessions were late by nearly the
 same total within each run on both sides (base 1.35–2.57 s, this change 0.20–2.85 s). That points at
 daemon-wide stalls, not at either session loop; the cause was not isolated. The `event_send_blocked`
-numbers are not directly comparable: the metric now samples a blocked episode, and the task is not
-parked during it.
+metric now samples a blocked episode rather than one parked send.
 
 The failures this change fixes (a stalled consumer, a non-reading peer, input that never pauses) do
 not arise in these loopback runs, so they are shown by tests, not by these numbers.
