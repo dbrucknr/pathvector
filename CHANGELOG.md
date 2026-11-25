@@ -4,6 +4,57 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvector-rpki: partial RTR PDUs and prefix tuple bounds — issues #89, #91)
+
+**#89 — a refresh could lose the bytes of a partly received PDU.** The idle loop races the
+socket read against the RFC 8210 §6 refresh timer. The read kept its header and body in
+local buffers, so when the timer won mid-PDU those bytes were gone and the remainder was
+parsed as a header: a spurious protocol error and reconnect on a healthy session.
+
+- New pure `frame.rs` (`FrameDecoder`) and `transport.rs` (`Connection`). Partial PDUs live
+  in the connection, so a read can be cancelled at any await point. Buffering stays bounded
+  (one PDU of at most 64 KiB plus a 16 KiB read).
+- The socket is read in 16 KiB chunks instead of two `read` calls per PDU.
+- Proof: black-box tests split a Serial Notify at all 11 offsets, v0 and v1, with the
+  refresh timer firing in the gap (all 22 failed before); exhaustive two-way splits;
+  cancellation at every byte and at the cooperative-budget yield; property tests over
+  segmentation and cancellation points; the `rtr_pdu` fuzz target now asserts that
+  segmentation does not change the result.
+
+**#91 — impossible prefix tuples were accepted.** A Prefix Length past the family was
+silently skipped while the transfer still committed; a Max Length past the family, or below
+the Prefix Length, was installed.
+
+- A `Vrp<A>` new-type enforces `prefix_len <= max_len <= family width` (RFC 8210 §§5.1,
+  5.6, 5.7; RFC 6810 §5) in its only constructor; Prefix PDUs decode into it and the table
+  accepts nothing else.
+- A violation sends Error Report 0 "Corrupt Data" with the offending PDU and drops the
+  session. Nothing of the failed transfer is published, the completed generation is kept,
+  and the next query is a Reset Query.
+- **Behaviour change:** a record whose Max Length was below its Prefix Length used to count
+  as *covering* (RFC 6811 §2), making routes under it `Invalid` and, by default, rejected.
+  RFC 8210 §5.1 says Max Length MUST NOT be less than Prefix Length, so it is not a VRP;
+  it no longer reaches the table. A cache that serves one now cannot update the router
+  until it is corrected; the previous data stays until the Expire Interval.
+- Address bits beyond the Prefix Length are cleared, as the table already did implicitly.
+- API: `PduError::InvalidPrefix(VrpError)` is new (a breaking change for exhaustive
+  matches). `for_testing` / `insert_roa_*` now panic on a tuple no cache could send.
+
+**Cost** (M2 Max, release build, loopback full load from Reset Query to the completed-sync
+notification; median of 301 / 201 / 101 runs):
+
+| VRPs | before | after | Takeaway |
+|---|---|---|---|
+| 100 | 162 µs | 73 µs | 2.2× faster: bulk reads replace ~200 `read` calls |
+| 1 000 | 1.12 ms | 0.29 ms | 3.9× faster: per-PDU `read` calls and allocations, not table inserts, were most of the cost |
+| 10 000 | 11.4 ms | 2.28 ms | 5.0× faster; the new bounds check is not visible |
+
+Median of five alternated before/after rounds; reproduce with
+`cargo test --release -p pathvector-rpki -- --ignored --nocapture sync_cost`.
+`validate_v4` / `validate_v6` are unchanged.
+
+---
+
 ## 2026-11-24 (pathvectord: list_peers / get_peer no longer scan the Loc-RIB — issue #106)
 
 `build_peer_state` counted `prefixes_accepted` by walking every best route once per
