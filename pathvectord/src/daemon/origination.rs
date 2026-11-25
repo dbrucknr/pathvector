@@ -64,9 +64,7 @@ impl DaemonState {
                 withdrawn_prefix: None,
             });
             let fib_change = self.rib_insert_v6(PeerId::from(LOCAL_ORIGIN_PEER), route);
-            if let Some(fm) = &self.fib_manager {
-                fm.apply_v6(fib_change);
-            }
+            self.program_fib_v6(RibEffects::from_best(vec![fib_change]));
             nlris.push(nlri);
         }
         self.propagate_to_all_peers_v6(&nlris);
@@ -90,9 +88,7 @@ impl DaemonState {
         for nlri in nlris {
             self.rib_mut().originated_routes.remove(nlri);
             let fib_change = self.rib_withdraw_v4(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
-            if let Some(fm) = &self.fib_manager {
-                fm.apply_v4(fib_change);
-            }
+            self.program_fib_v4(RibEffects::from_best(vec![fib_change]));
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Withdrawn as i32,
                 route: None,
@@ -120,9 +116,7 @@ impl DaemonState {
         for nlri in nlris {
             self.rib_mut().originated_routes_v6.remove(nlri);
             let fib_change = self.rib_withdraw_v6(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
-            if let Some(fm) = &self.fib_manager {
-                fm.apply_v6(fib_change);
-            }
+            self.program_fib_v6(RibEffects::from_best(vec![fib_change]));
             let _ = self.route_tx.send(proto::RouteEvent {
                 r#type: proto::RouteEventType::Withdrawn as i32,
                 route: None,

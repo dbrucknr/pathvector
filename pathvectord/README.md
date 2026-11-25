@@ -118,6 +118,46 @@ remote_as = 65001
 | `import_default` | `"accept"` \| `"reject"` | eBGP: `"reject"`, iBGP: `"accept"` | What to do with routes that don't match any import policy term. eBGP defaults to reject per RFC 8212 |
 | `export_default` | `"accept"` \| `"reject"` | eBGP: `"reject"`, iBGP: `"accept"` | What to do with routes that don't match any export policy term |
 | `md5_password` | `string` | — | TCP MD5SIG authentication password (RFC 2385), 1–80 bytes; an empty or longer value is a config error. Both sides must use the same password. Linux only; see note below |
+| `blackhole_authorized_prefixes` | list of IPv4/IPv6 prefixes | — (**denied**) | RFC 7999 BLACKHOLE: setting this **is** the agreement to honor the BLACKHOLE community (65535:666) on this session, and the list is the scope the peer may blackhole (a `/32` or `/128` inside an authorized `/24` or `/48` is covered). Omitted: BLACKHOLE-tagged announcements are ignored — no null route, no Loc-RIB entry, nothing exported. See [BLACKHOLE](#blackhole-routes-rfc-7999) |
+
+### BLACKHOLE routes (RFC 7999)
+
+pathvectord honors the well-known BLACKHOLE community (`65535:666`) only on a session whose
+operator agreed to it, and only for prefixes the peer is authorized to blackhole — RFC 7999
+§3.3: "MUST only accept and honor [...] announcements carrying the BLACKHOLE community" when
+"the announced prefix is covered by an equal or shorter prefix that the neighboring network is
+authorized to advertise" *and* "the receiving party agreed to honor the BLACKHOLE community on
+the particular BGP session". Both conditions are one setting:
+
+```toml
+[[peers]]
+address                       = "198.51.100.1"
+remote_as                     = 64496
+# eBGP default import is "reject" (RFC 8212); an agreed blackhole is honored regardless.
+blackhole_authorized_prefixes = ["192.0.2.0/24", "2001:db8:100::/40"]
+```
+
+- **Default: denied.** Without the setting a BLACKHOLE-tagged announcement is refused (RFC 7999
+  §4): no kernel null route, never in the Loc-RIB, never exported. It is kept in the Adj-RIB-In
+  like any ineligible route, and is *not* imported as ordinary unicast.
+- **Authorized:** the prefix is covered by a listed prefix (equal or shorter). A kernel
+  `RTN_BLACKHOLE` route is programmed (IPv4 and IPv6; host `/32` and `/128` included). The route
+  never enters the Loc-RIB, so it cannot be selected, exported or reflected as unicast.
+- **Origin validation does not block it.** RFC 7999 §3.3: "An operator MUST ensure that origin
+  validation techniques (such as the one described in [RFC6811]) do not inadvertently block
+  legitimate announcements carrying the BLACKHOLE community." An authorized request is judged
+  by the agreement *instead of* the session's import policy, so RPKI-Invalid (a host route is
+  longer than any ROA `maxLength`) and `import_default = "reject"` do not apply to it. An RFC 9234
+  route leak (OTC from a Customer) is still ineligible.
+- **One null route per prefix.** If two peers request the same prefix, the route stays until the
+  last one withdraws (or its session ends, or the agreement is revoked). While a prefix is
+  blackholed, a unicast best-path change for it is not programmed over the null route; the
+  Loc-RIB's best route is programmed again when the blackhole goes.
+- **Graceful Restart:** a restarting peer's blackholes are retained like its other routes (RFC
+  4724 §4.2), re-judged by the same rules, and removed at End-of-RIB if not refreshed or when the
+  Restart Time expires.
+- Must be a non-empty list of canonical prefixes (no host bits); an empty list or `192.0.2.5/24`
+  is a config error. Peers added over gRPC have no BLACKHOLE agreement.
 
 ### Full example
 
@@ -493,7 +533,7 @@ for the full breakdown.
 | `hold_time` | Negotiated hold timer in seconds; `0` when idle |
 | `uptime_seconds` | Seconds since last Established; `0` when idle |
 | `prefixes_received` | Routes in Adj-RIB-In (all received, pre-policy) |
-| `prefixes_accepted` | Routes whose best-path winner is this peer |
+| `prefixes_accepted` | Routes (IPv4 + IPv6) whose best-path winner is this peer. Maintained incrementally by the Loc-RIB, so `ListPeers` / `GetPeer` / `WatchPeers` cost O(peers) regardless of table size |
 | `prefixes_advertised` | Routes currently being sent to this peer (Adj-RIB-Out size) |
 
 ### Route fields

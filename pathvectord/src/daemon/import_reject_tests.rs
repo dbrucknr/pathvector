@@ -49,7 +49,7 @@ use pathvector_types::{AfiSafi, AsPath, Asn, Community, NextHop, Nlri, Origin, P
 use proptest::prelude::*;
 
 use super::DaemonState;
-use super::import::reapply_import_policy;
+use super::import::reapply_without_blackholes;
 use super::install_otc_import_term;
 use super::last_feasible_tests::{
     AS_A, AS_C, LOCAL_AS, PEER_A, PEER_B, PEER_C, RESOLVABLE_V4, RESOLVABLE_V4_ALT, RESOLVABLE_V6,
@@ -843,8 +843,8 @@ proptest! {
         let before_v6: Vec<_> = loc_rib_v6.best_routes().map(|(n, r)| (n, r.clone())).collect();
         for i in 0..3 {
             let gate = super::ingress::IngressGate::new(MODEL_LOCAL_AS, None, None, None);
-            let _ = reapply_import_policy(model_peer(i), &adj[i], &mut loc_rib, &policy, &gate, &AlwaysReachable);
-            let _ = reapply_import_policy(
+            let _ = reapply_without_blackholes(model_peer(i), &adj[i], &mut loc_rib, &policy, &gate, &AlwaysReachable);
+            let _ = reapply_without_blackholes(
                 model_peer(i), &adj_v6[i], &mut loc_rib_v6, &policy_v6, &gate, &AlwaysReachable,
             );
         }

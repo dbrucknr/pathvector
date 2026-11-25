@@ -4,6 +4,194 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-24 (pathvectord: list_peers / get_peer no longer scan the Loc-RIB — issue #106)
+
+`build_peer_state` counted `prefixes_accepted` by walking every best route once per
+configured peer, and the peer handlers did it on a cloned `Arc<RibSnapshot>`. So each
+`list_peers` call was O(table × peers), and while a reader held the clone the event loop's next
+`Arc::make_mut` deep-copied both Loc-RIBs under the write lock. On the 1.13 M-prefix table of
+the PR #114 harness that was `list_peers` p50 ~230 ms, write-lock holds up to 500 ms and an
+extra RIB copy in RSS (1.24 → 1.9 GiB) while a management client polled at 10 Hz.
+
+- `pathvector-rib`: new private `BestTable` owns the best-path winner map **and** a per-peer win
+  count. Its single mutator updates both, so the counts cannot drift; `LocRib::best_win_count(peer)`
+  is O(1). `LocRib::best_win_counts_consistent()` is the O(table) audit used by tests.
+- `pathvectord`: new read port `daemon/peer_stats.rs` (`RibSnapshot::peer_rib_stats` →
+  `PeerRibStats`, with a saturating `PrefixCount` newtype for the `u32` wire fields). `list_peers`,
+  `get_peer` and `watch_peers` (initial state and each `Changed` refresh) read it under the
+  `DaemonState` read guard and take **no** `Arc<RibSnapshot>` clone, so they cannot force a
+  copy-on-write. `watch_peers` now subscribes and reads its initial state under one guard.
+- Behavior change: `prefixes_accepted` now counts IPv4 **and** IPv6 wins. It read only the IPv4
+  Loc-RIB, so an IPv6-only peer showed 0 beside a non-zero `prefixes_received`.
+- Proof: `prop_loc_rib_win_counts_equal_full_recount` (random insert/withdraw/peer-down/
+  reachability sequences, checked after every step) and
+  `prop_accepted_count_matches_full_recount_through_daemon_paths` (through import policy,
+  withdrawals, session teardown and re-establishment); `test_list_peers_cost_is_independent_of_loc_rib_size`
+  (8 peers × 120 k prefixes; fails at ~545 ms on the old scan, passes in microseconds); the
+  winner-follows tests in `grpc.rs`. Both counting tests were confirmed to fail with the decrement
+  removed / the scan restored.
+- Benchmark `peer_win_count` (Apple M2 Max, release, jemalloc, one peer of four, per call):
+
+  | Loc-RIB prefixes | old scan | `best_win_count` | `LocRib::clone` (the forced CoW copy) |
+  |---|---|---|---|
+  | 100 | 4.0 µs | 3.7 ns | 3.8 µs |
+  | 1 k | 45 µs | 3.0 ns | 49 µs |
+  | 10 k | 397 µs | 2.9 ns | 499 µs |
+  | 100 k | 5.4 ms | 2.9 ns | 10.7 ms |
+  | 1 M | 100 ms | 3.7 ns | 127 ms |
+
+  `list_peers` paid the scan column once per peer; a management read can no longer cause the
+  right-hand column.
+- Insert cost (new steady-state bench `loc_rib_insert_steady`: RIB built once with exactly n distinct
+  /24s, asserted `rib.len() == n`, then a long loop, so no cold-start artifact; 3 alternating
+  before/after runs; before = `19d82fc`). A winner-changing insert on one hot prefix costs
+  533–552 ns before and 549–579 ns after (+~25–30 ns, about 5 %, the two per-peer count updates)
+  at 10k / 100k / 500k. Across every prefix of the table ("scattered", cache-cold) the runs overlap:
+  10k 731–778 ns before vs 705–788 ns after, 100k 1.30–1.42 µs vs 1.36–1.43 µs, 500k 1.59–1.71 µs
+  vs 1.57–1.67 µs. A route's whole UPDATE path (policy, Adj-RIB-In, propagation) is many
+  microseconds, so this is on the order of 1 % of it (an estimate, not a measurement). The older
+  `loc_rib_insert` bench is not a reliable comparison: it rebuilds the RIB per criterion sample
+  (cold first touches at 500k), and its `nlri_for` keeps only 16 bits of the index, so its 100k
+  and 500k RIBs hold 65,536 distinct prefixes, not 100k/500k (left unchanged here).
+- Full-table harness comparison (PR #114's `loadtest`, real `latest-bview.gz`: 1,133,510 IPv4
+  prefixes, one loader on 127.0.0.1 + control peer on the LAN address, release builds, Apple M2 Max,
+  `--scenarios converge,cow`, one run per cell). "old" = #114 head, "new" = #114 head + this change.
+  The "management client polling at 10 Hz" rows are the issue's scenario (default probe); the
+  "none" rows use `--probe-interval-ms 0`.
+
+  | `cow`, churn only (2000 prefixes, 12 s) | `list_peers` p50 | longest write-lock hold | peak RSS |
+  |---|---|---|---|
+  | old, 10 Hz client | 236 ms | ≤ 500 ms | 1651 MiB |
+  | old, no client | n/a | ≤ 10 ms | 1215 MiB |
+  | **new, 10 Hz client** | **526 µs** (max 11.5 ms) | **≤ 10 ms** | **1215 MiB** |
+  | new, no client | n/a | ≤ 10 ms | 1215 MiB |
+
+  With the polling client the new daemon behaves like one with no client (same lock-hold bucket,
+  RSS flat at the table size instead of +436 MiB). `converge`: `list_peers` p50 230 ms → 425 µs,
+  max 1.22 s → 454 ms; lock holds and convergence time (5.6–6.2 s) unchanged. The control peer's
+  keepalive stayed on cadence (≤ 3.45 s silence, hold 9 s) in all 12 windows. In the `cow`
+  "churn + concurrent `watch_routes` snapshots" window `list_peers` p99 is still 0.9 s (old: 1.3 s)
+  and RSS 2.1 GiB (old: 3.3 GiB with the client): `watch_routes` itself materialises the table and
+  is out of scope here. Each cell is a single run on a loaded laptop; treat differences of a bucket
+  as noise. Raw output is in the PR comment thread.
+- Not changed: the other `snapshot()` callers (`list_routes`, `watch_routes`, ...) legitimately
+  walk the table and still clone the `Arc`; moving them off the write-lock path is a separate
+  change.
+
+---
+
+## 2026-11-24 (pathvectord: authorize BLACKHOLE and re-import retained routes through one pipeline — issues #81, #82)
+
+Both issues share one root cause: the daemon had no single import classification path.
+`handle_update` looked for the BLACKHOLE community before import policy and programmed a
+kernel null route for any peer, whatever its import default; `reapply_import_policy` and
+Graceful Restart stale marking then treated the stored raw route as an ordinary unicast
+candidate. RFC 7999 §3.3 allows honoring BLACKHOLE only if "the announced prefix is covered
+by an equal or shorter prefix that the neighboring network is authorized to advertise" and
+"the receiving party agreed to honor the BLACKHOLE community on the particular BGP
+session", and requires that origin validation not "inadvertently block legitimate
+announcements carrying the BLACKHOLE community".
+
+- **New config: `blackhole_authorized_prefixes`** (per peer, list of IPv4/IPv6 prefixes).
+  Setting it is the agreement; the list is the authorized scope; omitted = **denied**
+  (RFC 7999 §4). Validated at parse time (`BlackholeScope`): non-empty, canonical prefixes.
+  **Behavior change:** a BLACKHOLE-tagged announcement from a peer with no setting is now
+  ignored (no null route, never unicast). Existing deployments that rely on BLACKHOLE must add
+  the setting. Peers added over gRPC have no agreement.
+- **One pipeline.** `ImportPipeline::classify_gated` (`daemon/import.rs`) turns a received
+  route into `Accepted` / `Blackhole(AuthorizedBlackhole)` / `Rejected` / `BlackholeDenied`;
+  UPDATE arrival, `set_import_default`, RPKI ROA-change re-evaluation and Graceful Restart
+  stale marking all use it, and `ImportDecision::apply` reconciles the Loc-RIB and the
+  blackhole book identically. `AuthorizedBlackhole` can only be minted by
+  `BlackholeAgreement::authorize` (`daemon/blackhole.rs`) and is the only thing
+  `BlackholeBook::claim` takes. Authorized requests are judged by the agreement *instead of* the
+  import policy, so ROV and `import_default = "reject"` cannot block them; an RFC 9234 leak is
+  still ineligible. A denied request is stored but never imported as unicast.
+- **Null-route ownership is recorded, not inferred.** `BlackholeBook` replaces the
+  `holds_blackhole` community scan: a null route is installed by the first peer to claim a
+  prefix and withdrawn by the last to release it, so a denied/dropped request can never delete
+  another peer's route and two peers share one. `program_effects` (`daemon/fib.rs`) is the one
+  place best-path and null-route changes become FIB port calls: a unicast change for a
+  blackholed prefix is not programmed over the null route, and the Loc-RIB best route is
+  restored when the blackhole goes.
+- **Graceful Restart (#82).** Stale marking marks the Adj-RIB-In in place
+  (`AdjRibIn::mark_all_stale` now returns the count, not raw clones) and re-imports through the
+  pipeline: rejected routes stay out, LOCAL_PREF / communities / next hop / ingress OTC survive,
+  authorized blackholes stay blackholes, and EOR / expiry sweeps release null routes. The
+  originally reported rejected-route and LOCAL_PREF repros had already been fixed on main by
+  #139/#140; they remain as pinned regression tests. Only the peer's own prefixes are
+  re-propagated, in address order.
+- **Also fixed:** an address family a GR peer did not advertise was cleared from the Adj-RIB-In
+  at unclean termination but its Loc-RIB entries, FIB routes and advertisements lingered until
+  the restart timer (`flush_family_v4/v6`).
+- **Performance** (`gr_stale_marking_cost`, 60 000 IPv4 routes × 2 candidates, release build,
+  Apple M2 Max): stale marking ~110 ms (~1.9 µs/route) vs ~130–145 ms before — one fewer
+  `Route` clone per route, a single `Arc::make_mut`, and propagation limited to the peer's
+  prefixes in address order (hash-order propagation was ~25 % slower).
+- **Tests:** `issue_81_82_tests.rs` (the reported defects through the real entry points; the
+  three BLACKHOLE ones fail on the pre-fix tree), `blackhole_tests.rs` (authorization, ROV
+  exception, leak, revocation, multi-peer, GR lifecycle, config → agreement, model property
+  tests: never unicast, book == authorized stored requests, fresh import == arrival, idempotent),
+  unit tests for `BlackholeScope`, `BlackholeAgreement`, `BlackholeBook`. e2e: BLACKHOLE tests
+  in `pathvector-e2e/tests/fib.rs` now configure the agreement and gain denied / out-of-scope /
+  IPv4 `/32` / IPv6 `/128` cases (Docker + Linux kernel; compiled, not run on macOS).
+- Docs: `pathvectord/RFC.md` (RFC 7999, RFC 4724), `RFC_AUDIT.md`, `pathvectord/README.md`.
+
+---
+
+## 2026-11-24 (pathvector-session: malformed-UPDATE recovery goes through the FSM — issue #98)
+
+`handle_primary_message` handed a `BgpMessage::MalformedUpdate` straight to
+`handle_malformed_update`, which applied RFC 7606 recovery itself and sent
+`SessionEvent::RouteUpdate` on the event channel without ever asking the FSM. So a recoverable
+malformed UPDATE (attribute discard, treat-as-withdraw) crossed the route-event boundary in
+`OpenSent`/`OpenConfirm` — states where RFC 4271 §8.2.2 processes no UPDATE at all — and a
+session-reset outcome in those states fed `ProtocolErrorNotificationToSend` to an FSM that only
+handled it in `Established`, so no NOTIFICATION was sent and the connection stayed open. Real-wire
+reproduction (before the fix): an UPDATE with a malformed `AGGREGATOR` in place of the peer's
+OPEN made the session emit a `RouteUpdate` and send nothing.
+
+RFC basis (read from the primary text; RFC 4271 §8.2.2, RFC 7606 §2/§3/§5.2, RFC 6608 §3):
+Events 27 (`UpdateMsg`) and 28 (`UpdateMsgErr`) are *state-dependent*. Idle ignores them;
+Connect/Active stop the ConnectRetryTimer, drop TCP and go Idle; OpenSent/OpenConfirm send a
+Finite State Machine Error NOTIFICATION (RFC 6608 subcodes 1/2) and go Idle; Established processes
+a valid UPDATE (Event 27: restart the HoldTimer) or, for an UPDATE error, sends an Update-error
+NOTIFICATION and goes Idle (Event 28). RFC 7606 only changes *which* errors are Event 28 versus
+recovered in place; it does not authorize processing an UPDATE before Established.
+
+- New `fsm::UpdateRecovery` (`src/fsm/recovery.rs`): the pure RFC 7606 decision (session reset /
+  treat-as-withdraw / attribute discard, incl. §3(h) precedence and §5.2 Missing-NLRI escalation).
+  `make_treat_as_withdraw` and `is_nlri_less_with_attributes` moved here from the transport,
+  with their tests. The type is opaque and only the FSM can consume it, so recovery cannot take
+  effect outside the state machine: the transport has no path from a `MalformedUpdate` to
+  `event_tx` any more (`handle_malformed_update` is gone).
+- New `FsmInput::MalformedUpdate(UpdateRecovery)` (`MessageReceived(MalformedUpdate)` is
+  normalised to it) with per-state handling as above. A recovered UPDATE in Established is now an
+  ordinary Event 27 UPDATE, which also fixes a latent bug: recovered UPDATEs did **not** restart
+  the HoldTimer, so a peer sending only RFC 7606-recovered UPDATEs would have been timed out.
+- Review follow-up (Codex, PR #143): RFC 6608 §4 requires the FSM Error NOTIFICATION's Data
+  to be "a 1-octet, unsigned integer that indicates the type of the unexpected message" in
+  OpenSent, OpenConfirm *and* Established; every such NOTIFICATION was sent with empty Data. All
+  four sites now carry the type octet (2 for an UPDATE, malformed or not; 1 OPEN, 4 KEEPALIVE,
+  5 ROUTE-REFRESH) via the new `BgpMessage::type_code`.
+- Connect/Active now treat a received UPDATE (valid or not) per §8.2.2 (drop to Idle) instead of
+  silently ignoring it.
+- The transport still classifies a session-reset recovery as `TerminationReason::OperatorStop`
+  (locally detected: immediate flush, reconnect scheduled), unchanged.
+
+Regression tests (each confirmed failing before the fix): the full state × outcome matrix with
+exact outputs and normal-UPDATE parity in `src/fsm/update_error_tests.rs`; real loopback-TCP /
+real-`BgpCodec` tests in `tests/malformed_update_fsm.rs` — raw payload bytes in OpenSent and
+OpenConfirm (exact NOTIFICATION incl. the RFC 6608 type octet off the wire, connection closed, no session event), Established
+discard/withdraw/reset (exact NOTIFICATION Data, `Terminated(OperatorStop)`, reconnect on a new
+connection) and HoldTimer restart. Not done: a Docker/pathvectord scenario (the e2e images are
+shared tags; building them from this branch would replace other work's images) — the daemon-side
+defenses behind the session boundary are unchanged and not re-exercised end to end. Pre-existing,
+unchanged and noted for follow-up: an FSM-error teardown before Established leaves the peer in
+Idle with no ConnectRetryTimer (same as any other OpenSent/OpenConfirm protocol error).
+
+---
+
 ## 2026-11-24 (pathvectord: withdraw the older route when a replacement is dropped before import policy — issue #138)
 
 Same bug shape as #80 (PR #131), for announcements that never reach import policy.

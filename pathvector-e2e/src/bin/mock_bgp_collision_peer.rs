@@ -125,7 +125,12 @@ async fn main() {
     }
 }
 
-fn open_message(bgp_id: Ipv4Addr, capabilities: Vec<Capability>) -> BgpMessage {
+/// Every OPEN this mock sends also advertises `FourByteAsn` (RFC 6793 §4.1):
+/// the mock builds its UPDATEs with the default four-octet `BgpCodec`, so it
+/// must be a NEW speaker on the wire too — without the capability pathvectord
+/// correctly treats it as an OLD speaker and parses AS_PATH two octets per ASN.
+fn open_message(bgp_id: Ipv4Addr, mut capabilities: Vec<Capability>) -> BgpMessage {
+    capabilities.push(Capability::FourByteAsn(u32::from(MOCK_AS)));
     BgpMessage::Open(OpenMessage {
         version: 4,
         my_as: MOCK_AS,

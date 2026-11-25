@@ -640,6 +640,55 @@ proptest! {
     }
 }
 
+// ── LocRib: per-peer win counts equal a full recount (issue #106) ───────────
+//
+// `LocRib::best_win_count` is answered from counters updated where a prefix's
+// winner changes, so management reads need not scan the table. The counters
+// are only trustworthy if they equal a from-scratch scan after *every*
+// mutation: insert (new winner, replaced winner, displaced winner), withdraw
+// (promotion, last candidate), session teardown, and reachability-driven
+// recompute (a winner turning infeasible, a candidate recovering).
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// After any operation sequence, each peer's incremental win count equals
+    /// the number of prefixes `best_peer` attributes to it, the counts sum to
+    /// the table size, and the internal audit agrees.
+    #[test]
+    fn prop_loc_rib_win_counts_equal_full_recount(
+        ops in proptest::collection::vec(arb_rib_op(), 1..=60usize),
+    ) {
+        let mut rib: LocRib<Ipv4Addr> = LocRib::new();
+        let mut oracle = ReachabilityOracle([true; 3]);
+
+        for op in ops {
+            match op {
+                RibOp::Insert(peer, route) => { rib.insert(peer, route, &oracle); }
+                RibOp::Withdraw(peer, nlri) => { rib.withdraw(&peer, &nlri, &oracle); }
+                RibOp::WithdrawPeer(peer) => { rib.withdraw_peer(&peer, &oracle); }
+                RibOp::SetReachable(i, reachable) => {
+                    oracle.0[i] = reachable;
+                    rib.recompute_all(&oracle);
+                }
+            }
+
+            let mut total = 0;
+            for octet in 1..=4u8 {
+                let peer = PeerId::from(Ipv4Addr::new(10, 0, 0, octet));
+                let scanned = rib
+                    .best_routes()
+                    .filter(|(nlri, _)| rib.best_peer(nlri) == Some(peer))
+                    .count();
+                prop_assert_eq!(rib.best_win_count(&peer), scanned, "peer {}", peer);
+                total += scanned;
+            }
+            prop_assert_eq!(total, rib.best_routes().count());
+            prop_assert!(rib.best_win_counts_consistent());
+        }
+    }
+}
+
 // ── AdjRibIn ────────────────────────────────────────────────────────────────
 
 proptest! {

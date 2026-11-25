@@ -10,13 +10,11 @@
 //! surviving the AS_PATH value toward a fellow `ConfedMember` peer (RFC 5065
 //! §5.3 — the opposite of the `External` case) while AS4_PATH excludes it.
 //!
-//! **Scope note (flagged by code review on PR #52):** this proves the
-//! *logical* AS_TRANS-substitution/AS4_PATH-split decision and the
-//! confed-segment inclusion/exclusion split, triggered by the observer not
-//! negotiating `FourByteAsn` — it does **not** prove genuine two-octet-
-//! per-ASN wire encoding, since pathvectord's AS_PATH encoder always writes
-//! 4 bytes per ASN regardless of negotiation (a separate, still-open gap;
-//! see `mock_bgp_as4path_peer.rs`'s module doc and `TODO.md`).
+//! The observer is a genuine OLD BGP speaker (no `FourByteAsn`, RFC 6793
+//! §4.2): it parses the raw UPDATE bytes at two octets per ASN, so this also
+//! proves pathvectord's real two-octet AS_PATH wire encoding (issue #95), not
+//! just the logical AS_TRANS/AS4_PATH decision. Interop with a third-party
+//! 2-byte-only implementation is still untested (see `TODO.md`).
 
 use std::time::Duration;
 
@@ -29,11 +27,9 @@ use pathvector_e2e::{
 /// pathvectord relays it to a fellow confed-member observer that hasn't
 /// negotiated `FourByteAsn`. The observer's own decode of the real wire
 /// bytes must show: the confed segment still present in the AS_PATH value
-/// (RFC 5065 §5.3), AS_TRANS substituted for the 4-byte ASN in AS_PATH
-/// (RFC 6793 §4), AS4_PATH present and carrying the real 4-byte ASN, and
+/// (RFC 5065 §5.3), AS_PATH genuinely two-octet on the wire with AS_TRANS
+/// substituted for the 4-byte ASN (RFC 6793 §4), AS4_PATH present and carrying the real 4-byte ASN, and
 /// AS4_PATH excluding the confed segment entirely (RFC 6793 §§3, 4.2.2).
-/// See the module doc's scope note: this does not exercise genuine
-/// two-octet-per-ASN wire encoding, only the logical downgrade decision.
 #[tokio::test]
 async fn as4_path_excludes_confed_segment_while_wire_as_path_keeps_it() {
     let mut h = As4PathConfedHarness::new().await;
@@ -51,7 +47,8 @@ async fn as4_path_excludes_confed_segment_while_wire_as_path_keeps_it() {
 
     wait_for_docker_log(
         &h.observer_id,
-        "SCENARIO_OUTCOME: wire_as_path_keeps_confed_sequence=true \
+        "SCENARIO_OUTCOME: wire_as_path_two_octet=true \
+         wire_as_path_keeps_confed_sequence=true \
          wire_as_path_has_as_trans=true \
          as4_path_present=true \
          as4_path_has_real_asn=true \

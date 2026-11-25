@@ -195,6 +195,7 @@ failing cases to the smallest reproducing input automatically.
 | A single insert always makes `best()` `Some` for that prefix | Missing best after insert would silently black-hole traffic |
 | `best_peer()` is always present in `candidates()` for that prefix | Stale best-peer pointer forwards traffic toward a withdrawn next-hop |
 | After `withdraw_peer`, exclusively-owned prefixes have no best | Stale best after teardown keeps traffic flowing toward a down peer |
+| `best_win_count(peer)` equals a full scan of `best_routes()` after any insert / withdraw / peer-down / reachability sequence (`prop_loc_rib_win_counts_equal_full_recount`) | `list_peers` reports it without scanning; a drifted counter would silently misreport every peer's accepted-prefix count (issue #106) |
 | `AdjRibIn::insert` → `get` roundtrips exactly | Lossy insert corrupts the pre-policy store for soft reconfig |
 | Second `AdjRibIn::insert` returns the displaced route | Losing the old route prevents detection of attribute changes |
 | `AdjRibIn::withdraw` → `get` returns `None` | Stale entry would be re-installed by soft reconfig |

@@ -103,9 +103,9 @@ land in `--work-dir` (default `target/loadtest`).
   and event-loop costs are representative; best-path churn is not.
 - **Loopback.** No real link latency or loss.
 - **The harness perturbs what it measures.** The 10 Hz `list_peers` probe is a
-  real management client; on a loaded table it is not free (see the PR-1
-  findings in `CHANGELOG.md`). Treat it as a realistic background client,
-  not a zero-cost observer.
+  real management client. Before GH #106 it forced RIB copies on a loaded table
+  (see `CHANGELOG.md`); that is fixed, but it still takes the state read lock.
+  Treat it as a realistic background client, not a zero-cost observer.
 - **Daemon metrics were unreliable under load** (found by this harness; fixed
   in GH #105). The event loop used to call its metrics hooks only for the first
   event of each coalesced batch, so gauges went stale and `session_up` could

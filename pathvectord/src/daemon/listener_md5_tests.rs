@@ -130,6 +130,7 @@ fn peer_config(address: IpAddr, md5: Option<&str>) -> config::PeerConfig {
         max_prefixes_restart: None,
         role: None,
         confederation_member: false,
+        blackhole_authorized_prefixes: None,
     }
 }
 
