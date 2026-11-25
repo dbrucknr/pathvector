@@ -29,7 +29,7 @@ fn arb_nlri_v6() -> impl Strategy<Value = Nlri<Ipv6Addr>> {
 }
 
 fn arb_asn() -> impl Strategy<Value = Asn> {
-    any::<u32>().prop_map(Asn::new)
+    (1..=u32::MAX).prop_map(Asn::new)
 }
 
 fn arb_afi_safi() -> impl Strategy<Value = AfiSafi> {
@@ -44,13 +44,15 @@ fn arb_origin() -> impl Strategy<Value = Origin> {
     ]
 }
 
+/// Only what a clean UPDATE may carry: no AS 0 (RFC 7607) and no set segments
+/// (RFC 9774). `as_rules_tests` covers the rest.
 fn arb_as_path() -> impl Strategy<Value = AsPath> {
     prop_oneof![
         prop::collection::vec(arb_asn(), 1..5).prop_map(AsPath::from_sequence),
         prop::collection::vec(
             prop_oneof![
                 prop::collection::vec(arb_asn(), 1..4).prop_map(AsPathSegment::Sequence),
-                prop::collection::vec(arb_asn(), 1..4).prop_map(AsPathSegment::Set),
+                prop::collection::vec(arb_asn(), 1..4).prop_map(AsPathSegment::ConfedSequence),
             ],
             1..3,
         )
@@ -236,8 +238,9 @@ proptest! {
 
 fn arb_wide_asn() -> impl Strategy<Value = Asn> {
     prop_oneof![
-        // 16-bit-mappable (incl. AS_TRANS and the boundary)
-        (0u32..=65_535).prop_map(Asn::new),
+        // 16-bit-mappable (incl. AS_TRANS and the boundary); AS 0 is excluded
+        // (RFC 7607)
+        (1u32..=65_535).prop_map(Asn::new),
         Just(Asn::TRANS),
         // non-mappable
         (65_536u32..=u32::MAX).prop_map(Asn::new),
@@ -256,7 +259,7 @@ fn arb_wide_asn() -> impl Strategy<Value = Asn> {
 /// unrecoverable across an OLD speaker by design.
 fn arb_realistic_path() -> impl Strategy<Value = AsPath> {
     let asns = || prop::collection::vec(arb_wide_asn(), 1..6);
-    let confed_asns = || prop::collection::vec((0u32..=65_535).prop_map(Asn::new), 1..6);
+    let confed_asns = || prop::collection::vec((1u32..=65_535).prop_map(Asn::new), 1..6);
     (
         prop::collection::vec(
             prop_oneof![
@@ -294,6 +297,28 @@ fn update_with_path(path: AsPath, agg: Option<Aggregator>) -> UpdateMessage {
     }
 }
 
+/// Decodes `wire` and returns the UPDATE as parsed, requiring it to be flagged
+/// treat-as-withdraw exactly when `path` holds a set segment (RFC 9774 §3) —
+/// in which case it is retained as received.
+fn decode_as_parsed(
+    wire: &[u8],
+    width: AsnWidth,
+    path: &AsPath,
+) -> Result<UpdateMessage, TestCaseError> {
+    match BgpMessage::decode_with_limit_and_caps(wire, MAX_LEN_EXTENDED, width).unwrap() {
+        BgpMessage::Update(u) => {
+            prop_assert!(!path.contains_as_set());
+            Ok(u)
+        }
+        BgpMessage::MalformedUpdate(m) => {
+            prop_assert!(path.contains_as_set(), "{:?}", m);
+            prop_assert!(m.treat_as_withdraw && !m.session_reset);
+            Ok(m.update)
+        }
+        other => Err(TestCaseError::fail(format!("{other:?}"))),
+    }
+}
+
 fn flat_asns(path: &AsPath) -> Vec<u32> {
     path.segments()
         .iter()
@@ -309,12 +334,9 @@ proptest! {
         agg_asn in arb_wide_asn(),
         agg_ip in arb_ipv4(),
     ) {
-        let msg = BgpMessage::Update(update_with_path(path, Some(Aggregator::new(agg_asn, agg_ip))));
-        let wire = msg.encode_with(AsnWidth::Four);
-        prop_assert_eq!(
-            BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, AsnWidth::Four).unwrap(),
-            msg
-        );
+        let msg = update_with_path(path.clone(), Some(Aggregator::new(agg_asn, agg_ip)));
+        let wire = BgpMessage::Update(msg.clone()).encode_with(AsnWidth::Four);
+        prop_assert_eq!(decode_as_parsed(&wire, AsnWidth::Four, &path)?, msg);
     }
 
     /// Two-octet session, arbitrary ASNs including non-mappable ones: what we
@@ -327,12 +349,9 @@ proptest! {
         agg_asn in arb_wide_asn(),
         agg_ip in arb_ipv4(),
     ) {
-        let msg = BgpMessage::Update(update_with_path(path, Some(Aggregator::new(agg_asn, agg_ip))));
-        let wire = msg.encode_with(AsnWidth::Two);
-        prop_assert_eq!(
-            BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, AsnWidth::Two).unwrap(),
-            msg
-        );
+        let msg = update_with_path(path.clone(), Some(Aggregator::new(agg_asn, agg_ip)));
+        let wire = BgpMessage::Update(msg.clone()).encode_with(AsnWidth::Two);
+        prop_assert_eq!(decode_as_parsed(&wire, AsnWidth::Two, &path)?, msg);
     }
 
     /// The wire never holds a two-octet ASN that was not mappable: decoding
@@ -341,13 +360,11 @@ proptest! {
     #[test]
     fn prop_old_peer_view_preserves_path_length(path in arb_realistic_path()) {
         let want = path.path_length();
-        let wire = BgpMessage::Update(update_with_path(path, None)).encode_with(AsnWidth::Two);
+        let wire = BgpMessage::Update(update_with_path(path.clone(), None)).encode_with(AsnWidth::Two);
         // Strip AS4_PATH (0xC0 0x11 ...) by re-decoding at two octets and
         // reading only what an OLD speaker reads is covered by exact-byte
         // tests; here we check the merged length is unchanged.
-        let BgpMessage::Update(u) =
-            BgpMessage::decode_with_limit_and_caps(&wire, MAX_LEN_EXTENDED, AsnWidth::Two).unwrap()
-        else { panic!("clean update expected") };
+        let u = decode_as_parsed(&wire, AsnWidth::Two, &path)?;
         let PathAttribute::AsPath(got) = &u.attributes[1] else { panic!("AS_PATH") };
         prop_assert_eq!(got.path_length(), want);
     }
@@ -358,7 +375,7 @@ proptest! {
     #[test]
     fn prop_long_sequences_split_at_255_and_roundtrip(
         len in 1usize..700,
-        base in 0u32..60_000,
+        base in 1u32..60_000,
     ) {
         let flat: Vec<Asn> = (0..len).map(|i| Asn::new(base + u32::try_from(i).unwrap())).collect();
         let msg = BgpMessage::Update(update_with_path(AsPath::from_sequence(flat.clone()), None));

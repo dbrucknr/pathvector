@@ -1,6 +1,7 @@
 mod blackhole;
 mod config;
 mod daemon;
+mod egress;
 mod fib;
 mod grpc;
 mod lock_timing;

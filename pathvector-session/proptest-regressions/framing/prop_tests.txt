@@ -9,3 +9,5 @@ cc afe0e7b97db453b78bac4bd494da3838b960adbe6250b76eebc7ba0ee210d177 # shrinks to
 cc a99de70c9f70121ab87c95800fda95c7a982d952247179245fb657e645f35001 # shrinks to msg = Update(UpdateMessage { withdrawn: [], attributes: [LargeCommunities([]), LargeCommunities([])], announced: [] })
 cc a003015f799dd101cf17ff3a13b2086de27a1fcbadda2ddd7245661875dafa22 # shrinks to msg = Update(UpdateMessage { withdrawn: [], attributes: [Aggregator(Aggregator { asn: Asn(0), ip: 0.0.0.0 })], announced: [] })
 cc bbb106a0a5fdb211df466f5d59610aa6d67202bdc3aa71711512980c7124b5c3 # shrinks to first = Update(UpdateMessage { withdrawn: [], attributes: [Aggregator(Aggregator { asn: Asn(0), ip: 0.0.0.0 })], announced: [] }), second = Keepalive
+cc f4bdb808d3e0723cdbb09750185ccfbadc45679b6bd7aa5524f000ca3b9aabce # shrinks to first = Update(UpdateMessage { withdrawn: [], attributes: [AsPath(AsPath { segments: [Set([Asn(0)])] })], announced: [] }), second = Keepalive
+cc 834888462ad3d19a7db7b5b37254a002d066fdb947b4d682f9f02545899fa89d # shrinks to msg = Update(UpdateMessage { withdrawn: [], attributes: [AsPath(AsPath { segments: [Set([Asn(0)])] })], announced: [] })

@@ -1,10 +1,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use pathvector_types::{
-    Afi, AfiSafi, Aggregator, AsPath, AsPathSegment, Asn, Community, ExtendedCommunity,
+    Afi, AfiSafi, Aggregator, As4Path, AsPath, AsPathSegment, Asn, Community, ExtendedCommunity,
     LargeCommunity, NextHop, Nlri, Origin, Safi,
 };
 
+use super::as_rules::apply_receive_rules;
 use super::asn_width::AsnWidth;
 use super::error::CodecError;
 use super::header::{MessageType, encode_header};
@@ -470,6 +471,7 @@ fn decode_path_attributes(
         }
     }
 
+    apply_receive_rules(&mut attrs, &mut errors);
     reconcile_as4_attributes(&mut attrs, &mut errors, asn_width);
 
     Ok((attrs, errors))
@@ -1033,14 +1035,10 @@ fn append_missing_as4_attributes(out: &mut Writer, attrs: &[PathAttribute]) {
     if !has_as4_path
         && let Some(PathAttribute::AsPath(path)) =
             attrs.iter().find(|a| matches!(a, PathAttribute::AsPath(_)))
+        && let Some(as4) = As4Path::for_two_byte_peer(path)
     {
-        // "Whenever the AS path information contains the AS_CONFED_SEQUENCE
-        // or AS_CONFED_SET path segment, the NEW BGP speaker MUST exclude
-        // such path segments from the AS4_PATH attribute being constructed."
-        let as4 = path.strip_confed_segments();
-        if as4.has_non_mappable_asn() {
-            encode_one_path_attr(out, &PathAttribute::As4Path(as4), AsnWidth::Two);
-        }
+        let attr = PathAttribute::As4Path(as4.into_path());
+        encode_one_path_attr(out, &attr, AsnWidth::Two);
     }
     let has_as4_agg = attrs
         .iter()
@@ -1412,6 +1410,23 @@ mod tests {
         );
     }
 
+    /// A message whose path holds a set parses back unchanged but is flagged
+    /// treat-as-withdraw (RFC 9774 §3).
+    fn set_flagged_roundtrip(msg: &UpdateMessage) {
+        let encoded = msg.encode_with(AsnWidth::Four);
+        let mut cur = Cursor::new(&encoded[19..]);
+        let UpdateDecodeOutcome::Partial {
+            update,
+            treat_as_withdraw,
+            ..
+        } = UpdateMessage::decode(&mut cur, AsnWidth::Four).unwrap()
+        else {
+            panic!("a set must be flagged");
+        };
+        assert!(treat_as_withdraw);
+        assert_eq!(&update, msg);
+    }
+
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
     }
@@ -1636,7 +1651,7 @@ mod tests {
             ],
             announced: vec![nlri4("10.0.0.0/8")],
         };
-        roundtrip(msg);
+        set_flagged_roundtrip(&msg);
     }
 
     #[test]
@@ -1748,7 +1763,7 @@ mod tests {
             attributes: vec![PathAttribute::AsPath(path)],
             announced: vec![],
         };
-        roundtrip(msg);
+        set_flagged_roundtrip(&msg);
     }
 
     #[test]

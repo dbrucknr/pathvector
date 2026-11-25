@@ -93,6 +93,7 @@ Decisions, and why:
 | Own address as NEXT_HOP | `Ineligible` | holds the replacement | no candidate | §6.3 (a) "SHOULD be ignored", read as *not used*; the route still supersedes the older one (§9), so keeping the superseded route would contradict §9 |
 | Unspecified, loopback, multicast or broadcast IPv4 NEXT_HOP; unspecified or multicast IPv6 next hop (incl. a multicast link-local) | `TreatAsWithdraw` | removed | no candidate | §6.3 syntax + RFC 7606 §3(e), §2 (RFC 1122 §3.2.1.3 and RFC 4291 §2.5.2 / §2.7 say these are not host addresses) |
 | AS 0 in AS_PATH | `TreatAsWithdraw` | removed | no candidate | RFC 7607 §2 → RFC 7606 |
+| AS_SET or AS_CONFED_SET in AS_PATH | `TreatAsWithdraw` | removed | no candidate | RFC 9774 §3 |
 
 Notes:
 
@@ -130,7 +131,10 @@ Notes:
   its claim, and the null route is withdrawn when no other peer holds the prefix
   (`dropped_replacement_of_a_blackhole_route_withdraws_the_null_route`,
   `dropped_blackhole_announcement_owns_no_null_route_and_its_withdrawal_removes_none`).
-- The session-side half of RFC 7607 (OPEN, AGGREGATOR, AS4 attributes) remains issue #111.
+- The AS 0 and set rows are also enforced by the session decoder (see
+  `pathvector-session/RFC.md`), so a wire UPDATE reaches the daemon already turned into
+  withdrawals; the gate holds them for a session implementation that does not use that
+  decoder.
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
@@ -222,8 +226,8 @@ last-sent stamp, so a re-announcement right after a withdrawal goes out immediat
 **Owns:** Outbound AS_PATH encoding for 2-byte-only peers: substituting 4-byte ASNs with
 AS_TRANS (23456) and appending the original path as AS4_PATH (type 17, flags 0xC0 =
 optional+transitive) so downstream 4-byte-capable routers can reconstruct the full path.  
-**Boundary:** `Asn::TRANS` constant and `AsPath::downgrade_for_two_byte_peer()` live in
-`pathvector-types`. The wire form (two-octet `AS_PATH`/`AGGREGATOR`, AS_TRANS, and a
+**Boundary:** `Asn::TRANS` constant, `AsPath::downgrade_for_two_byte_peer()` and the
+`As4Path` construction rule live in `pathvector-types`. The wire form (two-octet `AS_PATH`/`AGGREGATOR`, AS_TRANS, and a
 generated `AS4_PATH`/`AS4_AGGREGATOR` if the daemon did not attach one) and inbound AS4_PATH
 merging (receiving from 2-byte peers) are owned by `pathvector-session`, which the daemon
 reaches through the negotiated `AsnWidth`.  
@@ -499,17 +503,32 @@ from/to eBGP peers. Accept all routes from/to iBGP peers.
 
 ## RFC 7607 — Codification of AS 0 Processing
 
-**Added to this index 2026-07-16 by `RFC_AUDIT.md`** — genuinely implemented
-and tested, but had never been added to `RFC_REQUIREMENTS.md` or any crate's
-`RFC.md` until this audit noticed the gap in tracking (not in the code).  
-**Owns:** Rejecting AS 0 as a configured peer AS, and dropping any received
-UPDATE whose AS_PATH contains the reserved AS 0.  
+**Owns:** Refusing AS 0 in configuration, rejecting a received route that
+carries it, and never advertising it.  
+**Boundary:** OPEN and received-attribute handling live in `pathvector-session`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc7607
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
-| AS 0 and AS_TRANS (23456) rejected as a peer's configured `remote_as` | `src/grpc.rs:355` | ✅ | (see surrounding config-validation tests) |
-| UPDATE whose AS_PATH contains AS 0 is dropped (route ineligible) | `src/daemon/route.rs:1053-1063` | ✅ | "Finding L" test, `src/daemon/mod.rs:6954-6982` |
+| AS 0 refused in `local_as`, `confederation_id`, `remote_as` when the config (or dynamic-peer sidecar) is read | `src/config.rs` | ✅ | `as_zero_is_refused_in_every_identity_field`, `non_zero_identities_parse`, `sidecar_entry_with_as_zero_is_skipped` |
+| AS 0 and AS_TRANS (23456) rejected as `remote_as` over gRPC | `src/grpc.rs` `validate_remote_as` | ✅ | `test_add_peer_rejects_as_zero` |
+| Received AS_PATH containing AS 0: treat-as-withdraw, older route removed | `src/daemon/ingress.rs` | ✅ | `ingress_drop_tests.rs`, `prohibited_replacement_removes_the_installed_v4_route` / `_v6_route` (wire → FSM → daemon) |
+| Received AGGREGATOR with AS 0: attribute discarded, route kept | `pathvector-session` decoder | ✅ | `as_zero_aggregator_keeps_the_route_without_the_attribute` |
+| §2: "MUST NOT originate or propagate": AS 0 in AS_PATH is not advertised (a previous advertisement is withdrawn); an AS 0 AGGREGATOR is left off; AS4_PATH / AS4_AGGREGATOR are derived from these | `src/egress.rs`, `src/outbound.rs` | ✅ | `as_zero_in_as_path_is_never_advertised`, `as_zero_aggregator_is_omitted_by_both_builders` |
+
+---
+
+## RFC 9774 — Deprecation of AS_SET and AS_CONFED_SET
+
+**Owns:** Never advertising a set, and the daemon-side receive gate.  
+**Boundary:** Wire receive handling lives in `pathvector-session`.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9774
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| §3: received sets (AS_PATH or AS4_PATH) are withdrawals: the older route leaves Adj-RIB-In, Loc-RIB, FIB and peers, and the UPDATE's own withdrawals still apply — IPv4 and IPv6 | `src/daemon/route.rs`, `src/daemon/ingress.rs` | ✅ | `prohibited_replacement_removes_the_installed_v4_route`, `prohibited_replacement_removes_the_installed_v6_route`, `daemon_gate_withdraws_a_set_route_handed_in_directly`, `as_sets_are_treat_as_withdraw` |
+| §3: no advertised UPDATE contains a set, judged on the path as sent (an AS_CONFED_SET stripped toward an external peer does not block the route) | `src/egress.rs`, `src/outbound.rs` | ✅ | `sets_are_judged_on_the_path_that_would_be_sent`, `either_set_type_blocks_and_sequences_do_not`, `originated_route_with_a_set_is_not_advertised` |
+| §3: operator exception for a transition period | — | ❌ | not offered (see `TODO.md`) |
 
 ---
 
@@ -737,7 +756,7 @@ initiative (`TODO.md` task #128) rather than folded into the smaller RFC
 | `public_as` (`confederation_id.unwrap_or(local_as)`, but see the correction below — resolved via `effective_session_as`, not a bare `unwrap_or`, once `PeerType` is known) resolved once per propagation site and threaded through `propagate_prefix`/`propagate_prefix_v6` to `prepare_outbound`/`prepare_outbound_v6` | `src/outbound.rs`, `src/daemon/route.rs`, `src/daemon/policy.rs`, `src/daemon/deferral.rs`, `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | Full test suite (mechanical threading, same shape as the `deferred`-parameter PR) |
 | OPEN message `my_as` and the `FourByteAsn` capability also carry `public_as` (Confederation Identifier for `External` peers, Member-AS Number for `Internal`/`ConfedMember`) — RFC 5065 §4 covers *all* transactions with a peer, not just AS_PATH | `src/daemon/mod.rs` (`effective_session_as`, static spawn loop, reconnect capability refresh), `src/daemon/peer.rs` (dynamic `AddPeer`), `src/daemon/capabilities.rs` (`SpawnConfig::capabilities`), `pathvector-session/src/fsm/mod.rs` (`FsmConfig::public_as`, `make_open`) | ✅ | `test_effective_session_as_external_uses_confederation_id`, `test_effective_session_as_internal_uses_member_as`, `test_effective_session_as_confed_member_uses_member_as`, `test_effective_session_as_external_falls_back_to_local_as_when_unconfigured`, `pathvector-session`'s `test_sent_open_uses_public_as_not_local_as` |
 | MED not stripped for `ConfedMember` (RFC 5065 §5.2); ORIGINATOR_ID/CLUSTER_LIST still stripped for `ConfedMember` (deliberate — RR clusters are scoped to a single AS's internal topology; RFC 5065 is silent on the interaction, and letting RR metadata cross a Member-AS boundary risks cluster-ID collisions without serving RR's loop-prevention purpose) | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` | ✅ | `test_route_v6_to_attributes_ibgp_preserves_med`-style coverage extended to the `strip_med`/`strip_rr_metadata` split |
-| AS4_PATH excludes AS_CONFED_SEQUENCE/AS_CONFED_SET (RFC 6793 §§3, 4.2.2) even though the downgraded wire AS_PATH correctly keeps them | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` (`.strip_confed_segments()` on the AS4_PATH value) | ✅ | `as4_path_excludes_confed_segments_for_two_byte_peer`, `test_route_v6_to_attributes_as4path_excludes_confed_segments` |
+| AS4_PATH excludes AS_CONFED_SEQUENCE/AS_CONFED_SET (RFC 6793 §§3, 4.2.2) even though the downgraded wire AS_PATH correctly keeps them | `src/outbound.rs` `route_to_attributes`/`route_v6_to_attributes` (`pathvector_types::As4Path`) | ✅ | `as4_path_excludes_confed_segments_for_two_byte_peer`, `test_route_v6_to_attributes_as4path_excludes_confed_segments`, `as4_path_content_in_both_builders` |
 | e2e (2026-08-05, round 2, Codex follow-up review): the above was unit-tested only — nothing proved the real wire codec on both ends produces the expected split: a confed segment surviving the AS_PATH value toward a fellow `ConfedMember` peer (RFC 5065 §5.3) while AS4_PATH excludes it entirely | `pathvector-e2e/src/bin/mock_bgp_as4path_peer.rs`, `pathvector-e2e/tests/as4path_confed.rs` | ✅ | `as4_path_excludes_confed_segment_while_wire_as_path_keeps_it` (a four-byte-ASN-capable confed-source sends AS_PATH = [AS_CONFED_SEQUENCE, 4-byte ASN]; a fellow confed-member observer that hasn't negotiated `FourByteAsn` decodes pathvectord's re-advertised UPDATE and confirms the confed segment survives alongside AS_TRANS substitution, while AS4_PATH carries the real ASN with the confed segment excluded). **Scope correction (2026-08-05, PR #52 review):** the observer's `two-byte-observer` role name refers to capability negotiation only — pathvectord's AS_PATH encoder always writes 4 bytes per ASN regardless of negotiation (encode-side downgrade is implemented for AGGREGATOR only), so this test proves the logical AS_TRANS/AS4_PATH-split decision, not genuine two-octet-per-ASN wire interop; that remains an open gap (`TODO.md`) |
 | LOCAL_PREF accept guard widened from `Internal`-only to `Internal \| ConfedMember` (RFC 4271 §5.1.5's confederation exception, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_honored_from_confed_member_peer` |
 | Loop detection (RFC 4271 §9.1.2) extended to also check the confederation ID, not just `local_as` (RFC 5065 §4) | `src/daemon/route.rs` | ✅ | `test_as_path_loop_detection_drops_confederation_id_in_path`, `test_as_path_loop_detection_confederation_id_absent_does_not_block` |

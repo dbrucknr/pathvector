@@ -15,8 +15,10 @@
 //! * `cache.rs` — the publication boundary: staging, atomic commit, flush and
 //!   expiry; what `validate_*`, `status()` and `subscribe()` read.
 //! * `timers.rs` — RFC 8210 §6 interval ranges and the effective timers.
-//! * this module — the I/O loop that connects the three: reads frames, feeds
-//!   them to the state machine, writes queries and Error Reports, sleeps.
+//! * `frame.rs` — pure incremental decoder: bytes in, PDUs out.
+//! * `transport.rs` — the socket adapter around it; cancellation-safe reads.
+//! * this module — the I/O loop that connects them: reads PDUs, feeds them to
+//!   the state machine, writes queries and Error Reports, sleeps.
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
@@ -24,32 +26,21 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::watch,
-};
+use tokio::{net::TcpStream, sync::watch};
 use tracing::warn;
 
 #[cfg(any(test, feature = "test-util"))]
 use crate::cache::table_from;
 use crate::{
     cache::{RtrStatus, Shared, Staged},
-    error::{PduError, RtrConfigError, RtrError},
+    error::{RtrConfigError, RtrError},
+    frame::Frame,
     pdu::{self, Pdu, RtrVersion},
     protocol::{self, Consequence, Exchange, Negotiation, Query, Resume, Step, Violation},
     table::RoaValidity,
     timers::Timers,
+    transport::{Connection, ReadError},
 };
-
-/// Upper bound on a single PDU's declared length. The largest legitimate
-/// PDU in practice is an `ErrorReport` carrying a copy of the offending PDU
-/// plus UTF-8 text, or a `RouterKey` carrying an SPKI — neither approaches
-/// this. Rejecting anything larger before allocating a buffer for it closes
-/// off a trivial memory-exhaustion vector: without this cap, a misbehaving
-/// or compromised RTR server could declare a length near `u32::MAX` and
-/// force an equivalent-sized allocation attempt per PDU.
-const MAX_PDU_LEN: u32 = 64 * 1024;
 
 /// Configuration for an RTR session.
 ///
@@ -216,6 +207,11 @@ impl RtrClient {
 /// `status().connected == true` — for tests that need deterministic ROA data
 /// without running a real or mock RTR server. Each tuple is
 /// `(prefix, prefix_len, max_len, origin_asn)`.
+///
+/// # Panics
+///
+/// If a tuple is one a real cache could not send: either length longer than
+/// the address family, or `max_len < prefix_len`.
 #[cfg(any(test, feature = "test-util"))]
 #[must_use]
 pub fn for_testing(
@@ -233,34 +229,23 @@ impl RtrHandle {
     ///
     /// # Panics
     ///
-    /// Panics only if the internal status lock is poisoned (a prior holder
-    /// panicked while holding it) — not an expected runtime condition.
+    /// Panics if the lengths cannot form a VRP (see [`for_testing`]), or if
+    /// the internal status lock is poisoned.
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_roa_v4(&self, prefix: Ipv4Addr, prefix_len: u8, max_len: u8, asn: u32) {
-        self.0.insert_for_testing(&Pdu::Ipv4Prefix {
-            flags: pdu::PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
+        self.0
+            .insert_for_testing(&Pdu::announce_v4(prefix, prefix_len, max_len, asn));
     }
 
     /// IPv6 counterpart of [`RtrHandle::insert_roa_v4`].
     ///
     /// # Panics
     ///
-    /// Panics only if the internal status lock is poisoned (a prior holder
-    /// panicked while holding it) — not an expected runtime condition.
+    /// As for [`RtrHandle::insert_roa_v4`].
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_roa_v6(&self, prefix: Ipv6Addr, prefix_len: u8, max_len: u8, asn: u32) {
-        self.0.insert_for_testing(&Pdu::Ipv6Prefix {
-            flags: pdu::PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
+        self.0
+            .insert_for_testing(&Pdu::announce_v6(prefix, prefix_len, max_len, asn));
     }
 }
 
@@ -289,10 +274,14 @@ async fn run_session_loop(config: RtrConfig, shared: Arc<Shared>) {
 
     loop {
         match TcpStream::connect((config.host.as_str(), config.port)).await {
-            Ok(mut stream) => {
-                let result =
-                    run_one_connection(&mut stream, &config, &shared, &mut negotiated_version)
-                        .await;
+            Ok(stream) => {
+                let result = run_one_connection(
+                    &mut Connection::new(stream),
+                    &config,
+                    &shared,
+                    &mut negotiated_version,
+                )
+                .await;
                 if let Err(e) = result {
                     warn!(
                         host = %config.host,
@@ -327,7 +316,7 @@ async fn run_session_loop(config: RtrConfig, shared: Arc<Shared>) {
 /// error occurs (malformed PDU, protocol violation, EOF, ...), at which
 /// point control returns to `run_session_loop` for backoff-and-reconnect.
 async fn run_one_connection(
-    stream: &mut TcpStream,
+    connection: &mut Connection<TcpStream>,
     config: &RtrConfig,
     shared: &Arc<Shared>,
     version_hint: &mut RtrVersion,
@@ -353,7 +342,7 @@ async fn run_one_connection(
 
     loop {
         timers = sync(
-            stream,
+            connection,
             shared,
             &mut negotiation,
             version_hint,
@@ -364,18 +353,20 @@ async fn run_one_connection(
 
         // Idle until the refresh timer fires or the server sends an
         // unsolicited Serial Notify — either way, loop back to the top and
-        // re-sync via Serial Query.
+        // re-sync via Serial Query. The timer may win while a PDU is only
+        // partly received; `read_frame` is cancellation safe, so the rest of
+        // it is picked up by the exchange that follows.
         tokio::select! {
             () = tokio::time::sleep(timers.refresh) => {}
-            frame = read_frame(stream) => {
-                let frame = frame?;
+            read = connection.read_frame() => {
+                let frame = received(connection, shared, negotiation.version(), read).await?;
                 if let Err(violation) = protocol::on_idle(
                     negotiation.version(),
                     shared.resume(),
                     frame.version,
                     &frame.pdu,
                 ) {
-                    return Err(reject(stream, shared, negotiation.version(), violation, &frame.raw).await);
+                    return Err(reject(connection, shared, negotiation.version(), violation, &frame.raw).await);
                 }
             }
         }
@@ -392,7 +383,7 @@ async fn run_one_connection(
 /// each received PDU *means* is decided by [`Exchange`]; this function only
 /// performs the I/O and table effects the verdicts call for.
 async fn sync(
-    stream: &mut TcpStream,
+    connection: &mut Connection<TcpStream>,
     shared: &Arc<Shared>,
     negotiation: &mut Negotiation,
     version_hint: &mut RtrVersion,
@@ -416,10 +407,13 @@ async fn sync(
         // (see `cache.rs`). If the exchange ends any other way the staged
         // records are dropped with it.
         let mut staged = Staged::for_query(query, epoch);
-        write_pdu(stream, negotiation.version(), &query.pdu()).await?;
+        connection
+            .write_pdu(negotiation.version(), &query.pdu())
+            .await?;
 
         loop {
-            let frame = read_frame(stream).await?;
+            let read = connection.read_frame().await;
+            let frame = received(connection, shared, negotiation.version(), read).await?;
             let step = match exchange.on_pdu(frame.version, &frame.pdu) {
                 Ok(step) => step,
                 Err(violation) => {
@@ -429,7 +423,7 @@ async fn sync(
                     *negotiation = exchange.negotiation();
                     *version_hint = negotiation.version();
                     return Err(reject(
-                        stream,
+                        connection,
                         shared,
                         negotiation.version(),
                         violation,
@@ -586,7 +580,7 @@ const ERROR_REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Error Report (best effort), apply the consequence to the cached data, and
 /// return the error that ends the session.
 async fn reject(
-    stream: &mut TcpStream,
+    connection: &mut Connection<TcpStream>,
     shared: &Arc<Shared>,
     version: RtrVersion,
     violation: Violation,
@@ -602,7 +596,7 @@ async fn reject(
         // must not delay the cleanup below.
         let _ = tokio::time::timeout(
             ERROR_REPORT_WRITE_TIMEOUT,
-            write_pdu(stream, version, &report),
+            connection.write_pdu(version, &report),
         )
         .await;
     }
@@ -614,81 +608,41 @@ async fn reject(
     violation.error
 }
 
-/// Reads one complete PDU off the wire: the 8-byte header first (to learn the
-/// declared length), then the remaining `len - 8` bytes.
+/// Turns the outcome of [`Connection::read_frame`] into a PDU, carrying out
+/// the reaction to a peer that sent something that is not one.
 ///
-/// Returns the *wire* protocol version alongside the decoded PDU. This
-/// matters because a server may reply at a different version than we sent
-/// without an `ErrorReport` — RFC 8210 §5 describes this directly: a
-/// v0-only cache receiving a v1 query "responds with a version 0 response."
-/// Callers that care about version negotiation (`sync_once`) must inspect
-/// this rather than assuming the response matches what was sent.
-#[cfg(test)]
-pub(crate) async fn read_pdu(stream: &mut TcpStream) -> Result<(RtrVersion, Pdu), RtrError> {
-    let frame = read_frame(stream).await?;
-    Ok((frame.version, frame.pdu))
-}
-
-/// One PDU off the wire: decoded, plus the exact bytes it arrived as (so an
-/// Error Report can echo an offending PDU back — RFC 8210 §5.11).
-struct Frame {
+/// Takes the *outcome* rather than doing the read, so the idle loop can race
+/// only the (cancellation-safe) read against its timer: once bytes are being
+/// rejected, nothing can interrupt the Error Report or its consequence.
+async fn received(
+    connection: &mut Connection<TcpStream>,
+    shared: &Arc<Shared>,
     version: RtrVersion,
-    pdu: Pdu,
-    raw: Vec<u8>,
-}
-
-async fn read_frame(stream: &mut TcpStream) -> Result<Frame, RtrError> {
-    let mut header = [0u8; 8];
-    read_exact_mapped(stream, &mut header).await?;
-    let (version, pdu_type, field, len) = pdu::decode_header(&header)?;
-
-    if len > MAX_PDU_LEN {
-        return Err(RtrError::Pdu(PduError::InvalidLength { pdu_type: 0, len }));
+    read: Result<Frame, ReadError>,
+) -> Result<Frame, RtrError> {
+    match read {
+        Ok(frame) => Ok(frame),
+        Err(ReadError::Transport(error)) => Err(error),
+        Err(ReadError::Malformed(bad)) => Err(reject(
+            connection,
+            shared,
+            version,
+            Violation::malformed(bad.error),
+            &bad.raw,
+        )
+        .await),
     }
-
-    let mut full = header.to_vec();
-    if let Some(remaining) = (len as usize).checked_sub(8) {
-        let mut rest = vec![0u8; remaining];
-        read_exact_mapped(stream, &mut rest).await?;
-        full.extend_from_slice(&rest);
-    }
-    // If `len < 8`, `full` stays at just the 8-byte header; decode_payload's
-    // own length check below reports a proper InvalidLength error rather
-    // than us needing a separate underflow guard.
-    let pdu = pdu::decode_payload(version, pdu_type, field, len, &full)?;
-    Ok(Frame {
-        version,
-        pdu,
-        raw: full,
-    })
-}
-
-async fn read_exact_mapped(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), RtrError> {
-    match stream.read_exact(buf).await {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(RtrError::Closed),
-        Err(e) => Err(RtrError::Io(e)),
-    }
-}
-
-pub(crate) async fn write_pdu(
-    stream: &mut TcpStream,
-    version: RtrVersion,
-    pdu: &Pdu,
-) -> Result<(), RtrError> {
-    let bytes = pdu::encode(version, pdu);
-    stream.write_all(&bytes).await?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::TcpListener;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use super::*;
     use crate::{
-        pdu::{EndOfDataIntervals, PrefixFlags},
+        pdu::EndOfDataIntervals,
         protocol::{ERROR_CODE_NO_DATA_AVAILABLE, ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION},
+        transport::{read_pdu, write_pdu},
     };
 
     /// Minimal scripted RTR server for tests: accepts one connection, then
@@ -737,13 +691,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "192.0.2.0".parse().unwrap(),
-                    asn: 65001,
-                },
+                &Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001),
             )
             .await;
             write_one(
@@ -1177,13 +1125,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: old_roa_prefix,
-                    asn: 65099,
-                },
+                &Pdu::announce_v4(old_roa_prefix, 24, 24, 65099),
             )
             .await;
             write_one(
@@ -1264,13 +1206,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "203.0.113.0".parse().unwrap(),
-                    asn: 65001,
-                },
+                &Pdu::announce_v4("203.0.113.0".parse().unwrap(), 24, 24, 65001),
             )
             .await;
             write_one(
@@ -1491,13 +1427,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "203.0.113.0".parse().unwrap(),
-                    asn: 65010,
-                },
+                &Pdu::announce_v4("203.0.113.0".parse().unwrap(), 24, 24, 65010),
             )
             .await;
             write_one(

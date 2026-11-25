@@ -7,15 +7,19 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use pathvector_policy::{Decision, Policy};
 use pathvector_rib::{
-    AdjRibOut, InsertOutcome, LocRib, RibView, Route,
+    AdjRibOut, InsertOutcome, LocRib, PeerId, RibView, Route,
     outbound::{is_export_suppressed, prepare_outbound, prepare_outbound_v6},
 };
 use pathvector_session::message::{
     MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage, encode_attributes,
     nlri_encoded_len, nlri_v6_encoded_len,
 };
-use pathvector_types::{AfiSafi, Aggregator, AsPath, NextHop, Nlri, PeerType, UnknownAttribute};
+use pathvector_types::{
+    AfiSafi, Aggregator, As4Path, IpAddress, NextHop, Nlri, PeerType, UnknownAttribute,
+};
 use tokio::sync::mpsc;
+
+use crate::egress;
 
 /// BGP UPDATE wire overhead: 19-byte header + 2-byte withdrawn-len + 2-byte
 /// attr-len field.
@@ -49,8 +53,7 @@ pub(crate) fn route_to_attributes(
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
-        let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
-        (d, orig)
+        route.as_path.downgrade_for_two_byte_peer()
     };
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
@@ -70,6 +73,7 @@ pub(crate) fn route_to_attributes(
         }
     }
     let rare = route.rare_or_default();
+    let aggregator = egress::advertisable_aggregator(rare.aggregator);
     if !rare.communities.is_empty() {
         attrs.push(PathAttribute::Communities(rare.communities.clone()));
     }
@@ -86,7 +90,7 @@ pub(crate) fn route_to_attributes(
     if rare.atomic_aggregate {
         attrs.push(PathAttribute::AtomicAggregate);
     }
-    if let Some(agg) = rare.aggregator {
+    if let Some(agg) = aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
     if !strip_rr_metadata {
@@ -115,12 +119,7 @@ pub(crate) fn route_to_attributes(
     // 4-byte-capable routers further along the path can reconstruct the full
     // AS path. Only emitted when downgrade actually substituted AS_TRANS above.
     //
-    push_as4_side_channel(
-        &mut attrs,
-        peer_four_byte,
-        as4_path,
-        rare.aggregator.as_ref(),
-    );
+    push_as4_side_channel(&mut attrs, peer_four_byte, as4_path, aggregator.as_ref());
     attrs
 }
 
@@ -129,16 +128,9 @@ pub(crate) fn route_to_attributes(
 /// aggregating AS, the `AS4_AGGREGATOR` that accompanies an
 /// `AGGREGATOR` whose AS the wire codec writes as `AS_TRANS`.
 ///
-/// - §§3, 4.2.2: `AS_CONFED_SEQUENCE`/`AS_CONFED_SET` "are declared invalid
-///   for the AS4_PATH attribute and MUST NOT be included" — they are
-///   stripped here. The wire `AS_PATH` keeps its (downgraded) confed
-///   segments; only the `AS4_PATH` side-channel excludes them, since RFC 5065
-///   confederation relaying can leave confed segments in a route sent toward
-///   a two-byte-only peer.
-/// - §4.2.2: `AS4_PATH` is sent only when some AS in it is non-mappable
-///   ("In this case, the NEW BGP speaker MUST NOT send the AS4_PATH
-///   attribute"), so a four-byte ASN confined to a confed segment — absent
-///   from the stripped path — produces none.
+/// - Whether an `AS4_PATH` is sent, and what it may contain (no confederation
+///   segments, even though the two-octet `AS_PATH` keeps them), is decided by
+///   [`As4Path`]'s constructor.
 /// - `AS4_AGGREGATOR` "MUST NOT be sent" when the AS number is mappable.
 ///
 /// pathvector-session's encoder would generate the same attributes itself
@@ -147,7 +139,7 @@ pub(crate) fn route_to_attributes(
 fn push_as4_side_channel(
     attrs: &mut Vec<PathAttribute>,
     peer_four_byte: bool,
-    as4_path: Option<AsPath>,
+    as4_path: Option<As4Path>,
     aggregator: Option<&Aggregator>,
 ) {
     // RFC 6793 §4.1: neither attribute is carried between two NEW speakers.
@@ -155,10 +147,7 @@ fn push_as4_side_channel(
         return;
     }
     if let Some(as4) = as4_path {
-        let as4 = as4.strip_confed_segments();
-        if as4.has_non_mappable_asn() {
-            attrs.push(PathAttribute::As4Path(as4));
-        }
+        attrs.push(PathAttribute::As4Path(as4.into_path()));
     }
     if let Some(agg) = aggregator
         && agg.asn.is_four_byte()
@@ -184,6 +173,25 @@ fn unknown_attrs_to_path_attributes(
         type_code: attr.type_code,
         value: attr.value.clone(),
     })
+}
+
+/// Whether `route`, as transformed for `peer`, may be advertised at all
+/// ([`egress`]). A refusal is logged: it means something other than a peer put
+/// a prohibited route in the Loc-RIB or the export policy created one.
+fn permitted_on_wire<A: IpAddress>(route: &Route<A>, peer: PeerId) -> bool {
+    match egress::check_as_path(&route.as_path) {
+        None => true,
+        Some(block) => {
+            tracing::warn!(
+                peer = %peer,
+                prefix = %route.nlri,
+                as_path = %route.as_path,
+                "not advertising route: {}",
+                block.describe()
+            );
+            false
+        }
+    }
 }
 
 /// The outbound decision for a single prefix after AdjRibOut processing.
@@ -254,7 +262,8 @@ pub(crate) fn propagate_prefix(
                 // NO_EXPORT_SUBCONFED) can forbid advertising to this peer
                 // regardless of what the export policy decided.
                 Decision::Accept
-                    if !is_export_suppressed(&route.rare_or_default().communities, peer_type) =>
+                    if !is_export_suppressed(&route.rare_or_default().communities, peer_type)
+                        && permitted_on_wire(&route, adj_rib_out.peer()) =>
                 {
                     match adj_rib_out.insert(route.clone()) {
                         InsertOutcome::Accepted(prev) => {
@@ -507,7 +516,8 @@ pub(crate) fn propagate_prefix_v6(
                 // NO_EXPORT_SUBCONFED) can forbid advertising to this peer
                 // regardless of what the export policy decided.
                 Decision::Accept
-                    if !is_export_suppressed(&route.rare_or_default().communities, peer_type) =>
+                    if !is_export_suppressed(&route.rare_or_default().communities, peer_type)
+                        && permitted_on_wire(&route, adj_rib_out.peer()) =>
                 {
                     match adj_rib_out.insert(route.clone()) {
                         InsertOutcome::Accepted(prev) => {
@@ -726,8 +736,7 @@ pub(crate) fn route_v6_to_attributes(
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
-        let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
-        (d, orig)
+        route.as_path.downgrade_for_two_byte_peer()
     };
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
@@ -740,6 +749,7 @@ pub(crate) fn route_v6_to_attributes(
         attrs.push(PathAttribute::Med(m.as_u32()));
     }
     let rare = route.rare_or_default();
+    let aggregator = egress::advertisable_aggregator(rare.aggregator);
     if !rare.communities.is_empty() {
         attrs.push(PathAttribute::Communities(rare.communities.clone()));
     }
@@ -756,7 +766,7 @@ pub(crate) fn route_v6_to_attributes(
     if rare.atomic_aggregate {
         attrs.push(PathAttribute::AtomicAggregate);
     }
-    if let Some(agg) = rare.aggregator {
+    if let Some(agg) = aggregator {
         attrs.push(PathAttribute::Aggregator(agg));
     }
     if !strip_rr_metadata {
@@ -776,12 +786,7 @@ pub(crate) fn route_v6_to_attributes(
     // RFC 4271 §5: unrecognized transitive optional attributes — see the
     // v4 `route_to_attributes`'s comment on `unknown_attrs_to_path_attributes`.
     attrs.extend(unknown_attrs_to_path_attributes(&rare.unknown));
-    push_as4_side_channel(
-        &mut attrs,
-        peer_four_byte,
-        as4_path,
-        rare.aggregator.as_ref(),
-    );
+    push_as4_side_channel(&mut attrs, peer_four_byte, as4_path, aggregator.as_ref());
     let next_hop = route.next_hop.unwrap_or(NextHop::V6(Ipv6Addr::UNSPECIFIED));
     let mp_reach = MpReachNlri {
         afi_safi: AfiSafi::IPV6_UNICAST,
@@ -2051,6 +2056,58 @@ mod route_to_attributes_tests {
         );
     }
 
+    /// RFC 6793 §4.2.2 through both address families' attribute builders:
+    /// what AS4_PATH carries, if anything, for each mix of confederation and
+    /// public segments with mappable and non-mappable ASNs (issue #109).
+    #[test]
+    fn as4_path_content_in_both_builders() {
+        use pathvector_types::AsPathSegment::{ConfedSequence, Sequence};
+        let asns = |v: &[u32]| v.iter().copied().map(Asn::new).collect::<Vec<_>>();
+        let seq = |v: &[u32]| Sequence(asns(v));
+        let cseq = |v: &[u32]| ConfedSequence(asns(v));
+
+        // (route AS_PATH, expected AS4_PATH segments)
+        let cases = [
+            // Mixed, four-octet member and public ASNs.
+            (
+                vec![cseq(&[200_000]), seq(&[131_072, 65001])],
+                Some(vec![seq(&[131_072, 65001])]),
+            ),
+            // Confederation segments only.
+            (vec![cseq(&[200_000, 65010])], None),
+            // Only the member ASN is non-mappable.
+            (vec![cseq(&[200_000]), seq(&[65001])], None),
+            // Everything mappable.
+            (vec![cseq(&[65010]), seq(&[65001])], None),
+        ];
+        for (path, want) in cases {
+            let want = want.map(AsPath::from_segments);
+            let path = AsPath::from_segments(path);
+            let v4 = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, path.clone()).build();
+            let v6 = RouteBuilder::new(
+                "2001:db8::/32".parse::<Nlri<std::net::Ipv6Addr>>().unwrap(),
+                Origin::Igp,
+                path.clone(),
+            )
+            .build();
+            for attrs in [
+                route_to_attributes(&v4, PeerType::ConfedMember, false),
+                super::route_v6_to_attributes(&v6, PeerType::ConfedMember, false).0,
+            ] {
+                let as4 = attrs.iter().find_map(|a| match a {
+                    PathAttribute::As4Path(p) => Some(p),
+                    _ => None,
+                });
+                assert_eq!(as4, want.as_ref(), "AS4_PATH for {path}");
+                // The two-octet AS_PATH keeps its confederation segments.
+                assert!(
+                    attrs.contains(&PathAttribute::AsPath(path.downgrade_for_two_byte_peer().0)),
+                    "{attrs:?}"
+                );
+            }
+        }
+    }
+
     /// All-4-byte path sent to 2-byte peer: every ASN becomes AS_TRANS, all
     /// original ASNs are recoverable from AS4_PATH.
     #[test]
@@ -3003,5 +3060,196 @@ mod propagate_tests {
         assert!(matches!(decision, PrefixDecisionV6::NoChange));
         assert_eq!(adj_out.len(), 1);
         assert!(adj_out.get(&n).is_some());
+    }
+}
+
+/// RFC 7607 §2: "A BGP speaker MUST NOT originate or propagate a route with an
+/// AS number of zero in the AS_PATH, AS4_PATH, AGGREGATOR, or AS4_AGGREGATOR
+/// attributes" (issue #111), and RFC 9774 §3 on sets (issue #110). Ingress
+/// rejects such routes, so these cases reach the Loc-RIB only from a non-wire
+/// source.
+#[cfg(test)]
+mod egress_rules_tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use pathvector_policy::{DefaultAction, Policy};
+    use pathvector_rib::{AdjRibOut, LocRib, PeerId, Route, RouteBuilder, oracle::AlwaysReachable};
+    use pathvector_session::message::PathAttribute;
+    use pathvector_types::{Aggregator, AsPath, Asn, IpAddress, NextHop, Nlri, Origin, PeerType};
+
+    use super::{
+        PrefixDecision, PrefixDecisionV6, propagate_prefix, propagate_prefix_v6,
+        route_to_attributes, route_v6_to_attributes,
+    };
+
+    fn peer(n: u8) -> PeerId {
+        PeerId::from(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    }
+
+    fn n4() -> Nlri<Ipv4Addr> {
+        "203.0.113.0/24".parse().unwrap()
+    }
+
+    fn n6() -> Nlri<Ipv6Addr> {
+        "2001:db8::/32".parse().unwrap()
+    }
+
+    fn route<A: IpAddress>(nlri: Nlri<A>, asns: &[u32]) -> Route<A> {
+        let path = AsPath::from_sequence(asns.iter().copied().map(Asn::new).collect());
+        RouteBuilder::new(nlri, Origin::Igp, path)
+            .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .build()
+    }
+
+    /// Advertise `first`, replace it with `second`, and return both decisions.
+    fn advertise_then_replace_v4(
+        peer_type: PeerType,
+        first: Route<Ipv4Addr>,
+        second: Route<Ipv4Addr>,
+    ) -> (PrefixDecision, PrefixDecision) {
+        let mut loc_rib = LocRib::new();
+        let mut out = AdjRibOut::new(peer(3), peer_type);
+        let policy = Policy::new(DefaultAction::Accept);
+        let mut send = |r: Route<Ipv4Addr>| {
+            loc_rib.insert(peer(2), r, &AlwaysReachable);
+            propagate_prefix(
+                n4(),
+                &loc_rib,
+                &mut out,
+                &policy,
+                peer_type,
+                65001,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                false,
+                false,
+            )
+        };
+        (send(first), send(second))
+    }
+
+    fn advertise_then_replace_v6(
+        peer_type: PeerType,
+        first: Route<Ipv6Addr>,
+        second: Route<Ipv6Addr>,
+    ) -> (PrefixDecisionV6, PrefixDecisionV6) {
+        let mut loc_rib = LocRib::new();
+        let mut out = AdjRibOut::new(peer(3), peer_type);
+        let policy = Policy::new(DefaultAction::Accept);
+        let mut send = |r: Route<Ipv6Addr>| {
+            loc_rib.insert(peer(2), r, &AlwaysReachable);
+            propagate_prefix_v6(
+                n6(),
+                &loc_rib,
+                &mut out,
+                &policy,
+                peer_type,
+                65001,
+                65001,
+                Some("2001:db8::ff".parse().unwrap()),
+                false,
+                false,
+            )
+        };
+        (send(first), send(second))
+    }
+
+    /// Not advertised, and a previously advertised route is withdrawn rather
+    /// than left standing.
+    #[test]
+    fn as_zero_in_as_path_is_never_advertised() {
+        for peer_type in [PeerType::External, PeerType::ConfedMember] {
+            let (first, second) = advertise_then_replace_v4(
+                peer_type,
+                route(n4(), &[65002]),
+                route(n4(), &[65002, 0]),
+            );
+            assert!(matches!(first, PrefixDecision::Announce(_)), "{first:?}");
+            assert!(matches!(second, PrefixDecision::Withdraw(_)), "{second:?}");
+
+            let (first, second) = advertise_then_replace_v6(
+                peer_type,
+                route(n6(), &[65002]),
+                route(n6(), &[0, 65002]),
+            );
+            assert!(matches!(first, PrefixDecisionV6::Announce(_)), "{first:?}");
+            assert!(
+                matches!(second, PrefixDecisionV6::Withdraw(_)),
+                "{second:?}"
+            );
+
+            let (_, only) =
+                advertise_then_replace_v4(peer_type, route(n4(), &[0]), route(n4(), &[0]));
+            assert!(matches!(only, PrefixDecision::NoChange), "{only:?}");
+        }
+    }
+
+    /// RFC 9774 §3: no UPDATE containing a set is sent. The judgement is on
+    /// the path as it would go out: AS_CONFED_SET is stripped toward a
+    /// genuine external peer (RFC 5065 §5.3) and the route is then fine to
+    /// send, but not toward a confederation member.
+    #[test]
+    fn sets_are_judged_on_the_path_that_would_be_sent() {
+        use pathvector_types::AsPathSegment::{ConfedSet, Sequence, Set};
+        let with = |segments: Vec<pathvector_types::AsPathSegment>| {
+            RouteBuilder::new(n4(), Origin::Igp, AsPath::from_segments(segments))
+                .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .build()
+        };
+        let seq = || Sequence(vec![Asn::new(65002)]);
+        let set = || with(vec![seq(), Set(vec![Asn::new(65003)])]);
+        let confed_set = || with(vec![ConfedSet(vec![Asn::new(65010)]), seq()]);
+
+        for peer_type in [
+            PeerType::External,
+            PeerType::Internal,
+            PeerType::ConfedMember,
+        ] {
+            let (first, second) = advertise_then_replace_v4(peer_type, with(vec![seq()]), set());
+            // iBGP split horizon does not apply: the source is eBGP.
+            assert!(matches!(first, PrefixDecision::Announce(_)), "{first:?}");
+            assert!(matches!(second, PrefixDecision::Withdraw(_)), "{second:?}");
+        }
+        for peer_type in [PeerType::Internal, PeerType::ConfedMember] {
+            let (_, second) = advertise_then_replace_v4(peer_type, with(vec![seq()]), confed_set());
+            assert!(matches!(second, PrefixDecision::Withdraw(_)), "{second:?}");
+        }
+        let (_, external) =
+            advertise_then_replace_v4(PeerType::External, with(vec![seq()]), confed_set());
+        match external {
+            PrefixDecision::NoChange => {}
+            PrefixDecision::Announce(r) => assert!(!r.as_path.contains_as_set(), "{r:?}"),
+            PrefixDecision::Withdraw(_) => panic!("stripped path is advertisable"),
+        }
+    }
+
+    /// AGGREGATOR is informational (RFC 7606 §7.7 discards a malformed one),
+    /// so the route is sent without it — and without an AS4_AGGREGATOR.
+    #[test]
+    fn as_zero_aggregator_is_omitted_by_both_builders() {
+        let agg = Aggregator {
+            asn: Asn::ZERO,
+            ip: Ipv4Addr::new(10, 0, 0, 9),
+        };
+        let v4 = RouteBuilder::new(n4(), Origin::Igp, AsPath::new())
+            .aggregator(agg)
+            .build();
+        let v6 = RouteBuilder::new(n6(), Origin::Igp, AsPath::new())
+            .aggregator(agg)
+            .build();
+        for four_byte in [false, true] {
+            for attrs in [
+                route_to_attributes(&v4, PeerType::External, four_byte),
+                route_v6_to_attributes(&v6, PeerType::External, four_byte).0,
+            ] {
+                assert!(
+                    !attrs.iter().any(|a| matches!(
+                        a,
+                        PathAttribute::Aggregator(_) | PathAttribute::As4Aggregator { .. }
+                    )),
+                    "{attrs:?}"
+                );
+            }
+        }
     }
 }
