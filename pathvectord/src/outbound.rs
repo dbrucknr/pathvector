@@ -14,7 +14,7 @@ use pathvector_session::message::{
     MpReachNlri, MpUnreachNlri, PathAttribute, Prefix, UpdateMessage, encode_attributes,
     nlri_encoded_len, nlri_v6_encoded_len,
 };
-use pathvector_types::{AfiSafi, Aggregator, AsPath, NextHop, Nlri, PeerType, UnknownAttribute};
+use pathvector_types::{AfiSafi, Aggregator, As4Path, NextHop, Nlri, PeerType, UnknownAttribute};
 use tokio::sync::mpsc;
 
 /// BGP UPDATE wire overhead: 19-byte header + 2-byte withdrawn-len + 2-byte
@@ -49,8 +49,7 @@ pub(crate) fn route_to_attributes(
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
-        let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
-        (d, orig)
+        route.as_path.downgrade_for_two_byte_peer()
     };
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
@@ -129,16 +128,9 @@ pub(crate) fn route_to_attributes(
 /// aggregating AS, the `AS4_AGGREGATOR` that accompanies an
 /// `AGGREGATOR` whose AS the wire codec writes as `AS_TRANS`.
 ///
-/// - §§3, 4.2.2: `AS_CONFED_SEQUENCE`/`AS_CONFED_SET` "are declared invalid
-///   for the AS4_PATH attribute and MUST NOT be included" — they are
-///   stripped here. The wire `AS_PATH` keeps its (downgraded) confed
-///   segments; only the `AS4_PATH` side-channel excludes them, since RFC 5065
-///   confederation relaying can leave confed segments in a route sent toward
-///   a two-byte-only peer.
-/// - §4.2.2: `AS4_PATH` is sent only when some AS in it is non-mappable
-///   ("In this case, the NEW BGP speaker MUST NOT send the AS4_PATH
-///   attribute"), so a four-byte ASN confined to a confed segment — absent
-///   from the stripped path — produces none.
+/// - Whether an `AS4_PATH` is sent, and what it may contain (no confederation
+///   segments, even though the two-octet `AS_PATH` keeps them), is decided by
+///   [`As4Path`]'s constructor.
 /// - `AS4_AGGREGATOR` "MUST NOT be sent" when the AS number is mappable.
 ///
 /// pathvector-session's encoder would generate the same attributes itself
@@ -147,7 +139,7 @@ pub(crate) fn route_to_attributes(
 fn push_as4_side_channel(
     attrs: &mut Vec<PathAttribute>,
     peer_four_byte: bool,
-    as4_path: Option<AsPath>,
+    as4_path: Option<As4Path>,
     aggregator: Option<&Aggregator>,
 ) {
     // RFC 6793 §4.1: neither attribute is carried between two NEW speakers.
@@ -155,10 +147,7 @@ fn push_as4_side_channel(
         return;
     }
     if let Some(as4) = as4_path {
-        let as4 = as4.strip_confed_segments();
-        if as4.has_non_mappable_asn() {
-            attrs.push(PathAttribute::As4Path(as4));
-        }
+        attrs.push(PathAttribute::As4Path(as4.into_path()));
     }
     if let Some(agg) = aggregator
         && agg.asn.is_four_byte()
@@ -726,8 +715,7 @@ pub(crate) fn route_v6_to_attributes(
     let (wire_as_path, as4_path) = if peer_four_byte {
         ((*route.as_path).clone(), None)
     } else {
-        let (d, orig) = route.as_path.downgrade_for_two_byte_peer();
-        (d, orig)
+        route.as_path.downgrade_for_two_byte_peer()
     };
     let mut attrs = vec![
         PathAttribute::Origin(route.origin),
@@ -2049,6 +2037,58 @@ mod route_to_attributes_tests {
             as4_asns.contains(&Asn::new(131_072)) && as4_asns.contains(&Asn::new(65001)),
             "AS4_PATH must still carry the non-confed segment's original ASNs"
         );
+    }
+
+    /// RFC 6793 §4.2.2 through both address families' attribute builders:
+    /// what AS4_PATH carries, if anything, for each mix of confederation and
+    /// public segments with mappable and non-mappable ASNs (issue #109).
+    #[test]
+    fn as4_path_content_in_both_builders() {
+        use pathvector_types::AsPathSegment::{ConfedSequence, Sequence};
+        let asns = |v: &[u32]| v.iter().copied().map(Asn::new).collect::<Vec<_>>();
+        let seq = |v: &[u32]| Sequence(asns(v));
+        let cseq = |v: &[u32]| ConfedSequence(asns(v));
+
+        // (route AS_PATH, expected AS4_PATH segments)
+        let cases = [
+            // Mixed, four-octet member and public ASNs.
+            (
+                vec![cseq(&[200_000]), seq(&[131_072, 65001])],
+                Some(vec![seq(&[131_072, 65001])]),
+            ),
+            // Confederation segments only.
+            (vec![cseq(&[200_000, 65010])], None),
+            // Only the member ASN is non-mappable.
+            (vec![cseq(&[200_000]), seq(&[65001])], None),
+            // Everything mappable.
+            (vec![cseq(&[65010]), seq(&[65001])], None),
+        ];
+        for (path, want) in cases {
+            let want = want.map(AsPath::from_segments);
+            let path = AsPath::from_segments(path);
+            let v4 = RouteBuilder::new(nlri("10.0.0.0/8"), Origin::Igp, path.clone()).build();
+            let v6 = RouteBuilder::new(
+                "2001:db8::/32".parse::<Nlri<std::net::Ipv6Addr>>().unwrap(),
+                Origin::Igp,
+                path.clone(),
+            )
+            .build();
+            for attrs in [
+                route_to_attributes(&v4, PeerType::ConfedMember, false),
+                super::route_v6_to_attributes(&v6, PeerType::ConfedMember, false).0,
+            ] {
+                let as4 = attrs.iter().find_map(|a| match a {
+                    PathAttribute::As4Path(p) => Some(p),
+                    _ => None,
+                });
+                assert_eq!(as4, want.as_ref(), "AS4_PATH for {path}");
+                // The two-octet AS_PATH keeps its confederation segments.
+                assert!(
+                    attrs.contains(&PathAttribute::AsPath(path.downgrade_for_two_byte_peer().0)),
+                    "{attrs:?}"
+                );
+            }
+        }
     }
 
     /// All-4-byte path sent to 2-byte peer: every ASN becomes AS_TRANS, all

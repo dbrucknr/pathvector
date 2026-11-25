@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use pathvector_types::{
-    Afi, AfiSafi, Aggregator, AsPath, AsPathSegment, Asn, Community, ExtendedCommunity,
+    Afi, AfiSafi, Aggregator, As4Path, AsPath, AsPathSegment, Asn, Community, ExtendedCommunity,
     LargeCommunity, NextHop, Nlri, Origin, Safi,
 };
 
@@ -1033,14 +1033,10 @@ fn append_missing_as4_attributes(out: &mut Writer, attrs: &[PathAttribute]) {
     if !has_as4_path
         && let Some(PathAttribute::AsPath(path)) =
             attrs.iter().find(|a| matches!(a, PathAttribute::AsPath(_)))
+        && let Some(as4) = As4Path::for_two_byte_peer(path)
     {
-        // "Whenever the AS path information contains the AS_CONFED_SEQUENCE
-        // or AS_CONFED_SET path segment, the NEW BGP speaker MUST exclude
-        // such path segments from the AS4_PATH attribute being constructed."
-        let as4 = path.strip_confed_segments();
-        if as4.has_non_mappable_asn() {
-            encode_one_path_attr(out, &PathAttribute::As4Path(as4), AsnWidth::Two);
-        }
+        let attr = PathAttribute::As4Path(as4.into_path());
+        encode_one_path_attr(out, &attr, AsnWidth::Two);
     }
     let has_as4_agg = attrs
         .iter()
