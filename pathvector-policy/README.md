@@ -74,6 +74,7 @@ The policy engine uses a **hybrid dispatch** model that keeps the common-case fa
 | [`AnyCondition`] | Always — useful as a catch-all final term |
 | [`Not<C>`] | The inner condition does not match |
 | [`PrefixListCondition<A>`] | The route's prefix falls within an [`IpSet`](ipnetx::ipset::IpSet) |
+| [`PrefixMatchCondition<A>`] | At least one [`PrefixMatch`](ipnetx::prefix_match::PrefixMatch) entry contains the route's prefix and admits its length |
 | [`CommunityCondition`] | The route carries a specific standard community |
 | [`LargeCommunityCondition`] | The route carries a specific large community |
 | [`AsPathContainsCondition`] | The AS path contains a specific ASN |
@@ -81,6 +82,31 @@ The policy engine uses a **hybrid dispatch** model that keeps the common-case fa
 | [`LocalPrefCondition`] | `LOCAL_PREF` satisfies a comparison |
 | [`MedCondition`] | `MED` satisfies a comparison |
 | [`OriginCondition`] | `ORIGIN` equals a specific value |
+
+### Address coverage or prefix matching?
+
+[`PrefixListCondition`] asks whether every address of the route's prefix is in a
+set. The set merges adjacent ranges and has no notion of prefix length, so
+entries `10.0.0.0/25` and `10.0.0.128/25` cover a route for `10.0.0.0/24`.
+
+[`PrefixMatchCondition`] keeps each entry separate. An entry is an
+[`ipnetx::prefix_match::PrefixMatch`], a prefix with its own length window:
+
+| Constructor | Admits |
+|---|---|
+| `PrefixMatch::exact(p)` | `p` only |
+| `PrefixMatch::or_longer(p)` | `p` and every more-specific prefix inside it |
+| `PrefixMatch::new(p, min, max)` | Prefixes inside `p` whose length is in `min..=max` |
+
+`new` requires `prefix length ≤ min ≤ max ≤ address width`. Host bits are
+ignored. A route matches the condition if any one entry matches it; an empty
+list matches nothing.
+
+To use the list as a filter, reject what it does not match
+(`Term::new(Not(condition), Reject)`) so that later terms can still reject the
+routes it does match. The bounds are plain numbers; no compatibility with a
+vendor's prefix-list syntax is claimed. The daemon has no configuration for
+prefix entries.
 
 ---
 
