@@ -550,6 +550,32 @@ impl DaemonState {
         }
     }
 
+    /// IPv6 counterpart of [`emit_route_events`](Self::emit_route_events).
+    pub(super) fn emit_route_events_v6(&self, affected: &[Nlri<Ipv6Addr>]) {
+        for &nlri in affected {
+            let event = match self.rib.loc_rib_v6.best(&nlri) {
+                Some(route) => {
+                    let peer_id = self
+                        .rib
+                        .loc_rib_v6
+                        .best_peer(&nlri)
+                        .unwrap_or_else(|| PeerId::from(Ipv4Addr::UNSPECIFIED));
+                    proto::RouteEvent {
+                        r#type: proto::RouteEventType::Announced as i32,
+                        route: Some(grpc::route_v6_to_proto(peer_id, nlri, route)),
+                        withdrawn_prefix: None,
+                    }
+                }
+                None => proto::RouteEvent {
+                    r#type: proto::RouteEventType::Withdrawn as i32,
+                    route: None,
+                    withdrawn_prefix: Some(nlri.to_string()),
+                },
+            };
+            let _ = self.route_tx.send(event);
+        }
+    }
+
     pub(super) fn propagate_to_all_peers_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
         // Only send IPv6 UPDATEs to peers that negotiated the Multi-Protocol
         // capability for IPv6 unicast (RFC 4760).

@@ -105,8 +105,12 @@ proptest! {
     }
 
     /// local_as ≤ 65535 → outbound OPEN carries local_as directly in my_as.
+    ///
+    /// AS 0 is outside the range: RFC 7607 §2, "A router MUST NOT initiate a
+    /// connection claiming to be AS 0", so no OPEN is sent to inspect. That
+    /// refusal is covered by `fsm::open_as_zero_tests`.
     #[test]
-    fn prop_small_asn_sent_directly(local_as in 0u32..=65535) {
+    fn prop_small_asn_sent_directly(local_as in 1u32..=65535) {
         let config = FsmConfig { local_as, public_as: local_as, ..default_config() };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);
