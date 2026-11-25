@@ -208,7 +208,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::pdu::{EndOfDataIntervals, PrefixFlags};
+    use crate::pdu::EndOfDataIntervals;
 
     fn notify(serial: u32) -> Vec<u8> {
         pdu::encode(
@@ -252,23 +252,11 @@ mod tests {
             (RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }),
             (
                 RtrVersion::V1,
-                Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "192.0.2.0".parse().unwrap(),
-                    asn: 65001,
-                },
+                Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001),
             ),
             (
                 RtrVersion::V1,
-                Pdu::Ipv6Prefix {
-                    flags: PrefixFlags { announce: false },
-                    prefix_len: 32,
-                    max_len: 48,
-                    prefix: "2001:db8::".parse().unwrap(),
-                    asn: 65002,
-                },
+                Pdu::announce_v6("2001:db8::".parse().unwrap(), 32, 48, 65002).withdrawn(),
             ),
             (RtrVersion::V1, Pdu::RouterKey),
             (

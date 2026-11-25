@@ -25,13 +25,14 @@ mod protocol;
 mod table;
 mod timers;
 mod transport;
+mod vrp;
 
 #[cfg(test)]
 mod regression_tests;
 
 pub use cache::RtrStatus;
 pub use client::{RtrClient, RtrConfig, RtrHandle};
-pub use error::{PduError, RtrConfigError, RtrError};
+pub use error::{PduError, RtrConfigError, RtrError, VrpError};
 pub use pdu::RtrVersion;
 pub use table::{RoaTable, RoaValidity};
 

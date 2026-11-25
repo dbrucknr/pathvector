@@ -34,6 +34,7 @@ use crate::cache::table_from;
 use crate::{
     cache::{RtrStatus, Shared, Staged},
     error::{RtrConfigError, RtrError},
+    frame::Frame,
     pdu::{self, Pdu, RtrVersion},
     protocol::{self, Consequence, Exchange, Negotiation, Query, Resume, Step, Violation},
     table::RoaValidity,
@@ -206,6 +207,11 @@ impl RtrClient {
 /// `status().connected == true` — for tests that need deterministic ROA data
 /// without running a real or mock RTR server. Each tuple is
 /// `(prefix, prefix_len, max_len, origin_asn)`.
+///
+/// # Panics
+///
+/// If a tuple is one a real cache could not send: either length longer than
+/// the address family, or `max_len < prefix_len`.
 #[cfg(any(test, feature = "test-util"))]
 #[must_use]
 pub fn for_testing(
@@ -223,34 +229,23 @@ impl RtrHandle {
     ///
     /// # Panics
     ///
-    /// Panics only if the internal status lock is poisoned (a prior holder
-    /// panicked while holding it) — not an expected runtime condition.
+    /// Panics if the lengths cannot form a VRP (see [`for_testing`]), or if
+    /// the internal status lock is poisoned.
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_roa_v4(&self, prefix: Ipv4Addr, prefix_len: u8, max_len: u8, asn: u32) {
-        self.0.insert_for_testing(&Pdu::Ipv4Prefix {
-            flags: pdu::PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
+        self.0
+            .insert_for_testing(&Pdu::announce_v4(prefix, prefix_len, max_len, asn));
     }
 
     /// IPv6 counterpart of [`RtrHandle::insert_roa_v4`].
     ///
     /// # Panics
     ///
-    /// Panics only if the internal status lock is poisoned (a prior holder
-    /// panicked while holding it) — not an expected runtime condition.
+    /// As for [`RtrHandle::insert_roa_v4`].
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_roa_v6(&self, prefix: Ipv6Addr, prefix_len: u8, max_len: u8, asn: u32) {
-        self.0.insert_for_testing(&Pdu::Ipv6Prefix {
-            flags: pdu::PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
+        self.0
+            .insert_for_testing(&Pdu::announce_v6(prefix, prefix_len, max_len, asn));
     }
 }
 
@@ -363,8 +358,8 @@ async fn run_one_connection(
         // it is picked up by the exchange that follows.
         tokio::select! {
             () = tokio::time::sleep(timers.refresh) => {}
-            frame = connection.read_frame() => {
-                let frame = frame?;
+            read = connection.read_frame() => {
+                let frame = received(connection, shared, negotiation.version(), read).await?;
                 if let Err(violation) = protocol::on_idle(
                     negotiation.version(),
                     shared.resume(),
@@ -417,7 +412,8 @@ async fn sync(
             .await?;
 
         loop {
-            let frame = connection.read_frame().await?;
+            let read = connection.read_frame().await;
+            let frame = received(connection, shared, negotiation.version(), read).await?;
             let step = match exchange.on_pdu(frame.version, &frame.pdu) {
                 Ok(step) => step,
                 Err(violation) => {
@@ -612,12 +608,29 @@ async fn reject(
     violation.error
 }
 
-impl From<ReadError> for RtrError {
-    fn from(error: ReadError) -> Self {
-        match error {
-            ReadError::Transport(e) => e,
-            ReadError::Malformed(e) => Self::Pdu(e.error),
-        }
+/// Turns the outcome of [`Connection::read_frame`] into a PDU, carrying out
+/// the reaction to a peer that sent something that is not one.
+///
+/// Takes the *outcome* rather than doing the read, so the idle loop can race
+/// only the (cancellation-safe) read against its timer: once bytes are being
+/// rejected, nothing can interrupt the Error Report or its consequence.
+async fn received(
+    connection: &mut Connection<TcpStream>,
+    shared: &Arc<Shared>,
+    version: RtrVersion,
+    read: Result<Frame, ReadError>,
+) -> Result<Frame, RtrError> {
+    match read {
+        Ok(frame) => Ok(frame),
+        Err(ReadError::Transport(error)) => Err(error),
+        Err(ReadError::Malformed(bad)) => Err(reject(
+            connection,
+            shared,
+            version,
+            Violation::malformed(bad.error),
+            &bad.raw,
+        )
+        .await),
     }
 }
 
@@ -627,7 +640,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        pdu::{EndOfDataIntervals, PrefixFlags},
+        pdu::EndOfDataIntervals,
         protocol::{ERROR_CODE_NO_DATA_AVAILABLE, ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION},
         transport::{read_pdu, write_pdu},
     };
@@ -678,13 +691,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "192.0.2.0".parse().unwrap(),
-                    asn: 65001,
-                },
+                &Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001),
             )
             .await;
             write_one(
@@ -1118,13 +1125,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: old_roa_prefix,
-                    asn: 65099,
-                },
+                &Pdu::announce_v4(old_roa_prefix, 24, 24, 65099),
             )
             .await;
             write_one(
@@ -1205,13 +1206,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "203.0.113.0".parse().unwrap(),
-                    asn: 65001,
-                },
+                &Pdu::announce_v4("203.0.113.0".parse().unwrap(), 24, 24, 65001),
             )
             .await;
             write_one(
@@ -1432,13 +1427,7 @@ mod tests {
             write_one(
                 &mut stream,
                 RtrVersion::V1,
-                &Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: "203.0.113.0".parse().unwrap(),
-                    asn: 65010,
-                },
+                &Pdu::announce_v4("203.0.113.0".parse().unwrap(), 24, 24, 65010),
             )
             .await;
             write_one(

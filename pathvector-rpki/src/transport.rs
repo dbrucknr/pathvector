@@ -148,13 +148,7 @@ mod tests {
                 serial: 2,
             },
             Pdu::CacheResponse { session_id: 7 },
-            Pdu::Ipv4Prefix {
-                flags: pdu::PrefixFlags { announce: true },
-                prefix_len: 24,
-                max_len: 24,
-                prefix: "192.0.2.0".parse().unwrap(),
-                asn: 65001,
-            },
+            Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001),
             Pdu::EndOfData {
                 session_id: 7,
                 serial: 2,
