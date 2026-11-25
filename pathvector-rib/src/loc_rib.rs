@@ -4,8 +4,8 @@ use pathvector_types::Nlri;
 use smallvec::SmallVec;
 
 use crate::{
-    best_path::select_best_with_oracle, best_table::BestTable, oracle::NextHopOracle, peer::PeerId,
-    route::Route,
+    best_path::select_best_with_oracle, best_table::BestTable, canonical::CanonicalNlri,
+    oracle::NextHopOracle, peer::PeerId, route::Route,
 };
 
 /// Describes how the best path for a prefix changed after a `LocRib` mutation.
@@ -106,6 +106,48 @@ impl BestTransition {
     }
 }
 
+/// Read-only view into the Loc-RIB needed by the outbound advertisement path.
+///
+/// Abstracting over this boundary lets the Update-Send Process (`propagate_prefix`)
+/// be tested without constructing a full [`LocRib`] with real route data.
+pub trait RibView<A: IpAddress> {
+    /// Returns the current best route for `nlri`, or `None` if no route exists.
+    fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>>;
+
+    /// Returns the peer whose route is currently best for `nlri`.
+    ///
+    /// Implementations that cannot track the source peer (e.g. test stubs)
+    /// return `None`, which disables the source-peer split-horizon check in
+    /// the outbound pipeline.
+    fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
+        let _ = nlri;
+        None
+    }
+}
+
+impl<A: IpAddress> RibView<A> for LocRib<A> {
+    fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
+        LocRib::best(self, nlri)
+    }
+
+    fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
+        LocRib::best_peer(self, nlri)
+    }
+}
+
+/// Flat route table: `(prefix, peer) → Route`.
+///
+/// Uses `AHashMap` (non-cryptographic hasher) — ~15–20% faster than std's
+/// `SipHash` for internal keys that are not attacker-controlled.
+type CandidateMap<A> = AHashMap<(CanonicalNlri<A>, PeerId), Route<A>>;
+
+/// Reverse index: prefix → list of peers that have a candidate for it.
+///
+/// `SmallVec<[PeerId; 4]>` stores up to 4 peers inline (no heap allocation)
+/// which covers the vast majority of real-world prefixes (1–8 eBGP peers).
+/// Kept in sync with `candidates` so `recompute_best` is O(k) per prefix.
+type PeerIndex<A> = AHashMap<CanonicalNlri<A>, SmallVec<[PeerId; 4]>>;
+
 /// The local routing table — best-path selected, post-import-policy.
 ///
 /// `LocRib` holds two parallel data structures per prefix:
@@ -115,6 +157,14 @@ impl BestTransition {
 ///   peer.
 /// - **Best** — the single winning route chosen by `select_best_with_oracle`, recomputed
 ///   every time the candidate set changes.
+///
+/// # Prefix identity
+///
+/// A destination is its prefix: bits beyond the prefix length are irrelevant
+/// (RFC 4271 §4.3, RFC 4760 §5). Every method accepts any spelling of an NLRI,
+/// so `10.1.2.3/8` and `10.0.0.0/8` insert, find and withdraw the same entry.
+/// Everything handed back — `Route::nlri`, [`best_routes`](LocRib::best_routes),
+/// [`BestPathChange`] — carries the canonical form, with those bits zero.
 ///
 /// # Policy is applied externally
 ///
@@ -149,48 +199,6 @@ impl BestTransition {
 /// assert_eq!(rib.best_peer(&nlri), Some(peer_a));
 /// assert_eq!(rib.best(&nlri).unwrap().local_pref, Some(LocalPref::new(200)));
 /// ```
-/// Read-only view into the Loc-RIB needed by the outbound advertisement path.
-///
-/// Abstracting over this boundary lets the Update-Send Process (`propagate_prefix`)
-/// be tested without constructing a full [`LocRib`] with real route data.
-pub trait RibView<A: IpAddress> {
-    /// Returns the current best route for `nlri`, or `None` if no route exists.
-    fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>>;
-
-    /// Returns the peer whose route is currently best for `nlri`.
-    ///
-    /// Implementations that cannot track the source peer (e.g. test stubs)
-    /// return `None`, which disables the source-peer split-horizon check in
-    /// the outbound pipeline.
-    fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        let _ = nlri;
-        None
-    }
-}
-
-impl<A: IpAddress> RibView<A> for LocRib<A> {
-    fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        LocRib::best(self, nlri)
-    }
-
-    fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        LocRib::best_peer(self, nlri)
-    }
-}
-
-/// Flat route table: `(prefix, peer) → Route`.
-///
-/// Uses `AHashMap` (non-cryptographic hasher) — ~15–20% faster than std's
-/// `SipHash` for internal keys that are not attacker-controlled.
-type CandidateMap<A> = AHashMap<(Nlri<A>, PeerId), Route<A>>;
-
-/// Reverse index: prefix → list of peers that have a candidate for it.
-///
-/// `SmallVec<[PeerId; 4]>` stores up to 4 peers inline (no heap allocation)
-/// which covers the vast majority of real-world prefixes (1–8 eBGP peers).
-/// Kept in sync with `candidates` so `recompute_best` is O(k) per prefix.
-type PeerIndex<A> = AHashMap<Nlri<A>, SmallVec<[PeerId; 4]>>;
-
 #[derive(Clone)]
 pub struct LocRib<A: IpAddress> {
     /// All candidate routes, keyed by `(prefix, peer)`.
@@ -220,6 +228,9 @@ impl<A: IpAddress> LocRib<A> {
     /// Inserts a route from `peer` into the candidate set and recomputes the
     /// best route for that prefix.
     ///
+    /// The route is stored with its NLRI in canonical form (see [prefix
+    /// identity](LocRib#prefix-identity)).
+    ///
     /// If this peer previously had a route for this prefix, it is replaced —
     /// RFC 4271 §9: the new route "SHALL replace the older route [...] thus
     /// implicitly withdrawing the older route from service." Best-path
@@ -244,21 +255,22 @@ impl<A: IpAddress> LocRib<A> {
     pub fn insert(
         &mut self,
         peer: PeerId,
-        route: Route<A>,
+        mut route: Route<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
-        let nlri = route.nlri;
-        let previous = self.best.get(nlri.prefix());
+        let key = CanonicalNlri::new(route.nlri);
+        route.nlri = key.nlri();
+        let previous = self.best.get(key);
 
-        self.candidates.insert((nlri, peer), route);
-        let peers = self.peer_index.entry(nlri).or_default();
+        self.candidates.insert((key, peer), route);
+        let peers = self.peer_index.entry(key).or_default();
         if !peers.contains(&peer) {
             peers.push(peer);
         }
-        self.recompute_best(nlri, previous, oracle);
+        self.recompute_best(key, previous, oracle);
 
-        let next = self.best.get(nlri.prefix());
-        self.change_for(nlri, BestTransition::between(previous, next, Some(peer)))
+        let next = self.best.get(key);
+        self.change_for(key, BestTransition::between(previous, next, Some(peer)))
     }
 
     /// Removes a specific prefix from a peer's contribution and recomputes
@@ -280,29 +292,39 @@ impl<A: IpAddress> LocRib<A> {
         nlri: &Nlri<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
-        let previous = self.best.get(nlri.prefix());
+        self.withdraw_key(*peer, CanonicalNlri::new(*nlri), oracle)
+    }
 
-        if self.candidates.remove(&(*nlri, *peer)).is_none() {
+    /// [`withdraw`](Self::withdraw) for a caller that already holds a key.
+    fn withdraw_key(
+        &mut self,
+        peer: PeerId,
+        key: CanonicalNlri<A>,
+        oracle: &dyn NextHopOracle,
+    ) -> BestPathChange<A> {
+        let previous = self.best.get(key);
+
+        if self.candidates.remove(&(key, peer)).is_none() {
             return BestPathChange::Unchanged;
         }
 
-        let has_remaining = if let Some(peers) = self.peer_index.get_mut(nlri) {
-            peers.retain(|p| p != peer);
+        let has_remaining = if let Some(peers) = self.peer_index.get_mut(&key) {
+            peers.retain(|p| *p != peer);
             !peers.is_empty()
         } else {
             false
         };
         if has_remaining {
-            self.recompute_best(*nlri, previous, oracle);
+            self.recompute_best(key, previous, oracle);
         } else {
-            self.peer_index.remove(nlri);
-            self.best.set(nlri.prefix(), previous, None);
+            self.peer_index.remove(&key);
+            self.best.set(key, previous, None);
         }
 
         // `peer`'s candidate is gone, so it cannot be the next winner: no
         // route was replaced in place.
-        let next = self.best.get(nlri.prefix());
-        self.change_for(*nlri, BestTransition::between(previous, next, None))
+        let next = self.best.get(key);
+        self.change_for(key, BestTransition::between(previous, next, None))
     }
 
     /// Removes all routes contributed by `peer` and recomputes best-path
@@ -318,30 +340,31 @@ impl<A: IpAddress> LocRib<A> {
         peer: &PeerId,
         oracle: &dyn NextHopOracle,
     ) -> Vec<BestPathChange<A>> {
-        let affected: Vec<Nlri<A>> = self
+        let affected: Vec<CanonicalNlri<A>> = self
             .peer_index
             .iter()
             .filter(|(_, peers)| peers.contains(peer))
-            .map(|(n, _)| *n)
+            .map(|(key, _)| *key)
             .collect();
 
         affected
             .into_iter()
-            .map(|nlri| self.withdraw(peer, &nlri, oracle))
+            .map(|key| self.withdraw_key(*peer, key, oracle))
             .collect()
     }
 
     /// Returns the current best route for `nlri`, if any.
     #[must_use]
     pub fn best(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        let peer = self.best.get(nlri.prefix())?;
-        self.candidates.get(&(*nlri, peer))
+        let key = CanonicalNlri::new(*nlri);
+        let peer = self.best.get(key)?;
+        self.candidates.get(&(key, peer))
     }
 
     /// Returns the peer whose route is currently best for `nlri`.
     #[must_use]
     pub fn best_peer(&self, nlri: &Nlri<A>) -> Option<PeerId> {
-        self.best.get(nlri.prefix())
+        self.best.get(CanonicalNlri::new(*nlri))
     }
 
     /// Returns how many prefixes currently have `peer` as their best-path
@@ -371,10 +394,9 @@ impl<A: IpAddress> LocRib<A> {
     /// Useful for building `AdjRibOut` — iterate this, apply export policy,
     /// and insert accepted routes into the peer's outbound table.
     pub fn best_routes(&self) -> impl Iterator<Item = (Nlri<A>, &Route<A>)> {
-        self.best.iter().filter_map(|(prefix, peer)| {
-            let nlri = Nlri::from_prefix(prefix);
-            let route = self.candidates.get(&(nlri, *peer))?;
-            Some((nlri, route))
+        self.best.iter().filter_map(|(key, peer)| {
+            let route = self.candidates.get(&(key, *peer))?;
+            Some((key.nlri(), route))
         })
     }
 
@@ -384,9 +406,8 @@ impl<A: IpAddress> LocRib<A> {
     /// to forward a packet destined for `addr`.
     #[must_use]
     pub fn longest_match(&self, addr: A) -> Option<&Route<A>> {
-        let (prefix, peer) = self.best.longest_match_entry(addr)?;
-        let nlri = Nlri::from_prefix(prefix);
-        self.candidates.get(&(nlri, *peer))
+        let (key, peer) = self.best.longest_match_entry(addr)?;
+        self.candidates.get(&(key, *peer))
     }
 
     /// Returns all candidate routes for `nlri`, keyed by peer.
@@ -394,10 +415,11 @@ impl<A: IpAddress> LocRib<A> {
     /// Useful for diagnostics and "show bgp detail" output.
     #[must_use]
     pub fn candidates(&self, nlri: &Nlri<A>) -> Option<AHashMap<PeerId, &Route<A>>> {
-        let peers = self.peer_index.get(nlri)?;
+        let key = CanonicalNlri::new(*nlri);
+        let peers = self.peer_index.get(&key)?;
         let routes: AHashMap<PeerId, &Route<A>> = peers
             .iter()
-            .filter_map(|p| Some((*p, self.candidates.get(&(*nlri, *p))?)))
+            .filter_map(|p| Some((*p, self.candidates.get(&(key, *p))?)))
             .collect();
         if routes.is_empty() {
             None
@@ -425,15 +447,14 @@ impl<A: IpAddress> LocRib<A> {
     /// Only prefixes whose best path actually changed are included in the result;
     /// unchanged prefixes are silently skipped.
     pub fn recompute_all(&mut self, oracle: &dyn NextHopOracle) -> Vec<BestPathChange<A>> {
-        let nlris: Vec<Nlri<A>> = self.peer_index.keys().copied().collect();
+        let keys: Vec<CanonicalNlri<A>> = self.peer_index.keys().copied().collect();
 
-        nlris
-            .into_iter()
-            .filter_map(|nlri| {
-                let previous = self.best.get(nlri.prefix());
-                self.recompute_best(nlri, previous, oracle);
-                let next = self.best.get(nlri.prefix());
-                match self.change_for(nlri, BestTransition::between(previous, next, None)) {
+        keys.into_iter()
+            .filter_map(|key| {
+                let previous = self.best.get(key);
+                self.recompute_best(key, previous, oracle);
+                let next = self.best.get(key);
+                match self.change_for(key, BestTransition::between(previous, next, None)) {
                     BestPathChange::Unchanged => None,
                     change => Some(change),
                 }
@@ -441,17 +462,17 @@ impl<A: IpAddress> LocRib<A> {
             .collect()
     }
 
-    /// Maps a [`BestTransition`] for `nlri` to the public [`BestPathChange`].
+    /// Maps a [`BestTransition`] for `key` to the public [`BestPathChange`].
     ///
     /// The only place a `Route` is cloned for a change, and only for
     /// `Selected` — the same single clone the insert/withdraw paths have
     /// always paid for an announcement.
-    fn change_for(&self, nlri: Nlri<A>, transition: BestTransition) -> BestPathChange<A> {
+    fn change_for(&self, key: CanonicalNlri<A>, transition: BestTransition) -> BestPathChange<A> {
         match transition {
             BestTransition::NeverSelected | BestTransition::Kept => BestPathChange::Unchanged,
-            BestTransition::Lost => BestPathChange::Withdrawn(nlri),
+            BestTransition::Lost => BestPathChange::Withdrawn(key.nlri()),
             BestTransition::Selected(winner) => {
-                BestPathChange::Announced(nlri, self.candidates[&(nlri, winner)].clone())
+                BestPathChange::Announced(key.nlri(), self.candidates[&(key, winner)].clone())
             }
         }
     }
@@ -459,7 +480,7 @@ impl<A: IpAddress> LocRib<A> {
     /// `previous` is the prefix's winner as the caller just read it.
     fn recompute_best(
         &mut self,
-        nlri: Nlri<A>,
+        key: CanonicalNlri<A>,
         previous: Option<PeerId>,
         oracle: &dyn NextHopOracle,
     ) {
@@ -467,16 +488,16 @@ impl<A: IpAddress> LocRib<A> {
         // Clone routes into a temp AHashMap — k is typically 1–8, negligible cost.
         let peer_map: AHashMap<PeerId, Route<A>> = self
             .peer_index
-            .get(&nlri)
+            .get(&key)
             .into_iter()
             .flatten()
-            .filter_map(|p| Some((*p, self.candidates.get(&(nlri, *p))?.clone())))
+            .filter_map(|p| Some((*p, self.candidates.get(&(key, *p))?.clone())))
             .collect();
 
         if let Some((peer, _)) = select_best_with_oracle(&peer_map, oracle) {
-            self.best.set(nlri.prefix(), previous, Some(peer));
+            self.best.set(key, previous, Some(peer));
         } else {
-            self.best.set(nlri.prefix(), previous, None);
+            self.best.set(key, previous, None);
         }
     }
 }
@@ -692,12 +713,13 @@ mod tests {
         rib.insert(peer(1), route("10.0.0.0/8"), &AlwaysReachable);
         assert!(rib.best(&n).is_some());
 
-        rib.candidates.remove(&(n, peer(1)));
+        let key = CanonicalNlri::new(n);
+        rib.candidates.remove(&(key, peer(1)));
         rib.peer_index
-            .get_mut(&n)
+            .get_mut(&key)
             .unwrap()
             .retain(|p| *p != peer(1));
-        rib.recompute_best(n, rib.best_peer(&n), &AlwaysReachable);
+        rib.recompute_best(key, rib.best_peer(&n), &AlwaysReachable);
 
         assert!(rib.best(&n).is_none());
     }
@@ -707,7 +729,11 @@ mod tests {
         // Calls recompute_best directly with a prefix that is not in candidates.
         // Covers the implicit else-fallthrough of `if let Some(peer_map)`.
         let mut rib: LocRib<Ipv4Addr> = LocRib::new();
-        rib.recompute_best(nlri("10.0.0.0/8"), None, &AlwaysReachable);
+        rib.recompute_best(
+            CanonicalNlri::new(nlri("10.0.0.0/8")),
+            None,
+            &AlwaysReachable,
+        );
         assert!(rib.is_empty());
     }
 

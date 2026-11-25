@@ -172,6 +172,7 @@ impl DaemonState {
         self.peer_max_prefixes_v6.remove(&peer_ip);
         self.peer_max_prefixes_restart.remove(&peer_ip);
         self.max_prefix_idle.remove(&peer_ip);
+        self.max_prefix_latched.remove(&peer_ip);
         let rib = Arc::make_mut(&mut self.rib);
         rib.peer_remote_as.remove(&peer_ip);
         rib.peer_types.remove(&peer_ip);
@@ -223,12 +224,18 @@ impl DaemonState {
         self.rib_mut().prefixes_advertised.insert(peer_ip, v4 + v6);
     }
 
+    /// Whether a max-prefix CEASE is keeping this peer's session down, either
+    /// until its restart time or until an operator acts.
+    pub(super) fn is_max_prefix_held(&self, peer_ip: IpAddr) -> bool {
+        self.max_prefix_idle.contains_key(&peer_ip) || self.max_prefix_latched.contains(&peer_ip)
+    }
+
     /// Drains and returns the list of peers whose outbound UPDATE channel
     /// overflowed during the most recent event.
     ///
-    /// The event loop calls this after each event and sends
-    /// [`SessionCommand::Stop`] to each returned peer so the session can
-    /// re-establish and perform a fresh full-table dump.
+    /// The event loop calls this after each event and resets each returned
+    /// peer's session ([`SessionCommand::AutomaticStop`]) so it re-establishes
+    /// and performs a fresh full-table dump.
     pub(super) fn take_stalled_peers(&mut self) -> Vec<IpAddr> {
         std::mem::take(&mut self.stalled_peers)
     }
@@ -978,13 +985,18 @@ pub(super) async fn run_command_processor<H, F, P>(
             DaemonCommand::RemovePeer(peer_ip) => {
                 // Mark for removal so the Terminated handler in the event loop
                 // performs a full state purge instead of a reconnect reset.
-                let existed = {
+                // `held_down`: max-prefix stopped the session and its
+                // teardown has been processed, so no further `Terminated` is
+                // coming from it.
+                let (existed, held_down) = {
                     let mut s = state.write().await;
                     if s.adj_ribs_in.contains_key(&peer_ip) {
                         s.pending_removal.insert(peer_ip);
-                        true
+                        let held_down = s.is_max_prefix_held(peer_ip)
+                            && !s.rib.peer_types.contains_key(&peer_ip);
+                        (true, held_down)
                     } else {
-                        false
+                        (false, false)
                     }
                 };
 
@@ -1016,6 +1028,16 @@ pub(super) async fn run_command_processor<H, F, P>(
                         let _ = tx.send(cmd).await;
                     } else {
                         let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                    if held_down {
+                        // The session is already stopped, so it will not report
+                        // another teardown: complete the removal here.
+                        let _ = event_tx
+                            .send((
+                                peer_ip,
+                                SessionEvent::Terminated(TerminationReason::OperatorStop),
+                            ))
+                            .await;
                     }
                 } else {
                     // No live session actor (peer is idle / between reconnects and the
