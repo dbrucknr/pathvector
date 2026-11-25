@@ -1316,7 +1316,14 @@ impl<T: BgpTransport> Session<T> {
     /// Execute a batch of FSM outputs. Returns `false` if a TCP send failed;
     /// the caller is responsible for feeding [`FsmInput::TcpFailed`] back to
     /// the FSM.
+    ///
+    /// A failed send drops the connection but does not abandon the batch. The
+    /// FSM has already changed state, so the outputs that follow (timers,
+    /// `SessionTerminated`) will not be produced again: from `Idle` the
+    /// `TcpFailed` fed back is ignored. Later sends find no transport and are
+    /// skipped.
     async fn execute(&mut self, outputs: Vec<FsmOutput>) -> bool {
+        let mut all_sent = true;
         for output in outputs {
             match output {
                 FsmOutput::InitiateTcpConnect => {
@@ -1348,7 +1355,7 @@ impl<T: BgpTransport> Session<T> {
                         && t.send(msg).await.is_err()
                     {
                         self.drop_connection();
-                        return false;
+                        all_sent = false;
                     }
                 }
                 FsmOutput::StartHoldTimer(d) => {
@@ -1415,7 +1422,7 @@ impl<T: BgpTransport> Session<T> {
                 }
             }
         }
-        true
+        all_sent
     }
 
     /// Handles one decoded (or failed-to-decode) message from the primary
@@ -1652,11 +1659,12 @@ mod tests {
 
     use super::{
         BgpTransport, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity, ConnectionOrigin,
-        DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand, SessionConfig,
+        DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, Session, SessionCommand, SessionConfig,
         SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason, spawn, spawn_with,
         spawn_with_collision_timeout,
     };
     use crate::framing::FramingError;
+    use crate::fsm::{Fsm, FsmConfig};
     use pathvector_types::Nlri;
 
     use crate::message::{
@@ -1750,7 +1758,16 @@ mod tests {
     /// `spawn_with` and NOT yet called `start`.
     async fn drive_to_established(handle: &mut SpawnedSessionHandle, peer: &mut MockPeer) {
         handle.start().await;
+        complete_handshake(handle, peer, peer_open()).await;
+    }
 
+    /// The handshake half of `drive_to_established`, for a session that has
+    /// already been started.
+    async fn complete_handshake(
+        handle: &mut SpawnedSessionHandle,
+        peer: &mut MockPeer,
+        open: BgpMessage,
+    ) {
         let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
             .await
             .expect("timed out waiting for OPEN from session")
@@ -1760,7 +1777,7 @@ mod tests {
             "expected OPEN from session, got {msg:?}"
         );
 
-        peer.recv_tx.send(Ok(peer_open())).unwrap();
+        peer.recv_tx.send(Ok(open)).unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
             .await
@@ -1984,6 +2001,205 @@ mod tests {
             matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after UPDATE write failure, got {event:?}"
         );
+    }
+
+    // ── Failed NOTIFICATION writes ──────────────────────────────────────────
+    //
+    // RFC 4271 §8.2.2 lists sending the NOTIFICATION as one action alongside
+    // deleting the routes, dropping the TCP connection and changing state to
+    // Idle; none of the others depends on the write succeeding.
+
+    /// A [`MockTransport`] that fails every NOTIFICATION write and nothing
+    /// else, so a keepalive cannot be what ends the session.
+    struct NotificationWriteFails(MockTransport);
+
+    impl BgpTransport for NotificationWriteFails {
+        async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
+            if matches!(msg, BgpMessage::Notification(_)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "mock: send failed",
+                ));
+            }
+            self.0.send(msg).await
+        }
+
+        async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
+            self.0.recv().await
+        }
+    }
+
+    const SHORT_RETRY: Duration = Duration::from_millis(200);
+
+    /// A session that dials a loopback listener and wraps each connection in a
+    /// fresh [`NotificationWriteFails`]. Every dial yields one `MockPeer`, which
+    /// is how a test sees whether the session reconnected.
+    async fn spawn_with_failing_notifications(
+        hold_time: u16,
+    ) -> (
+        SpawnedSessionHandle,
+        mpsc::UnboundedReceiver<MockPeer>,
+        TcpListener,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.hold_time = hold_time;
+        config.peer_addr = listener.local_addr().unwrap();
+        config.connect_retry_time = SHORT_RETRY;
+
+        let (peers_tx, peers_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (update_tx, update_rx) = mpsc::channel(256);
+        let session: Session<NotificationWriteFails> = Session {
+            fsm: Fsm::new(FsmConfig {
+                local_as: config.local_as,
+                local_bgp_id: config.local_bgp_id,
+                hold_time: config.hold_time,
+                capabilities: config.capabilities.clone(),
+                required_capabilities: config.required_capabilities.clone(),
+                peer_as: config.peer_as,
+                confederation_member: config.confederation_member,
+                public_as: config.public_as,
+            }),
+            config,
+            cmd_rx,
+            event_tx,
+            hold_deadline: None,
+            keepalive_deadline: None,
+            retry_deadline: None,
+            transport: None,
+            pending_transport: None,
+            pending_input: None,
+            connect_task: None,
+            connect_factory: Some(Box::new(move |_stream| {
+                let (mock, peer) = MockTransport::pair();
+                let _ = peers_tx.send(peer);
+                NotificationWriteFails(mock)
+            })),
+            local_addr: None,
+            transport_identity: None,
+            pending_collision_candidate: None,
+            pending_collision_deadline: None,
+            collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
+            update_rx,
+            termination_reason: TerminationReason::Unclean,
+        };
+        tokio::spawn(session.run());
+
+        let handle = SpawnedSessionHandle {
+            cmd_tx,
+            event_rx,
+            update_tx,
+        };
+        (handle, peers_rx, listener)
+    }
+
+    async fn next_peer(peers: &mut mpsc::UnboundedReceiver<MockPeer>) -> MockPeer {
+        tokio::time::timeout(Duration::from_secs(2), peers.recv())
+            .await
+            .expect("timed out waiting for the session to dial")
+            .expect("session task ended")
+    }
+
+    async fn expect_terminated(
+        handle: &mut SpawnedSessionHandle,
+        within: Duration,
+    ) -> TerminationReason {
+        match tokio::time::timeout(within, handle.next_event()).await {
+            Ok(Some(SessionEvent::Terminated(reason))) => reason,
+            other => panic!("expected Terminated, got {other:?}"),
+        }
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 8 (`AutomaticStop`).
+    #[tokio::test]
+    async fn failed_notification_write_on_automatic_stop_still_terminates_and_reconnects() {
+        let (mut handle, mut peers, _listener) = spawn_with_failing_notifications(90).await;
+        handle.start().await;
+        let mut peer = next_peer(&mut peers).await;
+        complete_handshake(&mut handle, &mut peer, peer_open()).await;
+
+        handle
+            .stop_sender()
+            .send(SessionCommand::AutomaticStop(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::OutOfResources),
+                data: vec![],
+            }))
+            .await
+            .unwrap();
+
+        let reason = expect_terminated(&mut handle, Duration::from_secs(1)).await;
+        assert!(
+            matches!(reason, TerminationReason::OperatorStop),
+            "{reason:?}"
+        );
+        next_peer(&mut peers).await;
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 10 (`HoldTimer_Expires`).
+    #[tokio::test]
+    async fn failed_notification_write_on_hold_expiry_still_terminates_and_reconnects() {
+        let (mut handle, mut peers, _listener) = spawn_with_failing_notifications(3).await;
+        handle.start().await;
+        let mut peer = next_peer(&mut peers).await;
+        complete_handshake(&mut handle, &mut peer, peer_open()).await;
+
+        // The peer says nothing more, so the 3 s hold timer expires.
+        let reason = expect_terminated(&mut handle, Duration::from_secs(5)).await;
+        assert!(matches!(reason, TerminationReason::Unclean), "{reason:?}");
+        next_peer(&mut peers).await;
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 2 (`ManualStop`), and the same stop
+    /// carrying a caller's NOTIFICATION: Idle, with no reconnect.
+    #[tokio::test]
+    async fn failed_notification_write_on_stop_still_terminates_and_stays_down() {
+        let max_prefix = SessionCommand::Notification(NotificationMessage {
+            error: NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+            data: vec![],
+        });
+        for command in [SessionCommand::Stop, max_prefix] {
+            let (mut handle, mut peers, _listener) = spawn_with_failing_notifications(90).await;
+            handle.start().await;
+            let mut peer = next_peer(&mut peers).await;
+            complete_handshake(&mut handle, &mut peer, peer_open()).await;
+
+            handle.stop_sender().send(command).await.unwrap();
+
+            let reason = expect_terminated(&mut handle, Duration::from_secs(1)).await;
+            assert!(
+                matches!(reason, TerminationReason::OperatorStop),
+                "{reason:?}"
+            );
+            assert!(
+                tokio::time::timeout(SHORT_RETRY * 3, peers.recv())
+                    .await
+                    .is_err(),
+                "a stopped session dialled again"
+            );
+        }
+    }
+
+    /// RFC 4271 §8.2.2 `OpenSent`, Event 10. The session never reached
+    /// Established, so there is no `Terminated`, but the reconnect this
+    /// implementation schedules on hold expiry must survive the failed write.
+    #[tokio::test]
+    async fn failed_notification_write_in_open_sent_still_reconnects() {
+        let (handle, mut peers, _listener) = spawn_with_failing_notifications(90).await;
+        handle.start().await;
+        let mut peer = next_peer(&mut peers).await;
+        let sent = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for OPEN");
+        assert!(matches!(sent, Some(BgpMessage::Open(_))), "{sent:?}");
+
+        // Skip the 4-minute OpenSent hold timer, then dial in real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(241)).await;
+        tokio::time::resume();
+
+        next_peer(&mut peers).await;
     }
 
     /// `stop_sender` returns a live `Sender` that can enqueue a `Stop` command.

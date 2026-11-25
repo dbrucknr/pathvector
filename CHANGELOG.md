@@ -35,6 +35,9 @@ idle-hold expiry only removed its own deadline.
 - `Stop` and `Notification` sent while a reconnect is pending now cancel it, and `Notification` now
   stops the session from every state. Both used to be ignored in places, and the session dialled
   again.
+- A teardown now completes when its NOTIFICATION cannot be written. The session used to abandon
+  the rest of the teardown: no `Terminated` event, so the daemon was never told the session had
+  ended, and no reconnect timer. This also affected hold timer expiry and `Stop` before this change.
 - `FsmInput::ProtocolErrorNotificationToSend` is renamed to `FsmInput::AutomaticStop`. Nothing
   outside the FSM's own tests constructed it.
 
