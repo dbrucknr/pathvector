@@ -13,6 +13,14 @@
 //! * AGGREGATOR — RFC 7606 §7.7: attribute discard.
 //! * AS4_PATH, AS4_AGGREGATOR — RFC 6793 §6: attribute discard.
 //!
+//! RFC 9774 §3: "Unless explicitly configured by a network operator to do
+//! otherwise [...] BGP speakers: [...] MUST use the "treat-as-withdraw" error
+//! handling behavior per [RFC7606] upon reception of BGP UPDATE messages
+//! containing AS_SETs or AS_CONFED_SETs in the AS_PATH or AS4_PATH". This
+//! speaker offers no such configuration. The clause is unconditional about
+//! AS4_PATH, so it also applies where RFC 6793 alone would merely discard the
+//! attribute or segment: by §3(h) the stronger action wins.
+//!
 //! RFC 7606 §3(g): of a repeated attribute only the first occurrence counts.
 //! §3(h): among several errors, the strongest action applies.
 
@@ -21,6 +29,7 @@
 use std::net::Ipv4Addr;
 
 use pathvector_types::{Aggregator, AsPath, AsPathSegment, Asn, Nlri};
+use proptest::prelude::*;
 
 use super::{
     AsnWidth, AttributeErrorPolicy, BgpMessage, MAX_LEN_EXTENDED, MalformedUpdate, PathAttribute,
@@ -370,4 +379,152 @@ fn non_zero_as_numbers_are_accepted() {
         ],
     );
     assert!(matches!(msg, BgpMessage::Update(_)), "{msg:?}");
+}
+
+// ── AS_SET / AS_CONFED_SET (RFC 9774) ────────────────────────────────────────
+
+#[test]
+fn either_set_type_in_as_path_is_treat_as_withdraw() {
+    for width in BOTH_WIDTHS {
+        for kind in [SET, CONFED_SET] {
+            for segs in [
+                vec![(kind, &[65001u32, 65002][..])],
+                // A single-member set is still a set.
+                vec![(SEQUENCE, &[65001][..]), (kind, &[65002][..])],
+                vec![(kind, &[65002][..]), (SEQUENCE, &[65001][..])],
+            ] {
+                let msg = decode(width, &[as_path(&segs, width)]);
+                let m = assert_treat_as_withdraw(msg, AS_PATH);
+                // The attribute is retained as received, for inspection.
+                assert!(
+                    decoded_path(&m.update.attributes)
+                        .segments()
+                        .iter()
+                        .any(|s| matches!(s, AsPathSegment::Set(_) | AsPathSegment::ConfedSet(_))),
+                    "{m:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The reproduction in issue #110: confederation layout that is otherwise
+/// well formed (RFC 5065 §5 leading AS_CONFED_SEQUENCE).
+#[test]
+fn confed_set_after_a_confed_sequence_is_treat_as_withdraw() {
+    let width = AsnWidth::Four;
+    let msg = decode(
+        width,
+        &[as_path(
+            &[(CONFED_SEQUENCE, &[65010]), (CONFED_SET, &[65011, 65012])],
+            width,
+        )],
+    );
+    assert_treat_as_withdraw(msg, AS_PATH);
+}
+
+#[test]
+fn either_set_type_in_as4_path_is_treat_as_withdraw_at_either_width() {
+    for width in BOTH_WIDTHS {
+        for kind in [SET, CONFED_SET] {
+            let msg = decode(
+                width,
+                &[
+                    as_path(&[(SEQUENCE, &[65001, 23456])], width),
+                    as4_path(&[(kind, &[131_072])]),
+                ],
+            );
+            assert_treat_as_withdraw(msg, AS4_PATH);
+        }
+    }
+}
+
+/// RFC 9774 names only the two set types: a confederation *sequence* in
+/// AS4_PATH is still just discarded (RFC 6793 §6).
+#[test]
+fn confed_sequence_in_as4_path_is_still_only_discarded() {
+    let msg = decode(
+        AsnWidth::Two,
+        &[
+            as_path(&[(SEQUENCE, &[65001, 23456])], AsnWidth::Two),
+            as4_path(&[(CONFED_SEQUENCE, &[65010]), (SEQUENCE, &[131_072])]),
+        ],
+    );
+    let m = assert_discard(msg, &[AS4_PATH]);
+    assert_eq!(
+        decoded_path(&m.update.attributes),
+        AsPath::from_segments(vec![seq(&[65001, 131_072])])
+    );
+}
+
+/// Both violations in one AS4_PATH: the stronger action applies, and the
+/// AS 0 is not merged into AS_PATH.
+#[test]
+fn set_and_as_zero_in_as4_path_is_treat_as_withdraw() {
+    let msg = decode(
+        AsnWidth::Two,
+        &[
+            as_path(&[(SEQUENCE, &[65001, 23456])], AsnWidth::Two),
+            as4_path(&[(SET, &[0])]),
+        ],
+    );
+    let m = assert_treat_as_withdraw(msg, AS4_PATH);
+    assert!(!decoded_path(&m.update.attributes).contains(Asn::ZERO));
+}
+
+#[test]
+fn a_set_in_a_repeated_as_path_is_ignored() {
+    let width = AsnWidth::Four;
+    let clean = as_path(&[(SEQUENCE, &[65001])], width);
+    let set = as_path(&[(SET, &[65002])], width);
+    assert_discard(decode(width, &[clean.clone(), set.clone()]), &[AS_PATH]);
+    assert_treat_as_withdraw(decode(width, &[set, clean]), AS_PATH);
+}
+
+proptest! {
+    /// Over every layout of up to four segments: withdrawn exactly when a set
+    /// segment or AS 0 appears, clean otherwise.
+    #[test]
+    fn prop_as_path_verdict(
+        segs in proptest::collection::vec(
+            (
+                prop_oneof![Just(SET), Just(SEQUENCE), Just(CONFED_SEQUENCE), Just(CONFED_SET)],
+                proptest::collection::vec(prop_oneof![1 => Just(0u32), 20 => 1u32..=65_535], 1..4),
+            ),
+            0..4,
+        ),
+        four in any::<bool>(),
+    ) {
+        let width = if four { AsnWidth::Four } else { AsnWidth::Two };
+        let borrowed: Vec<(u8, &[u32])> = segs.iter().map(|(k, a)| (*k, a.as_slice())).collect();
+        let prohibited = segs
+            .iter()
+            .any(|(k, a)| matches!(*k, SET | CONFED_SET) || a.contains(&0));
+        let update = match decode(width, &[as_path(&borrowed, width)]) {
+            BgpMessage::Update(u) => {
+                prop_assert!(!prohibited);
+                u
+            }
+            BgpMessage::MalformedUpdate(m) => {
+                prop_assert!(prohibited);
+                prop_assert!(m.treat_as_withdraw);
+                m.update
+            }
+            other => return Err(TestCaseError::fail(format!("{other:?}"))),
+        };
+        // Whatever the verdict, the segments are represented as received.
+        let want: Vec<_> = segs
+            .iter()
+            .map(|(kind, asns)| {
+                let asns = asns.iter().copied().map(Asn::new).collect();
+                match *kind {
+                    SET => AsPathSegment::Set(asns),
+                    SEQUENCE => AsPathSegment::Sequence(asns),
+                    CONFED_SEQUENCE => AsPathSegment::ConfedSequence(asns),
+                    _ => AsPathSegment::ConfedSet(asns),
+                }
+            })
+            .collect();
+        prop_assert_eq!(decoded_path(&update.attributes), AsPath::from_segments(want));
+    }
 }

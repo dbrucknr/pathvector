@@ -3065,10 +3065,11 @@ mod propagate_tests {
 
 /// RFC 7607 §2: "A BGP speaker MUST NOT originate or propagate a route with an
 /// AS number of zero in the AS_PATH, AS4_PATH, AGGREGATOR, or AS4_AGGREGATOR
-/// attributes" (issue #111). Ingress rejects such routes, so these cases reach
-/// the Loc-RIB only from a non-wire source.
+/// attributes" (issue #111), and RFC 9774 §3 on sets (issue #110). Ingress
+/// rejects such routes, so these cases reach the Loc-RIB only from a non-wire
+/// source.
 #[cfg(test)]
-mod egress_as_zero_tests {
+mod egress_rules_tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::{DefaultAction, Policy};
@@ -3180,6 +3181,45 @@ mod egress_as_zero_tests {
             let (_, only) =
                 advertise_then_replace_v4(peer_type, route(n4(), &[0]), route(n4(), &[0]));
             assert!(matches!(only, PrefixDecision::NoChange), "{only:?}");
+        }
+    }
+
+    /// RFC 9774 §3: no UPDATE containing a set is sent. The judgement is on
+    /// the path as it would go out: AS_CONFED_SET is stripped toward a
+    /// genuine external peer (RFC 5065 §5.3) and the route is then fine to
+    /// send, but not toward a confederation member.
+    #[test]
+    fn sets_are_judged_on_the_path_that_would_be_sent() {
+        use pathvector_types::AsPathSegment::{ConfedSet, Sequence, Set};
+        let with = |segments: Vec<pathvector_types::AsPathSegment>| {
+            RouteBuilder::new(n4(), Origin::Igp, AsPath::from_segments(segments))
+                .next_hop(NextHop::V4(Ipv4Addr::new(10, 0, 0, 1)))
+                .build()
+        };
+        let seq = || Sequence(vec![Asn::new(65002)]);
+        let set = || with(vec![seq(), Set(vec![Asn::new(65003)])]);
+        let confed_set = || with(vec![ConfedSet(vec![Asn::new(65010)]), seq()]);
+
+        for peer_type in [
+            PeerType::External,
+            PeerType::Internal,
+            PeerType::ConfedMember,
+        ] {
+            let (first, second) = advertise_then_replace_v4(peer_type, with(vec![seq()]), set());
+            // iBGP split horizon does not apply: the source is eBGP.
+            assert!(matches!(first, PrefixDecision::Announce(_)), "{first:?}");
+            assert!(matches!(second, PrefixDecision::Withdraw(_)), "{second:?}");
+        }
+        for peer_type in [PeerType::Internal, PeerType::ConfedMember] {
+            let (_, second) = advertise_then_replace_v4(peer_type, with(vec![seq()]), confed_set());
+            assert!(matches!(second, PrefixDecision::Withdraw(_)), "{second:?}");
+        }
+        let (_, external) =
+            advertise_then_replace_v4(PeerType::External, with(vec![seq()]), confed_set());
+        match external {
+            PrefixDecision::NoChange => {}
+            PrefixDecision::Announce(r) => assert!(!r.as_path.contains_as_set(), "{r:?}"),
+            PrefixDecision::Withdraw(_) => panic!("stripped path is advertisable"),
         }
     }
 

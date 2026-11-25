@@ -18,6 +18,10 @@ pub(crate) enum EgressBlock {
     /// with an AS number of zero in the AS_PATH [or] AS4_PATH". AS4_PATH is
     /// derived from AS_PATH, so checking the latter covers both.
     AsZero,
+    /// RFC 9774 §3: "BGP speakers: MUST NOT advertise BGP UPDATE messages
+    /// containing AS_SETs or AS_CONFED_SETs". No operator exception is
+    /// offered.
+    AsSet,
 }
 
 impl EgressBlock {
@@ -25,13 +29,20 @@ impl EgressBlock {
     pub(crate) const fn describe(self) -> &'static str {
         match self {
             Self::AsZero => "AS_PATH contains reserved AS 0 (RFC 7607)",
+            Self::AsSet => "AS_PATH contains AS_SET or AS_CONFED_SET (RFC 9774)",
         }
     }
 }
 
 /// Checks the AS_PATH about to be advertised.
 pub(crate) fn check_as_path(as_path: &AsPath) -> Option<EgressBlock> {
-    as_path.contains(Asn::ZERO).then_some(EgressBlock::AsZero)
+    if as_path.contains(Asn::ZERO) {
+        Some(EgressBlock::AsZero)
+    } else if as_path.contains_as_set() {
+        Some(EgressBlock::AsSet)
+    } else {
+        None
+    }
 }
 
 /// The AGGREGATOR to advertise, if any.
@@ -68,6 +79,23 @@ mod tests {
             check_as_path(&AsPath::from_sequence(vec![Asn::new(65001)])),
             None
         );
+    }
+
+    #[test]
+    fn either_set_type_blocks_and_sequences_do_not() {
+        let asns = vec![Asn::new(65001)];
+        for (segment, want) in [
+            (AsPathSegment::Set(asns.clone()), Some(EgressBlock::AsSet)),
+            (
+                AsPathSegment::ConfedSet(asns.clone()),
+                Some(EgressBlock::AsSet),
+            ),
+            (AsPathSegment::Sequence(asns.clone()), None),
+            (AsPathSegment::ConfedSequence(asns.clone()), None),
+        ] {
+            let path = AsPath::from_segments(vec![segment]);
+            assert_eq!(check_as_path(&path), want, "{path}");
+        }
     }
 
     #[test]

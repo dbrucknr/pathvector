@@ -4,6 +4,14 @@
 /// you encounter in practice have a single `Sequence` segment, but aggregation
 /// and confederations introduce the other types.
 ///
+/// # Representation is not permission
+///
+/// `Set` and `ConfedSet` are deprecated: RFC 9774 forbids advertising them and
+/// requires a received one to be treated as a withdrawal. These types still
+/// represent them, so historical data and offending messages can be decoded and
+/// inspected; the live session and the speaker enforce the rule. Likewise any
+/// segment can hold AS 0, which RFC 7607 prohibits on the wire.
+///
 /// # Segment types
 ///
 /// | Variant | Wire type | Meaning |
@@ -102,6 +110,13 @@ impl AsPathSegment {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.asns().is_empty()
+    }
+
+    /// Returns `true` for `AS_SET` and `AS_CONFED_SET`, the two segment types
+    /// RFC 9774 deprecates.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        matches!(self, Self::Set(_) | Self::ConfedSet(_))
     }
 
     /// Returns `true` for `AS_CONFED_SEQUENCE` and `AS_CONFED_SET` (RFC 5065).
@@ -302,6 +317,27 @@ impl AsPath {
     #[must_use]
     pub fn contains(&self, asn: crate::Asn) -> bool {
         self.segments.iter().any(|seg| seg.contains(asn))
+    }
+
+    /// Returns `true` if this path holds an `AS_SET` or `AS_CONFED_SET`
+    /// segment.
+    ///
+    /// RFC 9774 §3: unless an operator configures otherwise, a speaker must
+    /// not advertise such a path and must treat a received one as a
+    /// withdrawal.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath, AsPathSegment};
+    ///
+    /// assert!(!AsPath::from_sequence(vec![Asn::new(65001)]).contains_as_set());
+    /// let aggregated = AsPath::from_segments(vec![AsPathSegment::Set(vec![Asn::new(65001)])]);
+    /// assert!(aggregated.contains_as_set());
+    /// ```
+    #[must_use]
+    pub fn contains_as_set(&self) -> bool {
+        self.segments.iter().any(AsPathSegment::is_set)
     }
 
     /// Returns the BGP path length used in best-path selection.

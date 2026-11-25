@@ -1253,7 +1253,7 @@ pub(super) fn process_update(
     }
 
     // ── Pre-policy checks on the AS_PATH (issue #138) ───────────────────────
-    // AS 0 (RFC 7607) and an AS loop (RFC 4271 §9.1.2 / RFC 5065 §4) are
+    // AS 0 (RFC 7607), AS_SET / AS_CONFED_SET (RFC 9774) and an AS loop (RFC 4271 §9.1.2 / RFC 5065 §4) are
     // properties of the whole UPDATE, so they are decided once here. They are
     // *applied* per announced NLRI below, not by discarding the NLRI: an
     // announcement dropped here still replaces the peer's older route for
@@ -1266,11 +1266,12 @@ pub(super) fn process_update(
     if let Some(drop) = as_path_drop
         && (!msg.announced.is_empty() || !mp_v4_announced.is_empty() || !mp_v6_announced.is_empty())
     {
-        if drop == IngressDrop::AsZero {
+        if drop.disposition() == Disposition::TreatAsWithdraw {
             tracing::warn!(
                 peer = %peer,
                 %as_path,
-                "AS_PATH contains reserved AS 0 (RFC 7607) — treat-as-withdraw (RFC 7606)"
+                "{} — treat-as-withdraw (RFC 7606)",
+                drop.describe()
             );
         } else {
             tracing::debug!(

@@ -1410,6 +1410,23 @@ mod tests {
         );
     }
 
+    /// A message whose path holds a set parses back unchanged but is flagged
+    /// treat-as-withdraw (RFC 9774 §3).
+    fn set_flagged_roundtrip(msg: &UpdateMessage) {
+        let encoded = msg.encode_with(AsnWidth::Four);
+        let mut cur = Cursor::new(&encoded[19..]);
+        let UpdateDecodeOutcome::Partial {
+            update,
+            treat_as_withdraw,
+            ..
+        } = UpdateMessage::decode(&mut cur, AsnWidth::Four).unwrap()
+        else {
+            panic!("a set must be flagged");
+        };
+        assert!(treat_as_withdraw);
+        assert_eq!(&update, msg);
+    }
+
     fn nlri4(s: &str) -> Nlri<Ipv4Addr> {
         s.parse().unwrap()
     }
@@ -1634,7 +1651,7 @@ mod tests {
             ],
             announced: vec![nlri4("10.0.0.0/8")],
         };
-        roundtrip(msg);
+        set_flagged_roundtrip(&msg);
     }
 
     #[test]
@@ -1746,7 +1763,7 @@ mod tests {
             attributes: vec![PathAttribute::AsPath(path)],
             announced: vec![],
         };
-        roundtrip(msg);
+        set_flagged_roundtrip(&msg);
     }
 
     #[test]

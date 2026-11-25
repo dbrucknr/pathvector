@@ -171,9 +171,9 @@ impl Writer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MalformedUpdate {
     /// The UPDATE with undecodable and discarded attributes removed. An
-    /// attribute that decoded but may not carry the AS numbers it does
-    /// (RFC 7607), and calls for treat-as-withdraw, is kept so the UPDATE can
-    /// be inspected as received; recovery strips it.
+    /// attribute that decoded but may not carry what it does (AS 0, RFC 7607;
+    /// `AS_SET` / `AS_CONFED_SET`, RFC 9774), and calls for treat-as-withdraw,
+    /// is kept so the UPDATE can be inspected as received; recovery strips it.
     pub update: UpdateMessage,
     /// Per-attribute errors with their RFC 7606 policies.
     pub errors: Vec<AttributeDecodeError>,
