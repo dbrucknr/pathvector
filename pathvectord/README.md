@@ -23,8 +23,10 @@ and decides which routes to install in the local routing table.
    it, the peer's older candidate is withdrawn, because the new advertisement implicitly
    withdraws the old one (RFC 4271 §9). The same holds for an announcement dropped before
    policy: an AS_PATH loop or our own address as NEXT_HOP leaves the peer with no candidate
-   (the ineligible route is kept in Adj-RIB-In), and AS 0 or a syntactically invalid
-   NEXT_HOP is treated as a withdrawal (RFC 7606), removing the older route outright.
+   (the ineligible route is kept in Adj-RIB-In), and AS 0 (RFC 7607), an `AS_SET` or
+   `AS_CONFED_SET` (RFC 9774) or a syntactically invalid NEXT_HOP is treated as a
+   withdrawal (RFC 7606), removing the older route outright. Neither AS 0 nor a set is
+   ever advertised, and there is no setting that permits sets.
    Best-path selection then picks a winner, which
    goes to Adj-RIB-Out for each peer that export policy allows it to reach.
 
@@ -499,7 +501,7 @@ daemon. Other sessions are never interrupted.
 | Field | Required | Description |
 |---|---|---|
 | `address` | ✓ | IPv4 address of the new peer |
-| `remote_as` | ✓ | Remote AS number. AS 0 and AS 23456 (AS_TRANS) are rejected. |
+| `remote_as` | ✓ | Remote AS number. AS 0 and AS 23456 (AS_TRANS) are rejected. AS 0 is also refused in the config file (`local_as`, `confederation_id`, `remote_as`). |
 | `port` | — | TCP port; defaults to 179 |
 | `import_default` | — | `POLICY_ACTION_ACCEPT` or `POLICY_ACTION_REJECT`; defaults to RFC 8212 (reject for eBGP, accept for iBGP) |
 | `export_default` | — | Same semantics as `import_default` |
