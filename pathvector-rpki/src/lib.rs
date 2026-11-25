@@ -19,10 +19,12 @@
 mod cache;
 mod client;
 mod error;
+mod frame;
 mod pdu;
 mod protocol;
 mod table;
 mod timers;
+mod transport;
 
 #[cfg(test)]
 mod regression_tests;
@@ -36,4 +38,4 @@ pub use table::{RoaTable, RoaValidity};
 #[cfg(any(test, feature = "test-util"))]
 pub use client::for_testing;
 #[cfg(any(test, feature = "test-util"))]
-pub use pdu::decode_for_fuzzing;
+pub use frame::decode_for_fuzzing;

@@ -24,8 +24,8 @@ use tokio::{
 
 use crate::{
     RoaValidity, RtrClient, RtrConfig, RtrHandle, RtrVersion,
-    client::{read_pdu, write_pdu},
     pdu::{EndOfDataIntervals, Pdu, PrefixFlags},
+    transport::{read_pdu, write_pdu},
 };
 
 // ── Harness ──────────────────────────────────────────────────────────────
@@ -1627,4 +1627,186 @@ async fn incremental_transfer_in_flight_at_expiry_is_not_applied_to_the_flushed_
         !handle.status().expired,
         "a completed sync clears `expired`"
     );
+}
+
+// ── #89: a refresh must not lose the bytes of a partially received PDU ───
+
+/// The cache writes the first `split` bytes of a Serial Notify while the
+/// router is idle, and the rest only after the router's *timer-driven* Serial
+/// Query arrives — so the refresh timer provably fired with exactly `split`
+/// bytes of a frame already received. TCP guarantees only the byte stream, so
+/// the router must reassemble the Notify and carry on in the same session.
+///
+/// RFC 8210 §5.2 lets a cache send Serial Notify at any time, and §5.1 makes
+/// the Length field, not the transport's segmentation, delimit a PDU.
+async fn refresh_with_partial_notify_keeps_the_session(version: RtrVersion, split: usize) {
+    const SESSION: u16 = 7;
+    let end_of_data = move |serial: u32| match version {
+        RtrVersion::V0 => Pdu::EndOfData {
+            session_id: SESSION,
+            serial,
+            intervals: None,
+        },
+        // 1 s is the smallest Refresh Interval §6 allows a cache to advertise.
+        RtrVersion::V1 => eod_with(SESSION, serial, 1, 600, 7200),
+    };
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| async move {
+        use tokio::io::AsyncWriteExt;
+        if conn != 0 {
+            hold_open().await;
+        }
+        tap.read(&mut s).await; // Reset Query
+        send(
+            &mut s,
+            version,
+            Pdu::CacheResponse {
+                session_id: SESSION,
+            },
+        )
+        .await;
+        send(&mut s, version, end_of_data(1)).await;
+        let notify = crate::pdu::encode(
+            version,
+            &Pdu::SerialNotify {
+                session_id: SESSION,
+                serial: 2,
+            },
+        );
+        s.write_all(&notify[..split]).await.unwrap();
+        tap.read(&mut s).await; // Serial Query, sent because the timer fired
+        s.write_all(&notify[split..]).await.unwrap();
+        send(
+            &mut s,
+            version,
+            Pdu::CacheResponse {
+                session_id: SESSION,
+            },
+        )
+        .await;
+        send(&mut s, version, end_of_data(2)).await;
+        // Anything further (an Error Report in particular) is reported.
+        while tap.read(&mut s).await.is_some() {}
+        hold_open().await;
+    })
+    .await;
+    cache.config.initial_version = version;
+    // v0 End of Data carries no intervals, so the configured one applies.
+    if version == RtrVersion::V0 {
+        cache.config.refresh_interval = Duration::from_millis(200);
+    }
+
+    let (handle, join) = RtrClient::spawn(cache.config.clone());
+    let ctx = format!("{version:?}, split at byte {split}");
+    cache.next_seen("Reset Query").await;
+    let query = cache.next_seen("timer-driven Serial Query").await;
+    assert_eq!(
+        query.pdu,
+        Pdu::SerialQuery {
+            session_id: SESSION,
+            serial: 1
+        },
+        "{ctx}"
+    );
+    wait_for(&format!("the refresh to complete ({ctx})"), || {
+        handle.status().serial == Some(2) || !handle.status().connected
+    })
+    .await;
+    let status = handle.status();
+    assert_eq!(
+        (status.connected, status.serial, status.last_error),
+        (true, Some(2), None),
+        "{ctx}: the refresh must complete on the original session"
+    );
+    assert_eq!(cache.accepted(), 1, "{ctx}: no reconnect");
+    join.abort();
+}
+
+/// Every proper split point of the 12-byte Serial Notify: all seven partial
+/// headers, the exact header boundary, and all partial bodies.
+async fn every_split_of_a_notify(version: RtrVersion) {
+    let cases: Vec<_> = (1..12)
+        .map(|split| {
+            tokio::spawn(refresh_with_partial_notify_keeps_the_session(
+                version, split,
+            ))
+        })
+        .collect();
+    let mut failed = Vec::new();
+    for (split, case) in (1..12).zip(cases) {
+        if case.await.is_err() {
+            failed.push(split);
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{version:?}: lost bytes at splits {failed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_timer_mid_notify_loses_no_bytes_v1() {
+    every_split_of_a_notify(RtrVersion::V1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_timer_mid_notify_loses_no_bytes_v0() {
+    every_split_of_a_notify(RtrVersion::V0).await;
+}
+
+// ── Cost report ──────────────────────────────────────────────────────────
+
+/// Full-load wall time, from the router's Reset Query reaching the cache to
+/// the completed-sync notification, over loopback TCP with the whole response
+/// written at once. Run with
+/// `cargo test --release -p pathvector-rpki -- --ignored --nocapture sync_cost`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark: prints timings, asserts nothing"]
+async fn sync_cost_report() {
+    use tokio::io::AsyncWriteExt;
+
+    for (records, iterations) in [(100u32, 301), (1_000, 201), (10_000, 101)] {
+        let mut response =
+            crate::pdu::encode(RtrVersion::V1, &Pdu::CacheResponse { session_id: 1 });
+        for i in 0..records {
+            let address = Ipv4Addr::from(0x0a00_0000 + (i << 8));
+            response.extend(crate::pdu::encode(
+                RtrVersion::V1,
+                &v4(&address.to_string(), 24, 64500),
+            ));
+        }
+        response.extend(crate::pdu::encode(RtrVersion::V1, &eod(1, 1)));
+        let response = Arc::new(response);
+
+        let mut samples = Vec::new();
+        for _ in 0..iterations {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = Arc::clone(&response);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                read_pdu(&mut s).await.unwrap();
+                let _ = started_tx.send(std::time::Instant::now());
+                s.write_all(&response).await.unwrap();
+                hold_open().await;
+            });
+            let (handle, join) = RtrClient::spawn(RtrConfig {
+                port,
+                ..Default::default()
+            });
+            let mut changed = handle.subscribe();
+            let started = started_rx.await.unwrap();
+            changed.changed().await.unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(handle.status().roa_count, records as usize);
+            join.abort();
+            server.abort();
+        }
+        samples.sort();
+        println!(
+            "full sync of {records:>6} VRPs: median {:?} (min {:?}, {iterations} runs)",
+            samples[samples.len() / 2],
+            samples[0]
+        );
+    }
 }
