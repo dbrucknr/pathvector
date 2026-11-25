@@ -63,7 +63,7 @@ sudo apt install protobuf-compiler
 cargo install cargo-fuzz
 cargo install --locked cargo-nextest
 cargo install just
-``
+```
 
 ```toml
 # config.toml — minimal eBGP peer config
