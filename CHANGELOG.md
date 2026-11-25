@@ -16,8 +16,8 @@ bounded-length matching.
   never apply to another's prefix.
 - **Entry rules come from `ipnetx`:** `prefix length <= min <= max <= address width`, with
   host bits normalized. An empty list matches nothing.
-- **Dependency:** requires the `ipnetx` release that adds `prefix_match`; 0.3.0 does not
-  have it.
+- **Dependency:** the workspace now requires `ipnetx` 0.3.1, which adds `prefix_match`. The
+  release is additive over 0.3.0.
 - **Unchanged:** `PrefixListCondition` keeps its whole-range union semantics.
 - **Not included:** And/Or combinators (the rest of issue #84) and any daemon configuration.
 

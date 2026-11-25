@@ -1634,9 +1634,9 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "ipnetx"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50d6743467d5a35b780780bee8efdc46478ca2892f5563db20342a93d8c93dd3"
+checksum = "ae80fa62df12b1ac0623f7e50136cccba1e7e90edf36f0ebee7bd6227744bcfd"
 
 [[package]]
 name = "is_terminal_polyfill"
