@@ -14,10 +14,10 @@
 //! [`LocRib`](crate::LocRib).
 
 use ahash::AHashMap;
-use ipnetx::{interfaces::IpAddress, prefix::IpPrefix};
+use ipnetx::interfaces::IpAddress;
 use routemap::RouteMap;
 
-use crate::peer::PeerId;
+use crate::{canonical::CanonicalNlri, peer::PeerId};
 
 /// Winning peer per prefix, with an incrementally maintained win count per
 /// peer.
@@ -38,26 +38,26 @@ impl<A: IpAddress> BestTable<A> {
         }
     }
 
-    /// The peer currently winning `prefix`.
-    pub(crate) fn get(&self, prefix: IpPrefix<A>) -> Option<PeerId> {
-        self.winners.get(prefix).copied()
+    /// The peer currently winning `key`.
+    pub(crate) fn get(&self, key: CanonicalNlri<A>) -> Option<PeerId> {
+        self.winners.get(key.prefix()).copied()
     }
 
-    /// Makes `winner` the winner of `prefix` (`None` clears it), keeping the
+    /// Makes `winner` the winner of `key` (`None` clears it), keeping the
     /// per-peer counts in step. The single mutation point of the table.
     ///
     /// The caller passes the winner it has just read as `previous` (every
     /// `LocRib` mutation already does, to classify the transition), which
     /// saves a second walk of the prefix tree on the insert hot path.
-    /// `previous` must equal [`get`](Self::get) for `prefix`; debug builds
+    /// `previous` must equal [`get`](Self::get) for `key`; debug builds
     /// assert it.
     pub(crate) fn set(
         &mut self,
-        prefix: IpPrefix<A>,
+        key: CanonicalNlri<A>,
         previous: Option<PeerId>,
         winner: Option<PeerId>,
     ) {
-        debug_assert_eq!(previous, self.get(prefix), "stale `previous` winner");
+        debug_assert_eq!(previous, self.get(key), "stale `previous` winner");
         if previous == winner {
             return;
         }
@@ -66,11 +66,11 @@ impl<A: IpAddress> BestTable<A> {
         }
         match winner {
             Some(new) => {
-                self.winners.insert(prefix, new);
+                self.winners.insert(key.prefix(), new);
                 *self.wins.entry(new).or_insert(0) += 1;
             }
             None => {
-                self.winners.remove(prefix);
+                self.winners.remove(key.prefix());
             }
         }
     }
@@ -89,12 +89,18 @@ impl<A: IpAddress> BestTable<A> {
         self.wins.get(&peer).copied().unwrap_or(0)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (IpPrefix<A>, &PeerId)> {
-        self.winners.iter()
+    /// Every `(key, winner)` pair, in prefix-tree order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (CanonicalNlri<A>, &PeerId)> {
+        self.winners
+            .iter()
+            .map(|(prefix, peer)| (CanonicalNlri::from_tree_prefix(prefix), peer))
     }
 
-    pub(crate) fn longest_match_entry(&self, addr: A) -> Option<(IpPrefix<A>, &PeerId)> {
-        self.winners.longest_match_entry(addr)
+    /// The most specific prefix covering `addr`, and its winner.
+    pub(crate) fn longest_match_entry(&self, addr: A) -> Option<(CanonicalNlri<A>, &PeerId)> {
+        self.winners
+            .longest_match_entry(addr)
+            .map(|(prefix, peer)| (CanonicalNlri::from_tree_prefix(prefix), peer))
     }
 
     /// Recomputes every peer's win count by scanning the table. O(table).
