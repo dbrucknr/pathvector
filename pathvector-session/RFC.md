@@ -240,7 +240,7 @@ size) is `pathvectord/src/outbound.rs`; the codec guarantees the wire form regar
 | §4.1/§6: `AS4_PATH`/`AS4_AGGREGATOR` received from a NEW peer are discarded, the UPDATE continues, and the discard is reported for logging | `src/message/update.rs` `reconcile_as4_attributes` | ✅ | `as4_attributes_from_a_four_octet_peer_are_discarded_and_logged`, `four_octet_peer_keeps_four_octet_as_path_and_as4_path_is_discarded` |
 | §4.2.3: reconstruct the true path from `AS_PATH` + `AS4_PATH` (shorter `AS4_PATH` prepended with leading `AS_PATH` hops; longer `AS4_PATH` ignored; leading/adjacent confed segments kept) | `pathvector-types` `AsPath::reconstruct_with_as4_path`, called from `reconcile_as4_attributes` | ✅ | `as4_path_is_merged_into_as_path_from_an_old_peer`, `as4_path_shorter_than_as_path_is_prefixed_with_the_leading_as_path_hops`, `as4_path_longer_than_as_path_is_ignored`, `leading_confed_segment_survives_the_merge`, types `reconstruct_*` |
 | §4.2.3: `AGGREGATOR` vs `AS4_AGGREGATOR` — AS_TRANS ⇒ `AS4_AGGREGATOR` replaces it; otherwise `AS4_AGGREGATOR` *and* `AS4_PATH` are ignored | `src/message/update.rs` | ✅ | `as4_aggregator_replaces_an_as_trans_aggregator`, `non_trans_aggregator_makes_as4_aggregator_and_as4_path_ignored`, `lone_as4_aggregator_is_dropped` |
-| §6: confed segments in a received `AS4_PATH` are discarded (not the attribute), logged, UPDATE continues | `src/message/update.rs` | ✅ | `confed_segments_in_as4_path_are_discarded_and_logged_not_fatal` |
+| §6: confed segments in a received `AS4_PATH` are discarded (not the attribute), logged, UPDATE continues — except `AS_CONFED_SET`, which RFC 9774 makes treat-as-withdraw | `src/message/update.rs` | ✅ | `confed_segments_in_as4_path_are_discarded_and_logged_not_fatal` |
 | §6: malformed `AS4_PATH` (length < 6 or odd, zero-length segment, bad type, overrun) / `AS4_AGGREGATOR` (length ≠ 8) → attribute discard | `src/message/update.rs` | ✅ | `malformed_as4_path_is_attribute_discard_and_as_path_is_untouched`, `test_as4_aggregator_too_short_is_attribute_discard` |
 | RFC 7606 §7.2: zero-length segment, unknown type, overrun, one-octet underrun in `AS_PATH` → treat-as-withdraw at either width | `src/message/update.rs` | ✅ | `rfc7606_*` in `asn_width_tests.rs` |
 | RFC 4271 §4.3: a segment holds ≤ 255 ASNs — longer ones are split on encode, never truncated | `src/message/update.rs` `encode_as_path_segments` | ✅ | `oversized_sequence_splits_into_255_asn_segments_at_both_widths`, `prop_long_sequences_split_at_255_and_roundtrip` |
@@ -256,6 +256,42 @@ merged path are only re-coalesced at the AS_PATH/AS4_PATH join.
 **Deferred:** A live legacy-peer interop test. The unit, property and loopback-TCP tests
 use hand-derived RFC bytes, but no real two-octet-only implementation has been run against
 this code.
+
+---
+
+## RFC 7607 — Codification of AS 0 Processing
+
+**Owns:** AS 0 in OPEN (both directions) and in received UPDATE attributes.  
+**Boundary:** Not advertising AS 0 and rejecting it in configuration are
+`pathvectord`'s. The encoder writes what it is given: a caller of
+`SessionHandle::update_sender` is responsible for not originating AS 0.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc7607
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| §2: zero as the peer AS in an OPEN → NOTIFICATION OPEN Message Error / Bad Peer AS, whether or not a peer AS is expected; `my_as` or `FourByteAsn` | `src/fsm/mod.rs` `validate_open` | ✅ | `two_octet_open_claiming_as_zero_is_bad_peer_as`, `four_octet_capability_claiming_as_zero_is_bad_peer_as`, `expecting_as_zero_does_not_admit_it`, `prop_open_is_rejected_iff_it_claims_as_zero` |
+| Repeated `FourByteAsn` capabilities: a zero in any instance is refused (no RFC defines which instance counts) | `src/fsm/mod.rs` `peer_speaker_as` | ✅ | `any_zero_among_repeated_capabilities_is_bad_peer_as` |
+| RFC 6793 §4.1: a non-zero capability value supersedes `my_as = 0` | `src/fsm/mod.rs` | ✅ | `capability_value_supersedes_a_zero_my_as` |
+| §2: "A router MUST NOT initiate a connection claiming to be AS 0" — `local_as`, `public_as` or the capability | `src/fsm/mod.rs` `local_speaker_as` | ✅ | `no_connection_is_initiated_while_claiming_as_zero`, `no_open_is_sent_if_the_claim_turns_to_as_zero_after_start` |
+| §2: AS 0 in `AS_PATH` → treat-as-withdraw (RFC 7606 §7.2) | `src/message/as_rules.rs` | ✅ | `as_zero_anywhere_in_as_path_is_treat_as_withdraw`, `prop_as_path_verdict` |
+| §2: AS 0 in `AGGREGATOR` → attribute discard (RFC 7606 §7.7) | `src/message/as_rules.rs` | ✅ | `as_zero_aggregator_is_discarded_and_the_route_kept`, `only_the_first_aggregator_is_judged` |
+| §2: AS 0 in `AS4_PATH` / `AS4_AGGREGATOR` → attribute discard (RFC 6793 §6), applied before the §4.2.3 merge | `src/message/as_rules.rs` | ✅ | `as_zero_in_as4_path_discards_as4_path`, `as_zero_in_an_as4_path_confed_segment_discards_as4_path`, `as_zero_in_as4_aggregator_discards_as4_aggregator`, `as_zero_aggregator_from_a_two_octet_peer_leaves_as4_path_in_use` |
+
+---
+
+## RFC 9774 — Deprecation of AS_SET and AS_CONFED_SET
+
+**Owns:** Treat-as-withdraw for received sets.  
+**Boundary:** Not advertising sets is `pathvectord`'s. As above, the encoder
+writes what it is given, and `MalformedUpdate::update` keeps the offending
+attribute so it can be inspected.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9774
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| §3: `AS_SET` / `AS_CONFED_SET` in `AS_PATH` → treat-as-withdraw | `src/message/as_rules.rs` | ✅ | `either_set_type_in_as_path_is_treat_as_withdraw`, `confed_set_after_a_confed_sequence_is_treat_as_withdraw`, `a_set_in_a_repeated_as_path_is_ignored`, `prop_as_path_verdict` |
+| §3: the same in `AS4_PATH`, at either ASN width — stronger than RFC 6793's discard, so it applies (RFC 7606 §3(h)) | `src/message/as_rules.rs` | ✅ | `either_set_type_in_as4_path_is_treat_as_withdraw_at_either_width`, `set_and_as_zero_in_as4_path_is_treat_as_withdraw`, `confed_sequence_in_as4_path_is_still_only_discarded` |
+| §3: operator exception for a transition period | — | ❌ | not offered (optional; see `TODO.md`) |
 
 ---
 

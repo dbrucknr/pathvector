@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use proptest::prelude::*;
 
-use crate::{AsPath, Asn, Community, LargeCommunity, LocalPref, Med, Nlri, Origin};
+use crate::{AsPath, AsPathSegment, Asn, Community, LargeCommunity, LocalPref, Med, Nlri, Origin};
 
 // ── Strategies ─────────────────────────────────────────────────────────────
 
@@ -343,5 +343,62 @@ proptest! {
             Med::new(a).cmp(&Med::new(b)),
             a.cmp(&b)
         );
+    }
+}
+
+// ── AS4_PATH construction (RFC 6793 §§3, 4.2.2) ────────────────────────────
+
+/// Any mix of the four segment types, with mappable and non-mappable ASNs.
+fn arb_mixed_path() -> impl Strategy<Value = AsPath> {
+    let asns = || {
+        proptest::collection::vec(
+            prop_oneof![1u32..=65_535, 65_536u32..=u32::MAX].prop_map(Asn::new),
+            1..5,
+        )
+    };
+    proptest::collection::vec(
+        prop_oneof![
+            asns().prop_map(AsPathSegment::Sequence),
+            asns().prop_map(AsPathSegment::Set),
+            asns().prop_map(AsPathSegment::ConfedSequence),
+            asns().prop_map(AsPathSegment::ConfedSet),
+        ],
+        0..6,
+    )
+    .prop_map(AsPath::from_segments)
+}
+
+proptest! {
+    #[test]
+    fn prop_downgrade_for_two_byte_peer(path in arb_mixed_path()) {
+        let (down, as4) = path.downgrade_for_two_byte_peer();
+
+        // §4.2.2: AS_PATH keeps its shape; every ASN is two-octet, and each
+        // is the original or AS_TRANS.
+        prop_assert_eq!(down.segments().len(), path.segments().len());
+        for (d, o) in down.segments().iter().zip(path.segments()) {
+            prop_assert_eq!(std::mem::discriminant(d), std::mem::discriminant(o));
+            prop_assert_eq!(d.asns().len(), o.asns().len());
+            for (&d, &o) in d.asns().iter().zip(o.asns()) {
+                prop_assert_eq!(d, if o.is_four_byte() { Asn::TRANS } else { o });
+            }
+        }
+
+        // §4.2.2: AS4_PATH is the path minus confederation segments, sent
+        // exactly when what remains holds a non-mappable ASN.
+        let public = path.strip_confed_segments();
+        prop_assert_eq!(as4.is_some(), public.has_non_mappable_asn());
+        if let Some(as4) = &as4 {
+            prop_assert_eq!(as4.as_path(), &public);
+            prop_assert!(!as4.as_path().segments().iter().any(AsPathSegment::is_confed));
+        }
+
+        // §4.2.3: a NEW speaker receiving the pair recovers every
+        // non-confederation segment's AS numbers.
+        let recovered = match &as4 {
+            Some(as4) => down.reconstruct_with_as4_path(as4.as_path()),
+            None => down,
+        };
+        prop_assert_eq!(recovered.strip_confed_segments(), public);
     }
 }
