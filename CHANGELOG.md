@@ -59,15 +59,17 @@ operator's prefix unmasked.
 
   Existing benches: `loc_rib_insert_steady` (best-path hot path) `hot` 534 → 511 ns,
   538 → 505 ns, 538 → 508 ns and `scattered` 600 → 599 ns, 1.20 → 1.07 µs, 1.36 → 1.42 µs at
-  10 k / 100 k / 500 k; `outbound_pipeline` (which calls `AdjRibOut::insert`) 1–4 % faster at
+  10 k / 100 k / 500 k; `outbound_pipeline` (`AdjRibOut::insert` into empty tables) 1–4 % faster at
   1 / 10 / 50 peers; `peer_win_count/scan` (the pre-#106 scan, no longer a daemon path)
   4–11 % slower, because `best_peer` now canonicalizes its argument.
 
-  The `AdjRibOut` IPv4 figures at 100 and 1 k are an unresolved microbenchmark effect. The
-  old binary is bimodal from run to run (1 k: 42–58 µs) and the new one sits near 60 µs. A
-  throwaway build with the masking removed from `CanonicalNlri::new` also measured ~59.5 µs,
-  so the mask arithmetic is not the cause; it appears to be code generation or layout. It is
-  absent at 10 k, for IPv6, and in `outbound_pipeline`.
+  The `AdjRibOut` IPv4 figures at 100 and 1 k are unexplained. The old binary varies a lot
+  from run to run (1 k: 42–58 µs) while the new one sits near 60 µs, so the new code is
+  slower in most runs, by anything from a few percent to about 45 %. A throwaway build with
+  the masking removed from `CanonicalNlri::new` also measured ~59.5 µs, so the mask
+  arithmetic is not the cause; code generation or memory layout is a guess, not verified.
+  It does not show at 10 k or for IPv6. `outbound_pipeline` does not settle whether the
+  daemon sees it: it inserts into empty tables, never one of this size.
 
 ---
 
