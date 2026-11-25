@@ -146,8 +146,9 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// `Option` is the previous route for this prefix, if any.  The route is
     /// stored with its NLRI in canonical form (see [prefix
     /// identity](AdjRibOut#prefix-identity)).
-    pub fn insert(&mut self, route: Route<A>) -> InsertOutcome<A> {
+    pub fn insert(&mut self, mut route: Route<A>) -> InsertOutcome<A> {
         let key = CanonicalNlri::new(route.nlri);
+        route.nlri = key.nlri();
         if !self.reflects
             && self.peer_type == PeerType::Internal
             && route.peer_type == PeerType::Internal
@@ -155,8 +156,6 @@ impl<A: IpAddress> AdjRibOut<A> {
             return InsertOutcome::Filtered(self.routes.remove(&key));
         }
 
-        let mut route = route;
-        route.nlri = key.nlri();
         if self.peer_type == PeerType::External {
             route.as_path = Arc::new(route.as_path.strip_confed_segments());
         }

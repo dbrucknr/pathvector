@@ -88,9 +88,8 @@ impl<A: IpAddress> AdjRibIn<A> {
     /// let old = rib.insert(RouteBuilder::new(nlri, Origin::Igp, AsPath::new()).build());
     /// assert!(old.is_none());
     /// ```
-    pub fn insert(&mut self, route: Route<A>) -> Option<Route<A>> {
+    pub fn insert(&mut self, mut route: Route<A>) -> Option<Route<A>> {
         let key = CanonicalNlri::new(route.nlri);
-        let mut route = route;
         route.nlri = key.nlri();
         self.routes.insert(key, route)
     }

@@ -255,11 +255,10 @@ impl<A: IpAddress> LocRib<A> {
     pub fn insert(
         &mut self,
         peer: PeerId,
-        route: Route<A>,
+        mut route: Route<A>,
         oracle: &dyn NextHopOracle,
     ) -> BestPathChange<A> {
         let key = CanonicalNlri::new(route.nlri);
-        let mut route = route;
         route.nlri = key.nlri();
         let previous = self.best.get(key);
 
