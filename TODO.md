@@ -1797,7 +1797,7 @@ the crate).
 **#89 and #91 fixed 2026-11-25** (see CHANGELOG): framing is now `frame.rs` +
 `transport.rs`, and prefix records are `Vrp<A>` values. Left open from that work:
 
-- ~~Error Reports for other malformed input~~ — **done 2026-11-25** (see CHANGELOG):
+- ~~Error Reports for other malformed input~~ — **done 2026-11-25** (see `changelog.d/2026-11-25-rpki-rtr-error-reports.md`):
   unknown PDU type (code 5), unrecognized version (4 while negotiating, 8 after) and
   wrong Length (0) are reported; Error Reports never are.
 - Found while doing that, not fixed:

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 49bc2a3c5e54ac7cd438163f4612fe41817374a31a91b848d6ce516399c2d060 # shrinks to ops = [(false, Announce { idx: 0, attrs: 0, next_hop: 0 }), (true, Announce { idx: 1, attrs: 0, next_hop: 0 }), (true, Withdraw { idx: 1 })], observer = Ebgp

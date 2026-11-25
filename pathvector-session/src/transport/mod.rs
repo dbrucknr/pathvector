@@ -3582,6 +3582,11 @@ mod tests {
     /// the daemon just removed. Pre-fix, this candidate would have survived
     /// (only `ManualStop` was covered) and been adopted once its OPEN
     /// arrived, since `Idle` alone said "nothing left to protect."
+    ///
+    /// The candidate never sends anything here. Writing to it after the
+    /// teardown would draw a TCP reset (RFC 9293 §3.6.1, SHLD-3) that races
+    /// the read of the session's FIN, making the result `None` or
+    /// `ConnectionReset` by chance.
     #[tokio::test]
     async fn test_collision_candidate_pending_closed_on_notification_to_send() {
         let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
@@ -3596,17 +3601,14 @@ mod tests {
         establish_with_gr(peer_bgp_id, &mut existing_peer, &mut handle).await;
 
         // A GR-purpose candidate is staged, but held back before it ever
-        // sends its OPEN.
+        // sends its OPEN. It shares a channel with the teardown below, so
+        // the session is certain to stage it first.
         let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
-
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
 
         // The daemon issues a locally initiated administrative teardown
         // (e.g. RFC 9003 peer removal) while the candidate is still
@@ -3653,22 +3655,9 @@ mod tests {
              got {terminated_event:?}"
         );
 
-        // Only now does the candidate send its OPEN — same BGP Identifier
-        // and GR, exactly what a genuine GR reconnect would look like. If
-        // the bug were still present, this would be adopted and recreate
-        // the session the daemon just deliberately tore down.
-        let mut candidate_open = peer_open();
-        if let BgpMessage::Open(ref mut o) = candidate_open {
-            o.bgp_id = peer_bgp_id;
-            o.capabilities.push(Capability::GracefulRestart {
-                restart_flags: 0,
-                restart_time: 120,
-                families: vec![],
-            });
-        }
-        candidate_peer.send(candidate_open).await.unwrap();
-
-        // The candidate must be closed outright — not adopted.
+        // The teardown alone must close the candidate: left staged, it would
+        // stay open for `COLLISION_CANDIDATE_OPEN_TIMEOUT` waiting to send
+        // its OPEN, and be adopted when it did.
         let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
             .await
             .expect("timed out waiting for the pending candidate to close");

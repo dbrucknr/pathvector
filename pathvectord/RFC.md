@@ -177,6 +177,8 @@ of UPDATE messages lives in `pathvector-session`.
 | NLRI batching: announcements with same path attributes packed into fewest UPDATEs within `max_len` | `src/outbound.rs` | ✅ | `test_flush_same_attrs_batched_into_one_message`, `test_flush_splits_when_exceeding_max_len`, `test_flush_withdrawal_split_delivers_all_nlris` |
 | Announcement groups with distinct path attributes go into separate UPDATEs | `src/outbound.rs` | ✅ | `test_flush_different_attrs_two_messages` |
 | Withdrawals sent before announcements; withdrawal list packed within `max_len` | `src/outbound.rs` | ✅ | `test_flush_withdrawals_before_announces`, `test_flush_withdrawal_split_delivers_all_nlris` |
+| Applying the UPDATEs in the order sent yields the Adj-RIB-Out (§3.1 withdrawal and replacement, §9.2): a batch sends only the last announce/withdraw per NLRI, and every route-carrying send drains the peer's coalescing buffer, so nothing overtakes an older decision (issue #159) | `src/outbound.rs` `retain_last_per_nlri`, `src/daemon/route.rs` `flush_peer` | ✅ | `src/daemon/outbound_order_tests.rs`: `event_loop_announce_then_withdraw`, `event_loop_announce_then_session_loss`, `replaced_announcement_sharing_a_group_leaves_the_replacement`, `sent_updates_always_match_adj_rib_out` (property) |
+| RFC 4760 §3: one `MP_REACH_NLRI` carries only prefixes that share its next hop | `src/outbound.rs` `flush_updates_v6` | ✅ | `v6_prefixes_with_different_next_hops_keep_their_own` |
 | Unrecognized transitive optional attributes stored on ingest (Optional+Transitive flags only; non-transitive quietly dropped) and forwarded unconditionally on egress regardless of peer type, with the Partial bit set (RFC 4271 §5) | `src/daemon/route.rs`, `src/outbound.rs` | ✅ | Fixed 2026-08-03 (`feature/rfc4271-unrecognized-transitive-attribute-storage`). See `RFC_AUDIT.md` §5 and `pathvector-rib/RFC.md`'s own section for the storage half. `test_handle_update_stores_unrecognized_transitive_attribute`, `test_handle_update_quietly_ignores_unrecognized_non_transitive_attribute`, `unrecognized_transitive_attribute_is_forwarded_with_optional_transitive_flags` |
 | e2e (2026-08-05, Codex review of PR #49): the complete decode → daemon storage → RIB → outbound-reconstruction → encode pipeline through a real two-hop relay, not just decode-level and daemon-storage-level unit tests — asserting the exact re-encoded flags octet, which a GoBGP CLI's rendered RIB text cannot express | `pathvector-e2e/src/bin/mock_bgp_attr_peer.rs`, `pathvector-e2e/tests/unknown_transitive_attribute.rs` | ✅ | `unknown_transitive_attribute_relayed_with_partial_bit_set` (a `source` mock injects an unrecognized Optional+Transitive attribute, Partial bit clear, plus an unrecognized Optional-only non-transitive negative control; an `observer` mock decodes pathvectord's re-advertised UPDATE with the real wire codec and confirms the transitive attribute survives with its value unchanged and Partial bit now set, while the non-transitive one is absent entirely) |
 
@@ -534,7 +536,7 @@ carries it, and never advertising it.
 ## RFC 4456 — BGP Route Reflection
 
 **Owns:** Route Reflector configuration, inbound attribute processing (ORIGINATOR_ID,
-CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the propagation loop, and
+CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the outbound decision, and
 outbound inclusion of reflection attributes in UPDATE messages.  
 **Boundary:** ORIGINATOR_ID / CLUSTER_LIST wire codec lives in `pathvector-session`.
 Route struct fields for carrying the attributes live in `pathvector-rib`.  
@@ -561,6 +563,8 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in propagation | `src/daemon.rs` | ✅ | `test_rr_v6_split_horizon_blocks_non_client_to_non_client` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in full-table dump | `src/daemon.rs` | ✅ | `test_rr_v6_established_dump_applies_split_horizon` |
+| §6 non-client → non-client exclusion applied on **every** send path (incremental, table dump, session loss, GR stale marking / End-of-RIB prune / deadline expiry, export-policy change), IPv4 and IPv6, including while the source's session is down (routes retained for GR) and for peers on IPv6 transport (issue #168) | `src/outbound.rs` `excluded_by_reflection`, called from `propagate_prefix` / `propagate_prefix_v6` | ✅ | `src/daemon/rr_split_horizon_tests.rs` |
+| RFC 4271 §9.1.3: a destination the §6 rule excludes is sent a withdrawal for what it was previously advertised (a non-client's path replacing a client's as best) | `src/outbound.rs` | ✅ | `rr_split_horizon_tests::{update_taking_over_from_client_withdraws_v4_and_v6, session_loss_withdraws_when_non_client_takes_over_v4, gr_expiry_withdraws_when_non_client_takes_over_v4_and_v6, eor_prune_withdraws_when_non_client_takes_over_v4_and_v6}` |
 
 ---
 
