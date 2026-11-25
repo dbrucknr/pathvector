@@ -4,6 +4,27 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvectord: a coalesced session teardown refreshes the capability set — issue #148)
+
+`run_event_loop` had two hand-written copies of `SessionEvent::Terminated` handling. Only the one
+for the first event of a batch sent `SessionCommand::SetCapabilities`. With `restarting = true`, a
+session whose teardown was coalesced behind other events therefore kept the set it was spawned
+with: its later OPENs carried Restart State (R) = 1 and Forwarding State (F) = 0 for IPv4 and IPv6
+unicast. RFC 4724 §4.2 says a speaker re-establishing a session MUST NOT set R unless it has
+restarted, and a peer that receives F = 0 MUST delete the stale routes it retained for that family.
+
+- Both arms now call one `handle_session_terminated`, which returns the refresh owed to the
+  session. The send happens after the state write lock is released, including when the drain loop
+  leaves early to send a NOTIFICATION.
+- Tests: `coalesced_teardown_refreshes_capabilities`,
+  `coalesced_teardown_refreshes_capabilities_when_batch_ends_in_notification`,
+  `coalesced_capability_refresh_is_sent_without_the_state_lock`. All three failed on the old code.
+- Unchanged: a session that has not reached Established since our restart still sends R = 1 after
+  `graceful_restart_time` has passed. RFC 4724 §4.1 requires the Restarting Speaker to set R to
+  re-establish a session and defines no expiry for it.
+
+---
+
 ## 2026-11-24 (pathvectord: list_peers / get_peer no longer scan the Loc-RIB — issue #106)
 
 `build_peer_state` counted `prefixes_accepted` by walking every best route once per
