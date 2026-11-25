@@ -2687,10 +2687,16 @@ mod tests {
         );
     }
 
-    /// `FramedBgpTransport::send` maps `FramingError::Io` to the underlying
-    /// `io::Error` when the TCP write half has been closed.
+    /// `FramedBgpTransport::send` returns the socket's own `io::Error` when the
+    /// write fails.
+    ///
+    /// The failure is induced by shutting down our own write half, which takes
+    /// effect before `shutdown` returns. Closing the peer instead would not:
+    /// writes keep succeeding until the peer's reset arrives, and no number of
+    /// `yield_now` calls guarantees that it has.
     #[tokio::test]
     async fn test_framed_transport_send_io_error_is_forwarded() {
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2698,25 +2704,20 @@ mod tests {
         let (client_stream, server_accept) =
             tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         let client_stream = client_stream.unwrap();
-        let (server_stream, _addr) = server_accept.unwrap();
-
-        // Close the server side so that writing to the client eventually fails.
-        drop(server_stream);
+        // Kept open, so the local shutdown is the only thing that can fail the write.
+        let (_server_stream, _addr) = server_accept.unwrap();
 
         let mut transport = FramedBgpTransport::from_stream(client_stream);
+        transport.writer.get_mut().shutdown().await.unwrap();
 
-        // Keep sending until we get an io::Error (a closed peer may buffer briefly).
-        let mut result = Ok(());
-        for _ in 0..20 {
-            result = transport.send(BgpMessage::Keepalive).await;
-            if result.is_err() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let err = transport
+            .send(BgpMessage::Keepalive)
+            .await
+            .expect_err("send on a shut-down write half must fail");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert!(
-            result.is_err(),
-            "expected FramedBgpTransport::send to fail after peer closed"
+            err.raw_os_error().is_some(),
+            "expected the OS error itself, got {err:?}"
         );
     }
 
