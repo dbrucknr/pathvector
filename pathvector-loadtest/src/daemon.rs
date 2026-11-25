@@ -148,7 +148,14 @@ pub async fn wait_ready(topo: &Topology, limit: Duration) -> Result<(), String> 
     loop {
         let metrics_ok = http_get(topo.metrics_port, "/metrics").await.is_ok();
         let grpc_ok = match PathvectorClient::connect(grpc_url(topo)) {
-            Ok(mut c) => c.list_peers().await.is_ok(),
+            // Bounded by what is left of `limit`: a server that accepts and
+            // never answers must not hang startup.
+            Ok(mut c) => timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                c.list_peers(),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok()),
             Err(_) => false,
         };
         if metrics_ok && grpc_ok {
@@ -284,6 +291,34 @@ mod tests {
         assert_eq!(s.errors, 1);
         assert_eq!(s.samples.len(), 2, "duplicate WARN message listed once");
         assert!(s.samples.iter().any(|m| m.contains("overflowed")));
+    }
+
+    /// A gRPC port that accepts connections and never answers must make
+    /// startup fail at its limit rather than hang.
+    #[tokio::test]
+    async fn wait_ready_gives_up_on_a_silent_grpc_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut topo = Topology::from_addrs(&[std::net::Ipv4Addr::LOCALHOST; 2], 9);
+        topo.grpc_port = listener.local_addr().unwrap().port();
+        // Nothing listens on the metrics port, so only gRPC is left hanging.
+        topo.metrics_port = {
+            let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            free.local_addr().unwrap().port()
+        };
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let result = timeout(
+            Duration::from_secs(30),
+            wait_ready(&topo, Duration::from_millis(500)),
+        )
+        .await
+        .expect("wait_ready hung");
+        assert!(result.is_err(), "{result:?}");
+        held.abort();
     }
 
     #[test]
