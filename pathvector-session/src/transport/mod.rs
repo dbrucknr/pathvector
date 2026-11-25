@@ -2900,7 +2900,8 @@ mod tests {
             if result.is_err() {
                 break;
             }
-            tokio::task::yield_now().await;
+            // Real time for the peer's reset to arrive.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             result.is_err(),
@@ -3484,9 +3485,8 @@ mod tests {
         }
         candidate_peer.send(candidate_open).await.unwrap();
 
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        // Real socket I/O: give the session time to read and validate it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // The operator stops the session while the candidate is still
         // deferred (validated, but held pending the primary's own identity).
@@ -3513,8 +3513,9 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
             .await
             .expect("timed out waiting for the deferred candidate to close");
+        // A reset rather than a clean close if the OPEN was still unread.
         assert!(
-            closed.is_none(),
+            matches!(closed, None | Some(Err(FramingError::Io(_)))),
             "a deferred collision candidate must be closed, not adopted, \
              when the operator stops the session, got {closed:?}"
         );
