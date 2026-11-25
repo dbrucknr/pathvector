@@ -17,6 +17,13 @@
 // service". §8: a speaker determines through Capability Advertisement whether
 // it can use Multiprotocol Extensions with a peer.
 //
+// RFC 4271 §9.1.3: "If a route in Loc-RIB is excluded from a particular
+// Adj-RIB-Out, the previously advertised route in that Adj-RIB-Out MUST be
+// withdrawn from service by means of an UPDATE message".
+//
+// RFC 4456 §6: "A route from a Non-Client IBGP peer: Reflect to all the
+// Clients."
+//
 // RFC 4724 §4.2: "If the session does not get re-established within the
 // "Restart Time" that the peer advertised previously, the Receiving Speaker
 // MUST delete all the stale routes from the peer that it is retaining."
@@ -35,9 +42,11 @@ use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::broadcast;
 
 use super::last_feasible_tests::{
-    AS_A, AS_C, LOCAL_AS, PEER_A, PEER_B, PEER_C, RESOLVABLE_V6, Receivers, announces_v6, drain,
-    established, n6, sent_to, withdraws_v6,
+    AS_A, AS_C, FixedOracle, LOCAL_AS, PEER_A, PEER_B, PEER_C, RESOLVABLE_V4, RESOLVABLE_V6,
+    Receivers, announces_v4, announces_v6, drain, established, n4, n6, sent_to, withdraws_v4,
+    withdraws_v6,
 };
+use super::tests::make_state;
 use super::{DaemonState, handle_session_terminated};
 use crate::proto;
 
@@ -283,6 +292,119 @@ fn session_loss_leaves_other_peers_v6_routes_alone() {
         }
     }
     assert_eq!(route_events(&mut events, other_n6()), []);
+}
+
+// ── Session loss against buffered and reflected routes ──────────────────────
+
+fn announce_v4(path: &[u32]) -> UpdateMessage {
+    UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(
+                path.iter().copied().map(Asn::new).collect(),
+            )),
+            PathAttribute::NextHop(RESOLVABLE_V4),
+        ],
+        announced: vec![n4()],
+    }
+}
+
+/// Whether a receiver applying `msgs` in order ends up holding the prefix that
+/// `announces` and `withdraws` look for.
+fn holds(
+    msgs: &[UpdateMessage],
+    announces: fn(&[UpdateMessage]) -> bool,
+    withdraws: fn(&[UpdateMessage]) -> bool,
+) -> bool {
+    msgs.iter().fold(false, |held, msg| {
+        let msg = std::slice::from_ref(msg);
+        announces(msg) || (held && !withdraws(msg))
+    })
+}
+
+/// `PEER_A`'s announcement is still buffered, as in one event-loop batch, when
+/// its session is lost. B must not be left holding the route (RFC 4271 §3.1,
+/// §9.2).
+#[test]
+fn session_loss_is_not_undone_by_a_buffered_v4_announcement() {
+    let (mut state, mut rx) = established();
+    feed(&mut state, PEER_A, announce_v4(&[AS_A]));
+
+    state.on_terminated(IpAddr::V4(PEER_A), TerminationReason::Unclean, true);
+
+    let msgs = sent_to(&mut state, &mut rx, PEER_B);
+    assert!(!holds(&msgs, announces_v4, withdraws_v4), "{msgs:?}");
+}
+
+#[test]
+fn session_loss_is_not_undone_by_a_buffered_v6_announcement() {
+    let (mut state, mut rx) = established();
+    feed(&mut state, PEER_A, announce(n6(), &[AS_A]));
+
+    state.on_terminated(IpAddr::V4(PEER_A), TerminationReason::Unclean, true);
+
+    let msgs = sent_to(&mut state, &mut rx, PEER_B);
+    assert!(!holds(&msgs, announces_v6, withdraws_v6), "{msgs:?}");
+}
+
+/// A route reflector with an eBGP peer A, supplying the best paths, and
+/// non-client iBGP peers B and C. C also offers both prefixes, and B has been
+/// sent A's routes.
+fn reflector_with_non_client_alternative() -> (DaemonState, Receivers) {
+    let peers = [(PEER_A, AS_A), (PEER_B, LOCAL_AS), (PEER_C, LOCAL_AS)];
+    let (mut state, mut rx) = make_state(LOCAL_AS, &peers.map(|(p, a)| (IpAddr::V4(p), a)));
+    state.set_oracles(FixedOracle, FixedOracle);
+    let rib = std::sync::Arc::make_mut(&mut state.rib);
+    rib.local_ipv6 = Some("2001:db8::ff".parse().unwrap());
+    // Naming a client elsewhere makes this speaker a reflector.
+    rib.rr_clients.insert("10.0.0.99".parse().unwrap());
+    let caps = [
+        Capability::MultiProtocol(AfiSafi::IPV4_UNICAST),
+        Capability::MultiProtocol(AfiSafi::IPV6_UNICAST),
+    ];
+    for (ip, asn) in peers {
+        let kind = if asn == LOCAL_AS {
+            PeerType::Internal
+        } else {
+            PeerType::External
+        };
+        state.on_established(IpAddr::V4(ip), ip, kind, asn, 90, &caps, None);
+    }
+    drain(&mut state, &mut rx);
+    feed(&mut state, PEER_A, announce_v4(&[AS_A]));
+    feed(&mut state, PEER_C, announce_v4(&[65100, 65101]));
+    feed(&mut state, PEER_A, announce(n6(), &[AS_A]));
+    feed(&mut state, PEER_C, announce(n6(), &[65100, 65101]));
+    let to_b = sent_to(&mut state, &mut rx, PEER_B);
+    assert!(
+        announces_v4(&to_b) && announces_v6(&to_b),
+        "precondition: B holds A's routes"
+    );
+    drain(&mut state, &mut rx);
+    (state, rx)
+}
+
+/// The replacement comes from a non-client, so B, also a non-client, is not
+/// sent it (RFC 4456 §6) and has A's route withdrawn (RFC 4271 §9.1.3).
+#[test]
+fn session_loss_withdraws_v4_from_a_non_client_excluded_from_the_replacement() {
+    let (mut state, mut rx) = reflector_with_non_client_alternative();
+
+    state.on_terminated(IpAddr::V4(PEER_A), TerminationReason::Unclean, true);
+
+    let msgs = sent_to(&mut state, &mut rx, PEER_B);
+    assert!(!announces_v4(&msgs) && withdraws_v4(&msgs), "{msgs:?}");
+}
+
+#[test]
+fn session_loss_withdraws_v6_from_a_non_client_excluded_from_the_replacement() {
+    let (mut state, mut rx) = reflector_with_non_client_alternative();
+
+    state.on_terminated(IpAddr::V4(PEER_A), TerminationReason::Unclean, true);
+
+    let msgs = sent_to(&mut state, &mut rx, PEER_B);
+    assert!(!announces_v6(&msgs) && withdraws_v6(&msgs), "{msgs:?}");
 }
 
 // ── Graceful Restart teardown paths ─────────────────────────────────────────
