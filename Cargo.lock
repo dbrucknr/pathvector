@@ -2472,6 +2472,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tonic-prost",

@@ -4,6 +4,7 @@ pub mod adj_rib_in;
 pub mod adj_rib_out;
 pub mod best_path;
 mod best_table;
+mod canonical;
 pub mod loc_rib;
 pub mod oracle;
 pub mod outbound;

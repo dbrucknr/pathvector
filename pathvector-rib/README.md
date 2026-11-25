@@ -9,6 +9,14 @@ BGP Routing Information Base for the [pathvector](https://github.com/dbrucknr/pa
 BGP maintains three distinct routing tables per address family. Understanding
 their roles is essential to understanding how BGP routers make decisions.
 
+All three identify a destination by its **prefix**: address bits beyond the
+prefix length are irrelevant (RFC 4271 §4.3, RFC 4760 §5), so `10.1.2.3/8` and
+`10.0.0.0/8` insert, find and withdraw the same entry. `Nlri` itself keeps
+whatever bits it was built with; the RIBs convert it to a crate-private
+`CanonicalNlri` (the only constructor masks) before it becomes a key, and every
+internal map is declared in terms of that type. Whatever comes back out —
+`Route::nlri`, iterator keys, `BestPathChange` — is canonical.
+
 ### Adj-RIB-In — the raw inbox
 
 One table per peer. Routes are stored exactly as received from that peer,
@@ -136,7 +144,7 @@ routes least preferred, is not implemented.
 
 ## Benchmarks
 
-Four Criterion benchmark groups measure the control-plane hot paths. Run them with:
+Criterion benchmark groups measure the control-plane hot paths. Run them with:
 
 ```bash
 cargo bench -p pathvector-rib
@@ -168,6 +176,7 @@ cargo bench -p pathvector-rib -- --baseline before
 | `loc_rib_insert` | 10k / 100k / 500k prefixes | `LocRib::insert` + best-path recompute; simulates a RIB of increasing size up to ~½ a full internet table |
 | `loc_rib_insert_steady` | 10k / 100k / 500k prefixes | Steady-state `LocRib::insert` on a RIB built once: `hot` (one prefix, winner flips) and `scattered` (stride over the whole table, cache-cold). Use this, not `loc_rib_insert`, to compare insert cost at 500k |
 | `peer_win_count` | 100 / 1k / 10k / 100k / 1M prefixes | Per-peer win count: the old `best_routes()` scan vs `best_win_count`, plus the `LocRib::clone` that copy-on-write performs |
+| `prefix_keyed_ops` | 100 / 1k / 10k prefixes, IPv4 and IPv6 | One pass of `insert` / `best` / `longest_match` / `withdraw` over every prefix, plus `AdjRibIn` and `AdjRibOut` insert + get + withdraw: the operations that build a storage key |
 | `outbound_pipeline` | 1 / 10 / 50 peers | `prepare_outbound` + `AdjRibOut::insert` per peer; simulates the Update-Send Process for one prefix change |
 
 All benchmarks are deterministic (no random input) and sized for M2 Max hardware.

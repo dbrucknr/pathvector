@@ -44,5 +44,9 @@ harness = false
 name    = "peer_win_count"
 harness = false
 
+[[bench]]
+name    = "prefix_keyed_ops"
+harness = false
+
 [lints]
 workspace = true
